@@ -1,7 +1,47 @@
-# Medical AI-CFD Project Rules
+# Project PIRON: Chemo-Hemodynamic Surrogate Solver Context
 
-- **Persona**: You are a Senior Research Engineer specializing in SciML and Hemodynamics.
-- **Tech Stack**: Always prefer `pyNastran` for .nas parsing, `PyVista` for 3D visualization, and `PyTorch Geometric` for GNNs.
-- **Data Integrity**: Never modify files in `data/raw/`. Write processed outputs to `data/aligned/` or `data/morphs/`.
-- **Anatomy Rules**: Blood vessels must be treated as manifolds. Ensure nodal correspondence across all 17 patients during preprocessing.
-- **Math**: Use LaTeX for any physics documentation. Ground all loss functions in Navier-Stokes equations.
+## Project Objective
+We are building a 2D GINO-DEQ (Graph Informed Neural Operator + Deep Equilibrium) model to predict final thrombus boundaries ($B_{final}$) in <5 seconds.
+**Constraint:** The model utilizes Sim-to-Real Transfer Learning.
+1.  **Pre-train:** 5,000 procedurally generated 2D vessels (Gmsh) to learn fluid dynamics.
+2.  **Fine-tune:** 17 patient-specific datasets (COMSOL/.nas) to learn biological factors.
+
+## Tech Stack
+* **Language:** Python 3.9+
+* **Deep Learning:** PyTorch, PyTorch Geometric (PyG)
+* **Math/Physics:** NumPy, SciPy (for sparse matrices)
+* **Meshing:** Gmsh API, meshio
+
+## Architectural Rules
+1.  **The Encoder (GINO):**
+    * Input: Graph $G = (V, E)$ from .nas files.
+    * Features: 8 channels (pos_x, pos_y, is_wall, curvature, vel_u, vel_v, pressure, conc_bio).
+    * Action: Linearize CTRIA6 elements into 4 linear triangles. Project to latent space $d=64$.
+2.  **The Solver (DEQ):**
+    * **Do not** use fixed depth layers.
+    * Use **Anderson Acceleration** (max iter=20) to find fixed point $z^* = f_\theta(z^*, x_{encoded})$.
+    * Use **Implicit Differentiation** for the backward pass to save memory.
+3.  **The Decoder:**
+    * Node-wise MLP. Output: $P_{clot} \in [0, 1]$.
+
+## Data Engineering Rules
+* **Tensor Shape:** `[N_nodes, 8]`
+* **Feature Index Mapping (STRICT):**
+    * 0-1: `pos_x`, `pos_y` (Normalized [-1, 1])
+    * 2: `is_wall` (Boolean 0.0/1.0)
+    * 3: `curvature` (Static)
+    * 4-5: `vel_u`, `vel_v` (Normalized by inlet)
+    * 6: `pressure`
+    * 7: `conc_bio` (0.0 - 1.0)
+* **Augmentation:** Implement "Digital Siblings" logic (Hyper-coagulant vs. Hypo-coagulant) to force biochemical learning over geometric memorization.
+
+## Physics-Informed Loss Guidelines
+Implement a composite loss function: `Loss = L_Dice + L_SUPG + L_Hinge`
+1.  **L_Dice:** Standard soft dice for segmentation (Weight: 1.0).
+2.  **L_SUPG:** Streamline-Upwind Petrov-Galerkin. Must calculate residual $R$ along streamlines to handle high Schmidt numbers ($Sc \approx 1000$).
+3.  **L_Hinge:** Viscosity guardrail. Penalize implicit viscosity if outside 3.5cP – 40cP.
+
+## Coding Style
+* Use type hints for all function definitions (e.g., `def forward(self, x: torch.Tensor) -> torch.Tensor:`).
+* Prefer modular files: separate `models/gino.py`, `models/deq_solver.py`, and `physics/losses.py`.
+* Docstrings must explain the *physical* meaning of variables, not just dimensions.

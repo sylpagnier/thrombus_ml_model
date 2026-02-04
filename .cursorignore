@@ -1,3 +1,40 @@
-# Ignore large data files to prevent reading them
-data/raw/*.nas
-data/raw/**/*.nas
+# Version Control
+.git
+.gitignore
+
+# Python / Environment
+__pycache__
+*.pyc
+venv/
+env/
+.env
+
+# Large Data & Meshes
+# Exclude raw simulation files to prevent context window overflow
+*.nas
+*.msh
+*.mphtxt
+*.mph
+*.vtk
+*.vtu
+data/raw/
+data/processed/
+# Keep data/sample/ if it exists for debugging
+
+# Model Checkpoints
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+models_saved/
+
+# Logs and Artifacts
+wandb/
+runs/
+logs/
+*.log
+
+# IDE settings
+.idea
+.vscode
+*.swp
