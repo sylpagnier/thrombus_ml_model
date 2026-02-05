@@ -1,40 +1,19 @@
-# Version Control
-.git
-.gitignore
-
-# Python / Environment
-__pycache__
-*.pyc
-venv/
-env/
-.env
-
-# Large Data & Meshes
-# Exclude raw simulation files to prevent context window overflow
-*.nas
-*.msh
-*.mphtxt
+# Data and Sim Outputs
+data/raw/*
+data/processed/*.pt
+outputs/plots/*
+outputs/checkpoints/*
 *.mph
-*.vtk
-*.vtu
-data/raw/
-data/processed/
-# Keep data/sample/ if it exists for debugging
+*.stl
+*.dxf
+*.msh
 
-# Model Checkpoints
-*.pth
-*.pt
-*.ckpt
-checkpoints/
-models_saved/
+# Standard Python
+__pycache__/
+.venv/
+env/
+.DS_Store
 
-# Logs and Artifacts
-wandb/
-runs/
+# Large Logs
 logs/
 *.log
-
-# IDE settings
-.idea
-.vscode
-*.swp

@@ -1,47 +1,22 @@
-# Project PIRON: Chemo-Hemodynamic Surrogate Solver Context
+# Project PIRON: AI Coding Rules
 
-## Project Objective
-We are building a 2D GINO-DEQ (Graph Informed Neural Operator + Deep Equilibrium) model to predict final thrombus boundaries ($B_{final}$) in <5 seconds.
-**Constraint:** The model utilizes Sim-to-Real Transfer Learning.
-1.  **Pre-train:** 5,000 procedurally generated 2D vessels (Gmsh) to learn fluid dynamics.
-2.  **Fine-tune:** 17 patient-specific datasets (COMSOL/.nas) to learn biological factors.
+## Context & Architecture
+- You are an expert in Physics-Informed Machine Learning (PIML), Graph Neural Operators (GINO), and Deep Equilibrium Models (DEQ).
+- The project implements an **rGINO-DEQ** to solve steady-state Navier-Stokes for non-Newtonian blood flow.
+- Core frameworks: PyTorch, PyTorch Geometric (PyG), and TorchDEQ.
 
-## Tech Stack
-* **Language:** Python 3.9+
-* **Deep Learning:** PyTorch, PyTorch Geometric (PyG)
-* **Math/Physics:** NumPy, SciPy (for sparse matrices)
-* **Meshing:** Gmsh API, meshio
+## Mathematical Standards
+- Use LaTeX for all mathematical documentation in docstrings.
+- **Viscosity Model:** Carreau-Yasuda: $\mu(\dot{\gamma}) = \mu_{\infty} + (\mu_{0} - \mu_{\infty}) [1 + (\lambda \dot{\gamma})^{a}]^{\frac{n-1}{a}}$.
+- **Loss Function:** $L_{total} = \lambda_{D}L_{Data} + \lambda_{NS}L_{NS} + \lambda_{Brink}L_{Brinkman} + \lambda_{Rheo}L_{Rheo}$.
 
-## Architectural Rules
-1.  **The Encoder (GINO):**
-    * Input: Graph $G = (V, E)$ from .nas files.
-    * Features: 8 channels (pos_x, pos_y, is_wall, curvature, vel_u, vel_v, pressure, conc_bio).
-    * Action: Linearize CTRIA6 elements into 4 linear triangles. Project to latent space $d=64$.
-2.  **The Solver (DEQ):**
-    * **Do not** use fixed depth layers.
-    * Use **Anderson Acceleration** (max iter=20) to find fixed point $z^* = f_\theta(z^*, x_{encoded})$.
-    * Use **Implicit Differentiation** for the backward pass to save memory.
-3.  **The Decoder:**
-    * Node-wise MLP. Output: $P_{clot} \in [0, 1]$.
+## Coding Standards
+- **Mesh Agnosticism:** Always assume unstructured graphs $G=(V, E)$. Do not hardcode grid dimensions.
+- **Dimensionality:** Default to 2D $(u, v, p, \phi, \mu)$ unless 3D is explicitly requested.
+- **Variable Naming:** Use `u` for velocity, `p` for pressure, `phi` for thrombus phase-field, and `gamma_dot` for shear rate.
+- **DEQ Solvers:** Prefer Anderson Acceleration or Broyden's method for fixed-point iterations.
+- **Soft-Logic:** Use Sigmoidal Gates for biochemical triggers to ensure $\nabla$ stability.
 
-## Data Engineering Rules
-* **Tensor Shape:** `[N_nodes, 8]`
-* **Feature Index Mapping (STRICT):**
-    * 0-1: `pos_x`, `pos_y` (Normalized [-1, 1])
-    * 2: `is_wall` (Boolean 0.0/1.0)
-    * 3: `curvature` (Static)
-    * 4-5: `vel_u`, `vel_v` (Normalized by inlet)
-    * 6: `pressure`
-    * 7: `conc_bio` (0.0 - 1.0)
-* **Augmentation:** Implement "Digital Siblings" logic (Hyper-coagulant vs. Hypo-coagulant) to force biochemical learning over geometric memorization.
-
-## Physics-Informed Loss Guidelines
-Implement a composite loss function: `Loss = L_Dice + L_SUPG + L_Hinge`
-1.  **L_Dice:** Standard soft dice for segmentation (Weight: 1.0).
-2.  **L_SUPG:** Streamline-Upwind Petrov-Galerkin. Must calculate residual $R$ along streamlines to handle high Schmidt numbers ($Sc \approx 1000$).
-3.  **L_Hinge:** Viscosity guardrail. Penalize implicit viscosity if outside 3.5cP – 40cP.
-
-## Coding Style
-* Use type hints for all function definitions (e.g., `def forward(self, x: torch.Tensor) -> torch.Tensor:`).
-* Prefer modular files: separate `models/gino.py`, `models/deq_solver.py`, and `physics/losses.py`.
-* Docstrings must explain the *physical* meaning of variables, not just dimensions.
+## Specialized Instructions
+- When writing loss functions, always include the residual of the Navier-Stokes equations as a penalty.
+- Ensure all LoRA layers are applied only to the GNN/GINO weights, leaving the physics-informed kernels frozen during Tier 3.
