@@ -1,22 +1,48 @@
-# Project PIRON: AI Coding Rules
+Project PIRON: AI Coding Rules
+Context & Architecture
 
-## Context & Architecture
-- You are an expert in Physics-Informed Machine Learning (PIML), Graph Neural Operators (GINO), and Deep Equilibrium Models (DEQ).
-- The project implements an **rGINO-DEQ** to solve steady-state Navier-Stokes for non-Newtonian blood flow.
-- Core frameworks: PyTorch, PyTorch Geometric (PyG), and TorchDEQ.
+    You are an expert in Physics-Informed Machine Learning (PIML), Graph Neural Operators (GINO), and Deep Equilibrium Models (DEQ).
 
-## Mathematical Standards
-- Use LaTeX for all mathematical documentation in docstrings.
-- **Viscosity Model:** Carreau-Yasuda: $\mu(\dot{\gamma}) = \mu_{\infty} + (\mu_{0} - \mu_{\infty}) [1 + (\lambda \dot{\gamma})^{a}]^{\frac{n-1}{a}}$.
-- **Loss Function:** $L_{total} = \lambda_{D}L_{Data} + \lambda_{NS}L_{NS} + \lambda_{Brink}L_{Brinkman} + \lambda_{Rheo}L_{Rheo}$.
+    The project implements an rGINO-DEQ to solve steady-state Navier-Stokes for non-Newtonian blood flow.
 
-## Coding Standards
-- **Mesh Agnosticism:** Always assume unstructured graphs $G=(V, E)$. Do not hardcode grid dimensions.
-- **Dimensionality:** Default to 2D $(u, v, p, \phi, \mu)$ unless 3D is explicitly requested.
-- **Variable Naming:** Use `u` for velocity, `p` for pressure, `phi` for thrombus phase-field, and `gamma_dot` for shear rate.
-- **DEQ Solvers:** Prefer Anderson Acceleration or Broyden's method for fixed-point iterations.
-- **Soft-Logic:** Use Sigmoidal Gates for biochemical triggers to ensure $\nabla$ stability.
+    Core frameworks: PyTorch, PyTorch Geometric (PyG), and TorchDEQ.
 
-## Specialized Instructions
-- When writing loss functions, always include the residual of the Navier-Stokes equations as a penalty.
-- Ensure all LoRA layers are applied only to the GNN/GINO weights, leaving the physics-informed kernels frozen during Tier 3.
+Mathematical Standards
+
+    Use LaTeX for all mathematical documentation in docstrings.
+
+    Viscosity Model: Carreau-Yasuda: μ(γ˙​)=μ∞​+(μ0​−μ∞​)[1+(λγ˙​)a]an−1​.
+
+    Loss Function: Ltotal​=λD​LData​+λNS​LNS​+λBrink​LBrinkman​+λRheo​LRheo​.
+
+Coding Standards
+
+    Mesh Agnosticism: Always assume unstructured graphs G=(V,E). Do not hardcode grid dimensions.
+
+    Dimensionality: Default to 2D (u,v,p,ϕ,μ) unless 3D is explicitly requested.
+
+    Variable Naming: Use u for velocity, p for pressure, phi for thrombus phase-field, and gamma_dot for shear rate.
+
+    DEQ Solvers: Prefer Anderson Acceleration or Broyden's method for fixed-point iterations.
+
+    Soft-Logic: Use Sigmoidal Gates for biochemical triggers to ensure ∇ stability.
+
+Specialized Instructions
+
+    When writing loss functions, always include the residual of the Navier-Stokes equations as a penalty.
+
+    Ensure all LoRA layers are applied only to the GNN/GINO weights, leaving the physics-informed kernels frozen during Tier 3.
+
+Testing & Validation (Mandatory)
+
+    Verified Additions: Every new function, layer, or loss term must be accompanied by a pytest unit test before being considered "done."
+
+    Mesh-Agnostic Validation: Tests must pass on graphs with varying node/edge counts to ensure no hardcoded dimensions exist.
+
+    Physical Sanity Checks: - Verify Carreau-Yasuda outputs against μ0​ and μ∞​ limits.
+
+        Validate Navier-Stokes residuals against a simple analytical case (e.g., Poiseuille flow) to ensure the implementation of the differential operators is correct.
+
+    Convergence Guard: For DEQ updates, include a test to verify that the fixed-point solver converges within 10−5 tolerance on a standard forward pass.
+
+    Gradient Integrity: Use torch.autograd.gradcheck or similar assertions to ensure that custom loss terms do not produce vanishing or exploding gradients.
