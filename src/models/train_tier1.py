@@ -1,18 +1,18 @@
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import Batch  # Added for validation safety
+from torch_geometric.data import Batch
 from src.models.ginodeq import rGINO_DEQ
 from src.utils.physics_kernels import PhysicsKernels
-import os
-import glob
 from pathlib import Path
 from tqdm import tqdm
 
 
 def validate_and_plot(model, val_data, epoch, device):
+    """Generates and saves a validation plot for the current epoch."""
     model.eval()
     with torch.no_grad():
         # Handle single sample validation safely by creating a Batch of size 1
@@ -23,7 +23,7 @@ def validate_and_plot(model, val_data, epoch, device):
             u_pred = pred[:val_data.num_nodes, 0].cpu().numpy()
             coords = val_data.x.cpu().numpy()
         else:
-            return  # Skip if data format is unexpected
+            return
 
     plt.figure(figsize=(10, 4))
     sc = plt.scatter(coords[:, 0], coords[:, 1], c=u_pred, cmap='jet', s=5)
@@ -39,8 +39,10 @@ def validate_and_plot(model, val_data, epoch, device):
 
 
 def load_dataset():
+    """Loads processed graph data from the project directory."""
     current_script_dir = Path(__file__).resolve().parent
     data_dir = current_script_dir.parent / "data_gen" / "data" / "processed" / "tier1_graphs"
+
     if not data_dir.exists():
         project_root = current_script_dir.parent.parent
         data_dir = project_root / "data" / "processed" / "tier1_graphs"
@@ -58,21 +60,19 @@ def load_dataset():
 
 
 def train_tier1(epochs=50, lr=1e-4):
+    """Executes the Tier 1 training loop with Hybrid Loss and Reynolds Ramp."""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"--- Starting Tier 1 Training on {device.upper()} ---")
+    print(f"--- Starting Tier 1 Hybrid Training on {device.upper()} ---")
 
-    # Keep batch size small for CPU/Memory safety
+    # Initialize Model and Kernels
     model = rGINO_DEQ(latent_dim=64, max_iters=15).to(device)
-
-    # Initialize Physics Kernel (Re will be updated dynamically)
     kernels = PhysicsKernels(reynolds=1.0)
-
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     try:
         dataset = load_dataset()
-    except FileNotFoundError as e:
-        print(e)
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
         return
 
     train_size = int(0.9 * len(dataset))
@@ -80,76 +80,56 @@ def train_tier1(epochs=50, lr=1e-4):
     loader = DataLoader(train_data, batch_size=4, shuffle=True)
     example_val = val_data[0] if len(val_data) > 0 else None
 
-    print(f"--- Dataset Loaded: {len(dataset)} samples ---")
-
-    # --- CURRICULUM SETUP ---
+    # Curriculum Setup
     target_re = 150.0
     start_re = 1.0
-    ramp_epochs = 20  # Ramp up Re over first 20 epochs
+    ramp_epochs = 20
 
     for epoch in range(epochs):
-        # 1. Update Reynolds Number (Curriculum Learning)
-        if epoch < ramp_epochs:
-            # Linear ramp: Re = start + (target - start) * (epoch / ramp_epochs)
-            current_re = start_re + (target_re - start_re) * (epoch / ramp_epochs)
-        else:
-            current_re = target_re
-
-        kernels.Re = current_re  # Update the kernel's physics constant
+        # Update Reynolds Number for the ramp
+        current_re = start_re + (target_re - start_re) * min(1.0, epoch / ramp_epochs)
+        kernels.Re = current_re
 
         model.train()
-        total_loss, total_ns, total_bc, total_io = 0, 0, 0, 0
+        total_loss, total_data = 0, 0
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={current_re:.1f}]", unit="batch")
-
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={current_re:.1f}]")
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
-
             pred = model(data)
 
-            # 1. Physics Loss (Navier-Stokes)
+            # 1. Physics Residuals
             l_ns = kernels.navier_stokes_residual(pred, data)
-
-            # 2. Wall Boundary (No-Slip)
             l_bc = kernels.boundary_condition_loss(pred, data)
-
-            # 3. Inlet/Outlet (The "Pump")
             l_io = kernels.inlet_outlet_loss(pred, data)
 
-            # Weighted Sum:
-            # High penalty for Inlet/Outlet to drive flow.
-            # Medium penalty for Walls.
-            # Low penalty for internal physics until boundaries are fixed.
-            loss = 1.0 * l_ns + 10.0 * l_bc + 20.0 * l_io
+            # 2. Hybrid Supervised Loss (The "Anchor")
+            l_data = torch.tensor(0.0, device=device)
+            if hasattr(data, 'y') and data.y is not None:
+                l_data = F.mse_loss(pred, data.y)
+                total_data += l_data.item()
+
+            # Weighted Objective combining physics and anchor data
+            loss = (1.0 * l_ns + 10.0 * l_bc + 20.0 * l_io) + (100.0 * l_data)
 
             loss.backward()
-
-            # Gradient Clipping (Essential for DEQ stability)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
 
             total_loss += loss.item()
-            total_ns += l_ns.item()
-            total_bc += l_bc.item()
-            total_io += l_io.item()
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}", "Anchor": f"{l_data.item():.4f}"})
 
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-        avg_loss = total_loss / len(loader)
-
-        # Validation Hook
+        # Periodically run validation
         if epoch % 5 == 0 and example_val:
             validate_and_plot(model, example_val, epoch, device)
-            print(
-                f"   >>> Epoch {epoch} | Re: {current_re:.1f} | NS: {total_ns / len(loader):.5f} | Pump: {total_io / len(loader):.5f}")
 
+    # Save finalized Tier 1 Backbone
     script_dir = Path(__file__).resolve().parent
     model_dir = script_dir.parent.parent / "models"
     model_dir.mkdir(exist_ok=True)
-    torch.save(model.state_dict(), model_dir / "tier1_newtonian_backbone.pth")
-    print(f"✅ Training Complete.")
+    torch.save(model.state_dict(), model_dir / "tier1_hybrid_backbone.pth")
+    print(f"✅ Training Complete. Model saved to {model_dir}")
 
 
 if __name__ == "__main__":
