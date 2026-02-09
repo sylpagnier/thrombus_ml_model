@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import meshio
 import matplotlib.pyplot as plt
+from pathlib import Path  # Added for robust path handling
 from scipy.spatial import KDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
@@ -14,9 +15,12 @@ class MeshToGraphConverter:
         Processes GMSH files into Dynamic Non-Dimensionalized PyG Graphs.
         Scaling: Mean Diameter (D_bar) per unique geometry.
         """
-        self.raw_dir = raw_dir
-        self.proc_dir = proc_dir
-        os.makedirs(self.proc_dir, exist_ok=True)
+        # Find the path to this script file and create the directory
+        current_script_path = Path(__file__).resolve()
+        project_root = current_script_path.parent.parent.parent
+        self.raw_dir = project_root / raw_dir
+        self.proc_dir = project_root / proc_dir
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
 
     def _calculate_dynamic_dbar(self, nodes, sdf):
         """Calculates mean diameter (D_bar) for per-sample non-dimensionalization."""
@@ -32,7 +36,11 @@ class MeshToGraphConverter:
     def _generate_unified_grid(self, sanity_data):
         """Generates a single figure containing all sanity check samples."""
         n = len(sanity_data)
+        if n == 0: return  # Handle case with 0 samples
+
         fig, axes = plt.subplots(n, 2, figsize=(15, 3 * n))
+        if n == 1: axes = np.expand_dims(axes, 0)  # Handle single sample case
+
         fig.suptitle("Unified Sanity Check: ND-SDF & Capped Shear Potential", fontsize=16)
 
         for i, (data, filename, d_bar) in enumerate(sanity_data):
@@ -59,8 +67,8 @@ class MeshToGraphConverter:
         plt.show()
 
     def process_file(self, filename):
-        msh_path = os.path.join(self.raw_dir, filename)
-        pt_path = os.path.join(self.proc_dir, filename.replace(".msh", ".pt"))
+        msh_path = self.raw_dir / filename
+        pt_path = self.proc_dir / filename.replace(".msh", ".pt")
 
         mesh = meshio.read(msh_path)
         nodes = mesh.points[:, :2]
@@ -93,10 +101,16 @@ class MeshToGraphConverter:
         return data, d_bar
 
     def run(self, n_sanity=5):
+        if not self.raw_dir.exists():
+            print(f"Error: Raw directory not found at {self.raw_dir}")
+            return
+
         files = [f for f in os.listdir(self.raw_dir) if f.endswith(".msh")]
         sanity_samples = []
 
         print(f"Starting conversion of {len(files)} files...")
+        print(f"Reading from: {self.raw_dir}")
+        print(f"Saving to:   {self.proc_dir}")
 
         # Process and collect sanity samples first
         for i in range(min(n_sanity, len(files))):

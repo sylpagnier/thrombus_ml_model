@@ -4,15 +4,20 @@ import numpy as np
 import gmsh
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
-
+from pathlib import Path
 
 class VesselGenerator:
     def __init__(self, output_dir="data/raw/synthetic_v1"):
-        self.output_dir = output_dir
+        # Find the path to this script file and create the directory
+        current_script_path = Path(__file__).resolve()
+        project_root = current_script_path.parent.parent.parent
+        self.output_dir = project_root / output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # Initialize GMSH
         gmsh.initialize()
         gmsh.option.setNumber("General.Terminal", 0)
-        gmsh.option.setNumber("Mesh.Algorithm", 6)  # Frontal-Delaunay
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
         gmsh.option.setNumber("Mesh.Smoothing", 5)
         gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 1)
 
