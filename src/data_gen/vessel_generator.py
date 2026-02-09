@@ -6,27 +6,29 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 from pathlib import Path
 
+
 class VesselGenerator:
     def __init__(self, output_dir="data/raw/synthetic_v1"):
-        # Find the path to this script file and create the directory
         current_script_path = Path(__file__).resolve()
         project_root = current_script_path.parent.parent.parent
         self.output_dir = project_root / output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Initialize GMSH
         gmsh.initialize()
         gmsh.option.setNumber("General.Terminal", 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
         gmsh.option.setNumber("Mesh.Smoothing", 5)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 1)
+        gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+        gmsh.option.setNumber("Mesh.Binary", 0)
+        gmsh.option.setNumber("Mesh.SaveAll", 0)  # Only save physical groups
+        gmsh.option.setNumber("Mesh.SaveGroupsOfNodes", 1)
 
     def _get_mesh_data(self):
         node_tags, coords, _ = gmsh.model.mesh.getNodes()
         nodes = coords.reshape(-1, 3)[:, :2]
         node_dict = {tag: i for i, tag in enumerate(node_tags)}
         element_types, _, node_connectivity = gmsh.model.mesh.getElements(2)
-        if not element_types: return None, None
+        if not element_types or len(node_connectivity) == 0: return None, None
         tri_nodes = node_connectivity[0].reshape(-1, 3)
         triangles = np.array([[node_dict[tag] for tag in tri] for tri in tri_nodes])
         return nodes, triangles
@@ -37,16 +39,19 @@ class VesselGenerator:
         verts = nodes[triangles]
         poly = PolyCollection(verts, edgecolors='black', facecolors='lightblue', linewidths=0.05)
         ax.add_collection(poly)
-        ax.set_xlim(-2, 18)
-        ax.set_ylim(-6, 6)
+        # Scaled limits for Meters (0.015m length)
+        ax.set_xlim(-0.002, 0.020)
+        ax.set_ylim(-0.006, 0.006)
         ax.set_aspect('equal')
-        ax.set_title(f"Smooth Sample {idx}")
+        ax.set_title(f"Sample {idx} (Meters)")
 
     def generate_smooth_pathology(self, idx, v_type, lc):
-        L, W = 15.0, random.uniform(1.2, 1.8)
+        # Scale: L=15mm, W=~1.5mm in Meters
+        L, W = 0.015, random.uniform(0.0012, 0.0018)
         bottom_pts = []
         for x in np.linspace(0, L, 6):
-            pt = gmsh.model.geo.addPoint(x, -W / 2 + random.uniform(-0.05, 0.05), 0, lc)
+            # Random jitter scaled to meters (0.05mm)
+            pt = gmsh.model.geo.addPoint(x, -W / 2 + random.uniform(-0.00005, 0.00005), 0, lc)
             bottom_pts.append(pt)
         s_bottom = gmsh.model.geo.addBSpline(bottom_pts)
 
@@ -55,8 +60,9 @@ class VesselGenerator:
         p_inlet_top = gmsh.model.geo.addPoint(0, W / 2, 0, lc)
 
         if v_type != 'straight':
-            offset = (
-                W * random.uniform(0.6, 0.8) * -1 if v_type in ['stenosis', 'occlusion'] else random.uniform(0.5, 1.5))
+            # Offset scaled to meters
+            offset = (W * random.uniform(0.6, 0.8) * -1 if v_type in ['stenosis', 'occlusion']
+                      else random.uniform(0.0005, 0.0015))
             p_t1 = gmsh.model.geo.addPoint(L * 0.8, W / 2, 0, lc)
             p_peak = gmsh.model.geo.addPoint(L * 0.5, W / 2 + offset, 0, lc)
             p_t2 = gmsh.model.geo.addPoint(L * 0.2, W / 2, 0, lc)
@@ -68,11 +74,10 @@ class VesselGenerator:
         return [s_bottom, l_outlet, s_top, l_inlet]
 
     def generate_bifurcation(self, idx, lc):
-        W, angle = random.uniform(1.4, 1.8), np.deg2rad(random.uniform(20, 40))
-        L1, L2 = 6.0, 9.0
-
-        # Geometry constants for the "fillet" (smoothed crotch)
-        fillet_radius = 0.4
+        # Scale units to meters (W ~ 1.5mm, L ~ 6mm)
+        W, angle = random.uniform(0.0014, 0.0018), np.deg2rad(random.uniform(20, 40))
+        L1, L2 = 0.006, 0.009
+        fillet_radius = 0.0004
 
         p_in_b = gmsh.model.geo.addPoint(0, -W / 2, 0, lc)
         p_in_t = gmsh.model.geo.addPoint(0, W / 2, 0, lc)
@@ -85,21 +90,15 @@ class VesselGenerator:
         p_o2_b = gmsh.model.geo.addPoint(o2_b_x, o2_b_y, 0, lc)
         p_o2_t = gmsh.model.geo.addPoint(o2_b_x + W * np.sin(angle), o2_b_y + W * np.cos(angle), 0, lc)
 
-        # Smoothed Apex Logic:
-        # Create control points for a B-Spline curve at the fork
         p_f_center = gmsh.model.geo.addPoint(L1 + fillet_radius, 0, 0, lc)
         p_f_upper = gmsh.model.geo.addPoint(L1 + fillet_radius * 2, W * 0.2, 0, lc)
         p_f_lower = gmsh.model.geo.addPoint(L1 + fillet_radius * 2, -W * 0.2, 0, lc)
 
         l_in = gmsh.model.geo.addLine(p_in_t, p_in_b)
-
         mid_bot = gmsh.model.geo.addPoint(L1 * 0.6, -W / 2, 0, lc)
         l_wb = gmsh.model.geo.addBSpline([p_in_b, mid_bot, p_o2_b])
         l_o2 = gmsh.model.geo.addLine(p_o2_b, p_o2_t)
-
-        # Fork is now a single B-Spline arc
         l_fork_smooth = gmsh.model.geo.addBSpline([p_o2_t, p_f_lower, p_f_center, p_f_upper, p_o1_b])
-
         l_o1 = gmsh.model.geo.addLine(p_o1_b, p_o1_t)
         mid_top = gmsh.model.geo.addPoint(L1 * 0.6, W / 2, 0, lc)
         l_wt = gmsh.model.geo.addBSpline([p_o1_t, mid_top, p_in_t])
@@ -107,44 +106,79 @@ class VesselGenerator:
         curves = [l_in, l_wb, l_o2, l_fork_smooth, l_o1, l_wt]
         groups = {
             "Inlet": [l_in],
-            "Outlet": [l_o1, l_o2],
+            "Outlet_1": [l_o1],
+            "Outlet_2": [l_o2],
             "Walls": [l_wb, l_fork_smooth, l_wt]
         }
         return curves, groups
 
     def generate(self, idx, show_viz=False, ax=None):
         gmsh.model.add(f"vessel_{idx}")
-        lc = 0.18
+        lc = 0.0002
         v_type = random.choice(['straight', 'stenosis', 'aneurysm', 'occlusion', 'bifurcation'])
+
         if v_type == 'bifurcation':
             curves, groups = self.generate_bifurcation(idx, lc)
         else:
             curves = self.generate_smooth_pathology(idx, v_type, lc)
-            groups = {"Inlet": [curves[3]], "Outlet": [curves[1]], "Walls": [curves[0], curves[2]]}
+            groups = {
+                "Inlet": [curves[3]],
+                "Outlet_1": [curves[1]],
+                "Outlet_2": [],
+                "Walls": [curves[0], curves[2]]
+            }
 
         cl = gmsh.model.geo.addCurveLoop(curves)
         s = gmsh.model.geo.addPlaneSurface([cl])
         gmsh.model.geo.synchronize()
-        for name, tags in groups.items():
-            gmsh.model.addPhysicalGroup(1, tags, name=name)
-        gmsh.model.addPhysicalGroup(2, [s], name="Fluid_Domain")
+
+        # Physical groups are still useful for partitioning fluid vs walls in Gmsh
+        gmsh.model.addPhysicalGroup(1, groups["Inlet"], 101, name="Inlet")
+        gmsh.model.addPhysicalGroup(1, groups["Outlet_1"], 102, name="Outlet_1")
+        if groups["Outlet_2"]:
+            gmsh.model.addPhysicalGroup(1, groups["Outlet_2"], 103, name="Outlet_2")
+            gmsh.model.addPhysicalGroup(1, groups["Walls"], 104, name="Walls")
+        else:
+            gmsh.model.addPhysicalGroup(1, groups["Walls"], 103, name="Walls")
+
+        gmsh.model.addPhysicalGroup(2, [s], 201, name="Fluid_Domain")
+
+        # Generate Mesh
         gmsh.model.mesh.generate(2)
-        if show_viz and ax: self.visualize_sample(idx, ax)
-        gmsh.write(f"{self.output_dir}/vessel_{idx}.msh")
+
+        # Visualize if requested
+        if show_viz and ax:
+            self.visualize_sample(idx, ax)
+
+        # --- EXPORT SECTION ---
+        # 1. Export Gmsh format (.msh) for the mesh_to_graph.py script
+        # Ensure only physical groups are saved to keep the graph clean
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
+        gmsh.write(str(self.output_dir / f"vessel_{idx}.msh"))
+
+        # 2. Export Nastran format (.nas) for COMSOL
+        gmsh.write(str(self.output_dir / f"vessel_{idx}.nas"))
+
+        # Clear the model for the next iteration to prevent memory bloat
         gmsh.model.remove()
 
     def run_pipeline(self, n=5000):
-        fig, axes = plt.subplots(3, 3, figsize=(18, 10))
+        # Visualize first 9 samples
+        fig, axes = plt.subplots(3, 3, figsize=(15, 8))
         axes = axes.flatten()
-        for i in range(9): self.generate(i, show_viz=True, ax=axes[i])
+        for i in range(9):
+            self.generate(i, show_viz=True, ax=axes[i])
         plt.tight_layout()
         plt.show()
+
+        # Run remainder
         for i in range(9, n):
             self.generate(i)
-            if i % 250 == 0: print(f"Progress: {i}/{n} complete.")
+            if i % 100 == 0: print(f"Progress: {i}/{n} complete.")
 
 
 if __name__ == "__main__":
     gen = VesselGenerator()
+    # Starting with a smaller batch to verify units
     gen.run_pipeline(n=500)
     gmsh.finalize()
