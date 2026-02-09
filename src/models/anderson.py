@@ -1,8 +1,10 @@
 import torch
 
-
-def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=25, tol=1e-3):
-    """Anderson Acceleration for finding fixed point z = f(z)."""
+def anderson_acceleration(f, z0, m=5, lam=0.1, max_iter=25, tol=1e-3):
+    """
+    Anderson Acceleration for finding fixed point z = f(z).
+    Stability Patch: Increased lam to 0.1 to stabilize high-Re transitions.
+    """
     if len(z0.shape) == 2:  # Add batch dim if missing
         z0 = z0.unsqueeze(0)
 
@@ -23,7 +25,7 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=25, tol=1e-3):
         if torch.norm(res) < tol:
             break
 
-        # Simple mixing for Tier 1 stability
+        # Mixing for Tier 1 stability
         z = (1 - lam) * F[:, k % m].reshape(bsz, n, d) + lam * X[:, k % m].reshape(bsz, n, d)
 
     return z.squeeze(0)

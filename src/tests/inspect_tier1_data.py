@@ -87,4 +87,4 @@ def inspect_sample(filename="vessel_0.pt"):
 if __name__ == "__main__":
     # Change this index to check different samples (e.g., vessel_0.pt)
     # Try finding a bifurcation index if you generated 5000 samples
-    inspect_sample("vessel_0.pt")
+    inspect_sample("vessel_18.pt")
