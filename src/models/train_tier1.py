@@ -1,7 +1,9 @@
 import torch
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import numpy as np
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch  # Added for validation safety
 from src.models.ginodeq import rGINO_DEQ
 from src.utils.physics_kernels import PhysicsKernels
 import os
@@ -13,13 +15,15 @@ from tqdm import tqdm
 def validate_and_plot(model, val_data, epoch, device):
     model.eval()
     with torch.no_grad():
+        # Handle single sample validation safely by creating a Batch of size 1
         if val_data.x.dim() == 2:
-            data_on_device = val_data.to(device)
+            data_on_device = Batch.from_data_list([val_data]).to(device)
             pred = model(data_on_device)
-            u_pred = pred[:, 0].cpu().numpy()
+            # Extract first sample from batch
+            u_pred = pred[:val_data.num_nodes, 0].cpu().numpy()
             coords = val_data.x.cpu().numpy()
         else:
-            pass
+            return  # Skip if data format is unexpected
 
     plt.figure(figsize=(10, 4))
     sc = plt.scatter(coords[:, 0], coords[:, 1], c=u_pred, cmap='jet', s=5)
@@ -57,15 +61,18 @@ def train_tier1(epochs=50, lr=1e-4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"--- Starting Tier 1 Training on {device.upper()} ---")
 
-    # Keep batch size small for CPU safety
-    model = rGINO_DEQ(latent_dim=64, max_iters=10).to(device)
-    kernels = PhysicsKernels(reynolds=150.0)
+    # Keep batch size small for CPU/Memory safety
+    model = rGINO_DEQ(latent_dim=64, max_iters=15).to(device)
+
+    # Initialize Physics Kernel (Re will be updated dynamically)
+    kernels = PhysicsKernels(reynolds=1.0)
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     try:
         dataset = load_dataset()
     except FileNotFoundError as e:
-        print(e);
+        print(e)
         return
 
     train_size = int(0.9 * len(dataset))
@@ -75,11 +82,25 @@ def train_tier1(epochs=50, lr=1e-4):
 
     print(f"--- Dataset Loaded: {len(dataset)} samples ---")
 
+    # --- CURRICULUM SETUP ---
+    target_re = 150.0
+    start_re = 1.0
+    ramp_epochs = 20  # Ramp up Re over first 20 epochs
+
     for epoch in range(epochs):
+        # 1. Update Reynolds Number (Curriculum Learning)
+        if epoch < ramp_epochs:
+            # Linear ramp: Re = start + (target - start) * (epoch / ramp_epochs)
+            current_re = start_re + (target_re - start_re) * (epoch / ramp_epochs)
+        else:
+            current_re = target_re
+
+        kernels.Re = current_re  # Update the kernel's physics constant
+
         model.train()
         total_loss, total_ns, total_bc, total_io = 0, 0, 0, 0
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d}", unit="batch")
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={current_re:.1f}]", unit="batch")
 
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
@@ -87,22 +108,26 @@ def train_tier1(epochs=50, lr=1e-4):
 
             pred = model(data)
 
-            # 1. Physics Loss
+            # 1. Physics Loss (Navier-Stokes)
             l_ns = kernels.navier_stokes_residual(pred, data)
 
             # 2. Wall Boundary (No-Slip)
             l_bc = kernels.boundary_condition_loss(pred, data)
 
-            # 3. Inlet/Outlet (The "Pump") - CRITICAL ADDITION
+            # 3. Inlet/Outlet (The "Pump")
             l_io = kernels.inlet_outlet_loss(pred, data)
 
             # Weighted Sum:
-            # High penalty for Inlet/Outlet (20.0) to drive flow.
-            # Medium penalty for Walls (10.0).
-            # Low penalty for internal physics (1.0) until boundaries are fixed.
+            # High penalty for Inlet/Outlet to drive flow.
+            # Medium penalty for Walls.
+            # Low penalty for internal physics until boundaries are fixed.
             loss = 1.0 * l_ns + 10.0 * l_bc + 20.0 * l_io
 
             loss.backward()
+
+            # Gradient Clipping (Essential for DEQ stability)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_loss += loss.item()
@@ -117,7 +142,8 @@ def train_tier1(epochs=50, lr=1e-4):
         # Validation Hook
         if epoch % 5 == 0 and example_val:
             validate_and_plot(model, example_val, epoch, device)
-            print(f"   >>> Epoch {epoch} | NS: {total_ns / len(loader):.5f} | Pump: {total_io / len(loader):.5f}")
+            print(
+                f"   >>> Epoch {epoch} | Re: {current_re:.1f} | NS: {total_ns / len(loader):.5f} | Pump: {total_io / len(loader):.5f}")
 
     script_dir = Path(__file__).resolve().parent
     model_dir = script_dir.parent.parent / "models"
