@@ -50,7 +50,11 @@ def load_dataset():
 def train_tier1(epochs=50, lr=1e-4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = rGINO_DEQ(latent_dim=64, max_iters=15).to(device)
-    kernels = PhysicsKernels(reynolds=1.0)
+
+    # Initialize directly with Target Reynolds
+    target_re = 150.0
+    kernels = PhysicsKernels(reynolds=target_re)
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     dataset = load_dataset()
@@ -58,15 +62,12 @@ def train_tier1(epochs=50, lr=1e-4):
     train_data, val_data = dataset[:train_size], dataset[train_size:]
     loader = DataLoader(train_data, batch_size=4, shuffle=True)
 
-    # Stability Patch: Smoother Reynolds Ramp
-    target_re, start_re, ramp_epochs = 150.0, 1.0, 30
-
     for epoch in range(epochs):
-        current_re = start_re + (target_re - start_re) * min(1.0, epoch / ramp_epochs)
-        kernels.Re = current_re
+        # Reynolds Ramp logic removed; using target_re immediately
+        kernels.Re = target_re
         model.train()
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={current_re:.1f}]")
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re:.1f}]")
         for data in pbar:
             data = data.to(device)
             optimizer.zero_grad()
@@ -80,7 +81,7 @@ def train_tier1(epochs=50, lr=1e-4):
             if hasattr(data, 'y') and data.y is not None:
                 l_data = F.mse_loss(pred, data.y)
 
-            # Stability Patch: Higher Anchor Weight (500.0)
+            # Maintaining Stability Patch weights
             loss = (1.0 * l_ns + 10.0 * l_bc + 20.0 * l_io) + (500.0 * l_data)
 
             loss.backward()

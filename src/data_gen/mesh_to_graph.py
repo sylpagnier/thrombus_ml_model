@@ -99,7 +99,7 @@ class MeshToGraphConverter:
         ]), axis=1), axis=0)
         edge_index = torch.tensor(np.hstack([edges.T, edges[:, [1, 0]].T]), dtype=torch.long)
 
-        # 3. Hybrid Labels (WITH SPATIAL MAPPING FIX)
+        # 3. Hybrid Labels (WITH UNIT FIX)
         y_labels = None
         if label_path.exists():
             cfd = np.load(label_path)
@@ -115,7 +115,6 @@ class MeshToGraphConverter:
             sol_tree = cKDTree(sol_points)
 
             # Query the nearest COMSOL point for every Mesh Node
-            # k=1 returns distances (d) and indices (idx)
             d, idx = sol_tree.query(nodes)
 
             # Map values
@@ -123,15 +122,37 @@ class MeshToGraphConverter:
             mapped_v = c_v[idx]
             mapped_p = c_p[idx]
 
-            # Outlet Pressure Pinning
+            # --- UNIT CORRECTION START ---
+            # Constants (Blood Density matching your simulation)
+            RHO = 1060.0
+
+            # 1. Calculate Characteristic Velocity (U_ref)
+            # We use the 99th percentile of velocity magnitude to be robust against outliers
+            vel_mag = np.sqrt(mapped_u**2 + mapped_v**2)
+            u_ref = np.percentile(vel_mag, 99)
+            if u_ref < 1e-6: u_ref = 1.0  # Safety for stagnant flow/walls
+
+            # 2. Outlet Pressure Pinning
             outlet_indices = mask_outlet.nonzero(as_tuple=True)[0].numpy()
             p_ref = mapped_p[outlet_indices].mean() if len(outlet_indices) > 0 else 0.0
 
-            u_nd = torch.tensor(mapped_u, dtype=torch.float32).reshape(-1, 1)
-            v_nd = torch.tensor(mapped_v, dtype=torch.float32).reshape(-1, 1)
-            p_nd = torch.tensor((mapped_p - p_ref), dtype=torch.float32).reshape(-1, 1)
+            # 3. Non-Dimensionalization
+            # Velocity: u* = u / U_ref
+            u_nd_val = mapped_u / u_ref
+            v_nd_val = mapped_v / u_ref
 
-            y_labels = torch.cat([u_nd, v_nd, p_nd], dim=1)
+            # Pressure: p* = (p - p_ref) / (rho * U_ref^2)
+            # This scales Pascal pressure to the dimensionless Coefficient of Pressure (Cp)
+            # consistent with the Convective Term (u* . grad u*) ~ 1.0
+            dynamic_pressure = RHO * (u_ref**2)
+            p_nd_val = (mapped_p - p_ref) / dynamic_pressure
+            # --- UNIT CORRECTION END ---
+
+            u_tensor = torch.tensor(u_nd_val, dtype=torch.float32).reshape(-1, 1)
+            v_tensor = torch.tensor(v_nd_val, dtype=torch.float32).reshape(-1, 1)
+            p_tensor = torch.tensor(p_nd_val, dtype=torch.float32).reshape(-1, 1)
+
+            y_labels = torch.cat([u_tensor, v_tensor, p_tensor], dim=1)
 
         data = Data(
             x=torch.tensor(nodes_nd, dtype=torch.float32),
