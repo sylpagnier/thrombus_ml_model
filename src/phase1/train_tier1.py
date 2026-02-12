@@ -119,7 +119,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=20):
 
         pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
 
-        for data in pbar:
+        for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
 
