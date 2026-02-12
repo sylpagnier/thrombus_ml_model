@@ -85,7 +85,10 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0)
         # 4. Update History
         # Rolling buffer update
         slot = k % m
-        X[:, slot] = z_next
-        F[:, slot] = f(z_next.view(bsz, n, d)).view(bsz, -1)
+        new_f = f(z_next.view(bsz, n, d)).view(bsz, -1)
+
+        # Reconstruct the buffers using concatenation to avoid in-place mutation
+        X = torch.cat([X[:, :slot], z_next.unsqueeze(1), X[:, slot + 1:]], dim=1)
+        F = torch.cat([F[:, :slot], new_f.unsqueeze(1), F[:, slot + 1:]], dim=1)
 
     return F[:, slot].view(bsz, n, d).squeeze(0)

@@ -14,15 +14,27 @@ import random
 
 
 class StratifiedAnchorSampler(Sampler):
-    """
-    Ensures every batch contains at least 50% Anchor samples (data with .y labels).
-    """
-
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        # Identify indices for anchors (supervised) and physics (unlabeled)
-        self.anchor_indices = [i for i, d in enumerate(dataset) if hasattr(d, 'y') and d.y is not None]
-        self.physics_indices = [i for i, d in enumerate(dataset) if i not in self.anchor_indices]
+
+        # FIX: Check the actual boolean flag stored in the Data object
+        self.anchor_indices = []
+        self.physics_indices = []
+
+        for i, d in enumerate(dataset):
+            # is_anchor is a tensor([True]) or tensor([False])
+            if hasattr(d, 'is_anchor') and d.is_anchor.item() is True:
+                self.anchor_indices.append(i)
+            else:
+                self.physics_indices.append(i)
+
+        # Safety Check
+        if not self.anchor_indices or not self.physics_indices:
+            raise ValueError(
+                f"Dataset split failed. Anchors: {len(self.anchor_indices)}, "
+                f"Physics: {len(self.physics_indices)}. Ensure you have some "
+                "unlabeled graphs in your data folder."
+            )
 
         self.num_batches = len(dataset) // batch_size
         self.num_anchors_per_batch = batch_size // 2
