@@ -8,29 +8,23 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 
 
-class MeshToGraphConverter:
-    def __init__(self, raw_dir="data/raw/synthetic_v1", proc_dir="data/processed/tier1_graphs"):
+class MeshToGraphComplete:
+    def __init__(self, raw_dir="data/raw/synthetic_v1", label_dir="data/raw/cfd_anchors",
+                 proc_dir="data/processed/tier1_graphs"):
         current_script_path = Path(__file__).resolve()
         project_root = current_script_path.parent.parent.parent
         self.raw_dir = project_root / raw_dir
+        self.label_dir = project_root / label_dir
         self.proc_dir = project_root / proc_dir
-        self.label_dir = project_root / "data" / "raw" / "cfd_anchors"
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
     def _calculate_dynamic_dbar(self, nodes, sdf):
-        x_min, x_max = nodes[:, 0].min(), nodes[:, 0].max()
-        length = x_max - x_min
-        if length < 1e-9: return 1.0
-
-        samples = np.linspace(x_min + 0.10 * length, x_max - 0.10 * length, 20)
-        slice_tol = 0.01 * length
-
-        radii = []
-        for s in samples:
-            mask = np.abs(nodes[:, 0] - s) < slice_tol
-            if mask.any():
-                radii.append(sdf[mask].max())
-        return 2.0 * np.mean(radii) if radii else (nodes[:, 1].max() - nodes[:, 1].min())
+        """Calculates characteristic length based on geometry thickness."""
+        local_max_radius = np.percentile(sdf, 95)
+        d_bar = 2.0 * local_max_radius
+        if d_bar < 1e-7:
+            return nodes[:, 1].max() - nodes[:, 1].min()
+        return d_bar
 
     def _get_boundary_masks(self, mesh, num_nodes):
         mask_inlet = torch.zeros(num_nodes, dtype=torch.bool)
@@ -66,19 +60,22 @@ class MeshToGraphConverter:
         stem = Path(filename).stem
         label_path = self.label_dir / f"{stem}.npz"
 
+        # 1. Load Mesh
         try:
             mesh = meshio.read(msh_path)
-        except Exception:
+        except Exception as e:
+            print(f"Failed to read mesh {filename}: {e}")
             return
 
         nodes = mesh.points[:, :2]
         num_nodes = len(nodes)
 
-        # 1. Masks & SDF
+        # 2. Geometry Processing (Masks & SDF)
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, num_nodes)
 
         wall_pts = nodes[mask_wall.numpy()]
-        if len(wall_pts) == 0: wall_pts = nodes[nodes[:, 1].abs() > 0.001]
+        if len(wall_pts) == 0:
+            wall_pts = nodes[nodes[:, 1].abs() > 0.001]
 
         tree = KDTree(wall_pts)
         dist, _ = tree.query(nodes)
@@ -91,75 +88,76 @@ class MeshToGraphConverter:
         sdf_nd = sdf_dim / d_bar_safe
         shear_pot_nd = torch.clamp(1.0 / (torch.tensor(sdf_nd) + 0.05), max=10.0)
 
-        # 2. Connectivity
-        if "triangle" not in mesh.cells_dict: return
+        # 3. Connectivity
+        if "triangle" not in mesh.cells_dict:
+            return
         tri_nodes = mesh.cells_dict["triangle"]
         edges = np.unique(np.sort(np.vstack([
             tri_nodes[:, [0, 1]], tri_nodes[:, [1, 2]], tri_nodes[:, [2, 0]]
         ]), axis=1), axis=0)
         edge_index = torch.tensor(np.hstack([edges.T, edges[:, [1, 0]].T]), dtype=torch.long)
 
-        # 3. Hybrid Labels (WITH UNIT FIX)
+        # 4. Label Injection (Integrated)
         y_labels = None
         if label_path.exists():
-            cfd = np.load(label_path)
+            try:
+                cfd = np.load(label_path)
 
-            # Retrieve COMSOL coordinates and values
-            c_x, c_y = cfd['x'], cfd['y']
-            c_u, c_v, c_p = cfd['u'], cfd['v'], cfd['p']
+                # --- ROBUST LOADING START ---
+                # Use .flatten() to ensure we have simple 1D arrays of length 1690
+                c_x = cfd['x'].flatten()
+                c_y = cfd['y'].flatten()
+                c_u = cfd['u'].flatten()
+                c_v = cfd['v'].flatten()
+                c_p = cfd['p'].flatten()
 
-            # Stack COMSOL points: [N_sol, 2]
-            sol_points = np.column_stack((c_x, c_y))
+                # Use np.stack with axis=-1 to guarantee shape (1690, 2)
+                sol_points = np.stack([c_x, c_y], axis=-1)
+                # --- ROBUST LOADING END ---
 
-            # Build Tree for fast lookup
-            sol_tree = cKDTree(sol_points)
+                # Build Tree for fast lookup (Now correctly 2D)
+                sol_tree = cKDTree(sol_points)
 
-            # Query the nearest COMSOL point for every Mesh Node
-            d, idx = sol_tree.query(nodes)
+                # Query the nearest COMSOL point for every Mesh Node
+                # nodes (686, 2) matched against sol_points (1690, 2)
+                d, idx = sol_tree.query(nodes)
 
-            # Map values
-            mapped_u = c_u[idx]
-            mapped_v = c_v[idx]
-            mapped_p = c_p[idx]
+                # Map values (using the flat arrays)
+                mapped_u = c_u[idx]
+                mapped_v = c_v[idx]
+                mapped_p = c_p[idx]
 
-            # --- UNIT CORRECTION START ---
-            # Constants (Blood Density matching your simulation)
-            RHO = 1060.0
+                # --- UNIT CORRECTION ---
+                RHO = 1060.0
+                vel_mag = np.sqrt(mapped_u ** 2 + mapped_v ** 2)
+                u_ref = np.percentile(vel_mag, 99)
+                if u_ref < 1e-6: u_ref = 1.0
 
-            # 1. Calculate Characteristic Velocity (U_ref)
-            # We use the 99th percentile of velocity magnitude to be robust against outliers
-            vel_mag = np.sqrt(mapped_u**2 + mapped_v**2)
-            u_ref = np.percentile(vel_mag, 99)
-            if u_ref < 1e-6: u_ref = 1.0  # Safety for stagnant flow/walls
+                outlet_indices = mask_outlet.nonzero(as_tuple=True)[0].numpy()
+                p_ref = mapped_p[outlet_indices].mean() if len(outlet_indices) > 0 else 0.0
 
-            # 2. Outlet Pressure Pinning
-            outlet_indices = mask_outlet.nonzero(as_tuple=True)[0].numpy()
-            p_ref = mapped_p[outlet_indices].mean() if len(outlet_indices) > 0 else 0.0
+                u_nd_val = mapped_u / u_ref
+                v_nd_val = mapped_v / u_ref
+                dynamic_pressure = RHO * (u_ref ** 2)
+                p_nd_val = (mapped_p - p_ref) / dynamic_pressure
 
-            # 3. Non-Dimensionalization
-            # Velocity: u* = u / U_ref
-            u_nd_val = mapped_u / u_ref
-            v_nd_val = mapped_v / u_ref
+                u_tensor = torch.tensor(u_nd_val, dtype=torch.float32).reshape(-1, 1)
+                v_tensor = torch.tensor(v_nd_val, dtype=torch.float32).reshape(-1, 1)
+                p_tensor = torch.tensor(p_nd_val, dtype=torch.float32).reshape(-1, 1)
 
-            # Pressure: p* = (p - p_ref) / (rho * U_ref^2)
-            # This scales Pascal pressure to the dimensionless Coefficient of Pressure (Cp)
-            # consistent with the Convective Term (u* . grad u*) ~ 1.0
-            dynamic_pressure = RHO * (u_ref**2)
-            p_nd_val = (mapped_p - p_ref) / dynamic_pressure
-            # --- UNIT CORRECTION END ---
+                y_labels = torch.cat([u_tensor, v_tensor, p_tensor], dim=1)
+            except Exception as e:
+                print(f"Error reading labels for {stem}: {e}")
+        else:
+            print(f"Warning: No labels found for {stem}. Saving graph without y.")
 
-            u_tensor = torch.tensor(u_nd_val, dtype=torch.float32).reshape(-1, 1)
-            v_tensor = torch.tensor(v_nd_val, dtype=torch.float32).reshape(-1, 1)
-            p_tensor = torch.tensor(p_nd_val, dtype=torch.float32).reshape(-1, 1)
-
-            y_labels = torch.cat([u_tensor, v_tensor, p_tensor], dim=1)
-
+        # 5. Save Final Data
         data = Data(
             x=torch.tensor(nodes_nd, dtype=torch.float32),
             edge_index=edge_index,
             sdf=torch.tensor(sdf_nd, dtype=torch.float32),
             shear_pot=shear_pot_nd,
-            d_bar=torch.tensor([d_bar_safe]),
+            d_bar=torch.tensor([d_bar_safe], dtype=torch.float32),
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
@@ -169,11 +167,10 @@ class MeshToGraphConverter:
 
     def run(self):
         files = sorted([f for f in os.listdir(self.raw_dir) if f.endswith(".msh")])
-        print(f"Converting {len(files)} meshes...")
+        print(f"Processing {len(files)} meshes (Geometry + Labels)...")
         for f in tqdm(files):
             self.process_file(f)
 
 
 if __name__ == "__main__":
-    converter = MeshToGraphConverter()
-    converter.run()
+    MeshToGraphComplete().run()
