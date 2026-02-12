@@ -84,6 +84,16 @@ class MeshToGraphComplete:
         d_bar = self._calculate_dynamic_dbar(nodes, sdf_dim)
         d_bar_safe = d_bar if d_bar > 1e-9 else 1.0
 
+        # --- MANDATORY PHYSICS SCALING ---
+        # These constants must match your Phase 1 template exactly
+        RHO = 1050.0
+        MU_phase1 = 0.0035
+        RE_TARGET = 150.0
+
+        # Calculate u_ref for EVERY sample (not just anchors)
+        u_ref = (RE_TARGET * MU_phase1) / (RHO * d_bar_safe)
+        u_ref_safe = u_ref if u_ref > 1e-6 else 1.0
+
         nodes_nd = nodes / d_bar_safe
         sdf_nd = sdf_dim / d_bar_safe
         shear_pot_nd = torch.clamp(1.0 / (torch.tensor(sdf_nd) + 0.05), max=10.0)
@@ -102,62 +112,44 @@ class MeshToGraphComplete:
         if label_path.exists():
             try:
                 cfd = np.load(label_path)
+                c_x, c_y = cfd['x'].flatten(), cfd['y'].flatten()
+                c_u, c_v, c_p = cfd['u'].flatten(), cfd['v'].flatten(), cfd['p'].flatten()
 
-                # --- ROBUST LOADING START ---
-                # Use .flatten() to ensure we have simple 1D arrays of length 1690
-                c_x = cfd['x'].flatten()
-                c_y = cfd['y'].flatten()
-                c_u = cfd['u'].flatten()
-                c_v = cfd['v'].flatten()
-                c_p = cfd['p'].flatten()
-
-                # Use np.stack with axis=-1 to guarantee shape (1690, 2)
                 sol_points = np.stack([c_x, c_y], axis=-1)
-                # --- ROBUST LOADING END ---
-
-                # Build Tree for fast lookup (Now correctly 2D)
                 sol_tree = cKDTree(sol_points)
+                _, idx = sol_tree.query(nodes)
 
-                # Query the nearest COMSOL point for every Mesh Node
-                # nodes (686, 2) matched against sol_points (1690, 2)
-                d, idx = sol_tree.query(nodes)
-
-                # Map values (using the flat arrays)
-                mapped_u = c_u[idx]
-                mapped_v = c_v[idx]
-                mapped_p = c_p[idx]
-
-                # --- UNIT CORRECTION ---
-                RHO = 1060.0
-                vel_mag = np.sqrt(mapped_u ** 2 + mapped_v ** 2)
-                u_ref = np.percentile(vel_mag, 99)
-                if u_ref < 1e-6: u_ref = 1.0
+                mapped_u, mapped_v, mapped_p = c_u[idx], c_v[idx], c_p[idx]
 
                 outlet_indices = mask_outlet.nonzero(as_tuple=True)[0].numpy()
                 p_ref = mapped_p[outlet_indices].mean() if len(outlet_indices) > 0 else 0.0
 
-                u_nd_val = mapped_u / u_ref
-                v_nd_val = mapped_v / u_ref
-                dynamic_pressure = RHO * (u_ref ** 2)
+                u_nd_val = mapped_u / u_ref_safe
+                v_nd_val = mapped_v / u_ref_safe
+                dynamic_pressure = RHO * (u_ref_safe ** 2)
                 p_nd_val = (mapped_p - p_ref) / dynamic_pressure
 
-                u_tensor = torch.tensor(u_nd_val, dtype=torch.float32).reshape(-1, 1)
-                v_tensor = torch.tensor(v_nd_val, dtype=torch.float32).reshape(-1, 1)
-                p_tensor = torch.tensor(p_nd_val, dtype=torch.float32).reshape(-1, 1)
-
-                y_labels = torch.cat([u_tensor, v_tensor, p_tensor], dim=1)
+                y_labels = torch.stack([
+                    torch.tensor(u_nd_val, dtype=torch.float32),
+                    torch.tensor(v_nd_val, dtype=torch.float32),
+                    torch.tensor(p_nd_val, dtype=torch.float32)
+                ], dim=1)
             except Exception as e:
                 print(f"Error reading labels for {stem}: {e}")
         else:
             print(f"Warning: No labels found for {stem}. Saving graph without y.")
 
         # 5. Save Final Data
+        # We pack all features into data.x to simplify the GINO forward pass
         data = Data(
-            x=torch.tensor(nodes_nd, dtype=torch.float32),
+            x=torch.cat([
+                torch.tensor(nodes_nd, dtype=torch.float32),
+                torch.tensor(sdf_nd, dtype=torch.float32),
+                shear_pot_nd.reshape(-1, 1)
+            ], dim=1),
             edge_index=edge_index,
-            sdf=torch.tensor(sdf_nd, dtype=torch.float32),
-            shear_pot=shear_pot_nd,
             d_bar=torch.tensor([d_bar_safe], dtype=torch.float32),
+            u_ref=torch.tensor([u_ref_safe], dtype=torch.float32),
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,

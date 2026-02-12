@@ -44,13 +44,11 @@ class StratifiedAnchorSampler(Sampler):
 def validate_and_plot(model, val_data, epoch, device):
     model.eval()
     with torch.no_grad():
-        if val_data.x.dim() == 2:
-            data_on_device = Batch.from_data_list([val_data]).to(device)
-            pred = model(data_on_device)
-            u_pred = pred[:val_data.num_nodes, 0].cpu().numpy()
-            coords = val_data.x.cpu().numpy()
-        else:
-            return
+        data_on_device = Batch.from_data_list([val_data]).to(device)
+        pred = model(data_on_device)
+        # Use first 2 columns of x (which are nodes_nd) for plotting
+        coords = data_on_device.x[:, :2].cpu().numpy()
+        u_pred = pred[:, 0].cpu().numpy()
 
     plt.figure(figsize=(10, 4))
     sc = plt.scatter(coords[:, 0], coords[:, 1], c=u_pred, cmap='jet', s=5)
@@ -58,8 +56,7 @@ def validate_and_plot(model, val_data, epoch, device):
     plt.title(f"Tier 1 Validation - Epoch {epoch}")
     plt.axis('equal')
 
-    project_root = Path(__file__).resolve().parent.parent.parent
-    save_dir = project_root / "reports" / "figures"
+    save_dir = Path("reports/figures")
     save_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_dir / f"val_epoch_{epoch}.png")
     plt.close()
@@ -79,44 +76,47 @@ def load_dataset():
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = rGINO_DEQ(latent_dim=64, max_iters=15).to(device)
+
+    # Encoder now takes 4 channels: [x_nd, y_nd, sdf_nd, shear_pot_nd]
+    model = rGINO_DEQ(in_channels=4, latent_dim=64, max_iters=15).to(device)
 
     target_re = 150.0
     kernels = PhysicsKernels(reynolds=target_re)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
+    # 1. Load Dataset
     dataset = load_dataset()
+    if not dataset:
+        print("Error: Dataset is empty.")
+        return
+
     train_size = int(0.9 * len(dataset))
     train_data, val_data = dataset[:train_size], dataset[train_size:]
 
-    # --- Stratified Loader ---
+    # 2. Initialize Stratified Loader (Fixes the Unresolved Reference)
+    # batch_size=4 to maintain the 50/50 anchor split
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)
 
     for epoch in range(epochs):
         model.train()
 
-        # --- Physics Warm-Up Logic ---
-        # Disable physics loss (L_ns) during warm-up to stabilize on data first
+        # Physics Warm-Up Logic
         physics_active = epoch >= warm_up_epochs
         lambda_phys = 1.0 if physics_active else 0.0
 
-        status_msg = f"Epoch {epoch:02d} [Re={target_re:.1f}]"
-        if not physics_active:
-            status_msg += " (WARM-UP: Data Only)"
-
-        pbar = tqdm(loader, desc=status_msg)
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
 
         for data in pbar:
             data = data.to(device)
             optimizer.zero_grad()
+
+            # Forward Pass
             pred = model(data)
 
             # Supervised Loss (L_data) - only for anchors
             l_data = torch.tensor(0.0, device=device)
             if hasattr(data, 'y') and data.y is not None:
-                # Masking might be needed if batch is mixed;
-                # but F.mse_loss on the whole batch is fine if y is pre-filtered
                 l_data = F.mse_loss(pred, data.y)
 
             # Physics Losses
@@ -124,9 +124,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
 
-            # Weighted Objective
-            # λ_data = 500.0, λ_bc = 10.0, λ_io = 20.0
-            # λ_phys (L_ns) is 0.0 during warm-up
+            # Weighted Objective (λ_data=500.0)
             loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + (500.0 * l_data)
 
             loss.backward()
@@ -134,9 +132,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             optimizer.step()
 
             pbar.set_postfix({
-                "Loss": f"{loss.item():.4f}",
-                "L_data": f"{l_data.item():.4f}",
-                "L_ns": f"{l_ns.item():.4f}" if physics_active else "OFF"
+                "L_total": f"{loss.item():.4f}",
+                "Phys": "ON" if physics_active else "WARMUP"
             })
 
         if epoch % 5 == 0:

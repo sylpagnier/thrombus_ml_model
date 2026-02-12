@@ -55,12 +55,12 @@ class rGINO_DEQ(nn.Module):
         self.decoder = nn.Linear(latent_dim, out_channels)
 
     def forward(self, data):
-        # x_in: [x, y, sdf, shear_pot]
-        x_in = torch.cat([data.x, data.sdf, data.shear_pot], dim=-1)
-        z = self.encoder(x_in)
+        # x_in is now already [nodes_nd (2), sdf_nd (1), shear_pot_nd (1)] = 4 channels
+        z = self.encoder(data.x)
 
         row, col = data.edge_index
-        edge_attr = data.x[col] - data.x[row]
+        # Use only spatial coordinates (first 2 columns) for edge features
+        edge_attr = data.x[col, :2] - data.x[row, :2]
 
         def f_fixed(curr_z):
             bsz, n, d = curr_z.shape
@@ -68,6 +68,5 @@ class rGINO_DEQ(nn.Module):
             out_flat = self.core(z_flat, data.edge_index, edge_attr, data.batch)
             return out_flat.reshape(bsz, n, d)
 
-        # Anderson Solver leverages the Lipschitz-constrained core for better convergence
         z_star = anderson_acceleration(f_fixed, z, max_iter=self.max_iters)
         return self.decoder(z_star)

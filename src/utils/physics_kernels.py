@@ -95,9 +95,9 @@ class PhysicsKernels:
 
         # 1. Inlet: Parabolic profile u = 1 - 4*y^2 (ND coords)
         if data.mask_inlet.any():
+            y_nd = data.x[data.mask_inlet, 1]
+            u_target = 1.0 - 4.0 * (y_nd ** 2)  # Now mathematically correct
             y = data.x[data.mask_inlet, 1]
-            u_target = 1.0 - 4.0 * (y ** 2)
-            u_target = torch.clamp(u_target, min=0.0).unsqueeze(1)
 
             l_inlet_u = F.mse_loss(u[data.mask_inlet], u_target)
             l_inlet_v = F.mse_loss(v[data.mask_inlet], torch.zeros_like(u_target))
