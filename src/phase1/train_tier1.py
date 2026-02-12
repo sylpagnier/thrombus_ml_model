@@ -139,7 +139,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device)
 
-    torch.save(model.state_dict(), "models/tier1_hybrid_backbone.pth")
+    torch.save(model.state_dict(), "utils/tier1_hybrid_backbone.pth")
 
 
 if __name__ == "__main__":
