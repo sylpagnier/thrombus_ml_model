@@ -157,16 +157,27 @@ class PhysicsKernels:
             return torch.tensor(0.0, device=pred.device)
 
     def inlet_outlet_loss(self, pred, data):
-        """Forces Parabolic Inlet and Zero Pressure Outlet."""
+        """Forces Parabolic Inlet (Corrected for 2D Mean Velocity) and Zero Pressure Outlet."""
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
 
-        # 1. Inlet: Parabolic profile u = 1 - 4*y^2 (ND coords)
+        # 1. Inlet: Parabolic profile for 2D Poiseuille Flow
         if data.mask_inlet.any():
-            # Fix: Ensure y_nd is extracted correctly
+            # Extract inlet Y-coordinates (Normalized)
             y_nd = data.x[data.mask_inlet, 1]
-            u_target = 1.0 - 4.0 * (y_nd ** 2)
 
-            # Fix: Ensure shapes match for MSE Loss (N vs N,1)
+            # Robustness: Dynamic centering.
+            # Ensures parabola is centered even if the mesh is offset in Y.
+            y_center = y_nd.mean()
+            y_centered = y_nd - y_center
+
+            # Amplitude Correction: U_max = 1.5 * U_mean for 2D channel
+            # We assume the channel width in ND space is ~1.0 (d_bar normalized)
+            # Profile: 1.5 * (1 - (2y)^2) -> 1.5 * (1 - 4y^2)
+            u_target = 1.5 * (1.0 - 4.0 * (y_centered ** 2))
+
+            # Clamp negative values (in case of slight mesh noise at edges) to 0
+            u_target = torch.clamp(u_target, min=0.0)
+
             l_inlet_u = F.mse_loss(u[data.mask_inlet].squeeze(), u_target)
             l_inlet_v = F.mse_loss(v[data.mask_inlet].squeeze(), torch.zeros_like(u_target))
         else:
