@@ -86,7 +86,7 @@ def load_dataset():
     return dataset
 
 
-def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
+def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=20):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Encoder now takes 4 channels: [x_nd, y_nd, sdf_nd, shear_pot_nd]
@@ -123,17 +123,28 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             data = data.to(device)
             optimizer.zero_grad()
 
+            # --- DEBUG BLOCK START ---
+            if epoch == 0 and batch_idx == 0:  # Run this check once
+                print(f"DEBUG: Batch has anchors? {data.is_anchor.any()}")
+                if data.is_anchor.any():
+                    mask = data.is_anchor[data.batch]
+                    print(f"DEBUG: Number of anchor nodes: {mask.sum()}")
+                    print(f"DEBUG: Max Label Value (y): {data.y[mask].max()}")
+                    print(f"DEBUG: Mean Label Value (y): {data.y[mask].mean()}")
+            # --- DEBUG BLOCK END ---
+
             # Forward Pass
             pred = model(data)
 
             # Supervised Loss (L_data) - only for anchors
             l_data = torch.tensor(0.0, device=device)
-            if hasattr(data, 'y') and data.y is not None:
-                l_data = F.mse_loss(pred, data.y)
-            if data.is_anchor.any():
-                node_mask = data.is_anchor[data.batch]
-                if node_mask.sum() > 0:
-                    l_data = F.mse_loss(pred[node_mask], data.y[node_mask])
+            if hasattr(data, 'is_anchor'):
+                # Expand the graph-level boolean to node-level boolean
+                node_is_anchor = data.is_anchor[data.batch]
+
+                if node_is_anchor.sum() > 0:
+                    # Calculate MSE only on anchor nodes
+                    l_data = F.mse_loss(pred[node_is_anchor], data.y[node_is_anchor])
 
             # Physics Losses
             l_ns = kernels.navier_stokes_residual(pred, data)
