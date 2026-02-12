@@ -21,16 +21,18 @@ class MeshToGraphComplete:
     def _calculate_dynamic_dbar(self, nodes, sdf, mask_inlet):
         """
         Calculates characteristic length (Diameter) based strictly on Inlet.
-        Falls back to SDF if inlet is not found (rare).
         """
-        if mask_inlet.any():
+        # FIX: Convert boolean Tensor to Numpy for indexing
+        mask_np = mask_inlet.numpy().astype(bool)
+
+        if mask_np.any():
             # Get inlet nodes
-            inlet_nodes = nodes[mask_inlet]
-            # Diameter = Max Y - Min Y (assuming vertical inlet)
+            inlet_nodes = nodes[mask_np]
+            # Diameter = Max Y - Min Y
             d_bar = inlet_nodes[:, 1].max() - inlet_nodes[:, 1].min()
             return d_bar
 
-        # Fallback (Original Logic)
+        # Fallback
         local_max_radius = np.percentile(sdf, 95)
         d_bar = 2.0 * local_max_radius
         if d_bar < 1e-7:
@@ -107,7 +109,7 @@ class MeshToGraphComplete:
 
         nodes_nd = nodes / d_bar_safe
         sdf_nd = sdf_dim / d_bar_safe
-        shear_pot_nd = torch.clamp(1.0 / (torch.tensor(sdf_nd) + 0.05), max=10.0)
+        shear_pot_nd = torch.log(1.0 + 1.0 / (torch.tensor(sdf_nd) + 1e-6))
 
         # 3. Connectivity
         if "triangle" not in mesh.cells_dict:
