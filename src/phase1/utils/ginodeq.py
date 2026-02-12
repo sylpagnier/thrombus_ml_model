@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.nn import GINEConv, global_mean_pool
-from src.models.anderson import anderson_acceleration
+from src.phase1.utils.anderson import anderson_acceleration
 
 class GlobalMixingBlock(nn.Module):
     """

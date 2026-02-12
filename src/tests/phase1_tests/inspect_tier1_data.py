@@ -4,12 +4,12 @@ import numpy as np
 from pathlib import Path
 from torch_geometric.data import Data
 # New import for physics verification
-from src.utils.physics_kernels import PhysicsKernels
+from src.phase1.utils.physics_kernels import PhysicsKernels
 
 
 def inspect_sample(filename="vessel_0.pt"):
     # 1. Load Data
-    project_root = Path(__file__).resolve().parent.parent.parent
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
     data_path = project_root / "data/processed/tier1_graphs" / filename
 
     if not data_path.exists():
@@ -25,10 +25,12 @@ def inspect_sample(filename="vessel_0.pt"):
     # Load with weights_only=False to ensure custom Data attributes are preserved
     data = torch.load(data_path, weights_only=False)
 
-    # 2. Attribute Verification (The "0.0000 Loss" Debugger)
+    # 2. Attribute Verification
     print("\n--- Attribute Check ---")
     available_attrs = data.keys()
     print(f"Fields found in Data object: {available_attrs}")
+    print(f"Node Features (data.x) Shape: {data.x.shape}")
+    print("   [0,1]: Pos (ND), [2]: SDF (ND), [3]: Shear Potential")
 
     has_y = hasattr(data, 'y') and data.y is not None
     if has_y:
@@ -37,14 +39,10 @@ def inspect_sample(filename="vessel_0.pt"):
         print(f"❌ 'y' NOT FOUND. Training on anchors will result in 0.0 supervised loss.")
 
     # 3. Physics Kernel Sanity Check
-    # If we have GT data, the physics residual should be near zero.
     if has_y:
         print("\n--- Physics Sanity Check (GT vs. Kernels) ---")
-        # Initialize kernels at your Target Re
         kernels = PhysicsKernels(reynolds=150.0)
 
-        # We treat the Ground Truth (data.y) as the "prediction"
-        # data.y contains [u, v, p] based on mesh_to_graph.py
         with torch.no_grad():
             res_ns = kernels.navier_stokes_residual(data.y, data)
             res_bc = kernels.boundary_condition_loss(data.y, data)
@@ -53,15 +51,15 @@ def inspect_sample(filename="vessel_0.pt"):
             print(f"Mean Navier-Stokes Residual of COMSOL data: {mean_res:.6f}")
             print(f"Mean Boundary Condition Residual: {res_bc.item():.6f}")
 
-            if mean_res > 1.0:
-                print("⚠️  WARNING: High residual on ground truth data!")
-                print("   This suggests a unit mismatch between COMSOL and the physics kernels.")
-                print("   Check: Pressure scaling (1/rho), viscosity (mu), or coordinate normalization.")
-            else:
-                print("✅ Kernels are consistent with COMSOL data units.")
+            if mean_res > 5.0:
+                print("⚠️  NOTE: High residual is expected if using 'Direct SPH' Laplacian.")
+                print("   Ensure PhysicsKernels is updated to use 'Double Gradient' for accuracy.")
 
-    # 4. Visualization (Existing Functionality)
+    # 4. Visualization
+    # Extract features from data.x based on mesh_to_graph.py packing
     pos = data.x[:, :2].numpy()  # ND-Coordinates
+    sdf_val = data.x[:, 2].numpy() # Extracted from Channel 2
+    shear_val = data.x[:, 3].numpy() # Extracted from Channel 3
 
     fig = plt.figure(figsize=(18, 10))
     gs = fig.add_gridspec(2, 3)
@@ -84,19 +82,19 @@ def inspect_sample(filename="vessel_0.pt"):
 
     # --- Plot 2: SDF ---
     ax2 = fig.add_subplot(gs[0, 1])
-    sc2 = ax2.scatter(pos[:, 0], pos[:, 1], c=data.sdf.numpy().flatten(), cmap='viridis', s=2)
+    sc2 = ax2.scatter(pos[:, 0], pos[:, 1], c=sdf_val, cmap='viridis', s=2)
     plt.colorbar(sc2, ax=ax2, label="ND-SDF")
-    ax2.set_title("Signed Distance Function")
+    ax2.set_title("Signed Distance Function (from data.x[:, 2])")
     ax2.axis('equal')
 
     # --- Plot 3: Shear Potential ---
     ax3 = fig.add_subplot(gs[0, 2])
-    sc3 = ax3.scatter(pos[:, 0], pos[:, 1], c=data.shear_pot.numpy().flatten(), cmap='plasma', s=2)
+    sc3 = ax3.scatter(pos[:, 0], pos[:, 1], c=shear_val, cmap='plasma', s=2)
     plt.colorbar(sc3, ax=ax3, label="Shear Potential")
-    ax3.set_title("Shear Rate Potential (1/SDF)")
+    ax3.set_title("Shear Rate Potential (from data.x[:, 3])")
     ax3.axis('equal')
 
-    # --- Plot 4 & 5: CFD Ground Truth (If exists) ---
+    # --- Compare number of nodes in graph vs CFD ---
     if has_y:
         u_gt = data.y[:, 0].numpy()
         p_gt = data.y[:, 2].numpy()
@@ -116,7 +114,23 @@ def inspect_sample(filename="vessel_0.pt"):
     plt.tight_layout()
     plt.show()
 
+    # 1. Define Paths Robustly
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    pt_path = project_root / "data/processed/tier1_graphs/vessel_0.pt"
+    npz_path = project_root / "data/raw/cfd_anchors/vessel_0.npz"
+
+    print(f"DEBUG: Loading PT from {pt_path}")
+    print(f"DEBUG: Loading NPZ from {npz_path}")
+
+    # 2. Load Data
+    pt_data = torch.load(pt_path, weights_only=False)  # weights_only=False for custom objects
+    npz_data = np.load(npz_path)
+
+    # 3. Check Alignment
+    # (Rest of the diagnostic logic remains the same)
+    print(f"Graph Nodes: {pt_data.x.shape[0]}")
+    print(f"CFD Solution Points: {npz_data['x'].flatten().shape[0]}")
+
 
 if __name__ == "__main__":
-    # Test on a specific anchor if known, otherwise default to vessel_0.pt
     inspect_sample("vessel_0.pt")

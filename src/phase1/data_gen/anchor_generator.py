@@ -32,30 +32,63 @@ class AnchorGenerator:
             print(f"Warning: Could not read {msh_path.name} to measure diameter. ({e})")
             return 0.0015  # Fallback
 
-        # Gmsh Physical Groups: 'line' block usually holds the boundaries
-        if "line" not in mesh.cell_data_dict["gmsh:physical"]:
+        if "line" not in mesh.cells_dict:
             return 0.0015
 
         lines = mesh.cells_dict["line"]
         tags = mesh.cell_data_dict["gmsh:physical"]["line"]
-
-        # Filter for Inlet Tag (101 is standard from vessel_generator.py)
         inlet_indices = [i for i, t in enumerate(tags) if t == 101]
 
         if not inlet_indices:
             return 0.0015
 
-        # Get all node indices for the inlet lines
         inlet_node_indices = np.unique(lines[inlet_indices].flatten())
-
-        # Get coordinates
         inlet_coords = mesh.points[inlet_node_indices]
-
-        # Diameter = Max Y - Min Y (Assuming inlet is vertical at x=0)
         y_coords = inlet_coords[:, 1]
-        diameter = np.max(y_coords) - np.min(y_coords)
+        return float(np.max(y_coords) - np.min(y_coords))
 
-        return float(diameter)
+    def _evaluate_at_coords(self, coords):
+        """
+        Uses COMSOL Java API to interpolate solution at specific (x, y) coordinates.
+        coords: (N, 2) numpy array of [x, y]
+        Returns: u, v, p (all shape (N,))
+        """
+        # 1. Prepare coordinates for COMSOL (Must be 2D array: [[x1, x2...], [y1, y2...]])
+        coords_T = coords.T  # Shape (2, N)
+
+        # 2. Get the Java 'Results' object
+        # 'dset1' is the standard default solution dataset in COMSOL.
+        # If your model uses a different one, check COMSOL GUI -> Results -> Datasets.
+        model_j = self.model.java
+
+        # Create a numerical "Interp" feature to evaluate arbitrary points
+        # This is faster and more robust than 'model.evaluate' for unstructured lists
+        results = model_j.result()
+        interp_tag = results.numerical().create("interp1", "Interp").tag()
+        interp = results.numerical(interp_tag)
+
+        interp.set("data", "dset1")  # Target the solution dataset
+        interp.set("expr", ["u", "v", "p"])  # Variables to evaluate
+
+        # Pass coordinates. COMSOL expects specific Java double[][] format,
+        # but JPype (used by mph) usually handles list-of-lists.
+        interp.setInterpolationCoordinates(coords_T.tolist())
+
+        # 3. Compute
+        # getData() returns a flattened 1D array or 2D array depending on version.
+        # Typically returns double[num_expr][num_points]
+        data = interp.getData()
+
+        # Cleanup (remove the temp feature to save memory)
+        results.numerical().remove("interp1")
+
+        # 4. Parse
+        # data is typically [[u1, u2...], [v1, v2...], [p1, p2...]]
+        u = np.array(data[0])
+        v = np.array(data[1])
+        p = np.array(data[2])
+
+        return u, v, p
 
     def run_batch(self, start_idx=0, end_idx=50):
         print("\n--- Java Layer Setup ---")
@@ -65,13 +98,13 @@ class AnchorGenerator:
         except Exception as e:
             raise RuntimeError(f"Critical: Could not access 'comp1' or 'mesh1'. Error: {e}")
 
+        # Find the Import feature
         import_tag = None
         all_tags = mesh_j.feature().tags()
         for tag in all_tags:
             if mesh_j.feature(tag).getType() == 'Import':
                 import_tag = tag
                 break
-
         if not import_tag:
             import_tag = 'imp1' if 'imp1' in all_tags else None
             if not import_tag: raise RuntimeError("No Import feature found.")
@@ -80,39 +113,42 @@ class AnchorGenerator:
 
         for i in tqdm(range(start_idx, end_idx), desc="Solving Anchors"):
             nas_file = self.mesh_dir / f"vessel_{i}.nas"
-            msh_file = self.mesh_dir / f"vessel_{i}.msh"  # Helper for metadata
+            msh_file = self.mesh_dir / f"vessel_{i}.msh"
 
             if not nas_file.exists(): continue
 
             try:
-                # 1. Measure ACTUAL Diameter from Mesh
+                # 1. Measure Diameter
                 D_actual = self._measure_inlet_width(msh_file)
-
-                # 2. Update COMSOL Parameter
-                # This updates the 'D_inlet' parameter we defined earlier.
-                # COMSOL will auto-calculate U_in = (Re*mu)/(rho*D) based on this.
                 self.model.parameter('D_inlet', f'{D_actual:.6f} [m]')
 
-                # 3. Load Mesh Geometry
+                # 2. Update Mesh
                 feat = mesh_j.feature(import_tag)
                 feat.set('filename', str(nas_file))
                 mesh_j.run()
 
-                # 4. Solve
+                # 3. Solve
                 self.model.solve()
 
-                # 5. Extract Data
-                data = self.model.evaluate(['x', 'y', 'u', 'v', 'p'])
-                x_sol, y_sol, u, v, p = data
+                # 4. Extract Data EXACTLY at Mesh Nodes
+                # Load the mesh used to generate the graph
+                mesh = meshio.read(msh_file)
+                # Use only x, y (ignore z if 2D)
+                target_nodes = mesh.points[:, :2]
 
-                # 6. Save
+                u, v, p = self._evaluate_at_coords(target_nodes)
+
+                # 5. Save
                 if np.isnan(u).any() or np.isinf(u).any():
                     print(f"Skipping {i}: Solver produced NaNs")
                     continue
+
                 np.savez(
                     self.output_dir / f"vessel_{i}.npz",
-                    x=x_sol, y=y_sol, u=u, v=v, p=p,
-                    d_inlet=D_actual  # Save metadata for verification
+                    x=target_nodes[:, 0],
+                    y=target_nodes[:, 1],
+                    u=u, v=v, p=p,
+                    d_inlet=D_actual
                 )
             except Exception as e:
                 print(f"Error solving vessel_{i}: {e}")

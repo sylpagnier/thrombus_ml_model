@@ -8,9 +8,9 @@ template_path = 'comsol_models/phase1_template.mph'
 current_path = Path(__file__).resolve()
 # Heuristic to find project root if running from src/
 if 'src' in str(current_path):
-    project_root = current_path.parent.parent.parent
+    project_root = current_path.parent.parent.parent.parent
 else:
-    project_root = current_path.parent
+    project_root = current_path.parent.parent
 
 abs_template = project_root / template_path
 

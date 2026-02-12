@@ -107,14 +107,14 @@ class PhysicsKernels:
         return lap
 
     def navier_stokes_residual(self, pred, data):
-        """Residual of steady-state Navier-Stokes."""
+        """Residual of steady-state Navier-Stokes using Double-Gradient Laplacian."""
         # 1. Precompute Geometry once per step
         props = self._get_geometric_props(data)
 
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
 
-        # 2. First Derivatives (Convective Terms need these)
-        grad_u = self._compute_gradients(u, props)
+        # 2. First Derivatives (Convective Terms)
+        grad_u = self._compute_gradients(u, props)  # [N, 2] (du/dx, du/dy)
         grad_v = self._compute_gradients(v, props)
         grad_p = self._compute_gradients(p, props)
 
@@ -122,10 +122,16 @@ class PhysicsKernels:
         v_x, v_y = grad_v[:, 0:1], grad_v[:, 1:2]
         p_x, p_y = grad_p[:, 0:1], grad_p[:, 1:2]
 
-        # 3. Laplacian (Viscous Terms)
-        # Use Direct Laplacian for stability
-        lap_u = self._compute_laplacian_direct(u, props)
-        lap_v = self._compute_laplacian_direct(v, props)
+        # 3. Laplacian (Viscous Terms) via Divergence of Gradient
+        # This is more expensive (4 extra gradient calls) but mathematically consistent
+        # lap(u) = d(u_x)/dx + d(u_y)/dy
+        grad_u_x = self._compute_gradients(u_x, props) # returns [u_xx, u_xy]
+        grad_u_y = self._compute_gradients(u_y, props) # returns [u_yx, u_yy]
+        lap_u = grad_u_x[:, 0:1] + grad_u_y[:, 1:2]
+
+        grad_v_x = self._compute_gradients(v_x, props)
+        grad_v_y = self._compute_gradients(v_y, props)
+        lap_v = grad_v_x[:, 0:1] + grad_v_y[:, 1:2]
 
         # 4. Navier-Stokes Equations
         # Continuity: div(u) = 0

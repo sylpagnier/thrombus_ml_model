@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Paths
-project_root = Path(__file__).parent.parent.parent  # Adjust based on where you save this
+project_root = Path(__file__).parent.parent.parent.parent  # Adjust based on where you save this
 data_path = project_root / 'data/raw/cfd_anchors/vessel_0.npz'
 
 
