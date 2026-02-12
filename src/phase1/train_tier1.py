@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch
-from src.models.ginodeq import rGINO_DEQ
-from src.utils.physics_kernels import PhysicsKernels
+from src.phase1.utils.ginodeq import rGINO_DEQ
+from src.phase1.utils.physics_kernels import PhysicsKernels
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Sampler
