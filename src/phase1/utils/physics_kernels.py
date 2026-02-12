@@ -85,9 +85,15 @@ class PhysicsKernels:
     def boundary_condition_loss(self, pred, data):
         """Penalizes velocity at walls using explicit Wall Masks."""
         u, v = pred[:, 0:1], pred[:, 1:2]
-        # Use explicit mask_wall (converted to float for multiplication)
-        mask = data.mask_wall.float().unsqueeze(1)
-        return torch.mean(mask * (u ** 2 + v ** 2))
+
+        # --- OPTIMIZED VERSION ---
+        # Only compute loss on actual wall nodes.
+        if data.mask_wall.any():
+            u_wall = u[data.mask_wall]
+            v_wall = v[data.mask_wall]
+            return torch.mean(u_wall ** 2 + v_wall ** 2)
+        else:
+            return torch.tensor(0.0, device=pred.device)
 
     def inlet_outlet_loss(self, pred, data):
         """Forces Parabolic Inlet and Zero Pressure Outlet."""

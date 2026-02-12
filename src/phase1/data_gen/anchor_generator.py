@@ -106,6 +106,9 @@ class AnchorGenerator:
                 x_sol, y_sol, u, v, p = data
 
                 # 6. Save
+                if np.isnan(u).any() or np.isinf(u).any():
+                    print(f"Skipping {i}: Solver produced NaNs")
+                    continue
                 np.savez(
                     self.output_dir / f"vessel_{i}.npz",
                     x=x_sol, y=y_sol, u=u, v=v, p=p,

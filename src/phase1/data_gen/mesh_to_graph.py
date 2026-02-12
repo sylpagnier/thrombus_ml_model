@@ -18,8 +18,19 @@ class MeshToGraphComplete:
         self.proc_dir = project_root / proc_dir
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
-    def _calculate_dynamic_dbar(self, nodes, sdf):
-        """Calculates characteristic length based on geometry thickness."""
+    def _calculate_dynamic_dbar(self, nodes, sdf, mask_inlet):
+        """
+        Calculates characteristic length (Diameter) based strictly on Inlet.
+        Falls back to SDF if inlet is not found (rare).
+        """
+        if mask_inlet.any():
+            # Get inlet nodes
+            inlet_nodes = nodes[mask_inlet]
+            # Diameter = Max Y - Min Y (assuming vertical inlet)
+            d_bar = inlet_nodes[:, 1].max() - inlet_nodes[:, 1].min()
+            return d_bar
+
+        # Fallback (Original Logic)
         local_max_radius = np.percentile(sdf, 95)
         d_bar = 2.0 * local_max_radius
         if d_bar < 1e-7:
@@ -81,7 +92,7 @@ class MeshToGraphComplete:
         dist, _ = tree.query(nodes)
         sdf_dim = dist.reshape(-1, 1).astype(np.float32)
 
-        d_bar = self._calculate_dynamic_dbar(nodes, sdf_dim)
+        d_bar = self._calculate_dynamic_dbar(nodes, sdf_dim, mask_inlet)
         d_bar_safe = d_bar if d_bar > 1e-9 else 1.0
 
         # --- MANDATORY PHYSICS SCALING ---
