@@ -12,7 +12,7 @@ class MeshToGraphComplete:
     def __init__(self, raw_dir="data/raw/synthetic_v1", label_dir="data/raw/cfd_anchors",
                  proc_dir="data/processed/tier1_graphs"):
         current_script_path = Path(__file__).resolve()
-        project_root = current_script_path.parent.parent.parent
+        project_root = current_script_path.parent.parent.parent.parent
         self.raw_dir = project_root / raw_dir
         self.label_dir = project_root / label_dir
         self.proc_dir = project_root / proc_dir

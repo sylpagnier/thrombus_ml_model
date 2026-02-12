@@ -10,7 +10,7 @@ from pathlib import Path
 class VesselGenerator:
     def __init__(self, output_dir="data/raw/synthetic_v1"):
         current_script_path = Path(__file__).resolve()
-        project_root = current_script_path.parent.parent.parent
+        project_root = current_script_path.parent.parent.parent.parent
         self.output_dir = project_root / output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 

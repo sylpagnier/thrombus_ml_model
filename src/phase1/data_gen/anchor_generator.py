@@ -8,7 +8,7 @@ from tqdm import tqdm
 class AnchorGenerator:
     def __init__(self, template_path, mesh_dir, output_dir):
         current_script = Path(__file__).resolve()
-        project_root = current_script.parent.parent.parent
+        project_root = current_script.parent.parent.parent.parent
 
         abs_template = project_root / template_path
         self.mesh_dir = project_root / mesh_dir
