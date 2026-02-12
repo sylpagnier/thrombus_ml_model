@@ -109,6 +109,7 @@ class MeshToGraphComplete:
 
         # 4. Label Injection (Integrated)
         y_labels = None
+        has_labels = False  # Flag
         if label_path.exists():
             try:
                 cfd = np.load(label_path)
@@ -134,10 +135,18 @@ class MeshToGraphComplete:
                     torch.tensor(v_nd_val, dtype=torch.float32),
                     torch.tensor(p_nd_val, dtype=torch.float32)
                 ], dim=1)
+                has_labels = True
             except Exception as e:
                 print(f"Error reading labels for {stem}: {e}")
         else:
             print(f"Warning: No labels found for {stem}. Saving graph without y.")
+
+        if y_labels is None:
+            # Create dummy labels of shape [Num_Nodes, 3]
+            y_labels = torch.zeros((num_nodes, 3), dtype=torch.float32)
+            mask_supervised = torch.tensor([False], dtype=torch.bool)
+        else:
+            mask_supervised = torch.tensor([True], dtype=torch.bool)
 
         # 5. Save Final Data
         # We pack all features into data.x to simplify the GINO forward pass
@@ -153,7 +162,8 @@ class MeshToGraphComplete:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
-            y=y_labels
+            y=y_labels,
+            is_anchor=mask_supervised
         )
         torch.save(data, self.proc_dir / f"{stem}.pt")
 

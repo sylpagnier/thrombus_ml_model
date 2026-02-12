@@ -118,6 +118,10 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_data = torch.tensor(0.0, device=device)
             if hasattr(data, 'y') and data.y is not None:
                 l_data = F.mse_loss(pred, data.y)
+            if data.is_anchor.any():
+                node_mask = data.is_anchor[data.batch]
+                if node_mask.sum() > 0:
+                    l_data = F.mse_loss(pred[node_mask], data.y[node_mask])
 
             # Physics Losses
             l_ns = kernels.navier_stokes_residual(pred, data)
