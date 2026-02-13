@@ -81,7 +81,7 @@ def load_dataset():
     return dataset
 
 
-def train_tier1_v2(epochs=50, lr=1e-4, warm_up_epochs=10):
+def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     # NOTE: Increased initial LR to 1e-4 because Scheduler will decay it
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -175,4 +175,4 @@ def train_tier1_v2(epochs=50, lr=1e-4, warm_up_epochs=10):
 
 
 if __name__ == "__main__":
-    train_tier1_v2()
+    train_tier1()
