@@ -87,8 +87,6 @@ class MeshToGraphComplete:
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, num_nodes)
 
         wall_pts = nodes[mask_wall.numpy()]
-        if len(wall_pts) == 0:
-            wall_pts = nodes[nodes[:, 1].abs() > 0.001]
 
         tree = KDTree(wall_pts)
         dist, _ = tree.query(nodes)
