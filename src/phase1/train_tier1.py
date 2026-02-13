@@ -153,7 +153,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     for epoch in range(epochs):
         model.train()
         physics_active = epoch >= warm_up_epochs
-        lambda_phys = 1.0 if physics_active else 0.0
+        lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
         total_loss_epoch = 0.0
 
         pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
