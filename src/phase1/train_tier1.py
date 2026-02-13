@@ -86,7 +86,7 @@ def load_dataset():
     return dataset
 
 
-def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=20):
+def train_tier1(epochs=50, lr=5e-5, warm_up_epochs=20):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Encoder now takes 4 channels: [x_nd, y_nd, sdf_nd, shear_pot_nd]
@@ -151,8 +151,14 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=20):
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
 
+            # Calculate a simple roughness penalty
+            # Penalize the difference between a node and its average neighbor
+            row, col = data.edge_index
+            # Calculate difference squared between connected nodes
+            l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
+
             # Weighted Objective (λ_data=500.0)
-            loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + (500.0 * l_data)
+            loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + (10 * l_data) + (5 * l_smoothness)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
