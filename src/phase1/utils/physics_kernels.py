@@ -22,8 +22,9 @@ class PhysicsKernels:
 
     def _get_geometric_props(self, data):
         """
-        Computes and caches geometric properties (distances, least-squares matrices).
-        Crucial for WLS consistency on unstructured meshes.
+        Computes geometric properties for direct 2nd-order Weighted Least Squares (WLS).
+        Extracts [u_x, u_y, u_xx, u_xy, u_yy] simultaneously, completely eliminating
+        boundary truncation errors associated with chained 1st-order gradients.
         """
         row, col = data.edge_index
         num_nodes = data.num_nodes
@@ -31,121 +32,147 @@ class PhysicsKernels:
         # 1. Edge Distances
         pos_diff = data.x[col, :2] - data.x[row, :2]
         dx, dy = pos_diff[:, 0], pos_diff[:, 1]
+
+        # Regularizer to prevent division by zero in weights
         dist_sq = dx ** 2 + dy ** 2 + 1e-8
 
-        # Weighting: Inverse distance squared (Standard WLS)
-        w = 1.0 / (dist_sq + 1e-8)
+        # 2nd Order Polynomial Basis: [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2]
+        dx2 = 0.5 * dx ** 2
+        dxy = dx * dy
+        dy2 = 0.5 * dy ** 2
 
-        # 2. Least-Squares Matrix Components
-        # We solve for gradients [gx, gy] minimizing: sum w * (df - gx*dx - gy*dy)^2
-        m_xx = scatter_add(w * dx * dx, row, dim=0, dim_size=num_nodes)
-        m_xy = scatter_add(w * dx * dy, row, dim=0, dim_size=num_nodes)
-        m_yy = scatter_add(w * dy * dy, row, dim=0, dim_size=num_nodes)
+        V = torch.stack([dx, dy, dx2, dxy, dy2], dim=1)  # [E, 5]
 
-        # Determinant for analytic 2x2 inversion
-        det = m_xx * m_yy - m_xy ** 2 + 1e-8
+        # Weights: inverse distance squared
+        W = 1.0 / dist_sq  # [E]
 
-        # Inverse components (Cramer's Rule)
-        inv_xx = m_yy / det
-        inv_xy = -m_xy / det
-        inv_yy = m_xx / det
+        # Compute M_e = W * V^T * V for each edge
+        V_unsqueezed = V.unsqueeze(2)  # [E, 5, 1]
+        V_T_unsqueezed = V.unsqueeze(1)  # [E, 1, 5]
+        M_e = W.view(-1, 1, 1) * torch.bmm(V_unsqueezed, V_T_unsqueezed)  # [E, 5, 5]
+
+        # Scatter sum to get M for each node
+        M_e_flat = M_e.view(-1, 25)
+        M_flat = scatter_add(M_e_flat, row, dim=0, dim_size=num_nodes)
+        M = M_flat.view(num_nodes, 5, 5)
+
+        # Compute pseudo-inverse directly. This handles low-degree boundary nodes safely.
+        M_inv = torch.linalg.pinv(M)  # [N, 5, 5]
 
         return {
-            'row': row, 'col': col, 'num_nodes': num_nodes,
-            'dx': dx, 'dy': dy, 'w': w,
-            'inv_xx': inv_xx, 'inv_xy': inv_xy, 'inv_yy': inv_yy
+            'row': row,
+            'col': col,
+            'num_nodes': num_nodes,
+            'V': V,
+            'W': W,
+            'M_inv': M_inv
         }
 
-    def _compute_gradients(self, f, props):
-        """Calculates First Derivatives (df/dx, df/dy) using Weighted Least Squares."""
+    def _compute_derivatives(self, u, props):
+        """
+        Computes 1st and 2nd derivatives using the 2nd-order WLS operator.
+        Returns tensor of shape [N, 5, C].
+        """
         row, col = props['row'], props['col']
+        num_nodes = props['num_nodes']
+        V, W, M_inv = props['V'], props['W'], props['M_inv']
 
-        # Difference in function values
-        f_diff = f[col] - f[row]
+        if u.dim() == 1:
+            u = u.unsqueeze(1)
 
-        # Weighted difference vectors
-        w_f = props['w'].unsqueeze(1) * f_diff
+        C = u.shape[1]
+        du = u[col] - u[row]  # [E, C]
 
-        b_x = scatter_add(w_f * props['dx'].unsqueeze(1), row, dim=0, dim_size=props['num_nodes'])
-        b_y = scatter_add(w_f * props['dy'].unsqueeze(1), row, dim=0, dim_size=props['num_nodes'])
+        W_unsqueezed = W.view(-1, 1, 1)  # [E, 1, 1]
+        V_unsqueezed = V.unsqueeze(2)  # [E, 5, 1]
+        du_unsqueezed = du.unsqueeze(1)  # [E, 1, C]
 
-        # Multiply by inverse geometric matrix
-        grad_x = props['inv_xx'].unsqueeze(1) * b_x + props['inv_xy'].unsqueeze(1) * b_y
-        grad_y = props['inv_xy'].unsqueeze(1) * b_x + props['inv_yy'].unsqueeze(1) * b_y
+        b_e = W_unsqueezed * torch.bmm(V_unsqueezed, du_unsqueezed)  # [E, 5, C]
 
-        return torch.cat([grad_x, grad_y], dim=1)
+        b_e_flat = b_e.view(-1, 5 * C)
+        b_flat = scatter_add(b_e_flat, row, dim=0, dim_size=num_nodes)
+        b = b_flat.view(num_nodes, 5, C)  # [N, 5, C]
 
-    def navier_stokes_residual(self, pred, data):
-        """Residual of steady-state Navier-Stokes using Consistent Div-Grad Laplacian."""
-        # 1. Precompute Geometry
-        # In training, you might cache this if topology is static, but dynamic batching requires recompute
-        props = self._get_geometric_props(data)
+        # [N, 5, 5] x [N, 5, C] -> [N, 5, C]
+        c = torch.bmm(M_inv, b)
+
+        return c
+
+    def _compute_gradients(self, u, props):
+        """Legacy wrapper to maintain compatibility with existing tests."""
+        c = self._compute_derivatives(u, props)
+        C = c.shape[2]
+        if C == 1:
+            return c[:, 0:2, 0]
+        else:
+            return c[:, 0:2, :].reshape(-1, 2 * C)
+
+    def navier_stokes_residual(self, pred, data, props=None):
+        if props is None:
+            props = self._get_geometric_props(data)
 
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
 
-        # 2. First Derivatives (Velocity & Pressure)
-        grad_u = self._compute_gradients(u, props)  # [N, 2] -> (u_x, u_y)
-        grad_v = self._compute_gradients(v, props)  # [N, 2] -> (v_x, v_y)
-        grad_p = self._compute_gradients(p, props)
+        c_u = self._compute_derivatives(u, props)  # [N, 5, 1]
+        c_v = self._compute_derivatives(v, props)  # [N, 5, 1]
+        c_p = self._compute_derivatives(p, props)  # [N, 5, 1]
 
-        u_x, u_y = grad_u[:, 0:1], grad_u[:, 1:2]
-        v_x, v_y = grad_v[:, 0:1], grad_v[:, 1:2]
-        p_x, p_y = grad_p[:, 0:1], grad_p[:, 1:2]
+        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
+        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
+        p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        # 3. Laplacian via Divergence of Gradient (Consistent WLS)
-        # This re-uses the WLS coefficients, ensuring spectral consistency with the gradient
-        grad_u_x = self._compute_gradients(u_x, props)  # [N, 2] -> (u_xx, u_xy)
-        grad_u_y = self._compute_gradients(u_y, props)  # [N, 2] -> (u_yx, u_yy)
-        lap_u = grad_u_x[:, 0:1] + grad_u_y[:, 1:2]
+        # Use explicitly calculated Laplacian instead of chained gradients!
+        u_xx, u_yy = c_u[:, 2, 0], c_u[:, 4, 0]
+        v_xx, v_yy = c_v[:, 2, 0], c_v[:, 4, 0]
 
-        grad_v_x = self._compute_gradients(v_x, props)
-        grad_v_y = self._compute_gradients(v_y, props)
-        lap_v = grad_v_x[:, 0:1] + grad_v_y[:, 1:2]
+        lap_u = u_xx + u_yy
+        lap_v = v_xx + v_yy
 
-        # 4. Navier-Stokes Equations
-        # Continuity: div(u) = 0
         l_cont = u_x + v_y
-
-        # Momentum X: (u.grad)u + grad_p - (1/Re)lap_u
         mom_x = (u * u_x + v * u_y) + p_x - (1.0 / self.Re) * lap_u
-
-        # Momentum Y: (u.grad)v + grad_p - (1/Re)lap_v
         mom_y = (u * v_x + v * v_y) + p_y - (1.0 / self.Re) * lap_v
 
-        return torch.mean(l_cont ** 2 + mom_x ** 2 + mom_y ** 2)
+        # Standard PINN procedure: evaluate PDE strictly on interior nodes
+        mask_wall_1d = data.mask_wall.view(-1).bool()
+        interior_mask = ~mask_wall_1d
+
+        if interior_mask.any():
+            res = torch.mean(l_cont[interior_mask] ** 2 + mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
+        else:
+            res = torch.tensor(0.0, device=pred.device)
+
+        return res
 
     def boundary_condition_loss(self, pred, data):
-        """Penalizes velocity at walls."""
         u, v = pred[:, 0:1], pred[:, 1:2]
-        if data.mask_wall.any():
-            u_wall = u[data.mask_wall]
-            v_wall = v[data.mask_wall]
+        mask_wall_1d = data.mask_wall.view(-1).bool()
+        if mask_wall_1d.any():
+            u_wall = u[mask_wall_1d]
+            v_wall = v[mask_wall_1d]
             return torch.mean(u_wall ** 2 + v_wall ** 2)
         return torch.tensor(0.0, device=pred.device)
 
     def inlet_outlet_loss(self, pred, data):
-        """Forces Parabolic Inlet and Zero Pressure Outlet."""
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
 
-        # 1. Inlet: Parabolic profile
-        if data.mask_inlet.any():
-            y_nd = data.x[data.mask_inlet, 1]
-            # Dynamic centering for robustness against mesh shifts
+        loss_inlet = torch.tensor(0.0, device=pred.device)
+        mask_inlet_1d = data.mask_inlet.view(-1).bool()
+        if mask_inlet_1d.any():
+            y_nd = data.x[mask_inlet_1d, 1]
             y_centered = y_nd - y_nd.mean()
 
-            # Profile: 1.5 * (1 - (2y)^2) assuming channel width ~1.0 in ND space
             u_target = 1.5 * (1.0 - 4.0 * (y_centered ** 2))
             u_target = torch.clamp(u_target, min=0.0)
 
-            l_inlet_u = F.mse_loss(u[data.mask_inlet].squeeze(), u_target)
-            l_inlet_v = F.mse_loss(v[data.mask_inlet].squeeze(), torch.zeros_like(u_target))
-        else:
-            l_inlet_u, l_inlet_v = 0.0, 0.0
+            u_in = u[mask_inlet_1d].squeeze()
+            v_in = v[mask_inlet_1d].squeeze()
 
-        # 2. Outlet: Zero Pressure
-        if data.mask_outlet.any():
-            l_outlet_p = torch.mean(p[data.mask_outlet] ** 2)
-        else:
-            l_outlet_p = 0.0
+            loss_inlet = torch.mean((u_in - u_target) ** 2 + v_in ** 2)
 
-        return l_inlet_u + l_inlet_v + l_outlet_p
+        loss_outlet = torch.tensor(0.0, device=pred.device)
+        mask_outlet_1d = data.mask_outlet.view(-1).bool()
+        if mask_outlet_1d.any():
+            p_out = p[mask_outlet_1d]
+            loss_outlet = torch.mean(p_out ** 2)
+
+        return loss_inlet + loss_outlet

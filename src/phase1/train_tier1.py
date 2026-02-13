@@ -175,7 +175,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             row, col = data.edge_index
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
-            loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + \
+            loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + \
                    (5.0 * l_data) + (2.0 * l_smoothness)
 
             loss.backward()

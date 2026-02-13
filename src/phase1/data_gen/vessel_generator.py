@@ -23,6 +23,7 @@ class VesselGenerator:
         gmsh.option.setNumber("Mesh.Binary", 0)
         gmsh.option.setNumber("Mesh.SaveAll", 0)  # Only save physical groups
         gmsh.option.setNumber("Mesh.SaveGroupsOfNodes", 1)
+        gmsh.option.setNumber("Mesh.MeshSizeFactor", 0.25)
 
     def _get_mesh_data(self):
         """Extracts nodes and triangles for visualization."""
