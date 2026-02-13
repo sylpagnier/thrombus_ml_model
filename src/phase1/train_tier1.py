@@ -12,17 +12,17 @@ from tqdm import tqdm
 from torch.utils.data import Sampler
 import random
 
+# --- 1. Scheduler Import ---
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 
 class StratifiedAnchorSampler(Sampler):
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-
-        # FIX: Check the actual boolean flag stored in the Data object
         self.anchor_indices = []
         self.physics_indices = []
 
         for i, d in enumerate(dataset):
-            # is_anchor is a tensor([True]) or tensor([False])
             if hasattr(d, 'is_anchor') and d.is_anchor.item() is True:
                 self.anchor_indices.append(i)
             else:
@@ -30,11 +30,7 @@ class StratifiedAnchorSampler(Sampler):
 
         # Safety Check
         if not self.anchor_indices or not self.physics_indices:
-            raise ValueError(
-                f"Dataset split failed. Anchors: {len(self.anchor_indices)}, "
-                f"Physics: {len(self.physics_indices)}. Ensure you have some "
-                "unlabeled graphs in your data folder."
-            )
+            raise ValueError("Dataset split failed. Ensure you have both anchor and physics graphs.")
 
         self.num_batches = len(dataset) // batch_size
         self.num_anchors_per_batch = batch_size // 2
@@ -43,9 +39,9 @@ class StratifiedAnchorSampler(Sampler):
     def __iter__(self):
         for _ in range(self.num_batches):
             batch_indices = []
-            # Sample 50% from anchors and 50% from physics sets
-            batch_indices.extend(random.sample(self.anchor_indices, self.num_anchors_per_batch))
-            batch_indices.extend(random.sample(self.physics_indices, self.num_physics_per_batch))
+            # Use random.choices to allow resampling if one set is smaller
+            batch_indices.extend(random.choices(self.anchor_indices, k=self.num_anchors_per_batch))
+            batch_indices.extend(random.choices(self.physics_indices, k=self.num_physics_per_batch))
             random.shuffle(batch_indices)
             yield from batch_indices
 
@@ -53,12 +49,11 @@ class StratifiedAnchorSampler(Sampler):
         return self.num_batches * self.batch_size
 
 
-def validate_and_plot(model, val_data, epoch, device):
+def validate_and_plot(model, val_data, epoch, device, save_name="val_epoch"):
     model.eval()
     with torch.no_grad():
         data_on_device = Batch.from_data_list([val_data]).to(device)
         pred = model(data_on_device)
-        # Use first 2 columns of x (which are nodes_nd) for plotting
         coords = data_on_device.x[:, :2].cpu().numpy()
         u_pred = pred[:, 0].cpu().numpy()
 
@@ -70,7 +65,7 @@ def validate_and_plot(model, val_data, epoch, device):
 
     save_dir = Path("reports/figures")
     save_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_dir / f"val_epoch_{epoch}.png")
+    plt.savefig(save_dir / f"{save_name}_{epoch}.png")
     plt.close()
 
 
@@ -86,64 +81,53 @@ def load_dataset():
     return dataset
 
 
-def train_tier1(epochs=50, lr=5e-5, warm_up_epochs=20):
+def train_tier1_v2(epochs=50, lr=1e-4, warm_up_epochs=10):
+    # NOTE: Increased initial LR to 1e-4 because Scheduler will decay it
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Encoder now takes 4 channels: [x_nd, y_nd, sdf_nd, shear_pot_nd]
     model = rGINO_DEQ(in_channels=4, latent_dim=64, max_iters=15).to(device)
 
     target_re = 150.0
     kernels = PhysicsKernels(reynolds=target_re)
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    # 1. Load Dataset
+    # --- 2. Initialize Scheduler ---
+    # Decays LR from 1e-4 down to 1e-6 over the course of training
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
     dataset = load_dataset()
-    if not dataset:
-        print("Error: Dataset is empty.")
-        return
+    if not dataset: return
 
     train_size = int(0.9 * len(dataset))
     train_data, val_data = dataset[:train_size], dataset[train_size:]
 
-    # 2. Initialize Stratified Loader (Fixes the Unresolved Reference)
-    # batch_size=4 to maintain the 50/50 anchor split
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)
+
+    best_loss = float('inf')
 
     for epoch in range(epochs):
         model.train()
 
-        # Physics Warm-Up Logic
+        # Physics Warm-Up: Turn on earlier (Epoch 10) to give scheduler time to work
         physics_active = epoch >= warm_up_epochs
         lambda_phys = 1.0 if physics_active else 0.0
 
+        total_loss_epoch = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
 
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
 
-            # --- DEBUG BLOCK START ---
-            if epoch == 0 and batch_idx == 0:  # Run this check once
-                print(f"DEBUG: Batch has anchors? {data.is_anchor.any()}")
-                if data.is_anchor.any():
-                    mask = data.is_anchor[data.batch]
-                    print(f"DEBUG: Number of anchor nodes: {mask.sum()}")
-                    print(f"DEBUG: Max Label Value (y): {data.y[mask].max()}")
-                    print(f"DEBUG: Mean Label Value (y): {data.y[mask].mean()}")
-            # --- DEBUG BLOCK END ---
-
-            # Forward Pass
             pred = model(data)
 
-            # Supervised Loss (L_data) - only for anchors
+            # Supervised Loss
             l_data = torch.tensor(0.0, device=device)
             if hasattr(data, 'is_anchor'):
-                # Expand the graph-level boolean to node-level boolean
                 node_is_anchor = data.is_anchor[data.batch]
-
                 if node_is_anchor.sum() > 0:
-                    # Calculate MSE only on anchor nodes
                     l_data = F.mse_loss(pred[node_is_anchor], data.y[node_is_anchor])
 
             # Physics Losses
@@ -151,29 +135,44 @@ def train_tier1(epochs=50, lr=5e-5, warm_up_epochs=20):
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
 
-            # Calculate a simple roughness penalty
-            # Penalize the difference between a node and its average neighbor
+            # Smoothness Penalty
             row, col = data.edge_index
-            # Calculate difference squared between connected nodes
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
-            # Weighted Objective (λ_data=500.0)
-            loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + (10 * l_data) + (5 * l_smoothness)
+            # --- 3. WEIGHT TUNING ---
+            # Reduced l_data (10 -> 5.0) to prevent overfitting noise
+            # Reduced l_smoothness (5 -> 2.0) to allow parabolic curves
+            # Kept l_ns strong (1.0)
+            loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + \
+                   (5.0 * l_data) + (2.0 * l_smoothness)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+            total_loss_epoch += loss.item()
+
             pbar.set_postfix({
                 "L_total": f"{loss.item():.4f}",
-                "Phys": "ON" if physics_active else "WARMUP"
+                "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
+
+        # --- 4. Step Scheduler ---
+        scheduler.step()
+
+        # Save Best Model (Checkpointing)
+        avg_loss = total_loss_epoch / len(loader)
+        if avg_loss < best_loss and physics_active:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), "models/tier1_best.pth")
 
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device)
 
-    torch.save(model.state_dict(), "utils/tier1_hybrid_backbone.pth")
+    # Save final
+    torch.save(model.state_dict(), "models/tier1_final.pth")
+    print(f"Training Complete. Best Loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":
-    train_tier1()
+    train_tier1_v2()
