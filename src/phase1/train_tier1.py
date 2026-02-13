@@ -69,6 +69,50 @@ def validate_and_plot(model, val_data, epoch, device, save_name="val_epoch"):
     plt.close()
 
 
+def quantify_performance(model, val_loader, kernels, device):
+    """
+    Computes PIRON-specific metrics:
+    1. Rel L2 Error (on Anchors)
+    2. Continuity Residual (Mass Conservation)
+    3. Max Wall Slip (BC Violations)
+    """
+    model.eval()
+    metrics = {
+        "rel_l2": [],
+        "continuity": [],
+        "wall_slip": []
+    }
+
+    with torch.no_grad():
+        for data in val_loader:
+            data = data.to(device)
+            pred = model(data)
+
+            # 1. Relative L2 Error (only for nodes with labels/anchors)
+            if hasattr(data, 'is_anchor'):
+                node_mask = data.is_anchor[data.batch]
+                if node_mask.any():
+                    diff_norm = torch.norm(pred[node_mask] - data.y[node_mask], p=2)
+                    target_norm = torch.norm(data.y[node_mask], p=2)
+                    rel_l2 = diff_norm / (target_norm + 1e-8)
+                    metrics["rel_l2"].append(rel_l2.item())
+
+            # 2. Continuity Residual (Mass Conservation: div(u) = 0)
+            props = kernels._get_geometric_props(data)
+            u, v = pred[:, 0:1], pred[:, 1:2]
+            grad_u = kernels._compute_gradients(u, props)
+            grad_v = kernels._compute_gradients(v, props)
+            div_u = grad_u[:, 0:1] + grad_v[:, 1:2]
+            metrics["continuity"].append(torch.abs(div_u).mean().item())
+
+            # 3. Wall Slip Violation (Velocity magnitude at walls)
+            if data.mask_wall.any():
+                wall_vel = torch.norm(pred[data.mask_wall, :2], p=2, dim=1)
+                metrics["wall_slip"].append(wall_vel.mean().item())
+
+    return {k: np.mean(v) if v else 0.0 for k, v in metrics.items()}
+
+
 def load_dataset():
     current_script_dir = Path(__file__).resolve().parent
     data_dir = current_script_dir.parent.parent / "data" / "processed" / "tier1_graphs"
@@ -82,18 +126,12 @@ def load_dataset():
 
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
-    # NOTE: Increased initial LR to 1e-4 because Scheduler will decay it
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
     model = rGINO_DEQ(in_channels=4, latent_dim=64, max_iters=15).to(device)
 
     target_re = 150.0
     kernels = PhysicsKernels(reynolds=target_re)
-
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-
-    # --- 2. Initialize Scheduler ---
-    # Decays LR from 1e-4 down to 1e-6 over the course of training
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     dataset = load_dataset()
@@ -104,52 +142,45 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)
+    val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
 
+    best_phys_score = float('inf')
     best_loss = float('inf')
+
+    # Ensure model directory exists
+    Path("models").mkdir(exist_ok=True)
 
     for epoch in range(epochs):
         model.train()
-
-        # Physics Warm-Up: Turn on earlier (Epoch 10) to give scheduler time to work
         physics_active = epoch >= warm_up_epochs
         lambda_phys = 1.0 if physics_active else 0.0
-
         total_loss_epoch = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
 
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
-
             pred = model(data)
 
-            # Supervised Loss
+            # --- Loss Calculation ---
             l_data = torch.tensor(0.0, device=device)
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
                     l_data = F.mse_loss(pred[node_is_anchor], data.y[node_is_anchor])
 
-            # Physics Losses
             l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
-
-            # Smoothness Penalty
             row, col = data.edge_index
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
-            # --- 3. WEIGHT TUNING ---
-            # Reduced l_data (10 -> 5.0) to prevent overfitting noise
-            # Reduced l_smoothness (5 -> 2.0) to allow parabolic curves
-            # Kept l_ns strong (1.0)
             loss = (lambda_phys * l_ns + 10.0 * l_bc + 20.0 * l_io) + \
                    (5.0 * l_data) + (2.0 * l_smoothness)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
             total_loss_epoch += loss.item()
 
             pbar.set_postfix({
@@ -157,21 +188,34 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                 "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
 
-        # --- 4. Step Scheduler ---
+        # --- 4. Step Scheduler & Post-Epoch Evaluation ---
         scheduler.step()
 
-        # Save Best Model (Checkpointing)
+        # Quantitative Metrics every 2 epochs
+        if epoch % 2 == 0:
+            scores = quantify_performance(model, val_loader, kernels, device)
+            print(f"\n📊 [Validation] Rel L2: {scores['rel_l2']:.4f} | Div Res: {scores['continuity']:.3e} | Wall Slip: {scores['wall_slip']:.4f}")
+
+            # Checkpoint 1: Best "Physical Health" (Focus on consistency)
+            phys_score = scores['rel_l2'] + scores['continuity']
+            if phys_score < best_phys_score and physics_active:
+                best_phys_score = phys_score
+                torch.save(model.state_dict(), "models/tier1_best_physics.pth")
+                print("⭐ Saved Best Physics Model")
+
+        # Checkpoint 2: Best "Training Loss" (Focus on objective minimization)
         avg_loss = total_loss_epoch / len(loader)
         if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
-            torch.save(model.state_dict(), "models/tier1_best.pth")
+            torch.save(model.state_dict(), "models/tier1_best_loss.pth")
 
+        # Visualization every 5 epochs
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device)
 
-    # Save final
+    # Save final weights
     torch.save(model.state_dict(), "models/tier1_final.pth")
-    print(f"Training Complete. Best Loss: {best_loss:.4f}")
+    print(f"Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":

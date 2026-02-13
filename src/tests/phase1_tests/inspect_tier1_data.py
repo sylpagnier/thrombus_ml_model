@@ -133,4 +133,4 @@ def inspect_sample(filename="vessel_0.pt"):
 
 
 if __name__ == "__main__":
-    inspect_sample("vessel_0.pt")
+    inspect_sample("vessel_5.pt")
