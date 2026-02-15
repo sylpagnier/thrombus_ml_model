@@ -137,5 +137,34 @@ def test_kernel_on_real_gmsh_topology(tmp_path):
     assert mse_interior < 0.20, f"Unstructured interior gradients failing: {mse_interior.item()}"
 
 
+def test_navier_stokes_integration(shared_test_graph):
+    """
+    Integration test to catch shape mismatches and broadcasting errors
+    in the full Navier-Stokes residual assembly.
+    """
+    data = shared_test_graph
+    kernels = PhysicsKernels(reynolds=1.0)
+
+    # Create dummy predictions [N, 3] (u, v, p)
+    # Using random data is fine; we just want to ensure it runs without crashing.
+    pred = torch.randn(data.num_nodes, 3)
+
+    # Create dummy masks (required because shared_test_graph doesn't have them)
+    # Mark the center as 'interior' and edges as 'wall'
+    x = data.x[:, 0]
+    mask_wall = (x < 0.1) | (x > 3.9)
+    data.mask_wall = mask_wall
+
+    # Run the function that was previously crashing
+    try:
+        loss = kernels.navier_stokes_residual(pred, data)
+        print(f"\nNavier-Stokes Residual Loss: {loss.item():.4f}")
+    except RuntimeError as e:
+        pytest.fail(f"Navier-Stokes assembly crashed: {e}")
+
+    assert not torch.isnan(loss), "Loss returned NaN"
+    assert loss >= 0.0, "Loss cannot be negative"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

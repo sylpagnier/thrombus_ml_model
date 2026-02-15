@@ -155,4 +155,4 @@ def inspect_sample(filename="vessel_0.pt"):
 
 if __name__ == "__main__":
     # You can change this to any vessel_idx.pt you want to check
-    inspect_sample("vessel_0.pt")
+    inspect_sample("vessel_18.pt")

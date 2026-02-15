@@ -111,23 +111,27 @@ class PhysicsKernels:
         if props is None:
             props = self._get_geometric_props(data)
 
-        u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+        # FIX 1: Squeeze to 1D [N] to match derivatives [N].
+        # Prevents [N,1]*[N] -> [N,N] broadcasting explosion.
+        u, v, p = pred[:, 0], pred[:, 1], pred[:, 2]
 
-        c_u = self._compute_derivatives(u, props)  # [N, 5, 1]
-        c_v = self._compute_derivatives(v, props)  # [N, 5, 1]
-        c_p = self._compute_derivatives(p, props)  # [N, 5, 1]
+        # Derivatives are shape [N, 5, 1] -> squeeze to [N]
+        c_u = self._compute_derivatives(u.unsqueeze(1), props)
+        c_v = self._compute_derivatives(v.unsqueeze(1), props)
+        c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
+        # Extract components (all shape [N])
         u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
         v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        # Use explicitly calculated Laplacian instead of chained gradients!
         u_xx, u_yy = c_u[:, 2, 0], c_u[:, 4, 0]
         v_xx, v_yy = c_v[:, 2, 0], c_v[:, 4, 0]
 
         lap_u = u_xx + u_yy
         lap_v = v_xx + v_yy
 
+        # Physics Equations (All terms are now [N])
         l_cont = u_x + v_y
         mom_x = (u * u_x + v * u_y) + p_x - (1.0 / self.Re) * lap_u
         mom_y = (u * v_x + v * v_y) + p_y - (1.0 / self.Re) * lap_v
@@ -137,14 +141,20 @@ class PhysicsKernels:
         interior_mask = ~mask_wall_1d
 
         if interior_mask.any():
-            res = torch.mean(l_cont[interior_mask] ** 2 + mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
+            # Ensure EVERY term has [interior_mask]
+            res = torch.mean(
+                l_cont[interior_mask] ** 2 +
+                mom_x[interior_mask] ** 2 +
+                mom_y[interior_mask] ** 2
+            )
         else:
             res = torch.tensor(0.0, device=pred.device)
 
         return res
 
     def boundary_condition_loss(self, pred, data):
-        u, v = pred[:, 0:1], pred[:, 1:2]
+        # Squeeze to [N] to be safe
+        u, v = pred[:, 0], pred[:, 1]
         mask_wall_1d = data.mask_wall.view(-1).bool()
         if mask_wall_1d.any():
             u_wall = u[mask_wall_1d]
