@@ -1,17 +1,10 @@
 import mph
-from pathlib import Path
+from src.utils.paths import get_project_root
 
 # --- 1. Setup Paths ---
 template_path = 'comsol_models/phase1_template.mph'
-# Adjust "root" logic if your script is in src/anchor_cfds/ vs project root
-# Assuming this script is run from project root or similar to your previous one:
-current_path = Path(__file__).resolve()
-# Heuristic to find project root if running from src/
-if 'src' in str(current_path):
-    project_root = current_path.parent.parent.parent.parent
-else:
-    project_root = current_path.parent.parent
 
+project_root = get_project_root()
 abs_template = project_root / template_path
 
 print(f"Loading: {abs_template}")
@@ -36,7 +29,7 @@ for c_tag in comp_tags:
     comp_node = model.java.component(c_tag)
 
     # 2. Inspect Meshes inside this Component
-    # Note: We skip 'geometries' since that caused your crash and you likely need 'meshes' anyway
+    # Note: We skip 'geometries' since that caused your crash, and you likely need 'meshes' anyway
     print(f"  Looking for Meshes in {c_tag}...")
     try:
         mesh_tags = comp_node.mesh().tags()

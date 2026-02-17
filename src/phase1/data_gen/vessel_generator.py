@@ -4,14 +4,13 @@ import numpy as np
 import gmsh
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
-from pathlib import Path
 from src.utils.paths import get_project_root
 from src.config import VesselConfig
 
 
 class VesselGenerator:
-    def __init__(self, config: VesselConfig):
-        self.cfg = config
+    def __init__(self):
+        self.cfg = VesselConfig
         self.project_root = get_project_root()
 
         # Resolve output directory from Config
@@ -248,7 +247,7 @@ class VesselGenerator:
             gmsh.model.remove()
 
     def run_pipeline(self, n=50, level=1):
-        print(f"🚀 Generating Level {level} Dataset (N={n}) in {self.output_dir}...")
+        print(f" Generating Level {level} Dataset (N={n}) in {self.output_dir}...")
 
         # Visualize first 9 samples in a grid
         fig, axes = plt.subplots(3, 3, figsize=(15, 8))
@@ -267,6 +266,6 @@ class VesselGenerator:
 
 if __name__ == "__main__":
     config = VesselConfig()
-    vg = VesselGenerator(config)
-    vg.run_pipeline(n=100, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
+    vg = VesselGenerator()
+    vg.run_pipeline(n=50, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
     gmsh.finalize()

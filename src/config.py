@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+from src.utils.paths import get_project_root
 
 
 @dataclass
@@ -7,19 +8,20 @@ class VesselConfig:
     """Central configuration for vessel geometry and mesh generation."""
     # --- Paths ---
     # Where the COMSOL template lives
-    template_path: str = "comsol_models/phase1_template.mph"
+    project_root = get_project_root()
+    template_path: str = project_root / "comsol_models/phase1_template.mph"
 
     # 1. RAW DATA: Where meshes (.msh/.nas) and metadata (.json) are saved
-    mesh_input_dir: str = "data/raw/synthetic"
+    mesh_input_dir: str = project_root / "data/raw/synthetic"
 
     # 2. PROCESSED CFD: Where COMSOL results (.npz) are saved
-    output_dir: str = "data/processed/cfd_results"
+    output_dir: str = project_root / "data/processed/cfd_results"
 
     # 3. FINAL GRAPHS: Where PyTorch Geometric graphs (.pt) are saved
-    graph_output_dir: str = "data/processed/graphs"
+    graph_output_dir: str = project_root / "data/processed/graphs"
 
     # Mesh Settings
-    mesh_size_factor: float = 0.25
+    mesh_size_factor: float = .8
     mesh_lc: float = 0.0002
 
     # Vessel Dimensions
