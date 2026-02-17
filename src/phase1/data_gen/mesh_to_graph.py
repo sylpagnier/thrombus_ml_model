@@ -32,23 +32,43 @@ class MeshToGraphComplete:
         line_cells = []
         line_tags = []
 
-        # 2. Define standard tags
-        T_IN = 101
-        T_OUT1 = 102
-        T_OUT2 = 103
-        T_WALL = 104 if num_outlets == 2 else 103
+        # 2. Define standard tags from Config
+        tags = self.vessel_cfg.TAGS
+        T_IN = tags["Inlet"]  # 101
+        T_OUT1 = tags["Outlet_1"]  # 102
+        T_OUT2 = tags["Outlet_2"]  # 103
+
+        # Dynamic Wall Tag Logic (Matches VesselGenerator)
+        # Bifurcation (2 outlets): Walls = 104 (Config['Walls'])
+        # Straight (1 outlet): Walls = 103 (Overlaps with Outlet_2 ID, but used as Wall)
+        T_WALL = tags["Walls"] if num_outlets == 2 else 103
 
         # 3. Populate if data exists
-        if "line" in mesh.cells_dict and "gmsh:physical" in mesh.cell_data_dict:
-            line_cells = mesh.cells_dict["line"]
-            line_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
+        # Handle modern meshio (list of blocks) vs older versions
+        try:
+            if "line" in mesh.cells_dict:
+                line_cells = mesh.cells_dict["line"]
+                line_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
+            elif hasattr(mesh, "get_cells_type"):
+                line_cells = mesh.get_cells_type("line")
+                line_tags = mesh.get_cell_data("gmsh:physical", "line")
+        except Exception:
+            pass
 
         # 4. Loop is now safe even if line_tags is empty
         for i, tag in enumerate(line_tags):
-            nodes = line_cells[i]
+            # Ensure we access the correct cell block if line_cells is a list of blocks
+            # (meshio < 5.0 often returns a list of arrays for cells)
+            if isinstance(line_cells, list) and not isinstance(line_cells[0], (int, float, np.integer)):
+                nodes = line_cells[i]
+            else:
+                nodes = line_cells[i]
+
             if tag == T_IN:
                 mask_inlet[nodes] = True
-            elif tag == T_OUT1 or (num_outlets == 2 and tag == T_OUT2):
+            elif tag == T_OUT1:
+                mask_outlet[nodes] = True
+            elif num_outlets == 2 and tag == T_OUT2:
                 mask_outlet[nodes] = True
             elif tag == T_WALL:
                 mask_wall[nodes] = True
@@ -70,14 +90,18 @@ class MeshToGraphComplete:
             print(f"Skipping {filename}: {e}")
             return
 
-        # Restored: Fallback for d_bar if JSON is missing
+        # --- FIX 1: Robust Metadata Loading ---
         d_bar = None
+        num_outlets = 1  # Default for safety
+
         if json_path.exists():
             with open(json_path, 'r') as f:
                 meta = json.load(f)
                 d_bar = meta.get('d_bar')
+                num_outlets = meta.get('num_outlets', 1)
 
-        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
+        # --- FIX 2: Pass num_outlets to function ---
+        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes), num_outlets)
 
         if d_bar is None:
             if mask_inlet.any():

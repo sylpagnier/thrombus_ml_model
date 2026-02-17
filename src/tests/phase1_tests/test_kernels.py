@@ -1,9 +1,10 @@
 import pytest
 import torch
+import os
 from torch_geometric.data import Data
 from src.phase1.physics.physics_kernels import PhysicsKernels
-import os
-from src.config import VesselConfig
+from src.config import VesselConfig, PhysicsConfig
+
 
 # ==========================================
 # FIXTURES
@@ -18,7 +19,6 @@ def shared_test_graph():
 
     dist = torch.cdist(nodes, nodes)
     edge_index = (dist < 0.20).nonzero().t()
-    # Remove self-loops
     edge_index = edge_index[:, edge_index[0] != edge_index[1]]
 
     return Data(x=nodes, edge_index=edge_index, num_nodes=nodes.shape[0])
@@ -28,10 +28,7 @@ def shared_test_graph():
 # UNIT TESTS (STRUCTURED)
 # ==========================================
 def test_first_order_gradient(shared_test_graph):
-    """
-    Verifies that the first derivative is computed correctly.
-    Input: u = y^2  =>  du/dy = 2y, du/dx = 0
-    """
+    """Verifies that the first derivative is computed correctly."""
     data = shared_test_graph
     kernels = PhysicsKernels(reynolds=1.0)
     props = kernels._get_geometric_props(data)
@@ -42,33 +39,23 @@ def test_first_order_gradient(shared_test_graph):
     grad_u = kernels._compute_gradients(u, props)
     du_dx, du_dy = grad_u[:, 0:1], grad_u[:, 1:2]
 
-    # dx should be 0, dy should be 2y
     assert torch.allclose(du_dx, torch.zeros_like(du_dx), atol=1e-3), "du/dx is non-zero!"
-
     mse_dy = torch.nn.functional.mse_loss(du_dy, 2.0 * y)
     assert mse_dy < 0.01, f"First derivative du/dy failed! MSE: {mse_dy.item():.4f}"
 
 
 def test_second_order_laplacian_structured(shared_test_graph):
-    """
-    Tests Div(Grad(u)) by isolating interior nodes from boundary nodes.
-    Input: u = y^2 => d^2u/dy^2 = 2.0, d^2u/dx^2 = 0.0
-    """
+    """Tests Div(Grad(u)) by isolating interior nodes from boundary nodes."""
     data = shared_test_graph
     kernels = PhysicsKernels(reynolds=1.0)
     props = kernels._get_geometric_props(data)
 
     u = data.x[:, 1:2] ** 2
 
-    # Compute 1st then 2nd derivative.
-    # Note: Even though we have a direct 2nd-order solver in PhysicsKernels now,
-    # this test specifically checks the legacy chained behavior. Because the direct
-    # solver is strictly 2nd-order, applying it twice on a quadratic works flawlessly!
     grad_u = kernels._compute_gradients(u, props)
     grad_du_dy = kernels._compute_gradients(grad_u[:, 1:2], props)
     d2u_dy2 = grad_du_dy[:, 1:2]
 
-    # Isolate interior vs boundary nodes
     x, y = data.x[:, 0], data.x[:, 1]
     interior_mask = (x > 0.4) & (x < 3.6) & (y > -0.3) & (y < 0.3)
     boundary_mask = ~interior_mask
@@ -82,43 +69,31 @@ def test_second_order_laplacian_structured(shared_test_graph):
     print(f"\nStructured Interior d^2u/dy^2 MSE: {mse_interior.item():.4f}")
     print(f"Structured Boundary d^2u/dy^2 MSE: {mse_boundary.item():.4f}")
 
-    # The interior should be extremely accurate
-    assert mse_interior < 0.05, f"Core WLS math is failing on interior nodes: MSE {mse_interior.item()}"
-
-    # WE FIXED THE KERNEL! The boundary error should now be virtually zero as well.
-    assert mse_boundary < 0.05, f"Boundary error is still too high! MSE: {mse_boundary.item()}"
+    assert mse_interior < 0.05, f"Interior MSE too high: {mse_interior.item()}"
+    assert mse_boundary < 0.05, f"Boundary MSE too high: {mse_boundary.item()}"
 
 
 # ==========================================
-# INTEGRATION TEST (UNSTRUCTURED)
+# INTEGRATION TESTS (REAL DATA)
 # ==========================================
 def test_kernel_on_existing_data():
-    """
-    Tests the Laplacian using pre-generated .pt files found in the
-    configured graph output directory.
-    """
-    # 1. Access the global configuration for paths
+    """Tests Laplacian accuracy on a real vessel mesh."""
     cfg = VesselConfig()
-    graph_dir = cfg.graph_output_dir  # data/processed/graphs
+    graph_dir = cfg.graph_output_dir
 
-    # 2. Check for available processed graphs
     if not os.path.exists(graph_dir):
-        pytest.skip(f"Directory {graph_dir} does not exist. Run the pipeline first.")
+        pytest.skip("Graph directory missing.")
 
     existing_files = [f for f in os.listdir(graph_dir) if f.endswith('.pt')]
-
     if not existing_files:
-        pytest.skip(f"No .pt files found in {graph_dir}. Generate data before testing.")
+        pytest.skip("No .pt files found.")
 
-    # 3. Load the first available graph
     data_path = graph_dir / existing_files[0]
     data = torch.load(data_path, weights_only=False)
 
-    # 4. Initialize kernels and compute gradients
     kernels = PhysicsKernels(reynolds=1.0)
     props = kernels._get_geometric_props(data)
 
-    # u = y^2 => d^2u/dy^2 = 2.0
     y_coord = data.x[:, 1:2]
     u = y_coord ** 2
 
@@ -126,52 +101,85 @@ def test_kernel_on_existing_data():
     grad_du_dy = kernels._compute_gradients(grad_u[:, 1:2], props)
     d2u_dy2 = grad_du_dy[:, 1:2]
 
-    # 5. Mask interior via the Signed Distance Field (Index 2 in node features)
     sdf = data.x[:, 2]
     interior_mask = sdf > 0.08
 
-    # Check if we have enough interior nodes to validate
     if interior_mask.sum() == 0:
-        pytest.fail("The loaded mesh has no interior nodes based on the SDF mask.")
+        pytest.fail("No interior nodes found.")
 
     mse_interior = torch.nn.functional.mse_loss(
         d2u_dy2[interior_mask],
         torch.full_like(d2u_dy2[interior_mask], 2.0)
     )
 
-    print(f"\nTested on existing file: {existing_files[0]}")
+    print(f"\nTested Laplacian on file: {existing_files[0]}")
     print(f"Unstructured Interior d^2u/dy^2 MSE: {mse_interior.item():.4f}")
 
-    assert mse_interior < 0.20, f"Kernel accuracy failed on existing mesh: {mse_interior.item()}"
+    assert mse_interior < 0.20, f"Laplacian accuracy failed: {mse_interior.item()}"
 
 
-def test_navier_stokes_integration(shared_test_graph):
+def test_navier_stokes_integration_real_data():
     """
-    Integration test to catch shape mismatches and broadcasting errors
-    in the full Navier-Stokes residual assembly.
+    Validates the full Navier-Stokes Residual using PRE-GENERATED COMSOL DATA.
+    Instead of synthetic parabolas, we check if the Kernel agrees with COMSOL.
     """
-    data = shared_test_graph
-    kernels = PhysicsKernels(reynolds=1.0)
+    # 1. Load Configs
+    v_cfg = VesselConfig()
+    p_cfg = PhysicsConfig()
 
-    # Create dummy predictions [N, 3] (u, v, p)
-    # Using random data is fine; we just want to ensure it runs without crashing.
-    pred = torch.randn(data.num_nodes, 3)
+    graph_dir = v_cfg.graph_output_dir
+    if not os.path.exists(graph_dir):
+        pytest.skip("Graph directory missing.")
 
-    # Create dummy masks (required because shared_test_graph doesn't have them)
-    # Mark the center as 'interior' and edges as 'wall'
-    x = data.x[:, 0]
-    mask_wall = (x < 0.1) | (x > 3.9)
-    data.mask_wall = mask_wall
+    existing_files = [f for f in os.listdir(graph_dir) if f.endswith('.pt')]
+    if not existing_files:
+        pytest.skip("No .pt files found. Run data pipeline first.")
 
-    # Run the function that was previously crashing
+    # 2. Load a real graph (e.g., vessel_0.pt)
+    # We try to find a 'straight' vessel if possible as they are numerically cleaner
+    # but any file will work.
+    filename = existing_files[0]
+    data_path = graph_dir / filename
+    data = torch.load(data_path, weights_only=False)
+
+    # 3. Setup Physics Kernel with CORRECT Reynolds Number
+    # The data in .pt is normalized. We must match the Re used in generation.
+    re_target = p_cfg.re_target  # e.g. 150.0
+    kernels = PhysicsKernels(reynolds=re_target)
+
+    # 4. Extract COMSOL Ground Truth
+    # data.y is [u, v, p] (normalized)
+    # We treat this as our "prediction" to see if it satisfies the equations
+    u_comsol = data.y[:, 0]
+    v_comsol = data.y[:, 1]
+    p_comsol = data.y[:, 2]
+
+    pred = torch.stack([u_comsol, v_comsol, p_comsol], dim=1)
+
+    # 5. Compute Residual
+    # Note: data.mask_wall or similar might need to be set if the kernel uses it strict
+    # But usually residuals are just computed over all nodes.
     try:
         loss = kernels.navier_stokes_residual(pred, data)
-        print(f"\nNavier-Stokes Residual Loss: {loss.item():.4f}")
+        print(f"\n[{filename}] Navier-Stokes Residual (Re={re_target}): {loss.item():.4f}")
     except RuntimeError as e:
         pytest.fail(f"Navier-Stokes assembly crashed: {e}")
 
+    # 6. Assertion
+    # The residual won't be 0.0 because:
+    #   a) COMSOL uses FEM, we use Finite Difference (discretization error)
+    #   b) Interpolation noise from mesh_to_graph
+    # However, it should be significantly lower than random noise (which was ~140,000)
+
+    # We normalize by number of nodes to get a sense of "per-node error"
+    mse_loss = loss.item() / data.num_nodes
+    print(f"Mean Residual per Node: {mse_loss:.6f}")
+
     assert not torch.isnan(loss), "Loss returned NaN"
-    assert loss >= 0.0, "Loss cannot be negative"
+
+    # Threshold: Random noise is ~200.0 per node. Physics should be < 5.0 per node.
+    # (Adjust this threshold based on what you see in the first run)
+    assert mse_loss < 5.0, f"Residual is too high ({mse_loss:.4f}). Physics might be mismatched."
 
 
 if __name__ == "__main__":

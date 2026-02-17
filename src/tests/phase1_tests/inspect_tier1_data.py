@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from torch_geometric.data import Data
-from src.phase1.utils.physics_kernels import PhysicsKernels
+from src.phase1.physics.physics_kernels import PhysicsKernels
 
 
 def analyze_wls_stability(data):
@@ -51,7 +51,7 @@ def analyze_wls_stability(data):
 def inspect_sample(filename="vessel_0.pt"):
     # 1. Load Data
     project_root = Path(__file__).resolve().parent.parent.parent.parent
-    data_dir = project_root / "data/processed/tier1_graphs"
+    data_dir = project_root / "data/processed/graphs"
     data_path = data_dir / filename
 
     if not data_path.exists():
@@ -155,4 +155,4 @@ def inspect_sample(filename="vessel_0.pt"):
 
 if __name__ == "__main__":
     # You can change this to any vessel_idx.pt you want to check
-    inspect_sample("vessel_18.pt")
+    inspect_sample("vessel_1.pt")

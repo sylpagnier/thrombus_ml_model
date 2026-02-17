@@ -1,7 +1,7 @@
 {
     "id": 0,
-    "type": "aneurysm_straight",
+    "type": "stenosis_straight",
     "level": 1,
-    "d_bar": 0.0024092247107616225,
+    "d_bar": 0.000836725823506358,
     "num_outlets": 1
 }
