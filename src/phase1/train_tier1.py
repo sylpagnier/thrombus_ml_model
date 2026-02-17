@@ -115,7 +115,7 @@ def quantify_performance(model, val_loader, kernels, device):
 
 def load_dataset():
     current_script_dir = Path(__file__).resolve().parent
-    data_dir = current_script_dir.parent.parent / "data" / "processed" / "tier1_graphs"
+    data_dir = current_script_dir.parent.parent / "data" / "processed" / "graphs"
     file_list = sorted(list(data_dir.glob("vessel_*.pt")))
     dataset = []
     print(f"📂 Loading {len(file_list)} graphs...")
