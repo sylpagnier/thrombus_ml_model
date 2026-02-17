@@ -6,7 +6,7 @@ import meshio
 from pathlib import Path
 from tqdm import tqdm
 from typing import Tuple, Optional
-from src.config import VesselConfig
+from src.config import VesselConfig, PhysicsConfig
 
 # Configure logging
 logging.basicConfig(
@@ -21,21 +21,22 @@ class AnchorGenerator:
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
-    def __init__(self, config: VesselConfig):
-        self.config = config
+    def __init__(self):
+        self.vessel_config = VesselConfig
+        self.phys_cfg = PhysicsConfig
         # Resolve root relative to this script location (src/anchor_generator.py -> root)
         self.root_dir = Path(__file__).resolve().parent.parent
 
         # --- 1. Resolve Template Path ---
-        self.template_path = self.root_dir / config.template_path
+        self.template_path = self.root_dir / VesselConfig.template_path
 
         # --- 2. Resolve Input/Output Paths ---
         # Handle absolute vs relative paths automatically from Config
-        self.output_dir = (Path(config.output_dir) if Path(config.output_dir).is_absolute()
-                           else self.root_dir / config.output_dir)
+        self.output_dir = (Path(VesselConfig.output_dir) if Path(VesselConfig.output_dir).is_absolute()
+                           else self.root_dir / VesselConfig.output_dir)
 
-        self.mesh_dir = (Path(config.mesh_input_dir) if Path(config.mesh_input_dir).is_absolute()
-                         else self.root_dir / config.mesh_input_dir)
+        self.mesh_dir = (Path(VesselConfig.mesh_input_dir) if Path(VesselConfig.mesh_input_dir).is_absolute()
+                         else self.root_dir / VesselConfig.mesh_input_dir)
 
         self.client: Optional[mph.Client] = None
         self.model: Optional[mph.Model] = None
@@ -51,6 +52,8 @@ class AnchorGenerator:
         logger.info(f"Connecting to COMSOL... Loading: {self.template_path.name}")
         self.client = mph.start()
         self.model = self.client.load(str(self.template_path))
+        self._set_global_physics_parameters()
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         return self
 
@@ -58,6 +61,21 @@ class AnchorGenerator:
         if self.client:
             logger.info("Disconnecting from COMSOL...")
             self.client.clear()
+
+    def _set_global_physics_parameters(self):
+        """Initializes COMSOL global parameters from PhysicsConfig."""
+        logger.info("Setting global physics parameters in COMSOL.")
+        # Fluid density and Newtonian viscosity
+        self.model.parameter('rho_fluid', f'{self.phys_cfg.rho} [kg/m^3]')
+        self.model.parameter('mu_ref', f'{self.phys_cfg.mu_newtonian} [Pa*s]')
+        self.model.parameter('Re_target', str(self.phys_cfg.re_target))
+
+        # Carreau-Yasuda parameters (for non-Newtonian sims)
+        self.model.parameter('mu_inf', f'{self.phys_cfg.mu_inf} [Pa*s]')
+        self.model.parameter('mu_0', f'{self.phys_cfg.mu_0} [Pa*s]')
+        self.model.parameter('lambda_cy', f'{self.phys_cfg.lam} [s]')
+        self.model.parameter('n_index', str(self.phys_cfg.n))
+        self.model.parameter('a_yasuda', str(self.phys_cfg.a))
 
     def _evaluate_at_coords(self, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -158,21 +176,41 @@ class AnchorGenerator:
                 continue
 
             try:
-                # 1. Load Metadata (The Source of Truth)
                 with open(json_file, 'r') as f:
                     meta = json.load(f)
                     d_bar = meta['d_bar']
+                    num_outlets = meta.get('num_outlets', 1)
 
-                # 2. Update COMSOL Parameters
-                # We pass d_bar to 'D_eff' for Reynolds scaling in COMSOL
+                # Dynamic Tag Selection
+                # Inlet is always 101, Outlet_1 is 102.
+                # Walls shift based on num_outlets.
+                wall_tag = 104 if num_outlets == 2 else 103
+                outlet_2_active = (num_outlets == 2)
+
+                # Update COMSOL Boundary Conditions
+                # Assuming 'wall_selection' and 'outlet2_feature' are named in your .mph
+                self.model.java.component('comp1').physics('spf').feature('wall1').selection().set(wall_tag)
+
+                if outlet_2_active:
+                    # Ensure the second outlet is enabled and set to Tag 103
+                    self.model.java.component('comp1').physics('spf').feature('out2').active(True)
+                    self.model.java.component('comp1').physics('spf').feature('out2').selection().set(103)
+                else:
+                    self.model.java.component('comp1').physics('spf').feature('out2').active(False)
+
+                # 1. Update dynamic parameters per vessel
                 self.model.parameter('D_eff', f'{d_bar:.8f} [m]')
 
-                # 3. Update Mesh Geometry
+                # 2. Calculate u_ref to match MeshToGraph scaling
+                # COMSOL can calculate this itself if you set a formula in the .mph,
+                # but pushing it explicitly ensures 100% parity with your graph labels.
+                u_ref = (self.phys_cfg.re_target * self.phys_cfg.mu_newtonian) / (self.phys_cfg.rho * d_bar)
+                self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')
+
+                # 3. Update Mesh & Solve
                 feat = mesh_j.feature(import_tag)
                 feat.set('filename', str(nas_file))
                 mesh_j.run()
-
-                # 4. Solve
                 self.model.solve()
 
                 # 5. Extract & Validate
@@ -181,8 +219,24 @@ class AnchorGenerator:
 
                 u, v, p = self._evaluate_at_coords(target_nodes)
 
-                if np.isnan(u).any():
-                    logger.warning(f"NaNs detected in {i}")
+                # PRESSURE PINNING: Subtract mean outlet pressure
+                if "line" in mesh.cells_dict and "gmsh:physical" in mesh.cell_data_dict:
+                    line_cells = mesh.cells_dict["line"]
+                    line_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
+                    outlet_node_indices = []
+
+                    # Use standard tags: Outlet_1 (102) and Outlet_2 (103)
+                    for j, tag in enumerate(line_tags):
+                        if tag in [102, 103]:
+                            outlet_node_indices.extend(line_cells[j])
+
+                    if outlet_node_indices:
+                        # Identify unique nodes and calculate mean pressure at the outlet
+                        p_offset = np.mean(p[np.unique(outlet_node_indices)])
+                        p = p - p_offset
+
+                if not np.isfinite(u).all():
+                    logger.warning(f"NaNs or infinities detected in {i}")
                     continue
 
                 np.savez(
@@ -198,12 +252,9 @@ class AnchorGenerator:
                 continue
 
 if __name__ == "__main__":
-    # Initialize Config
-    config = VesselConfig()
-
     try:
         # Run the pipeline
-        with AnchorGenerator(config) as generator:
+        with AnchorGenerator() as generator:
             generator.run_batch(start_idx=0, end_idx=50)
 
     except KeyboardInterrupt:

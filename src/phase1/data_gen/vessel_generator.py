@@ -2,6 +2,8 @@ import json
 import random
 import numpy as np
 import gmsh
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
 from pathlib import Path
 from src.utils.paths import get_project_root
 from src.config import VesselConfig
@@ -24,11 +26,37 @@ class VesselGenerator:
         gmsh.option.setNumber("General.Terminal", 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
         gmsh.option.setNumber("Mesh.Smoothing", 5)
-        # 2.2 is safest for Python meshio compatibility
         gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
         gmsh.option.setNumber("Mesh.Binary", 0)
         gmsh.option.setNumber("Mesh.SaveGroupsOfNodes", 1)
         gmsh.option.setNumber("Mesh.MeshSizeFactor", self.cfg.mesh_size_factor)
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
+
+    def _get_mesh_data(self):
+        """Extracts nodes and triangles for visualization."""
+        node_tags, coords, _ = gmsh.model.mesh.getNodes()
+        nodes = coords.reshape(-1, 3)[:, :2]
+        node_dict = {tag: i for i, tag in enumerate(node_tags)}
+        element_types, _, node_connectivity = gmsh.model.mesh.getElements(2)
+        if not element_types or len(node_connectivity) == 0:
+            return None, None
+        tri_nodes = node_connectivity[0].reshape(-1, 3)
+        triangles = np.array([[node_dict[tag] for tag in tri] for tri in tri_nodes])
+        return nodes, triangles
+
+    def visualize_sample(self, idx, ax):
+        """Visualizes the generated mesh on a Matplotlib axis."""
+        nodes, triangles = self._get_mesh_data()
+        if nodes is None:
+            return
+        verts = nodes[triangles]
+        poly = PolyCollection(verts, edgecolors='black', facecolors='lightblue', linewidths=0.1)
+        ax.add_collection(poly)
+        # Fixed limits for standard scale (Meters)
+        ax.set_xlim(-0.002, 0.020)
+        ax.set_ylim(-0.008, 0.008)
+        ax.set_aspect('equal')
+        ax.set_title(f"Sample {idx}")
 
     def _save_metadata(self, idx, d_bar, vessel_type, level, num_outlets):
         meta = {
@@ -103,9 +131,7 @@ class VesselGenerator:
             "Inlet": [l_in], "Outlet_1": [l_o1], "Outlet_2": [l_o2],
             "Walls": [l_wt, l_fork, l_wb]
         }
-
-        d_effective = w_parent
-        return curves, groups, d_effective
+        return curves, groups, w_parent
 
     def generate_spline_vessel(self, v_type, is_curved):
         width = random.uniform(self.cfg.width_min, self.cfg.width_max)
@@ -115,12 +141,16 @@ class VesselGenerator:
         c_pts = []
         for i in range(self.cfg.num_ctrl_pts):
             x = (i / (self.cfg.num_ctrl_pts - 1)) * length
-            y = random.uniform(-self.cfg.curvature_amplitude, self.cfg.curvature_amplitude) if is_curved else 0.0
+
+            # Strictly align the first point to y=0 for centered inlets
+            if i == 0:
+                y = 0.0
+            else:
+                y = random.uniform(-self.cfg.curvature_amplitude, self.cfg.curvature_amplitude) if is_curved else 0.0
+
             c_pts.append(np.array([x, y]))
 
         offsets = self._calculate_pathology_offsets(v_type, width)
-
-        # Calculate d_bar
         widths = [width + (2 * o) if o > 0 else width - (2 * abs(o)) for o in offsets]
         d_bar_true = np.mean(widths)
 
@@ -153,20 +183,21 @@ class VesselGenerator:
         }
         return curves, groups, d_bar_true
 
-    def generate(self, idx, level=1):
+    def generate(self, idx, level=1, show_viz=False, ax=None):
         gmsh.model.add(f"vessel_{idx}")
         try:
             is_bifurcation = False
-            v_type = 'straight'
             is_curved = False
+            v_type = 'straight'
 
-            # Logic for dataset complexity levels
-            if level == 0:
-                v_type = 'straight'
-            elif level == 1:
+            # 3-Tier Level Logic
+            if level == 1:
                 v_type = random.choice(['straight', 'stenosis', 'aneurysm'])
-                is_curved = random.choice([True, False])
-            elif level >= 2:
+                is_curved = False
+            elif level == 2:
+                v_type = random.choice(['straight', 'stenosis', 'aneurysm'])
+                is_curved = True
+            else:  # Level 3
                 if random.random() > 0.7:
                     is_bifurcation = True
                 else:
@@ -186,20 +217,27 @@ class VesselGenerator:
             s = gmsh.model.geo.addPlaneSurface([cl])
             gmsh.model.geo.synchronize()
 
-            # Physical Groups
-            gmsh.model.addPhysicalGroup(1, groups["Inlet"], self.cfg.TAGS["Inlet"], name="Inlet")
-            gmsh.model.addPhysicalGroup(1, groups["Outlet_1"], self.cfg.TAGS["Outlet_1"], name="Outlet_1")
-            if groups["Outlet_2"]:
-                gmsh.model.addPhysicalGroup(1, groups["Outlet_2"], self.cfg.TAGS["Outlet_2"], name="Outlet_2")
-            gmsh.model.addPhysicalGroup(1, groups["Walls"], self.cfg.TAGS["Walls"], name="Walls")
-            gmsh.model.addPhysicalGroup(2, [s], self.cfg.TAGS["Fluid_Domain"], name="Fluid_Domain")
+            # --- Old Tagging Logic ---
+            # Inlet: 101, Outlet_1: 102
+            # IF bifurcation: Outlet_2: 103, Walls: 104
+            # ELSE: Walls: 103
+            gmsh.model.addPhysicalGroup(1, groups["Inlet"], 101, name="Inlet")
+            gmsh.model.addPhysicalGroup(1, groups["Outlet_1"], 102, name="Outlet_1")
+
+            if is_bifurcation:
+                gmsh.model.addPhysicalGroup(1, groups["Outlet_2"], 103, name="Outlet_2")
+                gmsh.model.addPhysicalGroup(1, groups["Walls"], 104, name="Walls")
+            else:
+                gmsh.model.addPhysicalGroup(1, groups["Walls"], 103, name="Walls")
+
+            gmsh.model.addPhysicalGroup(2, [s], 201, name="Fluid_Domain")
 
             gmsh.model.mesh.generate(2)
 
-            # --- KEY EXPORT STEP ---
-            # 1. Export MSH (for Python/Graph)
+            if show_viz and ax:
+                self.visualize_sample(idx, ax)
+
             gmsh.write(str(self.output_dir / f"vessel_{idx}.msh"))
-            # 2. Export NAS (for COMSOL Import)
             gmsh.write(str(self.output_dir / f"vessel_{idx}.nas"))
 
             self._save_metadata(idx, d_bar, v_str, level, num_outlets)
@@ -210,14 +248,25 @@ class VesselGenerator:
             gmsh.model.remove()
 
     def run_pipeline(self, n=50, level=1):
-        print(f"Generating Level {level} Dataset (N={n}) in {self.output_dir}...")
-        for i in range(n):
+        print(f"🚀 Generating Level {level} Dataset (N={n}) in {self.output_dir}...")
+
+        # Visualize first 9 samples in a grid
+        fig, axes = plt.subplots(3, 3, figsize=(15, 8))
+        axes = axes.flatten()
+        for i in range(min(9, n)):
+            self.generate(i, level=level, show_viz=True, ax=axes[i])
+        plt.tight_layout()
+        plt.show()
+
+        # Generate remainder
+        for i in range(9, n):
             self.generate(i, level=level)
+            if i % 50 == 0:
+                print(f"Progress: {i}/{n}")
+
 
 if __name__ == "__main__":
-    # Initialize Config
     config = VesselConfig()
-
-    # Run Generation
     vg = VesselGenerator(config)
-    vg.run_pipeline(n=50, level=0)
+    vg.run_pipeline(n=100, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
+    gmsh.finalize()
