@@ -1,7 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 import time
-from src.phase1.utils.ginodeq import rGINO_DEQ
+from src.phase1.physics.ginodeq import rGINO_DEQ
 from torch_geometric.data import Data
 
 

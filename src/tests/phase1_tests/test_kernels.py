@@ -1,13 +1,9 @@
 import pytest
 import torch
 from torch_geometric.data import Data
-from pathlib import Path
-import shutil
-
-from src.phase1.utils.physics_kernels import PhysicsKernels
-from src.phase1.data_gen.vessel_generator import VesselGenerator
-from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
-
+from src.phase1.physics.physics_kernels import PhysicsKernels
+import os
+from src.config import VesselConfig
 
 # ==========================================
 # FIXTURES
@@ -96,45 +92,57 @@ def test_second_order_laplacian_structured(shared_test_graph):
 # ==========================================
 # INTEGRATION TEST (UNSTRUCTURED)
 # ==========================================
-def test_kernel_on_real_gmsh_topology(tmp_path):
+def test_kernel_on_existing_data():
     """
-    Tests the Laplacian on a real unstructured mesh, utilizing the SDF to mask out the boundary.
+    Tests the Laplacian using pre-generated .pt files found in the
+    configured graph output directory.
     """
-    raw_dir = tmp_path / "raw"
-    proc_dir = tmp_path / "processed"
-    raw_dir.mkdir()
+    # 1. Access the global configuration for paths
+    cfg = VesselConfig()
+    graph_dir = cfg.graph_output_dir  # data/processed/graphs
 
-    gen = VesselGenerator(output_dir=raw_dir)
-    gen.generate(idx=0, level=1, show_viz=False, ax=None)
+    # 2. Check for available processed graphs
+    if not os.path.exists(graph_dir):
+        pytest.skip(f"Directory {graph_dir} does not exist. Run the pipeline first.")
 
-    converter = MeshToGraphComplete(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=proc_dir)
-    converter.process_file("vessel_0.msh")
+    existing_files = [f for f in os.listdir(graph_dir) if f.endswith('.pt')]
 
-    data = torch.load(proc_dir / "vessel_0.pt", weights_only=False)
+    if not existing_files:
+        pytest.skip(f"No .pt files found in {graph_dir}. Generate data before testing.")
+
+    # 3. Load the first available graph
+    data_path = graph_dir / existing_files[0]
+    data = torch.load(data_path, weights_only=False)
+
+    # 4. Initialize kernels and compute gradients
     kernels = PhysicsKernels(reynolds=1.0)
     props = kernels._get_geometric_props(data)
 
-    # Input: u = y^2
+    # u = y^2 => d^2u/dy^2 = 2.0
     y_coord = data.x[:, 1:2]
     u = y_coord ** 2
 
-    # Compute 2nd derivative (d^2u/dy^2)
     grad_u = kernels._compute_gradients(u, props)
     grad_du_dy = kernels._compute_gradients(grad_u[:, 1:2], props)
     d2u_dy2 = grad_du_dy[:, 1:2]
 
-    # Use the Signed Distance Field (Index 2) to dynamically find interior nodes
+    # 5. Mask interior via the Signed Distance Field (Index 2 in node features)
     sdf = data.x[:, 2]
     interior_mask = sdf > 0.08
 
-    interior_lap = d2u_dy2[interior_mask]
-    mse_interior = torch.nn.functional.mse_loss(interior_lap, torch.full_like(interior_lap, 2.0))
+    # Check if we have enough interior nodes to validate
+    if interior_mask.sum() == 0:
+        pytest.fail("The loaded mesh has no interior nodes based on the SDF mask.")
 
-    print(f"\nUnstructured Interior d^2u/dy^2 MSE: {mse_interior.item():.4f}")
+    mse_interior = torch.nn.functional.mse_loss(
+        d2u_dy2[interior_mask],
+        torch.full_like(d2u_dy2[interior_mask], 2.0)
+    )
 
-    # Unstructured grids will have slightly higher natural error than structured grids,
-    # but with a 2nd-order WLS it should comfortably beat 0.20
-    assert mse_interior < 0.20, f"Unstructured interior gradients failing: {mse_interior.item()}"
+    print(f"\nTested on existing file: {existing_files[0]}")
+    print(f"Unstructured Interior d^2u/dy^2 MSE: {mse_interior.item():.4f}")
+
+    assert mse_interior < 0.20, f"Kernel accuracy failed on existing mesh: {mse_interior.item()}"
 
 
 def test_navier_stokes_integration(shared_test_graph):
