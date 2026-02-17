@@ -1,11 +1,22 @@
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
+
 
 @dataclass
 class VesselConfig:
     """Central configuration for vessel geometry and mesh generation."""
-    # Output
-    output_dir: str = "data/raw/synthetic_v2"
+    # --- Paths ---
+    # Where the COMSOL template lives
+    template_path: str = "comsol_models/phase1_template.mph"
+
+    # 1. RAW DATA: Where meshes (.msh/.nas) and metadata (.json) are saved
+    mesh_input_dir: str = "data/raw/synthetic"
+
+    # 2. PROCESSED CFD: Where COMSOL results (.npz) are saved
+    output_dir: str = "data/processed/cfd_results"
+
+    # 3. FINAL GRAPHS: Where PyTorch Geometric graphs (.pt) are saved
+    graph_output_dir: str = "data/processed/graphs"
 
     # Mesh Settings
     mesh_size_factor: float = 0.25
@@ -32,7 +43,7 @@ class VesselConfig:
     # Control Points
     num_ctrl_pts: int = 7
 
-    # Physical Group Tags (The Single Source of Truth)
+    # Physical Group Tags (Must match what is used in Gmsh and Graph Gen)
     TAGS: Dict[str, int] = field(default_factory=lambda: {
         "Inlet": 101,
         "Outlet_1": 102,
@@ -41,8 +52,20 @@ class VesselConfig:
         "Fluid_Domain": 201
     })
 
+
 @dataclass
 class PhysicsConfig:
+    # Fluid Properties
     rho: float = 1050.0  # kg/m^3
-    mu_newtonian: float = 0.0035  # Pa*s
     re_target: float = 150.0  # Reynolds number [-]
+
+    # Newtonian Reference (Tier 1)
+    mu_newtonian: float = 0.0035  # Pa*s (3.5 cP)
+
+    # Carreau-Yasuda Rheology (Tier 2 - Cho & Kensey 1991 Human Blood)
+    # mu_eff = mu_inf + (mu_0 - mu_inf) * (1 + (lambda * gamma_dot)^a)^((n-1)/a)
+    mu_inf: float = 0.0035  # Pa*s
+    mu_0: float = 0.056  # Pa*s
+    lam: float = 3.313  # Relaxation time (s)
+    n: float = 0.3568  # Power law index
+    a: float = 2.0  # Yasuda parameter
