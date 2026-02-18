@@ -157,7 +157,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
         total_loss_epoch = 0.0
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={target_re}]")
+        pbar = tqdm(loader, desc=f"Epoch {epoch:02d} [Re={phys_cfg.re_target}]")
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
@@ -177,7 +177,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + \
-                   (5.0 * l_data) + (2.0 * l_smoothness)
+                   (5.0 * l_data) + (.5 * l_smoothness)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
