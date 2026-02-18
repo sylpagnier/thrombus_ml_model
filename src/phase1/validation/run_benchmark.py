@@ -5,7 +5,7 @@ import sys
 import shutil
 import pandas as pd
 import time
-from datetime import datetime  # <--- Added
+from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
@@ -17,7 +17,7 @@ sys.path.append(str(project_root))
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.anchor_generator import AnchorGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
-from src.validation.phase1.validate_tier1 import Tier1Validator
+from src.phase1.validation.validate_tier1 import Tier1Validator
 
 
 def run_pipeline_for_level(level_idx, level_name, num_samples=10):

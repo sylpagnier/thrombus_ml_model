@@ -1,69 +1,69 @@
 import mph
+from pathlib import Path
 from src.utils.paths import get_project_root
+from src.config import VesselConfig
 
-# --- 1. Setup Paths ---
-template_path = 'comsol_models/phase1_template.mph'
 
-project_root = get_project_root()
-abs_template = project_root / template_path
+def inspect_comsol_tags():
+    root = get_project_root()
+    cfg = VesselConfig()
 
-print(f"Loading: {abs_template}")
-if not abs_template.exists():
-    raise FileNotFoundError(f"Cannot find: {abs_template}")
+    # Resolve template path dynamically from Config
+    if Path(cfg.template_path).is_absolute():
+        abs_template = Path(cfg.template_path)
+    else:
+        abs_template = root / cfg.template_path
 
-client = mph.start()
-model = client.load(str(abs_template))
+    print(f"Checking Template: {abs_template}")
+    if not abs_template.exists():
+        raise FileNotFoundError(f"Cannot find template at: {abs_template}")
 
-print("\n=== RAW JAVA LAYER INSPECTION ===")
-print("This inspects the internal COMSOL tags directly, bypassing mph wrappers.")
+    client = mph.start()
+    model = client.load(str(abs_template))
 
-# 1. Inspect Components
-# model.java.component() returns the container for components
-comp_tags = model.java.component().tags()
+    print("\n=== COMSOL TAG INSPECTION ===")
 
-if not comp_tags:
-    print("Warning: No components found in model!")
+    # 1. Inspect Components
+    comp_tags = model.java.component().tags()
+    if not comp_tags:
+        print("No components found!")
+        return
 
-for c_tag in comp_tags:
-    print(f"\n[Component]: {c_tag}")
-    comp_node = model.java.component(c_tag)
+    for c_tag in comp_tags:
+        print(f"\nComponent: {c_tag}")
+        comp_node = model.java.component(c_tag)
 
-    # 2. Inspect Meshes inside this Component
-    # Note: We skip 'geometries' since that caused your crash, and you likely need 'meshes' anyway
-    print(f"  Looking for Meshes in {c_tag}...")
-    try:
+        # 2. Inspect Meshes
+        print(f"   ├── Looking for Meshes...")
         mesh_tags = comp_node.mesh().tags()
+
         if not mesh_tags:
-            print("    (No meshes found)")
+            print("   │   No meshes found.")
 
         for m_tag in mesh_tags:
-            print(f"    [Mesh]: {m_tag}")
-
-            # 3. Inspect Features inside the Mesh (Look for your Import!)
+            print(f"   │   ├── Mesh Tag: {m_tag}")
             mesh_node = comp_node.mesh(m_tag)
             feature_tags = mesh_node.feature().tags()
 
+            # 3. Validation for AnchorGenerator compatibility
+            found_import = False
             for f_tag in feature_tags:
-                # We get the 'type' to confirm it's an import feature
                 f_type = mesh_node.feature(f_tag).getType()
-                print(f"      -> Feature: {f_tag} | Type: {f_type}")
+                print(f"   │   │   ├── Feature: {f_tag} (Type: {f_type})")
 
-    except Exception as e:
-        print(f"    ! Error inspecting meshes: {e}")
+                if f_type == 'Import':
+                    found_import = True
 
-    # 4. Inspect Geometries (Safe Mode)
-    print(f"  Looking for Geometries in {c_tag}...")
-    try:
-        geom_tags = comp_node.geom().tags()
-        if not geom_tags:
-            print("    (No geometries found)")
-        for g_tag in geom_tags:
-            print(f"    [Geometry]: {g_tag}")
-            # List features inside geometry
-            g_features = comp_node.geom(g_tag).feature().tags()
-            for gf_tag in g_features:
-                print(f"      -> Feature: {gf_tag}")
-    except Exception as e:
-        print(f"    ! Error inspecting geometries: {e}")
+            # Specific check for anchor_generator logic
+            if found_import:
+                print("   │   │    'Import' feature found (Compatible with AnchorGenerator)")
+            else:
+                print("   │   │    WARNING: No 'Import' feature found! AnchorGenerator will fail.")
+                print("   │   │      (It expects an 'Import' node to inject the mesh)")
 
-print("\n=================================")
+    client.clear()
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    inspect_comsol_tags()

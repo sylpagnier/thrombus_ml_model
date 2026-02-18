@@ -114,9 +114,11 @@ class MeshToGraphComplete:
                 d_bar = np.max(np.linalg.norm(inlet_nodes - inlet_nodes.mean(axis=0), axis=1)) * 2
 
         # Physics Scaling
-        # Select viscosity based on physics tier.
-        # For Tier 1 (Newtonian), use mu_newtonian. For Tier 2 (Non-Newtonian), typically mu_inf is the reference.
-        ref_mu = self.phys_cfg.mu_inf if self.phys_cfg.mu_inf != self.phys_cfg.mu_newtonian else self.phys_cfg.mu_newtonian
+        # Newtonian vs non-Newtonian mode
+        if self.phys_cfg.viscosity_model == "carreau":
+            ref_mu = self.phys_cfg.mu_inf
+        else:
+            ref_mu = self.phys_cfg.mu_newtonian
         u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
         p_ref_scale = self.phys_cfg.rho * (u_ref ** 2)
 
@@ -198,13 +200,17 @@ class MeshToGraphComplete:
         node_type[mask_wall, 0] = 0.0
         node_type[mask_wall, 3] = 1.0
 
+        # Add a one-hot or scalar for the physics mode
+        is_non_newt = 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0
+
         # Assembly: Concatenate the 4-channel one-hot features to the x_tensor
         x_tensor = torch.cat([
             torch.tensor(nodes_nd, dtype=torch.float32),
             torch.tensor(sdf_nd, dtype=torch.float32),
             shear_pot,
             torch.tensor(wall_normal_vec, dtype=torch.float32),
-            node_type  # Added One-Hot Features
+            node_type,
+            torch.full((len(nodes), 1), is_non_newt, dtype=torch.float32)
         ], dim=1)
 
         data = Data(

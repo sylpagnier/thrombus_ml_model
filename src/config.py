@@ -53,11 +53,12 @@ class PhysicsConfig:
     # Fluid Properties
     rho: float = 1050.0  # kg/m^3
     re_target: float = 150.0  # Reynolds number [-]
+    viscosity_model: str = "carreau"  # Options: "newtonian", "carreau"
 
-    # Newtonian Reference (Tier 1)
+    # Newtonian Reference (phase 1)
     mu_newtonian: float = 0.0035  # Pa*s (3.5 cP)
 
-    # Carreau-Yasuda Rheology (Tier 2 - Cho & Kensey 1991 Human Blood)
+    # Carreau-Yasuda Rheology (phase 1.2 - Cho & Kensey 1991 Human Blood)
     # mu_eff = mu_inf + (mu_0 - mu_inf) * (1 + (lambda * gamma_dot)^a)^((n-1)/a)
     mu_inf: float = 0.0035  # Pa*s
     mu_0: float = 0.056  # Pa*s

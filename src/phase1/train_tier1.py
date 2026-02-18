@@ -11,8 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Sampler
 import random
-
-# --- 1. Scheduler Import ---
+from src.config import PhysicsConfig
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
@@ -127,10 +126,12 @@ def load_dataset():
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = rGINO_DEQ(in_channels=10, latent_dim=64, max_iters=15).to(device)
+    model = rGINO_DEQ(in_channels=11, latent_dim=64, max_iters=15).to(device)
 
-    target_re = 150.0
-    kernels = PhysicsKernels(reynolds=target_re)
+    # Initialize the config object
+    phys_cfg = PhysicsConfig(re_target=150.0, viscosity_model="carreau")
+
+    kernels = PhysicsKernels(phys_cfg=phys_cfg)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 

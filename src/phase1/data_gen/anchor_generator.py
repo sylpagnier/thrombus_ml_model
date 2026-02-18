@@ -81,16 +81,27 @@ class AnchorGenerator:
             self.client.clear()
 
     def _set_global_physics_parameters(self):
-        logger.info("Setting global physics parameters in COMSOL.")
-        self.model.parameter('rho_fluid', f'{self.phys_cfg.rho} [kg/m^3]')
-        self.model.parameter('mu_ref', f'{self.phys_cfg.mu_newtonian} [Pa*s]')
-        self.model.parameter('Re_target', str(self.phys_cfg.re_target))
+        logger.info(f"Setting global physics in {self.phys_cfg.viscosity_model} mode.")
 
+        # Update Parameters (Global)
+        self.model.parameter('rho_fluid', f'{self.phys_cfg.rho} [kg/m^3]')
+        self.model.parameter('Re_target', str(self.phys_cfg.re_target))
+        self.model.parameter('mu_ref', f'{self.phys_cfg.mu_newtonian} [Pa*s]')
         self.model.parameter('mu_inf', f'{self.phys_cfg.mu_inf} [Pa*s]')
         self.model.parameter('mu_0', f'{self.phys_cfg.mu_0} [Pa*s]')
         self.model.parameter('lambda_cy', f'{self.phys_cfg.lam} [s]')
         self.model.parameter('n_index', str(self.phys_cfg.n))
         self.model.parameter('a_yasuda', str(self.phys_cfg.a))
+
+        # Update Variables (Component Level)
+        var_node = self.model.java.component('comp1').variable('var1')
+
+        if self.phys_cfg.viscosity_model == "carreau":
+            carreau_expr = 'mu_inf + (mu_0 - mu_inf) * (1 + (lambda_cy * spf.sr)^a_yasuda)^((n_index - 1) / a_yasuda)'
+            var_node.set('mu_final', carreau_expr)
+        else:
+            # Newtonian fallback
+            var_node.set('mu_final', 'mu_ref')
 
     def _evaluate_at_coords(self, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -173,9 +184,12 @@ class AnchorGenerator:
 
                 self.model.parameter('D_eff', f'{d_bar:.8f} [m]')
 
-                # Select viscosity based on physics tier.
-                # For Tier 1 (Newtonian), use mu_newtonian. For Tier 2 (Non-Newtonian), typically mu_inf is the reference.
-                ref_mu = self.phys_cfg.mu_inf if self.phys_cfg.mu_inf != self.phys_cfg.mu_newtonian else self.phys_cfg.mu_newtonian
+                # Newtonian vs non-Newtonian mode
+                if self.phys_cfg.viscosity_model == "carreau":
+                    ref_mu = self.phys_cfg.mu_inf
+                else:
+                    ref_mu = self.phys_cfg.mu_newtonian
+
                 u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
 
                 self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')

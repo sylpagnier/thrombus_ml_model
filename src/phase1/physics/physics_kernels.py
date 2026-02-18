@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 
 def scatter_add(src, index, dim=0, dim_size=None):
@@ -17,8 +16,32 @@ def scatter_add(src, index, dim=0, dim_size=None):
 
 
 class PhysicsKernels:
-    def __init__(self, reynolds=150.0):
-        self.Re = reynolds
+    def __init__(self, phys_cfg):
+        self.cfg = phys_cfg
+        # Normalize non-Newtonian parameters by reference values
+        self.mu_inf_nd = self.cfg.mu_inf / self.cfg.mu_inf
+        self.mu_0_nd = self.cfg.mu_0 / self.cfg.mu_inf
+        # Note: lambda must be scaled by (u_ref / d_bar) to be non-dimensional
+
+    def _compute_carreau_viscosity(self, du_ij, u_ref, d_bar):
+        """
+        Calculates local effective viscosity based on Carreau-Yasuda model.
+        du_ij: tensor containing [u_x, u_y, v_x, v_y]
+        """
+        # 1. Compute Shear Rate (gamma_dot)
+        # gamma_dot = sqrt(2 * D : D) where D is strain rate tensor
+        u_x, u_y, v_x, v_y = du_ij[:, 0], du_ij[:, 1], du_ij[:, 2], du_ij[:, 3]
+
+        # Second invariant of strain rate tensor
+        gamma_dot = torch.sqrt(2 * u_x ** 2 + 2 * v_y ** 2 + (u_y + v_x) ** 2 + 1e-8)
+
+        # Non-dimensionalize lambda
+        lam_nd = self.cfg.lam * (u_ref / d_bar)
+
+        # Carreau-Yasuda Equation
+        pow_term = (1 + (lam_nd * gamma_dot) ** self.cfg.a) ** ((self.cfg.n - 1) / self.cfg.a)
+        mu_eff = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * pow_term
+        return mu_eff
 
     def _get_geometric_props(self, data):
         """
@@ -108,33 +131,46 @@ class PhysicsKernels:
             return c[:, 0:2, :].reshape(-1, 2 * C)
 
     def navier_stokes_residual(self, pred, data, props=None):
-        if props is None:
-            props = self._get_geometric_props(data)
-
-        # FIX 1: Squeeze to 1D [N] to match derivatives [N].
-        # Prevents [N,1]*[N] -> [N,N] broadcasting explosion.
+        if props is None: props = self._get_geometric_props(data)
         u, v, p = pred[:, 0], pred[:, 1], pred[:, 2]
+        u_ref, d_bar = data.u_ref, data.d_bar
 
-        # Derivatives are shape [N, 5, 1] -> squeeze to [N]
+        # Compute first and second derivatives
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
         c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-        # Extract components (all shape [N])
-        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
-        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
+        u_x, u_y, u_xx, u_yy, u_xy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0], c_u[:, 3, 0]
+        v_x, v_y, v_xx, v_yy, v_xy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0], c_v[:, 3, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        u_xx, u_yy = c_u[:, 2, 0], c_u[:, 4, 0]
-        v_xx, v_yy = c_v[:, 2, 0], c_v[:, 4, 0]
+        # --- Dynamic Viscosity Logic ---
+        if self.cfg.viscosity_model == "carreau":
+            # Non-Newtonian path: Compute mu_eff and its spatial gradients
+            du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
+            mu_eff = self._compute_carreau_viscosity(du_ij, u_ref, d_bar)
 
-        lap_u = u_xx + u_yy
-        lap_v = v_xx + v_yy
+            c_mu = self._compute_derivatives(mu_eff.unsqueeze(1), props)
+            mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
-        # Physics Equations (All terms are now [N])
+            # Re relative to mu_inf
+            Re = (self.cfg.rho * u_ref * d_bar) / self.cfg.mu_inf
+        else:
+            # Newtonian path: Viscosity is constant, gradients are 0
+            mu_eff = torch.ones_like(u)
+            mu_x = torch.zeros_like(u)
+            mu_y = torch.zeros_like(u)
+
+            # Re relative to mu_newtonian
+            Re = (self.cfg.rho * u_ref * d_bar) / self.cfg.mu_newtonian
+
+        # Momentum equations (this unified form handles both cases)
+        visc_x = (1.0 / Re) * (mu_eff * (u_xx + u_yy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
+        visc_y = (1.0 / Re) * (mu_eff * (v_xx + v_yy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
+
         l_cont = u_x + v_y
-        mom_x = (u * u_x + v * u_y) + p_x - (1.0 / self.Re) * lap_u
-        mom_y = (u * v_x + v * v_y) + p_y - (1.0 / self.Re) * lap_v
+        mom_x = (u * u_x + v * u_y) + p_x - visc_x
+        mom_y = (u * v_x + v * v_y) + p_y - visc_y
 
         # Standard PINN procedure: evaluate PDE strictly on interior nodes
         mask_wall_1d = data.mask_wall.view(-1).bool()

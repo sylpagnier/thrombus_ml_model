@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.nn import GINEConv, global_mean_pool
@@ -45,7 +44,7 @@ class GINOBlock(nn.Module):
         return self.norm(self.relu(z + local_out + global_out))
 
 class rGINO_DEQ(nn.Module):
-    def __init__(self, in_channels=4, out_channels=3, latent_dim=64, max_iters=25):
+    def __init__(self, in_channels=11, out_channels=3, latent_dim=64, max_iters=25):
         super().__init__()
         self.max_iters = max_iters
         self.encoder = nn.Sequential(

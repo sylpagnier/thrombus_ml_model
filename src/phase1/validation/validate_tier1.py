@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
+from src.config import PhysicsConfig
 
 # --- Path Setup ---
 current_file = Path(__file__).resolve()
@@ -19,10 +20,11 @@ from src.phase1.physics.physics_kernels import PhysicsKernels
 class Tier1Validator:
     def __init__(self, model_path, device='cuda'):
         self.device = device if torch.cuda.is_available() else 'cpu'
-        self.kernels = PhysicsKernels(reynolds=150.0)
+        phys_cfg = PhysicsConfig()
+        self.kernels = PhysicsKernels(phys_cfg)
 
         print(f"⚡ Loading Model: {model_path}")
-        self.model = rGINO_DEQ(in_channels=10, out_channels=3, latent_dim=64, max_iters=15)
+        self.model = rGINO_DEQ(in_channels=11, out_channels=3, latent_dim=64, max_iters=15)
         # Load weights safely for CPU/GPU compatibility
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
@@ -30,22 +32,51 @@ class Tier1Validator:
         self.model.eval()
 
     def _compute_wss_proxy(self, pred, data, props):
-        """Calculates a WSS proxy (velocity gradient magnitude at the wall)."""
+        """
+        Calculates accurate WSS magnitude: tau = mu_eff * gamma_dot.
+        Correctly handles Non-Newtonian viscosity variations.
+        """
         u, v = pred[:, 0], pred[:, 1]
+
+        # 1. Compute full gradient tensor
+        # We need all 4 components to calculate the true strain rate invariant
         c_u = self.kernels._compute_derivatives(u.unsqueeze(1), props)
         c_v = self.kernels._compute_derivatives(v.unsqueeze(1), props)
 
-        u_y = c_u[:, 1, 0]
-        v_x = c_v[:, 0, 0]
+        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
+        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
 
-        # Approximate shear rate magnitude
-        shear_mag = torch.sqrt((u_y + v_x) ** 2)
+        # 2. Compute Generalized Shear Rate (gamma_dot)
+        # Using the second invariant of the rate of strain tensor (same as PhysicsKernels)
+        # gamma_dot = sqrt(2 * D : D)
+        gamma_dot = torch.sqrt(2 * u_x ** 2 + 2 * v_y ** 2 + (u_y + v_x) ** 2 + 1e-8)
 
+        # 3. Compute Effective Viscosity (mu_eff)
+        # We differentiate between Newtonian and Carreau modes here
+        if self.kernels.cfg.viscosity_model == "carreau":
+            # Extract scalar reference params from the data batch
+            u_ref = data.u_ref.item() if hasattr(data, 'u_ref') else 1.0
+            d_bar = data.d_bar.item() if hasattr(data, 'd_bar') else 1.0
+
+            # Stack gradients for the kernel function [u_x, u_y, v_x, v_y]
+            du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
+
+            # Reuse the EXACT viscosity logic from training
+            mu_eff = self.kernels._compute_carreau_viscosity(du_ij, u_ref, d_bar)
+        else:
+            # Newtonian: ND viscosity is constant (1.0 relative to mu_ref)
+            mu_eff = torch.ones_like(gamma_dot)
+
+        # 4. Compute Wall Shear Stress (tau = mu * gamma_dot)
+        # This captures the non-linear stress drop in plug-flow regions
+        wss = mu_eff * gamma_dot
+
+        # Filter for Wall Nodes only
         mask = data.mask_wall.bool()
         if mask.sum() == 0:
             return torch.tensor([]), mask
 
-        return shear_mag[mask], mask
+        return wss[mask], mask
 
     def validate_dataset(self, data_dir, level_name="Unknown"):
         path = project_root / data_dir
