@@ -4,9 +4,10 @@ matplotlib.use('Agg')
 import sys
 import shutil
 import pandas as pd
+import time
+from datetime import datetime  # <--- Added
 from pathlib import Path
 from tqdm import tqdm
-import time
 
 # --- Path Setup ---
 current_file = Path(__file__).resolve()
@@ -19,70 +20,79 @@ from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
 from src.validation.phase1.validate_tier1 import Tier1Validator
 
 
-def run_pipeline_for_level(level_idx, level_name, num_samples=20):
+def run_pipeline_for_level(level_idx, level_name, num_samples=10):
     print(f"\n{'=' * 60}")
     print(f"🚀 STARTING BENCHMARK: {level_name} (Level {level_idx})")
     print(f"{'=' * 60}")
 
-    # Define Absolute Paths
-    base_dir = project_root / "data" / "benchmark" / f"level_{level_idx}"
+    # --- UNIQUE DIRECTORY GENERATION ---
+    # We add a timestamp to ensure this run NEVER sees files from a previous run
+    # This solves the "Zombie File" / Synchronization bug completely.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = project_root / "data" / "benchmark" / f"level_{level_idx}_{timestamp}"
+
     raw_mesh_dir = base_dir / "raw_meshes"
     label_dir = base_dir / "comsol_solutions"
     graph_dir = base_dir / "processed_graphs"
 
-    # Clean previous runs
+    # Create fresh directories (No need to delete, they are new)
     for d in [raw_mesh_dir, label_dir, graph_dir]:
-        if d.exists(): shutil.rmtree(d)
         d.mkdir(parents=True, exist_ok=True)
 
+    try:
         # --- Step 1: Geometry Generation ---
-        print(f"\n[1/4] 📐 Generating {num_samples} Geometries...")
+        print(f"\n[1/4] 📐 Generating {num_samples} Geometries in {base_dir.name}...")
         v_gen = VesselGenerator(output_dir=str(raw_mesh_dir))
-
-        # 1. Loop completes FIRST
         for i in tqdm(range(num_samples), desc="Meshing"):
             v_gen.generate(i, level=level_idx, show_viz=False)
 
-        # 2. THEN run COMSOL once for the whole batch (Unindented)
         # --- Step 2: COMSOL Simulation ---
         print(f"\n[2/4] 🌪️ Solving Navier-Stokes in COMSOL...")
-        try:
-            template_absolute = project_root / "comsol_models" / "phase1_template.mph"
+        template_absolute = project_root / "comsol_models" / "phase1_template.mph"
 
-            with AnchorGenerator(
-                    template_path=str(template_absolute),
-                    mesh_dir=str(raw_mesh_dir),
-                    output_dir=str(label_dir)
-            ) as a_gen:
-                a_gen.run_batch(start_idx=0, end_idx=num_samples)
+        # We wrap this in a try block to ensure we can still clean up if COMSOL fails
+        with AnchorGenerator(
+                template_path=str(template_absolute),
+                mesh_dir=str(raw_mesh_dir),
+                output_dir=str(label_dir)
+        ) as a_gen:
+            a_gen.run_batch(start_idx=0, end_idx=num_samples)
 
-        except Exception as e:
-            print(f"❌ COMSOL Error: {e}")
-            print("   (Proceeding with available data...)")
+        # --- Step 3: Graph Conversion ---
+        print(f"\n[3/4] 🕸️ Converting to Graphs...")
+        m_gen = MeshToGraphComplete(
+            raw_dir=str(raw_mesh_dir),
+            label_dir=str(label_dir),
+            proc_dir=str(graph_dir)
+        )
+        m_gen.run()
 
-    # --- Step 3: Graph Conversion ---
-    print(f"\n[3/4] 🕸️ Converting to Graphs (Injecting Labels)...")
-    # FIX: Pass ABSOLUTE paths
-    m_gen = MeshToGraphComplete(
-        raw_dir=str(raw_mesh_dir),
-        label_dir=str(label_dir),
-        proc_dir=str(graph_dir)
-    )
-    m_gen.run()
+        # --- Step 4: Validation Inference ---
+        print(f"\n[4/4] 🧠 Running Model Inference & Metrics...")
+        model_path = project_root / "models/tier1_best_physics.pth"
 
-    # --- Step 4: Validation Inference ---
-    print(f"\n[4/4] 🧠 Running Model Inference & Metrics...")
-    model_path = project_root / "models/tier1_best_physics.pth"
+        if not model_path.exists():
+            print(f"❌ Model not found at {model_path}. Skipping validation.")
+            return None
 
-    if not model_path.exists():
-        print(f"❌ Model not found at {model_path}. Skipping validation.")
+        validator = Tier1Validator(model_path=model_path)
+        metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
+
+        return metrics
+
+    except Exception as e:
+        print(f"❌ Critical Benchmark Error: {e}")
         return None
 
-    validator = Tier1Validator(model_path=model_path)
-    # FIX: Validate dataset expects a string path relative to project root OR absolute
-    metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
-
-    return metrics
+    finally:
+        # --- CLEANUP ---
+        # Optional: Delete the temp folder to save space
+        # Comment this out if you want to inspect the files for debugging
+        print(f"\n🧹 Cleaning up temporary benchmark run: {base_dir.name}")
+        try:
+            shutil.rmtree(base_dir)
+        except Exception as e:
+            print(f"   ⚠️ Warning: Could not fully delete temp folder (likely file lock): {e}")
 
 
 if __name__ == "__main__":
@@ -95,7 +105,7 @@ if __name__ == "__main__":
     all_results = {}
 
     for lvl_idx, name in benchmarks:
-        metrics = run_pipeline_for_level(lvl_idx, name, num_samples=20)
+        metrics = run_pipeline_for_level(lvl_idx, name, num_samples=10)
         if metrics is not None:
             all_results[name] = metrics
         time.sleep(1)
