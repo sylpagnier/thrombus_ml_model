@@ -37,28 +37,22 @@ class MeshToGraphComplete:
 
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_boundary_masks(self, mesh, num_nodes, num_outlets):
+    def _get_boundary_masks(self, mesh, num_nodes):
         mask_inlet = torch.zeros(num_nodes, dtype=torch.bool)
         mask_outlet = torch.zeros(num_nodes, dtype=torch.bool)
         mask_wall = torch.zeros(num_nodes, dtype=torch.bool)
 
-        # 1. Initialize empty to avoid "Unresolved reference"
+        # Initialize empty
         line_cells = []
         line_tags = []
 
-        # 2. Define standard tags from Config
+        # Define standard tags from Config
         tags = self.vessel_cfg.TAGS
-        T_IN = tags["Inlet"]  # 101
-        T_OUT1 = tags["Outlet_1"]  # 102
-        T_OUT2 = tags["Outlet_2"]  # 103
+        t_in = tags["Inlet"]
+        t_out = tags["Outlet_1"]
+        t_wall = tags["Walls"]
 
-        # Dynamic Wall Tag Logic (Matches VesselGenerator)
-        # Bifurcation (2 outlets): Walls = 104 (Config['Walls'])
-        # Straight (1 outlet): Walls = 103 (Overlaps with Outlet_2 ID, but used as Wall)
-        T_WALL = tags["Walls"] if num_outlets == 2 else 103
-
-        # 3. Populate if data exists
-        # Handle modern meshio (list of blocks) vs older versions
+        # Populate if data exists
         try:
             if "line" in mesh.cells_dict:
                 line_cells = mesh.cells_dict["line"]
@@ -69,22 +63,19 @@ class MeshToGraphComplete:
         except Exception:
             pass
 
-        # 4. Loop is now safe even if line_tags is empty
+        # Loop is safe even if line_tags is empty
         for i, tag in enumerate(line_tags):
             # Ensure we access the correct cell block if line_cells is a list of blocks
-            # (meshio < 5.0 often returns a list of arrays for cells)
             if isinstance(line_cells, list) and not isinstance(line_cells[0], (int, float, np.integer)):
                 nodes = line_cells[i]
             else:
                 nodes = line_cells[i]
 
-            if tag == T_IN:
+            if tag == t_in:
                 mask_inlet[nodes] = True
-            elif tag == T_OUT1:
+            elif tag == t_out:
                 mask_outlet[nodes] = True
-            elif num_outlets == 2 and tag == T_OUT2:
-                mask_outlet[nodes] = True
-            elif tag == T_WALL:
+            elif tag == t_wall:
                 mask_wall[nodes] = True
 
         return mask_inlet, mask_outlet, mask_wall
@@ -104,18 +95,16 @@ class MeshToGraphComplete:
             print(f"Skipping {filename}: {e}")
             return
 
-        # --- FIX 1: Robust Metadata Loading ---
+        # Initialize d_bar
         d_bar = None
-        num_outlets = 1  # Default for safety
 
+        # Check json data
         if json_path.exists():
             with open(json_path, 'r') as f:
                 meta = json.load(f)
                 d_bar = meta.get('d_bar')
-                num_outlets = meta.get('num_outlets', 1)
 
-        # --- FIX 2: Pass num_outlets to function ---
-        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes), num_outlets)
+        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
 
         # d_bar Fallback
         if d_bar is None:
@@ -131,7 +120,7 @@ class MeshToGraphComplete:
         u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
         p_ref_scale = self.phys_cfg.rho * (u_ref ** 2)
 
-        # SDF and Gradients
+        # wall_pts and Gradients
         wall_node_indices = np.where(mask_wall.numpy())[0]
         if len(wall_node_indices) == 0: return
         wall_pts = nodes[wall_node_indices]
@@ -142,7 +131,7 @@ class MeshToGraphComplete:
         diff_vec = nodes - nearest_wall_pts
         wall_normal_vec = diff_vec / (dist_raw[:, None] + 1e-8)
 
-        # Restored: Spatial Label Mapping via cKDTree
+        # Spatial Label Mapping via cKDTree
         y_labels = torch.zeros((len(nodes), 3), dtype=torch.float32)
         is_anchor = False
         if label_path.exists():
@@ -194,18 +183,18 @@ class MeshToGraphComplete:
 
         node_type = torch.zeros((len(nodes), 4), dtype=torch.float32)
 
-        # 1. Default all nodes to Internal (Index 0)
+        # Default all nodes to Internal (Index 0)
         node_type[:, 0] = 1.0
 
-        # 2. Assign Inlet (Index 1)
+        # Assign Inlet (Index 1)
         node_type[mask_inlet, 0] = 0.0
         node_type[mask_inlet, 1] = 1.0
 
-        # 3. Assign Outlet (Index 2)
+        # Assign Outlet (Index 2)
         node_type[mask_outlet, 0] = 0.0
         node_type[mask_outlet, 2] = 1.0
 
-        # 4. Assign Wall (Index 3) - Walls override others if nodes overlap
+        # Assign Wall (Index 3)
         node_type[mask_wall, 0] = 0.0
         node_type[mask_wall, 3] = 1.0
 

@@ -17,14 +17,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_import_feature_tag(mesh_j) -> str:
+    all_tags = mesh_j.feature().tags()
+    for tag in all_tags:
+        if mesh_j.feature(tag).getType() == 'Import':
+            return tag
+    if 'imp1' in all_tags:
+        return 'imp1'
+    raise RuntimeError("No 'Import' feature found in the COMSOL model mesh sequence.")
+
+
 class AnchorGenerator:
     """
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
     def __init__(self, mesh_dir=None, output_dir=None, template_path=None):
-        self.vessel_config = VesselConfig
-        self.phys_cfg = PhysicsConfig
+        self.vessel_config = VesselConfig()
+        self.phys_cfg = PhysicsConfig()
         self.root_dir = Path(__file__).resolve().parent.parent
 
         # --- 1. Resolve Template Path ---
@@ -123,15 +133,6 @@ class AnchorGenerator:
             except Exception:
                 pass
 
-    def _get_import_feature_tag(self, mesh_j) -> str:
-        all_tags = mesh_j.feature().tags()
-        for tag in all_tags:
-            if mesh_j.feature(tag).getType() == 'Import':
-                return tag
-        if 'imp1' in all_tags:
-            return 'imp1'
-        raise RuntimeError("No 'Import' feature found in the COMSOL model mesh sequence.")
-
     def run_batch(self, start_idx: int = 0, end_idx: int = 50, max_anchors: int = 500):
         if not self.model:
             raise RuntimeError("Model not loaded.")
@@ -140,7 +141,7 @@ class AnchorGenerator:
 
         try:
             mesh_j = self.model.java.component('comp1').mesh('mesh1')
-            import_tag = self._get_import_feature_tag(mesh_j)
+            import_tag = _get_import_feature_tag(mesh_j)
         except Exception as e:
             logger.critical(f"Setup failed: {e}")
             return
@@ -210,7 +211,7 @@ class AnchorGenerator:
 
                 u, v, p = self._evaluate_at_coords(target_nodes)
 
-                # --- FIX: Robust Meshio Access ---
+                # ---Robust Meshio Access ---
                 # Check if 'line' cells exist using modern meshio API
                 # This handles both list-of-arrays and single-array internals
                 try:
@@ -223,16 +224,23 @@ class AnchorGenerator:
 
                 if has_lines:
                     outlet_node_indices = []
-                    # Standard tags: Outlet_1 (102) and Outlet_2 (103)
+                    # Dynamically fetch tags for any 'Outlet' defined in config
+                    outlet_tags = [
+                        tag_id for name, tag_id in self.vessel_config.TAGS.items()
+                        if "Outlet" in name
+                    ]
+
                     for j, tag in enumerate(line_tags):
-                        if tag in [102, 103]:
-                            # line_cells[j] now correctly accesses the j-th row
+                        if tag in outlet_tags:
+                            # line_cells[j] contains the vertex indices for that line segment
                             outlet_node_indices.extend(line_cells[j])
 
                     if outlet_node_indices:
                         unique_indices = np.unique(outlet_node_indices)
-                        valid_indices = unique_indices[unique_indices < len(p)]  # Bounds check
+                        # Ensure indices are within the bounds of the pressure array
+                        valid_indices = unique_indices[unique_indices < len(p)]
                         if len(valid_indices) > 0:
+                            # Pinning: Subtract mean outlet pressure to set relative gauge pressure
                             p_offset = np.mean(p[valid_indices])
                             p = p - p_offset
                 # ---------------------------------
@@ -251,8 +259,8 @@ class AnchorGenerator:
 
             except Exception as e:
                 logger.error(f"Error on {i}: {e}")
-                # Optional: Clear model results to save memory if solve failed
-                # self.model.clear_results()
+                # Clear model results to save memory if solve failed
+                self.model.clear_results()
                 continue
 
 

@@ -167,12 +167,11 @@ class PhysicsKernels:
 
         loss_inlet = torch.tensor(0.0, device=pred.device)
         mask_inlet_1d = data.mask_inlet.view(-1).bool()
-        if mask_inlet_1d.any():
-            y_nd = data.x[mask_inlet_1d, 1]
-            y_centered = y_nd - y_nd.mean()
 
-            u_target = 1.5 * (1.0 - 4.0 * (y_centered ** 2))
-            u_target = torch.clamp(u_target, min=0.0)
+        if mask_inlet_1d.any():
+            # Use robust pre-calculated BC ---
+            # data.u_inlet_bc is shape [N, 2], we need u component (idx 0)
+            u_target = data.u_inlet_bc[mask_inlet_1d, 0]
 
             u_in = u[mask_inlet_1d].squeeze()
             v_in = v[mask_inlet_1d].squeeze()
