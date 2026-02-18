@@ -269,5 +269,5 @@ class VesselGenerator:
 if __name__ == "__main__":
     config = VesselConfig()
     vg = VesselGenerator()
-    vg.run_pipeline(n=50, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
+    vg.run_pipeline(n=500, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
     gmsh.finalize()

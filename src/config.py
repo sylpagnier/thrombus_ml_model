@@ -21,7 +21,7 @@ class VesselConfig:
     graph_output_dir: str = project_root / "data/processed/graphs"
 
     # Mesh Settings
-    mesh_size_factor: float = .8
+    mesh_size_factor: float = .5
     mesh_lc: float = 0.0002
 
     # Vessel Dimensions

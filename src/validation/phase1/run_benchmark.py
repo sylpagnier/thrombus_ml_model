@@ -72,7 +72,7 @@ def run_pipeline_for_level(level_idx, level_name, num_samples=20):
 
     # --- Step 4: Validation Inference ---
     print(f"\n[4/4] 🧠 Running Model Inference & Metrics...")
-    model_path = project_root / "models/tier1_best_physics.pth"
+    model_path = project_root / "models/tier1_best_physics_oldstyle.pth"
 
     if not model_path.exists():
         print(f"❌ Model not found at {model_path}. Skipping validation.")

@@ -175,10 +175,28 @@ class AnchorGenerator:
                 self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')
 
                 feat = mesh_j.feature(import_tag)
-                feat.set('filename', str(nas_file))
+                safe_nas_path = str(nas_file).replace("\\", "/")
+                feat.set('filename', safe_nas_path)
 
                 # Rebuild mesh and Solve
                 mesh_j.run()
+                # --- VERIFICATION BLOCK ---
+                try:
+                    # Get vertex count (Java integer)
+                    n_verts = mesh_j.getNumVertex()
+
+                    # 1. Log it so you can see it changing in the terminal
+                    logger.info(f"Sample {i}: Loaded Mesh with {n_verts} vertices.")
+
+                    # 2. Safety Check: If it's too small, the import probably failed
+                    if n_verts < 10:
+                        raise RuntimeError(f"Mesh {i} is empty/corrupt (Vertices: {n_verts})")
+
+                except Exception as e:
+                    # If the specific API call fails (version mismatch), just warn and continue
+                    logger.warning(f"Could not verify mesh stats for {i}: {e}")
+                # --------------------------
+
                 self.model.solve()
 
                 # --- Extraction & Pinning ---
@@ -236,7 +254,7 @@ class AnchorGenerator:
 if __name__ == "__main__":
     try:
         with AnchorGenerator() as generator:
-            generator.run_batch(start_idx=0, end_idx=25)
+            generator.run_batch(start_idx=0, end_idx=50)
     except KeyboardInterrupt:
         logger.info("Batch run interrupted by user.")
     except Exception as e:
