@@ -260,7 +260,7 @@ class AnchorGenerator:
             except Exception as e:
                 logger.error(f"Error on {i}: {e}")
                 # Clear model results to save memory if solve failed
-                self.model.clear_results()
+                self.model.clear()
                 continue
 
 
