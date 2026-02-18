@@ -225,7 +225,7 @@ class AnchorGenerator:
 if __name__ == "__main__":
     try:
         with AnchorGenerator() as generator:
-            generator.run_batch(start_idx=0, end_idx=50)
+            generator.run_batch(start_idx=0, end_idx=25)
     except KeyboardInterrupt:
         logger.info("Batch run interrupted by user.")
     except Exception as e:

@@ -127,7 +127,7 @@ def load_dataset():
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = rGINO_DEQ(in_channels=4, latent_dim=64, max_iters=15).to(device)
+    model = rGINO_DEQ(in_channels=10, latent_dim=64, max_iters=15).to(device)
 
     target_re = 150.0
     kernels = PhysicsKernels(reynolds=target_re)
