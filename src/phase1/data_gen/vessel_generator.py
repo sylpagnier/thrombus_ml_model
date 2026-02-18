@@ -6,17 +6,20 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 from src.utils.paths import get_project_root
 from src.config import VesselConfig
-
+from pathlib import Path
 
 class VesselGenerator:
-    def __init__(self):
+    def __init__(self, output_dir=None):
         self.cfg = VesselConfig
         self.project_root = get_project_root()
 
-        # Resolve output directory from Config
-        self.output_dir = self.project_root / self.cfg.mesh_input_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # If override provided, use it; otherwise use Config default
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = self.project_root / self.cfg.mesh_input_dir
 
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self._configure_gmsh_options()
 
     def _configure_gmsh_options(self):

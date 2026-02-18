@@ -12,8 +12,8 @@ current_file = Path(__file__).resolve()
 project_root = current_file.parent.parent.parent.parent
 sys.path.append(str(project_root))
 
-from src.phase1.utils.ginodeq import rGINO_DEQ
-from src.phase1.utils.physics_kernels import PhysicsKernels
+from src.phase1.physics.ginodeq import rGINO_DEQ
+from src.phase1.physics.physics_kernels import PhysicsKernels
 
 
 class Tier1Validator:
@@ -22,7 +22,7 @@ class Tier1Validator:
         self.kernels = PhysicsKernels(reynolds=150.0)
 
         print(f"⚡ Loading Model: {model_path}")
-        self.model = rGINO_DEQ(in_channels=4, out_channels=3, latent_dim=64, max_iters=15)
+        self.model = rGINO_DEQ(in_channels=10, out_channels=3, latent_dim=64, max_iters=15)
         # Load weights safely for CPU/GPU compatibility
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
@@ -176,13 +176,3 @@ class Tier1Validator:
         safe_title = title.replace("/", "_").replace(" ", "_")
         plt.savefig(save_dir / f"{safe_title}.png", dpi=150, bbox_inches='tight')
         plt.close()
-
-
-if __name__ == "__main__":
-    # Standalone testing block
-    model_path = project_root / "models/tier1_best_physics.pth"
-    if model_path.exists():
-        validator = Tier1Validator(model_path=model_path)
-        # validator.validate_dataset("data/processed/test_l1", "Test")
-    else:
-        print("Model not found.")

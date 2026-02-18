@@ -22,20 +22,31 @@ class AnchorGenerator:
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
-    def __init__(self):
+    def __init__(self, mesh_dir=None, output_dir=None, template_path=None):
         self.vessel_config = VesselConfig
         self.phys_cfg = PhysicsConfig
         self.root_dir = Path(__file__).resolve().parent.parent
 
         # --- 1. Resolve Template Path ---
-        self.template_path = self.root_dir / VesselConfig.template_path
+        if template_path:
+            self.template_path = Path(template_path)
+        else:
+            self.template_path = self.root_dir / VesselConfig.template_path
 
         # --- 2. Resolve Input/Output Paths ---
-        self.output_dir = (Path(VesselConfig.output_dir) if Path(VesselConfig.output_dir).is_absolute()
-                           else self.root_dir / VesselConfig.output_dir)
+        # Handle Output Directory
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = (Path(VesselConfig.output_dir) if Path(VesselConfig.output_dir).is_absolute()
+                               else self.root_dir / VesselConfig.output_dir)
 
-        self.mesh_dir = (Path(VesselConfig.mesh_input_dir) if Path(VesselConfig.mesh_input_dir).is_absolute()
-                         else self.root_dir / VesselConfig.mesh_input_dir)
+        # Handle Mesh Directory
+        if mesh_dir:
+            self.mesh_dir = Path(mesh_dir)
+        else:
+            self.mesh_dir = (Path(VesselConfig.mesh_input_dir) if Path(VesselConfig.mesh_input_dir).is_absolute()
+                             else self.root_dir / VesselConfig.mesh_input_dir)
 
         self.client: Optional[mph.Client] = None
         self.model: Optional[mph.Model] = None

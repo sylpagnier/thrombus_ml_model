@@ -12,14 +12,28 @@ from src.utils.paths import get_project_root
 
 
 class MeshToGraphComplete:
-    def __init__(self):
+    def __init__(self, raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
         self.vessel_cfg = VesselConfig()
         self.phys_cfg = PhysicsConfig()
 
-        self.raw_dir = self.root / self.vessel_cfg.mesh_input_dir
-        self.label_dir = self.root / self.vessel_cfg.output_dir
-        self.proc_dir = self.root / self.vessel_cfg.graph_output_dir
+        # Resolve Raw Dir
+        if raw_dir:
+            self.raw_dir = Path(raw_dir)
+        else:
+            self.raw_dir = self.root / self.vessel_cfg.mesh_input_dir
+
+        # Resolve Label Dir
+        if label_dir:
+            self.label_dir = Path(label_dir)
+        else:
+            self.label_dir = self.root / self.vessel_cfg.output_dir
+
+        # Resolve Processed Dir
+        if proc_dir:
+            self.proc_dir = Path(proc_dir)
+        else:
+            self.proc_dir = self.root / self.vessel_cfg.graph_output_dir
 
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
