@@ -171,7 +171,12 @@ class AnchorGenerator:
                     d_bar = meta['d_bar']
 
                 self.model.parameter('D_eff', f'{d_bar:.8f} [m]')
-                u_ref = (self.phys_cfg.re_target * self.phys_cfg.mu_newtonian) / (self.phys_cfg.rho * d_bar)
+
+                # Select viscosity based on physics tier.
+                # For Tier 1 (Newtonian), use mu_newtonian. For Tier 2 (Non-Newtonian), typically mu_inf is the reference.
+                ref_mu = self.phys_cfg.mu_inf if self.phys_cfg.mu_inf != self.phys_cfg.mu_newtonian else self.phys_cfg.mu_newtonian
+                u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
+
                 self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')
 
                 feat = mesh_j.feature(import_tag)

@@ -10,7 +10,7 @@ from pathlib import Path
 
 class VesselGenerator:
     def __init__(self, output_dir=None):
-        self.cfg = VesselConfig
+        self.cfg = VesselConfig()
         self.project_root = get_project_root()
 
         # If override provided, use it; otherwise use Config default
@@ -54,9 +54,24 @@ class VesselGenerator:
         verts = nodes[triangles]
         poly = PolyCollection(verts, edgecolors='black', facecolors='lightblue', linewidths=0.1)
         ax.add_collection(poly)
-        # Fixed limits for standard scale (Meters)
-        ax.set_xlim(-0.002, 0.020)
-        ax.set_ylim(-0.008, 0.008)
+
+        # --- DYNAMIC LIMIT CALCULATION ---
+
+        # 1. Calculate the maximum possible Y excursion (distance from center)
+        #    Max Curvature + Half Width + Max Possible Aneurysm Expansion
+        max_expansion = self.cfg.width_max * self.cfg.aneurysm_factor_max
+        max_y = self.cfg.curvature_amplitude + (self.cfg.width_max / 2) + max_expansion
+
+        # Add a 20% padding buffer so it doesn't touch the edge
+        y_limit = max_y * 1.2
+
+        # 2. Calculate X limits based on vessel length
+        x_pad = self.cfg.base_length * 0.1  # 10% padding
+
+        # Apply the dynamic limits
+        ax.set_xlim(-x_pad, self.cfg.base_length + x_pad)
+        ax.set_ylim(-y_limit, y_limit)
+
         ax.set_aspect('equal')
         ax.set_title(f"Sample {idx}")
 
@@ -83,58 +98,6 @@ class VesselGenerator:
             offsets[peak_idx - 1: peak_idx + 2] = [max_off * 0.6, max_off, max_off * 0.6]
         return offsets
 
-    def generate_bifurcation(self):
-        w_parent = random.uniform(self.cfg.width_min, self.cfg.width_max)
-        split_ratio = random.uniform(0.4, 0.8)
-        w_d1 = w_parent * split_ratio
-        w_d2 = w_parent * (1.2 - split_ratio)
-
-        angle_1 = np.deg2rad(random.uniform(self.cfg.bifurcation_angle_min, self.cfg.bifurcation_angle_max))
-        angle_2 = np.deg2rad(random.uniform(25, 60))
-
-        lc = self.cfg.mesh_lc
-        L1, L2 = self.cfg.bifurcation_l1, self.cfg.bifurcation_l2
-        f_rad = 0.0004
-
-        # Geometry Points
-        p_in_t = gmsh.model.geo.addPoint(0, w_parent / 2, 0, lc)
-        p_in_b = gmsh.model.geo.addPoint(0, -w_parent / 2, 0, lc)
-        l_in = gmsh.model.geo.addLine(p_in_b, p_in_t)
-
-        o1_x = L1 + L2 * np.cos(angle_1)
-        o1_y = (w_parent / 2) + L2 * np.sin(angle_1)
-        p_o1_t = gmsh.model.geo.addPoint(o1_x - (w_d1 / 2) * np.sin(angle_1), o1_y + (w_d1 / 2) * np.cos(angle_1), 0,
-                                         lc)
-        p_o1_b = gmsh.model.geo.addPoint(o1_x + (w_d1 / 2) * np.sin(angle_1), o1_y - (w_d1 / 2) * np.cos(angle_1), 0,
-                                         lc)
-        l_o1 = gmsh.model.geo.addLine(p_o1_t, p_o1_b)
-
-        o2_x = L1 + L2 * np.cos(angle_2)
-        o2_y = -(w_parent / 2) - L2 * np.sin(angle_2)
-        p_o2_t = gmsh.model.geo.addPoint(o2_x + (w_d2 / 2) * np.sin(angle_2), o2_y + (w_d2 / 2) * np.cos(angle_2), 0,
-                                         lc)
-        p_o2_b = gmsh.model.geo.addPoint(o2_x - (w_d2 / 2) * np.sin(angle_2), o2_y - (w_d2 / 2) * np.cos(angle_2), 0,
-                                         lc)
-        l_o2 = gmsh.model.geo.addLine(p_o2_t, p_o2_b)
-
-        mid_top = gmsh.model.geo.addPoint(L1 * 0.5, w_parent / 2, 0, lc)
-        l_wt = gmsh.model.geo.addBSpline([p_in_t, mid_top, p_o1_t])
-
-        mid_bot = gmsh.model.geo.addPoint(L1 * 0.5, -w_parent / 2, 0, lc)
-        l_wb = gmsh.model.geo.addBSpline([p_o2_b, mid_bot, p_in_b])
-
-        p_f_upper = gmsh.model.geo.addPoint(L1 + f_rad, w_parent * 0.1, 0, lc)
-        p_f_center = gmsh.model.geo.addPoint(L1, 0, 0, lc)
-        p_f_lower = gmsh.model.geo.addPoint(L1 + f_rad, -w_parent * 0.1, 0, lc)
-        l_fork = gmsh.model.geo.addBSpline([p_o1_b, p_f_upper, p_f_center, p_f_lower, p_o2_t])
-
-        curves = [l_in, l_wt, l_o1, l_fork, l_o2, l_wb]
-        groups = {
-            "Inlet": [l_in], "Outlet_1": [l_o1], "Outlet_2": [l_o2],
-            "Walls": [l_wt, l_fork, l_wb]
-        }
-        return curves, groups, w_parent
-
     def generate_spline_vessel(self, v_type, is_curved):
         width = random.uniform(self.cfg.width_min, self.cfg.width_max)
         length = self.cfg.base_length
@@ -144,8 +107,8 @@ class VesselGenerator:
         for i in range(self.cfg.num_ctrl_pts):
             x = (i / (self.cfg.num_ctrl_pts - 1)) * length
 
-            # Strictly align the first point to y=0 for centered inlets
-            if i == 0:
+            # Strictly align the first points to y=0 for centered inlets
+            if i < 2:
                 y = 0.0
             else:
                 y = random.uniform(-self.cfg.curvature_amplitude, self.cfg.curvature_amplitude) if is_curved else 0.0
@@ -154,6 +117,7 @@ class VesselGenerator:
 
         offsets = self._calculate_pathology_offsets(v_type, width)
         widths = [width + (2 * o) if o > 0 else width - (2 * abs(o)) for o in offsets]
+        #effective length = d_bar
         d_bar_true = np.mean(widths)
 
         top_tags, bot_tags = [], []
@@ -185,53 +149,30 @@ class VesselGenerator:
         }
         return curves, groups, d_bar_true
 
-    def generate(self, idx, level=1, show_viz=False, ax=None):
+    def generate(self, idx, level=0, show_viz=False, ax=None):
         gmsh.model.add(f"vessel_{idx}")
         try:
-            is_bifurcation = False
-            is_curved = False
-            v_type = 'straight'
-
-            # 3-Tier Level Logic
-            if level == 1:
+            if level == 0:  # Level 0 (Purely straight with pathological defects)
                 v_type = random.choice(['straight', 'stenosis', 'aneurysm'])
                 is_curved = False
-            elif level == 2:
+            else:  # Level 1 (Curved/Tortuous with pathological defects)
                 v_type = random.choice(['straight', 'stenosis', 'aneurysm'])
-                is_curved = True
-            else:  # Level 3
-                if random.random() > 0.7:
-                    is_bifurcation = True
-                else:
-                    v_type = random.choice(['straight', 'stenosis', 'aneurysm'])
-                    is_curved = random.choice([True, False])
+                # Randomly decide if it's curved or straight for variety
+                is_curved = random.choice([True, False])
 
-            if is_bifurcation:
-                curves, groups, d_bar = self.generate_bifurcation()
-                v_str = "bifurcation"
-                num_outlets = 2
-            else:
-                curves, groups, d_bar = self.generate_spline_vessel(v_type, is_curved)
-                v_str = f"{v_type}_{'curved' if is_curved else 'straight'}"
-                num_outlets = 1
+            curves, groups, d_bar = self.generate_spline_vessel(v_type, is_curved)
+            v_str = f"{v_type}_{'curved' if is_curved else 'straight'}"
+            num_outlets = 1
 
             cl = gmsh.model.geo.addCurveLoop(curves)
             s = gmsh.model.geo.addPlaneSurface([cl])
             gmsh.model.geo.synchronize()
 
-            gmsh.model.addPhysicalGroup(1, groups["Inlet"], 101, name="Inlet")
-            gmsh.model.addPhysicalGroup(1, groups["Outlet_1"], 102, name="Outlet_1")
-
-            if is_bifurcation:
-                # Outlet_2 gets 103
-                gmsh.model.addPhysicalGroup(1, groups["Outlet_2"], 103, name="Outlet_2")
-                # Walls get 104
-                gmsh.model.addPhysicalGroup(1, groups["Walls"], 104, name="Walls")
-            else:
-                # Straight vessels: Walls get 103 (because there is no second outlet)
-                gmsh.model.addPhysicalGroup(1, groups["Walls"], 103, name="Walls")
-
-            gmsh.model.addPhysicalGroup(2, [s], 201, name="Fluid_Domain")
+            # Tag physical graph groups
+            gmsh.model.addPhysicalGroup(1, groups["Inlet"], self.cfg.TAGS["Inlet"], name="Inlet")
+            gmsh.model.addPhysicalGroup(1, groups["Outlet_1"], self.cfg.TAGS["Outlet_1"], name="Outlet_1")
+            gmsh.model.addPhysicalGroup(1, groups["Walls"], self.cfg.TAGS["Walls"], name="Walls")
+            gmsh.model.addPhysicalGroup(2, [s], self.cfg.TAGS["Fluid_Domain"], name="Fluid_Domain")
 
             gmsh.model.mesh.generate(2)
 
@@ -248,7 +189,7 @@ class VesselGenerator:
         finally:
             gmsh.model.remove()
 
-    def run_pipeline(self, n=50, level=1):
+    def run_pipeline(self, n=50, level=0):
         print(f" Generating Level {level} Dataset (N={n}) in {self.output_dir}...")
 
         # Visualize first 9 samples in a grid
@@ -269,5 +210,5 @@ class VesselGenerator:
 if __name__ == "__main__":
     config = VesselConfig()
     vg = VesselGenerator()
-    vg.run_pipeline(n=500, level=1)  # Level 1=Straight, 2=Curved, 3=Bifurcations
+    vg.run_pipeline(n=500, level=0)  # Level 0=Straight, 1=Curved/Tortuous
     gmsh.finalize()

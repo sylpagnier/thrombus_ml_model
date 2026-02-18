@@ -30,12 +30,6 @@ class VesselConfig:
     width_max: float = 0.0018
     curvature_amplitude: float = 0.0035
 
-    # Bifurcation Specifics
-    bifurcation_angle_min: float = 20.0
-    bifurcation_angle_max: float = 45.0
-    bifurcation_l1: float = 0.006
-    bifurcation_l2: float = 0.009
-
     # Pathology Constraints
     stenosis_factor_min: float = 0.30
     stenosis_factor_max: float = 0.66
@@ -49,8 +43,7 @@ class VesselConfig:
     TAGS: Dict[str, int] = field(default_factory=lambda: {
         "Inlet": 101,
         "Outlet_1": 102,
-        "Outlet_2": 103,
-        "Walls": 104,
+        "Walls": 103,
         "Fluid_Domain": 201
     })
 

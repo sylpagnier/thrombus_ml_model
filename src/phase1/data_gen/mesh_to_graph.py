@@ -117,13 +117,18 @@ class MeshToGraphComplete:
         # --- FIX 2: Pass num_outlets to function ---
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes), num_outlets)
 
+        # d_bar Fallback
         if d_bar is None:
             if mask_inlet.any():
                 inlet_nodes = nodes[mask_inlet]
-                d_bar = np.max(inlet_nodes[:, 1]) - np.min(inlet_nodes[:, 1])
+                # Use Euclidean distance for non-vertical inlets
+                d_bar = np.max(np.linalg.norm(inlet_nodes - inlet_nodes.mean(axis=0), axis=1)) * 2
 
         # Physics Scaling
-        u_ref = (self.phys_cfg.re_target * self.phys_cfg.mu_newtonian) / (self.phys_cfg.rho * d_bar)
+        # Select viscosity based on physics tier.
+        # For Tier 1 (Newtonian), use mu_newtonian. For Tier 2 (Non-Newtonian), typically mu_inf is the reference.
+        ref_mu = self.phys_cfg.mu_inf if self.phys_cfg.mu_inf != self.phys_cfg.mu_newtonian else self.phys_cfg.mu_newtonian
+        u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
         p_ref_scale = self.phys_cfg.rho * (u_ref ** 2)
 
         # SDF and Gradients
@@ -135,7 +140,7 @@ class MeshToGraphComplete:
 
         nearest_wall_pts = wall_pts[indices]
         diff_vec = nodes - nearest_wall_pts
-        sdf_grad = diff_vec / (dist_raw[:, None] + 1e-8)
+        wall_normal_vec = diff_vec / (dist_raw[:, None] + 1e-8)
 
         # Restored: Spatial Label Mapping via cKDTree
         y_labels = torch.zeros((len(nodes), 3), dtype=torch.float32)
@@ -209,7 +214,7 @@ class MeshToGraphComplete:
             torch.tensor(nodes_nd, dtype=torch.float32),
             torch.tensor(sdf_nd, dtype=torch.float32),
             shear_pot,
-            torch.tensor(sdf_grad, dtype=torch.float32),
+            torch.tensor(wall_normal_vec, dtype=torch.float32),
             node_type  # Added One-Hot Features
         ], dim=1)
 
