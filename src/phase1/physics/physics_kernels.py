@@ -140,16 +140,16 @@ class PhysicsKernels:
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
         c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-        u_x, u_y, u_xx, u_yy, u_xy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0], c_u[:, 3, 0]
-        v_x, v_y, v_xx, v_yy, v_xy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0], c_v[:, 3, 0]
+        u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
+        v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        # --- Dynamic Viscosity Logic ---
+        # --- Dynamic Viscosity Logic (Tier 2 Update) ---
         if self.cfg.viscosity_model == "carreau":
-            # Non-Newtonian path: Compute mu_eff and its spatial gradients
-            du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
-            mu_eff = self._compute_carreau_viscosity(du_ij, u_ref, d_bar)
+            # Extract the predicted mu directly from the 4th channel
+            mu_eff = pred[:, 3]
 
+            # Compute spatial gradients of the predicted mu
             c_mu = self._compute_derivatives(mu_eff.unsqueeze(1), props)
             mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
@@ -187,6 +187,37 @@ class PhysicsKernels:
             res = torch.tensor(0.0, device=pred.device)
 
         return res
+
+    def rheology_loss(self, pred, data, props=None):
+        """
+        Penalizes the network if its predicted viscosity (pred[:, 3])
+        deviates from the analytical Carreau-Yasuda model given its
+        predicted velocity gradients.
+        """
+        if self.cfg.viscosity_model != "carreau":
+            return torch.tensor(0.0, device=pred.device)
+
+        if props is None:
+            props = self._get_geometric_props(data)
+
+        # Extract predictions
+        u, v, mu_pred = pred[:, 0], pred[:, 1], pred[:, 3]
+        u_ref, d_bar = data.u_ref, data.d_bar
+
+        # We only need 1st order derivatives for the strain rate
+        c_u = self._compute_derivatives(u.unsqueeze(1), props)
+        c_v = self._compute_derivatives(v.unsqueeze(1), props)
+
+        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
+        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
+
+        du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
+
+        # Compute the theoretical target viscosity based on current predicted flow
+        mu_target = self._compute_carreau_viscosity(du_ij, u_ref, d_bar)
+
+        # Mean Squared Error between the network's mu prediction and the analytical mu
+        return torch.mean((mu_pred - mu_target) ** 2)
 
     def boundary_condition_loss(self, pred, data):
         # Squeeze to [N] to be safe

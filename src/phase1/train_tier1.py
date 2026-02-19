@@ -126,10 +126,10 @@ def load_dataset():
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = rGINO_DEQ(in_channels=11, latent_dim=64, max_iters=15).to(device)
+    model = rGINO_DEQ(in_channels=11, out_channels=4, latent_dim=64, max_iters=15).to(device)
 
     # Initialize the config object
-    phys_cfg = PhysicsConfig(re_target=150.0, viscosity_model="carreau")
+    phys_cfg = PhysicsConfig(re_target=150.0, viscosity_model="newtonian")
 
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -168,16 +168,22 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
+                    # Train all 4 channels
                     l_data = F.mse_loss(pred[node_is_anchor], data.y[node_is_anchor])
 
             l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
+
             row, col = data.edge_index
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
+            # Dummy regularization to ensure the 4th channel learns
+            # to be 1.0 globally, even on unlabeled synthetic nodes.
+            l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
+
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + \
-                   (5.0 * l_data) + (.5 * l_smoothness)
+                   (5.0 * l_data) + (.5 * l_smoothness) + (1.0 * l_mu_dummy)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

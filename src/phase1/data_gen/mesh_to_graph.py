@@ -134,7 +134,7 @@ class MeshToGraphComplete:
         wall_normal_vec = diff_vec / (dist_raw[:, None] + 1e-8)
 
         # Spatial Label Mapping via cKDTree
-        y_labels = torch.zeros((len(nodes), 3), dtype=torch.float32)
+        y_labels = torch.zeros((len(nodes), 4), dtype=torch.float32)
         is_anchor = False
         if label_path.exists():
             try:
@@ -148,13 +148,23 @@ class MeshToGraphComplete:
                 v_raw = torch.tensor(cfd['v'].flatten()[idx], dtype=torch.float32)
                 p_raw = torch.tensor(cfd['p'].flatten()[idx], dtype=torch.float32)
 
+                # Robust extraction for mu with a Newtonian fallback for older datasets
+                if 'mu' in cfd:
+                    mu_raw = torch.tensor(cfd['mu'].flatten()[idx], dtype=torch.float32)
+                else:
+                    mu_raw = torch.full_like(u_raw, ref_mu)
+
                 # Normalize
                 u_nd, v_nd = u_raw / u_ref, v_raw / u_ref
                 outlet_idx = mask_outlet.nonzero(as_tuple=True)[0]
                 p_offset = p_raw[outlet_idx].mean() if len(outlet_idx) > 0 else 0.0
                 p_nd = (p_raw - p_offset) / p_ref_scale
 
-                y_labels = torch.stack([u_nd, v_nd, p_nd], dim=1)
+                # Non-dimensionalize viscosity by the reference viscosity (mu_inf or mu_newtonian)
+                mu_nd = mu_raw / ref_mu
+
+                # Stack the 4 channels
+                y_labels = torch.stack([u_nd, v_nd, p_nd, mu_nd], dim=1)
                 is_anchor = True
             except Exception as e:
                 print(f"Error mapping labels {filename}: {e}")

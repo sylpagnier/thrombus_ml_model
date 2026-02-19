@@ -1,7 +1,6 @@
 import pytest
 import torch
 import os
-import math
 from torch_geometric.data import Data
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig

@@ -103,7 +103,7 @@ class AnchorGenerator:
             # Newtonian fallback
             var_node.set('mu_final', 'mu_ref')
 
-    def _evaluate_at_coords(self, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _evaluate_at_coords(self, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         High-performance evaluation using COMSOL Java API Interp feature.
         """
@@ -117,26 +117,27 @@ class AnchorGenerator:
             interp = results.numerical(interp_tag)
 
             interp.set("data", "dset1")
-            # Explicitly cast to Java String array to ensure stability
-            interp.set("expr", ["u", "v", "p"])
+            # Added "mu_final" to extract the computed viscosity field
+            interp.set("expr", ["u", "v", "p", "mu_final"])
 
             interp.setInterpolationCoordinates(coords_T.tolist())
             data = interp.getData()
 
-            # Robust unpacking: check if data is 2D
-            if len(data) < 3:
+            # Robust unpacking: check if data has all 4 fields
+            if len(data) < 4:
                 raise ValueError(f"COMSOL returned incomplete data. Shape: {len(data)}")
 
             u = np.array(data[0])
             v = np.array(data[1])
             p = np.array(data[2])
+            mu = np.array(data[3])
 
-            return u, v, p
+            return u, v, p, mu
 
         except Exception as e:
             logger.error(f"COMSOL Evaluation failed: {e}")
             nan_arr = np.full(coords.shape[0], np.nan)
-            return nan_arr, nan_arr, nan_arr
+            return nan_arr, nan_arr, nan_arr, nan_arr
 
         finally:
             try:
@@ -223,7 +224,7 @@ class AnchorGenerator:
                 mesh = meshio.read(msh_file)
                 target_nodes = mesh.points[:, :2]
 
-                u, v, p = self._evaluate_at_coords(target_nodes)
+                u, v, p, mu = self._evaluate_at_coords(target_nodes)
 
                 # ---Robust Meshio Access ---
                 # Check if 'line' cells exist using modern meshio API
@@ -266,7 +267,7 @@ class AnchorGenerator:
                 np.savez(
                     out_file,
                     x=target_nodes[:, 0], y=target_nodes[:, 1],
-                    u=u, v=v, p=p,
+                    u=u, v=v, p=p, mu=mu,
                     d_bar=d_bar,
                     config_id=i
                 )
