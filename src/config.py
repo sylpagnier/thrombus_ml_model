@@ -1,27 +1,33 @@
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 from src.utils.paths import get_project_root
-
+from pathlib import Path
 
 @dataclass
 class VesselConfig:
     """Central configuration for vessel geometry and mesh generation."""
+
+    # 1. Define the active tier/experiment here
+    tier: str = "tier1"  # e.g., "tier1", "tier2", "tier3_patients"
+
     # --- Paths ---
-    # Where the COMSOL template lives
-    project_root = get_project_root()
-    template_path: str = project_root / "comsol_models/phase1_template.mph"
+    project_root: Path = field(default_factory=get_project_root)
+    template_path: Path = field(init=False)
+    mesh_input_dir: Path = field(init=False)
+    output_dir: Path = field(init=False)
+    graph_output_dir: Path = field(init=False)
 
-    # 1. RAW DATA: Where meshes (.msh/.nas) and metadata (.json) are saved
-    mesh_input_dir: str = project_root / "data/raw/synthetic"
+    def __post_init__(self):
+        """Dynamically resolve paths based on the selected tier."""
+        self.template_path = self.project_root / "comsol_models/phase1_template.mph"
 
-    # 2. PROCESSED CFD: Where COMSOL results (.npz) are saved
-    output_dir: str = project_root / "data/processed/cfd_results"
-
-    # 3. FINAL GRAPHS: Where PyTorch Geometric graphs (.pt) are saved
-    graph_output_dir: str = project_root / "data/processed/graphs"
+        # Append the tier name to isolate data generation and processing
+        self.mesh_input_dir = self.project_root / f"data/raw/{self.tier}"
+        self.output_dir = self.project_root / f"data/processed/cfd_results_{self.tier}"
+        self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
 
     # Mesh Settings
-    mesh_size_factor: float = .5
+    mesh_size_factor: float = 0.5
     mesh_lc: float = 0.0002
 
     # Vessel Dimensions
@@ -39,7 +45,7 @@ class VesselConfig:
     # Control Points
     num_ctrl_pts: int = 7
 
-    # Physical Group Tags (Must match what is used in Gmsh and Graph Gen)
+    # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {
         "Inlet": 101,
         "Outlet_1": 102,
@@ -50,16 +56,29 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
+    # Add tier argument to match VesselConfig
+    tier: VesselConfig.tier
+
     # Fluid Properties
     rho: float = 1050.0  # kg/m^3
     re_target: float = 150.0  # Reynolds number [-]
-    viscosity_model: str = "carreau"  # Options: "newtonian", "carreau"
 
-    # Newtonian Reference (phase 1)
+    # Let post_init handle this automatically
+    viscosity_model: str = field(init=False)
+
+    def __post_init__(self):
+        """Automatically set the correct physics based on the project tier."""
+        if self.tier == "tier1":
+            self.viscosity_model = "newtonian"
+        elif self.tier in ["tier2", "tier3", "tier3_patients"]:
+            self.viscosity_model = "carreau"
+        else:
+            raise ValueError(f"Unknown tier: {self.tier}")
+
+    # Newtonian Reference (tier 1)
     mu_newtonian: float = 0.0035  # Pa*s (3.5 cP)
 
-    # Carreau-Yasuda Rheology (phase 1.2 - Cho & Kensey 1991 Human Blood)
-    # mu_eff = mu_inf + (mu_0 - mu_inf) * (1 + (lambda * gamma_dot)^a)^((n-1)/a)
+    # Carreau-Yasuda Rheology (tier 2 - Cho & Kensey 1991 Human Blood)
     mu_inf: float = 0.0035  # Pa*s
     mu_0: float = 0.056  # Pa*s
     lam: float = 3.313  # Relaxation time (s)

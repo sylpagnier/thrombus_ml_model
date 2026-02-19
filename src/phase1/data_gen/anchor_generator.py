@@ -48,15 +48,13 @@ class AnchorGenerator:
         if output_dir:
             self.output_dir = Path(output_dir)
         else:
-            self.output_dir = (Path(VesselConfig.output_dir) if Path(VesselConfig.output_dir).is_absolute()
-                               else self.root_dir / VesselConfig.output_dir)
+            self.output_dir = self.vessel_config.output_dir
 
         # Handle Mesh Directory
         if mesh_dir:
             self.mesh_dir = Path(mesh_dir)
         else:
-            self.mesh_dir = (Path(VesselConfig.mesh_input_dir) if Path(VesselConfig.mesh_input_dir).is_absolute()
-                             else self.root_dir / VesselConfig.mesh_input_dir)
+            self.mesh_dir = self.vessel_config.mesh_input_dir
 
         self.client: Optional[mph.Client] = None
         self.model: Optional[mph.Model] = None
@@ -281,9 +279,18 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        with AnchorGenerator() as generator:
+        active_tier = "tier2" # tier 1 (Newtonian), tier 2 (non-Newtonian)
+
+        generator = AnchorGenerator()
+        generator.vessel_config = VesselConfig(tier=active_tier)
+        generator.phys_cfg = PhysicsConfig(tier=active_tier)
+
+        # Apply the paths
+        generator.output_dir = generator.vessel_config.output_dir
+        generator.mesh_dir = generator.vessel_config.mesh_input_dir
+        generator.output_dir.mkdir(parents=True, exist_ok=True)
+
+        with generator:
             generator.run_batch(start_idx=0, end_idx=50)
-    except KeyboardInterrupt:
-        logger.info("Batch run interrupted by user.")
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        print(e)

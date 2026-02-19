@@ -240,4 +240,14 @@ class MeshToGraphComplete:
 
 
 if __name__ == "__main__":
-    MeshToGraphComplete().run()
+    processor = MeshToGraphComplete()
+    # Apply Tier settings
+    processor.vessel_cfg = VesselConfig(tier="tier1")
+
+    # Re-initialize paths based on new config
+    processor.raw_dir = processor.vessel_cfg.mesh_input_dir
+    processor.label_dir = processor.vessel_cfg.output_dir
+    processor.proc_dir = processor.vessel_cfg.graph_output_dir
+    processor.proc_dir.mkdir(parents=True, exist_ok=True)
+
+    processor.run()

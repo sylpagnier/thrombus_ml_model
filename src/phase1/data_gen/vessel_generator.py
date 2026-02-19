@@ -208,7 +208,10 @@ class VesselGenerator:
 
 
 if __name__ == "__main__":
-    config = VesselConfig()
+    config = VesselConfig(tier="tier1") # tier 1 (Newtonian), tier 2 (non-Newtonian)
     vg = VesselGenerator()
-    vg.run_pipeline(n=500, level=0)  # Level 0=Straight, 1=Curved/Tortuous
+    vg.cfg = config
+    vg.output_dir = config.mesh_input_dir
+
+    vg.run_pipeline(n=100, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
     gmsh.finalize()
