@@ -9,8 +9,8 @@ from src.config import VesselConfig
 from pathlib import Path
 
 class VesselGenerator:
-    def __init__(self, output_dir=None):
-        self.cfg = VesselConfig()
+    def __init__(self, tier="tier1", output_dir=None):
+        self.cfg = VesselConfig(tier=tier)
         self.project_root = get_project_root()
 
         # If override provided, use it; otherwise use Config default
@@ -208,10 +208,10 @@ class VesselGenerator:
 
 
 if __name__ == "__main__":
-    config = VesselConfig(tier="tier1") # tier 1 (Newtonian), tier 2 (non-Newtonian)
-    vg = VesselGenerator()
-    vg.cfg = config
-    vg.output_dir = config.mesh_input_dir
+    active_tier = "tier1"  # tier 1 (Newtonian), tier 2 (non-Newtonian)
+
+    # Pass the tier to vessel gen instance
+    vg = VesselGenerator(tier=active_tier)
 
     vg.run_pipeline(n=100, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
     gmsh.finalize()

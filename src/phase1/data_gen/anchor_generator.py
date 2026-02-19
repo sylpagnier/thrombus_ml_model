@@ -7,6 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Tuple, Optional
 from src.config import VesselConfig, PhysicsConfig
+from src.utils.paths import get_project_root
 
 # Configure logging
 logging.basicConfig(
@@ -32,16 +33,17 @@ class AnchorGenerator:
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
-    def __init__(self, mesh_dir=None, output_dir=None, template_path=None):
-        self.vessel_config = VesselConfig()
-        self.phys_cfg = PhysicsConfig()
-        self.root_dir = Path(__file__).resolve().parent.parent
+    def __init__(self, tier="tier1", mesh_dir=None, output_dir=None, template_path=None):
+        self.vessel_config = VesselConfig(tier=tier)
+        self.phys_cfg = PhysicsConfig(tier=tier)
+
+        self.root_dir = get_project_root()
 
         # --- 1. Resolve Template Path ---
         if template_path:
             self.template_path = Path(template_path)
         else:
-            self.template_path = self.root_dir / VesselConfig.template_path
+            self.template_path = self.vessel_config.template_path
 
         # --- 2. Resolve Input/Output Paths ---
         # Handle Output Directory
@@ -279,16 +281,8 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        active_tier = "tier1" # tier 1 (Newtonian), tier 2 (non-Newtonian)
-
-        generator = AnchorGenerator()
-        generator.vessel_config = VesselConfig(tier=active_tier)
-        generator.phys_cfg = PhysicsConfig(tier=active_tier)
-
-        # Apply the paths
-        generator.output_dir = generator.vessel_config.output_dir
-        generator.mesh_dir = generator.vessel_config.mesh_input_dir
-        generator.output_dir.mkdir(parents=True, exist_ok=True)
+        active_tier = "tier1"
+        generator = AnchorGenerator(tier=active_tier)
 
         with generator:
             generator.run_batch(start_idx=0, end_idx=50)

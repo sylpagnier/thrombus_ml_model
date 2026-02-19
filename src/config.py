@@ -56,8 +56,8 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
-    # Add tier argument to match VesselConfig
-    tier: VesselConfig.tier
+    # Set the type to str and provide a default value
+    tier: str = "tier1"
 
     # Fluid Properties
     rho: float = 1050.0  # kg/m^3

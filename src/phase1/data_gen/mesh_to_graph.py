@@ -12,10 +12,10 @@ from src.utils.paths import get_project_root
 
 
 class MeshToGraphComplete:
-    def __init__(self, raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, tier="tier1", raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
-        self.vessel_cfg = VesselConfig()
-        self.phys_cfg = PhysicsConfig()
+        self.vessel_cfg = VesselConfig(tier=tier)
+        self.phys_cfg = PhysicsConfig(tier=tier)
 
         # Resolve Raw Dir
         if raw_dir:
@@ -240,14 +240,6 @@ class MeshToGraphComplete:
 
 
 if __name__ == "__main__":
-    processor = MeshToGraphComplete()
-    # Apply Tier settings
-    processor.vessel_cfg = VesselConfig(tier="tier1")
-
-    # Re-initialize paths based on new config
-    processor.raw_dir = processor.vessel_cfg.mesh_input_dir
-    processor.label_dir = processor.vessel_cfg.output_dir
-    processor.proc_dir = processor.vessel_cfg.graph_output_dir
-    processor.proc_dir.mkdir(parents=True, exist_ok=True)
-
+    active_tier = "tier1"
+    processor = MeshToGraphComplete(tier=active_tier)
     processor.run()
