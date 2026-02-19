@@ -192,7 +192,8 @@ class PhysicsKernels:
         """
         Penalizes the network if its predicted viscosity (pred[:, 3])
         deviates from the analytical Carreau-Yasuda model given its
-        predicted velocity gradients.
+        predicted velocity gradients. Calculated in Log-Space to prevent
+        high-shear wall events from destabilizing early training.
         """
         if self.cfg.viscosity_model != "carreau":
             return torch.tensor(0.0, device=pred.device)
@@ -216,8 +217,16 @@ class PhysicsKernels:
         # Compute the theoretical target viscosity based on current predicted flow
         mu_target = self._compute_carreau_viscosity(du_ij, u_ref, d_bar)
 
-        # Mean Squared Error between the network's mu prediction and the analytical mu
-        return torch.mean((mu_pred - mu_target) ** 2)
+        # Log-Space Transformation
+        # Clamp predictions to prevent log(negative) or log(0) NaNs during early epochs
+        mu_pred_safe = torch.clamp(mu_pred, min=1e-8)
+        mu_target_safe = torch.clamp(mu_target, min=1e-8)
+
+        log_mu_pred = torch.log(mu_pred_safe)
+        log_mu_target = torch.log(mu_target_safe)
+
+        # Mean Squared Error in Log-Space
+        return torch.mean((log_mu_pred - log_mu_target) ** 2)
 
     def boundary_condition_loss(self, pred, data):
         # Squeeze to [N] to be safe

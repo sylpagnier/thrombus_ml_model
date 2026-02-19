@@ -279,7 +279,7 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        active_tier = "tier2" # tier 1 (Newtonian), tier 2 (non-Newtonian)
+        active_tier = "tier1" # tier 1 (Newtonian), tier 2 (non-Newtonian)
 
         generator = AnchorGenerator()
         generator.vessel_config = VesselConfig(tier=active_tier)

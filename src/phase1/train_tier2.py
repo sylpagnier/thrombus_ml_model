@@ -77,19 +77,22 @@ def quantify_performance(model, val_loader, kernels, device):
     2. Continuity Residual (Mass Conservation)
     3. Max Wall Slip (BC Violations)
     4. Rheology Error (Carreau-Yasuda deviation)
+    5. Shear Rate Error (Explicit Phase 1.3 Validation)
     """
     model.eval()
     metrics = {
         "rel_l2": [],
         "continuity": [],
         "wall_slip": [],
-        "rheology": []
+        "rheology": [],
+        "shear_mse": []  # Added shear tracking
     }
 
     with torch.no_grad():
         for data in val_loader:
             data = data.to(device)
             pred = model(data)
+            props = kernels._get_geometric_props(data)
 
             # 1. Relative L2 Error (only for nodes with labels/anchors)
             if hasattr(data, 'is_anchor'):
@@ -100,8 +103,30 @@ def quantify_performance(model, val_loader, kernels, device):
                     rel_l2 = diff_norm / (target_norm + 1e-8)
                     metrics["rel_l2"].append(rel_l2.item())
 
+                    # --- 5. Explicit Shear Rate Validation ---
+                    # Calculate ground-truth shear rate from labels
+                    u_true, v_true = data.y[:, 0:1], data.y[:, 1:2]
+                    c_u_true = kernels._compute_derivatives(u_true, props)
+                    c_v_true = kernels._compute_derivatives(v_true, props)
+
+                    ux_t, uy_t = c_u_true[:, 0, 0], c_u_true[:, 1, 0]
+                    vx_t, vy_t = c_v_true[:, 0, 0], c_v_true[:, 1, 0]
+                    gamma_dot_true = torch.sqrt(2 * ux_t ** 2 + 2 * vy_t ** 2 + (uy_t + vx_t) ** 2 + 1e-8)
+
+                    # Calculate predicted shear rate
+                    u_pred, v_pred = pred[:, 0:1], pred[:, 1:2]
+                    c_u_pred = kernels._compute_derivatives(u_pred, props)
+                    c_v_pred = kernels._compute_derivatives(v_pred, props)
+
+                    ux_p, uy_p = c_u_pred[:, 0, 0], c_u_pred[:, 1, 0]
+                    vx_p, vy_p = c_v_pred[:, 0, 0], c_v_pred[:, 1, 0]
+                    gamma_dot_pred = torch.sqrt(2 * ux_p ** 2 + 2 * vy_p ** 2 + (uy_p + vx_p) ** 2 + 1e-8)
+
+                    # Calculate MSE on anchor nodes
+                    shear_err = F.mse_loss(gamma_dot_pred[node_mask], gamma_dot_true[node_mask])
+                    metrics["shear_mse"].append(shear_err.item())
+
             # 2. Continuity Residual (Mass Conservation: div(u) = 0)
-            props = kernels._get_geometric_props(data)
             u, v = pred[:, 0:1], pred[:, 1:2]
             grad_u = kernels._compute_gradients(u, props)
             grad_v = kernels._compute_gradients(v, props)
@@ -214,7 +239,11 @@ def train_tier2(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device)
             print(
-                f"\n📊 [Validation] Rel L2: {scores['rel_l2']:.4f} | Div: {scores['continuity']:.3e} | Rheo Err: {scores['rheology']:.3e}")
+                f"\n📊 [Validation] Rel L2: {scores['rel_l2']:.4f} | "
+                f"Div: {scores['continuity']:.3e} | "
+                f"Rheo (Log-Err): {scores['rheology']:.3e} | "
+                f"Shear MSE: {scores['shear_mse']:.3e}"
+            )
 
             # Checkpoint 1: Best "Physical Health" (Focus on consistency)
             phys_score = scores['rel_l2'] + scores['continuity'] + scores['rheology']
