@@ -45,24 +45,34 @@ def inspect_comsol_tags():
             mesh_node = comp_node.mesh(m_tag)
             feature_tags = mesh_node.feature().tags()
 
-            # 3. Validation for AnchorGenerator compatibility
             found_import = False
             for f_tag in feature_tags:
                 f_type = mesh_node.feature(f_tag).getType()
                 print(f"   │   │   ├── Feature: {f_tag} (Type: {f_type})")
-
                 if f_type == 'Import':
                     found_import = True
 
-            # Specific check for anchor_generator logic
             if found_import:
                 print("   │   │    'Import' feature found (Compatible with AnchorGenerator)")
             else:
-                print("   │   │    WARNING: No 'Import' feature found! AnchorGenerator will fail.")
-                print("   │   │      (It expects an 'Import' node to inject the mesh)")
+                print("   │   │    WARNING: No 'Import' feature found.")
 
-    client.clear()
-    print("\nDone.")
+        # 3. Inspect Physics (Tier 2/3 Verification)
+        print(f"   ├── Looking for Physics Interfaces...")
+        phys_tags = comp_node.physics().tags()
+        if not phys_tags:
+            print("   │   No physics found.")
+        for p_tag in phys_tags:
+            p_type = comp_node.physics(p_tag).getType()
+            print(f"   │   ├── Physics Tag: {p_tag} (Type: {p_type})")
+
+        # 4. Inspect Materials (Carreau-Yasuda Verification)
+        print(f"   ├── Looking for Materials...")
+        mat_tags = comp_node.material().tags()
+        if not mat_tags:
+            print("   │   No materials found.")
+        for mat_tag in mat_tags:
+            print(f"   │   ├── Material Tag: {mat_tag}")
 
 
 if __name__ == "__main__":

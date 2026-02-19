@@ -13,7 +13,7 @@ current_file = Path(__file__).resolve()
 project_root = current_file.parent.parent.parent.parent
 sys.path.append(str(project_root))
 
-from src.phase1.physics.ginodeq import rGINO_DEQ
+from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 
 
@@ -24,7 +24,7 @@ class Tier1Validator:
         self.kernels = PhysicsKernels(phys_cfg)
 
         print(f"⚡ Loading Model: {model_path}")
-        self.model = rGINO_DEQ(in_channels=11, out_channels=3, latent_dim=64, max_iters=15)
+        self.model = GINO_DEQ(in_channels=11, out_channels=3, latent_dim=64, max_iters=15)
         # Load weights safely for CPU/GPU compatibility
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)

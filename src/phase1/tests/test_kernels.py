@@ -10,16 +10,16 @@ from src.config import VesselConfig, PhysicsConfig
 # CONFIG & FIXTURES
 # ==========================================
 
-@pytest.fixture(params=["newtonian", "carreau"], scope="module")
+@pytest.fixture(params=["tier1", "tier2"], scope="module")
 def phys_cfg(request):
     """
     Parameterized fixture: Runs every dependent test twice.
-    First pass: Tier 1 (Newtonian)
-    Second pass: Tier 2 (Carreau)
+    First pass: Tier 1 -> Sets viscosity_model to "newtonian" via post_init
+    Second pass: Tier 2 -> Sets viscosity_model to "carreau" via post_init
     """
     return PhysicsConfig(
         re_target=150.0,
-        viscosity_model=request.param
+        tier=request.param
     )
 
 

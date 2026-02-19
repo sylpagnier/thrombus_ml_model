@@ -4,28 +4,21 @@ import numpy as np
 from torch_geometric.utils import degree
 from src.config import PhysicsConfig, VesselConfig
 from src.phase1.physics.physics_kernels import PhysicsKernels, scatter_add
-from src.utils.paths import get_project_root
 
 
 def analyze_geometric_quality(data):
     """
     Analyzes geometric quality using 2nd-order WLS (5x5 matrix).
     Normalizes by local edge length to prevent unit-scale artifacts.
-    Returns:
-        cond_nums: The condition number for every node.
-        mask_valid: Boolean mask identifying nodes with enough neighbors (>=5) for valid stats.
     """
     row, col = data.edge_index
     num_nodes = data.num_nodes
 
-    # 1. Compute Node Degree for filtering
     d = degree(row, num_nodes, dtype=torch.long)
 
-    # 2. Geometric Setup (Normalized)
     pos_diff = data.x[col, :2] - data.x[row, :2]
     dist = torch.norm(pos_diff, dim=1)
 
-    # Average edge length per node for normalization
     ones = torch.ones_like(dist)
     count = scatter_add(ones, row, dim=0, dim_size=num_nodes)
     sum_dist = scatter_add(dist, row, dim=0, dim_size=num_nodes)
@@ -37,7 +30,6 @@ def analyze_geometric_quality(data):
     dist_sq_norm = dx ** 2 + dy ** 2 + 1e-8
     W = 1.0 / dist_sq_norm
 
-    # 3. Form 5x5 Matrix Basis: [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2]
     dx2, dxy, dy2 = 0.5 * dx ** 2, dx * dy, 0.5 * dy ** 2
     V = torch.stack([dx, dy, dx2, dxy, dy2], dim=1)
 
@@ -49,61 +41,58 @@ def analyze_geometric_quality(data):
     M_flat = scatter_add(M_e_flat, row, dim=0, dim_size=num_nodes)
     M = M_flat.view(num_nodes, 5, 5)
 
-    # 4. Eigenvalue check
     try:
         eigenvalues = torch.linalg.eigvalsh(M)
-        # Condition number = Max Eigen / Min Eigen
         cond_numbers = eigenvalues[:, -1] / (torch.abs(eigenvalues[:, 0]) + 1e-12)
         cond_nums_np = cond_numbers.cpu().numpy()
-
-        # Filter out nodes with fewer than 5 neighbors (Rank Deficient)
         mask_valid = (d >= 5).cpu().numpy()
-
         return cond_nums_np, mask_valid
-
     except RuntimeError:
         return np.zeros(num_nodes), np.zeros(num_nodes, dtype=bool)
 
 
-def inspect_sample(filename="vessel_0.pt"):
-    # 1. Load Data
-    root = get_project_root()
-    data_dir = root / VesselConfig.graph_output_dir
+def inspect_sample(filename="vessel_0.pt", tier="tier1"):
+    # 1. Configuration & Path Setup
+    phys_cfg = PhysicsConfig(tier=tier)
+    vessel_cfg = VesselConfig(tier=tier)
+
+    data_dir = vessel_cfg.graph_output_dir
     data_path = data_dir / filename
 
     if not data_path.exists():
+        print(f"File {filename} not found in {data_dir}. Looking for alternatives...")
         files = sorted(list(data_dir.glob("*.pt")))
         if not files:
-            print(" No .pt files found.")
+            print("No .pt files found. Please generate the graphs first.")
             return
         data_path = files[0]
 
-    print(f"--- Loading {data_path.name} ---")
+    print(f"--- Loading {data_path.name} ({tier.upper()}) ---")
     data = torch.load(data_path, weights_only=False)
 
     # 2. Version & Attribute Check
-    phys_cfg = PhysicsConfig()
-
-    # Default to assuming 11 channels is the target
     if data.x.shape[1] == 10:
         print(" [VERSION WARNING] Data is old (10 channels). Missing 'is_non_newt' flag.")
         phys_cfg.viscosity_model = "newtonian"
-        # Patch for viz: Add dummy column
         data.x = torch.cat([data.x, torch.zeros((data.num_nodes, 1))], dim=1)
     elif data.x.shape[1] == 11:
-        print("✅ Data format is current (11 channels).")
-        # Check flag at index 10
+        print(" Data format is current (11 channels).")
         if data.x[0, -1] == 1.0:
-            print("   -> Mode: Non-Newtonian (Carreau)")
+            print("   -> Mode: Non-Newtonian (Carreau-Yasuda)")
             phys_cfg.viscosity_model = "carreau"
         else:
             print("   -> Mode: Newtonian")
             phys_cfg.viscosity_model = "newtonian"
 
-    # 3. Geometric Quality
+    if hasattr(data, 'd_bar'):
+        print(f"   -> Mean Vessel Diameter (D_bar): {data.d_bar.item():.6f}")
+    if hasattr(data, 'u_inlet_bc'):
+        u_max = torch.max(data.u_inlet_bc[:, 0]).item()
+        print(f"   -> Max U_inlet applied: {u_max:.4f} m/s (Scaled for Re={phys_cfg.re_target})")
+
+    # 3. Geometric Quality Check
     print("\n--- Geometric Quality Check ---")
     cond_nums, mask_valid = analyze_geometric_quality(data)
-
     valid_cond = cond_nums[mask_valid]
     print(f"Nodes with < 5 neighbors: {len(cond_nums) - len(valid_cond)} (Excluded from stats)")
     print(f"Mean Condition No (Valid):  {np.mean(valid_cond):.2e}")
@@ -114,7 +103,7 @@ def inspect_sample(filename="vessel_0.pt"):
     else:
         print(" Internal mesh quality is excellent.")
 
-    # 4. Physics Residuals
+    # 4. Physics Residual Check
     if hasattr(data, 'y') and data.y is not None:
         print("\n--- Physics Residual Check ---")
         kernels = PhysicsKernels(phys_cfg=phys_cfg)
@@ -129,22 +118,23 @@ def inspect_sample(filename="vessel_0.pt"):
             print(f"BC Loss (Wall):         {res_bc.item():.6e}")
             print(f"Inlet/Outlet Loss:      {res_io.item():.6e}")
 
-    # 5. Visualization (Restored 6-Panel Layout)
+    # 5. Dynamic Visualization
     pos = data.x[:, :2].numpy()
     sdf_val = data.x[:, 2].numpy()
     shear_val = data.x[:, 3].numpy()
 
-    # 2 rows, 3 columns. Constrained layout prevents overlap.
-    fig = plt.figure(figsize=(20, 10), constrained_layout=True)
-    gs = fig.add_gridspec(2, 3)
+    # Determine Grid Size: 2x3 for Tier 1, 3x3 for Tier 2
+    cols = 3
+    rows = 3 if phys_cfg.viscosity_model == "carreau" else 2
+
+    fig = plt.figure(figsize=(6 * cols, 5 * rows), constrained_layout=True)
+    gs = fig.add_gridspec(rows, cols)
 
     # --- Plot 1: Geometric Stability ---
     ax1 = fig.add_subplot(gs[0, 0])
     cmap = plt.cm.viridis
-    cmap.set_bad(color='lightgrey')  # Masked nodes appear grey
+    cmap.set_bad(color='lightgrey')
     cond_viz = np.log10(cond_nums + 1)
-    # Apply mask for visualization (optional, or just rely on stats)
-    # Here we show all, but you can see the 'grey' boundaries if masked manually
     sc1 = ax1.scatter(pos[:, 0], pos[:, 1], c=cond_viz, cmap=cmap, s=5)
     plt.colorbar(sc1, ax=ax1, label="Log10(Cond No)", fraction=0.046, pad=0.04)
     ax1.set_title("Geometric Quality")
@@ -169,7 +159,7 @@ def inspect_sample(filename="vessel_0.pt"):
     if hasattr(data, 'y') and data.y is not None:
         sc4 = ax4.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 0].numpy(), cmap='jet', s=5)
         plt.colorbar(sc4, ax=ax4, label="U Velocity", fraction=0.046, pad=0.04)
-        ax4.set_title("Ground Truth: U")
+        ax4.set_title("Ground Truth: U Velocity")
     else:
         ax4.text(0.5, 0.5, "No Ground Truth", ha='center')
     ax4.set_aspect('equal')
@@ -186,23 +176,50 @@ def inspect_sample(filename="vessel_0.pt"):
 
     # --- Plot 6: Boundary Masks (Input Labels) ---
     ax6 = fig.add_subplot(gs[1, 2])
-    mask_inlet = data.mask_inlet.numpy()
-    mask_outlet = data.mask_outlet.numpy()
-    mask_wall = data.mask_wall.numpy()
+    mask_inlet = data.mask_inlet.numpy().astype(bool)
+    mask_outlet = data.mask_outlet.numpy().astype(bool)
+    mask_wall = data.mask_wall.numpy().astype(bool)
 
-    # Plot background
     ax6.scatter(pos[:, 0], pos[:, 1], c='whitesmoke', s=15, marker='s')
-    # Overlay masks
     ax6.scatter(pos[mask_inlet, 0], pos[mask_inlet, 1], c='green', s=10, label='Inlet')
     ax6.scatter(pos[mask_outlet, 0], pos[mask_outlet, 1], c='red', s=10, label='Outlet')
     ax6.scatter(pos[mask_wall, 0], pos[mask_wall, 1], c='black', s=5, label='Wall')
-
     ax6.set_title("Boundary Masks")
     ax6.legend(loc='upper right', fontsize='small')
     ax6.set_aspect('equal')
+
+    # --- Tier 2 Specific Plots ---
+    if rows == 3:
+        # Plot 7: Viscosity Field (\mu)
+        ax7 = fig.add_subplot(gs[2, 0])
+        if hasattr(data, 'mu'):
+            sc7 = ax7.scatter(pos[:, 0], pos[:, 1], c=data.mu.numpy(), cmap='viridis', s=5)
+            plt.colorbar(sc7, ax=ax7, label="Viscosity [Pa.s]", fraction=0.046, pad=0.04)
+            ax7.set_title(r"Carreau-Yasuda Viscosity ($\mu$)")
+        else:
+            ax7.text(0.5, 0.5, "Viscosity Missing", ha='center')
+        ax7.set_aspect('equal')
+
+        # Plot 8: Wall Normal Vectors
+        ax8 = fig.add_subplot(gs[2, 1])
+        skip = max(1, len(pos) // 500)
+        ax8.scatter(pos[:, 0], pos[:, 1], c='lightgray', s=1, alpha=0.3)
+        if mask_wall.any() and data.x.shape[1] > 5:
+            wall_pos = pos[mask_wall]
+            nx, ny = data.x[mask_wall, 4].numpy(), data.x[mask_wall, 5].numpy()
+            ax8.quiver(wall_pos[::skip, 0], wall_pos[::skip, 1], nx[::skip], ny[::skip],
+                       color='purple', scale=20, width=0.005)
+            ax8.set_title(r"Geometric Prior: Wall Normals ($n_{wall}$)")
+        else:
+            ax8.set_title("Wall Normals Missing")
+        ax8.set_aspect('equal')
+
+        # Plot 9: Placeholder/Empty (keeps the 3x3 grid neat)
+        ax9 = fig.add_subplot(gs[2, 2])
+        ax9.axis('off')
 
     plt.show()
 
 
 if __name__ == "__main__":
-    inspect_sample("vessel_0.pt")
+    inspect_sample(filename="vessel_0.pt", tier="tier1")

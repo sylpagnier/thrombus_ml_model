@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-import sys
 from src.utils.paths import get_project_root
 from src.config import VesselConfig
 
@@ -33,25 +32,32 @@ def inspect_data(sample_idx=0):
             print("Spatial coordinates (x, y) missing. Cannot plot spatial map.")
             return
 
-        # FORCE 1D SHAPES (Fixes the (1, N) vs (N,) mismatch)
+        # FORCE 1D SHAPES
         x = data['x'].flatten()
         y = data['y'].flatten()
         u = data['u'].flatten()
         v = data['v'].flatten()
         p = data['p'].flatten()
 
-        d_bar = data['d_bar'] if 'd_bar' in keys else "N/A"
-
-        # Calculate Magnitude
         vel_mag = np.sqrt(u ** 2 + v ** 2)
 
-        print(f"   Shape: {u.shape} points (Flattened)")
-        print(f"   Diameter (d_bar): {d_bar}")
+        # Check for Tier 2 Viscosity
+        has_mu = 'mu' in keys
+        if has_mu:
+            mu = data['mu'].flatten()
+
+        print(f"--- Data Summary (Sample {sample_idx}) ---")
+        if 'd_bar' in keys:
+            print(f"   Mean Diameter (d_bar): {data['d_bar']:.4f} m")
+        print(f"   Nodes: {len(x)}")
         print(f"   Velocity Range: {vel_mag.min():.4f} - {vel_mag.max():.4f} m/s")
         print(f"   Pressure Range: {p.min():.4f} - {p.max():.4f} Pa")
+        if has_mu:
+            print(f"   Viscosity Range: {mu.min():.6f} - {mu.max():.6f} Pa·s")
 
         # --- Spatial Visualization ---
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        num_subplots = 4 if has_mu else 3
+        fig, axes = plt.subplots(1, num_subplots, figsize=(6 * num_subplots, 5))
 
         # Plot Velocity Magnitude
         sc0 = axes[0].scatter(x, y, c=vel_mag, cmap='viridis', s=2)
@@ -59,31 +65,35 @@ def inspect_data(sample_idx=0):
         axes[0].set_title(f"Velocity Magnitude (Sample {sample_idx})")
         axes[0].set_aspect('equal')
 
-        # Plot Pressure
+        # Plot Relative Pressure
         sc1 = axes[1].scatter(x, y, c=p, cmap='plasma', s=2)
-        plt.colorbar(sc1, ax=axes[1], label='Pressure (Pa)')
-        axes[1].set_title("Pressure Field")
+        plt.colorbar(sc1, ax=axes[1], label='Relative Pressure (Pa)')
+        axes[1].set_title("Relative Pressure Field")
         axes[1].set_aspect('equal')
 
-        # Plot Vector Field (Downsampled for clarity)
-        # Skip every k points to make arrows visible
-        k = 20 if len(x) > 1000 else 1
+        # Plot Dynamic Viscosity (Tier 2)
+        if has_mu:
+            sc2 = axes[2].scatter(x, y, c=mu, cmap='magma', s=2)
+            plt.colorbar(sc2, ax=axes[2], label=r'Viscosity $\mu$ (Pa·s)')
+            axes[2].set_title("Dynamic Viscosity Field")
+            axes[2].set_aspect('equal')
+            vec_ax = axes[3]
+        else:
+            vec_ax = axes[2]
 
-        # Quiver requires inputs to be the same size, which .flatten() ensures
-        axes[2].quiver(x[::k], y[::k], u[::k], v[::k], vel_mag[::k], cmap='viridis')
-        axes[2].set_title(f"Velocity Vectors (Every {k}th point)")
-        axes[2].set_aspect('equal')
+        # Plot Vector Field
+        k = 20 if len(x) > 1000 else 1
+        vec_ax.quiver(x[::k], y[::k], u[::k], v[::k], color='white', alpha=0.8, scale=vel_mag.max() * 10)
+        vec_ax.set_facecolor('black')
+        vec_ax.set_title("Velocity Vector Field")
+        vec_ax.set_aspect('equal')
 
         plt.tight_layout()
         plt.show()
 
     except Exception as e:
         print(f"Error inspecting data: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    # You can pass an index argument or default to 0
-    idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    inspect_data(idx)
+    inspect_data(sample_idx=0)
