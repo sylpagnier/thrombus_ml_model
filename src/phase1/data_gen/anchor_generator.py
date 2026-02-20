@@ -281,8 +281,7 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        active_tier = "tier1"
-        generator = AnchorGenerator(tier=active_tier)
+        generator = AnchorGenerator(tier="tier2")
 
         with generator:
             generator.run_batch(start_idx=0, end_idx=50)

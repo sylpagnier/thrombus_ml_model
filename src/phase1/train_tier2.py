@@ -30,9 +30,19 @@ def load_dataset():
     return dataset
 
 
-def train_tier2(epochs=50, lr=1e-4, warm_up_epochs=10):
+# Changed default lr from 1e-4 to 2e-5 to prevent catastrophic forgetting of Tier 1 physics
+def train_tier2(epochs=50, lr=2e-5, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=64, max_iters=15).to(device)
+
+    # --- Load Tier 1 Weights ---
+    tier1_path = Path("models/tier1_best_physics.pth")
+    if tier1_path.exists():
+        model.load_state_dict(torch.load(tier1_path, map_location=device, weights_only=True))
+        print("✅ Successfully loaded Tier 1 foundational physics weights.")
+    else:
+        print("⚠️ Warning: Tier 1 weights not found. Training Tier 2 from scratch.")
+    # ----------------------------------------
 
     # Initialize the config object for non-Newtonian flow
     phys_cfg = PhysicsConfig(tier="tier2", re_target=150.0)
@@ -60,7 +70,15 @@ def train_tier2(epochs=50, lr=1e-4, warm_up_epochs=10):
     for epoch in range(epochs):
         model.train()
         physics_active = epoch >= warm_up_epochs
+
+        # Navier-Stokes Continuation
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
+
+        # --- NEW ADDITION: Rheology Continuation Method ---
+        # Gradually introduce the Carreau-Yasuda non-Newtonian loss over the first 15 epochs
+        lambda_rheo = min(1.0, epoch / 15.0)
+        # --------------------------------------------------
+
         total_loss_epoch = 0.0
 
         # Warm-up with Picard for the first 5 epochs to prevent Anderson divergence
@@ -89,9 +107,9 @@ def train_tier2(epochs=50, lr=1e-4, warm_up_epochs=10):
             row, col = data.edge_index
             l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
 
-            # Replaced dummy loss with the actual rheology constraint
+            # Replaced static rheology multiplier with dynamic lambda_rheo
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + \
-                   (5.0 * l_data) + (.5 * l_smoothness) + (1.0 * l_rheo)
+                   (5.0 * l_data) + (.5 * l_smoothness) + (lambda_rheo * l_rheo)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -101,6 +119,7 @@ def train_tier2(epochs=50, lr=1e-4, warm_up_epochs=10):
             pbar.set_postfix({
                 "L_tot": f"{loss.item():.3f}",
                 "L_rh": f"{l_rheo.item():.3f}",
+                "w_rh": f"{lambda_rheo:.2f}",  # Track the dynamic rheology weight
                 "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
 

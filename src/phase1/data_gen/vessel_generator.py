@@ -208,10 +208,9 @@ class VesselGenerator:
 
 
 if __name__ == "__main__":
-    active_tier = "tier1"  # tier 1 (Newtonian), tier 2 (non-Newtonian)
+    active_tier = "tier2"  # tier 1 (Newtonian), tier 2 (non-Newtonian)
 
-    # Pass the tier to vessel gen instance
+    # Run generator
     vg = VesselGenerator(tier=active_tier)
-
     vg.run_pipeline(n=100, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
     gmsh.finalize()
