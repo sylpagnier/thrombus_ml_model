@@ -111,5 +111,9 @@ class GINO_DEQ(nn.Module):
                 z_star = z_star.squeeze(0)
 
         raw_out = self.decoder(z_star)
-        raw_out[:, 3] = F.softplus(raw_out[:, 3])
-        return raw_out
+
+        # Split and concatenate to avoid in-place memory mutation
+        u_v_p = raw_out[:, :3]
+        mu = F.softplus(raw_out[:, 3:4])  # 3:4 keeps it 2D so it concatenates easily
+
+        return torch.cat([u_v_p, mu], dim=1)
