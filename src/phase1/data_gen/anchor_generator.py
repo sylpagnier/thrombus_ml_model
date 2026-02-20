@@ -179,19 +179,20 @@ class AnchorGenerator:
                 continue
 
             try:
+                # Guarantee that if the solve fails silently, we get an empty dataset
+                # rather than recycling the previous vessel's physics.
+                logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
+                for tag in self.model.java.sol().tags():
+                    self.model.java.sol(tag).clearSolutionData()
+
                 with open(json_file, 'r') as f:
                     meta = json.load(f)
                     d_bar = meta['d_bar']
 
                 self.model.parameter('D_eff', f'{d_bar:.8f} [m]')
 
-                # Newtonian vs non-Newtonian mode
-                if self.phys_cfg.viscosity_model == "carreau":
-                    ref_mu = self.phys_cfg.mu_inf
-                else:
-                    ref_mu = self.phys_cfg.mu_newtonian
-
-                u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
+                # Use centralized reference viscosity
+                u_ref = self.phys_cfg.get_u_ref(d_bar)
 
                 self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')
 
@@ -275,7 +276,9 @@ class AnchorGenerator:
             except Exception as e:
                 logger.error(f"Error on {i}: {e}")
                 # Clear model results to save memory if solve failed
-                self.model.clear()
+                logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
+                for tag in self.model.java.sol().tags():
+                    self.model.java.sol(tag).clearSolutionData()
                 continue
 
 

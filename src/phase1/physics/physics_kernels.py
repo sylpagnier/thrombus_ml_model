@@ -18,30 +18,51 @@ def scatter_add(src, index, dim=0, dim_size=None):
 class PhysicsKernels:
     def __init__(self, phys_cfg):
         self.cfg = phys_cfg
-        # Normalize non-Newtonian parameters by reference values
-        self.mu_inf_nd = self.cfg.mu_inf / self.cfg.mu_inf
-        self.mu_0_nd = self.cfg.mu_0 / self.cfg.mu_inf
-        # Note: lambda must be scaled by (u_ref / d_bar) to be non-dimensional
 
-    def _compute_carreau_viscosity(self, du_ij, u_ref, d_bar):
+        # Normalize the viscosity extremes by the target reference
+        self.mu_inf_nd = self.cfg.mu_inf / self.cfg.mu_ref
+        self.mu_0_nd = self.cfg.mu_0 / self.cfg.mu_ref
+
+    def _compute_carreau_viscosity(self, du_ij, data):
         """
-        Calculates local effective viscosity based on Carreau-Yasuda model.
-        du_ij: tensor containing [u_x, u_y, v_x, v_y]
+        Calculates local effective non-dimensional viscosity based on the Carreau-Yasuda model.
+        Implements batch-aware variable broadcasting and gradient clamping for stability.
         """
-        # 1. Compute Shear Rate (gamma_dot)
-        # gamma_dot = sqrt(2 * D : D) where D is strain rate tensor
-        u_x, u_y, v_x, v_y = du_ij[:, 0], du_ij[:, 1], du_ij[:, 2], du_ij[:, 3]
+        # du_ij contains the spatial gradients of velocity: [du/dx, du/dy, dv/dx, dv/dy]
+        du_dx, du_dy = du_ij[:, 0], du_ij[:, 1]
+        dv_dx, dv_dy = du_ij[:, 2], du_ij[:, 3]
 
-        # Second invariant of strain rate tensor
-        gamma_dot = torch.sqrt(2 * u_x ** 2 + 2 * v_y ** 2 + (u_y + v_x) ** 2 + 1e-8)
+        # --- NON-DIMENSIONAL SHEAR RATE ---
+        # Calculate the 2nd invariant of the strain rate tensor
+        strain_sq = 2.0 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2
 
-        # Non-dimensionalize lambda
-        lam_nd = self.cfg.lam * (u_ref / d_bar)
+        # Gradient Stability Safety
+        gamma_dot_nd = torch.sqrt(strain_sq + 1e-4)
 
-        # Carreau-Yasuda Equation
-        pow_term = (1 + (lam_nd * gamma_dot) ** self.cfg.a) ** ((self.cfg.n - 1) / self.cfg.a)
-        mu_eff = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * pow_term
-        return mu_eff
+        # --- BATCH-AWARE BROADCASTING (Phase 4.D Requirement) ---
+        # Broadcast the localized geometric scalars to every node in the disjoint PyG batch graph
+        if hasattr(data, 'batch') and data.batch is not None:
+            u_ref_b = data.u_ref[data.batch].squeeze()
+            d_bar_b = data.d_bar[data.batch].squeeze()
+        else:
+            u_ref_b = data.u_ref.squeeze()
+            d_bar_b = data.d_bar.squeeze()
+
+        # Scale the relaxation time (lambda) into the non-dimensional domain dynamically
+        lambda_nd = self.cfg.lam * (u_ref_b / d_bar_b)
+
+        # --- CARREAU-YASUDA EVALUATION ---
+        a = self.cfg.a
+        n = self.cfg.n
+
+        # mu = mu_inf + (mu_0 - mu_inf) * [1 + (lambda * gamma_dot)^a]^((n-1)/a)
+        shear_term = 1.0 + (lambda_nd * gamma_dot_nd) ** a
+        power = (n - 1.0) / a
+
+        mu_nd = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * (shear_term ** power)
+
+        return mu_nd
+
 
     def _get_geometric_props(self, data):
         """
@@ -91,17 +112,22 @@ class PhysicsKernels:
             'M_inv': M_inv
         }
 
-    def _compute_derivatives(self, u, props):
+    def _compute_derivatives(self, u, data_or_props):
         """
-        Computes 1st and 2nd derivatives using the 2nd-order WLS operator.
-        Returns tensor of shape [N, 5, C].
+        Computes 1st and 2nd derivatives using the precomputed 2nd-order WLS operator.
+        Safely handles either a PyG Data object or a props dictionary.
         """
-        row, col = props['row'], props['col']
-        num_nodes = props['num_nodes']
-        V, W, M_inv = props['V'], props['W'], props['M_inv']
+        if isinstance(data_or_props, dict):
+            row, col = data_or_props['row'], data_or_props['col']
+            num_nodes = data_or_props['num_nodes']
+            V, W, M_inv = data_or_props['V'], data_or_props['W'], data_or_props['M_inv']
+        else:
+            row, col = data_or_props.edge_index
+            num_nodes = data_or_props.num_nodes
+            V, W, M_inv = data_or_props.V, data_or_props.W, data_or_props.M_inv
 
         if u.dim() == 1:
-            u = u.unsqueeze(1)
+            u = u.unsqueeze(-1)
 
         C = u.shape[1]
         du = u[col] - u[row]  # [E, C]
@@ -131,10 +157,22 @@ class PhysicsKernels:
             return c[:, 0:2, :].reshape(-1, 2 * C)
 
     def navier_stokes_residual(self, pred, data, props=None):
-        if props is None: props = self._get_geometric_props(data)
+        if props is None:
+            if hasattr(data, 'M_inv'):
+                props = data
+            else:
+                props = self._get_geometric_props(data)
         u, v, p = pred[:, 0], pred[:, 1], pred[:, 2]
-        u_ref = data.u_ref[data.batch]
-        d_bar = data.d_bar[data.batch]
+
+        batch_idx = getattr(data, 'batch', None)
+        if batch_idx is not None:
+            u_ref = data.u_ref[batch_idx]
+            d_bar = data.d_bar[batch_idx]
+        else:
+            # Handle un-batched single graphs and raw Python floats safely
+            u_ref = data.u_ref.squeeze() if isinstance(data.u_ref, torch.Tensor) else data.u_ref
+            d_bar = data.d_bar.squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
+        # --------------------------------------
 
         # Compute first and second derivatives
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
@@ -145,7 +183,7 @@ class PhysicsKernels:
         v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        # --- Dynamic Viscosity Logic (Tier 2 Update) ---
+        # --- Non-Newtonian logic ---
         if self.cfg.viscosity_model == "carreau":
             # Extract the predicted mu directly from the 4th channel
             mu_eff = pred[:, 3]
@@ -154,16 +192,16 @@ class PhysicsKernels:
             c_mu = self._compute_derivatives(mu_eff.unsqueeze(1), props)
             mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
-            # Re relative to mu_inf
-            Re = (self.cfg.rho * u_ref * d_bar) / self.cfg.mu_inf
+            # Re relative to mu_0
+            Re = self.cfg.get_re(u_ref, d_bar)
         else:
             # Newtonian path: Viscosity is constant, gradients are 0
             mu_eff = torch.ones_like(u)
             mu_x = torch.zeros_like(u)
             mu_y = torch.zeros_like(u)
 
-            # Re relative to mu_newtonian
-            Re = (self.cfg.rho * u_ref * d_bar) / self.cfg.mu_newtonian
+            # Re relative to default mu_ref (Newtonian)
+            Re = self.cfg.get_re(u_ref, d_bar)
 
         # Momentum equations (this unified form handles both cases)
         visc_x = (1.0 / Re) * (mu_eff * (u_xx + u_yy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
@@ -175,7 +213,10 @@ class PhysicsKernels:
 
         # Standard PINN procedure: evaluate PDE strictly on interior nodes
         mask_wall_1d = data.mask_wall.view(-1).bool()
-        interior_mask = ~mask_wall_1d
+        mask_inlet_1d = data.mask_inlet.view(-1).bool()
+        mask_outlet_1d = data.mask_outlet.view(-1).bool()
+
+        interior_mask = ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
 
         if interior_mask.any():
             # Ensure EVERY term has [interior_mask]
@@ -204,8 +245,16 @@ class PhysicsKernels:
 
         # Extract predictions
         u, v, mu_pred = pred[:, 0], pred[:, 1], pred[:, 3]
-        u_ref = data.u_ref[data.batch]
-        d_bar = data.d_bar[data.batch]
+
+        batch_idx = getattr(data, 'batch', None)
+        if batch_idx is not None:
+            u_ref = data.u_ref[batch_idx]
+            d_bar = data.d_bar[batch_idx]
+        else:
+            # Handle un-batched single graphs and raw Python floats safely
+            u_ref = data.u_ref.squeeze() if isinstance(data.u_ref, torch.Tensor) else data.u_ref
+            d_bar = data.d_bar.squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
+        # --------------------------------------
 
         # We only need 1st order derivatives for the strain rate
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
@@ -217,18 +266,11 @@ class PhysicsKernels:
         du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
 
         # Compute the theoretical target viscosity based on current predicted flow
-        mu_target = self._compute_carreau_viscosity(du_ij, u_ref, d_bar)
+        mu_target = self._compute_carreau_viscosity(du_ij, data)
+        mu_pred_safe = torch.clamp(mu_pred, min=0.0)
 
-        # Log-Space Transformation
-        # Clamp predictions to prevent log(negative) or log(0) NaNs during early epochs
-        mu_pred_safe = torch.clamp(mu_pred, min=1e-8)
-        mu_target_safe = torch.clamp(mu_target, min=1e-8)
-
-        log_mu_pred = torch.log(mu_pred_safe)
-        log_mu_target = torch.log(mu_target_safe)
-
-        # Mean Squared Error in Log-Space
-        return torch.mean((log_mu_pred - log_mu_target) ** 2)
+        # Use Log-MSE to handle the order-of-magnitude difference in viscosity across the vessel
+        return torch.mean((torch.log(mu_pred_safe + 1e-6) - torch.log(mu_target + 1e-6)) ** 2)
 
     def boundary_condition_loss(self, pred, data):
         # Squeeze to [N] to be safe

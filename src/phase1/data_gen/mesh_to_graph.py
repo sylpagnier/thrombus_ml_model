@@ -37,6 +37,36 @@ class MeshToGraphComplete:
 
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
+    def _precompute_wls(self, edge_index, num_nodes, x_tensor):
+        row, col = edge_index
+        pos_diff = x_tensor[col, :2] - x_tensor[row, :2]
+        dx, dy = pos_diff[:, 0], pos_diff[:, 1]
+
+        dist_sq = dx ** 2 + dy ** 2 + 1e-8
+
+        # 2nd Order Polynomial Basis
+        dx2 = 0.5 * dx ** 2
+        dxy = dx * dy
+        dy2 = 0.5 * dy ** 2
+
+        V = torch.stack([dx, dy, dx2, dxy, dy2], dim=1)
+        W = 1.0 / dist_sq
+
+        V_unsqueezed = V.unsqueeze(2)
+        V_T_unsqueezed = V.unsqueeze(1)
+        M_e = W.view(-1, 1, 1) * torch.bmm(V_unsqueezed, V_T_unsqueezed)
+
+        # Scatter sum equivalent
+        M_e_flat = M_e.view(-1, 25)
+        out = torch.zeros((num_nodes, 25), dtype=M_e_flat.dtype, device=M_e_flat.device)
+        row_exp = row.view(-1, 1).expand_as(M_e_flat)
+        M_flat = out.scatter_add_(0, row_exp, M_e_flat)
+
+        M = M_flat.view(num_nodes, 5, 5)
+        M_inv = torch.linalg.pinv(M)  # Compute pseudo-inverse just once per graph
+
+        return V, W, M_inv
+
     def _get_boundary_masks(self, mesh, num_nodes):
         mask_inlet = torch.zeros(num_nodes, dtype=torch.bool)
         mask_outlet = torch.zeros(num_nodes, dtype=torch.bool)
@@ -114,13 +144,9 @@ class MeshToGraphComplete:
                 d_bar = np.max(np.linalg.norm(inlet_nodes - inlet_nodes.mean(axis=0), axis=1)) * 2
 
         # Physics Scaling
-        # Newtonian vs non-Newtonian mode
-        if self.phys_cfg.viscosity_model == "carreau":
-            ref_mu = self.phys_cfg.mu_inf
-        else:
-            ref_mu = self.phys_cfg.mu_newtonian
-        u_ref = (self.phys_cfg.re_target * ref_mu) / (self.phys_cfg.rho * d_bar)
-        p_ref_scale = self.phys_cfg.rho * (u_ref ** 2)
+        ref_mu = self.phys_cfg.mu_ref
+        u_ref = self.phys_cfg.get_u_ref(d_bar)
+        p_ref_scale = self.phys_cfg.get_p_ref(u_ref)
 
         # wall_pts and Gradients
         wall_node_indices = np.where(mask_wall.numpy())[0]
@@ -156,11 +182,9 @@ class MeshToGraphComplete:
 
                 # Normalize
                 u_nd, v_nd = u_raw / u_ref, v_raw / u_ref
-                outlet_idx = mask_outlet.nonzero(as_tuple=True)[0]
-                p_offset = p_raw[outlet_idx].mean() if len(outlet_idx) > 0 else 0.0
-                p_nd = (p_raw - p_offset) / p_ref_scale
+                p_nd = p_raw / p_ref_scale
 
-                # Non-dimensionalize viscosity by the reference viscosity (mu_inf or mu_newtonian)
+                # Non-dimensionalize viscosity by the reference viscosity
                 mu_nd = mu_raw / ref_mu
 
                 # Stack the 4 channels
@@ -223,14 +247,18 @@ class MeshToGraphComplete:
             torch.full((len(nodes), 1), is_non_newt, dtype=torch.float32)
         ], dim=1)
 
+        # Precompute WLS operators for rapid gradient calculations during training
+        V, W, M_inv = self._precompute_wls(edge_index, len(nodes), x_tensor)
+
         data = Data(
             x=x_tensor, edge_index=edge_index, y=y_labels,
             d_bar=torch.tensor([d_bar], dtype=torch.float32),
             u_ref=torch.tensor([u_ref], dtype=torch.float32),
             u_inlet_bc=u_inlet_bc,
             mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-            is_anchor=torch.tensor([is_anchor], dtype=torch.bool)
+            V=V, W=W, M_inv=M_inv  # <-- Add these so PyG batches them automatically
         )
+
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
     def run(self):

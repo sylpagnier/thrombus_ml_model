@@ -5,9 +5,9 @@ from src.utils.paths import get_project_root
 from src.config import VesselConfig
 
 
-def inspect_data(sample_idx=0):
+def inspect_data(sample_idx=0, active_tier="tier1"):
     root = get_project_root()
-    cfg = VesselConfig()
+    cfg = VesselConfig(tier=active_tier)
 
     # Dynamically resolve path from Config
     if Path(cfg.output_dir).is_absolute():
@@ -55,45 +55,45 @@ def inspect_data(sample_idx=0):
         if has_mu:
             print(f"   Viscosity Range: {mu.min():.6f} - {mu.max():.6f} Pa·s")
 
-        # --- Spatial Visualization ---
-        num_subplots = 4 if has_mu else 3
-        fig, axes = plt.subplots(1, num_subplots, figsize=(6 * num_subplots, 5))
+            # --- Spatial Visualization (2x2 Grid) ---
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            # Flatten axes array for easy indexing: [0,0]->0, [0,1]->1, etc.
+            ax = axes.flatten()
 
-        # Plot Velocity Magnitude
-        sc0 = axes[0].scatter(x, y, c=vel_mag, cmap='viridis', s=2)
-        plt.colorbar(sc0, ax=axes[0], label='|U| (m/s)')
-        axes[0].set_title(f"Velocity Magnitude (Sample {sample_idx})")
-        axes[0].set_aspect('equal')
+            # 1. Plot Velocity Magnitude
+            sc0 = ax[0].scatter(x, y, c=vel_mag, cmap='viridis', s=2)
+            plt.colorbar(sc0, ax=ax[0], label='|U| (m/s)')
+            ax[0].set_title(f"Velocity Magnitude (Sample {sample_idx})")
+            ax[0].set_aspect('equal')
 
-        # Plot Relative Pressure
-        sc1 = axes[1].scatter(x, y, c=p, cmap='plasma', s=2)
-        plt.colorbar(sc1, ax=axes[1], label='Relative Pressure (Pa)')
-        axes[1].set_title("Relative Pressure Field")
-        axes[1].set_aspect('equal')
+            # 2. Plot Relative Pressure
+            sc1 = ax[1].scatter(x, y, c=p, cmap='plasma', s=2)
+            plt.colorbar(sc1, ax=ax[1], label='Relative Pressure (Pa)')
+            ax[1].set_title("Relative Pressure Field")
+            ax[1].set_aspect('equal')
 
-        # Plot Dynamic Viscosity (Tier 2)
-        if has_mu:
-            sc2 = axes[2].scatter(x, y, c=mu, cmap='magma', s=2)
-            plt.colorbar(sc2, ax=axes[2], label=r'Viscosity $\mu$ (Pa·s)')
-            axes[2].set_title("Dynamic Viscosity Field")
-            axes[2].set_aspect('equal')
-            vec_ax = axes[3]
-        else:
-            vec_ax = axes[2]
+            # 3. Plot Dynamic Viscosity (if available) or skip
+            if has_mu:
+                sc2 = ax[2].scatter(x, y, c=mu, cmap='magma', s=2)
+                plt.colorbar(sc2, ax=ax[2], label=r'Viscosity $\mu$ (Pa·s)')
+                ax[2].set_title("Dynamic Viscosity Field")
+                ax[2].set_aspect('equal')
+            else:
+                ax[2].axis('off')  # Hide if no viscosity data
 
-        # Plot Vector Field
-        k = 20 if len(x) > 1000 else 1
-        vec_ax.quiver(x[::k], y[::k], u[::k], v[::k], color='white', alpha=0.8, scale=vel_mag.max() * 10)
-        vec_ax.set_facecolor('black')
-        vec_ax.set_title("Velocity Vector Field")
-        vec_ax.set_aspect('equal')
+            # 4. Plot Vector Field
+            k = 20 if len(x) > 1000 else 1
+            ax[3].quiver(x[::k], y[::k], u[::k], v[::k], color='white', alpha=0.8, scale=vel_mag.max() * 10)
+            ax[3].set_facecolor('black')
+            ax[3].set_title("Velocity Vector Field")
+            ax[3].set_aspect('equal')
 
-        plt.tight_layout()
-        plt.show()
+            plt.tight_layout()
+            plt.show()
 
     except Exception as e:
         print(f"Error inspecting data: {e}")
 
 
 if __name__ == "__main__":
-    inspect_data(sample_idx=0)
+    inspect_data(sample_idx=2, active_tier="tier2")

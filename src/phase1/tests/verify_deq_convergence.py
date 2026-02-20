@@ -83,7 +83,6 @@ def run_physics_audit(tier="tier1", max_iters=40):
 
             return model.core(z, batch_data.edge_index, edge_attr, batch_data.batch)
 
-        # --- TEST A: Naive Picard Iteration ---
         print("\n--- Test A: Naive Picard Iteration ---")
         z_picard = z0.clone()
         residuals_naive = []

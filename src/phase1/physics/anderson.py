@@ -28,6 +28,11 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0)
 
     res = []
 
+    # Pre-allocate solver tensors outside the loop to save GPU memory
+    I_max = torch.eye(m, dtype=z0.dtype, device=z0.device).unsqueeze(0).expand(bsz, -1, -1)
+    Y_max = torch.ones(bsz, m, 1, dtype=z0.dtype, device=z0.device)
+
+    slot = 1  # Fallback if loop doesn't execute
     for k in range(2, max_iter):
         n_history = min(k, m)
 
@@ -35,39 +40,20 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0)
         G = F[:, :n_history] - X[:, :n_history]
 
         # 1. Form the Least Squares Problem
-        # We want to find alphas that minimize || G * alpha ||
-        # This is equivalent to solving (G^T G) * alpha = 0 subject to sum(alpha)=1
-
-        # Efficient batch-wise construction of G^T G
-        # G_flat: [bsz, n_history, n*d]
         G_flat = G.view(bsz, n_history, -1)
-
-        # H = G^T G (Gram Matrix) -> [bsz, n_history, n_history]
         H = torch.bmm(G_flat, G_flat.transpose(1, 2))
 
-        # Ridge Regression (Regularization) for stability
-        H = H + lam * torch.eye(n_history, dtype=z0.dtype, device=z0.device).unsqueeze(0)
+        # Slice the pre-allocated identity matrix
+        H = H + lam * I_max[:, :n_history, :n_history]
 
-        # Solve H * alpha = y (where y is all ones, theoretically, but we use a constrained solver trick)
-        # Trick: Minimize || \sum gamma_i * delta_g_i - g_k ||
-        # Here is the standard DEQ efficient solver:
+        # Slice the pre-allocated ones vector
+        y_slice = Y_max[:, :n_history, :]
+        alpha = torch.linalg.lstsq(H, y_slice).solution
 
-        # Solve linear system H * x = 1 (to enforce sum(alpha)=1 later)
-        try:
-            # y is vector of ones [bsz, n_history, 1]
-            y = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device)
-            alpha = torch.linalg.solve(H, y)
-
-            # Normalize alpha so sum(alpha) = 1
-            alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
-        except RuntimeError:
-            # Fallback if matrix is singular: Average the history
-            alpha = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device) / n_history
+        # Normalize alpha so sum(alpha) = 1
+        alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
 
         # 2. Compute Next Step
-        # z_{k+1} = \sum alpha_i * (beta * F_i + (1-beta) * X_i)
-        # Usually beta=1.0 for pure Anderson
-
         alpha = alpha.view(bsz, n_history, 1)  # [bsz, m, 1]
 
         # Weighted sum of History terms
@@ -76,11 +62,16 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0)
 
         z_next = beta * combined_F + (1 - beta) * combined_X
 
-        # 3. Check Convergence
-        current_res = (combined_F - combined_X).norm(p=2, dim=-1).mean()
+        # 3. Check Convergence via Relative Residual
+        diff_norm = (combined_F - combined_X).norm(p=2, dim=-1)
+        x_norm = combined_X.norm(p=2, dim=-1)
+
+        # Relative residual handles varying activation scales across the latent feature space
+        current_res = (diff_norm / (x_norm + 1e-8)).mean()
         res.append(current_res.item())
+
         if current_res < tol:
-            return z_next.view(bsz, n, d).squeeze(0)
+            return z_next.view(bsz, n, d).squeeze(0)  # Remove dummy batch
 
         # 4. Update History
         # Rolling buffer update

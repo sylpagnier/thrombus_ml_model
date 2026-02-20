@@ -27,7 +27,7 @@ class VesselConfig:
         self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
 
     # Mesh Settings
-    mesh_size_factor: float = 0.5
+    mesh_size_factor: float = 0.4
     mesh_lc: float = 0.0002
 
     # Vessel Dimensions
@@ -56,24 +56,14 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
-    # Set the type to str and provide a default value
     tier: str = "tier1"
 
     # Fluid Properties
     rho: float = 1050.0  # kg/m^3
     re_target: float = 150.0  # Reynolds number [-]
 
-    # Let post_init handle this automatically
     viscosity_model: str = field(init=False)
-
-    def __post_init__(self):
-        """Automatically set the correct physics based on the project tier."""
-        if self.tier == "tier1":
-            self.viscosity_model = "newtonian"
-        elif self.tier in ["tier2", "tier3", "tier3_patients"]:
-            self.viscosity_model = "carreau"
-        else:
-            raise ValueError(f"Unknown tier: {self.tier}")
+    mu_ref: float = field(init=False)  # <-- Add this
 
     # Newtonian Reference (tier 1)
     mu_newtonian: float = 0.0035  # Pa*s (3.5 cP)
@@ -84,3 +74,30 @@ class PhysicsConfig:
     lam: float = 3.313  # Relaxation time (s)
     n: float = 0.3568  # Power law index
     a: float = 2.0  # Yasuda parameter
+
+    def __post_init__(self):
+        """Automatically set the correct physics based on the project tier."""
+        if self.tier == "tier1":
+            self.viscosity_model = "newtonian"
+            self.mu_ref = self.mu_newtonian
+        elif self.tier in ["tier2", "tier3", "tier3_patients"]:
+            self.viscosity_model = "carreau"
+            self.mu_ref = self.mu_inf
+        else:
+            raise ValueError(f"Unknown tier: {self.tier}")
+
+    def get_u_ref(self, d_bar) -> float:
+        """Calculate the reference velocity for a given effective diameter."""
+        return (self.re_target * self.mu_ref) / (self.rho * d_bar)
+
+    def get_p_ref(self, u_ref) -> float:
+        """Calculate the reference pressure scaling."""
+        return self.rho * (u_ref ** 2)
+
+    def get_re(self, u_ref, d_bar, mu_custom=None):
+        """
+        Calculate the Reynolds number.
+        Works with both raw floats and PyTorch tensors.
+        """
+        mu = mu_custom if mu_custom is not None else self.mu_ref
+        return (self.rho * u_ref * d_bar) / mu

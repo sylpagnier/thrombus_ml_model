@@ -116,8 +116,8 @@ class VesselGenerator:
             c_pts.append(np.array([x, y]))
 
         offsets = self._calculate_pathology_offsets(v_type, width)
-        widths = [width + (2 * o) if o > 0 else width - (2 * abs(o)) for o in offsets]
-        #effective length = d_bar
+        widths = [width + o for o in offsets]
+        # effective length = d_bar
         d_bar_true = np.mean(widths)
 
         top_tags, bot_tags = [], []
@@ -212,5 +212,5 @@ if __name__ == "__main__":
 
     # Run generator
     vg = VesselGenerator(tier=active_tier)
-    vg.run_pipeline(n=100, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
+    vg.run_pipeline(n=500, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
     gmsh.finalize()

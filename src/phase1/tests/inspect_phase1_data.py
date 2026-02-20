@@ -195,7 +195,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         if hasattr(data, 'y') and data.y is not None and data.y.shape[1] == 4:
             mu_vals = data.y[:, 3].numpy()
             sc7 = ax7.scatter(pos[:, 0], pos[:, 1], c=mu_vals, cmap='viridis', s=5)
-            plt.colorbar(sc7, ax=ax7, label="Viscosity [Pa.s] (ND)", fraction=0.046, pad=0.04)
+            plt.colorbar(sc7, ax=ax7, label="Viscosity [-] (ND)", fraction=0.046, pad=0.04)
             ax7.set_title(r"Carreau-Yasuda Viscosity ($\mu$)")
         else:
             ax7.text(0.5, 0.5, "Viscosity Missing", ha='center')
@@ -223,4 +223,4 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
 
 
 if __name__ == "__main__":
-    inspect_sample(filename="vessel_1.pt", tier="tier2")
+    inspect_sample(filename="vessel_2.pt", tier="tier2")
