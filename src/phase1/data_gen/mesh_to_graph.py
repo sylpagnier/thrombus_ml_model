@@ -256,7 +256,8 @@ class MeshToGraphComplete:
             u_ref=torch.tensor([u_ref], dtype=torch.float32),
             u_inlet_bc=u_inlet_bc,
             mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-            V=V, W=W, M_inv=M_inv  # <-- Add these so PyG batches them automatically
+            V=V, W=W, M_inv=M_inv,
+            is_anchor=torch.tensor([is_anchor], dtype=torch.bool)
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
@@ -268,6 +269,6 @@ class MeshToGraphComplete:
 
 
 if __name__ == "__main__":
-    active_tier = "tier1"
+    active_tier = "tier2"
     processor = MeshToGraphComplete(tier=active_tier)
     processor.run()
