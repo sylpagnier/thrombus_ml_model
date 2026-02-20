@@ -133,7 +133,8 @@ class PhysicsKernels:
     def navier_stokes_residual(self, pred, data, props=None):
         if props is None: props = self._get_geometric_props(data)
         u, v, p = pred[:, 0], pred[:, 1], pred[:, 2]
-        u_ref, d_bar = data.u_ref, data.d_bar
+        u_ref = data.u_ref[data.batch]
+        d_bar = data.d_bar[data.batch]
 
         # Compute first and second derivatives
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
@@ -203,7 +204,8 @@ class PhysicsKernels:
 
         # Extract predictions
         u, v, mu_pred = pred[:, 0], pred[:, 1], pred[:, 3]
-        u_ref, d_bar = data.u_ref, data.d_bar
+        u_ref = data.u_ref[data.batch]
+        d_bar = data.d_bar[data.batch]
 
         # We only need 1st order derivatives for the strain rate
         c_u = self._compute_derivatives(u.unsqueeze(1), props)

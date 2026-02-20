@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from pathlib import Path
 from tqdm import tqdm
-
+from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
@@ -89,7 +89,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
             if phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
-                torch.save(model.state_dict(), "models/tier1_best_physics.pth")
+                root = get_project_root()
+                torch.save(model.state_dict(), root / "models/tier1_best_physics.pth")
 
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
