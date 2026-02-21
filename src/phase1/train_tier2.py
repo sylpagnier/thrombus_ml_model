@@ -63,7 +63,7 @@ def train_tier2(epochs=50, lr=2e-5, warm_up_epochs=10):
         physics_active = epoch >= warm_up_epochs
 
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
-        lambda_rheo = min(1.0, epoch / 15.0)
+        lambda_rheo = min(10.0, epoch / 15.0)
 
         total_loss_epoch = 0.0
 
@@ -80,7 +80,8 @@ def train_tier2(epochs=50, lr=2e-5, warm_up_epochs=10):
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
-                    l_data = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
+                    # Use ground truth viscosity losses for tier2
+                    l_data = F.mse_loss(pred[node_is_anchor, :4], data.y[node_is_anchor, :4])
 
             l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)

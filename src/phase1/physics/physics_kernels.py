@@ -234,8 +234,12 @@ class PhysicsKernels:
         """
         Penalizes the network if its predicted viscosity (pred[:, 3])
         deviates from the analytical Carreau-Yasuda model given its
-        predicted velocity gradients. Calculated in Log-Space to prevent
-        high-shear wall events from destabilizing early training.
+        predicted velocity gradients.
+
+        Best Practice Updates:
+        1. Detaches velocity fields to prevent gradient collapse.
+        2. Detaches the target viscosity to ensure strict 1-way supervision.
+        3. Removes unused variable extractions for cleaner execution.
         """
         if self.cfg.viscosity_model != "carreau":
             return torch.tensor(0.0, device=pred.device)
@@ -243,20 +247,14 @@ class PhysicsKernels:
         if props is None:
             props = self._get_geometric_props(data)
 
-        # Extract predictions
-        u, v, mu_pred = pred[:, 0], pred[:, 1], pred[:, 3]
+        # 1. Extract and DETACH velocities
+        # We detach u and v so the optimizer cannot 'cheat' by smoothing the velocity
+        # field to artificially lower the shear rate and minimize this loss.
+        u = pred[:, 0].detach()
+        v = pred[:, 1].detach()
+        mu_pred = pred[:, 3]
 
-        batch_idx = getattr(data, 'batch', None)
-        if batch_idx is not None:
-            u_ref = data.u_ref[batch_idx]
-            d_bar = data.d_bar[batch_idx]
-        else:
-            # Handle un-batched single graphs and raw Python floats safely
-            u_ref = data.u_ref.squeeze() if isinstance(data.u_ref, torch.Tensor) else data.u_ref
-            d_bar = data.d_bar.squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
-        # --------------------------------------
-
-        # We only need 1st order derivatives for the strain rate
+        # 2. Compute 1st order derivatives using the detached velocities
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
 
@@ -265,12 +263,23 @@ class PhysicsKernels:
 
         du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
 
-        # Compute the theoretical target viscosity based on current predicted flow
+        # 3. Compute the theoretical target viscosity
+        # _compute_carreau_viscosity safely handles batching internally
         mu_target = self._compute_carreau_viscosity(du_ij, data)
-        mu_pred_safe = torch.clamp(mu_pred, min=0.0)
 
-        # Use Log-MSE to handle the order-of-magnitude difference in viscosity across the vessel
-        return torch.mean((torch.log(mu_pred_safe + 1e-6) - torch.log(mu_target + 1e-6)) ** 2)
+        # Detach the target to be absolutely certain no gradients
+        # flow backward through the analytical calculation framework.
+        mu_target = mu_target.detach()
+
+        # 4. Safe Log-MSE Loss Calculation
+        # Clamp predictions to prevent negative viscosity and NaNs in log
+        mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=100.0)
+
+        # Log-space comparison handles the order-of-magnitude differences
+        # typical in shear-thinning fluids without exploding the gradients.
+        loss = torch.mean((torch.log(mu_pred_safe) - torch.log(mu_target)) ** 2)
+
+        return loss
 
     def boundary_condition_loss(self, pred, data):
         # Squeeze to [N] to be safe
