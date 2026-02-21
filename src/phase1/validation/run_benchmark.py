@@ -1,21 +1,16 @@
-# run_benchmark.py
 import matplotlib
-
 matplotlib.use('Agg')
-import sys
 import shutil
 import pandas as pd
 import time
 from datetime import datetime
-from pathlib import Path
 from tqdm import tqdm
 from src.utils.paths import get_project_root
 project_root = get_project_root()
-
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.anchor_generator import AnchorGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
-from src.phase1.validation.validate_phase1_model import ModelValidator  # Updated import
+from src.phase1.validation.validate_phase1_model import ModelValidator
 
 
 def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
@@ -88,9 +83,8 @@ if __name__ == "__main__":
     target_tiers = ["tier1", "tier2"]
 
     benchmarks = [
-        (1, "Level 1 (Straight)"),
-        # (2, "Level 2 (Curved_Pathology)"),
-        # (3, "Level 3 (Bifurcations)")
+        (0, "Level 0 (Straight pathologies)"),
+        # (1, "Level 1 (Curved pathologies)"),
     ]
 
     for current_tier in target_tiers:
