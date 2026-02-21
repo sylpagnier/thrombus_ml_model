@@ -114,6 +114,6 @@ class GINO_DEQ(nn.Module):
 
         # Split and concatenate to avoid in-place memory mutation
         u_v_p = raw_out[:, :3]
-        mu = F.softplus(raw_out[:, 3:4])  # 3:4 keeps it 2D so it concatenates easily
+        mu = F.softplus(raw_out[:, 3:4]) + 1.0  # 3:4 keeps it 2D so it concatenates easily
 
         return torch.cat([u_v_p, mu], dim=1)

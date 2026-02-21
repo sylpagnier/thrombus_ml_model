@@ -188,8 +188,9 @@ class PhysicsKernels:
             # Extract the predicted mu directly from the 4th channel
             mu_eff = pred[:, 3]
 
-            # Compute spatial gradients of the predicted mu
-            c_mu = self._compute_derivatives(mu_eff.unsqueeze(1), props)
+            # Detach mu_eff before calculating spatial gradients
+            # This stops the NS loss from penalizing sharp peaks in viscosity.
+            c_mu = self._compute_derivatives(mu_eff.detach().unsqueeze(1), props)
             mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
             # Re relative to mu_0
