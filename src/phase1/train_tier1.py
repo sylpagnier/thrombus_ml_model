@@ -19,6 +19,7 @@ def load_dataset():
     if not cfg.graph_output_dir.exists():
         return []
     dataset = []
+    print(f"📂 Loading Tier 1 graphs from {cfg.graph_output_dir}...")
     for f in tqdm(sorted(list(cfg.graph_output_dir.glob("vessel_*.pt")))):
         dataset.append(torch.load(f, weights_only=False))
     return dataset
@@ -55,8 +56,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
         current_solver = "picard" if epoch < 5 else "anderson"
 
-        pbar = tqdm(loader, desc=f"Tier 1 Epoch {epoch:02d}")
-        for data in pbar:
+        pbar = tqdm(loader, desc=f"Tier 1 Epoch {epoch:02d} [Re={phys_cfg.re_target}]")
+        for batch_idx, data in enumerate(pbar):
             data = data.to(device)
             optimizer.zero_grad()
             pred = model(data, solver=current_solver, anderson_beta=0.8)
@@ -75,25 +76,56 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + (.5 * l_smoothness) + l_mu_dummy
+
+            # --- NaN Check ---
+            if torch.isnan(loss):
+                print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")
+                continue
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss_epoch += loss.item()
+
+            # --- Enhanced Postfix Tracking ---
+            pbar.set_postfix({
+                "L_tot": f"{loss.item():.3f}",
+                "L_data": f"{l_data.item():.3f}",
+                "L_ns": f"{l_ns.item():.3f}",
+                "|g|": f"{grad_norm:.2f}",  # Track gradient norm
+                "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
+            })
 
         scheduler.step()
 
         if epoch % 2 == 0:
-            # Pass the tier specifically so the unified function behaves correctly
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier1")
-            phys_score = scores['rel_l2'] + scores['continuity']
+
+            # --- DEBUGGING: Restore robust validation prints ---
+            print(f"\n📊 [Validation] Rel L2: {scores.get('rel_l2', 0):.4f} | "
+                  f"Div: {scores.get('continuity', 0):.3e} | "
+                  f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
+
+            phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
 
             if phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
                 root = get_project_root()
                 torch.save(model.state_dict(), root / "models/tier1_best_physics.pth")
+                print("⭐ Saved Best Physics Model")
+
+        # --- Restore best loss saving logic ---
+        avg_loss = total_loss_epoch / len(loader)
+        if avg_loss < best_loss and physics_active:
+            best_loss = avg_loss
+            root = get_project_root()
+            torch.save(model.state_dict(), root / "models/tier1_best_loss.pth")
 
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
+
+    # --- Final completion print ---
+    print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":
