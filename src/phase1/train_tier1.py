@@ -72,10 +72,9 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_io = kernels.inlet_outlet_loss(pred, data)
 
             row, col = data.edge_index
-            l_smoothness = torch.mean((pred[row] - pred[col]) ** 2)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
-            loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + (.5 * l_smoothness) + l_mu_dummy
+            loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + l_mu_dummy
 
             # --- NaN Check ---
             if torch.isnan(loss):

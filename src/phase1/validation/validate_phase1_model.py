@@ -154,7 +154,7 @@ class ModelValidator:
 
         # ROW 1: VELOCITY
         u_pred = pred[:, 0].cpu().numpy()
-        sc1 = axes[0, 0].tripcolor(pos[:, 0], pos[:, 1], u_pred, cmap='jet')
+        sc1 = axes[0, 0].scatter(pos[:, 0], pos[:, 1], c=u_pred, cmap='jet', s=5, edgecolor='none')
         axes[0, 0].set_title(f"Predicted Velocity (u)\n{title}")
         plt.colorbar(sc1, ax=axes[0, 0])
 

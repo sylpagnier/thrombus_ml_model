@@ -89,11 +89,9 @@ def train_tier2(epochs=50, lr=2e-5, warm_up_epochs=10):
             l_rheo = kernels.rheology_loss(pred, data)
 
             row, col = data.edge_index
-            # Only apply smoothness loss to velocity/pressure channels (viscosity is expected to be jagged)
-            l_smoothness = torch.mean((pred[row, :3] - pred[col, :3]) ** 2)
 
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + \
-                   (5.0 * l_data) + (.5 * l_smoothness) + (lambda_rheo * l_rheo)
+                   (5.0 * l_data) + (lambda_rheo * l_rheo)
 
             # --- NaN Check ---
             if torch.isnan(loss):

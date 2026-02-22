@@ -88,7 +88,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         print(f"   -> Mean Vessel Diameter (D_bar): {data.d_bar.item():.6f}")
     if hasattr(data, 'u_inlet_bc'):
         u_max = torch.max(data.u_inlet_bc[:, 0]).item()
-        print(f"   -> Max U_inlet applied: {u_max:.4f} m/s (Scaled for Re={phys_cfg.re_target})")
+        print(f"   -> Max ND U_inlet applied: {u_max:.4f} [-] (Scaled for Re={phys_cfg.re_target})")
 
     # 3. Geometric Quality Check
     print("\n--- Geometric Quality Check ---")
@@ -114,9 +114,12 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
             res_ns = kernels.navier_stokes_residual(data_gpu.y, data_gpu)
             res_bc = kernels.boundary_condition_loss(data_gpu.y, data_gpu)
             res_io = kernels.inlet_outlet_loss(data_gpu.y, data_gpu)
+            res_rheo = kernels.rheology_loss(data_gpu.y, data_gpu)
+
             print(f"Navier-Stokes Residual: {res_ns.item():.6e}")
             print(f"BC Loss (Wall):         {res_bc.item():.6e}")
             print(f"Inlet/Outlet Loss:      {res_io.item():.6e}")
+            print(f"Rheology Residual:      {res_rheo.item():.6e}")
 
     # 5. Dynamic Visualization
     pos = data.x[:, :2].numpy()
