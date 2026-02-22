@@ -212,5 +212,5 @@ if __name__ == "__main__":
 
     # Run generator
     vg = VesselGenerator(tier=active_tier)
-    vg.run_pipeline(n=500, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
+    vg.run_pipeline(n=1000, level=0) # level 0 (straight vessels), level 1 (curved/tortuous)
     gmsh.finalize()
