@@ -284,9 +284,9 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        generator = AnchorGenerator(tier="tier1")
+        generator = AnchorGenerator(tier="tier2")
 
         with generator:
-            generator.run_batch(start_idx=0, end_idx=50)
+            generator.run_batch(start_idx=0, end_idx=100)
     except Exception as e:
         print(e)

@@ -28,7 +28,7 @@ class VesselConfig:
 
     # Mesh Settings
     mesh_size_factor: float = 0.4
-    mesh_lc: float = 0.0002
+    mesh_lc: float = 0.0001
 
     # Vessel Dimensions
     base_length: float = 0.015
