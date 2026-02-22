@@ -148,16 +148,35 @@ class MeshToGraphComplete:
         u_ref = self.phys_cfg.get_u_ref(d_bar)
         p_ref_scale = self.phys_cfg.get_p_ref(u_ref)
 
-        # wall_pts and Gradients
+        # --- ROBUST WALL NORMAL CALCULATION ---
         wall_node_indices = np.where(mask_wall.numpy())[0]
         if len(wall_node_indices) == 0: return
         wall_pts = nodes[wall_node_indices]
-        tree = KDTree(wall_pts)
-        dist_raw, indices = tree.query(nodes)
 
-        nearest_wall_pts = wall_pts[indices]
-        diff_vec = nodes - nearest_wall_pts
-        wall_normal_vec = diff_vec / (dist_raw[:, None] + 1e-8)
+        # 1. Standard distance from wall for interior nodes
+        tree_wall = KDTree(wall_pts)
+        dist_raw, indices_wall = tree_wall.query(nodes)
+
+        nearest_wall_pts = wall_pts[indices_wall]
+        diff_vec = nodes - nearest_wall_pts  # Points FROM wall TO node (into the fluid)
+
+        # 2. Fix nodes strictly ON the wall (where diff_vec is [0,0])
+        # We find the nearest strictly interior node and point towards it
+        interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
+        interior_pts = nodes[interior_mask]
+
+        if len(interior_pts) > 0:
+            tree_int = KDTree(interior_pts)
+            _, indices_int = tree_int.query(wall_pts)
+
+            # Replace [0,0] vectors for wall nodes with vectors pointing to nearest interior
+            diff_vec[wall_node_indices] = interior_pts[indices_int] - wall_pts
+
+        # 3. Explicitly Normalize every vector to a magnitude of exactly 1.0
+        # This is strictly required for the ModulatedGATConv attention dot-products
+        norms = np.linalg.norm(diff_vec, axis=1, keepdims=True)
+        wall_normal_vec = diff_vec / (norms + 1e-12)
+        # --------------------------------------
 
         # Spatial Label Mapping via cKDTree
         y_labels = torch.zeros((len(nodes), 4), dtype=torch.float32)

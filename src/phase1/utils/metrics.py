@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from pathlib import Path
 from torch_geometric.data import Batch
 
@@ -15,16 +16,27 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
 
     plt.figure(figsize=(10, 4))
 
+    # --- Setup Tier-Specific Plotting Rules ---
     if tier == "tier1":
-        # Plot velocity for Tier 1
-        val_pred = pred[:, 0].cpu().numpy()
-        cmap, label, title = 'jet', r"Predicted ND-Velocity (u)", f"Tier 1 Validation - Epoch {epoch}"
+        val_pred = pred[:, 0].cpu().numpy()  # u-velocity
+        cmap, label = 'jet', r"Predicted ND-Velocity (u)"
+        title = f"Tier 1 Validation - Epoch {epoch}"
+        use_log_norm = False
     else:
-        # Plot viscosity for Tier 2
-        val_pred = pred[:, 3].cpu().numpy()
-        cmap, label, title = 'viridis', r"Predicted ND-Viscosity ($\mu$)", f"Tier 2 Validation (Carreau) - Epoch {epoch}"
+        val_pred = pred[:, 3].cpu().numpy()  # viscosity
+        cmap, label = 'viridis', r"Predicted ND-Viscosity ($\mu$)"
+        title = f"Tier 2 Validation (Carreau) - Epoch {epoch}"
+        # Viscosity MUST be plotted in log-scale to visualize the boundary layer
+        use_log_norm = True
 
-    sc = plt.scatter(coords[:, 0], coords[:, 1], c=val_pred, cmap=cmap, s=5)
+        # --- Plotting ---
+    if use_log_norm:
+        # Prevent log(0) issues and set bounds matching your mu_0 and mu_inf
+        val_pred_safe = np.clip(val_pred, a_min=1e-4, a_max=None)
+        sc = plt.scatter(coords[:, 0], coords[:, 1], c=val_pred_safe, cmap=cmap, s=5, norm=LogNorm())
+    else:
+        sc = plt.scatter(coords[:, 0], coords[:, 1], c=val_pred, cmap=cmap, s=5)
+
     plt.colorbar(sc, label=label)
     plt.title(title)
     plt.axis('equal')
@@ -37,9 +49,11 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
 
 def quantify_performance(model, val_loader, kernels, device, tier="tier1"):
     model.eval()
+
+    # Initialize metric trackers dynamically
     metrics = {"rel_l2": [], "continuity": [], "wall_slip": [], "shear_mse": []}
     if tier == "tier2":
-        metrics["rheology"] = []
+        metrics.update({"rheology": [], "mu_mae": [], "mu_log_mse": []})
 
     with torch.no_grad():
         for data in val_loader:
@@ -47,40 +61,57 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1"):
             pred = model(data, solver="anderson", anderson_beta=0.8)
             props = kernels._get_geometric_props(data)
 
-            # 1. Rel L2 & Explicit Shear Error (Calculated for both tiers now!)
+            # Resolve node mask safely for batched or unbatched data
             if hasattr(data, 'is_anchor'):
-                node_mask = data.is_anchor[data.batch]
+                node_mask = data.is_anchor[data.batch] if hasattr(data,
+                                                                  'batch') and data.batch is not None else data.is_anchor
+
                 if node_mask.any():
+                    # 1. Kinematic Error (u, v, p) only
                     diff_norm = torch.norm(pred[node_mask, :3] - data.y[node_mask, :3], p=2)
                     target_norm = torch.norm(data.y[node_mask, :3], p=2)
                     metrics["rel_l2"].append((diff_norm / (target_norm + 1e-8)).item())
 
-                    # Shear Rate tracking
+                    # 2. Explicit Shear Error
                     u_t, v_t = data.y[:, 0:1], data.y[:, 1:2]
                     c_u_t, c_v_t = kernels._compute_derivatives(u_t, props), kernels._compute_derivatives(v_t, props)
                     g_dot_t = torch.sqrt(2 * c_u_t[:, 0, 0] ** 2 + 2 * c_v_t[:, 1, 0] ** 2 + (
-                                c_u_t[:, 1, 0] + c_v_t[:, 0, 0]) ** 2 + 1e-8)
+                            c_u_t[:, 1, 0] + c_v_t[:, 0, 0]) ** 2 + 1e-8)
 
                     u_p, v_p = pred[:, 0:1], pred[:, 1:2]
                     c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
                     g_dot_p = torch.sqrt(2 * c_u_p[:, 0, 0] ** 2 + 2 * c_v_p[:, 1, 0] ** 2 + (
-                                c_u_p[:, 1, 0] + c_v_p[:, 0, 0]) ** 2 + 1e-8)
+                            c_u_p[:, 1, 0] + c_v_p[:, 0, 0]) ** 2 + 1e-8)
 
                     metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
-            # 2. Continuity
+                    # --- NEW: Viscosity Tracking (Tier 2) ---
+                    if tier == "tier2" and data.y.shape[1] >= 4:
+                        mu_p = pred[node_mask, 3]
+                        mu_t = data.y[node_mask, 3]
+
+                        # Raw Mean Absolute Error (biased toward vessel center)
+                        metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
+
+                        # Log-Space MSE (unbiased, captures boundary layer accuracy)
+                        mu_p_safe = torch.clamp(mu_p, min=1e-6)
+                        mu_t_safe = torch.clamp(mu_t, min=1e-6)
+                        metrics["mu_log_mse"].append(F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item())
+
+            # 3. Continuity (Divergence)
             u, v = pred[:, 0:1], pred[:, 1:2]
             grad_u, grad_v = kernels._compute_gradients(u, props), kernels._compute_gradients(v, props)
             div_u = grad_u[:, 0:1] + grad_v[:, 1:2]
             metrics["continuity"].append(torch.abs(div_u).mean().item())
 
-            # 3. Wall Slip
+            # 4. Wall Slip
             if data.mask_wall.any():
                 wall_vel = torch.norm(pred[data.mask_wall, :2], p=2, dim=1)
                 metrics["wall_slip"].append(wall_vel.mean().item())
 
-            # 4. Rheology (Tier 2 only)
+            # 5. Physics Rheology Residual
             if tier == "tier2":
                 metrics["rheology"].append(kernels.rheology_loss(pred, data, props).item())
 
-    return {k: np.mean(v) if v else 0.0 for k, v in metrics.items()}
+    # Safely compute mean over batches
+    return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}

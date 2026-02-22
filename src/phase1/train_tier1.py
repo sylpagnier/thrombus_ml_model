@@ -64,9 +64,43 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             pred = model(data, solver=current_solver, anderson_beta=0.8)
 
             l_data = torch.tensor(0.0, device=device)
-            if hasattr(data, 'is_anchor') and data.is_anchor[data.batch].sum() > 0:
-                mask = data.is_anchor[data.batch]
-                l_data = F.mse_loss(pred[mask, :3], data.y[mask, :3])
+            if hasattr(data, 'is_anchor'):
+                node_is_anchor = data.is_anchor[data.batch]
+                if node_is_anchor.sum() > 0:
+                    # 1. Standard L2/MSE Loss STRICTLY on Kinematics (u, v, p)
+                    # This prevents ground-truth noise from corrupting the viscosity sub-network
+                    mse_loss = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
+
+                    # 2. Sobolev H1 Regularization (Gradient-Enhanced Loss)
+                    props = kernels._get_geometric_props(data)
+
+                    u_pred, v_pred = pred[:, 0].unsqueeze(1), pred[:, 1].unsqueeze(1)
+
+                    # Compute predicted spatial derivatives
+                    c_u_pred = kernels._compute_derivatives(u_pred, props)  # [N, 5, 1]
+                    c_v_pred = kernels._compute_derivatives(v_pred, props)
+
+                    grad_u_pred = c_u_pred[:, :2, 0]  # [N, 2] (d/dx, d/dy)
+                    grad_v_pred = c_v_pred[:, :2, 0]
+
+                    # 🚀 OPTIMIZATION: Prevent graph tracking for ground truth
+                    with torch.no_grad():
+                        u_true, v_true = data.y[:, 0].unsqueeze(1), data.y[:, 1].unsqueeze(1)
+                        c_u_true = kernels._compute_derivatives(u_true, props)
+                        c_v_true = kernels._compute_derivatives(v_true, props)
+
+                        grad_u_true = c_u_true[:, :2, 0].detach()
+                        grad_v_true = c_v_true[:, :2, 0].detach()
+
+                    # Compute Gradient MSE strictly on the anchor nodes
+                    grad_mse = F.mse_loss(grad_u_pred[node_is_anchor], grad_u_true[node_is_anchor]) + \
+                               F.mse_loss(grad_v_pred[node_is_anchor], grad_v_true[node_is_anchor])
+
+                    # 🚀 DYNAMIC WEIGHTING: Anneal alpha_sobolev from 0.0 to 0.5
+                    # Start enforcing gradients only after basic physics kicks in
+                    alpha_sobolev = min(0.5, max(0.0, (epoch - warm_up_epochs) / 30.0))
+
+                    l_data = mse_loss + (alpha_sobolev * grad_mse)
 
             l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)

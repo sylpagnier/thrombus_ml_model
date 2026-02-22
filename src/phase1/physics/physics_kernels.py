@@ -26,21 +26,19 @@ class PhysicsKernels:
     def _compute_carreau_viscosity(self, du_ij, data):
         """
         Calculates local effective non-dimensional viscosity based on the Carreau-Yasuda model.
-        Implements batch-aware variable broadcasting and gradient clamping for stability.
+        Implements batch-aware variable broadcasting and pseudo-Huber smooth regularization.
         """
         # du_ij contains the spatial gradients of velocity: [du/dx, du/dy, dv/dx, dv/dy]
         du_dx, du_dy = du_ij[:, 0], du_ij[:, 1]
         dv_dx, dv_dy = du_ij[:, 2], du_ij[:, 3]
 
         # --- NON-DIMENSIONAL SHEAR RATE ---
-        # Calculate the 2nd invariant of the strain rate tensor
+        # Calculate the 2nd invariant of the strain rate tensor: 2*D:D
         strain_sq = 2.0 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2
+        eps_sq = 1e-4  # You can tune this (e.g., 1e-4 to 1e-6) depending on precision
+        gamma_dot_nd = torch.sqrt(strain_sq + eps_sq)
 
-        # Gradient Stability Safety
-        gamma_dot_nd = torch.sqrt(strain_sq + 1e-4)
-
-        # --- BATCH-AWARE BROADCASTING (Phase 4.D Requirement) ---
-        # Broadcast the localized geometric scalars to every node in the disjoint PyG batch graph
+        # --- BATCH-AWARE BROADCASTING ---
         if hasattr(data, 'batch') and data.batch is not None:
             u_ref_b = data.u_ref[data.batch].squeeze()
             d_bar_b = data.d_bar[data.batch].squeeze()
