@@ -51,6 +51,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     for epoch in range(epochs):
         model.train()
         physics_active = epoch >= warm_up_epochs
+        sampler.set_warmup_mode(not physics_active)
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
         total_loss_epoch = 0.0
 
@@ -70,8 +71,6 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
-
-            row, col = data.edge_index
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
             loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + l_mu_dummy
