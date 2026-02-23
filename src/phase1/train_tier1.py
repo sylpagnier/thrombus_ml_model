@@ -1,5 +1,5 @@
+# train_tier1.py
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
@@ -9,41 +9,9 @@ from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
-import random
-
-
-class DynamicLossWeighter(nn.Module):
-    """
-    Dynamically weights multiple loss components using homoscedastic task uncertainty.
-    Reference: Kendall et al., 2018 (Multi-Task Learning Using Uncertainty to Weigh Losses)
-    """
-
-    def __init__(self, num_losses=2):
-        super().__init__()
-        # Initialize log variances to 0 (which initializes the weight to 1.0)
-        self.log_vars = nn.Parameter(torch.zeros(num_losses))
-
-    def forward(self, losses, scales=None):
-        # Default to a scale of 1.0 for all tasks if no scales are provided
-        if scales is None:
-            scales = [1.0] * len(losses)
-
-        total_loss = 0
-        for i, loss in enumerate(losses):
-            # Safeguard: only apply to active losses to prevent log_vars from diverging
-            if loss > 0.0:
-                precision = torch.exp(-self.log_vars[i])
-
-                # 1. Calculate the balanced task loss based on RAW uncertainty
-                task_loss = precision * loss + self.log_vars[i]
-
-                # 2. Apply the manual external scaling (e.g., warm-up schedules)
-                total_loss += scales[i] * task_loss
-
-        return total_loss
 
 
 def load_dataset():
@@ -63,40 +31,16 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-
-    # Initialize the Dynamic Weighter exclusively for the 2 PDE losses: Cont and Mom
-    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
-
-    # Pass BOTH the model parameters and the weighter parameters to the optimizer
-    optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
-                            lr=lr, weight_decay=1e-5)
-
-    # Replaced basic CosineAnnealing with Warm Restarts (restarts every 15 epochs)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1, eta_min=1e-6)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     dataset = load_dataset()
     if not dataset: return
 
-    # --- NEW STRATIFIED SPLIT LOGIC ---
-    # 1. Separate graphs by type
-    anchors = [d for d in dataset if d.is_anchor.item()]
-    physics = [d for d in dataset if not d.is_anchor.item()]
-
-    # 2. Shuffle to remove any generation-order bias
-    random.seed(42)  # For reproducibility
-    random.shuffle(anchors)
-    random.shuffle(physics)
-
-    # 3. Calculate 90% split bounds for BOTH classes
-    split_idx_a = int(0.9 * len(anchors))
-    split_idx_p = int(0.9 * len(physics))
-
-    # 4. Combine them into train and val sets
-    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
-    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    train_size = int(0.9 * len(dataset))
+    train_data, val_data = dataset[:train_size], dataset[train_size:]
 
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
-
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)
     val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
 
@@ -120,26 +64,18 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             pred = model(data, solver=current_solver, anderson_beta=0.8)
 
             l_data = torch.tensor(0.0, device=device)
-            if hasattr(data, 'is_anchor'):
-                node_is_anchor = data.is_anchor[data.batch]
-                if node_is_anchor.sum() > 0:
-                    # Using MSE on primaries
-                    l_data = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
+            if hasattr(data, 'is_anchor') and data.is_anchor[data.batch].sum() > 0:
+                mask = data.is_anchor[data.batch]
+                l_data = F.mse_loss(pred[mask, :3], data.y[mask, :3])
 
-            l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
+            l_ns = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
-            #  DYNAMIC LOSS WEIGHTING (Only for Internal PDEs)
-            pde_losses = [l_cont, l_mom]
-            pde_scales = [lambda_phys, lambda_phys]
+            loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + l_mu_dummy
 
-            weighted_pde_loss = loss_weighter(pde_losses, scales=pde_scales)
-
-            # STATIC ANCHORING FOR BOUNDARIES AND DATA
-            loss = weighted_pde_loss + (5.0 * l_data) + (5.0 * l_bc) + (5.0 * l_io) + l_mu_dummy
-
+            # --- NaN Check ---
             if torch.isnan(loss):
                 print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")
                 continue
@@ -149,12 +85,12 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             optimizer.step()
             total_loss_epoch += loss.item()
 
+            # --- Enhanced Postfix Tracking ---
             pbar.set_postfix({
                 "L_tot": f"{loss.item():.3f}",
                 "L_data": f"{l_data.item():.3f}",
-                "L_mom": f"{l_mom.item():.3f}",
-                "L_cont": f"{l_cont.item():.3f}",
-                "|g|": f"{grad_norm:.2f}",
+                "L_ns": f"{l_ns.item():.3f}",
+                "|g|": f"{grad_norm:.2f}",  # Track gradient norm
                 "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
 
@@ -163,14 +99,10 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier1")
 
+            # --- DEBUGGING: Restore robust validation prints ---
             print(f"\n📊 [Validation] Rel L2: {scores.get('rel_l2', 0):.4f} | "
                   f"Div: {scores.get('continuity', 0):.3e} | "
                   f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
-
-            # Debugging the current learned weights for PDE residuals only
-            with torch.no_grad():
-                weights = torch.exp(-loss_weighter.log_vars)
-                print(f"⚖️ Learned PDE Weights -> Cont: {weights[0]:.2f} | Mom: {weights[1]:.2f}")
 
             phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
 
@@ -180,6 +112,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                 torch.save(model.state_dict(), root / "models/tier1_best_physics.pth")
                 print("⭐ Saved Best Physics Model")
 
+        # --- Restore best loss saving logic ---
         avg_loss = total_loss_epoch / len(loader)
         if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
@@ -189,6 +122,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
+    # --- Final completion print ---
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
 
