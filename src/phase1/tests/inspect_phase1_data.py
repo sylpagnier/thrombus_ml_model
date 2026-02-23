@@ -67,45 +67,89 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
             return
         data_path = files[0]
 
-    print(f"--- Loading {data_path.name} ({tier.upper()}) ---")
+    print(f"\n{'=' * 50}")
+    print(f" LOADING: {data_path.name} ({tier.upper()})")
+    print(f"{'=' * 50}")
     data = torch.load(data_path, weights_only=False)
 
-    # 2. Version & Attribute Check
-    if data.x.shape[1] == 10:
-        print(" [VERSION WARNING] Data is old (10 channels). Missing 'is_non_newt' flag.")
+    # 2. Strict Invariant Checks (No Zombie Logic)
+    print("\n--- Structural & Physical Validation ---")
+
+    # NaN Check
+    if torch.isnan(data.x).any() or (data.y is not None and torch.isnan(data.y).any()):
+        print(" ❌ FAIL: NaNs detected in graph data.")
+    else:
+        print(" ✅ PASS: No NaNs detected.")
+
+    # Version Check
+    if data.x.shape[1] != 11:
+        print(f" ❌ FAIL: Feature mismatch! Expected 11 channels, got {data.x.shape[1]}. Data is outdated.")
+        # We assign a default just so the plotting doesn't crash, but we DO NOT save/patch the data.
         phys_cfg.viscosity_model = "newtonian"
-        data.x = torch.cat([data.x, torch.zeros((data.num_nodes, 1))], dim=1)
-    elif data.x.shape[1] == 11:
-        print(" Data format is current (11 channels).")
+    else:
+        print(" ✅ PASS: Feature format is current (11 channels).")
         if data.x[0, -1] == 1.0:
-            print("   -> Mode: Non-Newtonian (Carreau-Yasuda)")
             phys_cfg.viscosity_model = "carreau"
         else:
-            print("   -> Mode: Newtonian")
             phys_cfg.viscosity_model = "newtonian"
 
+    # Mask Exclusivity Check
+    sum_masks = data.mask_inlet.int() + data.mask_outlet.int() + data.mask_wall.int()
+    if torch.any(sum_masks > 1):
+        print(" ❌ FAIL: Overlapping boundary masks detected (a node cannot be two boundaries at once).")
+    elif not (data.mask_inlet.any() and data.mask_outlet.any() and data.mask_wall.any()):
+        print(" ❌ FAIL: Missing one or more boundary masks (Inlet/Outlet/Wall).")
+    else:
+        print(" ✅ PASS: Boundary masks are exclusive and present.")
+
+    # Geometric Prior Validation (Only if format is modern enough)
+    if data.x.shape[1] >= 11:
+        wall_normals = data.x[data.mask_wall, 4:6]
+        magnitudes = torch.linalg.norm(wall_normals, dim=1)
+        if not torch.allclose(magnitudes, torch.ones_like(magnitudes), atol=1e-4):
+            print(" ❌ FAIL: Wall normals are not unit length.")
+        else:
+            print(" ✅ PASS: Wall normals are strictly unit length.")
+
+        sdf_vals = data.x[:, 2]
+        if not torch.all(sdf_vals >= -1e-5):
+            print(" ❌ FAIL: Negative SDF values detected.")
+        elif not torch.all(torch.abs(sdf_vals[data.mask_wall]) < 1e-3):
+            print(" ❌ FAIL: SDF is not zero at the wall boundary.")
+        else:
+            print(" ✅ PASS: SDF values follow spatial boundaries.")
+
+    # No-Slip Condition Check
+    if data.y is not None:
+        wall_velocities = data.y[data.mask_wall, :2]
+        max_wall_vel = torch.max(torch.abs(wall_velocities)).item()
+        if max_wall_vel >= 0.05:
+            print(f" ❌ FAIL: No-slip condition violated. Max wall velocity: {max_wall_vel:.4f} [-]")
+        else:
+            print(f" ✅ PASS: No-slip condition holds (Max Wall Vel: {max_wall_vel:.4f} [-]).")
+
+    # 3. Global Information
+    print("\n--- File Metadata ---")
+    print(f" -> Mode: {phys_cfg.viscosity_model.capitalize()}")
     if hasattr(data, 'd_bar'):
-        print(f"   -> Mean Vessel Diameter (D_bar): {data.d_bar.item():.6f}")
+        print(f" -> Mean Vessel Diameter (D_bar): {data.d_bar.item():.6f}")
     if hasattr(data, 'u_inlet_bc'):
         u_max = torch.max(data.u_inlet_bc[:, 0]).item()
-        print(f"   -> Max ND U_inlet applied: {u_max:.4f} [-] (Scaled for Re={phys_cfg.re_target})")
+        print(f" -> Max ND U_inlet applied: {u_max:.4f} [-] (Scaled for Re={phys_cfg.re_target})")
 
-    # 3. Geometric Quality Check
-    print("\n--- Geometric Quality Check ---")
+    # 4. Geometric Quality Check
+    print("\n--- Internal Mesh Stability ---")
     cond_nums, mask_valid = analyze_geometric_quality(data)
     valid_cond = cond_nums[mask_valid]
-    print(f"Nodes with < 5 neighbors: {len(cond_nums) - len(valid_cond)} (Excluded from stats)")
-    print(f"Mean Condition No (Valid):  {np.mean(valid_cond):.2e}")
-    print(f"Max Condition No (Valid):   {np.max(valid_cond):.2e}")
-
+    print(f" -> Nodes with < 5 neighbors: {len(cond_nums) - len(valid_cond)} (Excluded)")
+    print(f" -> Mean Condition No:  {np.mean(valid_cond):.2e}")
+    print(f" -> Max Condition No:   {np.max(valid_cond):.2e}")
     if np.max(valid_cond) > 1e6:
-        print(" WARNING: Internal mesh instability detected.")
-    else:
-        print(" Internal mesh quality is excellent.")
+        print(" ⚠️ WARNING: High condition numbers detected. Potential WLS gradient instability.")
 
-    # 4. Physics Residual Check
+    # 5. Physics Residual Check
     if hasattr(data, 'y') and data.y is not None:
-        print("\n--- Physics Residual Check ---")
+        print("\n--- Physical Governing Equations (Residuals) ---")
         kernels = PhysicsKernels(phys_cfg=phys_cfg)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         data_gpu = data.clone().to(device)
@@ -116,17 +160,17 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
             res_io = kernels.inlet_outlet_loss(data_gpu.y, data_gpu)
             res_rheo = kernels.rheology_loss(data_gpu.y, data_gpu)
 
-            print(f"Navier-Stokes Residual: {res_ns.item():.6e}")
-            print(f"BC Loss (Wall):         {res_bc.item():.6e}")
-            print(f"Inlet/Outlet Loss:      {res_io.item():.6e}")
-            print(f"Rheology Residual:      {res_rheo.item():.6e}")
+            print(f" -> Navier-Stokes: {res_ns.item():.6e}")
+            print(f" -> BC Loss:       {res_bc.item():.6e}")
+            print(f" -> Inlet/Outlet:  {res_io.item():.6e}")
+            print(f" -> Rheology:      {res_rheo.item():.6e}")
 
-    # 5. Dynamic Visualization
+    # 6. Dynamic Visualization
+    print("\nLaunching visualization...")
     pos = data.x[:, :2].numpy()
     sdf_val = data.x[:, 2].numpy()
     shear_val = data.x[:, 3].numpy()
 
-    # Determine Grid Size: 2x3 for Tier 1, 3x3 for Tier 2
     cols = 3
     rows = 3 if phys_cfg.viscosity_model == "carreau" else 2
 
@@ -140,7 +184,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
     cond_viz = np.log10(cond_nums + 1)
     sc1 = ax1.scatter(pos[:, 0], pos[:, 1], c=cond_viz, cmap=cmap, s=5)
     plt.colorbar(sc1, ax=ax1, label="Log10(Cond No)", fraction=0.046, pad=0.04)
-    ax1.set_title("Geometric Quality")
+    ax1.set_title("Geometric Quality (WLS Condition)")
     ax1.set_aspect('equal')
 
     # --- Plot 2: SDF (Input Feature) ---
@@ -208,7 +252,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         ax8 = fig.add_subplot(gs[2, 1])
         skip = max(1, len(pos) // 500)
         ax8.scatter(pos[:, 0], pos[:, 1], c='lightgray', s=1, alpha=0.3)
-        if mask_wall.any() and data.x.shape[1] > 5:
+        if mask_wall.any() and data.x.shape[1] >= 11:
             wall_pos = pos[mask_wall]
             nx, ny = data.x[mask_wall, 4].numpy(), data.x[mask_wall, 5].numpy()
             ax8.quiver(wall_pos[::skip, 0], wall_pos[::skip, 1], nx[::skip], ny[::skip],
@@ -226,4 +270,4 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
 
 
 if __name__ == "__main__":
-    inspect_sample(filename="vessel_2.pt", tier="tier1")
+    inspect_sample(filename="vessel_1.pt", tier="tier2")
