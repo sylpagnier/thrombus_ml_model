@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from pathlib import Path
 from tqdm import tqdm
-
+import random
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
@@ -77,8 +77,20 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
     dataset = load_dataset()
     if not dataset: return
 
-    train_size = int(0.9 * len(dataset))
-    train_data, val_data = dataset[:train_size], dataset[train_size:]
+    # --- STRATIFIED SPLIT (Fixes the 0.0000 Rel L2 bug) ---
+    anchors = [d for d in dataset if d.is_anchor.item()]
+    physics = [d for d in dataset if not d.is_anchor.item()]
+
+    random.seed(42)
+    random.shuffle(anchors)
+    random.shuffle(physics)
+
+    split_idx_a = int(0.9 * len(anchors))
+    split_idx_p = int(0.9 * len(physics))
+
+    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
+    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    # -----------------------------------------------------
 
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)

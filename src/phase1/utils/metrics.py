@@ -114,4 +114,4 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1"):
                 metrics["rheology"].append(kernels.rheology_loss(pred, data, props).item())
 
     # Safely compute mean over batches
-    return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}
+    return {k: np.mean(v) if len(v) > 0 else float('nan') for k, v in metrics.items()}

@@ -12,7 +12,7 @@ from src.config import VesselConfig, PhysicsConfig
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
-
+import random
 
 class DynamicLossWeighter(nn.Module):
     """
@@ -67,10 +67,26 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     dataset = load_dataset()
     if not dataset: return
 
-    train_size = int(0.9 * len(dataset))
-    train_data, val_data = dataset[:train_size], dataset[train_size:]
+    # --- NEW STRATIFIED SPLIT LOGIC ---
+    # 1. Separate graphs by type
+    anchors = [d for d in dataset if d.is_anchor.item()]
+    physics = [d for d in dataset if not d.is_anchor.item()]
+
+    # 2. Shuffle to remove any generation-order bias
+    random.seed(42)  # For reproducibility
+    random.shuffle(anchors)
+    random.shuffle(physics)
+
+    # 3. Calculate 90% split bounds for BOTH classes
+    split_idx_a = int(0.9 * len(anchors))
+    split_idx_p = int(0.9 * len(physics))
+
+    # 4. Combine them into train and val sets
+    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
+    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
 
     sampler = StratifiedAnchorSampler(train_data, batch_size=4)
+
     loader = DataLoader(train_data, batch_size=4, sampler=sampler)
     val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
 
