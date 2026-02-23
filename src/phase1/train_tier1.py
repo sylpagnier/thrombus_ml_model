@@ -123,31 +123,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
-                    mse_loss = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
-
-                    props = kernels._get_geometric_props(data)
-                    u_pred, v_pred = pred[:, 0].unsqueeze(1), pred[:, 1].unsqueeze(1)
-
-                    c_u_pred = kernels._compute_derivatives(u_pred, props)
-                    c_v_pred = kernels._compute_derivatives(v_pred, props)
-
-                    grad_u_pred = c_u_pred[:, :2, 0]
-                    grad_v_pred = c_v_pred[:, :2, 0]
-
-                    with torch.no_grad():
-                        u_true, v_true = data.y[:, 0].unsqueeze(1), data.y[:, 1].unsqueeze(1)
-                        c_u_true = kernels._compute_derivatives(u_true, props)
-                        c_v_true = kernels._compute_derivatives(v_true, props)
-
-                        grad_u_true = c_u_true[:, :2, 0].detach()
-                        grad_v_true = c_v_true[:, :2, 0].detach()
-
-                    grad_mse = F.mse_loss(grad_u_pred[node_is_anchor], grad_u_true[node_is_anchor]) + \
-                               F.mse_loss(grad_v_pred[node_is_anchor], grad_v_true[node_is_anchor])
-
-                    alpha_sobolev = min(0.3, max(0.0, (epoch - warm_up_epochs) / 30.0))
-
-                    l_data = mse_loss + (alpha_sobolev * grad_mse)
+                    # Using MSE on primaries
+                    l_data = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
 
             l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
