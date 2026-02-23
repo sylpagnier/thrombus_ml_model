@@ -274,4 +274,4 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
 
 
 if __name__ == "__main__":
-    inspect_sample(filename="vessel_6.pt", tier="tier1")
+    inspect_sample(filename="vessel_2.pt", tier="tier1")

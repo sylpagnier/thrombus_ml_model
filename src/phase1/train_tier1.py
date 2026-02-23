@@ -21,7 +21,7 @@ class DynamicLossWeighter(nn.Module):
     Reference: Kendall et al., 2018 (Multi-Task Learning Using Uncertainty to Weigh Losses)
     """
 
-    def __init__(self, num_losses=4):
+    def __init__(self, num_losses=2):
         super().__init__()
         # Initialize log variances to 0 (which initializes the weight to 1.0)
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
@@ -64,8 +64,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
 
-    # Initialize the Dynamic Weighter for 4 losses: Data, Navier-Stokes, BC, Inlet/Outlet
-    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
+    # Initialize the Dynamic Weighter exclusively for the 2 PDE losses: Cont and Mom
+    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
     # Pass BOTH the model parameters and the weighter parameters to the optimizer
     optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
@@ -154,15 +154,14 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_io = kernels.inlet_outlet_loss(pred, data)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
-            #  DYNAMIC LOSS WEIGHTING
-            # 1. Pass the RAW, unscaled losses to the weighter so it learns the true variance
-            losses = [l_data, l_cont, l_mom, l_bc, l_io]
+            #  DYNAMIC LOSS WEIGHTING (Only for Internal PDEs)
+            pde_losses = [l_cont, l_mom]
+            pde_scales = [lambda_phys, lambda_phys]
 
-            # 2. Apply the warm-up schedule strictly as a post-multiplier
-            # Index 1 corresponds to l_ns
-            scales = [1.0, lambda_phys, lambda_phys, 1.0, 1.0]
+            weighted_pde_loss = loss_weighter(pde_losses, scales=pde_scales)
 
-            loss = loss_weighter(losses, scales=scales) + l_mu_dummy
+            # STATIC ANCHORING FOR BOUNDARIES AND DATA
+            loss = weighted_pde_loss + (5.0 * l_data) + (5.0 * l_bc) + (5.0 * l_io) + l_mu_dummy
 
             if torch.isnan(loss):
                 print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")
@@ -191,11 +190,10 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                   f"Div: {scores.get('continuity', 0):.3e} | "
                   f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
 
-            # Debugging the current learned weights
+            # Debugging the current learned weights for PDE residuals only
             with torch.no_grad():
                 weights = torch.exp(-loss_weighter.log_vars)
-                print(
-                    f"⚖️ Learned Loss Weights -> Data: {weights[0]:.2f} | NS: {weights[1]:.2f} | BC: {weights[2]:.2f} | IO: {weights[3]:.2f}")
+                print(f"⚖️ Learned PDE Weights -> Cont: {weights[0]:.2f} | Mom: {weights[1]:.2f}")
 
             phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
 

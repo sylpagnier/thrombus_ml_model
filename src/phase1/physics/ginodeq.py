@@ -30,9 +30,8 @@ class GlobalMixingBlock(nn.Module):
 class ModulatedGATConv(MessagePassing):
     """
     Physics-Informed Graph Attention Network.
-    Modulates standard attention weights based on the alignment of the edge vector
-    with the wall normal, penalizing cross-stream (perpendicular) message passing
-    in high-gradient boundary layers.
+    Modulates standard attention weights based on a precomputed static edge
+    modulator to penalize cross-stream message passing.
     """
 
     def __init__(self, latent_dim, edge_dim=2):
@@ -49,25 +48,20 @@ class ModulatedGATConv(MessagePassing):
             spectral_norm(nn.Linear(latent_dim, latent_dim))
         )
 
-    def forward(self, x, edge_index, edge_attr, wall_normals):
-        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, wall_normals=wall_normals)
+    def forward(self, x, edge_index, edge_attr, physics_modulator):
+        # Propagate now accepts the precomputed static modulator
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, physics_modulator=physics_modulator)
         return self.mlp(out)
 
-    def message(self, x_i, x_j, edge_attr, wall_normals_i, index, ptr, size_i):
+    def message(self, x_i, x_j, edge_attr, physics_modulator, index, ptr, size_i):
         edge_emb = self.edge_proj(edge_attr)
         alpha_feat = torch.cat([x_i, x_j + edge_emb], dim=-1)
 
         e = self.att(alpha_feat)
         e = self.leaky_relu(e)
 
-        e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
-        n_dir = F.normalize(wall_normals_i, p=2, dim=-1, eps=1e-8)
-
-        dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
-        dot_prod = torch.clamp(dot_prod, max=1.0)
-
-        physics_modulator = dot_prod + 0.1
-        e = e + torch.log(physics_modulator + 1e-8)
+        # Apply the static physics modulator (log transform is already precomputed)
+        e = e + physics_modulator
 
         alpha = softmax(e, index, ptr, size_i)
         return alpha * (x_j + edge_emb)
@@ -81,8 +75,8 @@ class GINOBlock(nn.Module):
         self.norm = nn.LayerNorm(latent_dim)
         self.relu = nn.ReLU()
 
-    def forward(self, z, edge_index, edge_attr, batch, wall_normals):
-        local_out = self.conv(z, edge_index, edge_attr, wall_normals)
+    def forward(self, z, edge_index, edge_attr, batch, physics_modulator):
+        local_out = self.conv(z, edge_index, edge_attr, physics_modulator)
         global_out = self.global_mixer(z, batch)
         return self.norm(self.relu(z + local_out + global_out))
 
@@ -91,7 +85,7 @@ class GINO_DEQ(nn.Module):
     def __init__(self, in_channels=11, out_channels=4, latent_dim=64, max_iters=25, num_fourier_freqs=8, outer_iters=3):
         super().__init__()
         self.max_iters = max_iters
-        self.outer_iters = outer_iters  # Number of segregated property updates
+        self.outer_iters = outer_iters
         self.num_fourier_freqs = num_fourier_freqs
 
         freqs = (2.0 ** torch.arange(num_fourier_freqs)) * torch.pi
@@ -106,20 +100,16 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        # --- OPERATOR SPLITTING ARCHITECTURE ---
         self.core = GINOBlock(latent_dim, edge_dim=2)
 
-        # 1. Kinematics Decoder (u, v, p)
         self.kinematics_decoder = nn.Linear(latent_dim, 3)
 
-        # 2. Viscosity Sub-Network Decoder (mu)
         self.mu_decoder = nn.Sequential(
             spectral_norm(nn.Linear(latent_dim, latent_dim)),
             nn.ReLU(),
             nn.Linear(latent_dim, 1)
         )
 
-        # 3. Viscosity Encoder (injects updated mu back into the DEQ)
         self.mu_encoder = nn.Linear(1, latent_dim)
 
     def _apply_fourier_encoding(self, x):
@@ -150,7 +140,19 @@ class GINO_DEQ(nn.Module):
         batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(data.x.size(0),
                                                                                                      dtype=torch.long,
                                                                                                      device=data.x.device)
+
+        # --- PRECOMPUTE STATIC PHYSICS MODULATOR ---
+        # Target nodes in message passing are indexed by 'col' in PyG (x_i)
         wall_normals = data.x[:, 4:6]
+        e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
+        n_dir = F.normalize(wall_normals[col], p=2, dim=-1, eps=1e-8)
+
+        dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
+        dot_prod = torch.clamp(dot_prod, max=1.0)
+
+        # Precompute the log addition so the Anderson loop only does addition
+        physics_modulator = torch.log(dot_prod + 0.1 + 1e-8)
+        # ---------------------------------------------
 
         # Initialize Viscosity to 1.0 (Newtonian reference prior)
         mu = torch.ones((data.x.size(0), 1), dtype=data.x.dtype, device=data.x.device)
@@ -172,7 +174,8 @@ class GINO_DEQ(nn.Module):
                 # Inject Geometry/BCs + Current Kinematics + FROZEN Viscosity
                 z_in = z_flat + x_enc + mu_enc
 
-                out_flat = self.core(z_in, data.edge_index, edge_attr, batch_idx, wall_normals)
+                # Pass the precomputed physics_modulator instead of wall_normals
+                out_flat = self.core(z_in, data.edge_index, edge_attr, batch_idx, physics_modulator)
                 return out_flat.reshape(bsz, n, d)
 
             if solver == "picard":
@@ -183,7 +186,6 @@ class GINO_DEQ(nn.Module):
             else:
                 z_init = z.unsqueeze(0) if z.ndim == 2 else z
 
-                # Anderson only accelerates the kinematics, completely avoiding mu's instability!
                 z_star = anderson_acceleration(
                     f_inner, z_init,
                     max_iter=inner_iters,
@@ -192,7 +194,6 @@ class GINO_DEQ(nn.Module):
                 z = z_star.squeeze(0)
 
             # 3. Explicit Sub-Network Update for Viscosity
-            # Breaks the stiff feedback loop for the Anderson solver.
             mu_raw = self.mu_decoder(z)
             mu = F.softplus(mu_raw) + 1.0 # +1 since  mu_inf is mu_ref for ND
 
