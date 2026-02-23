@@ -26,21 +26,19 @@ class PhysicsKernels:
     def _compute_carreau_viscosity(self, du_ij, data):
         """
         Calculates local effective non-dimensional viscosity based on the Carreau-Yasuda model.
-        Implements batch-aware variable broadcasting and gradient clamping for stability.
+        Implements batch-aware variable broadcasting and pseudo-Huber smooth regularization.
         """
         # du_ij contains the spatial gradients of velocity: [du/dx, du/dy, dv/dx, dv/dy]
         du_dx, du_dy = du_ij[:, 0], du_ij[:, 1]
         dv_dx, dv_dy = du_ij[:, 2], du_ij[:, 3]
 
         # --- NON-DIMENSIONAL SHEAR RATE ---
-        # Calculate the 2nd invariant of the strain rate tensor
+        # Calculate the 2nd invariant of the strain rate tensor: 2*D:D
         strain_sq = 2.0 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2
+        eps_sq = 1e-4  # You can tune this (e.g., 1e-4 to 1e-6) depending on precision
+        gamma_dot_nd = torch.sqrt(strain_sq + eps_sq)
 
-        # Gradient Stability Safety
-        gamma_dot_nd = torch.sqrt(strain_sq + 1e-4)
-
-        # --- BATCH-AWARE BROADCASTING (Phase 4.D Requirement) ---
-        # Broadcast the localized geometric scalars to every node in the disjoint PyG batch graph
+        # --- BATCH-AWARE BROADCASTING ---
         if hasattr(data, 'batch') and data.batch is not None:
             u_ref_b = data.u_ref[data.batch].squeeze()
             d_bar_b = data.d_bar[data.batch].squeeze()
@@ -179,35 +177,40 @@ class PhysicsKernels:
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
         c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
+        # Extract primary 1st and 2nd derivatives
         u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
         v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
-        # --- Non-Newtonian logic ---
+        # --- Tier-Dependent Physics Formulation ---
         if self.cfg.viscosity_model == "carreau":
-            # Extract the predicted mu directly from the 4th channel
+            # Extract cross-derivatives strictly for non-Newtonian flow
+            u_xy = c_u[:, 3, 0]
+            v_xy = c_v[:, 3, 0]
+
+            # Extract predicted mu
             mu_eff = pred[:, 3]
 
-            # Detach mu_eff before calculating spatial gradients
-            # This stops the NS loss from penalizing sharp peaks in viscosity.
+            # Detach mu_eff to prevent physics gradients from penalizing sharp viscosity peaks
             c_mu = self._compute_derivatives(mu_eff.detach().unsqueeze(1), props)
             mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
-            # Re relative to mu_0
             Re = self.cfg.get_re(u_ref, d_bar)
-        else:
-            # Newtonian path: Viscosity is constant, gradients are 0
-            mu_eff = torch.ones_like(u)
-            mu_x = torch.zeros_like(u)
-            mu_y = torch.zeros_like(u)
 
+            # Full divergence of the strain rate tensor (Tier 2)
+            visc_x = (1.0 / Re) * (mu_eff * (u_xx + v_xy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
+            visc_y = (1.0 / Re) * (mu_eff * (v_yy + u_xy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
+
+        else:
             # Re relative to default mu_ref (Newtonian)
             Re = self.cfg.get_re(u_ref, d_bar)
 
-        # Momentum equations (this unified form handles both cases)
-        visc_x = (1.0 / Re) * (mu_eff * (u_xx + u_yy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
-        visc_y = (1.0 / Re) * (mu_eff * (v_xx + v_yy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
+            # Simplified Laplacian Formulation (Tier 1)
+            # Analytically, mu is constant (1.0) and mu gradients are 0.
+            visc_x = (1.0 / Re) * (u_xx + u_yy)
+            visc_y = (1.0 / Re) * (v_xx + v_yy)
 
+        # Calculate Continuity and Convective Momentum
         l_cont = u_x + v_y
         mom_x = (u * u_x + v * u_y) + p_x - visc_x
         mom_y = (u * v_x + v * v_y) + p_y - visc_y
@@ -220,42 +223,25 @@ class PhysicsKernels:
         interior_mask = ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
 
         if interior_mask.any():
-            # Ensure EVERY term has [interior_mask]
-            res = torch.mean(
-                l_cont[interior_mask] ** 2 +
-                mom_x[interior_mask] ** 2 +
-                mom_y[interior_mask] ** 2
-            )
+            loss_cont = torch.mean(l_cont[interior_mask] ** 2)
+            loss_mom = torch.mean(mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
         else:
-            res = torch.tensor(0.0, device=pred.device)
+            loss_cont = torch.tensor(0.0, device=pred.device)
+            loss_mom = torch.tensor(0.0, device=pred.device)
 
-        return res
+        return loss_cont, loss_mom
 
     def rheology_loss(self, pred, data, props=None):
-        """
-        Penalizes the network if its predicted viscosity (pred[:, 3])
-        deviates from the analytical Carreau-Yasuda model given its
-        predicted velocity gradients.
-
-        Best Practice Updates:
-        1. Detaches velocity fields to prevent gradient collapse.
-        2. Detaches the target viscosity to ensure strict 1-way supervision.
-        3. Removes unused variable extractions for cleaner execution.
-        """
         if self.cfg.viscosity_model != "carreau":
             return torch.tensor(0.0, device=pred.device)
 
         if props is None:
             props = self._get_geometric_props(data)
 
-        # 1. Extract and DETACH velocities
-        # We detach u and v so the optimizer cannot 'cheat' by smoothing the velocity
-        # field to artificially lower the shear rate and minimize this loss.
         u = pred[:, 0].detach()
         v = pred[:, 1].detach()
         mu_pred = pred[:, 3]
 
-        # 2. Compute 1st order derivatives using the detached velocities
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
 
@@ -264,26 +250,16 @@ class PhysicsKernels:
 
         du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
 
-        # 3. Compute the theoretical target viscosity
-        # _compute_carreau_viscosity safely handles batching internally
         mu_target = self._compute_carreau_viscosity(du_ij, data)
-
-        # Detach the target to be absolutely certain no gradients
-        # flow backward through the analytical calculation framework.
         mu_target = mu_target.detach()
 
-        # 4. Safe Log-MSE Loss Calculation
-        # Clamp predictions to prevent negative viscosity and NaNs in log
         mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=100.0)
 
-        # Log-space comparison handles the order-of-magnitude differences
-        # typical in shear-thinning fluids without exploding the gradients.
         loss = torch.mean((torch.log(mu_pred_safe) - torch.log(mu_target)) ** 2)
 
         return loss
 
     def boundary_condition_loss(self, pred, data):
-        # Squeeze to [N] to be safe
         u, v = pred[:, 0], pred[:, 1]
         mask_wall_1d = data.mask_wall.view(-1).bool()
         if mask_wall_1d.any():
@@ -299,8 +275,6 @@ class PhysicsKernels:
         mask_inlet_1d = data.mask_inlet.view(-1).bool()
 
         if mask_inlet_1d.any():
-            # Use robust pre-calculated BC ---
-            # data.u_inlet_bc is shape [N, 2], we need u component (idx 0)
             u_target = data.u_inlet_bc[mask_inlet_1d, 0]
 
             u_in = u[mask_inlet_1d].squeeze()
