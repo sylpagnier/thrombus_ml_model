@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
@@ -8,9 +9,31 @@ from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
+
+
+class DynamicLossWeighter(nn.Module):
+    """
+    Dynamically weights multiple loss components using homoscedastic task uncertainty.
+    Reference: Kendall et al., 2018 (Multi-Task Learning Using Uncertainty to Weigh Losses)
+    """
+
+    def __init__(self, num_losses=4):
+        super().__init__()
+        # Initialize log variances to 0 (which initializes the weight to 1.0)
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+
+    def forward(self, losses):
+        total_loss = 0
+        for i, loss in enumerate(losses):
+            # Safeguard: only apply to active losses to prevent log_vars from diverging
+            if loss > 0.0:
+                precision = torch.exp(-self.log_vars[i])
+                # precision * loss + log_variance
+                total_loss += precision * loss + self.log_vars[i]
+        return total_loss
 
 
 def load_dataset():
@@ -30,8 +53,16 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    # Initialize the Dynamic Weighter for 4 losses: Data, Navier-Stokes, BC, Inlet/Outlet
+    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
+
+    # Pass BOTH the model parameters and the weighter parameters to the optimizer
+    optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
+                            lr=lr, weight_decay=1e-5)
+
+    # Replaced basic CosineAnnealing with Warm Restarts (restarts every 15 epochs)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1, eta_min=1e-6)
 
     dataset = load_dataset()
     if not dataset: return
@@ -66,23 +97,17 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
-                    # 1. Standard L2/MSE Loss STRICTLY on Kinematics (u, v, p)
-                    # This prevents ground-truth noise from corrupting the viscosity sub-network
                     mse_loss = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
 
-                    # 2. Sobolev H1 Regularization (Gradient-Enhanced Loss)
                     props = kernels._get_geometric_props(data)
-
                     u_pred, v_pred = pred[:, 0].unsqueeze(1), pred[:, 1].unsqueeze(1)
 
-                    # Compute predicted spatial derivatives
-                    c_u_pred = kernels._compute_derivatives(u_pred, props)  # [N, 5, 1]
+                    c_u_pred = kernels._compute_derivatives(u_pred, props)
                     c_v_pred = kernels._compute_derivatives(v_pred, props)
 
-                    grad_u_pred = c_u_pred[:, :2, 0]  # [N, 2] (d/dx, d/dy)
+                    grad_u_pred = c_u_pred[:, :2, 0]
                     grad_v_pred = c_v_pred[:, :2, 0]
 
-                    # 🚀 OPTIMIZATION: Prevent graph tracking for ground truth
                     with torch.no_grad():
                         u_true, v_true = data.y[:, 0].unsqueeze(1), data.y[:, 1].unsqueeze(1)
                         c_u_true = kernels._compute_derivatives(u_true, props)
@@ -91,13 +116,11 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                         grad_u_true = c_u_true[:, :2, 0].detach()
                         grad_v_true = c_v_true[:, :2, 0].detach()
 
-                    # Compute Gradient MSE strictly on the anchor nodes
                     grad_mse = F.mse_loss(grad_u_pred[node_is_anchor], grad_u_true[node_is_anchor]) + \
                                F.mse_loss(grad_v_pred[node_is_anchor], grad_v_true[node_is_anchor])
 
-                    # 🚀 DYNAMIC WEIGHTING: Anneal alpha_sobolev from 0.0 to 0.5
-                    # Start enforcing gradients only after basic physics kicks in
-                    alpha_sobolev = min(0.5, max(0.0, (epoch - warm_up_epochs) / 30.0))
+                    # 🚀 CAPPED SOBOLEV WEIGHT: Reduced max from 0.5 to 0.1
+                    alpha_sobolev = min(0.1, max(0.0, (epoch - warm_up_epochs) / 30.0))
 
                     l_data = mse_loss + (alpha_sobolev * grad_mse)
 
@@ -106,9 +129,11 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_io = kernels.inlet_outlet_loss(pred, data)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
-            loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + l_mu_dummy
+            #  DYNAMIC LOSS WEIGHTING APPLIED HERE
+            # Note: lambda_phys is still used to strictly zero-out physics during warm-up
+            losses = [l_data, (lambda_phys * l_ns), l_bc, l_io]
+            loss = loss_weighter(losses) + l_mu_dummy
 
-            # --- NaN Check ---
             if torch.isnan(loss):
                 print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")
                 continue
@@ -118,12 +143,11 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             optimizer.step()
             total_loss_epoch += loss.item()
 
-            # --- Enhanced Postfix Tracking ---
             pbar.set_postfix({
                 "L_tot": f"{loss.item():.3f}",
                 "L_data": f"{l_data.item():.3f}",
                 "L_ns": f"{l_ns.item():.3f}",
-                "|g|": f"{grad_norm:.2f}",  # Track gradient norm
+                "|g|": f"{grad_norm:.2f}",
                 "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
 
@@ -132,10 +156,15 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier1")
 
-            # --- DEBUGGING: Restore robust validation prints ---
             print(f"\n📊 [Validation] Rel L2: {scores.get('rel_l2', 0):.4f} | "
                   f"Div: {scores.get('continuity', 0):.3e} | "
                   f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
+
+            # Debugging the current learned weights
+            with torch.no_grad():
+                weights = torch.exp(-loss_weighter.log_vars)
+                print(
+                    f"⚖️ Learned Loss Weights -> Data: {weights[0]:.2f} | NS: {weights[1]:.2f} | BC: {weights[2]:.2f} | IO: {weights[3]:.2f}")
 
             phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
 
@@ -145,7 +174,6 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                 torch.save(model.state_dict(), root / "models/tier1_best_physics.pth")
                 print("⭐ Saved Best Physics Model")
 
-        # --- Restore best loss saving logic ---
         avg_loss = total_loss_epoch / len(loader)
         if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
@@ -155,7 +183,6 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
-    # --- Final completion print ---
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
 

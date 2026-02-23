@@ -8,7 +8,7 @@ from tqdm import tqdm
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
 
@@ -46,11 +46,17 @@ def setup_distillation_phase(model):
     return optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
 
 
-def setup_coupled_phase(model, base_lr=2e-5):
+# Added log_vars to the optimizer for dynamic loss weighting
+def setup_coupled_phase(model, log_vars, base_lr=2e-5):
     """Unfreezes all layers for the final Operator Splitting DEQ phase."""
     print("🔥 Unfreezing All Layers. Activating Coupled DEQ Optimization.")
     for param in model.parameters(): param.requires_grad = True
-    return optim.Adam(model.parameters(), lr=base_lr)
+
+    # We assign a slightly higher learning rate (1e-3) to the loss weights so they adapt quickly
+    return optim.Adam([
+        {'params': model.parameters(), 'lr': base_lr},
+        {'params': [log_vars], 'lr': 1e-3}
+    ])
 
 
 def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
@@ -82,6 +88,10 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
     best_loss = float('inf')
     Path("models").mkdir(exist_ok=True)
 
+    # Initialize learnable parameters for Uncertainty-based Dynamic Weighting
+    # Indices map to -> 0: Navier-Stokes, 1: Boundary Conditions, 2: Inlet/Outlet, 3: Data, 4: Rheology
+    log_vars = torch.zeros(5, requires_grad=True, device=device)
+
     # State variables for optimizers/schedulers
     optimizer = None
     scheduler = None
@@ -93,12 +103,15 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
         if epoch == 0:
             print(f"\n🚀 --- Starting Phase 1: Viscosity Distillation (Epochs 0-{distillation_epochs - 1}) ---")
             optimizer = setup_distillation_phase(model)
-            scheduler = CosineAnnealingLR(optimizer, T_max=distillation_epochs, eta_min=1e-5)
+            # Implemented Warm Restarts to escape sharp local minima
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
             sampler.set_warmup_mode(True)  # Focus mostly on anchors initially
         elif epoch == distillation_epochs:
             print(f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ (Epochs {distillation_epochs}-{epochs - 1}) ---")
-            optimizer = setup_coupled_phase(model, base_lr=lr)
-            scheduler = CosineAnnealingLR(optimizer, T_max=(epochs - distillation_epochs), eta_min=1e-7)
+            # Pass the learnable log_vars to the optimizer
+            optimizer = setup_coupled_phase(model, log_vars, base_lr=lr)
+            # Implemented Warm Restarts (restarts every 10 epochs, increasing length)
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
             sampler.set_warmup_mode(False)  # Turn on full physics batching
 
         model.train()
@@ -111,22 +124,18 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
 
             # --- PHASE 1: DISTILLATION ROUTING ---
             if is_distillation:
-                # Fast Picard solver is sufficient since kinematics are frozen
                 pred = model(data, solver="picard", anderson_beta=1.0)
 
                 l_data_mu = torch.tensor(0.0, device=device)
                 if hasattr(data, 'is_anchor'):
                     node_is_anchor = data.is_anchor[data.batch]
                     if node_is_anchor.sum() > 0:
-                        # MSE strictly on the viscosity channel
                         l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
                 l_rheo = kernels.rheology_loss(pred, data)
 
-                # Heavy penalty on rheology alone; bypass expensive PDE evaluations
                 loss = 10.0 * l_rheo + 5.0 * l_data_mu
-                l_ns = l_bc = l_io = torch.tensor(0.0)
-                grad_norm_val = 1.0  # placeholder
+                l_ns = torch.tensor(0.0)
 
             # --- PHASE 2: FULLY COUPLED ROUTING ---
             else:
@@ -136,7 +145,6 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
                 if hasattr(data, 'is_anchor'):
                     node_is_anchor = data.is_anchor[data.batch]
                     if node_is_anchor.sum() > 0:
-                        # Standard MSE on all State Variables
                         mse_loss = F.mse_loss(pred[node_is_anchor, :4], data.y[node_is_anchor, :4])
 
                         # Sobolev H1 Regularization
@@ -157,8 +165,7 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
                         grad_mse = F.mse_loss(grad_u_pred[node_is_anchor], grad_u_true[node_is_anchor]) + \
                                    F.mse_loss(grad_v_pred[node_is_anchor], grad_v_true[node_is_anchor])
 
-                        # Ramp up Sobolev weighting after transition
-                        alpha_sobolev = min(0.5, max(0.0, (epoch - distillation_epochs) / 20.0))
+                        alpha_sobolev = min(0.1, max(0.0, (epoch - distillation_epochs) / 20.0))
                         l_data = mse_loss + (alpha_sobolev * grad_mse)
 
                 l_ns = kernels.navier_stokes_residual(pred, data)
@@ -166,10 +173,15 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
                 l_io = kernels.inlet_outlet_loss(pred, data)
                 l_rheo = kernels.rheology_loss(pred, data)
 
-                # Ramp up physics loss gradually
                 lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
 
-                loss = (lambda_phys * l_ns + 5 * l_bc + 5 * l_io) + (5.0 * l_data) + (5.0 * l_rheo)
+                # Dynamic Uncertainty Weighting
+                # Automatically balances the gradients so no single loss component dominates
+                loss = (torch.exp(-log_vars[0]) * (lambda_phys * l_ns) + log_vars[0]) + \
+                       (torch.exp(-log_vars[1]) * l_bc + log_vars[1]) + \
+                       (torch.exp(-log_vars[2]) * l_io + log_vars[2]) + \
+                       (torch.exp(-log_vars[3]) * l_data + log_vars[3]) + \
+                       (torch.exp(-log_vars[4]) * l_rheo + log_vars[4])
 
             # --- Safety checks and Backprop ---
             if torch.isnan(loss):
@@ -191,7 +203,7 @@ def train_tier2(epochs=60, distillation_epochs=15, lr=2e-5):
 
         scheduler.step()
 
-        # Validation (Only start saving the "Best Physics Model" during the fully coupled phase)
+        # Validation
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier2")
             print(
