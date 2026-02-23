@@ -108,6 +108,10 @@ class MeshToGraphComplete:
             elif tag == t_wall:
                 mask_wall[nodes] = True
 
+        # If a node is marked as a Wall, it cannot be an Inlet or Outlet
+        mask_inlet = mask_inlet & (~mask_wall)
+        mask_outlet = mask_outlet & (~mask_wall)
+
         return mask_inlet, mask_outlet, mask_wall
 
     def process_file(self, filename):
