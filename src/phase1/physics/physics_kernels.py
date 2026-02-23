@@ -219,16 +219,13 @@ class PhysicsKernels:
         interior_mask = ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
 
         if interior_mask.any():
-            # Ensure EVERY term has [interior_mask]
-            res = torch.mean(
-                l_cont[interior_mask] ** 2 +
-                mom_x[interior_mask] ** 2 +
-                mom_y[interior_mask] ** 2
-            )
+            loss_cont = torch.mean(l_cont[interior_mask] ** 2)
+            loss_mom = torch.mean(mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
         else:
-            res = torch.tensor(0.0, device=pred.device)
+            loss_cont = torch.tensor(0.0, device=pred.device)
+            loss_mom = torch.tensor(0.0, device=pred.device)
 
-        return res
+        return loss_cont, loss_mom
 
     def rheology_loss(self, pred, data, props=None):
         """

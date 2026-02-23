@@ -235,7 +235,6 @@ def test_kernels_on_real_generated_graph(phys_cfg):
     real_data = torch.load(sample_file, weights_only=False)
 
     # 1. Extract REAL values from the generated data
-    # These were saved in MeshToGraphComplete.process_file
     u_ref_real = real_data.u_ref.item()
     d_bar_real = real_data.d_bar.item()
 
@@ -246,11 +245,11 @@ def test_kernels_on_real_generated_graph(phys_cfg):
     num_channels = 4 if phys_cfg.viscosity_model == "carreau" else 3
     pred = torch.randn((real_data.num_nodes, num_channels), dtype=torch.float32)
 
-    # 3. Verify the Kernel uses the REAL data internally
-    # The NS residual takes 'data' and extracts data.u_ref
-    residual = kernels.navier_stokes_residual(pred, real_data, props)
+    # 3. Verify the Kernel handles the split residual return (l_cont, l_mom)
+    l_cont, l_mom = kernels.navier_stokes_residual(pred, real_data, props)
 
     # 4. Assertions for physical validity
-    assert not torch.isnan(residual), f"NaN in NS residual using real u_ref={u_ref_real}"
+    assert not torch.isnan(l_cont), f"NaN in Continuity residual (u_ref={u_ref_real})"
+    assert not torch.isnan(l_mom), f"NaN in Momentum residual (u_ref={u_ref_real})"
     assert u_ref_real > 0, "Reference velocity in generated data must be positive"
     assert d_bar_real > 0, "Effective diameter in generated data must be positive"

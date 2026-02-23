@@ -65,7 +65,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
 
     # Initialize the Dynamic Weighter for 4 losses: Data, Navier-Stokes, BC, Inlet/Outlet
-    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
 
     # Pass BOTH the model parameters and the weighter parameters to the optimizer
     optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
@@ -145,23 +145,22 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                     grad_mse = F.mse_loss(grad_u_pred[node_is_anchor], grad_u_true[node_is_anchor]) + \
                                F.mse_loss(grad_v_pred[node_is_anchor], grad_v_true[node_is_anchor])
 
-                    # 🚀 CAPPED SOBOLEV WEIGHT: Reduced max from 0.5 to 0.1
-                    alpha_sobolev = min(0.1, max(0.0, (epoch - warm_up_epochs) / 30.0))
+                    alpha_sobolev = min(0.3, max(0.0, (epoch - warm_up_epochs) / 30.0))
 
                     l_data = mse_loss + (alpha_sobolev * grad_mse)
 
-            l_ns = kernels.navier_stokes_residual(pred, data)
+            l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
             l_bc = kernels.boundary_condition_loss(pred, data)
             l_io = kernels.inlet_outlet_loss(pred, data)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
             #  DYNAMIC LOSS WEIGHTING
             # 1. Pass the RAW, unscaled losses to the weighter so it learns the true variance
-            losses = [l_data, l_ns, l_bc, l_io]
+            losses = [l_data, l_cont, l_mom, l_bc, l_io]
 
             # 2. Apply the warm-up schedule strictly as a post-multiplier
             # Index 1 corresponds to l_ns
-            scales = [1.0, lambda_phys, 1.0, 1.0]
+            scales = [1.0, lambda_phys, lambda_phys, 1.0, 1.0]
 
             loss = loss_weighter(losses, scales=scales) + l_mu_dummy
 
