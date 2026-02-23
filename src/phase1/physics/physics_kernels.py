@@ -177,8 +177,9 @@ class PhysicsKernels:
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
         c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-        u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
-        v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
+        # EXTRACT CROSS-DERIVATIVES (Index 3 maps to the 'dx*dy' basis term)
+        u_x, u_y, u_xx, u_xy, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 3, 0], c_u[:, 4, 0]
+        v_x, v_y, v_xx, v_xy, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 3, 0], c_v[:, 4, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         # --- Non-Newtonian logic ---
@@ -202,9 +203,9 @@ class PhysicsKernels:
             # Re relative to default mu_ref (Newtonian)
             Re = self.cfg.get_re(u_ref, d_bar)
 
-        # Momentum equations (this unified form handles both cases)
-        visc_x = (1.0 / Re) * (mu_eff * (u_xx + u_yy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
-        visc_y = (1.0 / Re) * (mu_eff * (v_xx + v_yy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
+        # Momentum equations (Using the full divergence of the strain rate tensor)
+        visc_x = (1.0 / Re) * (mu_eff * (u_xx + v_xy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
+        visc_y = (1.0 / Re) * (mu_eff * (v_yy + u_xy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
 
         l_cont = u_x + v_y
         mom_x = (u * u_x + v * u_y) + p_x - visc_x

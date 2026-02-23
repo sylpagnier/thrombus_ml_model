@@ -14,6 +14,7 @@ from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
 import random
 
+
 class DynamicLossWeighter(nn.Module):
     """
     Dynamically weights multiple loss components using homoscedastic task uncertainty.
@@ -25,14 +26,23 @@ class DynamicLossWeighter(nn.Module):
         # Initialize log variances to 0 (which initializes the weight to 1.0)
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
 
-    def forward(self, losses):
+    def forward(self, losses, scales=None):
+        # Default to a scale of 1.0 for all tasks if no scales are provided
+        if scales is None:
+            scales = [1.0] * len(losses)
+
         total_loss = 0
         for i, loss in enumerate(losses):
             # Safeguard: only apply to active losses to prevent log_vars from diverging
             if loss > 0.0:
                 precision = torch.exp(-self.log_vars[i])
-                # precision * loss + log_variance
-                total_loss += precision * loss + self.log_vars[i]
+
+                # 1. Calculate the balanced task loss based on RAW uncertainty
+                task_loss = precision * loss + self.log_vars[i]
+
+                # 2. Apply the manual external scaling (e.g., warm-up schedules)
+                total_loss += scales[i] * task_loss
+
         return total_loss
 
 
@@ -145,10 +155,15 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             l_io = kernels.inlet_outlet_loss(pred, data)
             l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
 
-            #  DYNAMIC LOSS WEIGHTING APPLIED HERE
-            # Note: lambda_phys is still used to strictly zero-out physics during warm-up
-            losses = [l_data, (lambda_phys * l_ns), l_bc, l_io]
-            loss = loss_weighter(losses) + l_mu_dummy
+            #  DYNAMIC LOSS WEIGHTING
+            # 1. Pass the RAW, unscaled losses to the weighter so it learns the true variance
+            losses = [l_data, l_ns, l_bc, l_io]
+
+            # 2. Apply the warm-up schedule strictly as a post-multiplier
+            # Index 1 corresponds to l_ns
+            scales = [1.0, lambda_phys, 1.0, 1.0]
+
+            loss = loss_weighter(losses, scales=scales) + l_mu_dummy
 
             if torch.isnan(loss):
                 print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")

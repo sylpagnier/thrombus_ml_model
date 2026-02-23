@@ -66,7 +66,7 @@ class ModulatedGATConv(MessagePassing):
         dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
         dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        physics_modulator = 1.0 - dot_prod
+        physics_modulator = dot_prod + 0.1
         e = e + torch.log(physics_modulator + 1e-8)
 
         alpha = softmax(e, index, ptr, size_i)
