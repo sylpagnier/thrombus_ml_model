@@ -63,7 +63,7 @@ class PhysicsConfig:
     re_target: float = 150.0  # Reynolds number [-]
 
     viscosity_model: str = field(init=False)
-    mu_ref: float = field(init=False)  # <-- Add this
+    mu_ref: float = field(init=False)
 
     # Newtonian Reference (tier 1)
     mu_newtonian: float = 0.0035  # Pa*s (3.5 cP)

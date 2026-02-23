@@ -194,7 +194,7 @@ class GINO_DEQ(nn.Module):
             # 3. Explicit Sub-Network Update for Viscosity
             # Breaks the stiff feedback loop for the Anderson solver.
             mu_raw = self.mu_decoder(z)
-            mu = F.softplus(mu_raw) + 1.0
+            mu = F.softplus(mu_raw) + 1.0 # +1 since  mu_inf is mu_ref for ND
 
             # Final decode
         u_v_p = self.kinematics_decoder(z)

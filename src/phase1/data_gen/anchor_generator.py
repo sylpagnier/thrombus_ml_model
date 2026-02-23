@@ -117,9 +117,7 @@ class AnchorGenerator:
             interp = results.numerical(interp_tag)
 
             interp.set("data", "dset1")
-            # Added "mu_final" to extract the computed viscosity field
             interp.set("expr", ["u", "v", "p", "mu_final"])
-
             interp.setInterpolationCoordinates(coords_T.tolist())
             data = interp.getData()
 
@@ -227,9 +225,7 @@ class AnchorGenerator:
 
                 u, v, p, mu = self._evaluate_at_coords(target_nodes)
 
-                # ---Robust Meshio Access ---
-                # Check if 'line' cells exist using modern meshio API
-                # This handles both list-of-arrays and single-array internals
+                # Meshio Access
                 try:
                     line_cells = mesh.get_cells_type("line")  # Returns (N, 2)
                     line_tags = mesh.get_cell_data("gmsh:physical", "line")  # Returns (N,)
@@ -262,7 +258,7 @@ class AnchorGenerator:
                 # ---------------------------------
 
                 if not np.isfinite(u).all():
-                    logger.warning(f"NaNs or infinities detected in {i}")
+                    logger.warning(f"NaNs or infinities detected in {nas_file.name}")
                     continue
 
                 np.savez(
@@ -287,6 +283,6 @@ if __name__ == "__main__":
         generator = AnchorGenerator(tier="tier1")
 
         with generator:
-            generator.run_batch(start_idx=0, end_idx=100)
+            generator.run_batch(start_idx=0, end_idx=250)
     except Exception as e:
         print(e)

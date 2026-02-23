@@ -1,4 +1,3 @@
-# train_tier1.py
 import torch
 import torch.nn.functional as F
 import torch.optim as optim

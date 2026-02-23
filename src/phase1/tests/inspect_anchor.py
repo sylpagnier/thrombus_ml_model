@@ -96,4 +96,4 @@ def inspect_data(sample_idx=0, active_tier="tier1"):
 
 
 if __name__ == "__main__":
-    inspect_data(sample_idx=2, active_tier="tier2")
+    inspect_data(sample_idx=1, active_tier="tier1")
