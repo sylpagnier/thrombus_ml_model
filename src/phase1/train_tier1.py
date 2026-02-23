@@ -176,7 +176,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
             pbar.set_postfix({
                 "L_tot": f"{loss.item():.3f}",
                 "L_data": f"{l_data.item():.3f}",
-                "L_ns": f"{l_ns.item():.3f}",
+                "L_mom": f"{l_mom.item():.3f}",
+                "L_cont": f"{l_cont.item():.3f}",
                 "|g|": f"{grad_norm:.2f}",
                 "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
             })
