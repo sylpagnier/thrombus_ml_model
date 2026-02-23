@@ -147,7 +147,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
     if np.max(valid_cond) > 1e6:
         print(" ⚠️ WARNING: High condition numbers detected. Potential WLS gradient instability.")
 
-    # 5. Physics Residual Check
+    # --- Section 5: Physics Residual Check ---
     if hasattr(data, 'y') and data.y is not None:
         print("\n--- Physical Governing Equations (Residuals) ---")
         kernels = PhysicsKernels(phys_cfg=phys_cfg)
@@ -155,15 +155,19 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         data_gpu = data.clone().to(device)
 
         with torch.no_grad():
-            res_ns = kernels.navier_stokes_residual(data_gpu.y, data_gpu)
+            # Unpack the new split return format
+            res_cont, res_mom = kernels.navier_stokes_residual(data_gpu.y, data_gpu)
+
             res_bc = kernels.boundary_condition_loss(data_gpu.y, data_gpu)
             res_io = kernels.inlet_outlet_loss(data_gpu.y, data_gpu)
             res_rheo = kernels.rheology_loss(data_gpu.y, data_gpu)
 
-            print(f" -> Navier-Stokes: {res_ns.item():.6e}")
-            print(f" -> BC Loss:       {res_bc.item():.6e}")
-            print(f" -> Inlet/Outlet:  {res_io.item():.6e}")
-            print(f" -> Rheology:      {res_rheo.item():.6e}")
+            # Print the split residuals for better diagnostic clarity
+            print(f" -> Continuity Res: {res_cont.item():.6e}")
+            print(f" -> Momentum Res:   {res_mom.item():.6e}")
+            print(f" -> BC Loss:         {res_bc.item():.6e}")
+            print(f" -> Inlet/Outlet:    {res_io.item():.6e}")
+            print(f" -> Rheology:        {res_rheo.item():.6e}")
 
     # 6. Dynamic Visualization
     print("\nLaunching visualization...")
