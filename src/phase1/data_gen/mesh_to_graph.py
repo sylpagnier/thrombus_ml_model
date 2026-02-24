@@ -260,14 +260,35 @@ class MeshToGraphComplete:
         # Add a one-hot or scalar for the physics mode
         is_non_newt = 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0
 
-        # Assembly: Concatenate the 4-channel one-hot features to the x_tensor
+        # --- GENERALIZED POISSEUILLE PRIOR ---
+        # u_max for 2D parabolic flow is 1.5 * u_ref
+        u_max_nd = 1.5  # Since we are non-dimensionalizing by u_ref, u_max is just 1.5
+
+        # d_bar is our characteristic diameter D
+        sdf_tensor = torch.tensor(sdf_nd, dtype=torch.float32)
+
+        # u_prior = 4 * u_max * (SDF * (D - SDF)) / D^2
+        # Since sdf_nd is already SDF/D, the math simplifies elegantly:
+        # u_prior = 4 * u_max_nd * sdf_nd * (1 - sdf_nd)
+        u_prior_mag = 4.0 * u_max_nd * sdf_tensor * (1.0 - sdf_tensor)
+
+        # We assume the primary background flow is in the +x direction
+        u_prior_x = torch.clamp(u_prior_mag, min=0.0)
+        v_prior_y = torch.zeros_like(u_prior_x)
+
+        # Stack into a 2D vector
+        uv_prior = torch.cat([u_prior_x, v_prior_y], dim=1)
+        # --------------------------------------
+
+        # Assembly: Concatenate to the x_tensor
         x_tensor = torch.cat([
             torch.tensor(nodes_nd, dtype=torch.float32),
             torch.tensor(sdf_nd, dtype=torch.float32),
             shear_pot,
             torch.tensor(wall_normal_vec, dtype=torch.float32),
             node_type,
-            torch.full((len(nodes), 1), is_non_newt, dtype=torch.float32)
+            torch.full((len(nodes), 1), is_non_newt, dtype=torch.float32),
+            uv_prior
         ], dim=1)
 
         # Precompute WLS operators for rapid gradient calculations during training

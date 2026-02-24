@@ -131,20 +131,24 @@ class GINO_DEQ(nn.Module):
         sdf_nd = x[:, 2:3]
         shear_pot = x[:, 3:4]
         wall_normal = x[:, 4:6]
-        rest = x[:, 6:]
+
+        # Extract the prior (assuming it's the last 2 columns based on mesh_to_graph)
+        uv_prior = x[:, -2:]
+        rest = x[:, 6:-2]
 
         features_to_encode = torch.cat([sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
 
         x_proj = (features_to_encode.unsqueeze(-1) * self.fourier_freqs).contiguous()
         x_proj = x_proj.view(N, -1)
-
         fourier_feats = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
-        return torch.cat([nodes_nd, shear_pot, features_to_encode, fourier_feats, rest], dim=1)
+        # We keep uv_prior in the encoded input so the network can "see" it
+        encoded_x = torch.cat([nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior], dim=1)
+        return encoded_x, uv_prior
 
     def forward(self, data, solver="anderson", anderson_beta=0.8):
-        x_encoded = self._apply_fourier_encoding(data.x)
+        x_encoded, uv_prior = self._apply_fourier_encoding(data.x)
         x_enc = self.encoder(x_encoded)
         z = x_enc.clone()
 
@@ -197,5 +201,15 @@ class GINO_DEQ(nn.Module):
             mu_raw = self.mu_decoder(z)
             mu = F.softplus(mu_raw) + 1.0
 
-        u_v_p = self.kinematics_decoder(z)
-        return torch.cat([u_v_p, mu], dim=1)
+            # Decode the final latent state into Kinematics
+            u_v_p_residual = self.kinematics_decoder(z)
+
+            # SPLIT the output: [u_res, v_res, p]
+            uv_res = u_v_p_residual[:, :2]
+            p = u_v_p_residual[:, 2:3]
+
+            # ADD THE PRIOR to the velocities!
+            uv_final = uv_res + uv_prior
+
+            u_v_p = torch.cat([uv_final, p], dim=1)
+            return torch.cat([u_v_p, mu], dim=1)
