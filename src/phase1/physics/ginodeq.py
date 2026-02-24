@@ -173,10 +173,13 @@ class GINO_DEQ(nn.Module):
 
         # -------------------------------------------------
 
-        # --- THE COUPLED DEQ STEP ---
         def f_coupled(curr_z):
+            # 0. Strip the dummy batch dimension added by the solver
+            is_batched = curr_z.ndim == 3
+            curr_z_sq = curr_z.squeeze(0) if is_batched else curr_z
+
             # 1. Enforce the physical bottleneck: decode latent state to physical mu
-            mu_raw = self.mu_decoder(curr_z)
+            mu_raw = self.mu_decoder(curr_z_sq)
             # REVISION: Swap Softplus for ELU to prevent gradient death at mu=1.0
             mu = F.elu(mu_raw) + 1.0
 
@@ -184,10 +187,13 @@ class GINO_DEQ(nn.Module):
             mu_enc = self.mu_encoder(mu)
 
             # 3. Form the combined input
-            z_in = curr_z + x_enc + mu_enc
+            z_in = curr_z_sq + x_enc + mu_enc
 
             # 4. Pass through the multi-head physics core
-            return self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
+            out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
+
+            # 5. Restore the dummy batch dimension for Anderson/Picard tracking
+            return out.unsqueeze(0) if is_batched else out
 
         z_init = z.unsqueeze(0) if z.ndim == 2 else z
 
