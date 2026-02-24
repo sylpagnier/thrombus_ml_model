@@ -154,62 +154,67 @@ class GINO_DEQ(nn.Module):
 
         row, col = data.edge_index
         edge_attr = data.x[col, :2] - data.x[row, :2]
-        batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(data.x.size(0),
-                                                                                                     dtype=torch.long,
-                                                                                                     device=data.x.device)
+
+        # Safe batch extraction for PyG
+        batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(
+            data.x.size(0), dtype=torch.long, device=data.x.device
+        )
 
         # --- PRECOMPUTE DUAL STATIC PHYSICS MODULATORS ---
         wall_normals = data.x[:, 4:6]
         e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
         n_dir = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
 
-        # Absolute dot product: 1.0 is strictly cross-stream, 0.0 is strictly streamwise
         dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
         dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        # Rheology (Cross-stream) prior: Log highly penalizes dot products near 0 (Softened to 1e-3)
         mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0))
-
-        # Advection (Streamwise) prior: Log highly penalizes dot products near 1 (Softened to 1e-3)
         mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0))
+
         # -------------------------------------------------
 
-        mu = torch.ones((data.x.size(0), 1), dtype=data.x.dtype, device=data.x.device)
-        inner_iters = max(1, self.max_iters // self.outer_iters)
-
-        for outer_step in range(self.outer_iters):
-            mu_enc = self.mu_encoder(mu)
-
-            def f_inner(curr_z):
-                z_in = curr_z + x_enc + mu_enc
-
-                # Pass both precomputed modulators to the core
-                out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
-                return out
-
-            if solver == "picard":
-                z_star = z.unsqueeze(0) if z.ndim == 2 else z
-                for _ in range(inner_iters):
-                    z_star = f_inner(z_star)
-                z = z_star.squeeze(0)
-            else:
-                z_init = z.unsqueeze(0) if z.ndim == 2 else z
-                # Pass batch_idx down to the anderson solver
-                z_star = anderson_acceleration(f_inner, z_init, batch_idx=batch_idx, max_iter=inner_iters, beta=anderson_beta)
-                z = z_star.squeeze(0)
-
-            mu_raw = self.mu_decoder(z)
+        # --- THE COUPLED DEQ STEP ---
+        # Instead of an outer loop, we define the complete non-linear step z_{k+1} = f(z_k).
+        # This allows Anderson Acceleration to continuously build its m=5 history.
+        def f_coupled(curr_z):
+            # 1. Enforce the physical bottleneck: decode latent state to physical mu
+            mu_raw = self.mu_decoder(curr_z)
             mu = F.softplus(mu_raw) + 1.0
 
-            # Decode the final latent state into Kinematics
-            u_v_p_residual = self.kinematics_decoder(z)
+            # 2. Re-encode mu to inject into the feature space
+            mu_enc = self.mu_encoder(mu)
 
-            # SPLIT the output: [u_res, v_res, p]
-            uv_res = u_v_p_residual[:, :2]
-            p = u_v_p_residual[:, 2:3]
+            # 3. Form the combined input
+            z_in = curr_z + x_enc + mu_enc
 
-            # ADD THE PRIOR to the velocities!
-            uv_final = uv_res + uv_prior
+            # 4. Pass through the multi-head physics core
+            return self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
 
-            u_v_p = torch.cat([uv_final, p], dim=1)
-            return torch.cat([u_v_p, mu], dim=1)
+        z_init = z.unsqueeze(0) if z.ndim == 2 else z
+
+        # --- SINGLE CONTINUOUS SOLVE ---
+        if solver == "picard":
+            z_star = z_init
+            for _ in range(self.max_iters):
+                z_star = f_coupled(z_star)
+            z = z_star.squeeze(0)
+        else:
+            # Anderson now runs for the full max_iters, preserving the contraction mapping
+            z_star = anderson_acceleration(
+                f_coupled, z_init, batch_idx=batch_idx,
+                max_iter=self.max_iters, beta=anderson_beta
+            )
+            z = z_star.squeeze(0)
+
+        # --- FINAL DECODE AFTER CONVERGENCE ---
+        mu_raw = self.mu_decoder(z)
+        mu = F.softplus(mu_raw) + 1.0
+
+        u_v_p_residual = self.kinematics_decoder(z)
+        uv_res = u_v_p_residual[:, :2]
+        p = u_v_p_residual[:, 2:3]
+
+        uv_final = uv_res + uv_prior
+
+        u_v_p = torch.cat([uv_final, p], dim=1)
+        return torch.cat([u_v_p, mu], dim=1)
