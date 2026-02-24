@@ -18,13 +18,17 @@ import random
 class DynamicLossWeighter(nn.Module):
     """
     Dynamically weights multiple loss components using homoscedastic task uncertainty.
-    Reference: Kendall et al., 2018 (Multi-Task Learning Using Uncertainty to Weigh Losses)
+    Includes a critical clamp to prevent the variance from collapsing to negative infinity
+    as PDE residuals approach zero.
+    Reference: Kendall et al., 2018.
     """
 
-    def __init__(self, num_losses=2):
+    def __init__(self, num_losses=2, min_log_var=-4.0):
         super().__init__()
         # Initialize log variances to 0 (which initializes the weight to 1.0)
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
+        # Set the floor to prevent the optimizer from "cheating"
+        self.min_log_var = min_log_var
 
     def forward(self, losses, scales=None):
         # Default to a scale of 1.0 for all tasks if no scales are provided
@@ -35,10 +39,13 @@ class DynamicLossWeighter(nn.Module):
         for i, loss in enumerate(losses):
             # Safeguard: only apply to active losses to prevent log_vars from diverging
             if loss > 0.0:
-                precision = torch.exp(-self.log_vars[i])
+                # CLAMP: Prevent log_var from dropping into the negative abyss
+                safe_log_var = torch.clamp(self.log_vars[i], min=self.min_log_var)
 
-                # 1. Calculate the balanced task loss based on RAW uncertainty
-                task_loss = precision * loss + self.log_vars[i]
+                precision = torch.exp(-safe_log_var)
+
+                # 1. Calculate the balanced task loss based on safely bounded uncertainty
+                task_loss = precision * loss + safe_log_var
 
                 # 2. Apply the manual external scaling (e.g., warm-up schedules)
                 total_loss += scales[i] * task_loss
@@ -167,9 +174,10 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
                   f"Div: {scores.get('continuity', 0):.3e} | "
                   f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
 
-            # Debugging the current learned weights for PDE residuals only
+            # Debugging the safely clamped learned weights
             with torch.no_grad():
-                weights = torch.exp(-loss_weighter.log_vars)
+                safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
+                weights = torch.exp(-safe_vars)
                 print(f"⚖️ Learned PDE Weights -> Cont: {weights[0]:.2f} | Mom: {weights[1]:.2f}")
 
             phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
