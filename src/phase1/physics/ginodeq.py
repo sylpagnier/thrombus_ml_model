@@ -173,27 +173,22 @@ class GINO_DEQ(nn.Module):
 
         # -------------------------------------------------
 
+        # --- THE COUPLED DEQ STEP ---
+        # Instead of an outer loop, we define the complete non-linear step z_{k+1} = f(z_k).
+        # This allows Anderson Acceleration to continuously build its m=5 history.
         def f_coupled(curr_z):
-            # 0. Strip the dummy batch dimension added by the solver
-            is_batched = curr_z.ndim == 3
-            curr_z_sq = curr_z.squeeze(0) if is_batched else curr_z
-
             # 1. Enforce the physical bottleneck: decode latent state to physical mu
-            mu_raw = self.mu_decoder(curr_z_sq)
-            # REVISION: Swap Softplus for ELU to prevent gradient death at mu=1.0
-            mu = F.elu(mu_raw) + 1.0
+            mu_raw = self.mu_decoder(curr_z)
+            mu = F.softplus(mu_raw) + 1.0
 
             # 2. Re-encode mu to inject into the feature space
             mu_enc = self.mu_encoder(mu)
 
             # 3. Form the combined input
-            z_in = curr_z_sq + x_enc + mu_enc
+            z_in = curr_z + x_enc + mu_enc
 
             # 4. Pass through the multi-head physics core
-            out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
-
-            # 5. Restore the dummy batch dimension for Anderson/Picard tracking
-            return out.unsqueeze(0) if is_batched else out
+            return self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
 
         z_init = z.unsqueeze(0) if z.ndim == 2 else z
 
@@ -204,6 +199,7 @@ class GINO_DEQ(nn.Module):
                 z_star = f_coupled(z_star)
             z = z_star.squeeze(0)
         else:
+            # Anderson now runs for the full max_iters, preserving the contraction mapping
             z_star = anderson_acceleration(
                 f_coupled, z_init, batch_idx=batch_idx,
                 max_iter=self.max_iters, beta=anderson_beta
@@ -212,8 +208,7 @@ class GINO_DEQ(nn.Module):
 
         # --- FINAL DECODE AFTER CONVERGENCE ---
         mu_raw = self.mu_decoder(z)
-        # REVISION: Match the inner loop activation
-        mu = F.elu(mu_raw) + 1.0
+        mu = F.softplus(mu_raw) + 1.0
 
         u_v_p_residual = self.kinematics_decoder(z)
         uv_res = u_v_p_residual[:, :2]
