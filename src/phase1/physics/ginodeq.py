@@ -174,12 +174,11 @@ class GINO_DEQ(nn.Module):
         # -------------------------------------------------
 
         # --- THE COUPLED DEQ STEP ---
-        # Instead of an outer loop, we define the complete non-linear step z_{k+1} = f(z_k).
-        # This allows Anderson Acceleration to continuously build its m=5 history.
         def f_coupled(curr_z):
             # 1. Enforce the physical bottleneck: decode latent state to physical mu
             mu_raw = self.mu_decoder(curr_z)
-            mu = F.softplus(mu_raw) + 1.0
+            # REVISION: Swap Softplus for ELU to prevent gradient death at mu=1.0
+            mu = F.elu(mu_raw) + 1.0
 
             # 2. Re-encode mu to inject into the feature space
             mu_enc = self.mu_encoder(mu)
@@ -199,7 +198,6 @@ class GINO_DEQ(nn.Module):
                 z_star = f_coupled(z_star)
             z = z_star.squeeze(0)
         else:
-            # Anderson now runs for the full max_iters, preserving the contraction mapping
             z_star = anderson_acceleration(
                 f_coupled, z_init, batch_idx=batch_idx,
                 max_iter=self.max_iters, beta=anderson_beta
@@ -208,7 +206,8 @@ class GINO_DEQ(nn.Module):
 
         # --- FINAL DECODE AFTER CONVERGENCE ---
         mu_raw = self.mu_decoder(z)
-        mu = F.softplus(mu_raw) + 1.0
+        # REVISION: Match the inner loop activation
+        mu = F.elu(mu_raw) + 1.0
 
         u_v_p_residual = self.kinematics_decoder(z)
         uv_res = u_v_p_residual[:, :2]
