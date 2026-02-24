@@ -1,7 +1,7 @@
 import torch
 
 
-def anderson_acceleration(f, z0, batch_idx=None, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False):
+def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False):
     """
     Robust Anderson Acceleration for Deep Equilibrium Models.
     Minimizes the residual norm over a history of size m.

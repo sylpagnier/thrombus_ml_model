@@ -155,12 +155,10 @@ class GINO_DEQ(nn.Module):
         row, col = data.edge_index
         edge_attr = data.x[col, :2] - data.x[row, :2]
 
-        # Safe batch extraction for PyG
         batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(
             data.x.size(0), dtype=torch.long, device=data.x.device
         )
 
-        # --- PRECOMPUTE DUAL STATIC PHYSICS MODULATORS ---
         wall_normals = data.x[:, 4:6]
         e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
         n_dir = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
@@ -171,47 +169,43 @@ class GINO_DEQ(nn.Module):
         mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0))
         mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0))
 
-        # -------------------------------------------------
-
-        # --- THE COUPLED DEQ STEP ---
         def f_coupled(curr_z):
-            # 0. Squeeze the DEQ dummy batch dimension (bsz=1) so PyG sees standard [N, C]
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
-
-            # 1. Enforce the physical bottleneck: decode latent state to physical mu
             mu_raw = self.mu_decoder(curr_z_flat)
             mu = F.softplus(mu_raw) + 1.0
-
-            # 2. Re-encode mu to inject into the feature space
             mu_enc = self.mu_encoder(mu)
-
-            # 3. Form the combined input
-            # (x_enc is already [N, C], so this now adds cleanly)
             z_in = curr_z_flat + x_enc + mu_enc
-
-            # 4. Pass through the multi-head physics core
             out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
-
-            # 5. Restore the dummy batch dimension for the Anderson/Picard solver loop
             return out.unsqueeze(0) if curr_z.ndim == 3 else out
 
         z_init = z.unsqueeze(0) if z.ndim == 2 else z
 
-        # --- SINGLE CONTINUOUS SOLVE ---
         if solver == "picard":
             z_star = z_init
             for _ in range(self.max_iters):
                 z_star = f_coupled(z_star)
             z = z_star.squeeze(0)
         else:
-            # Anderson now runs for the full max_iters, preserving the contraction mapping
             z_star = anderson_acceleration(
                 f_coupled, z_init, batch_idx=batch_idx,
                 max_iter=self.max_iters, beta=anderson_beta
             )
             z = z_star.squeeze(0)
 
-        # --- FINAL DECODE AFTER CONVERGENCE ---
+        # --- NEW: LIGHTWEIGHT JACOBIAN REGULARIZATION ---
+        jac_loss = torch.tensor(0.0, device=z.device)
+        if self.training:
+            # Detach the fixed point and require grad to compute the local Jacobian
+            z_star_req = z_star.detach().requires_grad_(True)
+            f_z = f_coupled(z_star_req)
+
+            # Hutchinson trace estimator for the Frobenius norm
+            eps = torch.randn_like(f_z)
+            vjp = torch.autograd.grad(f_z, z_star_req, grad_outputs=eps, create_graph=True)[0]
+
+            # Scale by the number of elements to maintain stable loss magnitudes
+            jac_loss = torch.mean(vjp ** 2)
+
         mu_raw = self.mu_decoder(z)
         mu = F.softplus(mu_raw) + 1.0
 
@@ -222,4 +216,7 @@ class GINO_DEQ(nn.Module):
         uv_final = uv_res + uv_prior
 
         u_v_p = torch.cat([uv_final, p], dim=1)
-        return torch.cat([u_v_p, mu], dim=1)
+        pred = torch.cat([u_v_p, mu], dim=1)
+
+        # Return tuple during training, standard tensor during inference
+        return (pred, jac_loss) if self.training else pred

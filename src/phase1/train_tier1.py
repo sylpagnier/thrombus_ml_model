@@ -9,7 +9,7 @@ from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
 import random
@@ -23,33 +23,21 @@ class DynamicLossWeighter(nn.Module):
     Reference: Kendall et al., 2018.
     """
 
-    def __init__(self, num_losses=2, min_log_var=-4.0):
+    def __init__(self, num_losses=2, min_log_var=-8.0):
         super().__init__()
-        # Initialize log variances to 0 (which initializes the weight to 1.0)
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
-        # Set the floor to prevent the optimizer from "cheating"
         self.min_log_var = min_log_var
 
     def forward(self, losses, scales=None):
-        # Default to a scale of 1.0 for all tasks if no scales are provided
         if scales is None:
             scales = [1.0] * len(losses)
-
         total_loss = 0
         for i, loss in enumerate(losses):
-            # Safeguard: only apply to active losses to prevent log_vars from diverging
             if loss > 0.0:
-                # CLAMP: Prevent log_var from dropping into the negative abyss
                 safe_log_var = torch.clamp(self.log_vars[i], min=self.min_log_var)
-
                 precision = torch.exp(-safe_log_var)
-
-                # 1. Calculate the balanced task loss based on safely bounded uncertainty
                 task_loss = precision * loss + safe_log_var
-
-                # 2. Apply the manual external scaling (e.g., warm-up schedules)
                 total_loss += scales[i] * task_loss
-
         return total_loss
 
 
@@ -64,22 +52,61 @@ def load_dataset():
     return dataset
 
 
-def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
+def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys, device):
+    """Extracted closure logic to support both AdamW and L-BFGS"""
+
+    # --- UPDATE: Unpack the tuple if the model returns the Jacobian loss ---
+    out = model(data, solver=current_solver, anderson_beta=0.8)
+    if isinstance(out, tuple):
+        pred, jac_loss = out
+    else:
+        pred = out
+        jac_loss = torch.tensor(0.0, device=device)
+
+    l_data = torch.tensor(0.0, device=device)
+    if hasattr(data, 'is_anchor'):
+        node_is_anchor = data.is_anchor[data.batch]
+        if node_is_anchor.sum() > 0:
+            l_data = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
+
+    l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
+    l_bc = kernels.boundary_condition_loss(pred, data)
+    l_io = kernels.inlet_outlet_loss(pred, data)
+    l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
+
+    pde_losses = [l_cont, l_mom]
+    pde_scales = [lambda_phys, lambda_phys]
+
+    weighted_pde_loss = loss_weighter(pde_losses, scales=pde_scales)
+
+    loss = weighted_pde_loss + (5.0 * l_data) + (5.0 * l_bc) + (5.0 * l_io) + l_mu_dummy + (0.1 * jac_loss)
+
+    metrics = {
+        "L_data": l_data.item(),
+        "L_mom": l_mom.item(),
+        "L_cont": l_cont.item(),
+        "L_jac": jac_loss.item()
+    }
+
+    return loss, metrics
+
+def train_tier1(epochs=125, lr=1e-4, warm_up_epochs=10, adam_epochs=100):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15).to(device)
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
 
-    # Initialize the Dynamic Weighter exclusively for the 2 PDE losses: Cont and Mom
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
-    # Pass BOTH the model parameters and the weighter parameters to the optimizer
+    # 1. Initialize Phase 1 Optimizer (AdamW)
     optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
                             lr=lr, weight_decay=1e-5)
 
-    # Replaced basic CosineAnnealing with Warm Restarts (restarts every 15 epochs)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1, eta_min=1e-6)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warm_up_epochs)
+    decay_epochs = adam_epochs - warm_up_epochs # Adjust decay to fit AdamW phase
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=decay_epochs, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warm_up_epochs])
 
     dataset = load_dataset()
     if not dataset: return
@@ -110,6 +137,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     best_phys_score = float('inf')
     best_loss = float('inf')
     Path("models").mkdir(exist_ok=True)
+    lbfgs_initialized = False
 
     for epoch in range(epochs):
         model.train()
@@ -120,52 +148,82 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
 
         current_solver = "picard" if epoch < 5 else "anderson"
 
-        pbar = tqdm(loader, desc=f"Tier 1 Epoch {epoch:02d} [Re={phys_cfg.re_target}]")
-        for batch_idx, data in enumerate(pbar):
-            data = data.to(device)
-            optimizer.zero_grad()
-            pred = model(data, solver=current_solver, anderson_beta=0.8)
+        if epoch >= adam_epochs and not lbfgs_initialized:
+            print(f"\n⚡ Switching to L-BFGS Optimizer for the final {epochs - adam_epochs} epochs...")
+            optimizer = optim.LBFGS(
+                list(model.parameters()) + list(loss_weighter.parameters()),
+                lr=0.01,
+                max_iter=20,
+                history_size=50,
+                line_search_fn="strong_wolfe",
+                tolerance_grad=1e-7,
+                tolerance_change=1e-9
+            )
+            lbfgs_initialized = True
 
-            l_data = torch.tensor(0.0, device=device)
-            if hasattr(data, 'is_anchor'):
-                node_is_anchor = data.is_anchor[data.batch]
-                if node_is_anchor.sum() > 0:
-                    # Using MSE on primaries
-                    l_data = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
+        if not lbfgs_initialized:
+            # --- PHASE 1: AdamW Execution (Mini-Batch) ---
+            pbar = tqdm(loader, desc=f"Tier 1 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (AdamW)")
+            for batch_idx, data in enumerate(pbar):
+                data = data.to(device)
 
-            l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
-            l_bc = kernels.boundary_condition_loss(pred, data)
-            l_io = kernels.inlet_outlet_loss(pred, data)
-            l_mu_dummy = torch.mean((pred[:, 3] - 1.0) ** 2)
+                optimizer.zero_grad()
+                loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys,
+                                                  device)
 
-            #  DYNAMIC LOSS WEIGHTING (Only for Internal PDEs)
-            pde_losses = [l_cont, l_mom]
-            pde_scales = [lambda_phys, lambda_phys]
+                if torch.isnan(loss):
+                    print(f"\n⚠️ NaN detected! Skipping batch.")
+                    continue
 
-            weighted_pde_loss = loss_weighter(pde_losses, scales=pde_scales)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss_epoch += loss.item()
 
-            # STATIC ANCHORING FOR BOUNDARIES AND DATA
-            loss = weighted_pde_loss + (5.0 * l_data) + (5.0 * l_bc) + (5.0 * l_io) + l_mu_dummy
+                pbar.set_postfix({
+                    "L_tot": f"{loss.item():.3f}",
+                    "L_data": f"{metrics['L_data']:.3f}",
+                    "L_mom": f"{metrics['L_mom']:.3f}",
+                    "L_cont": f"{metrics['L_cont']:.3f}",
+                    "L_jac": f"{metrics['L_jac']:.3f}",
+                    "|g|": f"{grad_norm:.2f}",
+                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
+                })
 
-            if torch.isnan(loss):
-                print(f"\n⚠️ NaN detected in loss at epoch {epoch}, batch {batch_idx}! Skipping batch.")
-                continue
+            scheduler.step()
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss_epoch += loss.item()
+        else:
+            # --- PHASE 2: L-BFGS Execution (Full-Batch via Accumulation) ---
+            print(f"⏳ Tier 1 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS Line Search...)")
 
-            pbar.set_postfix({
-                "L_tot": f"{loss.item():.3f}",
-                "L_data": f"{l_data.item():.3f}",
-                "L_mom": f"{l_mom.item():.3f}",
-                "L_cont": f"{l_cont.item():.3f}",
-                "|g|": f"{grad_norm:.2f}",
-                "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
-            })
+            def closure():
+                optimizer.zero_grad()
+                accumulated_loss = torch.tensor(0.0, device=device)
 
-        scheduler.step()
+                # Loop through the entire dataset to build the full-batch gradient
+                for closure_data in loader:
+                    closure_data = closure_data.to(device)
+                    loss, _ = compute_step_loss(model, closure_data, kernels, loss_weighter, current_solver,
+                                                lambda_phys, device)
+
+                    # Average the loss so the gradient magnitude is stable
+                    loss = loss / len(loader)
+                    loss.backward()
+
+                    accumulated_loss += loss.detach()
+
+                # Clip gradients over the accumulated full-batch
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                return accumulated_loss
+
+            # Take exactly ONE step per epoch. This will internally call the closure
+            # multiple times depending on the strong_wolfe line search.
+            loss_tensor = optimizer.step(closure)
+
+            # Scale it back up so the `avg_loss` calculation later in the script doesn't break
+            total_loss_epoch = loss_tensor.item() * len(loader)
+
+            print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier1")
