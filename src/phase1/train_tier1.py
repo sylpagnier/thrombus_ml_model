@@ -66,7 +66,7 @@ def load_dataset():
 
 def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=64, max_iters=15).to(device)
+    model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15).to(device)
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
