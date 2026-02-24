@@ -46,11 +46,14 @@ def anderson_acceleration(f, z0, batch_idx=None, m=5, lam=1e-4, max_iter=50, tol
 
         z_next = beta * combined_F + (1 - beta) * combined_X
 
-        diff_norm = (combined_F - combined_X).norm(p=2, dim=-1)
-        x_norm = combined_X.norm(p=2, dim=-1)
+        combined_X_node = combined_X.view(bsz, n, d)
+        combined_F_node = combined_F.view(bsz, n, d)
+
+        diff_norm = (combined_F_node - combined_X_node).norm(p=2, dim=-1)  # Shape: [bsz, n]
+        x_norm = combined_X_node.norm(p=2, dim=-1)  # Shape: [bsz, n]
 
         # Node-level residuals
-        node_res = diff_norm / (x_norm + 1e-8)
+        node_res = diff_norm / (x_norm + 1e-8)  # Shape: [bsz, n]
 
         # PyG Batched Evaluation
         if batch_idx is not None and bsz == 1:
