@@ -174,21 +174,26 @@ class GINO_DEQ(nn.Module):
         # -------------------------------------------------
 
         # --- THE COUPLED DEQ STEP ---
-        # Instead of an outer loop, we define the complete non-linear step z_{k+1} = f(z_k).
-        # This allows Anderson Acceleration to continuously build its m=5 history.
         def f_coupled(curr_z):
+            # 0. Squeeze the DEQ dummy batch dimension (bsz=1) so PyG sees standard [N, C]
+            curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
+
             # 1. Enforce the physical bottleneck: decode latent state to physical mu
-            mu_raw = self.mu_decoder(curr_z)
+            mu_raw = self.mu_decoder(curr_z_flat)
             mu = F.softplus(mu_raw) + 1.0
 
             # 2. Re-encode mu to inject into the feature space
             mu_enc = self.mu_encoder(mu)
 
             # 3. Form the combined input
-            z_in = curr_z + x_enc + mu_enc
+            # (x_enc is already [N, C], so this now adds cleanly)
+            z_in = curr_z_flat + x_enc + mu_enc
 
             # 4. Pass through the multi-head physics core
-            return self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
+            out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
+
+            # 5. Restore the dummy batch dimension for the Anderson/Picard solver loop
+            return out.unsqueeze(0) if curr_z.ndim == 3 else out
 
         z_init = z.unsqueeze(0) if z.ndim == 2 else z
 
