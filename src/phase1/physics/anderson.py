@@ -1,9 +1,11 @@
 import torch
 
-def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False):
+
+def anderson_acceleration(f, z0, batch_idx=None, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False):
     """
     Robust Anderson Acceleration for Deep Equilibrium Models.
     Minimizes the residual norm over a history of size m.
+    Supports PyG batching by ensuring all subgraphs meet the tolerance.
     """
     if z0.ndim == 2:
         z0 = z0.unsqueeze(0)
@@ -47,7 +49,26 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0,
         diff_norm = (combined_F - combined_X).norm(p=2, dim=-1)
         x_norm = combined_X.norm(p=2, dim=-1)
 
-        current_res = (diff_norm / (x_norm + 1e-8)).mean()
+        # Node-level residuals
+        node_res = diff_norm / (x_norm + 1e-8)
+
+        # PyG Batched Evaluation
+        if batch_idx is not None and bsz == 1:
+            node_res_flat = node_res.squeeze(0)
+
+            # Calculate the mean residual for each distinct graph in the batch
+            num_graphs = batch_idx.max().item() + 1
+            graph_res_sum = torch.zeros(num_graphs, dtype=node_res.dtype, device=node_res.device)
+            graph_res_sum.scatter_add_(0, batch_idx, node_res_flat)
+
+            graph_node_counts = torch.bincount(batch_idx).to(node_res.dtype)
+            graph_res = graph_res_sum / graph_node_counts
+
+            # The batch only converges if the worst-performing graph meets the tolerance
+            current_res = graph_res.max()
+        else:
+            current_res = node_res.mean()
+
         res.append(current_res.item())
 
         if current_res < tol:
@@ -57,8 +78,8 @@ def anderson_acceleration(f, z0, m=5, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0,
         slot = k % m
         new_f = f(z_next.view(bsz, n, d)).view(bsz, -1)
 
-        X = torch.cat([X[:, :slot], z_next.unsqueeze(1), X[:, slot + 1:]], dim=1)
-        F = torch.cat([F[:, :slot], new_f.unsqueeze(1), F[:, slot + 1:]], dim=1)
+        X[:, slot] = z_next.view(bsz, -1)
+        F[:, slot] = new_f.view(bsz, -1)
 
     out = F[:, slot].view(bsz, n, d).squeeze(0)
     return (out, res) if return_history else out

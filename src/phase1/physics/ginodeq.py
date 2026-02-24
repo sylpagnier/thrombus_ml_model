@@ -163,11 +163,11 @@ class GINO_DEQ(nn.Module):
         dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
         dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        # Rheology (Cross-stream) prior: Log highly penalizes dot products near 0
-        mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-5, max=1.0))
+        # Rheology (Cross-stream) prior: Log highly penalizes dot products near 0 (Softened to 1e-3)
+        mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0))
 
-        # Advection (Streamwise) prior: Log highly penalizes dot products near 1
-        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-5, max=1.0))
+        # Advection (Streamwise) prior: Log highly penalizes dot products near 1 (Softened to 1e-3)
+        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0))
         # -------------------------------------------------
 
         mu = torch.ones((data.x.size(0), 1), dtype=data.x.dtype, device=data.x.device)
@@ -190,7 +190,8 @@ class GINO_DEQ(nn.Module):
                 z = z_star.squeeze(0)
             else:
                 z_init = z.unsqueeze(0) if z.ndim == 2 else z
-                z_star = anderson_acceleration(f_inner, z_init, max_iter=inner_iters, beta=anderson_beta)
+                # Pass batch_idx down to the anderson solver
+                z_star = anderson_acceleration(f_inner, z_init, batch_idx=batch_idx, max_iter=inner_iters, beta=anderson_beta)
                 z = z_star.squeeze(0)
 
             mu_raw = self.mu_decoder(z)
