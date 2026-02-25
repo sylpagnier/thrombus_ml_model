@@ -129,10 +129,11 @@ def train_tier1(epochs=125, lr=1e-4, warm_up_epochs=10, adam_epochs=100):
     train_data = anchors[:split_idx_a] + physics[:split_idx_p]
     val_data = anchors[split_idx_a:] + physics[split_idx_p:]
 
-    sampler = StratifiedAnchorSampler(train_data, batch_size=4)
+    batch_size = 8
+    sampler = StratifiedAnchorSampler(train_data, batch_size=batch_size)
 
-    loader = DataLoader(train_data, batch_size=4, sampler=sampler)
-    val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
+    loader = DataLoader(train_data, batch_size=batch_size, sampler=sampler)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
 
     best_phys_score = float('inf')
     best_loss = float('inf')
@@ -156,8 +157,8 @@ def train_tier1(epochs=125, lr=1e-4, warm_up_epochs=10, adam_epochs=100):
                 max_iter=20,
                 history_size=50,
                 line_search_fn="strong_wolfe",
-                tolerance_grad=1e-7,
-                tolerance_change=1e-9
+                tolerance_grad=1e-6,
+                tolerance_change=1e-8
             )
             lbfgs_initialized = True
 
