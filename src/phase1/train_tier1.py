@@ -212,8 +212,6 @@ def train_tier1(epochs=125, lr=1e-4, warm_up_epochs=10, adam_epochs=100):
 
                     accumulated_loss += loss.detach()
 
-                # Clip gradients over the accumulated full-batch
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 return accumulated_loss
 
             # Take exactly ONE step per epoch. This will internally call the closure
