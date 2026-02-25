@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
-from pathlib import Path
 from tqdm import tqdm
 from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
@@ -13,7 +12,8 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot
 import random
-
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 class DynamicLossWeighter(nn.Module):
     """
@@ -90,14 +90,18 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
 
     return loss, metrics
 
-def train_tier1(epochs=150, lr=1e-4, warm_up_epochs=15, adam_epochs=125):
+def train_tier1(epochs=225, lr=1e-4, warm_up_epochs=200, adam_epochs=200):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("Device being used:", device)
     model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15).to(device)
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
 
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
+
+    fig_dir = get_project_root() / "reports" / "figures" / "tier1"
+    fig_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Initialize Phase 1 Optimizer (AdamW)
     optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
@@ -137,7 +141,9 @@ def train_tier1(epochs=150, lr=1e-4, warm_up_epochs=15, adam_epochs=125):
 
     best_phys_score = float('inf')
     best_loss = float('inf')
-    Path("models").mkdir(exist_ok=True)
+    root = get_project_root()
+    model_dir = root / "models"
+    model_dir.mkdir(exist_ok=True)
     lbfgs_initialized = False
 
     for epoch in range(epochs):
@@ -151,11 +157,15 @@ def train_tier1(epochs=150, lr=1e-4, warm_up_epochs=15, adam_epochs=125):
 
         if epoch >= adam_epochs and not lbfgs_initialized:
             print(f"\n⚡ Switching to L-BFGS Optimizer for the final {epochs - adam_epochs} epochs...")
+
+            # Flush the GPU memory!
+            torch.cuda.empty_cache()
+
             optimizer = optim.LBFGS(
                 list(model.parameters()) + list(loss_weighter.parameters()),
                 lr=0.01,
                 max_iter=20,
-                history_size=50,
+                history_size=30,
                 line_search_fn="strong_wolfe",
                 tolerance_grad=1e-6,
                 tolerance_change=1e-8
@@ -241,18 +251,19 @@ def train_tier1(epochs=150, lr=1e-4, warm_up_epochs=15, adam_epochs=125):
 
             if phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
-                root = get_project_root()
-                torch.save(model.state_dict(), root / "models/tier1_best_physics.pth")
-                print("⭐ Saved Best Physics Model")
+                save_path = model_dir / "tier1_best_physics.pth"
+                torch.save(model.state_dict(), save_path)
+                print(f"⭐ Saved Best Physics Model to {save_path}")
 
         avg_loss = total_loss_epoch / len(loader)
         if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
-            root = get_project_root()
-            torch.save(model.state_dict(), root / "models/tier1_best_loss.pth")
+            save_path = model_dir / "tier1_best_loss.pth"
+            torch.save(model.state_dict(), save_path)
+            print(f"⭐ Saved Best Loss Model to {save_path}")
 
         if epoch % 5 == 0:
-            validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
+            validate_and_plot(model, val_data[0], epoch, device, tier="tier1", save_dir=fig_dir)
 
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
