@@ -28,8 +28,8 @@ class ModelValidator:
 
         print(f"⚡ Loading {self.tier.capitalize()} Model: {model_path}")
 
-        # CRITICAL FIX: out_channels=4 to match training (u, v, p, mu)
-        self.model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=64, max_iters=15)
+        # CRITICAL FIX: in_channels=13 to account for the new Generalized Poiseuille Prior (uv_prior)
+        self.model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15)
 
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
@@ -54,7 +54,10 @@ class ModelValidator:
         return wss[mask], mask
 
     def validate_dataset(self, data_dir, level_name="Unknown"):
-        path = project_root / data_dir
+        # CRITICAL FIX: Handle absolute paths correctly when passed from run_benchmark.py
+        data_path = Path(data_dir)
+        path = data_path if data_path.is_absolute() else project_root / data_dir
+
         files = list(path.glob("*.pt"))
         if not files:
             print(f"⚠️ No files found in {path}")
@@ -125,7 +128,7 @@ class ModelValidator:
                         vx = pred_wss - pred_wss.mean()
                         vy = gt_wss - gt_wss.mean()
                         corr = torch.sum(vx * vy) / (
-                                    torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+                                torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
                         metrics["wss_corr"].append(corr.item())
                     else:
                         metrics["wss_corr"].append(np.nan)

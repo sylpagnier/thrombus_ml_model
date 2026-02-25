@@ -177,7 +177,8 @@ def test_boundary_condition_exactness(shared_test_graph, phys_cfg):
     # Mask 2 nodes as wall
     data.mask_wall[:2] = True
 
-    num_channels = 4 if phys_cfg.viscosity_model == "carreau" else 3
+    # FIX: GINO_DEQ universally outputs 4 channels now (u, v, p, mu)
+    num_channels = 4
     pred = torch.zeros((data.num_nodes, num_channels))
 
     # Node 0 has u=2, v=3 -> squared sum = 13
@@ -199,7 +200,8 @@ def test_inlet_outlet_exactness(shared_test_graph, phys_cfg):
     data.mask_outlet[1] = True  # 1 outlet node
     data.u_inlet_bc[0, 0] = 0.5  # Target u = 0.5
 
-    num_channels = 4 if phys_cfg.viscosity_model == "carreau" else 3
+    # FIX: Output channels universally set to 4
+    num_channels = 4
     pred = torch.zeros((data.num_nodes, num_channels))
 
     # INLET Node (0): pred u=2.0, v=1.0. Target u=0.5, v=0.0
@@ -242,7 +244,8 @@ def test_kernels_on_real_generated_graph(phys_cfg):
     props = kernels._get_geometric_props(real_data)
 
     # 2. Generate a "Probe" prediction matching the graph's size
-    num_channels = 4 if phys_cfg.viscosity_model == "carreau" else 3
+    # FIX: Universally set to 4 channels
+    num_channels = 4
     pred = torch.randn((real_data.num_nodes, num_channels), dtype=torch.float32)
 
     # 3. Verify the Kernel handles the split residual return (l_cont, l_mom)

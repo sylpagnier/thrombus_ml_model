@@ -62,6 +62,7 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
             return None
 
         validator = ModelValidator(model_path=model_path, tier=tier)
+        # Passing str(graph_dir) is now safely handled by the updated ModelValidator
         metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
 
         return metrics
@@ -84,7 +85,7 @@ if __name__ == "__main__":
 
     benchmarks = [
         (0, "Level 0 (Straight pathologies)"),
-        # (1, "Level 1 (Curved pathologies)"),
+      # (1, "Level 1 (Curved pathologies)"),
     ]
 
     for current_tier in target_tiers:

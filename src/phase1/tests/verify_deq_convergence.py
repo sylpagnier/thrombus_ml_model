@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
 from src.config import PhysicsConfig
 from src.phase1.physics.ginodeq import GINO_DEQ
@@ -14,8 +15,11 @@ def setup_synthetic_batch(num_graphs=2, num_nodes_per_graph=100):
         pos = torch.randn((num_nodes_per_graph, 2))
         sdf = torch.rand((num_nodes_per_graph, 1))
         shear_pot = torch.rand((num_nodes_per_graph, 1))
-        normals = torch.nn.functional.normalize(torch.randn((num_nodes_per_graph, 2)), dim=1)
-        rest = torch.zeros((num_nodes_per_graph, 5))
+        normals = F.normalize(torch.randn((num_nodes_per_graph, 2)), dim=1)
+
+        # FIX: Increased from 5 to 7 to account for the new Generalized Poiseuille Prior
+        # This brings the total channel count to 13 to match mesh_to_graph.py
+        rest = torch.zeros((num_nodes_per_graph, 7))
 
         x_full = torch.cat([pos, sdf, shear_pot, normals, rest], dim=-1)
         edge_index = torch.randint(0, num_nodes_per_graph, (2, num_nodes_per_graph * 5))
@@ -53,8 +57,8 @@ def test_ginodeq_forward_api():
     """
     batch_data = setup_synthetic_batch(num_graphs=2, num_nodes_per_graph=50)
 
-    # Use smaller dims to speed up the test suite
-    model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=16, max_iters=4, outer_iters=2)
+    # FIX: in_channels=13 to match the updated data generation pipeline
+    model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=16, max_iters=4, outer_iters=2)
     model.eval()
 
     for solver in ["picard", "anderson"]:
@@ -82,14 +86,16 @@ def test_ginodeq_backward_pass():
     Ensures autograd can trace through the DEQ loop without in-place mutation crashes.
     """
     batch_data = setup_synthetic_batch(num_graphs=1, num_nodes_per_graph=30)
-    model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=16, max_iters=3)
+    # FIX: in_channels=13
+    model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=16, max_iters=3)
     model.train()
 
-    out = model(batch_data, solver="anderson")
+    # FIX: Handle the tuple return (pred, jac_loss) during training mode
+    pred, jac_loss = model(batch_data, solver="anderson")
 
     # Create a dummy MSE loss against random targets
-    target = torch.randn_like(out)
-    loss = torch.nn.functional.mse_loss(out, target)
+    target = torch.randn_like(pred)
+    loss = F.mse_loss(pred, target) + (0.1 * jac_loss)
 
     loss.backward()
 
@@ -122,18 +128,27 @@ def test_visualize_convergence_audit():
         phys_cfg = PhysicsConfig(tier=tier)
         ax = axes[idx]
 
-        # Initialize a fresh model for each tier to ensure independent graphs
-        model = GINO_DEQ(in_channels=11, out_channels=4, latent_dim=16, max_iters=max_iters)
+        # FIX: in_channels=13
+        model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=16, max_iters=max_iters)
         model.eval()
 
         with torch.no_grad():
-            x_fourier = model._apply_fourier_encoding(batch_data.x)
-            x_enc = model.encoder(x_fourier)
+            # FIX: Handle tuple unpacking from the updated fourier encoding method
+            x_encoded, uv_prior = model._apply_fourier_encoding(batch_data.x)
+            x_enc = model.encoder(x_encoded)
             z0 = x_enc.clone()
 
             row, col = batch_data.edge_index
             edge_attr = batch_data.x[col, :2] - batch_data.x[row, :2]
             wall_normals = batch_data.x[:, 4:6]
+
+            # FIX: Compute the structural priors (mod_adv, mod_rheo) exactly as they are in the forward pass
+            e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
+            n_dir = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
+            dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
+            dot_prod = torch.clamp(dot_prod, max=1.0)
+            mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0))
+            mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0))
 
             # Baseline Viscosity
             mu = torch.ones((batch_data.x.size(0), 1))
@@ -142,7 +157,8 @@ def test_visualize_convergence_audit():
             def f_fixed_point(z):
                 if z.ndim == 3: z = z.squeeze(0)
                 z_in = z + x_enc + mu_enc
-                return model.core(z_in, batch_data.edge_index, edge_attr, batch_data.batch, wall_normals)
+                # FIX: Pass mod_adv and mod_rheo instead of wall_normals to match the updated MultiHeadPhysicsGATConv
+                return model.core(z_in, batch_data.edge_index, edge_attr, batch_data.batch, mod_adv, mod_rheo)
 
             # 1. Track Picard History
             z_picard = z0.clone()
