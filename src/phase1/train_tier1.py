@@ -90,7 +90,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
 
     return loss, metrics
 
-def train_tier1(epochs=125, lr=1e-4, warm_up_epochs=10, adam_epochs=100):
+def train_tier1(epochs=225, lr=1e-4, warm_up_epochs=20, adam_epochs=200):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15).to(device)
 

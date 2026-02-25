@@ -283,6 +283,6 @@ if __name__ == "__main__":
         generator = AnchorGenerator(tier="tier1")
 
         with generator:
-            generator.run_batch(start_idx=0, end_idx=100)
+            generator.run_batch(start_idx=0, end_idx=250)
     except Exception as e:
         print(e)
