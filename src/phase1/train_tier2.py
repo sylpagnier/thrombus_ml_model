@@ -164,7 +164,24 @@ def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
     tier1_path = model_dir / "tier1_best_physics.pth"
 
     if tier1_path.exists():
-        model.load_state_dict(torch.load(tier1_path, map_location=device, weights_only=True), strict=False)
+        # Load the raw state dictionary into memory
+        state_dict = torch.load(tier1_path, map_location=device, weights_only=True)
+
+        # --- Handle input channel expansion (61 -> 62) ---
+        if 'encoder.0.weight' in state_dict:
+            tier1_weight = state_dict['encoder.0.weight']
+            # Check if we are dealing with the exact 61 -> 62 mismatch
+            if tier1_weight.shape[1] == 61 and model.encoder[0].weight.shape[1] == 62:
+                print("🔧 Adapting Tier 1 encoder weights for Tier 2 (+1 mu_prior channel)...")
+                # Create a zero-padded weight matrix [64, 62] on the correct device
+                new_weight = torch.zeros_like(model.encoder[0].weight)
+                # Copy the old Tier 1 weights into the first 61 columns
+                new_weight[:, :61] = tier1_weight
+                # Overwrite the dictionary entry
+                state_dict['encoder.0.weight'] = new_weight
+        # ------------------------------------------------------
+
+        model.load_state_dict(state_dict, strict=False)
         print("✅ Successfully loaded Tier 1 foundational physics weights.")
     else:
         print("⚠️ Warning: Tier 1 weights not found.")
