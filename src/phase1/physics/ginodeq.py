@@ -96,11 +96,13 @@ class GINOBlock(nn.Module):
 
 
 class GINO_DEQ(nn.Module):
-    def __init__(self, in_channels=11, out_channels=4, latent_dim=64, max_iters=25, num_fourier_freqs=8, outer_iters=3):
+    def __init__(self, in_channels=11, out_channels=4, latent_dim=64, max_iters=25, num_fourier_freqs=8, outer_iters=3, mu_inf_nd=0.03, mu_0_nd=1.0):
         super().__init__()
         self.max_iters = max_iters
         self.outer_iters = outer_iters
         self.num_fourier_freqs = num_fourier_freqs
+        self.mu_inf_nd = mu_inf_nd
+        self.mu_0_nd = mu_0_nd
 
         freqs = (2.0 ** torch.arange(num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
@@ -132,9 +134,9 @@ class GINO_DEQ(nn.Module):
         shear_pot = x[:, 3:4]
         wall_normal = x[:, 4:6]
 
-        # Extract the prior (assuming it's the last 2 columns based on mesh_to_graph)
-        uv_prior = x[:, -2:]
-        rest = x[:, 6:-2]
+        rest = x[:, 6:11]
+        uv_prior = x[:, 11:13]
+        mu_prior = x[:, 13:14]  # New feature!
 
         features_to_encode = torch.cat([sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
@@ -143,8 +145,7 @@ class GINO_DEQ(nn.Module):
         x_proj = x_proj.view(N, -1)
         fourier_feats = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
-        # We keep uv_prior in the encoded input so the network can "see" it
-        encoded_x = torch.cat([nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior], dim=1)
+        encoded_x = torch.cat([nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior], dim=1)
         return encoded_x, uv_prior
 
     def forward(self, data, solver="anderson", anderson_beta=0.8):
@@ -172,7 +173,7 @@ class GINO_DEQ(nn.Module):
         def f_coupled(curr_z):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
             mu_raw = self.mu_decoder(curr_z_flat)
-            mu = F.softplus(mu_raw) + 1.0
+            mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
             mu_enc = self.mu_encoder(mu)
             z_in = curr_z_flat + x_enc + mu_enc
             out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo)
@@ -192,7 +193,7 @@ class GINO_DEQ(nn.Module):
             )
             z = z_star.squeeze(0)
 
-        # --- NEW: LIGHTWEIGHT JACOBIAN REGULARIZATION ---
+        # --- LIGHTWEIGHT JACOBIAN REGULARIZATION ---
         jac_loss = torch.tensor(0.0, device=z.device)
         if self.training:
             # Detach the fixed point and require grad to compute the local Jacobian
@@ -207,7 +208,7 @@ class GINO_DEQ(nn.Module):
             jac_loss = torch.mean(vjp ** 2)
 
         mu_raw = self.mu_decoder(z)
-        mu = F.softplus(mu_raw) + 1.0
+        mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
 
         u_v_p_residual = self.kinematics_decoder(z)
         uv_res = u_v_p_residual[:, :2]

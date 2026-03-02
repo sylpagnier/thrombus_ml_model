@@ -152,7 +152,7 @@ class MeshToGraphComplete:
         u_ref = self.phys_cfg.get_u_ref(d_bar)
         p_ref_scale = self.phys_cfg.get_p_ref(u_ref)
 
-        # --- ROBUST WALL NORMAL CALCULATION ---
+        # --- WALL NORMAL CALCULATION ---
         wall_node_indices = np.where(mask_wall.numpy())[0]
         if len(wall_node_indices) == 0: return
         wall_pts = nodes[wall_node_indices]
@@ -162,7 +162,15 @@ class MeshToGraphComplete:
         dist_raw, indices_wall = tree_wall.query(nodes)
 
         nearest_wall_pts = wall_pts[indices_wall]
-        diff_vec = nodes - nearest_wall_pts  # Points FROM wall TO node (into the fluid)
+        diff_vec = nodes - nearest_wall_pts
+
+        try:
+            if "triangle" in mesh.cells_dict:
+                tri_nodes = mesh.cells_dict["triangle"]
+            else:
+                tri_nodes = mesh.get_cells_type("triangle")
+        except Exception:
+            tri_nodes = np.array([])
 
         # 2. Exact Mathematical Normals for Wall Nodes using Gmsh Line Segments
         t_wall = self.vessel_cfg.TAGS["Walls"]
@@ -199,10 +207,32 @@ class MeshToGraphComplete:
                 # Orthogonal normal vector (-dy, dx)
                 n = np.array([-dy, dx])
 
-                # Ensure the normal points towards the vessel interior
+                # --- Use local mesh topology to orient normal ---
                 midpoint = (pt_a + pt_b) / 2.0
-                if np.dot(n, center_pt - midpoint) < 0:
-                    n = -n
+                flipped = False
+
+                if len(tri_nodes) > 0:
+                    # Find the triangle sharing this boundary edge
+                    mask_a = np.any(tri_nodes == idx_a, axis=1)
+                    mask_b = np.any(tri_nodes == idx_b, axis=1)
+                    shared_tris = tri_nodes[mask_a & mask_b]
+
+                    if len(shared_tris) > 0:
+                        tri = shared_tris[0]
+                        # Get the 3rd node in the triangle (strictly in the fluid interior)
+                        idx_c = tri[(tri != idx_a) & (tri != idx_b)][0]
+                        pt_c = nodes[idx_c]
+                        interior_vec = pt_c - midpoint
+
+                        # If normal points away from the interior node, flip it
+                        if np.dot(n, interior_vec) < 0:
+                            n = -n
+                        flipped = True
+
+                # Fallback to centroid if topological search failed
+                if not flipped:
+                    if np.dot(n, center_pt - midpoint) < 0:
+                        n = -n
 
                 # Accumulate the normalized segment normal to the vertices
                 n_norm = n / (np.linalg.norm(n) + 1e-12)
@@ -333,16 +363,27 @@ class MeshToGraphComplete:
         is_non_newt = 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0
 
         # --- GENERALIZED POISSEUILLE PRIOR ---
-        # u_max for 2D parabolic flow is 1.5 * u_ref
-        u_max_nd = 1.5  # Since we are non-dimensionalizing by u_ref, u_max is just 1.5
-
-        # d_bar is our characteristic diameter D
+        # Around line 258, where you calculate u_prior_mag
+        u_max_nd = 1.5
         sdf_tensor = torch.tensor(sdf_nd, dtype=torch.float32)
-
-        # u_prior = 4 * u_max * (SDF * (D - SDF)) / D^2
-        # Since sdf_nd is already SDF/D, the math simplifies elegantly:
-        # u_prior = 4 * u_max_nd * sdf_nd * (1 - sdf_nd)
         u_prior_mag = 4.0 * u_max_nd * sdf_tensor * (1.0 - sdf_tensor)
+
+        # Derivative of the parabolic profile yields a linear shear rate prior
+        # The domain radius R_nd is 0.5 (since sdf_nd goes from 0 to 0.5 to 0)
+        r_nd = torch.abs(0.5 - sdf_tensor)
+        gamma_dot_prior_nd = torch.abs(4.0 * u_max_nd * (1.0 - 2.0 * sdf_tensor))
+
+        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+        shear_term = 1.0 + (lambda_nd * gamma_dot_prior_nd.numpy()) ** self.phys_cfg.a
+        power = (self.phys_cfg.n - 1.0) / self.phys_cfg.a
+
+        mu_inf_nd = self.phys_cfg.mu_inf / self.phys_cfg.mu_ref
+        mu_0_nd = self.phys_cfg.mu_0 / self.phys_cfg.mu_ref
+
+        mu_prior = mu_inf_nd + (mu_0_nd - mu_inf_nd) * (shear_term ** power)
+        mu_prior_tensor = torch.tensor(mu_prior, dtype=torch.float32)
+
+        # Update x_tensor concatenation to include mu_prior_tensor
 
         # We assume the primary background flow is in the +x direction
         u_prior_x = torch.clamp(u_prior_mag, min=0.0)
@@ -360,7 +401,8 @@ class MeshToGraphComplete:
             torch.tensor(wall_normal_vec, dtype=torch.float32),
             node_type,
             torch.full((len(nodes), 1), is_non_newt, dtype=torch.float32),
-            uv_prior
+            uv_prior,
+            mu_prior_tensor
         ], dim=1)
 
         # Precompute WLS operators for rapid gradient calculations during training

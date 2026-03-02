@@ -254,9 +254,13 @@ class PhysicsKernels:
         mu_target = self._compute_carreau_viscosity(du_ij, data)
         mu_target = mu_target.detach()
 
-        mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=100.0)
+        # self.mu_0_nd is naturally available from the class initialization
+        dynamic_max = self.mu_0_nd * 1.2
+        mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=dynamic_max)
 
-        loss = torch.mean((torch.log(mu_pred_safe) - torch.log(mu_target)) ** 2)
+        # Weighting factor emphasizes the centerline peak proportionally
+        weights = (mu_target / self.mu_inf_nd).detach()
+        loss = torch.mean(weights * (mu_pred_safe - mu_target) ** 2)
 
         return loss
 

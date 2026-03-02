@@ -92,7 +92,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
             if hasattr(data, 'is_anchor'):
                 node_is_anchor = data.is_anchor[data.batch]
                 if node_is_anchor.sum() > 0:
-                    l_data_mu = F.smooth_l1_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+                    l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
             l_rheo = kernels.rheology_loss(pred, data)
 
@@ -113,7 +113,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
         node_is_anchor = data.is_anchor[data.batch]
         if node_is_anchor.sum() > 0:
             l_data_kine = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
-            l_data_mu = F.smooth_l1_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+            l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
     l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
     l_bc = kernels.boundary_condition_loss(pred, data)
@@ -141,20 +141,33 @@ def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Device being used:", device)
 
-    model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15).to(device)
+    # 1. Calculate physics bounds
+    phys_cfg = PhysicsConfig(tier="tier2", re_target=150.0)
+    kernels = PhysicsKernels(phys_cfg=phys_cfg)
+    mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_ref
+    mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_ref
+
+    # 2. Instantiate the model
+    model = GINO_DEQ(
+        in_channels=14,
+        out_channels=4,
+        latent_dim=64,
+        max_iters=15,
+        mu_inf_nd=mu_inf_nd,
+        mu_0_nd=mu_0_nd
+    ).to(device)
+
+    # 3. Load the Tier 1 weights safely
     root = get_project_root()
     model_dir = root / "models"
     model_dir.mkdir(exist_ok=True)
-
     tier1_path = model_dir / "tier1_best_physics.pth"
+
     if tier1_path.exists():
         model.load_state_dict(torch.load(tier1_path, map_location=device, weights_only=True), strict=False)
         print("✅ Successfully loaded Tier 1 foundational physics weights.")
     else:
         print("⚠️ Warning: Tier 1 weights not found.")
-
-    phys_cfg = PhysicsConfig(tier="tier2", re_target=150.0)
-    kernels = PhysicsKernels(phys_cfg=phys_cfg)
 
     # Drop back down to 2 PDEs for the uncertainty weighter
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
@@ -190,7 +203,10 @@ def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
         is_distillation = epoch < distillation_epochs
         physics_active = not is_distillation
         lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
-        current_solver = "picard" if is_distillation else "anderson"
+        if is_distillation or lbfgs_initialized:
+            current_solver = "picard"
+        else:
+            current_solver = "anderson"
 
         if epoch == 0:
             print(f"\n🚀 --- Starting Phase 1: Viscosity Distillation (Epochs 0-{distillation_epochs - 1}) ---")
@@ -205,9 +221,20 @@ def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
         elif epoch == adam_epochs and not lbfgs_initialized:
             print(f"\n⚡ --- Starting Phase 3: L-BFGS Optimizer for final {epochs - adam_epochs} epochs ---")
             torch.cuda.empty_cache()
+
+            # --- Freeze the dynamic loss weighter ---
+            for param in loss_weighter.parameters():
+                param.requires_grad = False
+
+            # --- FIX: Only pass the model parameters to L-BFGS ---
             optimizer = optim.LBFGS(
-                list(model.parameters()) + list(loss_weighter.parameters()),
-                lr=0.01, max_iter=20, history_size=30, line_search_fn=None, tolerance_grad=1e-6, tolerance_change=1e-8
+                model.parameters(),  # Removed loss_weighter.parameters()
+                lr=0.01,
+                max_iter=20,
+                history_size=30,
+                line_search_fn=None,
+                tolerance_grad=1e-6,
+                tolerance_change=1e-8
             )
             lbfgs_initialized = True
 

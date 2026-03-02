@@ -81,12 +81,12 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
     else:
         print(" ✅ PASS: No NaNs detected.")
 
-    # Version Check (Strict 13 Channels)
-    if data.x.shape[1] != 13:
-        print(f" ❌ FAIL: Feature mismatch! Expected 13 channels, got {data.x.shape[1]}. Please regenerate data.")
+    # Version Check (Strict 14 Channels)
+    if data.x.shape[1] != 14:
+        print(f" ❌ FAIL: Feature mismatch! Expected 14 channels, got {data.x.shape[1]}. Please regenerate data.")
         return # Halt execution if data is structurally invalid
     else:
-        print(" ✅ PASS: Feature format is current (13 channels).")
+        print(" ✅ PASS: Feature format is current (14 channels).")
         # is_non_newt is at index 10
         if data.x[0, 10] == 1.0:
             phys_cfg.viscosity_model = "carreau"
