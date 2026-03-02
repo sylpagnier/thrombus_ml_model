@@ -313,6 +313,6 @@ class MeshToGraphComplete:
 
 
 if __name__ == "__main__":
-    active_tier = "tier1"
+    active_tier = "tier2"
     processor = MeshToGraphComplete(tier=active_tier)
     processor.run()
