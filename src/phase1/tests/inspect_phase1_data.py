@@ -81,14 +81,14 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
     else:
         print(" ✅ PASS: No NaNs detected.")
 
-    # Version Check
-    if data.x.shape[1] != 11:
-        print(f" ❌ FAIL: Feature mismatch! Expected 11 channels, got {data.x.shape[1]}. Data is outdated.")
-        # We assign a default just so the plotting doesn't crash, but we DO NOT save/patch the data.
-        phys_cfg.viscosity_model = "newtonian"
+    # Version Check (Strict 13 Channels)
+    if data.x.shape[1] != 13:
+        print(f" ❌ FAIL: Feature mismatch! Expected 13 channels, got {data.x.shape[1]}. Please regenerate data.")
+        return # Halt execution if data is structurally invalid
     else:
-        print(" ✅ PASS: Feature format is current (11 channels).")
-        if data.x[0, -1] == 1.0:
+        print(" ✅ PASS: Feature format is current (13 channels).")
+        # is_non_newt is at index 10
+        if data.x[0, 10] == 1.0:
             phys_cfg.viscosity_model = "carreau"
         else:
             phys_cfg.viscosity_model = "newtonian"
@@ -102,22 +102,21 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
     else:
         print(" ✅ PASS: Boundary masks are exclusive and present.")
 
-    # Geometric Prior Validation (Only if format is modern enough)
-    if data.x.shape[1] >= 11:
-        wall_normals = data.x[data.mask_wall, 4:6]
-        magnitudes = torch.linalg.norm(wall_normals, dim=1)
-        if not torch.allclose(magnitudes, torch.ones_like(magnitudes), atol=1e-4):
-            print(" ❌ FAIL: Wall normals are not unit length.")
-        else:
-            print(" ✅ PASS: Wall normals are strictly unit length.")
+    # Geometric Prior Validation
+    wall_normals = data.x[data.mask_wall, 4:6]
+    magnitudes = torch.linalg.norm(wall_normals, dim=1)
+    if not torch.allclose(magnitudes, torch.ones_like(magnitudes), atol=1e-4):
+        print(" ❌ FAIL: Wall normals are not unit length.")
+    else:
+        print(" ✅ PASS: Wall normals are strictly unit length.")
 
-        sdf_vals = data.x[:, 2]
-        if not torch.all(sdf_vals >= -1e-5):
-            print(" ❌ FAIL: Negative SDF values detected.")
-        elif not torch.all(torch.abs(sdf_vals[data.mask_wall]) < 1e-3):
-            print(" ❌ FAIL: SDF is not zero at the wall boundary.")
-        else:
-            print(" ✅ PASS: SDF values follow spatial boundaries.")
+    sdf_vals = data.x[:, 2]
+    if not torch.all(sdf_vals >= -1e-5):
+        print(" ❌ FAIL: Negative SDF values detected.")
+    elif not torch.all(torch.abs(sdf_vals[data.mask_wall]) < 1e-3):
+        print(" ❌ FAIL: SDF is not zero at the wall boundary.")
+    else:
+        print(" ✅ PASS: SDF values follow spatial boundaries.")
 
     # No-Slip Condition Check
     if data.y is not None:
@@ -155,14 +154,11 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         data_gpu = data.clone().to(device)
 
         with torch.no_grad():
-            # Unpack the new split return format
             res_cont, res_mom = kernels.navier_stokes_residual(data_gpu.y, data_gpu)
-
             res_bc = kernels.boundary_condition_loss(data_gpu.y, data_gpu)
             res_io = kernels.inlet_outlet_loss(data_gpu.y, data_gpu)
             res_rheo = kernels.rheology_loss(data_gpu.y, data_gpu)
 
-            # Print the split residuals for better diagnostic clarity
             print(f" -> Continuity Res: {res_cont.item():.6e}")
             print(f" -> Momentum Res:   {res_mom.item():.6e}")
             print(f" -> BC Loss:         {res_bc.item():.6e}")
@@ -256,7 +252,7 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
         ax8 = fig.add_subplot(gs[2, 1])
         skip = max(1, len(pos) // 500)
         ax8.scatter(pos[:, 0], pos[:, 1], c='lightgray', s=1, alpha=0.3)
-        if mask_wall.any() and data.x.shape[1] >= 11:
+        if mask_wall.any():
             wall_pos = pos[mask_wall]
             nx, ny = data.x[mask_wall, 4].numpy(), data.x[mask_wall, 5].numpy()
             ax8.quiver(wall_pos[::skip, 0], wall_pos[::skip, 1], nx[::skip], ny[::skip],
@@ -274,4 +270,4 @@ def inspect_sample(filename="vessel_0.pt", tier="tier1"):
 
 
 if __name__ == "__main__":
-    inspect_sample(filename="vessel_2.pt", tier="tier1")
+    inspect_sample(filename="vessel_0.pt", tier="tier2")

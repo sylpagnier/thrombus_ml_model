@@ -164,17 +164,53 @@ class MeshToGraphComplete:
         nearest_wall_pts = wall_pts[indices_wall]
         diff_vec = nodes - nearest_wall_pts  # Points FROM wall TO node (into the fluid)
 
-        # 2. Fix nodes strictly ON the wall (where diff_vec is [0,0])
-        # We find the nearest strictly interior node and point towards it
-        interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
-        interior_pts = nodes[interior_mask]
+        # 2. Exact Mathematical Normals for Wall Nodes using Gmsh Line Segments
+        t_wall = self.vessel_cfg.TAGS["Walls"]
+        wall_lines = []
 
-        if len(interior_pts) > 0:
-            tree_int = KDTree(interior_pts)
-            _, indices_int = tree_int.query(wall_pts)
+        try:
+            if "line" in mesh.cells_dict:
+                l_cells = mesh.cells_dict["line"]
+                l_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
+            elif hasattr(mesh, "get_cells_type"):
+                l_cells = mesh.get_cells_type("line")
+                l_tags = mesh.get_cell_data("gmsh:physical", "line")
 
-            # Replace [0,0] vectors for wall nodes with vectors pointing to nearest interior
-            diff_vec[wall_node_indices] = interior_pts[indices_int] - wall_pts
+            for i, tag in enumerate(l_tags):
+                if tag == t_wall:
+                    wall_lines.append(l_cells[i])
+        except Exception:
+            pass
+
+        if len(wall_lines) > 0:
+            node_normals = np.zeros((len(nodes), 2))
+
+            # Calculate vessel center to ensure normals point inward (into the fluid)
+            interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
+            center_pt = np.mean(nodes[interior_mask], axis=0) if interior_mask.any() else np.mean(nodes, axis=0)
+
+            for line in wall_lines:
+                idx_a, idx_b = line[0], line[1]
+                pt_a, pt_b = nodes[idx_a], nodes[idx_b]
+
+                # Tangent vector
+                dx, dy = pt_b[0] - pt_a[0], pt_b[1] - pt_a[1]
+
+                # Orthogonal normal vector (-dy, dx)
+                n = np.array([-dy, dx])
+
+                # Ensure the normal points towards the vessel interior
+                midpoint = (pt_a + pt_b) / 2.0
+                if np.dot(n, center_pt - midpoint) < 0:
+                    n = -n
+
+                # Accumulate the normalized segment normal to the vertices
+                n_norm = n / (np.linalg.norm(n) + 1e-12)
+                node_normals[idx_a] += n_norm
+                node_normals[idx_b] += n_norm
+
+            # Replace KDTree vectors with the exact geometric normals for wall nodes
+            diff_vec[wall_node_indices] = node_normals[wall_node_indices]
 
         # 3. Explicitly Normalize every vector to a magnitude of exactly 1.0
         # This is strictly required for the ModulatedGATConv attention dot-products
@@ -218,6 +254,8 @@ class MeshToGraphComplete:
 
         # Inlet BC Calculation
         u_inlet_bc = torch.zeros((len(nodes), 2), dtype=torch.float32)
+        mu_inlet_bc = torch.zeros(len(nodes), dtype=torch.float32)  # NEW
+
         if mask_inlet.any():
             inlet_indices = torch.where(mask_inlet)[0]
             y_coords = nodes[inlet_indices, 1]
@@ -225,8 +263,42 @@ class MeshToGraphComplete:
             R = (np.max(y_coords) - np.min(y_coords)) / 2.0
             u_max = 1.5 * u_ref
             r = np.abs(y_coords - y_center)
+
+            # 1. Kinematics (Velocity Profile)
             profile_mag = u_max * (1 - (r ** 2 / (R ** 2 + 1e-12)))
             u_inlet_bc[inlet_indices, 0] = torch.tensor(profile_mag / u_ref, dtype=torch.float32)
+
+            # 2. Rheology (Analytical Viscosity Profile)
+            if self.phys_cfg.viscosity_model == "carreau":
+                # Analytical derivative of parabolic flow: |du/dy| = |-2 * u_max * r / R^2|
+                gamma_dot = np.abs(-2.0 * u_max * r / (R ** 2 + 1e-12))
+
+                # Non-dimensionalize shear rate
+                gamma_dot_nd = gamma_dot / (u_ref / d_bar)
+                lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+                a = self.phys_cfg.a
+                n = self.phys_cfg.n
+
+                shear_term = 1.0 + (lambda_nd * gamma_dot_nd) ** a
+                power = (n - 1.0) / a
+
+                mu_inf_nd = self.phys_cfg.mu_inf / self.phys_cfg.mu_ref
+                mu_0_nd = self.phys_cfg.mu_0 / self.phys_cfg.mu_ref
+
+                mu_profile = mu_inf_nd + (mu_0_nd - mu_inf_nd) * (shear_term ** power)
+                mu_inlet_bc[inlet_indices] = torch.tensor(mu_profile, dtype=torch.float32)
+            else:
+                mu_inlet_bc[inlet_indices] = 1.0  # Newtonian baseline
+
+        # --- Wall BC Calculation (Viscosity) ---
+        mu_wall_bc = torch.zeros(len(nodes), dtype=torch.float32)
+        if mask_wall.any():
+            if self.phys_cfg.viscosity_model == "carreau":
+                # Non-dimensionalize mu_inf by mu_ref
+                mu_inf_nd = self.phys_cfg.mu_inf / self.phys_cfg.mu_ref
+                mu_wall_bc[mask_wall] = torch.tensor(mu_inf_nd, dtype=torch.float32)
+            else:
+                mu_wall_bc[mask_wall] = 1.0
 
         # Graph Assembly
         nodes_nd = nodes / d_bar
@@ -299,6 +371,8 @@ class MeshToGraphComplete:
             d_bar=torch.tensor([d_bar], dtype=torch.float32),
             u_ref=torch.tensor([u_ref], dtype=torch.float32),
             u_inlet_bc=u_inlet_bc,
+            mu_inlet_bc=mu_inlet_bc,
+            mu_wall_bc=mu_wall_bc,
             mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
             V=V, W=W, M_inv=M_inv,
             is_anchor=torch.tensor([is_anchor], dtype=torch.bool)

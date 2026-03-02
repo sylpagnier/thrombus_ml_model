@@ -198,8 +198,9 @@ class PhysicsKernels:
             Re = self.cfg.get_re(u_ref, d_bar)
 
             # Full divergence of the strain rate tensor (Tier 2)
-            visc_x = (1.0 / Re) * (mu_eff * (u_xx + v_xy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
-            visc_y = (1.0 / Re) * (mu_eff * (v_yy + u_xy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
+            # Utilizing the Laplacian form (u_xx + u_yy) based on the incompressible assumption
+            visc_x = (1.0 / Re) * (mu_eff * (u_xx + u_yy) + 2 * mu_x * u_x + mu_y * (u_y + v_x))
+            visc_y = (1.0 / Re) * (mu_eff * (v_xx + v_yy) + 2 * mu_y * v_y + mu_x * (u_y + v_x))
 
         else:
             # Re relative to default mu_ref (Newtonian)
@@ -261,12 +262,27 @@ class PhysicsKernels:
 
     def boundary_condition_loss(self, pred, data):
         u, v = pred[:, 0], pred[:, 1]
+        loss_wall = torch.tensor(0.0, device=pred.device)
         mask_wall_1d = data.mask_wall.view(-1).bool()
+
         if mask_wall_1d.any():
+            # 1. Kinematics (No-slip velocity)
             u_wall = u[mask_wall_1d]
             v_wall = v[mask_wall_1d]
-            return torch.mean(u_wall ** 2 + v_wall ** 2)
-        return torch.tensor(0.0, device=pred.device)
+            loss_wall = torch.mean(u_wall ** 2 + v_wall ** 2)
+
+            # --- Rheology (Minimum Viscosity at Max Shear) ---
+            if self.cfg.viscosity_model == "carreau" and hasattr(data, 'mu_wall_bc'):
+                mu_pred = pred[:, 3]
+                mu_wall_pred = mu_pred[mask_wall_1d].squeeze()
+
+                # Ensure the BC is on the correct GPU device
+                mu_target_bc = data.mu_wall_bc[mask_wall_1d].squeeze().to(pred.device)
+
+                # Weight matches the inlet penalty
+                loss_wall += 2.0 * torch.nn.functional.smooth_l1_loss(mu_wall_pred, mu_target_bc)
+
+        return loss_wall
 
     def inlet_outlet_loss(self, pred, data):
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
@@ -281,6 +297,14 @@ class PhysicsKernels:
             v_in = v[mask_inlet_1d].squeeze()
 
             loss_inlet = torch.mean((u_in - u_target) ** 2 + v_in ** 2)
+
+            if self.cfg.viscosity_model == "carreau" and hasattr(data, 'mu_inlet_bc'):
+                mu_pred = pred[:, 3]
+                mu_in = mu_pred[mask_inlet_1d].squeeze()
+                mu_target_bc = data.mu_inlet_bc[mask_inlet_1d].squeeze()
+
+                # Smooth L1 is safer here due to the larger numerical scale of mu
+                loss_inlet += 2.0 * torch.nn.functional.smooth_l1_loss(mu_in, mu_target_bc)
 
         loss_outlet = torch.tensor(0.0, device=pred.device)
         mask_outlet_1d = data.mask_outlet.view(-1).bool()
