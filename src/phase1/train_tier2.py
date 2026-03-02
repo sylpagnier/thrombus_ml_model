@@ -54,14 +54,17 @@ def load_dataset():
 
 
 def setup_distillation_phase(model):
-    print("❄️ Freezing Kinematics Decoders. Unfreezing Core and Viscosity Sub-network.")
-    for param in model.encoder.parameters(): param.requires_grad = False
-    for param in model.kinematics_decoder.parameters(): param.requires_grad = False
+    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network.")
 
-    # Unfreeze the core so it learns to route velocity gradients to the mu_decoder
-    for param in model.core.parameters(): param.requires_grad = True
-    for param in model.mu_decoder.parameters(): param.requires_grad = True
-    for param in model.mu_encoder.parameters(): param.requires_grad = True
+    # Lock down the entire model
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # ONLY unfreeze the specific viscosity routing layers
+    for param in model.mu_decoder.parameters():
+        param.requires_grad = True
+    for param in model.mu_encoder.parameters():
+        param.requires_grad = True
 
     return optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
 
@@ -83,20 +86,25 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
         pred = out
         jac_loss = torch.tensor(0.0, device=device)
 
-    # --- PHASE 1: DISTILLATION ROUTING ---
-    if is_distillation:
-        l_data_mu = torch.tensor(0.0, device=device)
-        if hasattr(data, 'is_anchor'):
-            node_is_anchor = data.is_anchor[data.batch]
-            if node_is_anchor.sum() > 0:
-                # Use Smooth L1 to prevent massive gradient explosion from high mu values
-                l_data_mu = F.smooth_l1_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+        # --- DISTILLATION ROUTING ---
+        if is_distillation:
+            l_data_mu = torch.tensor(0.0, device=device)
+            if hasattr(data, 'is_anchor'):
+                node_is_anchor = data.is_anchor[data.batch]
+                if node_is_anchor.sum() > 0:
+                    l_data_mu = F.smooth_l1_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
-        l_rheo = kernels.rheology_loss(pred, data)
-        loss = 10.0 * l_rheo + 5.0 * l_data_mu + (0.1 * jac_loss)
+            l_rheo = kernels.rheology_loss(pred, data)
 
-        metrics = {"L_rh": l_rheo.item(), "L_jac": jac_loss.item(), "L_mom": 0.0, "L_cont": 0.0}
-        return loss, metrics
+            # ADDED: Enforce the mathematical anchors during distillation!
+            l_bc = kernels.boundary_condition_loss(pred, data)
+            l_io = kernels.inlet_outlet_loss(pred, data)
+
+            # Include them in the loss formulation
+            loss = (10.0 * l_rheo) + (5.0 * l_data_mu) + (5.0 * l_bc) + (5.0 * l_io) + (0.1 * jac_loss)
+
+            metrics = {"L_rh": l_rheo.item(), "L_jac": jac_loss.item(), "L_mom": 0.0, "L_cont": 0.0}
+            return loss, metrics
 
     # --- PHASE 2/3: FULLY COUPLED ROUTING ---
     l_data_kine = torch.tensor(0.0, device=device)
@@ -236,21 +244,26 @@ def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
                 })
             scheduler.step()
 
+
         else:
             print(f"⏳ Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS)")
+            if not hasattr(optimizer, 'static_batches'):
+                optimizer.static_batches = [d.to(device) for d in loader]
+
             def closure():
                 optimizer.zero_grad()
                 accumulated_loss = torch.tensor(0.0, device=device)
-                for closure_data in loader:
-                    closure_data = closure_data.to(device)
-                    loss, _ = compute_step_loss(model, closure_data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation)
-                    loss = loss / len(loader)
+
+
+                for closure_data in optimizer.static_batches:
+                    loss, _ = compute_step_loss(model, closure_data, kernels, loss_weighter, current_solver,
+                                                lambda_phys, device, is_distillation)
+                    loss = loss / len(optimizer.static_batches)
                     loss.backward()
                     accumulated_loss += loss.detach()
                 return accumulated_loss
-
             loss_tensor = optimizer.step(closure)
-            total_loss_epoch = loss_tensor.item() * len(loader)
+            total_loss_epoch = loss_tensor.item() * len(optimizer.static_batches)
             print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         if epoch % 2 == 0:
