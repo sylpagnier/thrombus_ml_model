@@ -137,7 +137,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
     return loss, metrics
 
 
-def train_tier2(epochs=80, distillation_epochs=15, adam_epochs=65, lr=1e-4):
+def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Device being used:", device)
 
