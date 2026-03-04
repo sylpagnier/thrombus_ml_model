@@ -263,9 +263,10 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
             model.eval()
 
         total_loss_epoch = 0.0
+        grad_norm = 0.0
 
         if not lbfgs_initialized:
-            pbar = tqdm(loader, desc=f"Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}]")
+            pbar = tqdm(loader, desc=f"Tier X Epoch {epoch:02d}...")
 
             # Zero gradients AT THE START of the epoch
             optimizer.zero_grad()
