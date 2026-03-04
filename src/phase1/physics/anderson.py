@@ -1,10 +1,11 @@
 import torch
 
-
-def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False):
+def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol=1e-3, beta=1.0, return_history=False,
+                          warmup_iters=5, residual_weight=None):
     """
     Robust Anderson Acceleration for Deep Equilibrium Models.
     Minimizes the residual norm over a history of size m.
+    Adds support for weighted residuals to prevent pressure/velocity imbalance.
     """
     if z0.ndim == 2:
         z0 = z0.unsqueeze(0)
@@ -33,28 +34,42 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
         X = torch.stack(X_history, dim=1)
         F = torch.stack(F_history, dim=1)
 
-        G = F - X
-        G_flat = G.view(bsz, n_history, -1)
+        if k < warmup_iters:
+            # Bypass optimization early on to stabilize non-Newtonian coupling
+            combined_X = X[:, -1, :]
+            combined_F = F[:, -1, :]
+        else:
+            # Standard Anderson least-squares mixing
+            G = F - X
+            G_flat = G.view(bsz, n_history, -1)
 
-        H = torch.bmm(G_flat, G_flat.transpose(1, 2))
-        I_max = torch.eye(n_history, dtype=z0.dtype, device=z0.device).unsqueeze(0).expand(bsz, -1, -1)
-        H = H + lam * I_max
+            H = torch.bmm(G_flat, G_flat.transpose(1, 2))
+            I_max = torch.eye(n_history, dtype=z0.dtype, device=z0.device).unsqueeze(0).expand(bsz, -1, -1)
+            H = H + lam * I_max
 
-        y_slice = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device)
-        alpha = torch.linalg.lstsq(H, y_slice).solution
-        alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
-        alpha = alpha.view(bsz, n_history, 1)
+            y_slice = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device)
+            alpha = torch.linalg.lstsq(H, y_slice).solution
+            alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
+            alpha = alpha.view(bsz, n_history, 1)
 
-        combined_X = (alpha * X).sum(dim=1)
-        combined_F = (alpha * F).sum(dim=1)
+            combined_X = (alpha * X).sum(dim=1)
+            combined_F = (alpha * F).sum(dim=1)
 
+        # Apply beta relaxation
         z_next = beta * combined_F + (1 - beta) * combined_X
 
         # --- Subgraph Residual Tracking ---
         combined_X_node = combined_X.view(bsz, n, d)
         combined_F_node = combined_F.view(bsz, n, d)
 
-        diff_norm = (combined_F_node - combined_X_node).norm(p=2, dim=-1)
+        # Calculate the raw difference
+        diff = combined_F_node - combined_X_node
+
+        # Apply component-wise weighting if provided (e.g., to down-weight pressure spikes)
+        if residual_weight is not None:
+            diff = diff * residual_weight.to(diff.device)
+
+        diff_norm = diff.norm(p=2, dim=-1)
         x_norm = combined_X_node.norm(p=2, dim=-1)
         node_res = diff_norm / (x_norm + 1e-8)
 
@@ -83,11 +98,9 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
         X_history.append(z_next.view(bsz, -1))
         F_history.append(new_f)
 
-        # Enforce history length 'm' by popping the oldest entry
         if len(X_history) > m:
             X_history.pop(0)
             F_history.pop(0)
 
-    # If max_iter is reached, return the latest F evaluation
     out = F_history[-1].view(bsz, n, d).squeeze(0)
     return (out, res) if return_history else out

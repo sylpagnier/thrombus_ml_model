@@ -5,7 +5,31 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from pathlib import Path
 from torch_geometric.data import Batch
+import torch.nn as nn
 
+class DynamicLossWeighter(nn.Module):
+    """
+    Dynamically weights multiple loss components using homoscedastic task uncertainty.
+    Includes a critical clamp to prevent the variance from collapsing to negative infinity
+    as PDE residuals approach zero.
+    Reference: Kendall et al., 2018.
+    """
+    def __init__(self, num_losses=2, min_log_var=-8.0):
+        super().__init__()
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+        self.min_log_var = min_log_var
+
+    def forward(self, losses, scales=None):
+        if scales is None:
+            scales = [1.0] * len(losses)
+        total_loss = 0
+        for i, loss in enumerate(losses):
+            if loss > 0.0:
+                safe_log_var = torch.clamp(self.log_vars[i], min=self.min_log_var)
+                precision = torch.exp(-safe_log_var)
+                task_loss = precision * loss + safe_log_var
+                total_loss += scales[i] * task_loss
+        return total_loss
 
 def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     model.eval()

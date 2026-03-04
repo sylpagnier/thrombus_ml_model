@@ -1,42 +1,18 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import random
 from src.utils.paths import get_project_root
-
-# Enable expandable segments to reduce fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
-from src.phase1.utils.metrics import quantify_performance, validate_and_plot
-
-
-class DynamicLossWeighter(nn.Module):
-    def __init__(self, num_losses=2, min_log_var=-8.0):
-        super().__init__()
-        self.log_vars = nn.Parameter(torch.zeros(num_losses))
-        self.min_log_var = min_log_var
-
-    def forward(self, losses, scales=None):
-        if scales is None:
-            scales = [1.0] * len(losses)
-        total_loss = 0
-        for i, loss in enumerate(losses):
-            if loss > 0.0:
-                safe_log_var = torch.clamp(self.log_vars[i], min=self.min_log_var)
-                precision = torch.exp(-safe_log_var)
-                task_loss = precision * loss + safe_log_var
-                total_loss += scales[i] * task_loss
-        return total_loss
-
+from src.phase1.utils.metrics import quantify_performance, validate_and_plot, DynamicLossWeighter
 
 def load_dataset():
     cfg = VesselConfig(tier="tier2")
@@ -55,18 +31,13 @@ def load_dataset():
 
 def setup_distillation_phase(model):
     print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network AND Encoder.")
-
-    # Lock down the entire model
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze the specific viscosity routing layers
     for param in model.mu_decoder.parameters():
         param.requires_grad = True
     for param in model.mu_encoder.parameters():
         param.requires_grad = True
-
-    # Unfreeze the encoder to learn the new mu_prior channel
     for param in model.encoder.parameters():
         param.requires_grad = True
 
@@ -90,53 +61,69 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
         pred = out
         jac_loss = torch.tensor(0.0, device=device)
 
-        # --- DISTILLATION ROUTING ---
-        if is_distillation:
-            l_data_mu = torch.tensor(0.0, device=device)
-            if hasattr(data, 'is_anchor'):
-                node_is_anchor = data.is_anchor[data.batch]
-                if node_is_anchor.sum() > 0:
-                    l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+    # Precompute all spatial properties ONCE per batch
+    props = kernels._get_geometric_props(data)
 
-            l_rheo = kernels.rheology_loss(pred, data)
+    # Explicit WSS gradient loss using encapsulated kernel
+    l_wss = kernels.wall_shear_stress_loss(pred, data, props=props)
 
-            # ADDED: Enforce the mathematical anchors during distillation!
-            l_bc = kernels.boundary_condition_loss(pred, data)
-            l_io = kernels.inlet_outlet_loss(pred, data)
+    # --- DISTILLATION ROUTING ---
+    if is_distillation:
+        l_data_mu = torch.tensor(0.0, device=device)
+        if hasattr(data, 'is_anchor'):
+            node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
+            if node_is_anchor.sum() > 0:
+                l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
-            # Include them in the loss formulation
-            loss = (10.0 * l_rheo) + (5.0 * l_data_mu) + (5.0 * l_bc) + (5.0 * l_io) + (0.1 * jac_loss)
+        l_rheo = kernels.rheology_loss(pred, data, props=props)
+        l_bc = kernels.boundary_condition_loss(pred, data)
+        l_io = kernels.inlet_outlet_loss(pred, data)
 
-            metrics = {"L_rh": l_rheo.item(), "L_jac": jac_loss.item(), "L_mom": 0.0, "L_cont": 0.0}
-            return loss, metrics
+        loss = (10.0 * l_rheo) + (5.0 * l_data_mu) + (5.0 * l_bc) + (5.0 * l_io) + (10.0 * l_wss) + (0.1 * jac_loss)
+
+        metrics = {"L_rh": l_rheo.item(), "L_jac": jac_loss.item(), "L_mom": 0.0, "L_cont": 0.0, "L_wss": l_wss.item()}
+        return loss, metrics
 
     # --- PHASE 2/3: FULLY COUPLED ROUTING ---
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_mu = torch.tensor(0.0, device=device)
     if hasattr(data, 'is_anchor'):
-        node_is_anchor = data.is_anchor[data.batch]
+        node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
         if node_is_anchor.sum() > 0:
             l_data_kine = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
             l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
 
-    l_cont, l_mom = kernels.navier_stokes_residual(pred, data)
+    # 1. Compute Momentum
+    l_mom = kernels.navier_stokes_residual(pred, data, props=props)
+
+    # 2. Extract 1st-order gradients for Continuity
+    c_u = kernels._compute_derivatives(pred[:, 0:1], props)
+    c_v = kernels._compute_derivatives(pred[:, 1:2], props)
+
+    du_dx, du_dy = c_u[:, 0, 0], c_u[:, 1, 0]
+    dv_dx, dv_dy = c_v[:, 0, 0], c_v[:, 1, 0]
+    du_ij = torch.stack([du_dx, du_dy, dv_dx, dv_dy], dim=1)
+
+    # 3. Compute Continuity explicitly
+    l_cont = kernels.continuity_loss(du_ij)
+
     l_bc = kernels.boundary_condition_loss(pred, data)
     l_io = kernels.inlet_outlet_loss(pred, data)
-    l_rheo = kernels.rheology_loss(pred, data)
+    l_rheo = kernels.rheology_loss(pred, data, props=props)
 
-    # Weighter ONLY handles Continuity and Momentum equations now
     pde_losses = [l_cont, l_mom]
     pde_scales = [lambda_phys, lambda_phys]
     weighted_pdes = loss_weighter(pde_losses, scales=pde_scales)
 
-    # Explicitly add rheology and separate data losses
-    loss = weighted_pdes + (1.0 * l_rheo) + (5.0 * l_data_kine) + (2.0 * l_data_mu) + (5.0 * l_bc) + (5.0 * l_io) + (0.1 * jac_loss)
+    loss = weighted_pdes + (1.0 * l_rheo) + (500.0 * l_data_kine) + (50.0 * l_data_mu) + (5.0 * l_bc) + (5.0 * l_io) + (
+                10.0 * l_wss) + (0.1 * jac_loss)
 
     metrics = {
         "L_mom": l_mom.item(),
         "L_cont": l_cont.item(),
         "L_rh": l_rheo.item(),
-        "L_jac": jac_loss.item()
+        "L_jac": jac_loss.item(),
+        "L_wss": l_wss.item()
     }
     return loss, metrics
 
@@ -153,7 +140,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
     # 2. Instantiate the model
     model = GINO_DEQ(
-        in_channels=14,
+        in_channels=15,
         out_channels=4,
         latent_dim=64,
         max_iters=15,
@@ -168,20 +155,15 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     tier1_path = model_dir / "tier1_best_physics.pth"
 
     if tier1_path.exists():
-        # Load the raw state dictionary into memory
         state_dict = torch.load(tier1_path, map_location=device, weights_only=True)
 
         # --- Handle input channel expansion (61 -> 62) ---
         if 'encoder.0.weight' in state_dict:
             tier1_weight = state_dict['encoder.0.weight']
-            # Check if we are dealing with the exact 61 -> 62 mismatch
             if tier1_weight.shape[1] == 61 and model.encoder[0].weight.shape[1] == 62:
                 print("🔧 Adapting Tier 1 encoder weights for Tier 2 (+1 mu_prior channel)...")
-                # Create a zero-padded weight matrix [64, 62] on the correct device
                 new_weight = torch.zeros_like(model.encoder[0].weight)
-                # Copy the old Tier 1 weights into the first 61 columns
                 new_weight[:, :61] = tier1_weight
-                # Overwrite the dictionary entry
                 state_dict['encoder.0.weight'] = new_weight
         # ------------------------------------------------------
 
@@ -190,8 +172,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     else:
         print("⚠️ Warning: Tier 1 weights not found.")
 
-    # Drop back down to 2 PDEs for the uncertainty weighter
-    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=3).to(device)
 
     dataset = load_dataset()
     if not dataset: return
@@ -220,7 +201,6 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     scheduler = None
     lbfgs_initialized = False
 
-    # Dynamic annealing of power-law index during distillation phase
     target_n = phys_cfg.n
     start_n = 0.8
 
@@ -228,13 +208,14 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
         is_distillation = epoch < distillation_epochs
         physics_active = not is_distillation
         lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
+
         if is_distillation:
             progress = epoch / max(1, (distillation_epochs - 1))
             current_n = start_n - progress * (start_n - target_n)
-            phys_cfg.n = current_n  # Dynamically update the physics kernels
+            phys_cfg.n = current_n
             print(f"🔄 Curriculum: Annealed Carreau index 'n' to {current_n:.4f}")
         else:
-            phys_cfg.n = target_n  # Ensure it locks to target for coupled phase
+            phys_cfg.n = target_n
 
         if is_distillation or lbfgs_initialized:
             current_solver = "picard"
@@ -247,7 +228,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
             scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
             sampler.set_warmup_mode(True)
         elif epoch == distillation_epochs:
-            print(f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ via AdamW (Epochs {distillation_epochs}-{adam_epochs - 1}) ---")
+            print(
+                f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ via AdamW (Epochs {distillation_epochs}-{adam_epochs - 1}) ---")
             optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
             scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
             sampler.set_warmup_mode(False)
@@ -255,13 +237,11 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
             print(f"\n⚡ --- Starting Phase 3: L-BFGS Optimizer for final {epochs - adam_epochs} epochs ---")
             torch.cuda.empty_cache()
 
-            # --- Freeze the dynamic loss weighter ---
             for param in loss_weighter.parameters():
                 param.requires_grad = False
 
-            # --- FIX: Only pass the model parameters to L-BFGS ---
             optimizer = optim.LBFGS(
-                model.parameters(),  # Removed loss_weighter.parameters()
+                model.parameters(),
                 lr=0.01,
                 max_iter=20,
                 history_size=30,
@@ -284,7 +264,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                 data = data.to(device)
                 optimizer.zero_grad()
 
-                loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation)
+                loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys,
+                                                  device, is_distillation)
 
                 if torch.isnan(loss):
                     print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping batch.")
@@ -304,7 +285,6 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                 })
             scheduler.step()
 
-
         else:
             print(f"⏳ Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS)")
             if not hasattr(optimizer, 'static_batches'):
@@ -314,7 +294,6 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                 optimizer.zero_grad()
                 accumulated_loss = torch.tensor(0.0, device=device)
 
-
                 for closure_data in optimizer.static_batches:
                     loss, _ = compute_step_loss(model, closure_data, kernels, loss_weighter, current_solver,
                                                 lambda_phys, device, is_distillation)
@@ -322,13 +301,15 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                     loss.backward()
                     accumulated_loss += loss.detach()
                 return accumulated_loss
+
             loss_tensor = optimizer.step(closure)
             total_loss_epoch = loss_tensor.item() * len(optimizer.static_batches)
             print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         if epoch % 2 == 0:
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier2")
-            print(f"\n📊 [Validation] Rel L2: {scores.get('rel_l2', 0):.4f} | Div: {scores.get('continuity', 0):.3e} | Rheo: {scores.get('rheology', 0):.3e}")
+            print(
+                f"\n📊 [Validation] Rel L2: {scores.get('rel_l2', 0):.4f} | Div: {scores.get('continuity', 0):.3e} | Rheo: {scores.get('rheology', 0):.3e}")
 
             if physics_active:
                 with torch.no_grad():
@@ -353,6 +334,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
     torch.save(model.state_dict(), model_dir / "tier2_final.pth")
     print(f"Tier 2 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
+
 
 if __name__ == "__main__":
     train_tier2()

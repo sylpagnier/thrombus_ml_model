@@ -1,19 +1,82 @@
-import torch.nn.functional as F
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.parametrize as parametrize
 from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.nn import global_mean_pool, MessagePassing
 from torch_geometric.utils import softmax
+from typing import Optional, Tuple, Union
+from torch import Tensor
+
 from src.phase1.physics.anderson import anderson_acceleration
+
+
+class LoRAParametrization(nn.Module):
+    """
+    Sub-module that computes the Low-Rank Adaptation (LoRA) additive weight.
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int = 4, alpha: float = 1.0):
+        super().__init__()
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        self.scaling = alpha / rank
+
+    def forward(self, original_weight):
+        # The returned tensor is the mathematical sum of the frozen base and the active LoRA matrices
+        return original_weight + (self.lora_B @ self.lora_A) * self.scaling
+
+
+class SpectralLinear(nn.Module):
+    """
+    A Linear layer pre-configured for strictly bounded Lipschitz Operator Splitting.
+    Allows for dynamic, computationally-safe LoRA injection during Tier 3 adaptation.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        # Apply spectral norm to the base layer immediately for Tier 1 & 2
+        spectral_norm(self.linear)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    def inject_lora(self, rank: int = 4, alpha: float = 1.0):
+        """
+        Safely injects LoRA into the parameterization chain BEFORE the spectral norm.
+        This guarantees that the SVD power iteration computes the spectral radius
+        of the COMBINED (frozen + LoRA) weight matrix, maintaining the Lipschitz bound.
+        """
+        in_features = self.linear.in_features
+        out_features = self.linear.out_features
+
+        # 1. Temporarily remove spectral norm to access the base parameters
+        torch.nn.utils.remove_spectral_norm(self.linear)
+
+        # 2. Register LoRA parameterization first
+        parametrize.register_parametrization(
+            self.linear, "weight",
+            LoRAParametrization(in_features, out_features, rank, alpha)
+        )
+
+        # 3. Re-apply spectral norm so it wraps the LoRA-augmented weight sum
+        spectral_norm(self.linear)
+
+        # 4. Freeze base weights, leaving only LoRA parameters (A and B) trainable
+        self.linear.parametrizations.weight.original.requires_grad = False
 
 
 class GlobalMixingBlock(nn.Module):
     def __init__(self, latent_dim):
         super().__init__()
         self.global_mlp = nn.Sequential(
-            spectral_norm(nn.Linear(latent_dim, latent_dim)),
+            SpectralLinear(latent_dim, latent_dim),
             nn.ReLU(),
-            spectral_norm(nn.Linear(latent_dim, latent_dim))
+            SpectralLinear(latent_dim, latent_dim)
         )
 
     def forward(self, x, batch):
@@ -25,63 +88,60 @@ class GlobalMixingBlock(nn.Module):
 class MultiHeadPhysicsGATConv(MessagePassing):
     """
     Physics-Informed Multi-Head Graph Attention Network.
-    Separates streamwise (advection) and cross-stream (rheology/shear)
-    message passing to prevent over-smoothing of physical gradients.
+    Strictly typed to satisfy IDE linters and PyG's message passing dispatcher.
     """
 
-    def __init__(self, latent_dim, edge_dim=2):
-        super().__init__(aggr='add', node_dim=0)
+    def __init__(self, latent_dim: int, edge_dim: int = 3, temperature: float = 1.5, **kwargs):
+        kwargs.setdefault('aggr', 'add')
+        kwargs.setdefault('node_dim', 0)
+        super().__init__(**kwargs)
 
-        self.edge_proj = spectral_norm(nn.Linear(edge_dim, latent_dim))
+        self.temperature = temperature
+        self.edge_proj = SpectralLinear(edge_dim, latent_dim)
 
-        # --- Head 1: Advection (Streamwise) ---
-        self.att_adv = spectral_norm(nn.Linear(2 * latent_dim, 1))
-        self.val_adv = spectral_norm(nn.Linear(latent_dim, latent_dim // 2))
+        self.lin_src = SpectralLinear(latent_dim, latent_dim)
+        self.lin_dst = SpectralLinear(latent_dim, latent_dim)
+        self.att = SpectralLinear(latent_dim, 1)
 
-        # --- Head 2: Rheology/Shear (Cross-stream) ---
-        self.att_rheo = spectral_norm(nn.Linear(2 * latent_dim, 1))
-        self.val_rheo = spectral_norm(nn.Linear(latent_dim, latent_dim // 2))
+    def forward(self,
+                x: Union[Tensor, Tuple[Tensor, Tensor]],
+                edge_index: Tensor,
+                edge_attr: Tensor,
+                mod_adv: Tensor,
+                mod_rheo: Tensor,
+                size: Optional[Tuple[int, int]] = None) -> Tensor:
+        if isinstance(x, Tensor):
+            x = (x, x)
 
-        self.leaky_relu = nn.LeakyReLU(0.2)
+        x_src = self.lin_src(x[0])
+        x_dst = self.lin_dst(x[1])
 
-        self.mlp = nn.Sequential(
-            spectral_norm(nn.Linear(latent_dim, latent_dim)),
-            nn.ReLU(),
-            spectral_norm(nn.Linear(latent_dim, latent_dim))
+        alpha_src = self.att(x_src)
+        alpha_dst = self.att(x_dst)
+
+        out = self.propagate(
+            edge_index,
+            size=size,
+            x=(x_src, x_dst),
+            alpha=(alpha_src, alpha_dst),
+            edge_attr=edge_attr,
+            mod_adv=mod_adv,
+            mod_rheo=mod_rheo
         )
+        return out
 
-    def forward(self, x, edge_index, edge_attr, mod_adv, mod_rheo):
-        out = self.propagate(edge_index, x=x, edge_attr=edge_attr,
-                             mod_adv=mod_adv, mod_rheo=mod_rheo)
-        return self.mlp(out)
-
-    def message(self, x_i, x_j, edge_attr, mod_adv, mod_rheo, index, ptr, size_i):
-        edge_emb = self.edge_proj(edge_attr)
-        msg_base = x_j + edge_emb
-
-        # Combined features for attention scoring
-        alpha_feat = torch.cat([x_i, msg_base], dim=-1)
-
-        # --- Calculate Advection Messages ---
-        e_adv = self.leaky_relu(self.att_adv(alpha_feat))
-        e_adv = e_adv + mod_adv  # Apply streamwise structural prior
-        alpha_adv = softmax(e_adv, index, ptr, size_i)
-        out_adv = alpha_adv * self.val_adv(msg_base)
-
-        # --- Calculate Rheology Messages ---
-        e_rheo = self.leaky_relu(self.att_rheo(alpha_feat))
-        e_rheo = e_rheo + mod_rheo  # Apply cross-stream structural prior
-        alpha_rheo = softmax(e_rheo, index, ptr, size_i)
-        out_rheo = alpha_rheo * self.val_rheo(msg_base)
-
-        # Concatenate the split latent space back together
-        return torch.cat([out_adv, out_rheo], dim=-1)
+    def message(self, x_j: Tensor, alpha_j: Tensor, alpha_i: Tensor,
+                edge_attr: Tensor, mod_adv: Tensor, mod_rheo: Tensor,
+                index: Tensor, ptr: Optional[Tensor], size_i: Optional[int]) -> Tensor:
+        alpha = (alpha_j + alpha_i) / self.temperature
+        alpha = alpha * self.edge_proj(edge_attr)
+        alpha = softmax(alpha, index, ptr, size_i)
+        return x_j * alpha
 
 
 class GINOBlock(nn.Module):
-    def __init__(self, latent_dim=64, edge_dim=2):
+    def __init__(self, latent_dim=64, edge_dim=3):
         super().__init__()
-        # Ensure latent_dim is even so it splits cleanly into the two heads
         assert latent_dim % 2 == 0, "latent_dim must be divisible by 2 for multi-head split"
 
         self.conv = MultiHeadPhysicsGATConv(latent_dim, edge_dim=edge_dim)
@@ -96,13 +156,20 @@ class GINOBlock(nn.Module):
 
 
 class GINO_DEQ(nn.Module):
-    def __init__(self, in_channels=11, out_channels=4, latent_dim=64, max_iters=25, num_fourier_freqs=8, outer_iters=3, mu_inf_nd=0.03, mu_0_nd=1.0):
+    def __init__(self, in_channels=11, out_channels=5, latent_dim=64, max_iters=25, num_fourier_freqs=8, outer_iters=3,
+                 mu_inf_nd=0.03, mu_0_nd=1.0):
         super().__init__()
         self.max_iters = max_iters
         self.outer_iters = outer_iters
         self.num_fourier_freqs = num_fourier_freqs
         self.mu_inf_nd = mu_inf_nd
         self.mu_0_nd = mu_0_nd
+
+        self.wss_decoder = nn.Sequential(
+            SpectralLinear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, 1)  # Non-recurrent output projection
+        )
 
         freqs = (2.0 ** torch.arange(num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
@@ -116,17 +183,24 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        self.core = GINOBlock(latent_dim, edge_dim=2)
-
+        self.core = GINOBlock(latent_dim, edge_dim=3)
         self.kinematics_decoder = nn.Linear(latent_dim, 3)
 
         self.mu_decoder = nn.Sequential(
-            spectral_norm(nn.Linear(latent_dim, latent_dim)),
+            SpectralLinear(latent_dim, latent_dim),
             nn.ReLU(),
             nn.Linear(latent_dim, 1)
         )
-
         self.mu_encoder = nn.Linear(1, latent_dim)
+
+    def prepare_for_tier3_lora(self, rank: int = 4, alpha: float = 1.0):
+        """
+        Iterates through the model's architecture and dynamically injects LoRA
+        into all SpectralLinear modules while rigorously maintaining Lipschitz bounds.
+        """
+        for module in self.modules():
+            if isinstance(module, SpectralLinear):
+                module.inject_lora(rank=rank, alpha=alpha)
 
     def _apply_fourier_encoding(self, x):
         nodes_nd = x[:, 0:2]
@@ -136,7 +210,8 @@ class GINO_DEQ(nn.Module):
 
         rest = x[:, 6:11]
         uv_prior = x[:, 11:13]
-        mu_prior = x[:, 13:14]  # New feature!
+        mu_prior = x[:, 13:14]
+        wss_prior = x[:, 14:15]
 
         features_to_encode = torch.cat([sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
@@ -145,7 +220,8 @@ class GINO_DEQ(nn.Module):
         x_proj = x_proj.view(N, -1)
         fourier_feats = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
-        encoded_x = torch.cat([nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior], dim=1)
+        encoded_x = torch.cat(
+            [nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior, wss_prior], dim=1)
         return encoded_x, uv_prior
 
     def forward(self, data, solver="anderson", anderson_beta=0.8):
@@ -167,8 +243,14 @@ class GINO_DEQ(nn.Module):
         dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
         dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0))
-        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0))
+        sdf_nd = data.x[:, 2:3]
+        sdf_edge = sdf_nd[row]
+
+        k_decay = 5.0
+        decay_factor = torch.exp(-k_decay * sdf_edge)
+
+        mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0)) * decay_factor
+        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0)) * decay_factor
 
         def f_coupled(curr_z):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
@@ -193,18 +275,12 @@ class GINO_DEQ(nn.Module):
             )
             z = z_star.squeeze(0)
 
-        # --- LIGHTWEIGHT JACOBIAN REGULARIZATION ---
         jac_loss = torch.tensor(0.0, device=z.device)
         if self.training:
-            # Detach the fixed point and require grad to compute the local Jacobian
             z_star_req = z_star.detach().requires_grad_(True)
             f_z = f_coupled(z_star_req)
-
-            # Hutchinson trace estimator for the Frobenius norm
             eps = torch.randn_like(f_z)
             vjp = torch.autograd.grad(f_z, z_star_req, grad_outputs=eps, create_graph=True)[0]
-
-            # Scale by the number of elements to maintain stable loss magnitudes
             jac_loss = torch.mean(vjp ** 2)
 
         mu_raw = self.mu_decoder(z)
@@ -213,11 +289,10 @@ class GINO_DEQ(nn.Module):
         u_v_p_residual = self.kinematics_decoder(z)
         uv_res = u_v_p_residual[:, :2]
         p = u_v_p_residual[:, 2:3]
-
         uv_final = uv_res + uv_prior
 
         u_v_p = torch.cat([uv_final, p], dim=1)
-        pred = torch.cat([u_v_p, mu], dim=1)
+        wss_pred = self.wss_decoder(z)
+        pred = torch.cat([u_v_p, mu, wss_pred], dim=1)
 
-        # Return tuple during training, standard tensor during inference
         return (pred, jac_loss) if self.training else pred
