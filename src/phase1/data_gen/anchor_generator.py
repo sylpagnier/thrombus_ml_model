@@ -8,6 +8,7 @@ from tqdm import tqdm
 from typing import Tuple, Optional
 from src.config import VesselConfig, PhysicsConfig
 from src.utils.paths import get_project_root
+from scipy.interpolate import NearestNDInterpolator
 
 # Configure logging
 logging.basicConfig(
@@ -225,6 +226,24 @@ class AnchorGenerator:
 
                 u, v, p, mu = self._evaluate_at_coords(target_nodes)
 
+                # Flatten arrays to 1D (fixes shape mismatch bugs)
+                u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
+
+                # --- Handle Boundary NaNs ---
+                def fix_boundary_nans(field, coords):
+                    mask = np.isnan(field)
+                    if mask.any() and not mask.all():
+                        # Find the nearest valid neighbor and copy its value
+                        interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
+                        field[mask] = interpolator(coords[mask])
+                    return field
+
+                u = fix_boundary_nans(u, target_nodes)
+                v = fix_boundary_nans(v, target_nodes)
+                p = fix_boundary_nans(p, target_nodes)
+                mu = fix_boundary_nans(mu, target_nodes)
+                # ----------------------------
+
                 # Meshio Access
                 try:
                     line_cells = mesh.get_cells_type("line")  # Returns (N, 2)
@@ -255,11 +274,31 @@ class AnchorGenerator:
                             # Pinning: Subtract mean outlet pressure to set relative gauge pressure
                             p_offset = np.mean(p[valid_indices])
                             p = p - p_offset
-                # ---------------------------------
+                    # ---------------------------------
 
-                if not np.isfinite(u).all():
-                    logger.warning(f"NaNs or infinities detected in {nas_file.name}")
-                    continue
+                    # --- DEBUGGING BLOCK ---
+                nan_u = np.isnan(u).sum()
+                nan_v = np.isnan(v).sum()
+                nan_p = np.isnan(p).sum()
+                nan_mu = np.isnan(mu).sum()
+                total_nodes = len(u)
+
+                if nan_u > 0 or nan_v > 0 or nan_p > 0 or nan_mu > 0:
+                    logger.warning(
+                        f"NaNs detected in {nas_file.name} | Total Nodes: {total_nodes} | "
+                        f"NaN counts -> u: {nan_u}, v: {nan_v}, p: {nan_p}, mu: {nan_mu}"
+                    )
+
+                    if nan_u == total_nodes:
+                        logger.error(
+                            f"[{i}] FATAL: 100% of nodes are NaN. (Solver diverged or coordinate shape mismatch)")
+                    else:
+                        pct_failed = (nan_u / total_nodes) * 100
+                        logger.warning(
+                            f"[{i}] BOUNDARY ISSUE: {pct_failed:.2f}% of nodes are NaN. COMSOL thinks these nodes are outside the mesh.")
+
+                    continue  # Still skip saving so we don't write garbage data
+                # -----------------------
 
                 np.savez(
                     out_file,

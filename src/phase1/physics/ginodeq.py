@@ -230,14 +230,16 @@ class GINO_DEQ(nn.Module):
         z = x_enc.clone()
 
         row, col = data.edge_index
-        edge_attr = data.x[col, :2] - data.x[row, :2]
+        edge_vec = data.x[col, :2] - data.x[row, :2]
+        edge_dist = torch.norm(edge_vec, p=2, dim=-1, keepdim=True)  # Calculate distance
+        edge_attr = torch.cat([edge_vec, edge_dist], dim=-1)  # Now Shape: [E, 3]
 
         batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(
             data.x.size(0), dtype=torch.long, device=data.x.device
         )
 
         wall_normals = data.x[:, 4:6]
-        e_dir = F.normalize(edge_attr, p=2, dim=-1, eps=1e-8)
+        e_dir = F.normalize(edge_vec, p=2, dim=-1, eps=1e-8)
         n_dir = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
 
         dot_prod = torch.abs((e_dir * n_dir).sum(dim=-1, keepdim=True))
