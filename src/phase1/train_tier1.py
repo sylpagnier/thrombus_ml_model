@@ -245,7 +245,7 @@ def train_tier1(epochs=225, lr=1e-4, warm_up_epochs=200, adam_epochs=200):
             print(f"⭐ Saved Best Loss Model to {save_path}")
 
         if epoch % 5 == 0:
-            validate_and_plot(model, val_data[0], epoch, device, tier="tier1", save_dir=fig_dir)
+            validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
