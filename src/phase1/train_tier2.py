@@ -193,10 +193,13 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     train_data = anchors[:split_idx_a] + physics[:split_idx_p]
     val_data = anchors[split_idx_a:] + physics[split_idx_p:]
 
-    batch_size = 4
-    sampler = StratifiedAnchorSampler(train_data, batch_size=batch_size)
-    loader = DataLoader(train_data, batch_size=batch_size, sampler=sampler)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
+    # Reduce physical batch size to save memory, but maintain effective batch size
+    micro_batch_size = 2
+    accumulation_steps = 4  # Effective batch size = 2 * 4 = 8
+
+    sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
+    loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
+    val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
 
     best_phys_score = float('inf')
     best_loss = float('inf')
@@ -263,24 +266,35 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
         if not lbfgs_initialized:
             pbar = tqdm(loader, desc=f"Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}]")
+
+            # Zero gradients AT THE START of the epoch
+            optimizer.zero_grad()
+
             for batch_idx, data in enumerate(pbar):
                 data = data.to(device)
-                optimizer.zero_grad()
 
+                # Compute loss (scaled by accumulation steps)
                 loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys,
                                                   device, is_distillation)
+                loss = loss / accumulation_steps
 
                 if torch.isnan(loss):
-                    print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping batch.")
+                    print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping micro-batch.")
                     continue
 
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                total_loss_epoch += loss.item()
+
+                # Step optimizer ONLY when we've accumulated enough micro-batches
+                if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()  # Reset for the next effective batch
+
+                # Multiply back for display purposes
+                total_loss_epoch += (loss.item() * accumulation_steps)
 
                 pbar.set_postfix({
-                    "L_tot": f"{loss.item():.3f}",
+                    "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
                     "L_mom": f"{metrics['L_mom']:.3f}",
                     "L_rh": f"{metrics['L_rh']:.3f}",
                     "|g|": f"{grad_norm:.2f}",
