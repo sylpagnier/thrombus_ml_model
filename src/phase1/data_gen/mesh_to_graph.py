@@ -157,13 +157,69 @@ class MeshToGraphComplete:
         u_ref = self.phys_cfg.get_u_ref(d_bar)
         p_ref_scale = self.phys_cfg.get_p_ref(u_ref)
 
-        # --- Wall Normal & Distance Calculation ---
+        # --- ROBUST WALL Normal & Distance Calculation ---
         wall_node_indices = np.where(mask_wall.numpy())[0]
         if len(wall_node_indices) == 0: return
         wall_pts = nodes[wall_node_indices]
 
+        # 1. Standard distance from wall for interior nodes
         tree_wall = KDTree(wall_pts)
-        dist_raw, _ = tree_wall.query(nodes)
+        dist_raw, indices_wall = tree_wall.query(nodes)
+
+        nearest_wall_pts = wall_pts[indices_wall]
+        diff_vec = nodes - nearest_wall_pts  # Points FROM wall TO node (into the fluid)
+
+        # 2. Exact Mathematical Normals for Wall Nodes using Gmsh Line Segments
+        t_wall = self.vessel_cfg.TAGS["Walls"]
+        wall_lines = []
+
+        try:
+            if "line" in mesh.cells_dict:
+                l_cells = mesh.cells_dict["line"]
+                l_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
+            elif hasattr(mesh, "get_cells_type"):
+                l_cells = mesh.get_cells_type("line")
+                l_tags = mesh.get_cell_data("gmsh:physical", "line")
+
+            for i, tag in enumerate(l_tags):
+                if tag == t_wall:
+                    wall_lines.append(l_cells[i])
+        except Exception:
+            pass
+
+        if len(wall_lines) > 0:
+            node_normals = np.zeros((len(nodes), 2))
+
+            # Calculate vessel center to ensure normals point inward (into the fluid)
+            interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
+            center_pt = np.mean(nodes[interior_mask], axis=0) if interior_mask.any() else np.mean(nodes, axis=0)
+
+            for line in wall_lines:
+                idx_a, idx_b = line[0], line[1]
+                pt_a, pt_b = nodes[idx_a], nodes[idx_b]
+
+                # Tangent vector
+                dx, dy = pt_b[0] - pt_a[0], pt_b[1] - pt_a[1]
+
+                # Orthogonal normal vector (-dy, dx)
+                n = np.array([-dy, dx])
+
+                # Ensure the normal points towards the vessel interior
+                midpoint = (pt_a + pt_b) / 2.0
+                if np.dot(n, center_pt - midpoint) < 0:
+                    n = -n
+
+                # Accumulate the normalized segment normal to the vertices
+                n_norm = n / (np.linalg.norm(n) + 1e-12)
+                node_normals[idx_a] += n_norm
+                node_normals[idx_b] += n_norm
+
+            # Replace KDTree vectors with the exact geometric normals for wall nodes
+            diff_vec[wall_node_indices] = node_normals[wall_node_indices]
+
+        # 3. Explicitly Normalize every vector to a magnitude of exactly 1.0
+        norms = np.linalg.norm(diff_vec, axis=1, keepdims=True)
+        wall_normal_vec = torch.tensor(diff_vec / (norms + 1e-12), dtype=torch.float32)
 
         # Non-dimensionalize
         nodes_nd = nodes / d_bar
@@ -221,13 +277,21 @@ class MeshToGraphComplete:
                                                                                                 sum_W_V_dv.unsqueeze(
                                                                                                     2)).squeeze()
 
-                # Stress Tensor & Projection
-                tau_xx, tau_yy, tau_xy = 2.0 * mu_nd * grad_u[:, 0], 2.0 * mu_nd * grad_v[:, 1], mu_nd * (
-                            grad_u[:, 1] + grad_v[:, 0])
-                # wall_normal_vec calculation omitted for brevity, use same logic as original
+                # Stress Tensor Components
+                tau_xx = 2.0 * mu_nd * grad_u[:, 0]
+                tau_yy = 2.0 * mu_nd * grad_v[:, 1]
+                tau_xy = mu_nd * (grad_u[:, 1] + grad_v[:, 0])
 
-                # Mask Ground Truth WSS to walls only
-                wss_mag = torch.sqrt((tau_xx) ** 2 + (tau_xy) ** 2) * mask_wall.float()
+                # Extract normal vector components
+                n_x = wall_normal_vec[:, 0]
+                n_y = wall_normal_vec[:, 1]
+
+                # Project stress tensor onto the normal vector to get the traction vector (t = Tau * n)
+                t_x = tau_xx * n_x + tau_xy * n_y
+                t_y = tau_xy * n_x + tau_yy * n_y
+
+                # True WSS magnitude is the magnitude of the traction vector at the wall
+                wss_mag = torch.sqrt(t_x ** 2 + t_y ** 2) * mask_wall.float()
                 y_labels = torch.stack([u_nd, v_nd, p_nd, mu_nd, wss_mag], dim=1)
                 is_anchor = True
             except Exception as e:
@@ -255,7 +319,7 @@ class MeshToGraphComplete:
         # --- Final Assembly ---
         x_tensor = torch.cat([
             pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
-            torch.zeros((len(nodes), 2)),  # Normals (Placeholder)
+            wall_normal_vec,
             torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
             torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
             u_prior_mag.view(-1, 1), torch.zeros((len(nodes), 1)),  # UV Prior
