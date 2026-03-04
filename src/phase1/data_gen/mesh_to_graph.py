@@ -264,7 +264,12 @@ class MeshToGraphComplete:
 
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
                     mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                    is_anchor=torch.tensor([is_anchor]), d_bar=torch.tensor([d_bar]))
+                    is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+                    d_bar=torch.tensor([d_bar], dtype=torch.float32),
+                    u_ref=torch.tensor([u_ref], dtype=torch.float32),
+                    u_inlet_bc=u_prior_mag.view(-1, 1),
+                    mu_inlet_bc=mu_prior.view(-1, 1),
+                    mu_wall_bc=mu_prior.view(-1, 1))
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 

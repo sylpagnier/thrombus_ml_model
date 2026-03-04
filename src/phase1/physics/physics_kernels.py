@@ -324,12 +324,13 @@ class PhysicsKernels:
 
     def inlet_outlet_loss(self, pred, data):
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+        device = pred.device # Get active device
 
-        loss_inlet = torch.tensor(0.0, device=pred.device)
+        loss_inlet = torch.tensor(0.0, device=device)
         mask_inlet_1d = data.mask_inlet.view(-1).bool()
 
         if mask_inlet_1d.any():
-            u_target = data.u_inlet_bc[mask_inlet_1d, 0]
+            u_target = data.u_inlet_bc[mask_inlet_1d, 0].to(device)
 
             u_in = u[mask_inlet_1d].squeeze()
             v_in = v[mask_inlet_1d].squeeze()
@@ -339,9 +340,8 @@ class PhysicsKernels:
             if self.cfg.viscosity_model == "carreau" and hasattr(data, 'mu_inlet_bc'):
                 mu_pred = pred[:, 3]
                 mu_in = mu_pred[mask_inlet_1d].squeeze()
-                mu_target_bc = data.mu_inlet_bc[mask_inlet_1d].squeeze()
+                mu_target_bc = data.mu_inlet_bc[mask_inlet_1d].squeeze().to(device)
 
-                # Smooth L1 is safer here due to the larger numerical scale of mu
                 loss_inlet += 2.0 * torch.nn.functional.smooth_l1_loss(mu_in, mu_target_bc)
 
         loss_outlet = torch.tensor(0.0, device=pred.device)

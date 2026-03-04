@@ -31,7 +31,7 @@ def load_dataset():
 
 
 def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation=False):
-    out = model(data, solver=current_solver, anderson_beta=0.8)
+    out = model(data, solver=current_solver, anderson_beta=0.8, anderson_warmup_iters=5)
     if isinstance(out, tuple):
         pred, jac_loss = out
     else:
@@ -89,7 +89,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
 def train_tier1(epochs=225, lr=1e-4, warm_up_epochs=200, adam_epochs=200):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Device being used:", device)
-    model = GINO_DEQ(in_channels=15, out_channels=4, latent_dim=64, max_iters=15).to(device)
+    model = GINO_DEQ(in_channels=15, out_channels=5, latent_dim=64, max_iters=15).to(device)
 
     phys_cfg = PhysicsConfig(tier="tier1", re_target=150.0)
     kernels = PhysicsKernels(phys_cfg=phys_cfg)

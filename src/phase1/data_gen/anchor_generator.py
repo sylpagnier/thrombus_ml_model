@@ -300,6 +300,18 @@ class AnchorGenerator:
                     continue  # Still skip saving so we don't write garbage data
                 # -----------------------
 
+                # --- FINAL NUMERICAL SANITY CHECK ---
+                # Ensure the pressure field isn't flat (trivial solution)
+                # and velocities are within a physical order of magnitude
+                p_std = np.std(p)
+                u_max = np.max(np.abs(u))
+
+                if p_std < 1e-9 or u_max < 1e-7:
+                    logger.warning(
+                        f"[{i}] Skipping: Trivial solution detected (P_std: {p_std:.2e}, U_max: {u_max:.2e})")
+                    continue
+                # ------------------------------------
+
                 np.savez(
                     out_file,
                     x=target_nodes[:, 0], y=target_nodes[:, 1],

@@ -141,9 +141,7 @@ class VesselGenerator:
         c_pts = []
 
         for i, x in enumerate(x_vals):
-            # FIX 1: Remove all jitter and curvature from the first and last two points
-            # This ensures the inlet and outlet are completely horizontal
-            if i < 2 or i > self.cfg.num_ctrl_pts - 3:
+            if i < 3 or i > self.cfg.num_ctrl_pts - 4:
                 y = 0.0
             else:
                 jitter = random.uniform(-width * 0.03, width * 0.03)
@@ -263,7 +261,7 @@ class VesselGenerator:
 
 
 if __name__ == "__main__":
-    active_tier = "tier2"
+    active_tier = "tier1"
 
     vg = VesselGenerator(tier=active_tier)
     vg.run_pipeline(n=100, level=0)

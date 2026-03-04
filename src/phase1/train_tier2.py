@@ -54,7 +54,7 @@ def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
 
 
 def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation):
-    out = model(data, solver=current_solver, anderson_beta=1.0 if is_distillation else 0.8)
+    out = model(data, solver=current_solver, anderson_beta=1.0 if is_distillation else 0.8, anderson_warmup_iters=5)
     if isinstance(out, tuple):
         pred, jac_loss = out
     else:
@@ -141,7 +141,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     # 2. Instantiate the model
     model = GINO_DEQ(
         in_channels=15,
-        out_channels=4,
+        out_channels=5,
         latent_dim=64,
         max_iters=15,
         mu_inf_nd=mu_inf_nd,
@@ -157,13 +157,15 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     if tier1_path.exists():
         state_dict = torch.load(tier1_path, map_location=device, weights_only=True)
 
-        # --- Handle input channel expansion (61 -> 62) ---
+        # --- Dynamic channel expansion surgery ---
         if 'encoder.0.weight' in state_dict:
             tier1_weight = state_dict['encoder.0.weight']
-            if tier1_weight.shape[1] == 61 and model.encoder[0].weight.shape[1] == 62:
-                print("🔧 Adapting Tier 1 encoder weights for Tier 2 (+1 mu_prior channel)...")
-                new_weight = torch.zeros_like(model.encoder[0].weight)
-                new_weight[:, :61] = tier1_weight
+            model_weight = model.encoder[0].weight
+            if tier1_weight.shape[1] != model_weight.shape[1]:
+                print(f"🔧 Adapting Tier 1 encoder weights ({tier1_weight.shape[1]} -> {model_weight.shape[1]})...")
+                new_weight = torch.zeros_like(model_weight)
+                min_dim = min(tier1_weight.shape[1], model_weight.shape[1])
+                new_weight[:, :min_dim] = tier1_weight[:, :min_dim]
                 state_dict['encoder.0.weight'] = new_weight
         # ------------------------------------------------------
 
@@ -172,7 +174,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     else:
         print("⚠️ Warning: Tier 1 weights not found.")
 
-    loss_weighter = DynamicLossWeighter(num_losses=3).to(device)
+    # Synchronized to strictly handle [l_cont, l_mom]
+    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
     dataset = load_dataset()
     if not dataset: return

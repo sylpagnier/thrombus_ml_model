@@ -224,15 +224,16 @@ class GINO_DEQ(nn.Module):
             [nodes_nd, shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior, wss_prior], dim=1)
         return encoded_x, uv_prior
 
-    def forward(self, data, solver="anderson", anderson_beta=0.8):
+    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5):
         x_encoded, uv_prior = self._apply_fourier_encoding(data.x)
         x_enc = self.encoder(x_encoded)
         z = x_enc.clone()
 
         row, col = data.edge_index
-        edge_vec = data.x[col, :2] - data.x[row, :2]
-        edge_dist = torch.norm(edge_vec, p=2, dim=-1, keepdim=True)  # Calculate distance
-        edge_attr = torch.cat([edge_vec, edge_dist], dim=-1)  # Now Shape: [E, 3]
+
+        # Pull precomputed edge attributes directly instead of recalculating
+        edge_attr = data.edge_attr
+        edge_vec = edge_attr[:, :2]
 
         batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(
             data.x.size(0), dtype=torch.long, device=data.x.device
@@ -271,9 +272,10 @@ class GINO_DEQ(nn.Module):
                 z_star = f_coupled(z_star)
             z = z_star.squeeze(0)
         else:
+            # Pass the warmup iters down to the Anderson solver
             z_star = anderson_acceleration(
                 f_coupled, z_init, batch_idx=batch_idx,
-                max_iter=self.max_iters, beta=anderson_beta
+                max_iter=self.max_iters, beta=anderson_beta, warmup_iters=anderson_warmup_iters
             )
             z = z_star.squeeze(0)
 
