@@ -333,7 +333,8 @@ class MeshToGraphComplete:
                     u_ref=torch.tensor([u_ref], dtype=torch.float32),
                     u_inlet_bc=u_prior_mag.view(-1, 1),
                     mu_inlet_bc=mu_prior.view(-1, 1),
-                    mu_wall_bc=mu_prior.view(-1, 1))
+                    mu_wall_bc=mu_prior.view(-1, 1),
+                    V=V, W=W, M_inv=M_inv)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
