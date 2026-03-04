@@ -258,9 +258,19 @@ class PhysicsKernels:
         dynamic_max = self.mu_0_nd * 1.2
         mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=dynamic_max)
 
-        # Weighting factor emphasizes the centerline peak proportionally
-        weights = (mu_target / self.mu_inf_nd).detach()
-        loss = torch.mean(weights * (mu_pred_safe - mu_target) ** 2)
+        # Normalizes the gradient updates across orders of magnitude
+        pointwise_loss = torch.abs(torch.log(mu_pred_safe) - torch.log(mu_target))
+
+        # Residual-Based Adaptive Weighting (RAR)
+        # Identify the top 10% of nodes with the highest error
+        k_nodes = max(1, int(0.10 * pointwise_loss.size(0)))
+        _, topk_indices = torch.topk(pointwise_loss, k_nodes)
+
+        # Apply a multiplier specifically to those high-error nodes (the centerline peak)
+        multipliers = torch.ones_like(pointwise_loss)
+        multipliers[topk_indices] = 5.0
+
+        loss = torch.mean(multipliers * pointwise_loss)
 
         return loss
 

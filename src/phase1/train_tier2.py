@@ -54,16 +54,20 @@ def load_dataset():
 
 
 def setup_distillation_phase(model):
-    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network.")
+    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network AND Encoder.")
 
     # Lock down the entire model
     for param in model.parameters():
         param.requires_grad = False
 
-    # ONLY unfreeze the specific viscosity routing layers
+    # Unfreeze the specific viscosity routing layers
     for param in model.mu_decoder.parameters():
         param.requires_grad = True
     for param in model.mu_encoder.parameters():
+        param.requires_grad = True
+
+    # Unfreeze the encoder to learn the new mu_prior channel
+    for param in model.encoder.parameters():
         param.requires_grad = True
 
     return optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
@@ -216,10 +220,22 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     scheduler = None
     lbfgs_initialized = False
 
+    # Dynamic annealing of power-law index during distillation phase
+    target_n = phys_cfg.n
+    start_n = 0.8
+
     for epoch in range(epochs):
         is_distillation = epoch < distillation_epochs
         physics_active = not is_distillation
         lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
+        if is_distillation:
+            progress = epoch / max(1, (distillation_epochs - 1))
+            current_n = start_n - progress * (start_n - target_n)
+            phys_cfg.n = current_n  # Dynamically update the physics kernels
+            print(f"🔄 Curriculum: Annealed Carreau index 'n' to {current_n:.4f}")
+        else:
+            phys_cfg.n = target_n  # Ensure it locks to target for coupled phase
+
         if is_distillation or lbfgs_initialized:
             current_solver = "picard"
         else:
