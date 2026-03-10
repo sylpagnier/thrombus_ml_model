@@ -1,4 +1,5 @@
 import torch
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -22,39 +23,69 @@ class ModelValidator:
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.tier = tier
 
-        # Load the correct config based on the tier
         phys_cfg = PhysicsConfig(tier=self.tier)
         self.kernels = PhysicsKernels(phys_cfg)
 
         print(f"⚡ Loading {self.tier.capitalize()} Model: {model_path}")
 
-        # CRITICAL FIX: in_channels=13 to account for the new Generalized Poiseuille Prior (uv_prior)
-        self.model = GINO_DEQ(in_channels=13, out_channels=4, latent_dim=64, max_iters=15)
+        # --- THE FIX: Extract correct physical bounds for the Sigmoid ---
+        mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_ref
+        mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_ref
+
+        # Pass the bounds into the model architecture
+        self.model = GINO_DEQ(
+            in_channels=15, out_channels=5, latent_dim=64, max_iters=15,
+            mu_inf_nd=mu_inf_nd, mu_0_nd=mu_0_nd
+        )
 
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
 
-    def _compute_wss_proxy(self, u_x, u_y, v_x, v_y, mu_eff, data):
+    def _predict_with_physics_correction(self, data, correction_steps=25, lr=1e-3):
         """
-        Calculates Wall Shear Stress (WSS): tau = mu_eff * gamma_dot.
+        Inference-Time Physics Correction (ITPC) loop ("Tier 2.5").
         """
-        # Compute Generalized Shear Rate (gamma_dot)
-        gamma_dot = torch.sqrt(2 * u_x ** 2 + 2 * v_y ** 2 + (u_y + v_x) ** 2 + 1e-8)
+        # 1. Base Prediction (Smart Guess)
+        with torch.no_grad():
+            base_pred = self.model(data, solver="anderson")
 
-        # Compute Wall Shear Stress
-        wss = mu_eff * gamma_dot
+        # 2. Optimization Setup
+        pred_opt = base_pred.detach().clone()
+        pred_opt.requires_grad_(True)
+        optimizer = optim.Adam([pred_opt], lr=lr)
 
-        # Filter for Wall Nodes only
-        mask = data.mask_wall.bool()
-        if mask.sum() == 0:
-            return torch.tensor([]), mask
+        props = self.kernels._get_geometric_props(data)
 
-        return wss[mask], mask
+        for step in range(correction_steps):
+            optimizer.zero_grad()
+
+            # --- Physics Residuals ---
+            l_mom = self.kernels.navier_stokes_residual(pred_opt, data, props=props)
+
+            c_u = self.kernels._compute_derivatives(pred_opt[:, 0:1], props)
+            c_v = self.kernels._compute_derivatives(pred_opt[:, 1:2], props)
+            du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
+            l_cont = self.kernels.continuity_loss(du_ij)
+
+            l_bc = self.kernels.boundary_condition_loss(pred_opt, data)
+            l_io = self.kernels.inlet_outlet_loss(pred_opt, data)
+
+            loss = l_mom + (10.0 * l_cont) + (50.0 * l_bc) + (10.0 * l_io)
+
+            loss.backward()
+            optimizer.step()
+
+            # Hard No-Slip Enforcement
+            with torch.no_grad():
+                mask_wall = data.mask_wall.view(-1).bool()
+                if mask_wall.any():
+                    pred_opt[mask_wall, 0:2] = 0.0
+
+        return base_pred.detach(), pred_opt.detach()
 
     def validate_dataset(self, data_dir, level_name="Unknown"):
-        # CRITICAL FIX: Handle absolute paths correctly when passed from run_benchmark.py
         data_path = Path(data_dir)
         path = data_path if data_path.is_absolute() else project_root / data_dir
 
@@ -67,139 +98,157 @@ class ModelValidator:
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
         metrics = {
-            "rel_l2_u": [],
-            "rel_l2_mu": [],
-            "div_residual": [],
-            "wall_slip": [],
-            "wss_corr": []
+            "base_rel_l2_u": [], "itpc_rel_l2_u": [],
+            "base_div_res": [], "itpc_div_res": [],
+            "base_wall_slip": [], "itpc_wall_slip": [],
+            "base_wss_corr": [], "itpc_wss_corr": []
         }
 
-        print(f"\n🔍 Validating {self.tier.capitalize()} - {level_name} (N={len(dataset)})...")
+        print(f"\n🔍 A/B Testing {self.tier.capitalize()} - {level_name} (N={len(dataset)})...")
 
-        with torch.no_grad():
-            for i, data in enumerate(tqdm(loader)):
-                data = data.to(self.device)
-                pred = self.model(data)
+        for i, data in enumerate(tqdm(loader)):
+            data = data.to(self.device)
 
-                # --- 1. Physics Metrics ---
-                props = self.kernels._get_geometric_props(data)
+            pred_base, pred_itpc = self._predict_with_physics_correction(data, correction_steps=20)
+            props = self.kernels._get_geometric_props(data)
+            has_labels = (hasattr(data, 'y') and data.y is not None and data.y.abs().sum() > 1e-6)
 
-                # Mass Conservation (Div U)
+            def evaluate_prediction(pred, prefix):
+                # 1. Physics Metrics
                 grads_u = self.kernels._compute_gradients(pred[:, 0:1], props)
                 grads_v = self.kernels._compute_gradients(pred[:, 1:2], props)
                 div = torch.abs(grads_u[:, 0] + grads_v[:, 1]).mean()
-                metrics["div_residual"].append(div.item())
+                metrics[f"{prefix}_div_res"].append(div.item())
 
-                # Wall Slip
-                if data.mask_wall.any():
-                    slip = torch.norm(pred[data.mask_wall, :2], dim=1).mean()
-                    metrics["wall_slip"].append(slip.item())
+                mask_wall = data.mask_wall.view(-1).bool()
+
+                if mask_wall.any():
+                    slip = torch.norm(pred[mask_wall, :2], dim=1).mean()
+                    metrics[f"{prefix}_wall_slip"].append(slip.item())
                 else:
-                    metrics["wall_slip"].append(0.0)
+                    metrics[f"{prefix}_wall_slip"].append(0.0)
 
-                # --- 2. Supervised Metrics ---
-                has_labels = (hasattr(data, 'y') and data.y is not None and
-                              data.y.shape[0] == data.x.shape[0] and data.y.abs().sum() > 1e-6)
-
+                # 2. Supervised Metrics
                 if has_labels:
                     target = data.y
-
-                    # Velocity L2 Error
                     diff_u = torch.norm(pred[:, :2] - target[:, :2], dim=1)
                     denom_u = torch.norm(target[:, :2], dim=1) + 1e-6
-                    metrics["rel_l2_u"].append((diff_u.sum() / denom_u.sum()).item())
+                    metrics[f"{prefix}_rel_l2_u"].append((diff_u.sum() / denom_u.sum()).item())
 
-                    # Viscosity L2 Error (Important for Tier 2)
-                    diff_mu = torch.abs(pred[:, 3] - target[:, 3])
-                    denom_mu = torch.abs(target[:, 3]) + 1e-6
-                    metrics["rel_l2_mu"].append((diff_mu.sum() / denom_mu.sum()).item())
+                    # DIRECT WSS CORRELATION
+                    if mask_wall.any():
+                        pred_wss = pred[mask_wall, 4]
+                        gt_wss = target[mask_wall, 4]
 
-                    # WSS Correlation
-                    # Extract target gradients for GT WSS
-                    c_u_gt = self.kernels._compute_derivatives(target[:, 0].unsqueeze(1), props)
-                    c_v_gt = self.kernels._compute_derivatives(target[:, 1].unsqueeze(1), props)
-
-                    pred_wss, _ = self._compute_wss_proxy(grads_u[:, 0], grads_u[:, 1], grads_v[:, 0], grads_v[:, 1],
-                                                          pred[:, 3], data)
-                    gt_wss, _ = self._compute_wss_proxy(c_u_gt[:, 0, 0], c_u_gt[:, 1, 0], c_v_gt[:, 0, 0],
-                                                        c_v_gt[:, 1, 0], target[:, 3], data)
-
-                    if len(pred_wss) > 5:
-                        vx = pred_wss - pred_wss.mean()
-                        vy = gt_wss - gt_wss.mean()
-                        corr = torch.sum(vx * vy) / (
-                                torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
-                        metrics["wss_corr"].append(corr.item())
+                        if len(pred_wss) > 5:
+                            vx = pred_wss - pred_wss.mean()
+                            vy = gt_wss - gt_wss.mean()
+                            corr = torch.sum(vx * vy) / (
+                                        torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+                            metrics[f"{prefix}_wss_corr"].append(corr.item())
+                        else:
+                            metrics[f"{prefix}_wss_corr"].append(np.nan)
                     else:
-                        metrics["wss_corr"].append(np.nan)
+                        metrics[f"{prefix}_wss_corr"].append(np.nan)
                 else:
-                    metrics["rel_l2_u"].append(np.nan)
-                    metrics["rel_l2_mu"].append(np.nan)
-                    metrics["wss_corr"].append(np.nan)
+                    metrics[f"{prefix}_rel_l2_u"].append(np.nan)
+                    metrics[f"{prefix}_wss_corr"].append(np.nan)
 
-                # --- 3. Save Visualization ---
-                if i < 5:
-                    self._plot_comparison(data, pred, data.y if has_labels else None, f"{level_name}_sample_{i}")
+            evaluate_prediction(pred_base, "base")
+            evaluate_prediction(pred_itpc, "itpc")
+
+            # Save the new comprehensive Tier 2.5 Visualization
+            if i < 3:
+                self._plot_comparison(data, pred_base, pred_itpc, data.y if has_labels else None,
+                                      f"{level_name}_sample_{i}_Tier2.5")
 
         df = pd.DataFrame(metrics)
-        print(f"📊 {level_name} Results:")
-        print(df.describe().loc[['mean', 'std', 'count']])
+        print(f"\n📊 A/B Test Results for {level_name}:")
+
+        mean_base = df["base_rel_l2_u"].mean()
+        mean_itpc = df["itpc_rel_l2_u"].mean()
+        improvement = ((mean_base - mean_itpc) / mean_base) * 100
+
+        print(df.describe().loc[['mean']].T)
+        print(f"\n💡 ITPC reduced L2 Velocity Error by {improvement:.2f}%")
 
         return df.mean()
 
-    def _plot_comparison(self, data, pred, target, title):
-        # Dynamically size plot based on tier (show viscosity for Tier 2)
-        rows = 2 if self.tier == "tier2" else 1
+    def _plot_comparison(self, data, pred_base, pred_itpc, target, title):
+        rows = 3 if self.tier == "tier2" else 2
         fig, axes = plt.subplots(rows, 3, figsize=(15, 4 * rows))
         if rows == 1: axes = np.array([axes])
 
         pos = data.x[:, :2].cpu().numpy()
+        mask_wall = data.mask_wall.view(-1).cpu().bool().numpy()
+        wall_pos = pos[mask_wall]
 
-        # ROW 1: VELOCITY
-        u_pred = pred[:, 0].cpu().numpy()
-        sc1 = axes[0, 0].scatter(pos[:, 0], pos[:, 1], c=u_pred, cmap='jet', s=5, edgecolor='none')
-        axes[0, 0].set_title(f"Predicted Velocity (u)\n{title}")
-        plt.colorbar(sc1, ax=axes[0, 0])
+        def plot_row(row_idx, gt_val, base_val, itpc_val, name, cmap, is_wall=False):
+            vmax = max(gt_val.max() if target is not None else 0, base_val.max(), itpc_val.max())
+            vmin = min(gt_val.min() if target is not None else 0, base_val.min(), itpc_val.min())
 
-        if target is not None:
-            u_gt = target[:, 0].cpu().numpy()
-            error_u = np.abs(u_pred - u_gt)
-            sc2 = axes[0, 1].tripcolor(pos[:, 0], pos[:, 1], u_gt, cmap='jet')
-            axes[0, 1].set_title("Ground Truth (u)")
-            plt.colorbar(sc2, ax=axes[0, 1])
-            sc3 = axes[0, 2].tripcolor(pos[:, 0], pos[:, 1], error_u, cmap='inferno')
-            axes[0, 2].set_title("Error |Pred - GT|")
-            plt.colorbar(sc3, ax=axes[0, 2])
-        else:
-            axes[0, 1].text(0.5, 0.5, "GT Missing", ha='center', va='center')
-            axes[0, 2].text(0.5, 0.5, "N/A", ha='center', va='center')
+            if is_wall:
+                if target is not None:
+                    sc0 = axes[row_idx, 0].scatter(wall_pos[:, 0], wall_pos[:, 1], c=gt_val, cmap=cmap, s=20, vmin=vmin,
+                                                   vmax=vmax)
+                    axes[row_idx, 0].set_title(f"GT {name}")
+                    plt.colorbar(sc0, ax=axes[row_idx, 0])
+                else:
+                    axes[row_idx, 0].text(0.5, 0.5, "GT Missing", ha='center', va='center')
 
-        # ROW 2: VISCOSITY (Tier 2 only)
-        if self.tier == "tier2":
-            mu_pred = pred[:, 3].cpu().numpy()
-            sc4 = axes[1, 0].tripcolor(pos[:, 0], pos[:, 1], mu_pred, cmap='viridis')
-            axes[1, 0].set_title("Predicted Viscosity (mu)")
-            plt.colorbar(sc4, ax=axes[1, 0])
+                sc1 = axes[row_idx, 1].scatter(wall_pos[:, 0], wall_pos[:, 1], c=base_val, cmap=cmap, s=20, vmin=vmin,
+                                               vmax=vmax)
+                axes[row_idx, 1].set_title(f"Base Pred {name}")
+                plt.colorbar(sc1, ax=axes[row_idx, 1])
 
-            if target is not None:
-                mu_gt = target[:, 3].cpu().numpy()
-                error_mu = np.abs(mu_pred - mu_gt)
-                sc5 = axes[1, 1].tripcolor(pos[:, 0], pos[:, 1], mu_gt, cmap='viridis')
-                axes[1, 1].set_title("Ground Truth (mu)")
-                plt.colorbar(sc5, ax=axes[1, 1])
-                sc6 = axes[1, 2].tripcolor(pos[:, 0], pos[:, 1], error_mu, cmap='inferno')
-                axes[1, 2].set_title("Viscosity Error")
-                plt.colorbar(sc6, ax=axes[1, 2])
+                sc2 = axes[row_idx, 2].scatter(wall_pos[:, 0], wall_pos[:, 1], c=itpc_val, cmap=cmap, s=20, vmin=vmin,
+                                               vmax=vmax)
+                axes[row_idx, 2].set_title(f"Tier 2.5 (ITPC) {name}")
+                plt.colorbar(sc2, ax=axes[row_idx, 2])
             else:
-                axes[1, 1].text(0.5, 0.5, "GT Missing", ha='center', va='center')
-                axes[1, 2].text(0.5, 0.5, "N/A", ha='center', va='center')
+                if target is not None:
+                    sc0 = axes[row_idx, 0].tripcolor(pos[:, 0], pos[:, 1], gt_val, cmap=cmap)
+                    axes[row_idx, 0].set_title(f"GT {name}")
+                    plt.colorbar(sc0, ax=axes[row_idx, 0])
+                else:
+                    axes[row_idx, 0].text(0.5, 0.5, "GT Missing", ha='center', va='center')
 
-        for ax in axes.flatten():
-            ax.set_aspect('equal')
-            ax.axis('off')
+                sc1 = axes[row_idx, 1].tripcolor(pos[:, 0], pos[:, 1], base_val, cmap=cmap)
+                axes[row_idx, 1].set_title(f"Base Pred {name}")
+                plt.colorbar(sc1, ax=axes[row_idx, 1])
+
+                sc2 = axes[row_idx, 2].tripcolor(pos[:, 0], pos[:, 1], itpc_val, cmap=cmap)
+                axes[row_idx, 2].set_title(f"Tier 2.5 (ITPC) {name}")
+                plt.colorbar(sc2, ax=axes[row_idx, 2])
+
+            for col in range(3):
+                axes[row_idx, col].set_aspect('equal')
+                axes[row_idx, col].axis('off')
+
+        # Row 0: Velocity Magnitude
+        u_base = np.linalg.norm(pred_base[:, :2].cpu().numpy(), axis=1)
+        u_itpc = np.linalg.norm(pred_itpc[:, :2].cpu().numpy(), axis=1)
+        u_gt = np.linalg.norm(target[:, :2].cpu().numpy(), axis=1) if target is not None else None
+        plot_row(0, u_gt, u_base, u_itpc, "Velocity Mag", 'jet')
+
+        # Row 1 (Tier 2): Viscosity
+        current_row = 1
+        if self.tier == "tier2":
+            mu_base = pred_base[:, 3].cpu().numpy()
+            mu_itpc = pred_itpc[:, 3].cpu().numpy()
+            mu_gt = target[:, 3].cpu().numpy() if target is not None else None
+            plot_row(current_row, mu_gt, mu_base, mu_itpc, "Viscosity", 'viridis')
+            current_row += 1
+
+        # Row 2 (or 1): Direct WSS (Scatter on walls)
+        wss_base = pred_base[mask_wall, 4].cpu().numpy()
+        wss_itpc = pred_itpc[mask_wall, 4].cpu().numpy()
+        wss_gt = target[mask_wall, 4].cpu().numpy() if target is not None else None
+        plot_row(current_row, wss_gt, wss_base, wss_itpc, "WSS", 'plasma', is_wall=True)
 
         save_dir = project_root / f"reports/validation_{self.tier}"
         save_dir.mkdir(parents=True, exist_ok=True)
         safe_title = title.replace("/", "_").replace(" ", "_")
+        plt.tight_layout()
         plt.savefig(save_dir / f"{safe_title}.png", dpi=150, bbox_inches='tight')
         plt.close()

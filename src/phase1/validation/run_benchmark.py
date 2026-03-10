@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from tqdm import tqdm
 from src.utils.paths import get_project_root
+
 project_root = get_project_root()
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.anchor_generator import AnchorGenerator
@@ -62,7 +63,6 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
             return None
 
         validator = ModelValidator(model_path=model_path, tier=tier)
-        # Passing str(graph_dir) is now safely handled by the updated ModelValidator
         metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
 
         return metrics
@@ -71,21 +71,12 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
         print(f"❌ Critical Benchmark Error: {e}")
         return None
 
-    finally:
-        print(f"\n🧹 Cleaning up temporary benchmark run: {base_dir.name}")
-        try:
-            shutil.rmtree(base_dir)
-        except Exception as e:
-            print(f"   ⚠️ Warning: Could not fully delete temp folder: {e}")
-
 
 if __name__ == "__main__":
-    # Define which tiers to benchmark
     target_tiers = ["tier1", "tier2"]
 
     benchmarks = [
         (0, "Level 0 (Straight pathologies)"),
-      # (1, "Level 1 (Curved pathologies)"),
     ]
 
     for current_tier in target_tiers:
@@ -109,3 +100,10 @@ if __name__ == "__main__":
             print(f"\n📄 Detailed report saved to: {save_path}")
         else:
             print(f"❌ No results generated for {current_tier}.")
+
+    # Full aggressive cleanup of all benchmark data once everything finishes
+    benchmark_data_dir = project_root / "data" / "benchmark"
+    if benchmark_data_dir.exists():
+        print(f"\n🧹 Final Cleanup: Sweeping up all generated temporary benchmark data at {benchmark_data_dir}...")
+        shutil.rmtree(benchmark_data_dir, ignore_errors=True)
+        print("✅ Cleanup complete.")
