@@ -1,0 +1,292 @@
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.loader import DataLoader
+from tqdm import tqdm
+import random
+from pathlib import Path
+
+from src.utils.paths import get_project_root
+from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
+from src.phase1.physics.physics_kernels import PhysicsKernels
+from src.config import VesselConfig, PhysicsConfig
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from src.phase1.utils.samplers import StratifiedAnchorSampler
+from src.phase1.utils.metrics import DynamicLossWeighter
+
+
+def load_dataset():
+    cfg = VesselConfig(tier="tier3")
+    data_dir = cfg.graph_output_dir
+    if not data_dir.exists():
+        print(f"Directory not found: {data_dir}. Please generate Tier 3 data first.")
+        return []
+    file_list = sorted(list(data_dir.glob("vessel_*.pt")))
+    dataset = []
+    print(f"📂 Loading {len(file_list)} Tier 3 graphs...")
+    for f in tqdm(file_list):
+        data = torch.load(f, weights_only=False)
+        dataset.append(data)
+    return dataset
+
+
+def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
+    print("❄️  Verifying Kinematic Backbone is Frozen.")
+    print("🔥 Activating LoRA layers, Biochemistry Encoders/Decoders, and Loss Weighter.")
+
+    # Freeze everything by default to be absolutely safe
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze specifically intended modules
+    for name, param in model.named_parameters():
+        if 'lora' in name.lower():
+            param.requires_grad = True
+
+    for param in model.bio_encoder.parameters():
+        param.requires_grad = True
+
+    for name, param in model.biochem_decoder.named_parameters():
+        if 'lora' not in name.lower():
+            param.requires_grad = True
+
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+
+    return optim.AdamW([
+        {'params': trainable_params, 'lr': base_lr},
+        {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
+    ], weight_decay=1e-5)
+
+
+def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device):
+    # 1. Forward Pass
+    out = model(data, solver=current_solver)
+    pred, jac_loss = out if isinstance(out, tuple) else (out, torch.tensor(0.0))
+
+    # 2. Extract Fields (Based on COMSOL 9+2 mapping)
+    velocity_fields = pred[:, 0:2]  # [u, v]
+    biochem_preds = pred[:, 4:13]  # [RP...FI] (9 species)
+    wall_preds = pred[:, 13:15]  # [M, M_active] (2 surface species)
+
+    spatial_props = kernels.core._get_geometric_props(data)
+    mask_wall = data.mask_wall.view(-1).bool()
+
+    # 3. Physics-Informed Residuals (Refurbished)
+    # Replaces the old MSE placeholder with explicit COMSOL ADR physics
+    l_adr = kernels.biochem_adr_residual(biochem_preds, velocity_fields, spatial_props)
+    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, spatial_props, mask_wall)
+
+    # Kinematic Residuals (Navier-Stokes)
+    l_ns = kernels.core.navier_stokes_residual(pred[:, 0:4], data, props=spatial_props)
+
+    # 4. Balanced Backward Pass
+    losses = [l_ns, l_adr, l_wall]  # Expand as needed for Rheology/Data
+    weighted_loss = loss_weighter(losses)
+
+    return weighted_loss + (0.1 * jac_loss), {"L_ADR": l_adr.item(), "L_Wall": l_wall.item()}
+
+
+def calculate_validation_metrics(pred, data, kernels, device):
+    props = kernels._get_geometric_props(data)
+
+    # --- Morphological Metric: Clot Dice Coefficient ---
+    mu_eff = pred[:, 3]
+    mu_base = 0.0035  # Approximated reference viscosity
+    pred_clot = (mu_eff > 20.0 * mu_base).float()
+
+    if data.y.shape[1] > 3:
+        gt_clot = (data.y[:, 3] > 20.0 * mu_base).float()
+        intersection = (pred_clot * gt_clot).sum()
+        dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
+    else:
+        dice = torch.tensor(0.0)
+
+    # --- Hemodynamic Metric: WSS Pearson Correlation (Patent Lumen) ---
+    mask_wall = data.mask_wall.view(-1).bool()
+
+    if mask_wall.any() and data.y.shape[1] > 1:
+        # Patent Lumen Mask (Walls where there is NO ground truth clot)
+        patent_wall_mask = mask_wall & (gt_clot == 0) if data.y.shape[1] > 3 else mask_wall
+
+        if patent_wall_mask.any():
+            # Compute Predicted WSS
+            c_u = kernels._compute_derivatives(pred[:, 0:1], props)
+            c_v = kernels._compute_derivatives(pred[:, 1:2], props)
+            dudx_p, dudy_p = c_u[:, 0, 0], c_u[:, 1, 0]
+            dvdx_p, dvdy_p = c_v[:, 0, 0], c_v[:, 1, 0]
+
+            mu_wall_p = pred[patent_wall_mask, 3]
+            tau_xx_p = 2.0 * mu_wall_p * dudx_p[patent_wall_mask]
+            tau_yy_p = 2.0 * mu_wall_p * dvdy_p[patent_wall_mask]
+            tau_xy_p = mu_wall_p * (dudy_p[patent_wall_mask] + dvdx_p[patent_wall_mask])
+
+            nx = data.x[patent_wall_mask, 4]
+            ny = data.x[patent_wall_mask, 5]
+
+            tx_p, ty_p = tau_xx_p * nx + tau_xy_p * ny, tau_xy_p * nx + tau_yy_p * ny
+            tn_p = tx_p * nx + ty_p * ny
+            wss_pred = torch.sqrt((tx_p - tn_p * nx) ** 2 + (ty_p - tn_p * ny) ** 2 + 1e-8)
+
+            # Compute Target WSS
+            c_u_t = kernels._compute_derivatives(data.y[:, 0:1], props)
+            c_v_t = kernels._compute_derivatives(data.y[:, 1:2], props)
+            dudx_t, dudy_t = c_u_t[:, 0, 0], c_u_t[:, 1, 0]
+            dvdx_t, dvdy_t = c_v_t[:, 0, 0], c_v_t[:, 1, 0]
+
+            mu_wall_t = data.y[patent_wall_mask, 3] if data.y.shape[1] > 3 else torch.full_like(mu_wall_p, mu_base)
+            tau_xx_t = 2.0 * mu_wall_t * dudx_t[patent_wall_mask]
+            tau_yy_t = 2.0 * mu_wall_t * dvdy_t[patent_wall_mask]
+            tau_xy_t = mu_wall_t * (dudy_t[patent_wall_mask] + dvdx_t[patent_wall_mask])
+
+            tx_t, ty_t = tau_xx_t * nx + tau_xy_t * ny, tau_xy_t * nx + tau_yy_t * ny
+            tn_t = tx_t * nx + ty_t * ny
+            wss_targ = torch.sqrt((tx_t - tn_t * nx) ** 2 + (ty_t - tn_t * ny) ** 2 + 1e-8)
+
+            # Pearson Correlation
+            stacked = torch.stack([wss_pred, wss_targ])
+            pearson_corr = torch.corrcoef(stacked)[0, 1]
+            if torch.isnan(pearson_corr): pearson_corr = torch.tensor(0.0)
+        else:
+            pearson_corr = torch.tensor(0.0)
+    else:
+        pearson_corr = torch.tensor(0.0)
+
+    return dice.item(), pearson_corr.item()
+
+
+def train_tier3(epochs=50, lr=1e-3):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device being used: {device}")
+
+    phys_cfg = PhysicsConfig(tier="tier3", re_target=150.0)
+    kernels = PhysicsKernels(phys_cfg=phys_cfg)
+
+    model = GINO_DEQ_Tier3(in_channels=15, latent_dim=64, max_outer_iters=3, max_inner_iters=15).to(device)
+
+    # 1. Load Tier 2 Checkpoint (Frozen Kinematic Backbone)
+    root = get_project_root()
+    model_dir = root / "models"
+    tier2_path = model_dir / "tier2_best_physics.pth"
+
+    if tier2_path.exists():
+        state_dict = torch.load(tier2_path, map_location=device, weights_only=True)
+        # strict=False allows ignoring the newly initialized LoRA/Biochem parameters
+        model.load_state_dict(state_dict, strict=False)
+        print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
+    else:
+        print("⚠️ Warning: Tier 2 weights not found. Backbone will be untrained!")
+
+    # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
+    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
+
+    dataset = load_dataset()
+    if not dataset: return
+
+    anchors = [d for d in dataset if d.is_anchor.item()]
+    physics = [d for d in dataset if not d.is_anchor.item()]
+
+    random.seed(42)
+    random.shuffle(anchors)
+    random.shuffle(physics)
+
+    split_idx_a = int(0.9 * len(anchors))
+    split_idx_p = int(0.9 * len(physics))
+
+    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
+    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+
+    micro_batch_size = 2
+    accumulation_steps = 4
+
+    sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
+    loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
+    val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
+
+    optimizer = setup_tier3_optimization(model, loss_weighter, base_lr=lr)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+
+    best_dice = -1.0
+
+    print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
+
+    for epoch in range(epochs):
+        # --- Curriculum Learning Scheduler for mu_ratio ---
+        if epoch < 10:
+            current_mu_ratio = 2.0
+        else:
+            progress = (epoch - 10) / max(1, (epochs - 11))
+            current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
+
+        model.mu_ratio = current_mu_ratio
+
+        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio Curriculum: {current_mu_ratio:.2f}x")
+
+        model.train()
+        total_loss_epoch = 0.0
+        optimizer.zero_grad()
+
+        pbar = tqdm(loader, desc=f"Tier 3 Ep {epoch:02d}")
+        for batch_idx, data in enumerate(pbar):
+            data = data.to(device)
+
+            loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, "anderson", device)
+            loss = loss / accumulation_steps
+
+            if torch.isnan(loss):
+                print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping micro-batch.")
+                continue
+
+            loss.backward()
+
+            if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss_epoch += (loss.item() * accumulation_steps)
+
+            pbar.set_postfix({
+                "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
+                "L_ADR": f"{metrics['L_ADR']:.3f}",
+                "L_Wall": f"{metrics['L_Wall']:.3f}"
+            })
+
+        scheduler.step()
+
+        # Validation & Metrics
+        if epoch % 2 == 0:
+            model.eval()
+            val_dice_total, val_pearson_total = 0.0, 0.0
+
+            with torch.no_grad():
+                # Print current learned loss weights
+                safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
+                weights = torch.exp(-safe_vars)
+                print(
+                    f"⚖️ Loss Weights -> NS: {weights[0]:.2f} | Rheo: {weights[1]:.2f} | Data: {weights[2]:.2f} | ADR: {weights[3]:.2f} | Wall: {weights[4]:.2f}")
+
+                for v_data in val_loader:
+                    v_data = v_data.to(device)
+                    v_pred = model(v_data, solver="anderson", anderson_beta=1.0)
+                    if isinstance(v_pred, tuple): v_pred = v_pred[0]
+
+                    d, p = calculate_validation_metrics(v_pred, v_data, kernels, device)
+                    val_dice_total += d
+                    val_pearson_total += p
+
+            avg_dice = val_dice_total / len(val_loader)
+            avg_pearson = val_pearson_total / len(val_loader)
+
+            print(f"📊 [Validation] Clot Dice: {avg_dice:.4f} | Patent WSS Pearson: {avg_pearson:.4f}")
+
+            if avg_dice > best_dice:
+                best_dice = avg_dice
+                torch.save(model.state_dict(), model_dir / "tier3_best_bio.pth")
+                print("⭐ Saved Best Biochemical Coupling Model")
+
+
+if __name__ == "__main__":
+    train_tier3()

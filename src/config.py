@@ -17,9 +17,16 @@ class VesselConfig:
     def __post_init__(self):
         """Dynamically resolve paths based on the selected tier."""
         self.template_path = self.project_root / "comsol_models/phase1_template.mph"
-        self.mesh_input_dir = self.project_root / f"data/raw/{self.tier}"
-        self.output_dir = self.project_root / f"data/processed/cfd_results_{self.tier}"
-        self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
+
+        # Explicitly handle tier 3 patient data directory mapping
+        if self.tier == "tier3_patients":
+            self.mesh_input_dir = self.project_root / "data/raw/tier3_patients"
+            self.output_dir = self.project_root / "data/processed/cfd_results_tier3_patients"
+            self.graph_output_dir = self.project_root / "data/processed/graphs_tier3_patients"
+        else:
+            self.mesh_input_dir = self.project_root / f"data/raw/{self.tier}"
+            self.output_dir = self.project_root / f"data/processed/cfd_results_{self.tier}"
+            self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
 
     # Mesh Settings
     mesh_size_factor: float = 0.75
@@ -49,6 +56,7 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
+    """Configuration for physical properties and fluid dynamics."""
     tier: str = "tier1"
 
     # Fluid Properties
@@ -63,9 +71,9 @@ class PhysicsConfig:
 
     # Relaxed Carreau-Yasuda Rheology (Mild Shear-Thinning Proxy)
     mu_inf: float = 0.0035  # Pa*s
-    mu_0: float = 0.056  # Pa*s (Un-Reduced from 0.056 - check if values still converge)
-    lam: float = 3.313  # Relaxation time in s (Reduced from 3.313 - check if values still converge)
-    n: float = 0.358  # Power law index (reduced from .5 - check if vlaues still converge)
+    mu_0: float = 0.056  # Pa*s
+    lam: float = 3.313  # Relaxation time [s]
+    n: float = 0.358  # Power law index
     a: float = 2.0  # Yasuda parameter
 
     def __post_init__(self):
@@ -94,3 +102,68 @@ class PhysicsConfig:
         """
         mu = mu_custom if mu_custom is not None else self.mu_ref
         return (self.rho * u_ref * d_bar) / mu
+
+
+@dataclass
+class BiochemConfig:
+    """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations."""
+    tier: str = "tier3"
+
+    # --- Initial Concentrations ---
+    c_RP0: float = 2.5e8  # Initial resting platelets [plt/ml]
+    c_pT0: float = 1.2  # Initial prothrombin concentration [uM]
+    c_Fg0: float = 7.0  # Initial fibrinogen concentration [uM]
+    cAT0: float = 2.84  # Initial/Static background antithrombin concentration [uM]
+
+    # --- Agonist Critical Thresholds ---
+    APScrit: float = 0.6  # Thromboxane critical concentration [uM]
+    APRcrit: float = 2.0  # ADP critical concentration for activation [uM]
+    Tcrit: float = 5.0e-4  # Thrombin concentration for activation [uM]
+
+    # --- Activation & Adhesion Constants ---
+    t_act: float = 1.0  # Activation time [s]
+    shear_crit: float = 10000.0  # Threshold for mechanical activation [1/s]
+    k_rs: float = 0.0037  # Resting adhesion rate [cm/s]
+    k_as: float = 0.045  # Activated adhesion rate [cm/s]
+
+    # --- Thrombin Generation & Inhibition ---
+    k_1t: float = 13.33  # Rate constant for AT [1/s]
+    c_H: float = 0.25  # Heparin concentration [uM]
+    K_at: float = 0.1  # Dissociation constant heparin-AT [uM]
+    K_T: float = 0.035  # Dissociation constant heparin-Thrombin [uM]
+    phi_at: float = 3.69e-9  # Thrombin generation rate (activated) [U/(plt*s*uM)]
+    phi_rt: float = 6.5e-10  # Thrombin generation rate (resting) [U/(plt*s*uM)]
+    beta: float = 9.11e-3  # Conversion factor for thrombin [nmol/U]
+
+    # --- Agonist Synthesis & Inactivation ---
+    lambda_adp: float = 2.4e-8  # Released ADP per activated platelet [nmol/plt] (renamed from lambda)
+    s_t: float = 9.5e-12  # Rate of synthesis of TxA2 [nmol/(s*plt)]
+    k_i: float = 0.0161  # Rate of TxA2 inactivation [1/s]
+
+    # --- Fibrin Kinetics ---
+    kfi: float = 59.0  # Reaction rate fibrinogen [1/s]
+    kmfi: float = 3.16  # Rate constant fibrin reaction [uM]
+
+    # --- Surface Parameters & Diffusion ---
+    Minf: float = 7.0e6  # Total deposition capacity / max surface saturation [plt/cm^2]
+    d_RBC: float = 5.5e-4  # Keller diffusion coefficient proxy (RBC diameter) [cm]
+
+    # Diffusion Coefficients [cm^2/s]
+    D_RP: float = 1.58e-9  # Resting platelets
+    D_AP: float = 1.58e-9  # Activated platelets
+    D_APR: float = 2.57e-6  # ADP agonist
+    D_APS: float = 2.14e-6  # TxA2 agonist
+    D_PT: float = 3.32e-7  # Prothrombin
+    D_T: float = 4.16e-7  # Thrombin
+    D_AT: float = 3.49e-7  # Antithrombin
+    D_FI: float = 2.47e-7  # Fibrin
+    D_FG: float = 3.10e-7  # Fibrinogen
+
+    # --- Curriculum Learning Bounds ---
+    mu_ratio_init: float = 2.0
+    mu_ratio_max: float = 80.0
+
+    def __post_init__(self):
+        """Validate constraints on biochemical properties if needed."""
+        if self.mu_ratio_max <= self.mu_ratio_init:
+            raise ValueError("mu_ratio_max must be strictly greater than mu_ratio_init")
