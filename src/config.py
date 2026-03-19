@@ -27,9 +27,9 @@ class VesselConfig:
 
     # Vessel Dimensions
     base_length: float = 0.015
-    width_min: float = 0.0012
-    width_max: float = 0.0018
-    curvature_amplitude: float = 0.0035
+    width_min: float = 0.0015
+    width_max: float = 0.0025
+    curvature_amplitude: float = 0.0025
 
     # Pathology Constraints
     stenosis_factor_min: float = 0.1
@@ -52,8 +52,8 @@ class PhysicsConfig:
     tier: str = "tier1"
 
     # Fluid Properties
-    rho: float = 1050.0  # kg/m^3
-    re_target: float = 150.0  # Reynolds number [-]
+    rho: float = 1106  # kg/m^3
+    re_target: float = 75  # Reynolds number [-]
 
     viscosity_model: str = field(init=False)
     mu_ref: float = field(init=False)
@@ -63,9 +63,9 @@ class PhysicsConfig:
 
     # Relaxed Carreau-Yasuda Rheology (Mild Shear-Thinning Proxy)
     mu_inf: float = 0.0035  # Pa*s
-    mu_0: float = 0.0150  # Pa*s (Reduced from 0.056)
-    lam: float = 0.1  # Relaxation time in s (Reduced from 3.313)
-    n: float = 0.5  # Power law index
+    mu_0: float = 0.056  # Pa*s (Un-Reduced from 0.056 - check if values still converge)
+    lam: float = 3.313  # Relaxation time in s (Reduced from 3.313 - check if values still converge)
+    n: float = 0.358  # Power law index (reduced from .5 - check if vlaues still converge)
     a: float = 2.0  # Yasuda parameter
 
     def __post_init__(self):
