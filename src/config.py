@@ -6,7 +6,7 @@ from pathlib import Path
 
 @dataclass
 class VesselConfig:
-    """Central configuration for vessel geometry and mesh generation (SI Units: m)."""
+    """Central configuration for vessel geometry and mesh generation."""
     tier: str = "tier1"
     project_root: Path = field(default_factory=get_project_root)
     template_path: Path = field(init=False)
@@ -30,13 +30,13 @@ class VesselConfig:
 
     # Mesh Settings
     mesh_size_factor: float = 0.75
-    mesh_lc: float = 0.00008
+    mesh_lc: float = 0.00008  # [m]
 
-    # Vessel Dimensions (Scaled for Portal Vein)
-    base_length: float = 0.15
-    width_min: float = 0.008
-    width_max: float = 0.02
-    curvature_amplitude: float = 0.0025
+    # Vessel Dimensions
+    base_length: float = 0.015  # [m]
+    width_min: float = 0.008  # [m]
+    width_max: float = 0.02  # [m]
+    curvature_amplitude: float = 0.0025  # [m]
 
     # Pathology Constraints
     stenosis_factor_min: float = 0.1
@@ -56,17 +56,22 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
-    """Fluid dynamics configuration (SI Units: kg, m, s, Pa)."""
+    """Configuration for physical properties and fluid dynamics."""
     tier: str = "tier1"
-    rho: float = 1106  # kg/m^3
+
+    # Fluid Properties
+    rho: float = 1106.0  # [kg/m^3]
     re_target: float = 450  # Reynolds number [-]
 
     viscosity_model: str = field(init=False)
     mu_ref: float = field(init=False)
 
-    # Carreau-Yasuda parameters (SI)
-    mu_inf: float = 0.0035  # Pa*s
-    mu_0: float = 0.056  # Pa*s
+    # Newtonian Reference (tier 1)
+    mu_newtonian: float = 0.0035  # [Pa*s]
+
+    # Relaxed Carreau-Yasuda Rheology (Mild Shear-Thinning Proxy)
+    mu_inf: float = 0.0035  # [Pa*s]
+    mu_0: float = 0.056  # [Pa*s]
     lam: float = 3.313  # Relaxation time [s]
     n: float = 0.358  # Power law index
     a: float = 2.0  # Yasuda parameter
@@ -101,55 +106,64 @@ class PhysicsConfig:
 
 @dataclass
 class BiochemConfig:
-    """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations [SI units]"""
+    """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations."""
     tier: str = "tier3"
 
     # --- Initial Concentrations ---
-    # plt/m^3
-    # mol/m^3
-    c_RP0: float = 2.5e14  # 2.5e8 plt/ml
-    c_pT0: float = 0.0012  # 1.2 uM
-    c_Fg0: float = 0.007  # 7.0 uM
-    cAT0: float = 0.00284  # 2.84 uM
+    c_RP0: float = 2.5e14  # Initial resting platelets [plt/m^3]
+    c_pT0: float = 1.2e-3  # Initial prothrombin concentration [mol/m^3]
+    c_Fg0: float = 7.0e-3  # Initial fibrinogen concentration [mol/m^3]
+    cAT0: float = 2.84e-3  # Initial/Static background antithrombin concentration [mol/m^3]
 
-    # --- Agonist Critical Thresholds (mol/m^3) ---
-    APScrit: float = 0.0006
-    APRcrit: float = 0.002
-    Tcrit: float = 5.0e-7
+    # --- Agonist Critical Thresholds ---
+    APScrit: float = 0.6e-3  # Thromboxane critical concentration [mol/m^3]
+    APRcrit: float = 2.0e-3  # ADP critical concentration for activation [mol/m^3]
+    Tcrit: float = 5.0e-7  # Thrombin concentration for activation [mol/m^3]
 
-    # --- Activation & Adhesion Constants (m/s) ---
-    t_act: float = 1.0
-    shear_crit: float = 10000.0
-    k_rs: float = 0.000037  # 3.7e-5 m/s
-    k_as: float = 0.00045  # 4.5e-4 m/s
+    # --- Activation & Adhesion Constants ---
+    t_act: float = 1.0  # Activation time [s]
+    shear_crit: float = 10000.0  # Threshold for mechanical activation [1/s]
+    k_rs: float = 3.7e-5  # Resting adhesion rate [m/s]
+    k_as: float = 4.5e-4  # Activated adhesion rate [m/s]
 
     # --- Thrombin Generation & Inhibition ---
-    k_1t: float = 13.33
-    c_H: float = 0.00025  # mol/m^3
-    phi_at: float = 3.69e-6  # Adjusted for mol/m^3 in denominator
-    phi_rt: float = 6.5e-7  # Adjusted for mol/m^3 in denominator
-    beta: float = 9.11e-12  # mol/U
+    k_1t: float = 13.33  # Rate constant for AT [1/s]
+    c_H: float = 0.25e-3  # Heparin concentration [mol/m^3]
+    K_at: float = 0.1e-3  # Dissociation constant heparin-AT [mol/m^3]
+    K_T: float = 0.035e-3  # Dissociation constant heparin-Thrombin [mol/m^3]
+    phi_at: float = 3.69e-6  # Thrombin generation rate (activated) [U/(plt*s*(mol/m^3))]
+    phi_rt: float = 6.5e-7  # Thrombin generation rate (resting) [U/(plt*s*(mol/m^3))]
+    beta: float = 9.11e-12  # Conversion factor for thrombin [mol/U]
 
     # --- Agonist Synthesis & Inactivation ---
-    lambda_adp: float = 2.4e-17  # mol/plt
-    s_t: float = 9.5e-21  # mol/(s*plt)
-    k_i: float = 0.0161
+    lambda_adp: float = 2.4e-17  # Released ADP per activated platelet [mol/plt]
+    s_t: float = 9.5e-21  # Rate of synthesis of TxA2 [mol/(s*plt)]
+    k_i: float = 0.0161  # Rate of TxA2 inactivation [1/s]
 
     # --- Fibrin Kinetics ---
-    kfi: float = 59.0
-    kmfi: float = 0.00316  # 3.16 mol/m^3
+    kfi: float = 59.0  # Reaction rate fibrinogen [1/s]
+    kmfi: float = 3.16e-3  # Rate constant fibrin reaction [mol/m^3]
 
-    # --- Surface Parameters & Diffusion (m and m^2/s) ---
-    Minf: float = 7.0e10  # 7.0e6 plt/cm^2 -> 7.0e10 plt/m^2
-    d_RBC: float = 5.5e-6  # 5.5e-4 cm -> 5.5e-6 m
+    # --- Surface Parameters & Diffusion ---
+    Minf: float = 7.0e10  # Total deposition capacity / max surface saturation [plt/m^2]
+    d_RBC: float = 5.5e-6  # Keller diffusion coefficient proxy (RBC diameter) [m]
 
-    # Diffusion Coefficients: m^2/s
-    D_RP: float = 1.58e-13
-    D_AP: float = 1.58e-13
-    D_APR: float = 2.57e-10
-    D_APS: float = 2.14e-10
-    D_PT: float = 3.32e-11
-    D_T: float = 4.16e-11
-    D_AT: float = 3.49e-11
-    D_FI: float = 2.47e-11
-    D_FG: float = 3.10e-11
+    # Diffusion Coefficients [m^2/s]
+    D_RP: float = 1.58e-13  # Resting platelets
+    D_AP: float = 1.58e-13  # Activated platelets
+    D_APR: float = 2.57e-10  # ADP agonist
+    D_APS: float = 2.14e-10  # TxA2 agonist
+    D_PT: float = 3.32e-11  # Prothrombin
+    D_T: float = 4.16e-11  # Thrombin
+    D_AT: float = 3.49e-11  # Antithrombin
+    D_FI: float = 2.47e-11  # Fibrin
+    D_FG: float = 3.10e-11  # Fibrinogen
+
+    # --- Curriculum Learning Bounds ---
+    mu_ratio_init: float = 2.0
+    mu_ratio_max: float = 80.0
+
+    def __post_init__(self):
+        """Validate constraints on biochemical properties if needed."""
+        if self.mu_ratio_max <= self.mu_ratio_init:
+            raise ValueError("mu_ratio_max must be strictly greater than mu_ratio_init")
