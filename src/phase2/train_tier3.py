@@ -19,14 +19,19 @@ from src.phase1.utils.metrics import DynamicLossWeighter
 
 
 def load_dataset():
-    cfg = VesselConfig(tier="tier3")
+    # Update tier to match the PatientDataExtractor configuration
+    cfg = VesselConfig(tier="tier3_patients")
     data_dir = cfg.graph_output_dir
+
     if not data_dir.exists():
         print(f"Directory not found: {data_dir}. Please generate Tier 3 data first.")
         return []
+
+    # Update glob pattern to find files without the "vessel_" prefix
     file_list = sorted(list(data_dir.glob("*.pt")))
+
     dataset = []
-    print(f"📂 Loading {len(file_list)} Tier 3 graphs...")
+    print(f"📂 Loading {len(file_list)} Tier 3 patient graphs...")
     for f in tqdm(file_list):
         data = torch.load(f, weights_only=False)
         dataset.append(data)
