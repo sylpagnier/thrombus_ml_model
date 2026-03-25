@@ -11,8 +11,9 @@ from pathlib import Path
 
 from src.utils.paths import get_project_root
 from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
+from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
 from src.phase1.physics.physics_kernels import PhysicsKernels
-from src.config import VesselConfig, PhysicsConfig
+from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import DynamicLossWeighter
@@ -68,13 +69,13 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
 
 def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device):
     # 1. Forward Pass
-    out = model(data, solver=current_solver)
+    out = model(data)
     pred, jac_loss = out if isinstance(out, tuple) else (out, torch.tensor(0.0))
 
     # 2. Extract Fields (Based on COMSOL 9+2 mapping)
     velocity_fields = pred[:, 0:2]  # [u, v]
     biochem_preds = pred[:, 4:13]  # [RP...FI] (9 species)
-    wall_preds = pred[:, 13:15]  # [M, M_active] (2 surface species)
+    wall_preds = pred[:, 13:16]  # [M, Mas, Mat] (3 surface species)
 
     spatial_props = kernels.core._get_geometric_props(data)
     mask_wall = data.mask_wall.view(-1).bool()
@@ -95,7 +96,7 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
 
 
 def calculate_validation_metrics(pred, data, kernels, device):
-    props = kernels._get_geometric_props(data)
+    props = kernels.core._get_geometric_props(data)
 
     # --- Morphological Metric: Clot Dice Coefficient ---
     mu_eff = pred[:, 3]
@@ -118,8 +119,8 @@ def calculate_validation_metrics(pred, data, kernels, device):
 
         if patent_wall_mask.any():
             # Compute Predicted WSS
-            c_u = kernels._compute_derivatives(pred[:, 0:1], props)
-            c_v = kernels._compute_derivatives(pred[:, 1:2], props)
+            c_u = kernels.core._compute_derivatives(pred[:, 0:1], props)
+            c_v = kernels.core._compute_derivatives(pred[:, 1:2], props)
             dudx_p, dudy_p = c_u[:, 0, 0], c_u[:, 1, 0]
             dvdx_p, dvdy_p = c_v[:, 0, 0], c_v[:, 1, 0]
 
@@ -136,8 +137,8 @@ def calculate_validation_metrics(pred, data, kernels, device):
             wss_pred = torch.sqrt((tx_p - tn_p * nx) ** 2 + (ty_p - tn_p * ny) ** 2 + 1e-8)
 
             # Compute Target WSS
-            c_u_t = kernels._compute_derivatives(data.y[:, 0:1], props)
-            c_v_t = kernels._compute_derivatives(data.y[:, 1:2], props)
+            c_u_t = kernels.core._compute_derivatives(data.y[:, 0:1], props)
+            c_v_t = kernels.core._compute_derivatives(data.y[:, 1:2], props)
             dudx_t, dudy_t = c_u_t[:, 0, 0], c_u_t[:, 1, 0]
             dvdx_t, dvdy_t = c_v_t[:, 0, 0], c_v_t[:, 1, 0]
 
@@ -167,9 +168,11 @@ def train_tier3(epochs=50, lr=1e-3):
     print(f"Device being used: {device}")
 
     phys_cfg = PhysicsConfig(tier="tier3", re_target=150.0)
-    kernels = PhysicsKernels(phys_cfg=phys_cfg)
+    bio_cfg = BiochemConfig(tier="tier3")
+    core_kernels = PhysicsKernels(phys_cfg=phys_cfg)
+    kernels = BiochemPhysicsKernels(biochem_cfg=bio_cfg, core_physics_kernels=core_kernels)
 
-    model = GINO_DEQ_Tier3(in_channels=15, latent_dim=64, max_outer_iters=3, max_inner_iters=15).to(device)
+    model = GINO_DEQ_Tier3(in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=15).to(device)
 
     # 1. Load Tier 2 Checkpoint (Frozen Kinematic Backbone)
     root = get_project_root()
@@ -190,6 +193,7 @@ def train_tier3(epochs=50, lr=1e-3):
     dataset = load_dataset()
     if not dataset: return
 
+    # Separate anchors (labeled) and physics-only (unlabeled)
     anchors = [d for d in dataset if d.is_anchor.item()]
     physics = [d for d in dataset if not d.is_anchor.item()]
 
@@ -197,18 +201,28 @@ def train_tier3(epochs=50, lr=1e-3):
     random.shuffle(anchors)
     random.shuffle(physics)
 
-    split_idx_a = int(0.9 * len(anchors))
-    split_idx_p = int(0.9 * len(physics))
-
-    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
-    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    # ADJUSTED SPLIT: Ensure at least 1 graph in validation if dataset is very small
+    if len(dataset) == 1:
+        print("⚠️ Only one patient graph found. Using it for both Training and Validation.")
+        train_data = dataset
+        val_data = dataset
+    else:
+        split_idx_a = int(0.9 * len(anchors))
+        split_idx_p = int(0.9 * len(physics))
+        train_data = anchors[:split_idx_a] + physics[:split_idx_p]
+        val_data = anchors[split_idx_a:] + physics[split_idx_p:]
 
     micro_batch_size = 2
     accumulation_steps = 4
 
-    sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
-    loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
-    val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
+    # Handle single-patient case (usually just for quick testing)
+    if len(train_data) < micro_batch_size:
+        loader = DataLoader(train_data, batch_size=1, shuffle=True)
+        val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
+    else:
+        sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
+        loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
+        val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
 
     optimizer = setup_tier3_optimization(model, loss_weighter, base_lr=lr)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
@@ -225,7 +239,7 @@ def train_tier3(epochs=50, lr=1e-3):
             progress = (epoch - 10) / max(1, (epochs - 11))
             current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
 
-        model.mu_ratio = current_mu_ratio
+        model.mu_ratio_max = current_mu_ratio
 
         print(f"\n⏳ Epoch {epoch:02d} | mu_ratio Curriculum: {current_mu_ratio:.2f}x")
 
@@ -275,7 +289,7 @@ def train_tier3(epochs=50, lr=1e-3):
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    v_pred = model(v_data, solver="anderson", anderson_beta=1.0)
+                    v_pred = model(v_data, anderson_beta=1.0)
                     if isinstance(v_pred, tuple): v_pred = v_pred[0]
 
                     d, p = calculate_validation_metrics(v_pred, v_data, kernels, device)

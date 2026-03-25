@@ -159,46 +159,106 @@ class BiochemPhysicsKernels:
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
         return pseudo_huber_loss
 
-    def compute_adr_loss(self, species_preds, velocity_field, spatial_props):
-        """Computes Advection-Diffusion-Reaction (L_ADR) residuals for ALL 8 species."""
+    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props):
+        """Computes Advection-Diffusion-Reaction (L_ADR) residuals."""
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
-        keys = ['RP', 'AP', 'APR', 'APS', 'T', 'AT', 'FG', 'FI']
-        species_dict = {keys[i]: species_preds[..., i] for i in range(8)}
+        # FIX: Explicitly include 'PT' at index 4 to prevent downstream array shifting!
+        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
+        species_dict = {keys[i]: species_preds[..., i] for i in range(len(keys))}
 
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
 
         adr_losses = {}
         total_adr_loss = 0.0
 
-        for i, key in enumerate(keys):
+        # Only compute ADR for the 8 active species (ignoring the passive PT)
+        active_keys = ['RP', 'AP', 'APR', 'APS', 'T', 'AT', 'FG', 'FI']
+
+        for key in active_keys:
             C = species_dict[key]
             D = self.D_coeff[key]
             R = reaction_terms[key]
 
             grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
-            dC_dx, dC_dy = grad_C[..., 0], grad_C[..., 1]
+
+            # Extract 1st derivatives (Index 0 = dx, Index 1 = dy)
+            dC_dx, dC_dy = grad_C[:, 0, 0], grad_C[:, 1, 0]
             advection = u * dC_dx + v * dC_dy
 
-            grad_C_x = self.core._compute_derivatives(dC_dx.unsqueeze(1), spatial_props)[..., 0]
-            grad_C_y = self.core._compute_derivatives(dC_dy.unsqueeze(1), spatial_props)[..., 1]
-            diffusion = D * (grad_C_x + grad_C_y)
+            # Extract 2nd derivatives directly (Index 2 = dxx, Index 4 = dyy)
+            dC_dxx, dC_dyy = grad_C[:, 2, 0], grad_C[:, 4, 0]
+            diffusion = D * (dC_dxx + dC_dyy)
 
             residual = advection - diffusion - R
             loss_c = torch.mean(residual ** 2)
             adr_losses[key] = loss_c
             total_adr_loss += loss_c
 
-        return total_adr_loss, adr_losses
+        return total_adr_loss
+
+    def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, mask_wall):
+        """
+        Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary.
+        Calculates the steady-state residual for M, Mas, and Mat.
+        """
+        if not mask_wall.any():
+            return torch.tensor(0.0, device=biochem_preds.device)
+
+        # 1. Extract Bulk Species at the Wall
+        RP_wall = biochem_preds[mask_wall, 0]
+        AP_wall = biochem_preds[mask_wall, 1]
+
+        # We need local agonists to compute surface activation (k_pa)
+        APR_wall = biochem_preds[mask_wall, 2]
+        APS_wall = biochem_preds[mask_wall, 3]
+        T_wall = biochem_preds[mask_wall, 5]  # T is index 5 (after PT)
+
+        # 2. Extract Surface Species
+        M = wall_preds[mask_wall, 0]
+        Mas = wall_preds[mask_wall, 1]
+        Mat = wall_preds[mask_wall, 2]
+
+        # 3. Compute Available Binding Sites (Saturation constraint)
+        M_tot = M + Mas + Mat
+        Minf = self.cfg.Minf
+
+        # Soft-clamp to prevent negative availability during early training
+        availability = torch.clamp(1.0 - (M_tot / Minf), min=0.0, max=1.0)
+
+        # 4. Compute Local Surface Activation Rate (k_pa)
+        u_wall = velocity_field[mask_wall, 0]
+        v_wall = velocity_field[mask_wall, 1]
+        # Shear rate requires the full field to compute gradients, so we compute globally and mask
+        global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props)
+        shear_wall = global_shear[mask_wall]
+
+        omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
+        k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
+
+        # 5. Steady-State Residual Equations (Target = 0)
+        # Residual M: Deposition of RP minus activation of M into Mat
+        R_M = (self.cfg.k_rs * RP_wall * availability) - (k_pa_wall * M)
+
+        # Residual Mas: Direct deposition of AP
+        R_Mas = self.cfg.k_as * AP_wall * availability
+
+        # Residual Mat: Activation of previously resting wall platelets
+        R_Mat = k_pa_wall * M
+
+        # Calculate MSE loss for the residuals
+        loss_wall = torch.mean(R_M ** 2 + R_Mas ** 2 + R_Mat ** 2)
+
+        return loss_wall
 
     def _compute_shear_rate(self, u, v, spatial_props):
         """Helper to extract scalar shear rate magnitude from velocity fields."""
         c_u = self.core._compute_derivatives(u.unsqueeze(1), spatial_props)
         c_v = self.core._compute_derivatives(v.unsqueeze(1), spatial_props)
 
-        du_dx, du_dy = c_u[..., 0], c_u[..., 1]
-        dv_dx, dv_dy = c_v[..., 0], c_v[..., 1]
+        du_dx, du_dy = c_u[:, 0, 0], c_u[:, 1, 0]
+        dv_dx, dv_dy = c_v[:, 0, 0], c_v[:, 1, 0]
 
         gamma_dot = torch.sqrt(2 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2 + 1e-8)
         return gamma_dot

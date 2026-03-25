@@ -342,11 +342,15 @@ class PatientDataExtractor:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            is_anchor=torch.tensor([True], dtype=torch.bool),
             d_bar=torch.tensor([d_bar], dtype=torch.float32),
             u_ref=torch.tensor([u_ref], dtype=torch.float32),
             G_x=G_x,
             G_y=G_y,
-            Laplacian=Laplacian
+            Laplacian=Laplacian,
+            V=V,
+            W=W,
+            M_inv=M_inv
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")

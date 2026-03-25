@@ -31,8 +31,7 @@ class GINO_DEQ_Tier3(nn.Module):
         # ==========================================
         # 1. KINEMATICS BACKBONE (FROZEN)
         # ==========================================
-        # Kinematics takes u, v, p + mu_eff (4 channels)
-        # FIXED: Changed in_channels/out_channels to in_features/out_features
+        # Kinematics takes u, v, p + mu_eff (4 features)
         self.kin_encoder = SpectralLinear(in_features=4, out_features=latent_dim)
         self.kin_processor = GINOBlock(latent_dim)
         self.kinematics_decoder = SpectralLinear(in_features=latent_dim, out_features=3)
@@ -40,13 +39,11 @@ class GINO_DEQ_Tier3(nn.Module):
         # ==========================================
         # 2. BIOCHEMISTRY SOLVER
         # ==========================================
-        # Biochemistry takes 12 species + newly updated kinematics (u, v, p)
-        # FIXED: Changed in_channels/out_channels to in_features/out_features
+        # Biochemistry takes 12 species + newly updated kinematics (u, v, p) (15 features)
         self.bio_encoder = SpectralLinear(in_features=in_channels + 3, out_features=latent_dim)
         self.bio_processor = GINOBlock(latent_dim)
 
         # Decoder strictly matched to the updated 12 species count
-        # FIXED: Changed in_channels/out_channels to in_features/out_features
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
     def mu1_sigmoid(self, mat):
@@ -58,19 +55,42 @@ class GINO_DEQ_Tier3(nn.Module):
         return self.mu_ratio_max * torch.sigmoid((fi - self.fi_crit) / self.temp_fi)
 
     def forward(self, batch, anderson_beta=1.0, anderson_warmup=5):
-        kin_init = batch['kin_inputs']  # (B, 3, ...) u, v, p
-        bio_init = batch['bio_inputs']  # (B, 12, ...) the 12 species
-        mu_cy = batch['mu_cy']  # (B, 1, ...) Base Carreau-Yasuda viscosity
-        wall_mask = batch['wall_mask']  # (B, 1, ...) Wall boundary identifier
+        # 1. Extract dimensions natively and FORCE standard integer type
+        num_nodes = int(batch.x.shape[0])
+        device = batch.x.device
 
-        B = kin_init.shape[0]
-        spatial_dims = kin_init.shape[2:]
+        # 2. Setup Initial Guesses & Boundary Conditions
+        # (Pass dimensions directly rather than as a tuple)
+        kin_init = torch.zeros(num_nodes, 3, dtype=torch.float32, device=device)  # u, v, p
+        bio_init = torch.zeros(num_nodes, 12, dtype=torch.float32, device=device)  # 12 species
 
-        z_kin = torch.zeros((B, self.latent_dim, *spatial_dims), device=kin_init.device)
-        z_bio = torch.zeros((B, self.latent_dim, *spatial_dims), device=kin_init.device)
+        # torch.full still requires a tuple or list for the size parameter
+        mu_cy = torch.full((num_nodes, 1), 0.0035, dtype=torch.float32, device=device)
+
+        # Wall mask formatted for element-wise multiplication
+        wall_mask = batch.mask_wall.view(-1, 1).float()
+
+        # Initialize hidden states
+        z_kin = torch.zeros(num_nodes, self.latent_dim, device=device)
+        z_bio = torch.zeros(num_nodes, self.latent_dim, device=device)
 
         # Initialize Effective Viscosity
         mu_eff = mu_cy.clone()
+
+        # Helper to pass all required topology and modulation args to GINOBlock
+        def apply_processor(processor, x):
+            # 1. Get batch indices
+            batch_idx = batch.batch if hasattr(batch, 'batch') and batch.batch is not None else torch.zeros(num_nodes,
+                                                                                                            dtype=torch.long,
+                                                                                                            device=device)
+
+            # 2. Match PyG's expected edge dimensions for the unused modulators
+            num_edges = int(batch.edge_index.shape[1])
+            mod_adv = torch.zeros(num_edges, 1, dtype=torch.float32, device=device)
+            mod_rheo = torch.zeros(num_edges, 1, dtype=torch.float32, device=device)
+
+            # 3. Call GINOBlock with its strict signature
+            return processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo)
 
         # ==========================================
         # BLOCK-SEIDEL OUTER LOOP
@@ -79,11 +99,10 @@ class GINO_DEQ_Tier3(nn.Module):
 
             # --- 1. Kinematics Inner Loop ---
             def f_kinematics(z):
-                kin_in = torch.cat([kin_init, mu_eff], dim=1)
-                return self.kin_processor(self.kin_encoder(kin_in) + z)
+                kin_in = torch.cat([kin_init, mu_eff], dim=-1)
+                return apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z)
 
             with torch.no_grad():
-                # Simplified loop iteration (can be replaced with Anderson Acceleration)
                 for _ in range(self.max_inner_iters):
                     z_kin = f_kinematics(z_kin)
 
@@ -91,8 +110,8 @@ class GINO_DEQ_Tier3(nn.Module):
 
             # --- 2. Biochemistry Inner Loop ---
             def f_biochem(z):
-                bio_in = torch.cat([bio_init, u_v_p.detach()], dim=1)
-                return self.bio_processor(self.bio_encoder(bio_in) + z)
+                bio_in = torch.cat([bio_init, u_v_p.detach()], dim=-1)
+                return apply_processor(self.bio_processor, self.bio_encoder(bio_in) + z)
 
             with torch.no_grad():
                 for _ in range(self.max_inner_iters):
@@ -100,23 +119,20 @@ class GINO_DEQ_Tier3(nn.Module):
 
             current_species = self.biochem_decoder(z_bio)
 
-            # Zero out surface species away from the wall
+            # Zero out surface species (M, Mas, Mat) away from the wall
             current_species[:, 9:12] = current_species[:, 9:12] * wall_mask
 
             # --- 3. Dual-Trigger Rheology Update ---
-            # Index 8 corresponds to FI (9th bulk species)
-            # Index 9 corresponds to Mat (1st surface species)
-            FI = current_species[:, 8:9, ...]
-            Mat = current_species[:, 9:10, ...]
+            FI = current_species[:, 8:9]  # 9th bulk species
+            Mat = current_species[:, 11:12]
 
-            # Implement dual ramp logic natively as derived from COMSOL
             mu_eff = mu_cy * (self.mu1_sigmoid(Mat) + self.mu2_sigmoid(FI))
 
         # ==========================================
         # FINAL DECODING & LOSS PREPARATION
         # ==========================================
         if self.training:
-            # Re-engage autograd graph for the final pass
+            # Re-engage autograd graph for the final pass to calculate loss
             z_kin = f_kinematics(z_kin)
             u_v_p = self.kinematics_decoder(z_kin)
 
@@ -124,12 +140,13 @@ class GINO_DEQ_Tier3(nn.Module):
             final_species = self.biochem_decoder(z_bio)
             final_species[:, 9:12] = final_species[:, 9:12] * wall_mask
 
-            FI = final_species[:, 8:9, ...]
-            Mat = final_species[:, 9:10, ...]
+            FI = final_species[:, 8:9]
+            Mat = final_species[:, 11:12]
             mu_eff = mu_cy * (self.mu1_sigmoid(Mat) + self.mu2_sigmoid(FI))
         else:
             final_species = current_species
 
-        pred = torch.cat([u_v_p, mu_eff, final_species], dim=1)
+        # Combine into a single [Nodes, 16] output tensor: u, v, p, mu, 12x species
+        pred = torch.cat([u_v_p, mu_eff, final_species], dim=-1)
 
         return pred
