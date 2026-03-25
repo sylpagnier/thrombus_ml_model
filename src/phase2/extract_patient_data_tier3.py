@@ -207,9 +207,9 @@ class PatientDataExtractor:
     def process_patient(self, stem):
         msh_path = self.raw_dir / f"{stem}.msh"
         json_path = self.raw_dir / f"{stem}.json"
-        csv_path = self.label_dir / f"{stem}.csv"
+        txt_path = self.label_dir / f"{stem}.txt"
 
-        if not (msh_path.exists() and csv_path.exists()):
+        if not (msh_path.exists() and txt_path.exists()):
             return
 
         print(f"Processing patient: {stem}...")
@@ -237,21 +237,17 @@ class PatientDataExtractor:
         row, col = edge_index
 
         # 2. Eulerian Mapping (1:1 Constraint)
-        # Read the entire CSV first to handle COMSOL's formatting quirks
-        df_csv = pd.read_csv(csv_path)
+        # Read the .txt file: treat any whitespace as a separator and ignore COMSOL's '%' comments
+        df_csv = pd.read_csv(txt_path, sep=r'\s+', comment='%', header=None)
 
-        # Clean COMSOL headers: remove '%', drop units like '(m/s)', and strip whitespace
-        df_csv.columns = [str(col).replace('%', '').split('(').strip() for col in df_csv.columns]
+        # Manually assign columns in the exact order COMSOL exported them
+        # Note: COMSOL duplicates x and y at the start of spatial datasets
+        df_csv.columns = [
+            'x_orig', 'y_orig', 'x', 'y', 'u', 'v', 'p', 'mu_effective',
+            'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
+        ]
 
-        # Map COMSOL's default variable names to your internal pipeline names
-        rename_map = {
-            'spf.u': 'u',
-            'spf.v': 'v',
-            'spf.mu': 'mu_effective'
-        }
-        df_csv.rename(columns=rename_map, inplace=True)
-
-        # Filter down to just the expected columns
+        # Filter down to just the columns expected by the ML pipeline
         expected_cols = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
         df_csv = df_csv[expected_cols]
 
