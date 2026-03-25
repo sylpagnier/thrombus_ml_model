@@ -325,12 +325,15 @@ class PatientDataExtractor:
         species_cols = list(self.species_map.keys())
         species = torch.tensor(df_matched[species_cols].values, dtype=torch.float32)
 
+        eps = 1e-8
+        species_log = torch.log(torch.clamp(species, min=eps))
+
         y_tensor = torch.cat([
             u.unsqueeze(1),
             v.unsqueeze(1),
             p_relative.unsqueeze(1),
             mu_eff.unsqueeze(1),
-            species
+            species_log
         ], dim=1)
 
         # 6. PyG Data Construction
@@ -350,7 +353,10 @@ class PatientDataExtractor:
             Laplacian=Laplacian,
             V=V,
             W=W,
-            M_inv=M_inv
+            M_inv=M_inv,
+            u_inlet_bc=u.unsqueeze(1),
+            mu_inlet_bc=mu_eff.unsqueeze(1),
+            mu_wall_bc=mu_eff.unsqueeze(1)
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")

@@ -132,11 +132,15 @@ class GINO_DEQ_Tier3(nn.Module):
         # FINAL DECODING & LOSS PREPARATION
         # ==========================================
         if self.training:
-            # Re-engage autograd graph for the final pass to calculate loss
-            z_kin = f_kinematics(z_kin)
+            # Final Kinematics pass (connected to autograd)
+            kin_in = torch.cat([kin_init, mu_eff], dim=-1)
+            z_kin = apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z_kin)
             u_v_p = self.kinematics_decoder(z_kin)
 
-            z_bio = f_biochem(z_bio)
+            # Final Biochemistry pass (CRITICAL: Do NOT detach u_v_p here)
+            bio_in = torch.cat([bio_init, u_v_p], dim=-1)  # Removed .detach()
+            z_bio = apply_processor(self.bio_processor, self.bio_encoder(bio_in) + z_bio)
+
             final_species = self.biochem_decoder(z_bio)
             final_species[:, 9:12] = final_species[:, 9:12] * wall_mask
 
@@ -145,8 +149,8 @@ class GINO_DEQ_Tier3(nn.Module):
             mu_eff = mu_cy * (self.mu1_sigmoid(Mat) + self.mu2_sigmoid(FI))
         else:
             final_species = current_species
+            u_v_p = u_v_p  # from the last loop iteration
 
-        # Combine into a single [Nodes, 16] output tensor: u, v, p, mu, 12x species
+            # Combine into [Nodes, 16] output
         pred = torch.cat([u_v_p, mu_eff, final_species], dim=-1)
-
         return pred

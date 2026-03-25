@@ -69,30 +69,68 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
 
 def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device):
     # 1. Forward Pass
-    out = model(data)
-    pred, jac_loss = out if isinstance(out, tuple) else (out, torch.tensor(0.0))
+    out = model(data, anderson_beta=1.0)
+    if isinstance(out, tuple):
+        pred, jac_loss = out
+    else:
+        pred = out
+        jac_loss = torch.tensor(0.0, device=device)
 
-    # 2. Extract Fields (Based on COMSOL 9+2 mapping)
-    velocity_fields = pred[:, 0:2]  # [u, v]
-    biochem_preds = pred[:, 4:13]  # [RP...FI] (9 species)
-    wall_preds = pred[:, 13:16]  # [M, Mas, Mat] (3 surface species)
+    # Precompute spatial properties ONCE per batch
+    props = kernels.core._get_geometric_props(data)
 
-    spatial_props = kernels.core._get_geometric_props(data)
+    # 2. Extract Fields
+    velocity_fields = pred[:, 0:2]
+    biochem_preds = pred[:, 4:13]
+    wall_preds = pred[:, 13:16]
     mask_wall = data.mask_wall.view(-1).bool()
 
-    # 3. Physics-Informed Residuals (Refurbished)
-    # Replaces the old MSE placeholder with explicit COMSOL ADR physics
-    l_adr = kernels.biochem_adr_residual(biochem_preds, velocity_fields, spatial_props)
-    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, spatial_props, mask_wall)
+    # 3. Supervised Data / Anchor Loss (The Trivial Solution Killer)
+    l_data_kine = torch.tensor(0.0, device=device)
+    l_data_bio = torch.tensor(0.0, device=device)
 
-    # Kinematic Residuals (Navier-Stokes)
-    l_ns = kernels.core.navier_stokes_residual(pred[:, 0:4], data, props=spatial_props)
+    if hasattr(data, 'is_anchor'):
+        node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
+        if node_is_anchor.sum() > 0:
+            # Match Kinematics & Rheology (Channels 0-3)
+            l_data_kine = F.mse_loss(pred[node_is_anchor, :4], data.y[node_is_anchor, :4])
+            # Match Biochemistry (Channels 4-15)
+            l_data_bio = F.mse_loss(pred[node_is_anchor, 4:16], data.y[node_is_anchor, 4:16])
 
-    # 4. Balanced Backward Pass
-    losses = [l_ns, l_adr, l_wall]  # Expand as needed for Rheology/Data
-    weighted_loss = loss_weighter(losses)
+    # 4. Fluid Mechanics (Inherited from Tiers 1 & 2)
+    l_mom = kernels.core.navier_stokes_residual(pred[:, 0:4], data, props=props)
 
-    return weighted_loss + (0.1 * jac_loss), {"L_ADR": l_adr.item(), "L_Wall": l_wall.item()}
+    # Extract 1st-order gradients for Continuity
+    c_u = kernels.core._compute_derivatives(pred[:, 0:1], props)
+    c_v = kernels.core._compute_derivatives(pred[:, 1:2], props)
+    du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
+
+    l_cont = kernels.core.continuity_loss(du_ij)
+    l_rheo = kernels.core.rheology_loss(pred[:, 0:4], data, props=props)
+    l_bc = kernels.core.boundary_condition_loss(pred[:, 0:4], data)
+    l_io = kernels.core.inlet_outlet_loss(pred[:, 0:4], data)
+    l_wss = kernels.core.wall_shear_stress_loss(pred[:, 0:5], data, props=props)
+
+    # 5. Biochemistry (Tier 3 additions)
+    l_adr = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
+    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, mask_wall)
+
+    # 6. Balance & Combine (The Tier 1/2 Way)
+    # Only put the tricky physical PDEs in the dynamic weighter
+    pde_losses = [l_mom, l_cont, l_adr]
+    weighted_pdes = loss_weighter(pde_losses)
+
+    # Combine with massive static weights pushing the boundary and data constraints
+    loss = weighted_pdes + (1.0 * l_rheo) + (10.0 * l_wall) + \
+           (500.0 * l_data_kine) + (500.0 * l_data_bio) + \
+           (10.0 * l_bc) + (5.0 * l_io) + (10.0 * l_wss) + (0.1 * jac_loss)
+
+    metrics = {
+        "L_mom": l_mom.item(),
+        "L_ADR": l_adr.item(),
+        "L_Wall": l_wall.item()
+    }
+    return loss, metrics
 
 
 def calculate_validation_metrics(pred, data, kernels, device):
@@ -104,7 +142,7 @@ def calculate_validation_metrics(pred, data, kernels, device):
     pred_clot = (mu_eff > 20.0 * mu_base).float()
 
     if data.y.shape[1] > 3:
-        gt_clot = (data.y[:, 3] > 20.0 * mu_base).float()
+        gt_clot = (data.y[:, 3] > 5.0 * mu_base).float()
         intersection = (pred_clot * gt_clot).sum()
         dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
     else:
@@ -181,14 +219,27 @@ def train_tier3(epochs=50, lr=1e-3):
 
     if tier2_path.exists():
         state_dict = torch.load(tier2_path, map_location=device, weights_only=True)
-        # strict=False allows ignoring the newly initialized LoRA/Biochem parameters
-        model.load_state_dict(state_dict, strict=False)
+
+        # --- NEW: Map Tier 1/2 keys to Tier 3 kinematic keys ---
+        mapped_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('encoder'):
+                mapped_state_dict[key.replace('encoder', 'kin_encoder')] = value
+            elif key.startswith('processor'):
+                mapped_state_dict[key.replace('processor', 'kin_processor')] = value
+            elif key.startswith('decoder'):
+                mapped_state_dict[key.replace('decoder', 'kinematics_decoder')] = value
+            elif key.startswith('mu_encoder') or key.startswith('mu_decoder'):
+                pass  # Ignore standalone mu layers if they exist from Tier 2
+            else:
+                mapped_state_dict[key] = value
+
+        # Load the mapped dict
+        model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
-    else:
-        print("⚠️ Warning: Tier 2 weights not found. Backbone will be untrained!")
 
     # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=3).to(device)
 
     dataset = load_dataset()
     if not dataset: return
@@ -250,6 +301,7 @@ def train_tier3(epochs=50, lr=1e-3):
         pbar = tqdm(loader, desc=f"Tier 3 Ep {epoch:02d}")
         for batch_idx, data in enumerate(pbar):
             data = data.to(device)
+            data.x.requires_grad_(True)
 
             loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, "anderson", device)
             loss = loss / accumulation_steps
@@ -269,6 +321,7 @@ def train_tier3(epochs=50, lr=1e-3):
 
             pbar.set_postfix({
                 "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
+                "L_mom": f"{metrics['L_mom']:.3f}",
                 "L_ADR": f"{metrics['L_ADR']:.3f}",
                 "L_Wall": f"{metrics['L_Wall']:.3f}"
             })
@@ -285,7 +338,7 @@ def train_tier3(epochs=50, lr=1e-3):
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
                 print(
-                    f"⚖️ Loss Weights -> NS: {weights[0]:.2f} | Rheo: {weights[1]:.2f} | Data: {weights[2]:.2f} | ADR: {weights[3]:.2f} | Wall: {weights[4]:.2f}")
+                    f"⚖️ Dynamic PDE Weights -> Mom: {weights[0]:.2f} | Cont: {weights[1]:.2f} | ADR: {weights[2]:.2f}")
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)

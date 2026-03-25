@@ -164,9 +164,13 @@ class BiochemPhysicsKernels:
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
-        # FIX: Explicitly include 'PT' at index 4 to prevent downstream array shifting!
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
-        species_dict = {keys[i]: species_preds[..., i] for i in range(len(keys))}
+
+        # --- THE FIX: Convert log-predictions back to linear space ---
+        linear_species_preds = torch.exp(species_preds)
+
+        # Build the dictionary using the linear values
+        species_dict = {keys[i]: linear_species_preds[..., i] for i in range(len(keys))}
 
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
 
@@ -201,19 +205,21 @@ class BiochemPhysicsKernels:
     def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, mask_wall):
         """
         Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary.
-        Calculates the steady-state residual for M, Mas, and Mat.
         """
         if not mask_wall.any():
             return torch.tensor(0.0, device=biochem_preds.device)
 
-        # 1. Extract Bulk Species at the Wall
-        RP_wall = biochem_preds[mask_wall, 0]
-        AP_wall = biochem_preds[mask_wall, 1]
+        # --- THE FIX: Convert log-predictions back to linear space ---
+        linear_biochem_preds = torch.exp(biochem_preds)
+
+        # 1. Extract Bulk Species at the Wall (using the linear values)
+        RP_wall = linear_biochem_preds[mask_wall, 0]
+        AP_wall = linear_biochem_preds[mask_wall, 1]
 
         # We need local agonists to compute surface activation (k_pa)
-        APR_wall = biochem_preds[mask_wall, 2]
-        APS_wall = biochem_preds[mask_wall, 3]
-        T_wall = biochem_preds[mask_wall, 5]  # T is index 5 (after PT)
+        APR_wall = linear_biochem_preds[mask_wall, 2]
+        APS_wall = linear_biochem_preds[mask_wall, 3]
+        T_wall = linear_biochem_preds[mask_wall, 5]
 
         # 2. Extract Surface Species
         M = wall_preds[mask_wall, 0]
