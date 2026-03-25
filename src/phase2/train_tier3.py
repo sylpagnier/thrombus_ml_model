@@ -67,8 +67,13 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     ], weight_decay=1e-5)
 
 
-def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device):
-    # 1. Forward Pass
+def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device, phys_cfg):
+    # --- 1. DYNAMIC REYNOLDS NUMBER UPDATE ---
+    if hasattr(data, 're_actual'):
+        # Update the core physics config for this specific graph's scaling
+        phys_cfg.re_target = data.re_actual.mean().item()
+
+    # 2. Forward Pass
     out = model(data, anderson_beta=1.0)
     if isinstance(out, tuple):
         pred, jac_loss = out
@@ -76,31 +81,44 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
         pred = out
         jac_loss = torch.tensor(0.0, device=device)
 
-    # Precompute spatial properties ONCE per batch
     props = kernels.core._get_geometric_props(data)
 
-    # 2. Extract Fields
+    # We use data.batch to ensure proper mapping if multiple graphs are batched together
+    if hasattr(data, 'batch') and data.batch is not None:
+        props['u_ref'] = data.u_ref[data.batch]
+        props['d_bar'] = data.d_bar[data.batch]
+    else:
+        props['u_ref'] = data.u_ref
+        props['d_bar'] = data.d_bar
+
     velocity_fields = pred[:, 0:2]
     biochem_preds = pred[:, 4:13]
     wall_preds = pred[:, 13:16]
     mask_wall = data.mask_wall.view(-1).bool()
 
-    # 3. Supervised Data / Anchor Loss (The Trivial Solution Killer)
+    # 3. Supervised Data Loss (With Dual Variance Normalization)
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_bio = torch.tensor(0.0, device=device)
 
     if hasattr(data, 'is_anchor'):
         node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
         if node_is_anchor.sum() > 0:
-            # Match Kinematics & Rheology (Channels 0-3)
-            l_data_kine = F.mse_loss(pred[node_is_anchor, :4], data.y[node_is_anchor, :4])
-            # Match Biochemistry (Channels 4-15)
-            l_data_bio = F.mse_loss(pred[node_is_anchor, 4:16], data.y[node_is_anchor, 4:16])
+            # --- Kinematics Variance Normalization (Channels 0-3) ---
+            pred_kine = pred[node_is_anchor, :4]
+            targ_kine = data.y[node_is_anchor, :4]
+            # Add epsilon to prevent div by zero
+            kine_var = torch.var(targ_kine, dim=0, keepdim=True) + 1e-6
+            l_data_kine = torch.mean(((pred_kine - targ_kine) ** 2) / kine_var)
+
+            # --- Biochemistry Variance Normalization (Channels 4-15) ---
+            pred_bio = pred[node_is_anchor, 4:16]
+            targ_bio = data.y[node_is_anchor, 4:16]
+            bio_var = torch.var(targ_bio, dim=0, keepdim=True) + 1e-6
+            l_data_bio = torch.mean(((pred_bio - targ_bio) ** 2) / bio_var)
 
     # 4. Fluid Mechanics (Inherited from Tiers 1 & 2)
     l_mom = kernels.core.navier_stokes_residual(pred[:, 0:4], data, props=props)
 
-    # Extract 1st-order gradients for Continuity
     c_u = kernels.core._compute_derivatives(pred[:, 0:1], props)
     c_v = kernels.core._compute_derivatives(pred[:, 1:2], props)
     du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
@@ -115,15 +133,13 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
     l_adr = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
     l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, mask_wall)
 
-    # 6. Balance & Combine (The Tier 1/2 Way)
-    # Only put the tricky physical PDEs in the dynamic weighter
+    # 6. Balance & Combine
     pde_losses = [l_mom, l_cont, l_adr]
     weighted_pdes = loss_weighter(pde_losses)
 
-    # Combine with massive static weights pushing the boundary and data constraints
-    loss = weighted_pdes + (1.0 * l_rheo) + (10.0 * l_wall) + \
+    loss = weighted_pdes + (10.0 * l_wall) + \
            (500.0 * l_data_kine) + (500.0 * l_data_bio) + \
-           (10.0 * l_bc) + (5.0 * l_io) + (10.0 * l_wss) + (0.1 * jac_loss)
+           (10.0 * l_bc) + (5.0 * l_io) + (0.1 * jac_loss)
 
     metrics = {
         "L_mom": l_mom.item(),
@@ -139,10 +155,10 @@ def calculate_validation_metrics(pred, data, kernels, device):
     # --- Morphological Metric: Clot Dice Coefficient ---
     mu_eff = pred[:, 3]
     mu_base = 0.0035  # Approximated reference viscosity
-    pred_clot = (mu_eff > 20.0 * mu_base).float()
+    pred_clot = (mu_eff > 1000.0 * mu_base).float()
 
     if data.y.shape[1] > 3:
-        gt_clot = (data.y[:, 3] > 5.0 * mu_base).float()
+        gt_clot = (data.y[:, 3] > 1000.0 * mu_base).float()
         intersection = (pred_clot * gt_clot).sum()
         dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
     else:
@@ -288,7 +304,7 @@ def train_tier3(epochs=50, lr=1e-3):
             current_mu_ratio = 2.0
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
-            current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
+            current_mu_ratio = 2.0 + progress * (7000.0 - 2.0)
 
         model.mu_ratio_max = current_mu_ratio
 
@@ -303,7 +319,7 @@ def train_tier3(epochs=50, lr=1e-3):
             data = data.to(device)
             data.x.requires_grad_(True)
 
-            loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, "anderson", device)
+            loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, "anderson", device, phys_cfg)
             loss = loss / accumulation_steps
 
             if torch.isnan(loss):

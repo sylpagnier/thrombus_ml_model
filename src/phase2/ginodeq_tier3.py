@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from src.phase1.physics.ginodeq import GINOBlock, SpectralLinear
+import torch.nn.functional as F
 
 
 class GINO_DEQ_Tier3(nn.Module):
@@ -11,7 +12,7 @@ class GINO_DEQ_Tier3(nn.Module):
     """
 
     def __init__(self, in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=25,
-                 mu_ratio_max=80.0, mat_crit=2e7, fi_crit=0.6,
+                 mu_ratio_max=7000.0, mat_crit=2e7, fi_crit=0.6,
                  temp_mat=1e6, temp_fi=0.05, lora_rank=4, lora_alpha=1.0):
         super().__init__()
 
@@ -119,6 +120,10 @@ class GINO_DEQ_Tier3(nn.Module):
 
             current_species = self.biochem_decoder(z_bio)
 
+            # --- NEW: Enforce non-negativity ---
+            raw_species = self.biochem_decoder(z_bio)
+            current_species = F.softplus(raw_species)
+
             # Zero out surface species (M, Mas, Mat) away from the wall
             current_species[:, 9:12] = current_species[:, 9:12] * wall_mask
 
@@ -137,11 +142,14 @@ class GINO_DEQ_Tier3(nn.Module):
             z_kin = apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z_kin)
             u_v_p = self.kinematics_decoder(z_kin)
 
-            # Final Biochemistry pass (CRITICAL: Do NOT detach u_v_p here)
-            bio_in = torch.cat([bio_init, u_v_p], dim=-1)  # Removed .detach()
+            # Final Biochemistry pass
+            bio_in = torch.cat([bio_init, u_v_p], dim=-1)
             z_bio = apply_processor(self.bio_processor, self.bio_encoder(bio_in) + z_bio)
 
-            final_species = self.biochem_decoder(z_bio)
+            # Enforce non-negativity ---
+            raw_final_species = self.biochem_decoder(z_bio)
+            final_species = F.softplus(raw_final_species)
+
             final_species[:, 9:12] = final_species[:, 9:12] * wall_mask
 
             FI = final_species[:, 8:9]

@@ -12,12 +12,18 @@ class BiochemPhysicsKernels:
 
     def __init__(self, biochem_cfg, core_physics_kernels):
         self.cfg = biochem_cfg
-        self.core = core_physics_kernels  # Reference to baseline PhysicsKernels for _compute_derivatives
+        self.core = core_physics_kernels
 
-        # --- PINN Normalization Scales ---
-        # To avoid vanishing gradients, inputs are scaled up from standard SI units.
+        # --- Species Re-dimensionalization Scales ---
+        self.species_scales = torch.tensor([
+            self.cfg.c_RP0, self.cfg.c_RP0, self.cfg.APRcrit, self.cfg.APScrit,
+            self.cfg.c_pT0, self.cfg.c_pT0, self.cfg.cAT0, self.cfg.c_Fg0, self.cfg.c_Fg0,
+            self.cfg.Minf, self.cfg.Minf, self.cfg.Minf
+        ])
+
         self.D_scale = 1e4
         self.C_scale = 1e3
+        # ... (rest of init remains the same)
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
 
@@ -149,8 +155,8 @@ class BiochemPhysicsKernels:
         Computes the Pseudo-Huber regularization loss for the spatial gradients
         of the dual viscosity field. Stabilizes PINN training.
         """
-        mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * 79.0 + 1.0
-        mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * 80.0
+        mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * 6999.0 + 1.0
+        mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * 7000.0
         mu_total = mu1_mat + mu2_fi
 
         dmu_dx = self.core._compute_derivatives(mu_total.unsqueeze(1), spatial_props)
@@ -166,8 +172,16 @@ class BiochemPhysicsKernels:
 
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
 
-        # --- THE FIX: Convert log-predictions back to linear space ---
-        linear_species_preds = torch.exp(species_preds)
+        # --- Reverse log1p and re-dimensionalize ---
+        # Move scales to the correct device automatically
+        scales = self.species_scales.to(species_preds.device)
+
+        # FIX: Clamp network outputs to prevent expm1 float32 overflow (inf -> NaN)
+        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=20.0)
+
+        # expm1 reverses log1p: (e^y - 1)
+        nd_species_preds = torch.expm1(species_preds_safe)
+        linear_species_preds = nd_species_preds * scales[:9]
 
         # Build the dictionary using the linear values
         species_dict = {keys[i]: linear_species_preds[..., i] for i in range(len(keys))}
@@ -180,6 +194,12 @@ class BiochemPhysicsKernels:
         # Only compute ADR for the 8 active species (ignoring the passive PT)
         active_keys = ['RP', 'AP', 'APR', 'APS', 'T', 'AT', 'FG', 'FI']
 
+        u_ref = spatial_props['u_ref'].to(species_preds.device)
+        d_bar = spatial_props['d_bar'].to(species_preds.device)
+
+        u_raw = u * u_ref
+        v_raw = v * u_ref
+
         for key in active_keys:
             C = species_dict[key]
             D = self.D_coeff[key]
@@ -187,16 +207,24 @@ class BiochemPhysicsKernels:
 
             grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
 
-            # Extract 1st derivatives (Index 0 = dx, Index 1 = dy)
-            dC_dx, dC_dy = grad_C[:, 0, 0], grad_C[:, 1, 0]
-            advection = u * dC_dx + v * dC_dy
+            # Re-dimensionalize Spatial Derivatives (1st Order)
+            dC_dx = grad_C[:, 0, 0] / d_bar
+            dC_dy = grad_C[:, 1, 0] / d_bar
+            advection = u_raw * dC_dx + v_raw * dC_dy
 
-            # Extract 2nd derivatives directly (Index 2 = dxx, Index 4 = dyy)
-            dC_dxx, dC_dyy = grad_C[:, 2, 0], grad_C[:, 4, 0]
+            # Re-dimensionalize Spatial Derivatives (2nd Order)
+            dC_dxx = grad_C[:, 2, 0] / (d_bar ** 2)
+            dC_dyy = grad_C[:, 4, 0] / (d_bar ** 2)
             diffusion = D * (dC_dxx + dC_dyy)
 
             residual = advection - diffusion - R
-            loss_c = torch.mean(residual ** 2)
+            scale_idx = keys.index(key)
+            scale_c = scales[scale_idx]
+
+            # Non-dimensionalize the final residual before squaring
+            residual_nd = residual / (scale_c + 1e-8)
+
+            loss_c = torch.mean(residual_nd ** 2)
             adr_losses[key] = loss_c
             total_adr_loss += loss_c
 
@@ -209,8 +237,11 @@ class BiochemPhysicsKernels:
         if not mask_wall.any():
             return torch.tensor(0.0, device=biochem_preds.device)
 
-        # --- THE FIX: Convert log-predictions back to linear space ---
-        linear_biochem_preds = torch.exp(biochem_preds)
+        # --- Reverse log1p and re-dimensionalize ---
+        scales = self.species_scales.to(biochem_preds.device)
+        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=20.0)
+        nd_biochem_preds = torch.expm1(biochem_preds_safe)
+        linear_biochem_preds = nd_biochem_preds * scales[:9]  # Only bulk species passed here
 
         # 1. Extract Bulk Species at the Wall (using the linear values)
         RP_wall = linear_biochem_preds[mask_wall, 0]
@@ -222,9 +253,9 @@ class BiochemPhysicsKernels:
         T_wall = linear_biochem_preds[mask_wall, 5]
 
         # 2. Extract Surface Species
-        M = wall_preds[mask_wall, 0]
-        Mas = wall_preds[mask_wall, 1]
-        Mat = wall_preds[mask_wall, 2]
+        M = wall_preds[mask_wall, 0] * self.cfg.Minf
+        Mas = wall_preds[mask_wall, 1] * self.cfg.Minf
+        Mat = wall_preds[mask_wall, 2] * self.cfg.Minf
 
         # 3. Compute Available Binding Sites (Saturation constraint)
         M_tot = M + Mas + Mat
@@ -253,8 +284,13 @@ class BiochemPhysicsKernels:
         # Residual Mat: Activation of previously resting wall platelets
         R_Mat = k_pa_wall * M
 
-        # Calculate MSE loss for the residuals
-        loss_wall = torch.mean(R_M ** 2 + R_Mas ** 2 + R_Mat ** 2)
+        # --- Non-Dimensionalize the Wall Residuals ---
+        R_M_nd = R_M / Minf
+        R_Mas_nd = R_Mas / Minf
+        R_Mat_nd = R_Mat / Minf
+
+        # Calculate MSE loss using the normalized residuals
+        loss_wall = torch.mean(R_M_nd ** 2 + R_Mas_nd ** 2 + R_Mat_nd ** 2)
 
         return loss_wall
 

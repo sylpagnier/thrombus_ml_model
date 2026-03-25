@@ -161,7 +161,7 @@ class BiochemConfig:
 
     # --- Curriculum Learning Bounds ---
     mu_ratio_init: float = 2.0
-    mu_ratio_max: float = 80.0
+    mu_ratio_max: float = 7000.0
 
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""
