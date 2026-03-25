@@ -24,7 +24,7 @@ def load_dataset():
     if not data_dir.exists():
         print(f"Directory not found: {data_dir}. Please generate Tier 3 data first.")
         return []
-    file_list = sorted(list(data_dir.glob("vessel_*.pt")))
+    file_list = sorted(list(data_dir.glob("*.pt")))
     dataset = []
     print(f"📂 Loading {len(file_list)} Tier 3 graphs...")
     for f in tqdm(file_list):
