@@ -58,18 +58,13 @@ class PatientDataExtractor:
         self.csv_fields = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
 
     def _precompute_wls(self, edge_index, num_nodes, pos_tensor):
-        """Computes the 2nd Order Polynomial Basis and WLS Inverse Matrix."""
+        """Computes the 2nd Order Polynomial Basis, WLS Inverse, and Condition Number."""
         row, col = edge_index
         pos_diff = pos_tensor[col, :2] - pos_tensor[row, :2]
         dx, dy = pos_diff[:, 0], pos_diff[:, 1]
-
         dist_sq = dx ** 2 + dy ** 2 + 1e-8
 
-        dx2 = 0.5 * dx ** 2
-        dxy = dx * dy
-        dy2 = 0.5 * dy ** 2
-
-        V = torch.stack([dx, dy, dx2, dxy, dy2], dim=1)
+        V = torch.stack([dx, dy, 0.5 * dx ** 2, dx * dy, 0.5 * dy ** 2], dim=1)
         W = 1.0 / dist_sq
 
         V_unsqueezed = V.unsqueeze(2)
@@ -78,16 +73,19 @@ class PatientDataExtractor:
 
         M_e_flat = M_e.view(-1, 25)
         out = torch.zeros((num_nodes, 25), dtype=M_e_flat.dtype, device=M_e_flat.device)
-        row_exp = row.view(-1, 1).expand_as(M_e_flat)
-        M_flat = out.scatter_add_(0, row_exp, M_e_flat)
+        M_flat = out.scatter_add_(0, row.view(-1, 1).expand_as(M_e_flat), M_e_flat)
 
         M = M_flat.view(num_nodes, 5, 5)
         epsilon = 1e-6
-        I = torch.eye(5, dtype=M.dtype, device=M.device).unsqueeze(0).expand(num_nodes, 5, 5)
+        I = torch.eye(5, device=M.device).unsqueeze(0).expand(num_nodes, 5, 5)
         M_reg = M + epsilon * I
-        M_inv = torch.linalg.pinv(M_reg)
 
-        return V, W, M_inv.squeeze(1)
+        # --- NEW: Compute Max Condition Number for Stability Check ---
+        cond_numbers = torch.linalg.cond(M_reg)
+        max_cond = cond_numbers.max().item()
+
+        M_inv = torch.linalg.pinv(M_reg)
+        return V, W, M_inv.squeeze(1), max_cond
 
     def _precompute_sparse_operators(self, edge_index, num_nodes, M_inv, V, W):
         """Converts WLS polynomial weights into global sparse matrices."""
@@ -123,243 +121,242 @@ class PatientDataExtractor:
         return grad_f[:, :2]
 
     def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
-        """Robust KDTree spatial mapping for boundary nodes."""
+        """Robust KDTree mapping with unmapped coordinate reporting."""
         mask = torch.zeros(num_nodes, dtype=torch.bool)
+        unmapped_ratio = 0.0
+
         if not file_path.exists():
-            print(f"Warning: Boundary file missing: {file_path}")
-            return mask
+            return mask, 1.0  # 100% missing
 
-        # Load coords, grab last two columns (x, y), and drop duplicates
         bnd_df = pd.read_csv(file_path, comment='%', sep=r'\s+', header=None)
-        bnd_coords = bnd_df.iloc[:, -2:].values
-        bnd_coords = np.unique(bnd_coords, axis=0)
+        bnd_coords = np.unique(bnd_df.iloc[:, -2:].values, axis=0)
 
-        # Query KDTree
         distances, indices = tree.query(bnd_coords)
         valid_matches = indices[distances < tolerance]
+
         mask[valid_matches] = True
-        return mask
+        unmapped_ratio = 1.0 - (len(np.unique(valid_matches)) / len(bnd_coords))
+
+        return mask, unmapped_ratio
 
     def _plot_sanity_check(self, data, stem):
-        """Generates a PNG visualization of the mapped graph data to verify correctness."""
+        """Generates a PNG visualization including Velocity, Thrombin, Viscosity, and Geometry."""
         x = data.x[:, 0].numpy()
         y = data.x[:, 1].numpy()
 
-        u_vel = data.y[:, 0].numpy()
-        thrombin = data.y[:, 9].numpy()
-        sdf = data.x[:, 2].numpy()
+        # Extract fields from y_tensor indices
+        u_vel = data.y[:, 0].numpy()      # Index 0: Velocity U
+        p_rel = data.y[:, 2].numpy()      # Index 2: Pressure
+        mu_eff = data.y[:, 3].numpy()     # Index 3: Effective Viscosity
+        thrombin = data.y[:, 9].numpy()   # Index 9: Thrombin (log-scale)
+        sdf = data.x[:, 2].numpy()        # x index 2: Signed Distance Function
 
-        fig, axs = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f"Sanity Check: {stem}", fontsize=16)
+        fig, axs = plt.subplots(3, 2, figsize=(16, 18))
+        fig.suptitle(f"Sanity Check: {stem}", fontsize=18, fontweight='bold')
 
+        # 1. Mapped Velocity
         sc1 = axs[0, 0].scatter(x, y, c=u_vel, cmap='viridis', s=2)
-        axs[0, 0].set_title("Mapped Velocity (u)")
-        fig.colorbar(sc1, ax=axs[0, 0])
+        axs[0, 0].set_title("Ground Truth Velocity (u)")
+        fig.colorbar(sc1, ax=axs[0, 0], label='m/s')
 
-        sc2 = axs[0, 1].scatter(x, y, c=thrombin, cmap='plasma', s=2)
-        axs[0, 1].set_title("Mapped Thrombin (th)")
-        fig.colorbar(sc2, ax=axs[0, 1])
+        # 2. Relative Pressure
+        sc2 = axs[0, 1].scatter(x, y, c=p_rel, cmap='RdBu_r', s=2)
+        axs[0, 1].set_title("Ground Truth Pressure (Relative)")
+        fig.colorbar(sc2, ax=axs[0, 1], label='Pa')
 
-        sc3 = axs[1, 0].scatter(x, y, c=sdf, cmap='coolwarm', s=2)
-        axs[1, 0].set_title("Computed Wall Distance (SDF)")
-        fig.colorbar(sc3, ax=axs[1, 0])
+        # 3. Effective Viscosity (The new plot)
+        sc3 = axs[1, 0].scatter(x, y, c=mu_eff, cmap='magma', s=2)
+        axs[1, 0].set_title("Effective Viscosity ($\mu_{eff}$)")
+        fig.colorbar(sc3, ax=axs[1, 0], label='Pa·s')
 
-        axs[1, 1].scatter(x, y, c='gray', s=1, alpha=0.1, label='Internal')
-        axs[1, 1].scatter(x[data.mask_wall], y[data.mask_wall], c='black', s=5, label='Wall')
-        axs[1, 1].scatter(x[data.mask_inlet], y[data.mask_inlet], c='blue', s=5, label='Inlet')
-        axs[1, 1].scatter(x[data.mask_outlet], y[data.mask_outlet], c='red', s=5, label='Outlet')
-        axs[1, 1].set_title("Boundary Masks")
-        axs[1, 1].legend()
+        # 4. Thrombin Concentration
+        sc4 = axs[1, 1].scatter(x, y, c=thrombin, cmap='plasma', s=2)
+        axs[1, 1].set_title("Thrombin (Log Concentration)")
+        fig.colorbar(sc4, ax=axs[1, 1], label='log(M)')
 
+        # 5. Wall Distance (SDF)
+        sc5 = axs[2, 0].scatter(x, y, c=sdf, cmap='coolwarm', s=2)
+        axs[2, 0].set_title("Wall Distance (SDF)")
+        fig.colorbar(sc5, ax=axs[2, 0])
+
+        # 6. Boundary Masks
+        axs[2, 1].scatter(x, y, c='gray', s=1, alpha=0.05, label='Internal')
+        axs[2, 1].scatter(x[data.mask_wall], y[data.mask_wall], c='black', s=5, label='Wall')
+        axs[2, 1].scatter(x[data.mask_inlet], y[data.mask_inlet], c='blue', s=8, label='Inlet')
+        axs[2, 1].scatter(x[data.mask_outlet], y[data.mask_outlet], c='red', s=8, label='Outlet')
+        axs[2, 1].set_title("Boundary Node Verification")
+        axs[2, 1].legend(loc='upper right')
+
+        # Formatting
         for ax in axs.flat:
             ax.axis('equal')
             ax.axis('off')
 
-        plt.tight_layout()
-        plt.savefig(self.vis_dir / f"{stem}_sanity.png", dpi=150, bbox_inches='tight')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(self.vis_dir / f"{stem}_sanity.png", dpi=200, bbox_inches='tight')
         plt.close()
 
     def process_patient(self, stem):
-        # Automatically detect .nas (from COMSOL) or .msh (from Gmsh)
+        """
+        Full extraction pipeline with Physics-Informed Sanity Checks and
+        Training Metadata generation.
+        """
+        # 1. Path Setup and Mesh Loading
         msh_path_nas = self.raw_dir / f"{stem}.nas"
         msh_path_msh = self.raw_dir / f"{stem}.msh"
+        msh_path = msh_path_nas if msh_path_nas.exists() else msh_path_msh
 
-        if msh_path_nas.exists():
-            msh_path = msh_path_nas
-        elif msh_path_msh.exists():
-            msh_path = msh_path_msh
-        else:
-            print(f"\n❌ SKIPPING {stem}: Mesh file not found.")
-            print(f"   Looked for: {msh_path_nas} OR {msh_path_msh}")
+        if not msh_path.exists():
+            print(f"❌ Skipping {stem}: Mesh file (.nas/.msh) not found.")
             return
 
         json_path = self.raw_dir / f"{stem}.json"
-
-        # Paths for spatial mapping
         txt_path = self.label_dir / f"{stem}.txt"
         inlet_path = self.label_dir / f"{stem}_inlet.txt"
         outlet_path = self.label_dir / f"{stem}_outlet.txt"
         wall_path = self.label_dir / f"{stem}_wall.txt"
 
-        # Explicitly check for the main text file
         if not txt_path.exists():
-            print(f"\n❌ SKIPPING {stem}: COMSOL domain data missing.")
-            print(f"   Looked for: {txt_path}")
+            print(f"❌ Skipping {stem}: COMSOL domain data (.txt) missing.")
             return
 
-        print(f"\nProcessing patient: {stem} (Using mesh: {msh_path.name})...")
-
-        # 1. Topology & Graph Extraction
-        # meshio natively understands .nas and .msh, no extra flags needed!
+        # 2. Topology & Enhanced Boundary Mapping
         mesh = meshio.read(msh_path)
-        mesh_nodes = mesh.points[:, :2]
+        mesh_nodes = mesh.points[:, :2]  # Extract 2D coords
         num_nodes = len(mesh_nodes)
+        mesh_tree = cKDTree(mesh_nodes)
 
-        d_bar = 0.005
+        # Get masks and mapping quality metrics (Requires updated _load_spatial_mask)
+        mask_inlet, inlet_fail = self._load_spatial_mask(inlet_path, mesh_tree, num_nodes)
+        mask_outlet, outlet_fail = self._load_spatial_mask(outlet_path, mesh_tree, num_nodes)
+        mask_wall, wall_fail = self._load_spatial_mask(wall_path, mesh_tree, num_nodes)
+
+        # 3. Scale Detection (d_bar)
+        d_bar = 0.005  # Default 5mm
         if json_path.exists():
             with open(json_path, 'r') as f:
                 d_bar = json.load(f).get('d_bar', d_bar)
-
         u_ref = self.phys_cfg.get_u_ref(d_bar)
 
-        # Build KDTree on the mesh nodes for spatial boundary mapping
-        mesh_tree = cKDTree(mesh_nodes)
-
-        # Load exactly mapped PyTorch boolean tensors using our new robust method
-        mask_inlet = self._load_spatial_mask(inlet_path, mesh_tree, num_nodes)
-        mask_outlet = self._load_spatial_mask(outlet_path, mesh_tree, num_nodes)
-        mask_wall = self._load_spatial_mask(wall_path, mesh_tree, num_nodes)
-
+        # 4. Connectivity and Edge Construction
         if "triangle" in mesh.cells_dict:
             all_tris = mesh.cells_dict["triangle"]
         elif "triangle6" in mesh.cells_dict:
             all_tris = mesh.cells_dict["triangle6"][:, :3]
         else:
-            print(f"❌ Warning: No valid triangles found in {stem}'s mesh")
+            print(f"⚠️ {stem}: Unsupported cell type.")
             return
 
-        if len(all_tris) == 0: return
         edges = np.unique(np.sort(np.vstack([
             all_tris[:, [0, 1]], all_tris[:, [1, 2]], all_tris[:, [2, 0]]
         ]), axis=1), axis=0)
         edge_index = torch.tensor(np.hstack([edges.T, edges[:, [1, 0]].T]), dtype=torch.long)
         row, col = edge_index
 
-        # 2. Eulerian Mapping (1:1 Constraint)
+        # 5. Eulerian Field Mapping
         df_csv = pd.read_csv(txt_path, sep=r'\s+', comment='%', header=None)
-
+        # Assuming the standard 20-column layout from your documentation
         df_csv.columns = [
             'x_orig', 'y_orig', 'x', 'y', 'u', 'v', 'p', 'mu_effective',
             'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
         ]
-
-        expected_cols = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
-        df_csv = df_csv[expected_cols]
-
         csv_coords = df_csv[['x', 'y']].values
-
-        # Re-using a KDTree here just to align the domain CSV data perfectly to the mesh indices
         domain_tree = cKDTree(csv_coords)
-        dists, match_indices = domain_tree.query(mesh_nodes)
-        if np.max(dists) > 1e-2:
-            print(f"⚠️ Warning: Spatial mismatch detected in {stem}. Max err: {np.max(dists)}")
-
+        _, match_indices = domain_tree.query(mesh_nodes)
         df_matched = df_csv.iloc[match_indices].reset_index(drop=True)
 
-        # 3. Geometric Features (SDF & Wall Normals)
-        wall_node_indices = np.where(mask_wall.numpy())[0]
-        if len(wall_node_indices) > 0:
-            wall_pts = mesh_nodes[wall_node_indices]
-            tree_wall = KDTree(wall_pts)
-            dist_raw, indices_wall = tree_wall.query(mesh_nodes)
-            nearest_wall_pts = wall_pts[indices_wall]
-            diff_vec = mesh_nodes - nearest_wall_pts
-            norms = np.linalg.norm(diff_vec, axis=1, keepdims=True)
-            wall_normal_vec = torch.tensor(diff_vec / (norms + 1e-12), dtype=torch.float32)
-        else:
-            print(f"⚠️ CRITICAL WARNING: No wall nodes found for {stem}. SDF will be zeroed out.")
-            dist_raw = np.zeros(num_nodes)
-            wall_normal_vec = torch.zeros((num_nodes, 2), dtype=torch.float32)
-
         nodes_nd = torch.tensor(mesh_nodes / d_bar, dtype=torch.float32)
-        sdf_nd = torch.clamp(torch.tensor(dist_raw / d_bar, dtype=torch.float32).view(-1, 1), min=1e-6)
 
-        edge_attr = torch.cat([
-            nodes_nd[row] - nodes_nd[col],
-            torch.linalg.norm(nodes_nd[row] - nodes_nd[col], dim=1, keepdim=True)
-        ], dim=1)
-
-        # 4. Feature Engineering: WLS Shear Rate Gradient
-        V, W, M_inv = self._precompute_wls(edge_index, num_nodes, nodes_nd)
+        # 6. Gradients & Numerical Stability (Requires updated _precompute_wls)
+        V, W, M_inv, max_cond = self._precompute_wls(edge_index, num_nodes, nodes_nd)
         G_x, G_y, Laplacian = self._precompute_sparse_operators(edge_index, num_nodes, M_inv, V, W)
 
+        # 7. Mass Flux Proxy Calculation
         u = torch.tensor(df_matched['u'].values, dtype=torch.float32)
         v = torch.tensor(df_matched['v'].values, dtype=torch.float32)
 
-        grad_u = self._compute_gradient_wls(u, row, col, W, V, M_inv, num_nodes)
-        grad_v = self._compute_gradient_wls(v, row, col, W, V, M_inv, num_nodes)
+        # We estimate flux by summing velocity magnitude on boundary nodes
+        inlet_flux = torch.sqrt(u[mask_inlet] ** 2 + v[mask_inlet] ** 2).sum().item()
+        outlet_flux = torch.sqrt(u[mask_outlet] ** 2 + v[mask_outlet] ** 2).sum().item()
+        flux_imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + 1e-8)
 
-        du_dx, du_dy = grad_u[:, 0], grad_u[:, 1]
-        dv_dx, dv_dy = grad_v[:, 0], grad_v[:, 1]
-
-        dot_gamma = torch.sqrt(2.0 * (du_dx ** 2 + dv_dy ** 2 + 0.5 * (du_dy + dv_dx) ** 2))
-        grad_dot_gamma = self._compute_gradient_wls(dot_gamma, row, col, W, V, M_inv, num_nodes)
-
-        x_tensor = torch.cat([
-            nodes_nd,
-            sdf_nd,
-            wall_normal_vec,
-            grad_dot_gamma
-        ], dim=1)
-
-        # 5. Assemble Target Tensor (y)
+        # 8. Feature Engineering (Pressure & Species)
         p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32)
-        if mask_outlet.any():
-            p_outlet_mean = p_raw[mask_outlet].mean()
-        else:
-            p_outlet_mean = p_raw.min()
+        # Relative pressure (zeroed at outlet)
+        p_relative = p_raw - (p_raw[mask_outlet].mean() if mask_outlet.any() else p_raw.min())
 
-        p_relative = p_raw - p_outlet_mean
         mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32)
 
         species_cols = list(self.species_map.keys())
         species = torch.tensor(df_matched[species_cols].values, dtype=torch.float32)
-
-        eps = 1e-8
-        species_log = torch.log(torch.clamp(species, min=eps))
+        species_log = torch.log(torch.clamp(species, min=1e-8))
 
         y_tensor = torch.cat([
-            u.unsqueeze(1),
-            v.unsqueeze(1),
-            p_relative.unsqueeze(1),
-            mu_eff.unsqueeze(1),
-            species_log
+            u.unsqueeze(1), v.unsqueeze(1), p_relative.unsqueeze(1),
+            mu_eff.unsqueeze(1), species_log
         ], dim=1)
 
-        # 6. PyG Data Construction
+        # 9. SDF and Normals (The "Wall Knowledge")
+        wall_coords = mesh_nodes[mask_wall.numpy()]
+        if len(wall_coords) > 0:
+            wall_tree = KDTree(wall_coords)
+            dist, idx = wall_tree.query(mesh_nodes)
+            sdf = torch.tensor(dist / d_bar, dtype=torch.float32).unsqueeze(1)
+
+            # Normal vector calculation (pointing into domain)
+            nearest_wall_points = wall_coords[idx]
+            normals = mesh_nodes - nearest_wall_points
+            norm_mag = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9
+            normals_unit = torch.tensor(normals / norm_mag, dtype=torch.float32)
+        else:
+            sdf = torch.zeros((num_nodes, 1))
+            normals_unit = torch.zeros((num_nodes, 2))
+
+        x_tensor = torch.cat([nodes_nd, sdf, normals_unit], dim=1)
+
+        # 10. Metadata Export (Improved with Flux interpretation)
+        metadata = {
+            "stem": stem,
+            "quality": {
+                "max_wls_condition_number": max_cond,
+                "mass_flux_magnitude_imbalance": flux_imbalance,  # Treat as "Scale Check"
+                "boundary_unmapped_ratio": max(inlet_fail, outlet_fail, wall_fail)
+            },
+            "field_stats": {
+                "u_max": u.max().item(),
+                "p_range": [p_relative.min().item(), p_relative.max().item()],
+                "mean_log_thrombin": species_log[:, 5].mean().item()
+            }
+        }
+        with open(self.proc_dir / f"{stem}_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=4)
+
+        # 11. Final PyG Data Save (REPAIRED FOR TRAINING COMPATIBILITY)
+        # We add 'is_anchor' for the StratifiedAnchorSampler
+        # We add 'mu_wall_bc' for the wall loss in physics_kernels
         data = Data(
             x=x_tensor,
             y=y_tensor,
             edge_index=edge_index,
-            edge_attr=edge_attr,
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
-            is_anchor=torch.tensor([True], dtype=torch.bool),
+            is_anchor=torch.tensor([True], dtype=torch.bool),  # Required by Sampler
             d_bar=torch.tensor([d_bar], dtype=torch.float32),
             u_ref=torch.tensor([u_ref], dtype=torch.float32),
             G_x=G_x,
             G_y=G_y,
             Laplacian=Laplacian,
-            V=V,
-            W=W,
+            V=V,  # Kept for potential on-the-fly gradients
+            W=W,  # Kept for potential on-the-fly gradients
             M_inv=M_inv,
             u_inlet_bc=u.unsqueeze(1),
             mu_inlet_bc=mu_eff.unsqueeze(1),
-            mu_wall_bc=mu_eff.unsqueeze(1)
+            mu_wall_bc=mu_eff.unsqueeze(1)  # Required by BiochemPhysicsKernels
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
+        print(f"✅ Saved {stem}: Imbalance: {flux_imbalance:.2%}, Max Cond: {max_cond:.1e}")
 
         if self.visualize:
             self._plot_sanity_check(data, stem)
