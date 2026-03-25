@@ -237,7 +237,24 @@ class PatientDataExtractor:
         row, col = edge_index
 
         # 2. Eulerian Mapping (1:1 Constraint)
-        df_csv = pd.read_csv(csv_path, usecols=self.csv_fields)
+        # Read the entire CSV first to handle COMSOL's formatting quirks
+        df_csv = pd.read_csv(csv_path)
+
+        # Clean COMSOL headers: remove '%', drop units like '(m/s)', and strip whitespace
+        df_csv.columns = [str(col).replace('%', '').split('(').strip() for col in df_csv.columns]
+
+        # Map COMSOL's default variable names to your internal pipeline names
+        rename_map = {
+            'spf.u': 'u',
+            'spf.v': 'v',
+            'spf.mu': 'mu_effective'
+        }
+        df_csv.rename(columns=rename_map, inplace=True)
+
+        # Filter down to just the expected columns
+        expected_cols = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
+        df_csv = df_csv[expected_cols]
+
         csv_coords = df_csv[['x', 'y']].values
 
         tree = cKDTree(csv_coords)
