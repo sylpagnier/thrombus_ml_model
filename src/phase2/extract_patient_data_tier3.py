@@ -22,15 +22,13 @@ class PatientDataExtractor:
     To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
 
     1. In COMSOL: Go to Results > Export > Data.
-    2. Time Selection: Select your final asymptotic time step (e.g., t=48h).
-    3. Expressions: Add the exact variables expected by the script. The headers must map exactly to:
+    2. Main Domain: Export domain nodes to `data/processed/cfd_results_tier3_patients/<stem>.txt`
+       Headers must map exactly to:
        x, y, u, v, p, mu_effective, rp, ap, apr, aps, PT, th, at, fg, fi, M, Mas, Mat
-    4. Settings: Set "Points to evaluate in" to 'From dataset' (this ensures it pulls the exact mesh nodes).
-       Choose 'CSV' format and check 'Include header'.
-    5. Save Location: Save it as <patient_name>.csv in your label directory:
-       data/processed/cfd_results_tier3_patients/
-    6. Mesh Pairing: Ensure your matching Gmsh export is saved as <patient_name>.msh in:
-       data/raw/tier3_patients/
+    3. Boundaries: Export Edge 2D coordinates (x, y) with "Time Selection: Last" to:
+       - <stem>_inlet.txt
+       - <stem>_outlet.txt
+       - <stem>_wall.txt
     ----------------------------------
     """
 
@@ -52,24 +50,12 @@ class PatientDataExtractor:
 
         # Dictionary mapping exact COMSOL export names to standardized internal names
         self.species_map = {
-            'rp': 'RP',  # Resting Platelets
-            'ap': 'AP',  # Activated Platelets
-            'apr': 'APR',  # ADP Agonist
-            'aps': 'APS',  # TxA2 Agonist
-            'PT': 'PT',  # Prothrombin
-            'th': 'T',  # Thrombin
-            'at': 'AT',  # Antithrombin
-            'fg': 'FG',  # Fibrinogen
-            'fi': 'FI',  # Fibrin
-            'M': 'M',  # Deposited Platelets
-            'Mas': 'Mas',  # Adsorbed surface species 1
-            'Mat': 'Mat'  # Adsorbed surface species 2
+            'rp': 'RP', 'ap': 'AP', 'apr': 'APR', 'aps': 'APS',
+            'PT': 'PT', 'th': 'T', 'at': 'AT', 'fg': 'FG',
+            'fi': 'FI', 'M': 'M', 'Mas': 'Mas', 'Mat': 'Mat'
         }
 
-        # Expected headers from COMSOL CSV export
-        self.csv_fields = [
-                              'x', 'y', 'u', 'v', 'p', 'mu_effective'
-                          ] + list(self.species_map.keys())
+        self.csv_fields = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
 
     def _precompute_wls(self, edge_index, num_nodes, pos_tensor):
         """Computes the 2nd Order Polynomial Basis and WLS Inverse Matrix."""
@@ -79,7 +65,6 @@ class PatientDataExtractor:
 
         dist_sq = dx ** 2 + dy ** 2 + 1e-8
 
-        # 2nd Order Polynomial Basis
         dx2 = 0.5 * dx ** 2
         dxy = dx * dy
         dy2 = 0.5 * dy ** 2
@@ -105,15 +90,15 @@ class PatientDataExtractor:
         return V, W, M_inv.squeeze(1)
 
     def _precompute_sparse_operators(self, edge_index, num_nodes, M_inv, V, W):
-        """Converts WLS polynomial weights into global sparse matrices for O(1) gradient evaluation."""
+        """Converts WLS polynomial weights into global sparse matrices."""
         row, col = edge_index
         M_inv_edges = M_inv[row]
         WV = (W.unsqueeze(1) * V).unsqueeze(2)
         C = torch.bmm(M_inv_edges, WV).squeeze(2)
 
-        Cx = C[:, 0]  # d/dx
-        Cy = C[:, 1]  # d/dy
-        C_laplacian = C[:, 2] + C[:, 4]  # d2/dx2 + d2/dy2
+        Cx = C[:, 0]
+        Cy = C[:, 1]
+        C_laplacian = C[:, 2] + C[:, 4]
 
         def build_sparse_matrix(edge_weights):
             off_diag_indices = edge_index
@@ -137,41 +122,31 @@ class PatientDataExtractor:
         grad_f = torch.bmm(M_inv, sum_W_V_df.unsqueeze(2)).squeeze(2)
         return grad_f[:, :2]
 
-    def _get_boundary_masks(self, mesh, num_nodes):
-        mask_inlet = torch.zeros(num_nodes, dtype=torch.bool)
-        mask_outlet = torch.zeros(num_nodes, dtype=torch.bool)
-        mask_wall = torch.zeros(num_nodes, dtype=torch.bool)
+    def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
+        """Robust KDTree spatial mapping for boundary nodes."""
+        mask = torch.zeros(num_nodes, dtype=torch.bool)
+        if not file_path.exists():
+            print(f"Warning: Boundary file missing: {file_path}")
+            return mask
 
-        line_cells, line_tags = [], []
-        tags = self.vessel_cfg.TAGS
+        # Load coords, grab last two columns (x, y), and drop duplicates
+        bnd_df = pd.read_csv(file_path, comment='%', sep=r'\s+', header=None)
+        bnd_coords = bnd_df.iloc[:, -2:].values
+        bnd_coords = np.unique(bnd_coords, axis=0)
 
-        try:
-            if "line" in mesh.cells_dict:
-                line_cells = mesh.cells_dict["line"]
-                line_tags = mesh.cell_data_dict["gmsh:physical"]["line"]
-        except Exception:
-            pass
-
-        for i, tag in enumerate(line_tags):
-            nodes = line_cells[i]
-            if tag == tags["Inlet"]:
-                mask_inlet[nodes] = True
-            elif tag == tags["Outlet_1"]:
-                mask_outlet[nodes] = True
-            elif tag == tags["Walls"]:
-                mask_wall[nodes] = True
-
-        mask_inlet = mask_inlet & (~mask_wall)
-        mask_outlet = mask_outlet & (~mask_wall)
-        return mask_inlet, mask_outlet, mask_wall
+        # Query KDTree
+        distances, indices = tree.query(bnd_coords)
+        valid_matches = indices[distances < tolerance]
+        mask[valid_matches] = True
+        return mask
 
     def _plot_sanity_check(self, data, stem):
         """Generates a PNG visualization of the mapped graph data to verify correctness."""
         x = data.x[:, 0].numpy()
         y = data.x[:, 1].numpy()
 
-        u_vel = data.y[:, 0].numpy()  # u-velocity
-        thrombin = data.y[:, 9].numpy()  # species[:, 5] maps to 'th' (Thrombin), so index 4 + 5 = 9 in y_tensor
+        u_vel = data.y[:, 0].numpy()
+        thrombin = data.y[:, 9].numpy()
         sdf = data.x[:, 2].numpy()
 
         fig, axs = plt.subplots(2, 2, figsize=(16, 12))
@@ -205,16 +180,37 @@ class PatientDataExtractor:
         plt.close()
 
     def process_patient(self, stem):
-        msh_path = self.raw_dir / f"{stem}.msh"
-        json_path = self.raw_dir / f"{stem}.json"
-        txt_path = self.label_dir / f"{stem}.txt"
+        # Automatically detect .nas (from COMSOL) or .msh (from Gmsh)
+        msh_path_nas = self.raw_dir / f"{stem}.nas"
+        msh_path_msh = self.raw_dir / f"{stem}.msh"
 
-        if not (msh_path.exists() and txt_path.exists()):
+        if msh_path_nas.exists():
+            msh_path = msh_path_nas
+        elif msh_path_msh.exists():
+            msh_path = msh_path_msh
+        else:
+            print(f"\n❌ SKIPPING {stem}: Mesh file not found.")
+            print(f"   Looked for: {msh_path_nas} OR {msh_path_msh}")
             return
 
-        print(f"Processing patient: {stem}...")
+        json_path = self.raw_dir / f"{stem}.json"
+
+        # Paths for spatial mapping
+        txt_path = self.label_dir / f"{stem}.txt"
+        inlet_path = self.label_dir / f"{stem}_inlet.txt"
+        outlet_path = self.label_dir / f"{stem}_outlet.txt"
+        wall_path = self.label_dir / f"{stem}_wall.txt"
+
+        # Explicitly check for the main text file
+        if not txt_path.exists():
+            print(f"\n❌ SKIPPING {stem}: COMSOL domain data missing.")
+            print(f"   Looked for: {txt_path}")
+            return
+
+        print(f"\nProcessing patient: {stem} (Using mesh: {msh_path.name})...")
 
         # 1. Topology & Graph Extraction
+        # meshio natively understands .nas and .msh, no extra flags needed!
         mesh = meshio.read(msh_path)
         mesh_nodes = mesh.points[:, :2]
         num_nodes = len(mesh_nodes)
@@ -226,9 +222,22 @@ class PatientDataExtractor:
 
         u_ref = self.phys_cfg.get_u_ref(d_bar)
 
-        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, num_nodes)
+        # Build KDTree on the mesh nodes for spatial boundary mapping
+        mesh_tree = cKDTree(mesh_nodes)
 
-        all_tris = mesh.cells_dict.get("triangle", [])
+        # Load exactly mapped PyTorch boolean tensors using our new robust method
+        mask_inlet = self._load_spatial_mask(inlet_path, mesh_tree, num_nodes)
+        mask_outlet = self._load_spatial_mask(outlet_path, mesh_tree, num_nodes)
+        mask_wall = self._load_spatial_mask(wall_path, mesh_tree, num_nodes)
+
+        if "triangle" in mesh.cells_dict:
+            all_tris = mesh.cells_dict["triangle"]
+        elif "triangle6" in mesh.cells_dict:
+            all_tris = mesh.cells_dict["triangle6"][:, :3]
+        else:
+            print(f"❌ Warning: No valid triangles found in {stem}'s mesh")
+            return
+
         if len(all_tris) == 0: return
         edges = np.unique(np.sort(np.vstack([
             all_tris[:, [0, 1]], all_tris[:, [1, 2]], all_tris[:, [2, 0]]
@@ -237,40 +246,40 @@ class PatientDataExtractor:
         row, col = edge_index
 
         # 2. Eulerian Mapping (1:1 Constraint)
-        # Read the .txt file: treat any whitespace as a separator and ignore COMSOL's '%' comments
         df_csv = pd.read_csv(txt_path, sep=r'\s+', comment='%', header=None)
 
-        # Manually assign columns in the exact order COMSOL exported them
-        # Note: COMSOL duplicates x and y at the start of spatial datasets
         df_csv.columns = [
             'x_orig', 'y_orig', 'x', 'y', 'u', 'v', 'p', 'mu_effective',
             'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
         ]
 
-        # Filter down to just the columns expected by the ML pipeline
         expected_cols = ['x', 'y', 'u', 'v', 'p', 'mu_effective'] + list(self.species_map.keys())
         df_csv = df_csv[expected_cols]
 
         csv_coords = df_csv[['x', 'y']].values
 
-        tree = cKDTree(csv_coords)
-        dists, match_indices = tree.query(mesh_nodes)
-        if np.max(dists) > 1e-5:
-            print(f"Warning: Spatial mismatch detected in {stem}. Max err: {np.max(dists)}")
+        # Re-using a KDTree here just to align the domain CSV data perfectly to the mesh indices
+        domain_tree = cKDTree(csv_coords)
+        dists, match_indices = domain_tree.query(mesh_nodes)
+        if np.max(dists) > 1e-2:
+            print(f"⚠️ Warning: Spatial mismatch detected in {stem}. Max err: {np.max(dists)}")
 
         df_matched = df_csv.iloc[match_indices].reset_index(drop=True)
 
         # 3. Geometric Features (SDF & Wall Normals)
         wall_node_indices = np.where(mask_wall.numpy())[0]
-        wall_pts = mesh_nodes[wall_node_indices]
-        tree_wall = KDTree(wall_pts)
-        dist_raw, indices_wall = tree_wall.query(mesh_nodes)
-
-        nearest_wall_pts = wall_pts[indices_wall]
-        diff_vec = mesh_nodes - nearest_wall_pts
-
-        norms = np.linalg.norm(diff_vec, axis=1, keepdims=True)
-        wall_normal_vec = torch.tensor(diff_vec / (norms + 1e-12), dtype=torch.float32)
+        if len(wall_node_indices) > 0:
+            wall_pts = mesh_nodes[wall_node_indices]
+            tree_wall = KDTree(wall_pts)
+            dist_raw, indices_wall = tree_wall.query(mesh_nodes)
+            nearest_wall_pts = wall_pts[indices_wall]
+            diff_vec = mesh_nodes - nearest_wall_pts
+            norms = np.linalg.norm(diff_vec, axis=1, keepdims=True)
+            wall_normal_vec = torch.tensor(diff_vec / (norms + 1e-12), dtype=torch.float32)
+        else:
+            print(f"⚠️ CRITICAL WARNING: No wall nodes found for {stem}. SDF will be zeroed out.")
+            dist_raw = np.zeros(num_nodes)
+            wall_normal_vec = torch.zeros((num_nodes, 2), dtype=torch.float32)
 
         nodes_nd = torch.tensor(mesh_nodes / d_bar, dtype=torch.float32)
         sdf_nd = torch.clamp(torch.tensor(dist_raw / d_bar, dtype=torch.float32).view(-1, 1), min=1e-6)
@@ -313,31 +322,8 @@ class PatientDataExtractor:
         p_relative = p_raw - p_outlet_mean
         mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32)
 
-        # Exact extraction mapping to the 12 biological species
         species_cols = list(self.species_map.keys())
         species = torch.tensor(df_matched[species_cols].values, dtype=torch.float32)
-
-        # ---------------------------------------------------------------------------------
-        # y_tensor Structure [Dimension = 16 (Nodes x 16)]
-        # ---------------------------------------------------------------------------------
-        # Index 0: u          (Velocity X)
-        # Index 1: v          (Velocity Y)
-        # Index 2: p_relative (Pressure relative to outlet)
-        # Index 3: mu_eff     (Effective Viscosity)
-        # -- BIOLOGICAL SPECIES [Indices 4 to 15] --
-        # Index 4: rp         (Resting Platelets)
-        # Index 5: ap         (Activated Platelets)
-        # Index 6: apr        (ADP Agonist)
-        # Index 7: aps        (TxA2 Agonist)
-        # Index 8: PT         (Prothrombin)
-        # Index 9: th         (Thrombin)
-        # Index 10: at        (Antithrombin)
-        # Index 11: fg        (Fibrinogen)
-        # Index 12: fi        (Fibrin)
-        # Index 13: M         (Deposited Platelets)
-        # Index 14: Mas       (Adsorbed species 1 / Surface AP)
-        # Index 15: Mat       (Adsorbed species 2 / Surface Thrombin-related)
-        # ---------------------------------------------------------------------------------
 
         y_tensor = torch.cat([
             u.unsqueeze(1),
@@ -369,10 +355,17 @@ class PatientDataExtractor:
             self._plot_sanity_check(data, stem)
 
     def run(self):
-        files = sorted([f for f in os.listdir(self.raw_dir) if f.endswith(".msh")])
-        for f in tqdm(files, desc="Extracting Tier 3 Patient Data"):
-            self.process_patient(Path(f).stem)
+        # Look for the .nas files now!
+        files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
 
+        if len(files) == 0:
+            print(f"CRITICAL ERROR: No .msh or .nas files found in {self.raw_dir}")
+            return
+
+        stems = sorted(list(set([Path(f).stem for f in files])))
+
+        for stem in tqdm(stems, desc="Extracting Tier 3 Patient Data"):
+            self.process_patient(stem)
 
 if __name__ == "__main__":
     extractor = PatientDataExtractor(tier="tier3_patients", visualize=True)

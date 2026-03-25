@@ -13,19 +13,24 @@ class BiochemPhysicsKernels:
     def __init__(self, biochem_cfg, core_physics_kernels):
         self.cfg = biochem_cfg
         self.core = core_physics_kernels  # Reference to baseline PhysicsKernels for _compute_derivatives
-        self.kinetics = self.BiochemKinetics(self.cfg)
 
-        # Diffusion coefficients mapping (scaled dynamically in DEQ if needed)
-        # Sourced from COMSOL Parameters
+        # --- PINN Normalization Scales ---
+        # To avoid vanishing gradients, inputs are scaled up from standard SI units.
+        self.D_scale = 1e4
+        self.C_scale = 1e3
+
+        self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
+
+        # Diffusion coefficients mapped directly from COMSOL config with explicit PINN scaling
         self.D_coeff = {
-            'RP': 1.58e-9,
-            'AP': 1.58e-9,
-            'APR': 2.57e-6,
-            'APS': 2.14e-6,
-            'T': 4.16e-7,
-            'AT': 3.49e-7,
-            'FG': 3.10e-7,
-            'FI': 2.47e-7
+            'RP': self.cfg.D_RP * self.D_scale,
+            'AP': self.cfg.D_AP * self.D_scale,
+            'APR': self.cfg.D_APR * self.D_scale,
+            'APS': self.cfg.D_APS * self.D_scale,
+            'T': self.cfg.D_T * self.D_scale,
+            'AT': self.cfg.D_AT * self.D_scale,
+            'FG': self.cfg.D_FG * self.D_scale,
+            'FI': self.cfg.D_FI * self.D_scale
         }
 
     class BiochemKinetics:
@@ -34,25 +39,26 @@ class BiochemPhysicsKernels:
         Replaces rigid step functions with temperature-scaled sigmoids to ensure smooth gradients.
         """
 
-        def __init__(self, cfg):
+        def __init__(self, cfg, C_scale):
             self.cfg = cfg
+            self.C_scale = C_scale
 
-            # --- Soft-Logic Temperature Parameters ---
+            # --- Soft-Logic Temperature Parameters (ML Hyperparameters) ---
             self.T_omega = 0.05  # Chemical activation threshold
             self.T_shear = 500.0  # Mechanical shear threshold
             self.T_grad = 50.0  # Spatial shear gradient threshold
             self.T_low_shear = 5.0  # Low shear stagnation threshold
 
-            # --- COMSOL Biochemical Parameters ---
-            self.APScrit = 0.6
-            self.APRcrit = 2.0
-            self.Tcrit = 0.0005
-            self.t_act = 1.0
-            self.shear_crit = 10000.0
+            # --- COMSOL Biochemical Parameters (Mapped & Scaled) ---
+            self.APScrit = self.cfg.APScrit * self.C_scale
+            self.APRcrit = self.cfg.APRcrit * self.C_scale
+            self.Tcrit = self.cfg.Tcrit * self.C_scale
+            self.t_act = self.cfg.t_act
+            self.shear_crit = self.cfg.shear_crit
 
             # Fibrin reaction parameters
-            self.kfi = 59.0  # Reaction rate fibrinogen [1/s]
-            self.kmfi = 3.16  # Rate constant fibrin reaction [uM]
+            self.kfi = self.cfg.kfi
+            self.kmfi = self.cfg.kmfi * self.C_scale
 
         def _soft_step(self, x, threshold, temperature, reverse=False):
             """Smooth approximation of Heaviside step function."""
@@ -69,13 +75,11 @@ class BiochemPhysicsKernels:
             Uses soft-logic for differentiable conditionals.
             """
             # kpa_chem (Analytic 2)
-            # if(Omega<500, (Omega/t_act)*Act_step(Omega), 500)
             chem_active = self._soft_step(omega, 1.0, self.T_omega)
             cap_mask = self._soft_step(omega, 500.0, self.T_omega, reverse=True)
             kpa_chem = cap_mask * (omega / self.t_act) * chem_active + (1.0 - cap_mask) * 500.0
 
             # kpa_mech (Analytic 6)
-            # if(spf.sr>shear_crit, spf.sr/shear_crit, 0)
             mech_active = self._soft_step(shear_rate, self.shear_crit, self.T_shear)
             kpa_mech = mech_active * (shear_rate / self.shear_crit)
 
@@ -86,18 +90,16 @@ class BiochemPhysicsKernels:
             Computes source/sink terms for Fibrinogen (FG) and Fibrin (FI)
             Formula: kfi * T * FG / (kmfi + FG)
             """
-            # Add epsilon to denominator for numerical stability in PINN
             eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
 
-            # Fibrinogen is consumed (Sink), Fibrin is created (Source)
             R_FG = -reaction_rate
             R_FI = reaction_rate
 
             return R_FG, R_FI
 
         def compute_species_reactions(self, species_dict, shear_rate):
-            """Computes net reaction source/sink terms for all 8 species."""
+            """Computes net reaction source/sink terms for all 8 species using config params."""
             RP = species_dict['RP']
             AP = species_dict['AP']
             APR = species_dict['APR']
@@ -110,25 +112,31 @@ class BiochemPhysicsKernels:
             omega = self.compute_omega(APR, APS, T)
             k_pa = self.compute_k_pa(omega, shear_rate)
 
-            # Platelet Activation (RP -> AP)
+            # 1. Platelet Activation (RP -> AP)
+            # RP is consumed, AP is produced at rate k_pa
             R_RP = -k_pa * RP
             R_AP = k_pa * RP
 
-            # Agonist Release (APR, APS) - simplified proportional release
-            lambda_apr = 2.4e-8
-            s_t_aps = 9.5e-12
+            # 2. Agonist Release (APR, APS)
+            scale_release = 1e9
+            lambda_apr = self.cfg.lambda_adp * scale_release
+            s_t_aps = self.cfg.s_t * scale_release
+
+            # DIMENSIONAL FIX: ADP is a burst release (depends on activation RATE R_AP)
             R_APR = lambda_apr * R_AP
-            R_APS = s_t_aps * R_AP - 0.0161 * APS  # Includes inactivation k_i
 
-            # Thrombin & Antithrombin
-            # Note: Gamma analytic and specific phi_at/phi_rt constants applied
-            phi_at = 3.69e-9
-            phi_rt = 6.5e-10
-            k_1t = 13.33
-            R_T = (phi_at * AP + phi_rt * RP) - (k_1t * AT * T)  # simplified interaction
-            R_AT = - (k_1t * AT * T)
+            # DIMENSIONAL FIX: TxA2 is continuously synthesized (depends on activated CONCENTRATION AP)
+            R_APS = (s_t_aps * AP) - (self.cfg.k_i * APS)
 
-            # Fibrin Cascade
+            # 3. Thrombin & Antithrombin
+            scale_phi = 1e-3
+            phi_at = self.cfg.phi_at * scale_phi
+            phi_rt = self.cfg.phi_rt * scale_phi
+
+            R_T = (phi_at * AP + phi_rt * RP) - (self.cfg.k_1t * AT * T)
+            R_AT = - (self.cfg.k_1t * AT * T)
+
+            # 4. Fibrin Cascade
             R_FG, R_FI = self.compute_fibrin_kinetics(T, FG)
 
             return {
@@ -139,65 +147,45 @@ class BiochemPhysicsKernels:
     def compute_dual_viscosity_penalty(self, M_wall, FI_field, spatial_props, delta=1e-3):
         """
         Computes the Pseudo-Huber regularization loss for the spatial gradients
-        of the dual viscosity field (mu_b * (mu1(Mat) + mu2(FI))).
-        Helps stabilize PINN training against the 0->80 step function cliffs.
+        of the dual viscosity field. Stabilizes PINN training.
         """
-        # Soft-step models of mu1 and mu2 derived from COMSOL step parameters
         mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * 79.0 + 1.0
         mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * 80.0
-
-        # Combine viscosities
         mu_total = mu1_mat + mu2_fi
 
-        # Compute spatial gradient of the total viscosity field
         dmu_dx = self.core._compute_derivatives(mu_total.unsqueeze(1), spatial_props)
         grad_mu_sq = torch.sum(dmu_dx ** 2, dim=-1)
 
-        # Pseudo-Huber Loss Formulation: L = delta^2 * (sqrt(1 + (grad/delta)^2) - 1)
-        # Prevents extreme gradient explosion where the step functions jump
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
-
         return pseudo_huber_loss
 
     def compute_adr_loss(self, species_preds, velocity_field, spatial_props):
-        """
-        Computes the Advection-Diffusion-Reaction (L_ADR) residuals for ALL 8 species.
-        Species vector index mapping:
-        0: RP, 1: AP, 2: APR, 3: APS, 4: T, 5: AT, 6: FG, 7: FI
-        """
+        """Computes Advection-Diffusion-Reaction (L_ADR) residuals for ALL 8 species."""
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
         keys = ['RP', 'AP', 'APR', 'APS', 'T', 'AT', 'FG', 'FI']
         species_dict = {keys[i]: species_preds[..., i] for i in range(8)}
 
-        # 1. Compute Reaction Terms (Source/Sinks)
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
 
         adr_losses = {}
         total_adr_loss = 0.0
 
-        # 2. Compute Advection and Diffusion for each species
         for i, key in enumerate(keys):
             C = species_dict[key]
             D = self.D_coeff[key]
             R = reaction_terms[key]
 
-            # First derivatives for Advection
             grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
             dC_dx, dC_dy = grad_C[..., 0], grad_C[..., 1]
             advection = u * dC_dx + v * dC_dy
 
-            # Second derivatives for Diffusion
             grad_C_x = self.core._compute_derivatives(dC_dx.unsqueeze(1), spatial_props)[..., 0]
             grad_C_y = self.core._compute_derivatives(dC_dy.unsqueeze(1), spatial_props)[..., 1]
             diffusion = D * (grad_C_x + grad_C_y)
 
-            # ADR Residual: Advection - Diffusion - Reaction = 0 (assuming steady-state)
-            # If time-dependent, add dC_dt term here.
             residual = advection - diffusion - R
-
-            # Mean Squared Error of the residual
             loss_c = torch.mean(residual ** 2)
             adr_losses[key] = loss_c
             total_adr_loss += loss_c
