@@ -205,7 +205,7 @@ class BiochemPhysicsKernels:
         scales = self.species_scales.to(species_preds.device)
 
         # Expand clamp max to 80.0 to allow massive physical spikes without float32 overflow
-        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=20.0)
+        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=8.0)
         # expm1 reverses log1p: (e^y - 1)
         nd_species_preds = torch.expm1(species_preds_safe)
         linear_species_preds = nd_species_preds * scales[:9]
@@ -241,7 +241,7 @@ class BiochemPhysicsKernels:
             scale_c = scales[scale_idx]
 
             residual_nd = residual / (scale_c + 1e-8)
-            loss_c = torch.mean(residual_nd ** 2)
+            loss_c = F.huber_loss(residual_nd, torch.zeros_like(residual_nd), delta=1.0)
             if key in fast_keys:
                 adr_losses_fast += loss_c
             else:
@@ -260,7 +260,7 @@ class BiochemPhysicsKernels:
 
         # --- Reverse log1p and re-dimensionalize ---
         scales = self.species_scales.to(biochem_preds.device)
-        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=20.0)
+        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
 
         # 1. Extract Bulk Species (using the linear values)
@@ -368,9 +368,9 @@ class BiochemPhysicsKernels:
 
             # Non-dimensionalize the flux residual using characteristic diffusion scaling
             flux_residual_nd = flux_residual / (scales[idx] * (base_D / d_bar_wall) + 1e-8)
-            loss_flux += torch.mean(flux_residual_nd ** 2)
+            loss_flux += F.huber_loss(flux_residual_nd, torch.zeros_like(flux_residual_nd), delta=1.0)
 
-        return loss_surface + loss_flux
+        return loss_surface, loss_flux
 
     def _compute_shear_rate(self, u, v, spatial_props):
         """Helper to extract scalar shear rate magnitude from velocity fields."""

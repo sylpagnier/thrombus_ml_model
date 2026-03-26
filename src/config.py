@@ -30,10 +30,10 @@ class VesselConfig:
 
     # Mesh Settings
     mesh_size_factor: float = 0.75
-    mesh_lc: float = 0.00008  # [m]
+    mesh_lc: float = 1/1000  # [m]
 
     # Vessel Dimensions
-    base_length: float = 0.015  # [m]
+    base_length: float = 0.1  # [m]
     width_min: float = 0.008  # [m]
     width_max: float = 0.02  # [m]
     curvature_amplitude: float = 0.0025  # [m]
@@ -43,7 +43,7 @@ class VesselConfig:
     stenosis_factor_max: float = 0.2
     aneurysm_factor_min: float = 0.15
     aneurysm_factor_max: float = 0.2
-    num_ctrl_pts: int = 11
+    num_ctrl_pts: int = 50
 
     # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {

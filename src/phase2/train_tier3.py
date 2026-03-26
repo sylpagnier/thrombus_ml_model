@@ -143,20 +143,23 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
 
     # 5. Biochemistry Residuals
     l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
-    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, data)
+
+    # FIX: Unpack the newly split wall losses
+    l_wall_bio, l_wall_phys = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, data)
 
     # 6. Balance & Combine with PDE targets
-    # Only pass active PDE losses
-    pde_losses = [l_adr_fast, l_adr_slow]
+    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys]
     weighted_pdes = loss_weighter(pde_losses)
 
-    loss = weighted_pdes + (1000.0 * l_wall) + (500.0 * l_data_bio)
+    loss = weighted_pdes + (500.0 * l_data_bio) + l_data_kine
 
     metrics = {
         "L_mom": l_mom.item(),
         "L_ADR_F": l_adr_fast.item(),
         "L_ADR_S": l_adr_slow.item(),
-        "L_Wall": l_wall.item()
+        "L_W_Bio": l_wall_bio.item(),
+        "L_W_Phy": l_wall_phys.item(),
+        "L_Data": l_data_bio.item()
     }
     return loss, metrics
 
@@ -270,7 +273,7 @@ def train_tier3(epochs=50, lr=1e-3):
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
     # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
 
     dataset = load_dataset()
     if len(dataset) == 0:
@@ -315,19 +318,30 @@ def train_tier3(epochs=50, lr=1e-3):
     print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
     for epoch in range(epochs):
-        # --- Curriculum Learning Scheduler ---
-        # --- Curriculum Learning Scheduler ---
+        # --- Smooth Curriculum Learning Scheduler ---
+        # 1. Warmup Phase (Epochs 0-9): Keep mu_ratio low, keep step functions VERY smooth
         if epoch < 10:
             current_mu_ratio = 2.0
-            current_T_scale = max(0.1, 3.0 - (epoch / epochs) * (3.0 - 0.1))
+            # Start at T=10.0 (very smooth), gently cool to T=8.0
+            current_T_scale = 10.0 - (epoch / 10.0) * 2.0
+
+            # 2. Coupling Phase (Epochs 10+): Ramp up physics severity, sharpen step functions
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
-            current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
-            current_T_scale = 10.0 - progress * 9.0
 
-            # Push updates to the network and kernels
+            # Linearly scale viscosity up to COMSOL max (80.0)
+            current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
+
+            # Continue cooling T_scale from 8.0 down to 0.1 (sharp, physical bounds)
+            current_T_scale = 8.0 - progress * (8.0 - 0.1)
+
+        # Push updates to the network and kernels
         model.mu_ratio_max = current_mu_ratio
+
+        # Keep model internal T_scale relatively low/stable for the sigmoid multipliers
         model.T_scale = max(0.01, model.T_scale * 0.95)
+
+        # Push the macroscopic curriculum temperature to the kinetic step functions
         kernels.kinetics.T_scale = current_T_scale
 
         # FIX: Capitalized 'T' here as well
@@ -360,9 +374,10 @@ def train_tier3(epochs=50, lr=1e-3):
 
             pbar.set_postfix({
                 "L_tot": f"{(loss.item() * accumulation_steps):.2e}",
+                "L_Data": f"{metrics['L_Data']:.2e}",
                 "L_ADR_F": f"{metrics['L_ADR_F']:.2e}",
-                "L_ADR_S": f"{metrics['L_ADR_S']:.2e}",
-                "L_Wall": f"{metrics['L_Wall']:.2e}"
+                "L_W_Bio": f"{metrics['L_W_Bio']:.2e}",
+                "L_W_Phy": f"{metrics['L_W_Phy']:.2e}"
             })
 
         scheduler.step()
@@ -376,7 +391,7 @@ def train_tier3(epochs=50, lr=1e-3):
             with torch.no_grad():
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
-                print(f"⚖️ Learned Weights -> ADR_Fast: {weights[0]:.2f} | ADR_Slow: {weights[1]:.2f}")
+                print(f"⚖️ Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f}")
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)

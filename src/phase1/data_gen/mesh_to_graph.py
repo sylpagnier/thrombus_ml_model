@@ -297,69 +297,100 @@ class MeshToGraphComplete:
             except Exception as e:
                 print(f"Error mapping labels: {e}")
 
-            # --- Refurbished Analytic Prior (SDF-Based) suitable for Curves ---
-            # 1. Use SDF to determine r_nd (0 at center, R at wall)
-            R_nd = 0.5
-            r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
+        # --- Refurbished Analytic Prior (SDF-Based) suitable for Curves ---
+        # 1. Use SDF to determine r_nd (0 at center, R at wall)
+        R_nd = 0.5
+        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
 
-            # 2. Velocity Magnitude Prior (Poiseuille)
-            u_max_nd = 1.5
-            u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
+        # 2. Velocity Magnitude Prior (Poiseuille)
+        u_max_nd = 1.5
+        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
 
-            # 3. Derive Flow Direction (Tangent) from Inward Wall Normals
-            # Since vessel_generator.py creates geometries from left to right (+X),
-            # we find the orthogonal vector to the wall normal that points in the +X direction.
-            n_x = wall_normal_vec[:, 0]
-            n_y = wall_normal_vec[:, 1]
+        # 3. Derive Flow Direction (Tangent) from Inward Wall Normals
+        # Since vessel_generator.py creates geometries from left to right (+X),
+        # we find the orthogonal vector to the wall normal that points in the +X direction.
+        n_x = wall_normal_vec[:, 0]
+        n_y = wall_normal_vec[:, 1]
 
-            # Handle exact zero to prevent sign() from returning 0
-            sign_ny = torch.sign(n_y)
-            sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
+        # Handle exact zero to prevent sign() from returning 0
+        sign_ny = torch.sign(n_y)
+        sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
 
-            # Orthogonal tangent vector pointing rightward
-            t_x = torch.abs(n_y)
-            t_y = -sign_ny * n_x
+        # Orthogonal tangent vector pointing rightward
+        t_x = torch.abs(n_y)
+        t_y = -sign_ny * n_x
 
-            # Normalize the tangent vector
-            t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
-            flow_dir_x = t_x / t_mag
-            flow_dir_y = t_y / t_mag
+        # Normalize the tangent vector
+        t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
+        flow_dir_x = t_x / t_mag
+        flow_dir_y = t_y / t_mag
 
-            # Project magnitude onto the curved tangent directions
-            u_prior = u_prior_mag * flow_dir_x
-            v_prior = u_prior_mag * flow_dir_y
+        # Project magnitude onto the curved tangent directions
+        u_prior = u_prior_mag * flow_dir_x
+        v_prior = u_prior_mag * flow_dir_y
 
-            # 4. Viscosity Prior (Carreau)
-            gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
-            lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
-            mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
-                        (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
-                       (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
-                               (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
+        # 4. Viscosity Prior (Carreau)
+        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
+        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
+                    (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
+                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
 
-            # 5. WSS Prior: MASKED to wall boundary
-            wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
+        # 5. WSS Prior: MASKED to wall boundary
+        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
 
-            # --- Final Assembly ---
-            x_tensor = torch.cat([
-                pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
-                wall_normal_vec,
-                torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
-                torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
-                u_prior.view(-1, 1), v_prior.view(-1, 1),  # <-- UPDATED: Vectorized UV Prior
-                mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
-            ], dim=1)
+        # --- Final Assembly ---
+        x_tensor = torch.cat([
+            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
+            wall_normal_vec,
+            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
+            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
+            u_prior.view(-1, 1), v_prior.view(-1, 1),  # <-- UPDATED: Vectorized UV Prior
+            mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
+        ], dim=1)
 
-            # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
-            data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
-                        mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
-                        d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                        u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                        u_inlet_bc=u_prior.view(-1, 1),
-                        mu_inlet_bc=mu_prior.view(-1, 1),
-                        mu_wall_bc=mu_prior.view(-1, 1),
-                        V=V, W=W, M_inv=M_inv)
+        # --------------------------------------------------------------------------
+        #  Compute Explicit Sparse Gradient Matrices (G_x, G_y) for GINO
+        # --------------------------------------------------------------------------
+        W_V = W.unsqueeze(1) * V  # Shape: (E, 5)
+        M_inv_row = M_inv[row]  # Shape: (E, 5, 5)
+
+        # Calculate the gradient coefficients for each edge
+        coeffs = torch.bmm(M_inv_row, W_V.unsqueeze(2)).squeeze(2)  # Shape: (E, 5)
+        cx = coeffs[:, 0]
+        cy = coeffs[:, 1]
+
+        N = len(nodes)
+
+        # The diagonal entries are the negative sum of the off-diagonal coefficients
+        diag_cx = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cx)
+        diag_cy = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cy)
+
+        # Assemble indices for sparse tensors (Off-diagonals + Diagonals)
+        diag_indices = torch.arange(N, dtype=torch.long).unsqueeze(0).repeat(2, 1)
+
+        idx_x = torch.cat([edge_index, diag_indices], dim=1)
+        val_x = torch.cat([cx, -diag_cx], dim=0)
+
+        idx_y = torch.cat([edge_index, diag_indices], dim=1)
+        val_y = torch.cat([cy, -diag_cy], dim=0)
+
+        # Create the sparse tensors that GINO DEQ uses for derivatives
+        G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
+        G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
+
+        # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
+        data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
+                    mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
+                    is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+                    d_bar=torch.tensor([d_bar], dtype=torch.float32),
+                    u_ref=torch.tensor([u_ref], dtype=torch.float32),
+                    u_inlet_bc=u_prior.view(-1, 1),
+                    mu_inlet_bc=mu_prior.view(-1, 1),
+                    mu_wall_bc=mu_prior.view(-1, 1),
+                    V=V, W=W, M_inv=M_inv,
+                    G_x=G_x, G_y=G_y)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
