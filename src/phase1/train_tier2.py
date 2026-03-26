@@ -133,7 +133,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     print("Device being used:", device)
 
     # 1. Calculate physics bounds
-    phys_cfg = PhysicsConfig(tier="tier2", re_target=150.0)
+    phys_cfg = PhysicsConfig(tier="tier2")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
     mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_ref
     mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_ref

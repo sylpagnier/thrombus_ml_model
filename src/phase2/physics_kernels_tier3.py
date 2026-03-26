@@ -23,7 +23,6 @@ class BiochemPhysicsKernels:
 
         self.D_scale = 1e4
         self.C_scale = 1e3
-        # ... (rest of init remains the same)
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
 
@@ -54,6 +53,7 @@ class BiochemPhysicsKernels:
             self.T_shear = 500.0  # Mechanical shear threshold
             self.T_grad = 50.0  # Spatial shear gradient threshold
             self.T_low_shear = 5.0  # Low shear stagnation threshold
+            self.T_scale = 1.0  # Dynamic temperature scalar
 
             # --- COMSOL Biochemical Parameters (Mapped & Scaled) ---
             self.APScrit = self.cfg.APScrit * self.C_scale
@@ -69,7 +69,8 @@ class BiochemPhysicsKernels:
         def _soft_step(self, x, threshold, temperature, reverse=False):
             """Smooth approximation of Heaviside step function."""
             sign = -1.0 if reverse else 1.0
-            return torch.sigmoid(sign * (x - threshold) / temperature)
+            # Apply T_scale to the temperature
+            return torch.sigmoid(sign * (x - threshold) / (temperature * self.T_scale))
 
         def compute_omega(self, APR, APS, T):
             """Analytic 1: Chemical activation function."""
@@ -170,15 +171,26 @@ class BiochemPhysicsKernels:
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
-        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
+        # Split species based on kinetic timescale stiffness
+        fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
+        slow_keys = ['AT', 'FG', 'FI']
 
+        adr_losses_fast = 0.0
+        adr_losses_slow = 0.0
+
+        u_ref = spatial_props['u_ref'].to(species_preds.device)
+        d_bar = spatial_props['d_bar'].to(species_preds.device)
+
+        u_raw = u * u_ref
+        v_raw = v * u_ref
+
+        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
         # --- Reverse log1p and re-dimensionalize ---
         # Move scales to the correct device automatically
         scales = self.species_scales.to(species_preds.device)
 
-        # FIX: Clamp network outputs to prevent expm1 float32 overflow (inf -> NaN)
-        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=20.0)
-
+        # Expand clamp max to 80.0 to allow massive physical spikes without float32 overflow
+        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=80.0)
         # expm1 reverses log1p: (e^y - 1)
         nd_species_preds = torch.expm1(species_preds_safe)
         linear_species_preds = nd_species_preds * scales[:9]
@@ -188,19 +200,7 @@ class BiochemPhysicsKernels:
 
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
 
-        adr_losses = {}
-        total_adr_loss = 0.0
-
-        # Only compute ADR for the 8 active species (ignoring the passive PT)
-        active_keys = ['RP', 'AP', 'APR', 'APS', 'T', 'AT', 'FG', 'FI']
-
-        u_ref = spatial_props['u_ref'].to(species_preds.device)
-        d_bar = spatial_props['d_bar'].to(species_preds.device)
-
-        u_raw = u * u_ref
-        v_raw = v * u_ref
-
-        for key in active_keys:
+        for key in fast_keys + slow_keys:
             C = species_dict[key]
             D = self.D_coeff[key]
             R = reaction_terms[key]
@@ -221,14 +221,14 @@ class BiochemPhysicsKernels:
             scale_idx = keys.index(key)
             scale_c = scales[scale_idx]
 
-            # Non-dimensionalize the final residual before squaring
             residual_nd = residual / (scale_c + 1e-8)
-
             loss_c = torch.mean(residual_nd ** 2)
-            adr_losses[key] = loss_c
-            total_adr_loss += loss_c
+            if key in fast_keys:
+                adr_losses_fast += loss_c
+            else:
+                adr_losses_slow += loss_c
 
-        return total_adr_loss
+        return adr_losses_fast, adr_losses_slow
 
     def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, mask_wall):
         """
@@ -239,7 +239,10 @@ class BiochemPhysicsKernels:
 
         # --- Reverse log1p and re-dimensionalize ---
         scales = self.species_scales.to(biochem_preds.device)
-        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=20.0)
+
+        # FIX: Expand clamp max to 80.0
+        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=80.0)
+
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
         linear_biochem_preds = nd_biochem_preds * scales[:9]  # Only bulk species passed here
 

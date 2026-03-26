@@ -297,44 +297,69 @@ class MeshToGraphComplete:
             except Exception as e:
                 print(f"Error mapping labels: {e}")
 
-        # --- Refurbished Analytic Prior (SDF-Based) ---
-        # 1. Use SDF to determine r_nd (0 at center, R at wall)
-        R_nd = 0.5  # Normalized Radius is always 0.5 if d_bar is the scaling factor
-        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
+            # --- Refurbished Analytic Prior (SDF-Based) suitable for Curves ---
+            # 1. Use SDF to determine r_nd (0 at center, R at wall)
+            R_nd = 0.5
+            r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
 
-        # 2. Velocity & Shear Rate Prior
-        u_max_nd = 1.5
-        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
+            # 2. Velocity Magnitude Prior (Poiseuille)
+            u_max_nd = 1.5
+            u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
 
-        # 3. Viscosity Prior (Carreau)
-        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
-        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
-        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + ((self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
-                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
+            # 3. Derive Flow Direction (Tangent) from Inward Wall Normals
+            # Since vessel_generator.py creates geometries from left to right (+X),
+            # we find the orthogonal vector to the wall normal that points in the +X direction.
+            n_x = wall_normal_vec[:, 0]
+            n_y = wall_normal_vec[:, 1]
+
+            # Handle exact zero to prevent sign() from returning 0
+            sign_ny = torch.sign(n_y)
+            sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
+
+            # Orthogonal tangent vector pointing rightward
+            t_x = torch.abs(n_y)
+            t_y = -sign_ny * n_x
+
+            # Normalize the tangent vector
+            t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
+            flow_dir_x = t_x / t_mag
+            flow_dir_y = t_y / t_mag
+
+            # Project magnitude onto the curved tangent directions
+            u_prior = u_prior_mag * flow_dir_x
+            v_prior = u_prior_mag * flow_dir_y
+
+            # 4. Viscosity Prior (Carreau)
+            gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
+            lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+            mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
+                        (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+                       (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
                                (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
 
-        # 4. WSS Prior: MASKED to wall boundary
-        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
+            # 5. WSS Prior: MASKED to wall boundary
+            wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
 
-        # --- Final Assembly ---
-        x_tensor = torch.cat([
-            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
-            wall_normal_vec,
-            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
-            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
-            u_prior_mag.view(-1, 1), torch.zeros((len(nodes), 1)),  # UV Prior
-            mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
-        ], dim=1)
+            # --- Final Assembly ---
+            x_tensor = torch.cat([
+                pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
+                wall_normal_vec,
+                torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
+                torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
+                u_prior.view(-1, 1), v_prior.view(-1, 1),  # <-- UPDATED: Vectorized UV Prior
+                mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
+            ], dim=1)
 
-        data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
-                    mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                    is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
-                    d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                    u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                    u_inlet_bc=u_prior_mag.view(-1, 1),
-                    mu_inlet_bc=mu_prior.view(-1, 1),
-                    mu_wall_bc=mu_prior.view(-1, 1),
-                    V=V, W=W, M_inv=M_inv)
+            # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
+            data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
+                        mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
+                        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+                        d_bar=torch.tensor([d_bar], dtype=torch.float32),
+                        u_ref=torch.tensor([u_ref], dtype=torch.float32),
+                        u_inlet_bc=u_prior.view(-1, 1),
+                        mu_inlet_bc=mu_prior.view(-1, 1),
+                        mu_wall_bc=mu_prior.view(-1, 1),
+                        V=V, W=W, M_inv=M_inv)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 

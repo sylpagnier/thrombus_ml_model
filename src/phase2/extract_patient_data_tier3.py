@@ -144,7 +144,6 @@ class PatientDataExtractor:
         x = data.x[:, 0].numpy()
         y = data.x[:, 1].numpy()
 
-        u_vel = data.y[:, 0].numpy()
         p_rel = data.y[:, 2].numpy()
         mu_eff = data.y[:, 3].numpy()
         # Index 9 in y_tensor (4 kinematics + 5th species) is Thrombin
@@ -155,8 +154,13 @@ class PatientDataExtractor:
         fig.suptitle(f"Sanity Check: {stem}", fontsize=18, fontweight='bold')
 
         # 1. Mapped Velocity
-        sc1 = axs[0, 0].scatter(x, y, c=u_vel, cmap='viridis', s=2)
-        axs[0,0].set_title(r"Normalized Velocity ($u / u_{ref}$)")
+        # Calculate Velocity Magnitude manually for the plot
+        u_comp = data.y[:, 0].numpy()
+        v_comp = data.y[:, 1].numpy()
+        vel_mag = np.sqrt(u_comp ** 2 + v_comp ** 2)
+
+        sc1 = axs[0, 0].scatter(x, y, c=vel_mag, cmap='viridis', s=2)
+        axs[0,0].set_title(r"Normalized Velocity ($|U| / u_{ref}$)")
         fig.colorbar(sc1, ax=axs[0,0], label='ND')
 
         # 2. Relative Pressure
@@ -286,11 +290,8 @@ class PatientDataExtractor:
 
         # 8. Data-Driven ML Scaling
         # Compute U_ref from the 99th percentile to clamp data strictly to ~[-1.0, 1.0]
-        velocity_mag = torch.sqrt(u_raw ** 2 + v_raw ** 2)
-        u_ref_actual = torch.quantile(velocity_mag, 0.99).item()
-
-        # Calculate the dynamic ML Reynolds number
-        re_actual = self.phys_cfg.get_re(u_ref_actual, d_bar)
+        u_ref_actual = self.phys_cfg.get_u_ref(d_bar)  # Matches Tier 1/2 logic exactly
+        re_actual = self.phys_cfg.re_target  # Locks the ML Re to your target
 
         # Pressure scaling based on the new ML velocity reference
         p_ref = self.phys_cfg.rho * (u_ref_actual ** 2)

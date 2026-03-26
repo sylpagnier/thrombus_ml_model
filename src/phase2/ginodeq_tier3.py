@@ -13,7 +13,7 @@ class GINO_DEQ_Tier3(nn.Module):
 
     def __init__(self, in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=25,
                  mu_ratio_max=7000.0, mat_crit=2e7, fi_crit=0.6,
-                 temp_mat=1e6, temp_fi=0.05, lora_rank=4, lora_alpha=1.0):
+                 temp_mat=1e6, temp_fi=0.05, lora_rank=4, lora_alpha=1.0, tol=1e-4):
         super().__init__()
 
         self.max_outer_iters = max_outer_iters
@@ -28,6 +28,8 @@ class GINO_DEQ_Tier3(nn.Module):
         # Temperature scaling for soft sigmoids to ensure differentiable backprop
         self.temp_mat = temp_mat
         self.temp_fi = temp_fi
+        self.tol = tol
+        self.T_scale = 1.0  # Default scale for temperature annealing
 
         # ==========================================
         # 1. KINEMATICS BACKBONE (FROZEN)
@@ -49,13 +51,13 @@ class GINO_DEQ_Tier3(nn.Module):
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier."""
-        return self.mu_ratio_max * torch.sigmoid((mat - self.mat_crit) / self.temp_mat)
+        return self.mu_ratio_max * torch.sigmoid((mat - self.mat_crit) / (self.temp_mat * self.T_scale))
 
     def mu2_sigmoid(self, fi):
         """Soft logic for Fibrin-driven viscosity multiplier."""
-        return self.mu_ratio_max * torch.sigmoid((fi - self.fi_crit) / self.temp_fi)
+        return self.mu_ratio_max * torch.sigmoid((fi - self.fi_crit) / (self.temp_fi * self.T_scale))
 
-    def forward(self, batch, anderson_beta=1.0, anderson_warmup=5):
+    def forward(self, batch):
         # 1. Extract dimensions natively and FORCE standard integer type
         num_nodes = int(batch.x.shape[0])
         device = batch.x.device
@@ -105,7 +107,11 @@ class GINO_DEQ_Tier3(nn.Module):
 
             with torch.no_grad():
                 for _ in range(self.max_inner_iters):
-                    z_kin = f_kinematics(z_kin)
+                    z_kin_next = f_kinematics(z_kin)
+                    diff = torch.norm(z_kin_next - z_kin, p=2, dim=-1).mean()
+                    z_kin = z_kin_next
+                    if diff < self.tol:
+                        break  # Early exit if converged
 
             u_v_p = self.kinematics_decoder(z_kin)
 
@@ -116,7 +122,11 @@ class GINO_DEQ_Tier3(nn.Module):
 
             with torch.no_grad():
                 for _ in range(self.max_inner_iters):
-                    z_bio = f_biochem(z_bio)
+                    z_bio_next = f_biochem(z_bio)
+                    diff = torch.norm(z_bio_next - z_bio, p=2, dim=-1).mean()
+                    z_bio = z_bio_next
+                    if diff < self.tol:
+                        break  # Early exit if converged
 
             current_species = self.biochem_decoder(z_bio)
 

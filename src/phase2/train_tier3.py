@@ -7,7 +7,6 @@ import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import random
-from pathlib import Path
 
 from src.utils.paths import get_project_root
 from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
@@ -70,16 +69,10 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
 def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device, phys_cfg):
     # --- 1. DYNAMIC REYNOLDS NUMBER UPDATE ---
     if hasattr(data, 're_actual'):
-        # Update the core physics config for this specific graph's scaling
         phys_cfg.re_target = data.re_actual.mean().item()
 
     # 2. Forward Pass
-    out = model(data, anderson_beta=1.0)
-    if isinstance(out, tuple):
-        pred, jac_loss = out
-    else:
-        pred = out
-        jac_loss = torch.tensor(0.0, device=device)
+    pred = model(data)
 
     props = kernels.core._get_geometric_props(data)
 
@@ -96,24 +89,25 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
     wall_preds = pred[:, 13:16]
     mask_wall = data.mask_wall.view(-1).bool()
 
-    # 3. Supervised Data Loss (With Dual Variance Normalization)
+    # 3. Supervised Data Loss (With SAFELY CLAMPED Variance Normalization)
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_bio = torch.tensor(0.0, device=device)
 
     if hasattr(data, 'is_anchor'):
         node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
         if node_is_anchor.sum() > 0:
-            # --- Kinematics Variance Normalization (Channels 0-3) ---
+            # --- Kinematics Variance Normalization ---
             pred_kine = pred[node_is_anchor, :4]
             targ_kine = data.y[node_is_anchor, :4]
-            # Add epsilon to prevent div by zero
-            kine_var = torch.var(targ_kine, dim=0, keepdim=True) + 1e-6
+            # FIX: Clamp variance to a physical minimum to prevent division by near-zero
+            kine_var = torch.clamp(torch.var(targ_kine, dim=0, keepdim=True), min=1e-2)
             l_data_kine = torch.mean(((pred_kine - targ_kine) ** 2) / kine_var)
 
-            # --- Biochemistry Variance Normalization (Channels 4-15) ---
+            # --- Biochemistry Variance Normalization ---
             pred_bio = pred[node_is_anchor, 4:16]
             targ_bio = data.y[node_is_anchor, 4:16]
-            bio_var = torch.var(targ_bio, dim=0, keepdim=True) + 1e-6
+            # FIX: Clamp variance to a physical minimum
+            bio_var = torch.clamp(torch.var(targ_bio, dim=0, keepdim=True), min=1e-2)
             l_data_bio = torch.mean(((pred_bio - targ_bio) ** 2) / bio_var)
 
     # 4. Fluid Mechanics (Inherited from Tiers 1 & 2)
@@ -124,26 +118,25 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
     du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
 
     l_cont = kernels.core.continuity_loss(du_ij)
-    l_rheo = kernels.core.rheology_loss(pred[:, 0:4], data, props=props)
     l_bc = kernels.core.boundary_condition_loss(pred[:, 0:4], data)
     l_io = kernels.core.inlet_outlet_loss(pred[:, 0:4], data)
-    l_wss = kernels.core.wall_shear_stress_loss(pred[:, 0:5], data, props=props)
 
-    # 5. Biochemistry (Tier 3 additions)
-    l_adr = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
+    # 5. Biochemistry Residuals
+    l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
     l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, mask_wall)
 
-    # 6. Balance & Combine
-    pde_losses = [l_mom, l_cont, l_adr]
+    # 6. Balance & Combine with 4 PDE targets
+    pde_losses = [l_mom, l_cont, l_adr_fast, l_adr_slow]
     weighted_pdes = loss_weighter(pde_losses)
 
     loss = weighted_pdes + (10.0 * l_wall) + \
            (500.0 * l_data_kine) + (500.0 * l_data_bio) + \
-           (10.0 * l_bc) + (5.0 * l_io) + (0.1 * jac_loss)
+           (10.0 * l_bc) + (5.0 * l_io)
 
     metrics = {
         "L_mom": l_mom.item(),
-        "L_ADR": l_adr.item(),
+        "L_ADR_F": l_adr_fast.item(),
+        "L_ADR_S": l_adr_slow.item(),
         "L_Wall": l_wall.item()
     }
     return loss, metrics
@@ -255,7 +248,7 @@ def train_tier3(epochs=50, lr=1e-3):
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
     # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=3).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
 
     dataset = load_dataset()
     if not dataset: return
@@ -299,16 +292,21 @@ def train_tier3(epochs=50, lr=1e-3):
     print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
     for epoch in range(epochs):
-        # --- Curriculum Learning Scheduler for mu_ratio ---
+        # --- Curriculum Learning Scheduler ---
         if epoch < 10:
             current_mu_ratio = 2.0
+            current_t_scale = 10.0  # Very soft logic early on
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
             current_mu_ratio = 2.0 + progress * (7000.0 - 2.0)
+            current_t_scale = 10.0 - progress * 9.0  # Anneals down to 1.0 (strict logic)
 
+        # Push updates to the network and kernels
         model.mu_ratio_max = current_mu_ratio
+        model.T_scale = current_t_scale
+        kernels.kinetics.T_scale = current_t_scale
 
-        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio Curriculum: {current_mu_ratio:.2f}x")
+        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | T_scale: {current_t_scale:.2f}")
 
         model.train()
         total_loss_epoch = 0.0
@@ -338,7 +336,8 @@ def train_tier3(epochs=50, lr=1e-3):
             pbar.set_postfix({
                 "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
                 "L_mom": f"{metrics['L_mom']:.3f}",
-                "L_ADR": f"{metrics['L_ADR']:.3f}",
+                "L_ADR_F": f"{metrics['L_ADR_F']:.3f}",
+                "L_ADR_S": f"{metrics['L_ADR_S']:.3f}",
                 "L_Wall": f"{metrics['L_Wall']:.3f}"
             })
 
@@ -351,14 +350,14 @@ def train_tier3(epochs=50, lr=1e-3):
 
             with torch.no_grad():
                 # Print current learned loss weights
+                # When printing weights during validation, update the log:
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
-                print(
-                    f"⚖️ Dynamic PDE Weights -> Mom: {weights[0]:.2f} | Cont: {weights[1]:.2f} | ADR: {weights[2]:.2f}")
+                print(f"⚖️ Weights -> Mom: {weights[0]:.2f} | Cont: {weights[1]:.2f} | ADR_F: {weights[2]:.2f} | ADR_S: {weights[3]:.2f}")
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    v_pred = model(v_data, anderson_beta=1.0)
+                    v_pred = model(v_data)
                     if isinstance(v_pred, tuple): v_pred = v_pred[0]
 
                     d, p = calculate_validation_metrics(v_pred, v_data, kernels, device)

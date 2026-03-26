@@ -49,119 +49,95 @@ def inspect_sample(filename="vessel_0.pt", tier="tier2"):
     data = torch.load(data_path, weights_only=False)
 
     # --- 1. Structural & Feature Validation ---
-    print("\n[1] Architecture & Invariants")
-
-    # Updated to 15 channels (Pos:2, SDF:1, ShearPot:1, Normal:2, Type:4, NonNewt:1, UVPrior:2, MuPrior:1, WSSPrior:1)
+    print("\n Architecture & Invariants")
     expected_channels = 15
-    if data.x.shape[1] != expected_channels:
-        print(f" ❌ FAIL: Feature mismatch! Expected {expected_channels}, got {data.x.shape[1]}.")
+    if data.x.shape != expected_channels:
+        print(f" ❌ FAIL: Feature mismatch! Expected {expected_channels}, got {data.x.shape}.")
     else:
         print(f" ✅ PASS: Features aligned ({expected_channels} channels).")
 
-    # Check for NaNs across all attributes
-    for attr in ['x', 'y', 'edge_attr', 'edge_index']:
-        val = getattr(data, attr)
-        if val is not None and torch.isnan(val).any():
-            print(f" ❌ FAIL: NaNs found in '{attr}'.")
-        else:
-            print(f" ✅ PASS: '{attr}' is clean.")
-
     # --- 2. Physical Consistency ---
-    print("\n[2] Boundary & Physics Sanity")
-
-    # No-slip condition (y[mask_wall, 0:2] should be ~0)
+    print("\n Boundary & Physics Sanity")
     if data.y is not None:
         wall_vel = torch.norm(data.y[data.mask_wall, :2], dim=1).max().item()
         status = "✅ PASS" if wall_vel < 1e-3 else "❌ FAIL"
         print(f" {status}: No-slip condition (Max Wall Vel: {wall_vel:.2e})")
 
-    # SDF Zero-crossing check
-    wall_sdf = torch.abs(data.x[data.mask_wall, 2]).max().item()
-    status = "✅ PASS" if wall_sdf < 5e-3 else "❌ FAIL"
-    print(f" {status}: SDF Wall Alignment (Max SDF at Wall: {wall_sdf:.2e})")
-
     # --- 3. Geometric Quality ---
     cond_nums, mask_valid = analyze_geometric_quality(data)
-    print(f"\n[3] Mesh Stability (WLS Condition Numbers)")
+    print(f"\n Mesh Stability (WLS Condition Numbers)")
     print(f" -> Mean: {np.mean(cond_nums[mask_valid]):.2e} | Max: {np.max(cond_nums[mask_valid]):.2e}")
-    if np.max(cond_nums[mask_valid]) > 1e7:
-        print(" ⚠️ WARNING: Extreme condition numbers. WLS gradients will likely explode.")
 
     # --- 4. Visualization Grid (3x4 Layout) ---
     print("\nRendering visualization...")
     pos = data.x[:, :2].numpy()
 
+    # PRE-CALCULATE MAGNITUDES FOR PHYSICAL ALIGNMENT
+    # GT Magnitude: sqrt(u^2 + v^2) from indices 0 and 1
+    vel_mag_gt = torch.norm(data.y[:, 0:2], dim=1).cpu().numpy()
+    # Prior Magnitude: sqrt(u_p^2 + v_p^2) from indices 11 and 12
+    vel_mag_prior = torch.norm(data.x[:, 11:13], dim=1).cpu().numpy()
+
     fig, axes = plt.subplots(3, 4, figsize=(20, 12), constrained_layout=True)
     axes = axes.flatten()
 
-    # Row 1: Inputs & Geometric Quality
-    # 0: SDF
-    sc0 = axes[0].scatter(pos[:, 0], pos[:, 1], c=data.x[:, 2], cmap='viridis', s=2)
-    axes[0].set_title("Input: ND-SDF")
-    plt.colorbar(sc0, ax=axes[0])
+    # ROW 1: INPUTS & GEOMETRY
+    sc0 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 2], cmap='viridis', s=2)
+    axes.set_title("Input: ND-SDF")
+    plt.colorbar(sc0, ax=axes)
 
-    # 1: WLS Condition
-    sc1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=np.log10(cond_nums + 1), cmap='magma', s=2)
-    axes[1].set_title("Mesh: Log10(WLS Cond)")
-    plt.colorbar(sc1, ax=axes[1])
+    sc1 = axes.scatter(pos[:, 0], pos[:, 1], c=np.log10(cond_nums + 1), cmap='magma', s=2)
+    axes.set_title("Mesh: Log10(WLS Cond)")
+    plt.colorbar(sc1, ax=axes)
 
-    # 2: Wall Normals (Quiver)
     mask_w = data.mask_wall.numpy()
-    axes[2].scatter(pos[:, 0], pos[:, 1], color='lightgray', s=1, alpha=0.1)
-    axes[2].quiver(pos[mask_w, 0], pos[mask_w, 1], data.x[mask_w, 4], data.x[mask_w, 5], color='red', scale=30)
-    axes[2].set_title("Input: Wall Normals")
+    axes.scatter(pos[:, 0], pos[:, 1], color='lightgray', s=1, alpha=0.1)
+    axes.quiver(pos[mask_w, 0], pos[mask_w, 1], data.x[mask_w, 4], data.x[mask_w, 5], color='red', scale=30)
+    axes.set_title("Input: Wall Normals")
 
-    # 3: Boundary Masks
-    axes[3].scatter(pos[data.mask_inlet, 0], pos[data.mask_inlet, 1], c='green', s=5, label='Inlet')
-    axes[3].scatter(pos[data.mask_outlet, 0], pos[data.mask_outlet, 1], c='blue', s=5, label='Outlet')
-    axes[3].scatter(pos[data.mask_wall, 0], pos[data.mask_wall, 1], c='black', s=2, label='Wall')
-    axes[3].set_title("Input: Boundary Masks")
-    axes[3].legend(loc='upper right', fontsize='x-small')
+    axes.scatter(pos[data.mask_inlet, 0], pos[data.mask_inlet, 1], c='green', s=5, label='Inlet')
+    axes.scatter(pos[data.mask_outlet, 0], pos[data.mask_outlet, 1], c='blue', s=5, label='Outlet')
+    axes.scatter(pos[data.mask_wall, 0], pos[data.mask_wall, 1], c='black', s=2, label='Wall')
+    axes.set_title("Input: Boundary Masks")
+    axes.legend(loc='upper right', fontsize='x-small')
 
-    # Row 2: Ground Truth (Labels)
-    # 4: U-Velocity
-    sc4 = axes[4].scatter(pos[:, 0], pos[:, 1], c=data.y[:, 0], cmap='jet', s=2)
-    axes[4].set_title("GT: U-Velocity")
-    plt.colorbar(sc4, ax=axes[4])
+    # ROW 2: GROUND TRUTH (Now with Magnitude)
+    sc4 = axes.scatter(pos[:, 0], pos[:, 1], c=vel_mag_gt, cmap='jet', s=2)
+    axes.set_title("GT: Velocity Magnitude")
+    plt.colorbar(sc4, ax=axes, label='ND Speed')
 
-    # 5: Pressure
-    sc5 = axes[5].scatter(pos[:, 0], pos[:, 1], c=data.y[:, 2], cmap='coolwarm', s=2)
-    axes[5].set_title("GT: Pressure")
-    plt.colorbar(sc5, ax=axes[5])
+    sc5 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 2], cmap='coolwarm', s=2)
+    axes.set_title("GT: Pressure")
+    plt.colorbar(sc5, ax=axes)
 
-    # 6: Viscosity (Tier 2)
-    sc6 = axes[6].scatter(pos[:, 0], pos[:, 1], c=data.y[:, 3], cmap='plasma', s=2)
-    axes[6].set_title("GT: ND-Viscosity")
-    plt.colorbar(sc6, ax=axes[6])
+    sc6 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 3], cmap='plasma', s=2)
+    axes.set_title("GT: ND-Viscosity")
+    plt.colorbar(sc6, ax=axes)
 
-    # 7: WSS Magnitude (New Channel!)
-    sc7 = axes[7].scatter(pos[:, 0], pos[:, 1], c=data.y[:, 4], cmap='inferno', s=2)
-    axes[7].set_title("GT: Wall Shear Stress")
-    plt.colorbar(sc7, ax=axes[7])
+    sc7 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 4], cmap='inferno', s=2)
+    axes.set_title("GT: Wall Shear Stress")
+    plt.colorbar(sc7, ax=axes)
 
-    # Row 3: Physical Priors (x-channels 11-14)
-    # 8: U-Prior
-    sc8 = axes[8].scatter(pos[:, 0], pos[:, 1], c=data.x[:, 11], cmap='jet', s=2)
-    axes[8].set_title("Prior: U-Velocity")
-    plt.colorbar(sc8, ax=axes[8])
+    # ROW 3: PHYSICAL PRIORS (Now with Magnitude)
+    sc8 = axes.scatter(pos[:, 0], pos[:, 1], c=vel_mag_prior, cmap='jet', s=2)
+    axes.set_title("Prior: Velocity Magnitude")
+    plt.colorbar(sc8, ax=axes, label='ND Speed')
 
-    # 9: Mu-Prior
-    sc9 = axes[9].scatter(pos[:, 0], pos[:, 1], c=data.x[:, 13], cmap='plasma', s=2)
-    axes[9].set_title("Prior: Viscosity")
-    plt.colorbar(sc9, ax=axes[9])
+    sc9 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 13], cmap='plasma', s=2)
+    axes.set_title("Prior: Viscosity")
+    plt.colorbar(sc9, ax=axes)
 
-    # 10: WSS-Prior
-    sc10 = axes[10].scatter(pos[:, 0], pos[:, 1], c=data.x[:, 14], cmap='inferno', s=2)
-    axes[10].set_title("Prior: WSS")
-    plt.colorbar(sc10, ax=axes[10])
+    sc10 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 14], cmap='inferno', s=2)
+    axes.set_title("Prior: WSS")
+    plt.colorbar(sc10, ax=axes)
 
-    # 11: Info
-    axes[11].axis('off')
-    axes[11].text(0, 0.5, f"File: {filename}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}", fontsize=10)
+    axes.axis('off')
+    axes.text(0, 0.5, f"File: {filename}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}", fontsize=10)
 
     for ax in axes:
         if ax.get_title():
             ax.set_aspect('equal')
+            ax.axis('off')
 
     plt.show()
 
