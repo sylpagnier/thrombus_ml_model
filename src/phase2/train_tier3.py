@@ -125,13 +125,12 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
     l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
     l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, mask_wall)
 
-    # 6. Balance & Combine with 4 PDE targets
-    pde_losses = [l_mom, l_cont, l_adr_fast, l_adr_slow]
+    # 6. Balance & Combine with PDE targets
+    # Only pass active PDE losses
+    pde_losses = [l_adr_fast, l_adr_slow]
     weighted_pdes = loss_weighter(pde_losses)
 
-    loss = weighted_pdes + (10.0 * l_wall) + \
-           (500.0 * l_data_kine) + (500.0 * l_data_bio) + \
-           (10.0 * l_bc) + (5.0 * l_io)
+    loss = weighted_pdes + (1000.0 * l_wall) + (500.0 * l_data_bio)
 
     metrics = {
         "L_mom": l_mom.item(),
@@ -207,7 +206,9 @@ def calculate_validation_metrics(pred, data, kernels, device):
     else:
         pearson_corr = torch.tensor(0.0)
 
-    return dice.item(), pearson_corr.item()
+    max_fibrin_pred = pred[:, 12].max().item()
+
+    return dice.item(), pearson_corr.item(), max_fibrin_pred
 
 
 def train_tier3(epochs=50, lr=1e-3):
@@ -248,7 +249,7 @@ def train_tier3(epochs=50, lr=1e-3):
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
     # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
     dataset = load_dataset()
     if not dataset: return
@@ -298,7 +299,7 @@ def train_tier3(epochs=50, lr=1e-3):
             current_t_scale = 10.0  # Very soft logic early on
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
-            current_mu_ratio = 2.0 + progress * (7000.0 - 2.0)
+            current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
             current_t_scale = 10.0 - progress * 9.0  # Anneals down to 1.0 (strict logic)
 
         # Push updates to the network and kernels
@@ -334,11 +335,10 @@ def train_tier3(epochs=50, lr=1e-3):
             total_loss_epoch += (loss.item() * accumulation_steps)
 
             pbar.set_postfix({
-                "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
-                "L_mom": f"{metrics['L_mom']:.3f}",
-                "L_ADR_F": f"{metrics['L_ADR_F']:.3f}",
-                "L_ADR_S": f"{metrics['L_ADR_S']:.3f}",
-                "L_Wall": f"{metrics['L_Wall']:.3f}"
+                "L_tot": f"{(loss.item() * accumulation_steps):.2e}",
+                "L_ADR_F": f"{metrics['L_ADR_F']:.2e}",
+                "L_ADR_S": f"{metrics['L_ADR_S']:.2e}",
+                "L_Wall": f"{metrics['L_Wall']:.2e}"
             })
 
         scheduler.step()
@@ -346,28 +346,30 @@ def train_tier3(epochs=50, lr=1e-3):
         # Validation & Metrics
         if epoch % 2 == 0:
             model.eval()
-            val_dice_total, val_pearson_total = 0.0, 0.0
+            val_dice_total, val_pearson_total, val_fibrin_total = 0.0, 0.0, 0.0
 
             with torch.no_grad():
-                # Print current learned loss weights
-                # When printing weights during validation, update the log:
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
-                print(f"⚖️ Weights -> Mom: {weights[0]:.2f} | Cont: {weights[1]:.2f} | ADR_F: {weights[2]:.2f} | ADR_S: {weights[3]:.2f}")
+                print(f"⚖️ Learned Weights -> ADR_Fast: {weights[0]:.2f} | ADR_Slow: {weights[1]:.2f}")
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
                     v_pred = model(v_data)
                     if isinstance(v_pred, tuple): v_pred = v_pred[0]
 
-                    d, p = calculate_validation_metrics(v_pred, v_data, kernels, device)
+                    # 2. Unpack the third variable (f) and add it to the total
+                    d, p, f = calculate_validation_metrics(v_pred, v_data, kernels, device)
                     val_dice_total += d
                     val_pearson_total += p
+                    val_fibrin_total += f
 
             avg_dice = val_dice_total / len(val_loader)
             avg_pearson = val_pearson_total / len(val_loader)
+            # 3. Calculate the average before printing
+            avg_fibrin = val_fibrin_total / len(val_loader)
 
-            print(f"📊 [Validation] Clot Dice: {avg_dice:.4f} | Patent WSS Pearson: {avg_pearson:.4f}")
+            print(f"📊 [Validation] Clot Dice: {avg_dice:.4f} | Patent WSS Pearson: {avg_pearson:.4f} | Max Fibrin: {avg_fibrin:.2e}")
 
             if avg_dice > best_dice:
                 best_dice = avg_dice

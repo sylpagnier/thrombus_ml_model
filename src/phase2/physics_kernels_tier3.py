@@ -105,6 +105,15 @@ class BiochemPhysicsKernels:
 
             return R_FG, R_FI
 
+        def compute_gamma(self, T, AT):
+            """
+            Analytic 3: Thrombin inhibition by Antithrombin/Heparin complex.
+            Gamma = (k_1t * c_H * AT) / (K_at * K_T + T * K_at + AT * T)
+            """
+            numerator = self.cfg.k_1t * self.cfg.c_H * AT
+            denominator = (self.cfg.K_at * self.cfg.K_T) + (T * self.cfg.K_at) + (AT * T) + 1e-8
+            return numerator / denominator
+
         def compute_species_reactions(self, species_dict, shear_rate):
             """Computes net reaction source/sink terms for all 8 species using config params."""
             RP = species_dict['RP']
@@ -119,31 +128,23 @@ class BiochemPhysicsKernels:
             omega = self.compute_omega(APR, APS, T)
             k_pa = self.compute_k_pa(omega, shear_rate)
 
-            # 1. Platelet Activation (RP -> AP)
-            # RP is consumed, AP is produced at rate k_pa
+            # Agonist Release (APR, APS)
+            lambda_apr = self.cfg.lambda_adp
+            s_t_aps = self.cfg.s_t
+
             R_RP = -k_pa * RP
             R_AP = k_pa * RP
-
-            # 2. Agonist Release (APR, APS)
-            scale_release = 1e9
-            lambda_apr = self.cfg.lambda_adp * scale_release
-            s_t_aps = self.cfg.s_t * scale_release
-
-            # DIMENSIONAL FIX: ADP is a burst release (depends on activation RATE R_AP)
             R_APR = lambda_apr * R_AP
-
-            # DIMENSIONAL FIX: TxA2 is continuously synthesized (depends on activated CONCENTRATION AP)
             R_APS = (s_t_aps * AP) - (self.cfg.k_i * APS)
 
-            # 3. Thrombin & Antithrombin
-            scale_phi = 1e-3
-            phi_at = self.cfg.phi_at * scale_phi
-            phi_rt = self.cfg.phi_rt * scale_phi
+            # Thrombin & Antithrombin
+            phi_at = self.cfg.phi_at * self.cfg.beta
+            phi_rt = self.cfg.phi_rt * self.cfg.beta
 
-            R_T = (phi_at * AP + phi_rt * RP) - (self.cfg.k_1t * AT * T)
-            R_AT = - (self.cfg.k_1t * AT * T)
+            Gamma_inhibit = self.compute_gamma(T, AT)
+            R_T = (phi_at * AP + phi_rt * RP) - (Gamma_inhibit * T)
+            R_AT = - (Gamma_inhibit * T)
 
-            # 4. Fibrin Cascade
             R_FG, R_FI = self.compute_fibrin_kinetics(T, FG)
 
             return {
@@ -156,8 +157,13 @@ class BiochemPhysicsKernels:
         Computes the Pseudo-Huber regularization loss for the spatial gradients
         of the dual viscosity field. Stabilizes PINN training.
         """
-        mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * 6999.0 + 1.0
-        mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * 7000.0
+        # FIX: Use the dynamically assigned config limits, not hardcoded 7000s
+        max_ratio = self.cfg.mu_ratio_max
+
+        # mu1 maxes out at (max_ratio - 1.0) so the base fluid remains 1.0x
+        mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * (max_ratio - 1.0) + 1.0
+        mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * max_ratio
+
         mu_total = mu1_mat + mu2_fi
 
         dmu_dx = self.core._compute_derivatives(mu_total.unsqueeze(1), spatial_props)
@@ -170,6 +176,10 @@ class BiochemPhysicsKernels:
         """Computes Advection-Diffusion-Reaction (L_ADR) residuals."""
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
+
+        # --- Shear-Enhanced Diffusion (Keller Effect) ---
+        # Ds = 0.18 * dRBC^2 * shear_rate
+        D_s = 0.18 * (self.cfg.d_RBC ** 2) * shear_rate
 
         # Split species based on kinetic timescale stiffness
         fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
@@ -190,7 +200,7 @@ class BiochemPhysicsKernels:
         scales = self.species_scales.to(species_preds.device)
 
         # Expand clamp max to 80.0 to allow massive physical spikes without float32 overflow
-        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=80.0)
+        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=20.0)
         # expm1 reverses log1p: (e^y - 1)
         nd_species_preds = torch.expm1(species_preds_safe)
         linear_species_preds = nd_species_preds * scales[:9]
@@ -199,12 +209,16 @@ class BiochemPhysicsKernels:
         species_dict = {keys[i]: linear_species_preds[..., i] for i in range(len(keys))}
 
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
+        keller_species = ['RP', 'AP', 'PT', 'T', 'AT']
 
         for key in fast_keys + slow_keys:
             C = species_dict[key]
-            D = self.D_coeff[key]
-            R = reaction_terms[key]
 
+            # Add Keller diffusion dynamically
+            base_D = self.D_coeff[key]
+            D = base_D + D_s if key in keller_species else base_D
+
+            R = reaction_terms[key]
             grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
 
             # Re-dimensionalize Spatial Derivatives (1st Order)
@@ -241,7 +255,7 @@ class BiochemPhysicsKernels:
         scales = self.species_scales.to(biochem_preds.device)
 
         # FIX: Expand clamp max to 80.0
-        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=80.0)
+        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=20.0)
 
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
         linear_biochem_preds = nd_biochem_preds * scales[:9]  # Only bulk species passed here
@@ -264,27 +278,56 @@ class BiochemPhysicsKernels:
         M_tot = M + Mas + Mat
         Minf = self.cfg.Minf
 
-        # Soft-clamp to prevent negative availability during early training
-        availability = torch.clamp(1.0 - (M_tot / Minf), min=0.0, max=1.0)
-
-        # 4. Compute Local Surface Activation Rate (k_pa)
-        u_wall = velocity_field[mask_wall, 0]
-        v_wall = velocity_field[mask_wall, 1]
-        # Shear rate requires the full field to compute gradients, so we compute globally and mask
+        # 4. Compute Local Surface Activation & Spatial Gradients
         global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props)
         shear_wall = global_shear[mask_wall]
+
+        # Calculate spatial derivative of the shear rate (dshear/dx)
+        c_shear = self.core._compute_derivatives(global_shear.unsqueeze(1), spatial_props)
+        d_bar = spatial_props['d_bar'].to(biochem_preds.device)
+        dshear_dx_global = c_shear[:, 0, 0] / d_bar
+        dshear_dx_wall = dshear_dx_global[mask_wall]
+
+        dshear_abs = torch.abs(dshear_dx_wall) + 1e-6
+        availability = torch.clamp(1.0 - (M_tot / Minf), min=1e-8, max=1.0)
+
+        # COMSOL Pathological Conditionals (Soft-Logic)
+        # Condition 1: High negative spatial shear gradient (Separation zone / Stagnation point)
+        # if d(spf.sr, x) < sgt
+        is_separation = self.kinetics._soft_step(dshear_dx_wall, self.cfg.sgt, self.kinetics.T_grad, reverse=True)
+
+        # Condition 2: Absolute low shear (Recirculation zone)
+        # if spf.sr < lss
+        is_low_shear = self.kinetics._soft_step(shear_wall, self.cfg.lss, self.kinetics.T_low_shear, reverse=True)
 
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
-        # 5. Steady-State Residual Equations (Target = 0)
-        # Residual M: Deposition of RP minus activation of M into Mat
-        R_M = (self.cfg.k_rs * RP_wall * availability) - (k_pa_wall * M)
+        # 5. Steady-State Residual Equations (Matching COMSOL Inward Flux Rules)
+
+        # Pathological adhesion rates using the safe dshear_abs variable
+        # (L/gamma_m) * abs(d(spf.sr, x)) * Sat(M) * k_rs * RP
+        pathological_RP_adhesion = is_separation * (
+                    self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_rs * RP_wall
+        low_shear_RP_adhesion = is_low_shear * availability * self.cfg.k_rs * RP_wall
+
+        pathological_AP_adhesion = is_separation * (
+                    self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_as * AP_wall
+        low_shear_AP_adhesion = is_low_shear * availability * self.cfg.k_as * AP_wall
+
+        # AP sticking to previously deposited Mas
+        pathological_Mas_adhesion = is_separation * (self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * (
+                Mas / Minf) * self.cfg.k_aa * AP_wall
+        low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * self.cfg.k_aa * AP_wall
+
+        # Residual M: Deposition minus activation
+        R_M = (pathological_RP_adhesion + low_shear_RP_adhesion) - (k_pa_wall * M)
 
         # Residual Mas: Direct deposition of AP
-        R_Mas = self.cfg.k_as * AP_wall * availability
+        R_Mas = (pathological_AP_adhesion + low_shear_AP_adhesion) + (
+                    pathological_Mas_adhesion + low_shear_Mas_adhesion)
 
-        # Residual Mat: Activation of previously resting wall platelets
+        # Residual Mat: Activation of resting wall platelets
         R_Mat = k_pa_wall * M
 
         # --- Non-Dimensionalize the Wall Residuals ---

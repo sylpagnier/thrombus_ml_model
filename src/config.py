@@ -159,9 +159,16 @@ class BiochemConfig:
     D_FI: float = 2.47e-11  # Fibrin
     D_FG: float = 3.10e-11  # Fibrinogen
 
-    # --- Curriculum Learning Bounds ---
+    # Surface & Flow Pathology Constants mapped from COMSOL
+    gamma_m: float = 150.0  # Reference shear rate for scaling [1/s]
+    lss: float = 25.0  # Low shear rate threshold for stagnation [1/s]
+    sgt: float = -750.0  # Spatial shear gradient threshold [1/(m*s)]
+    L_char: float = 0.00075  # Characteristic length scale (converted 0.075 cm to m)
+    k_aa: float = 0.045  # Adhesion rate for activated platelets on Mas [m/s]
+
+    # Curriculum Learning Bounds (Corrected to match COMSOL mu1/mu2 max values)
     mu_ratio_init: float = 2.0
-    mu_ratio_max: float = 7000.0
+    mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
 
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""

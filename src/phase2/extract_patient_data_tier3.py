@@ -121,7 +121,7 @@ class PatientDataExtractor:
         return grad_f[:, :2]
 
     def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
-        """Robust KDTree mapping with unmapped coordinate reporting."""
+        """Robust KDTree mapping with unmapped coordinate reporting and silent failure prevention."""
         mask = torch.zeros(num_nodes, dtype=torch.bool)
         unmapped_ratio = 0.0
 
@@ -129,13 +129,27 @@ class PatientDataExtractor:
             return mask, 1.0  # 100% missing
 
         bnd_df = pd.read_csv(file_path, comment='%', sep=r'\s+', header=None)
-        bnd_coords = np.unique(bnd_df.iloc[:, -2:].values, axis=0)
+
+        # FIX: Apply the * 0.01 scale to convert boundary cm to domain m
+        bnd_coords = np.unique(bnd_df.iloc[:, -2:].values, axis=0) * 0.01
 
         distances, indices = tree.query(bnd_coords)
         valid_matches = indices[distances < tolerance]
 
+        # ROBUSTNESS: Prevent the "Silent Failure" PDE collapse
+        if len(valid_matches) == 0 and len(bnd_coords) > 0:
+            raise ValueError(
+                f"\nCRITICAL ERROR: Zero boundary nodes mapped for {file_path.name}!\n"
+                f"Attempted to map {len(bnd_coords)} nodes but none fell within the {tolerance} tolerance.\n"
+                f"Please verify that your COMSOL boundary exports are in the same spatial units (cm) as your domain export."
+            )
+
         mask[valid_matches] = True
         unmapped_ratio = 1.0 - (len(np.unique(valid_matches)) / len(bnd_coords))
+
+        # Optional: Print a warning if the mask only partially maps
+        if unmapped_ratio > 0.10:
+            print(f"⚠️ Warning: {unmapped_ratio:.1%} of boundary nodes in {file_path.name} failed to map.")
 
         return mask, unmapped_ratio
 
@@ -279,10 +293,16 @@ class PatientDataExtractor:
         G_x, G_y, Laplacian = self._precompute_sparse_operators(edge_index, num_nodes, M_inv, V, W)
 
         # 7. Mass Flux Calculation
+        # Convert CGS (cm/s) to SI (m/s)
         u_raw = torch.tensor(df_matched['u'].values, dtype=torch.float32) * 0.01
         v_raw = torch.tensor(df_matched['v'].values, dtype=torch.float32) * 0.01
-        p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32)
-        mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32)
+
+        # --- NEW: Convert CGS (comsol unit sys) to SI for Pressure and Viscosity ---
+        # COMSOL Pressure is in Barye (dyn/cm^2). 1 Barye = 0.1 Pascals.
+        p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32) * 0.1
+
+        # COMSOL Viscosity is in Poise (g/(cm*s)). 1 Poise = 0.1 Pascal-seconds.
+        mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32) * 0.1
 
         inlet_flux = torch.sqrt(u_raw[mask_inlet] ** 2 + v_raw[mask_inlet] ** 2).sum().item()
         outlet_flux = torch.sqrt(u_raw[mask_outlet] ** 2 + v_raw[mask_outlet] ** 2).sum().item()
