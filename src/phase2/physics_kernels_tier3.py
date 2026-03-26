@@ -32,6 +32,7 @@ class BiochemPhysicsKernels:
             'AP': self.cfg.D_AP * self.D_scale,
             'APR': self.cfg.D_APR * self.D_scale,
             'APS': self.cfg.D_APS * self.D_scale,
+            'PT': self.cfg.D_PT * self.D_scale,
             'T': self.cfg.D_T * self.D_scale,
             'AT': self.cfg.D_AT * self.D_scale,
             'FG': self.cfg.D_FG * self.D_scale,
@@ -67,10 +68,11 @@ class BiochemPhysicsKernels:
             self.kmfi = self.cfg.kmfi * self.C_scale
 
         def _soft_step(self, x, threshold, temperature, reverse=False):
-            """Smooth approximation of Heaviside step function."""
+            """Smooth approximation of Heaviside step function using STE."""
             sign = -1.0 if reverse else 1.0
-            # Apply T_scale to the temperature
-            return torch.sigmoid(sign * (x - threshold) / (temperature * self.T_scale))
+            scaled_temp = temperature * self.T_scale
+            # Implement Straight-Through Estimator to bypass vanishing gradients
+            return SoftStepSTE.apply(x, threshold, scaled_temp, sign)
 
         def compute_omega(self, APR, APS, T):
             """Analytic 1: Chemical activation function."""
@@ -92,17 +94,16 @@ class BiochemPhysicsKernels:
 
             return kpa_chem + kpa_mech
 
-        def compute_fibrin_kinetics(self, T, FG):
-            """
-            Computes source/sink terms for Fibrinogen (FG) and Fibrin (FI)
-            Formula: kfi * T * FG / (kmfi + FG)
-            """
+        # Update signature to include FI concentration
+        def compute_fibrin_kinetics(self, T, FG, FI):
             eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
 
-            R_FG = -reaction_rate
-            R_FI = reaction_rate
+            # Enforce 1.0 maximum mass/volume limit constraint
+            saturation_term = torch.clamp(1.0 - FI, min=0.0)
 
+            R_FI = reaction_rate * saturation_term
+            R_FG = -reaction_rate * saturation_term  # Conservation of species mass
             return R_FG, R_FI
 
         def compute_gamma(self, T, AT):
@@ -115,11 +116,12 @@ class BiochemPhysicsKernels:
             return numerator / denominator
 
         def compute_species_reactions(self, species_dict, shear_rate):
-            """Computes net reaction source/sink terms for all 8 species using config params."""
+            """Computes net reaction source/sink terms for all bulk species using config params."""
             RP = species_dict['RP']
             AP = species_dict['AP']
             APR = species_dict['APR']
             APS = species_dict['APS']
+            PT = species_dict['PT']
             T = species_dict['T']
             AT = species_dict['AT']
             FG = species_dict['FG']
@@ -141,15 +143,18 @@ class BiochemPhysicsKernels:
             phi_at = self.cfg.phi_at * self.cfg.beta
             phi_rt = self.cfg.phi_rt * self.cfg.beta
 
+            # FIX: Enzymatic conversion now correctly depends on available Prothrombin (PT)
+            enzymatic_term = PT * (phi_at * AP + phi_rt * RP)
+            R_PT = -enzymatic_term
+
             Gamma_inhibit = self.compute_gamma(T, AT)
-            R_T = (phi_at * AP + phi_rt * RP) - (Gamma_inhibit * T)
+            R_T = enzymatic_term - (Gamma_inhibit * T)
             R_AT = - (Gamma_inhibit * T)
 
-            R_FG, R_FI = self.compute_fibrin_kinetics(T, FG)
-
+            R_FG, R_FI = self.compute_fibrin_kinetics(T, FG, FI)
             return {
                 'RP': R_RP, 'AP': R_AP, 'APR': R_APR, 'APS': R_APS,
-                'T': R_T, 'AT': R_AT, 'FG': R_FG, 'FI': R_FI
+                'PT': R_PT, 'T': R_T, 'AT': R_AT, 'FG': R_FG, 'FI': R_FI
             }
 
     def compute_dual_viscosity_penalty(self, M_wall, FI_field, spatial_props, delta=1e-3):
@@ -244,29 +249,28 @@ class BiochemPhysicsKernels:
 
         return adr_losses_fast, adr_losses_slow
 
-    def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, mask_wall):
+    def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, data):
         """
-        Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary.
+        Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary,
+        AND couples them to the bulk fluid via Neumann inward flux boundary conditions.
         """
+        mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
             return torch.tensor(0.0, device=biochem_preds.device)
 
         # --- Reverse log1p and re-dimensionalize ---
         scales = self.species_scales.to(biochem_preds.device)
-
-        # FIX: Expand clamp max to 80.0
         biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=20.0)
-
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
-        linear_biochem_preds = nd_biochem_preds * scales[:9]  # Only bulk species passed here
 
-        # 1. Extract Bulk Species at the Wall (using the linear values)
+        # 1. Extract Bulk Species (using the linear values)
+        linear_biochem_preds = nd_biochem_preds * scales[:9]
+
         RP_wall = linear_biochem_preds[mask_wall, 0]
         AP_wall = linear_biochem_preds[mask_wall, 1]
-
-        # We need local agonists to compute surface activation (k_pa)
         APR_wall = linear_biochem_preds[mask_wall, 2]
         APS_wall = linear_biochem_preds[mask_wall, 3]
+        PT_wall = linear_biochem_preds[mask_wall, 4]  # Needed for wall fluxes
         T_wall = linear_biochem_preds[mask_wall, 5]
 
         # 2. Extract Surface Species
@@ -282,31 +286,24 @@ class BiochemPhysicsKernels:
         global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props)
         shear_wall = global_shear[mask_wall]
 
-        # Calculate spatial derivative of the shear rate (dshear/dx)
         c_shear = self.core._compute_derivatives(global_shear.unsqueeze(1), spatial_props)
         d_bar = spatial_props['d_bar'].to(biochem_preds.device)
-        dshear_dx_global = c_shear[:, 0, 0] / d_bar
-        dshear_dx_wall = dshear_dx_global[mask_wall]
 
+        d_bar_wall = d_bar[mask_wall]
+
+        dshear_dx_wall = (c_shear[:, 0, 0] / d_bar)[mask_wall]
         dshear_abs = torch.abs(dshear_dx_wall) + 1e-6
+
         availability = torch.clamp(1.0 - (M_tot / Minf), min=1e-8, max=1.0)
 
         # COMSOL Pathological Conditionals (Soft-Logic)
-        # Condition 1: High negative spatial shear gradient (Separation zone / Stagnation point)
-        # if d(spf.sr, x) < sgt
         is_separation = self.kinetics._soft_step(dshear_dx_wall, self.cfg.sgt, self.kinetics.T_grad, reverse=True)
-
-        # Condition 2: Absolute low shear (Recirculation zone)
-        # if spf.sr < lss
         is_low_shear = self.kinetics._soft_step(shear_wall, self.cfg.lss, self.kinetics.T_low_shear, reverse=True)
 
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
-        # 5. Steady-State Residual Equations (Matching COMSOL Inward Flux Rules)
-
-        # Pathological adhesion rates using the safe dshear_abs variable
-        # (L/gamma_m) * abs(d(spf.sr, x)) * Sat(M) * k_rs * RP
+        # 5. Adhesion Rates (Matching COMSOL Inward Flux Rules)
         pathological_RP_adhesion = is_separation * (
                     self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_rs * RP_wall
         low_shear_RP_adhesion = is_low_shear * availability * self.cfg.k_rs * RP_wall
@@ -315,30 +312,65 @@ class BiochemPhysicsKernels:
                     self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_as * AP_wall
         low_shear_AP_adhesion = is_low_shear * availability * self.cfg.k_as * AP_wall
 
-        # AP sticking to previously deposited Mas
         pathological_Mas_adhesion = is_separation * (self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * (
-                Mas / Minf) * self.cfg.k_aa * AP_wall
+                    Mas / Minf) * self.cfg.k_aa * AP_wall
         low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * self.cfg.k_aa * AP_wall
 
-        # Residual M: Deposition minus activation
+        # --- SURFACE RESIDUALS (ODEs) ---
         R_M = (pathological_RP_adhesion + low_shear_RP_adhesion) - (k_pa_wall * M)
-
-        # Residual Mas: Direct deposition of AP
         R_Mas = (pathological_AP_adhesion + low_shear_AP_adhesion) + (
                     pathological_Mas_adhesion + low_shear_Mas_adhesion)
-
-        # Residual Mat: Activation of resting wall platelets
         R_Mat = k_pa_wall * M
 
-        # --- Non-Dimensionalize the Wall Residuals ---
-        R_M_nd = R_M / Minf
-        R_Mas_nd = R_Mas / Minf
-        R_Mat_nd = R_Mat / Minf
+        loss_surface = torch.mean((R_M / Minf) ** 2 + (R_Mas / Minf) ** 2 + (R_Mat / Minf) ** 2)
 
-        # Calculate MSE loss using the normalized residuals
-        loss_wall = torch.mean(R_M_nd ** 2 + R_Mas_nd ** 2 + R_Mat_nd ** 2)
+        # --- 6. FIX: NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
+        # Inward Fluxes (J_in) mapped directly from COMSOL 'Flux 1' and 'Flux 2'
+        J_in_RP = - (pathological_RP_adhesion + low_shear_RP_adhesion)
+        J_in_AP = - (
+                    pathological_AP_adhesion + low_shear_AP_adhesion + pathological_Mas_adhesion + low_shear_Mas_adhesion)
+        J_in_APR = self.cfg.lambda_adp * (pathological_RP_adhesion + low_shear_RP_adhesion)
+        J_in_APS = self.cfg.s_t * Mat
+        J_in_PT = - self.cfg.beta * self.cfg.phi_at * Mat * PT_wall
+        J_in_T = self.cfg.beta * self.cfg.phi_at * Mat * PT_wall
 
-        return loss_wall
+        flux_targets = {0: J_in_RP, 1: J_in_AP, 2: J_in_APR, 3: J_in_APS, 4: J_in_PT, 5: J_in_T}
+
+        # Wall Outward Normals from the processed mesh
+        nx = data.x[mask_wall, 3]
+        ny = data.x[mask_wall, 4]
+
+        D_s_wall = 0.18 * (self.cfg.d_RBC ** 2) * shear_wall
+        # THE MISSING LINE FIX:
+        keller_indices = [0, 1, 4, 5, 6]
+        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
+
+        loss_flux = torch.tensor(0.0, device=biochem_preds.device)
+
+        for idx, J_in in flux_targets.items():
+            # Get Full Field Gradient
+            C_field = linear_biochem_preds[:, idx].unsqueeze(1)
+            grad_C = self.core._compute_derivatives(C_field, spatial_props)
+
+            # Redimensionalize gradient
+            dC_dx = grad_C[:, 0, 0] / d_bar
+            dC_dy = grad_C[:, 1, 0] / d_bar
+
+            # Dot with outward normal vector (D * grad(C) dot n)
+            dC_dn_wall = dC_dx[mask_wall] * nx + dC_dy[mask_wall] * ny
+
+            # Diffusion Coefficient at Wall
+            base_D = self.D_coeff[keys[idx]]
+            D_eff = base_D + D_s_wall if idx in keller_indices else base_D
+
+            predicted_flux = D_eff * dC_dn_wall
+            flux_residual = predicted_flux - J_in
+
+            # Non-dimensionalize the flux residual using characteristic diffusion scaling
+            flux_residual_nd = flux_residual / (scales[idx] * (base_D / d_bar_wall) + 1e-8)
+            loss_flux += torch.mean(flux_residual_nd ** 2)
+
+        return loss_surface + loss_flux
 
     def _compute_shear_rate(self, u, v, spatial_props):
         """Helper to extract scalar shear rate magnitude from velocity fields."""
@@ -350,3 +382,25 @@ class BiochemPhysicsKernels:
 
         gamma_dot = torch.sqrt(2 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2 + 1e-8)
         return gamma_dot
+
+
+class SoftStepSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold, temperature, sign):
+        thresh_t = torch.tensor(threshold, dtype=x.dtype, device=x.device)
+        temp_t = torch.tensor(temperature, dtype=x.dtype, device=x.device)
+        sign_t = torch.tensor(sign, dtype=x.dtype, device=x.device)
+
+        ctx.save_for_backward(x, thresh_t, temp_t, sign_t)
+        return (sign_t * (x - thresh_t) > 0).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Unpack the saved tensors
+        x, threshold, temperature, sign = ctx.saved_tensors
+
+        # Backward pass: Smooth sigmoid derivative to keep gradients flowing
+        sig = torch.sigmoid(sign * (x - threshold) / temperature)
+        grad_x = grad_output * sign * (1.0 / temperature) * sig * (1.0 - sig)
+
+        return grad_x, None, None, None

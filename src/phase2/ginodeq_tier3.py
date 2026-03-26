@@ -49,6 +49,18 @@ class GINO_DEQ_Tier3(nn.Module):
         # Decoder strictly matched to the updated 12 species count
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
+    def train(self, mode=True):
+        """
+        Override the default train method to ensure the frozen kinematic
+        backbone strictly remains in evaluation mode.
+        """
+        super().train(mode)  # Sets the whole model to train mode
+
+        # Force the frozen layers back into deterministic eval mode
+        self.kin_encoder.eval()
+        self.kin_processor.eval()
+        self.kinematics_decoder.eval()
+
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
         # 1. Prevent Division by Zero if T_scale aggressively anneals
@@ -58,10 +70,11 @@ class GINO_DEQ_Tier3(nn.Module):
         norm_val = (mat - self.mat_crit) / (self.temp_mat * safe_t_scale)
 
         # 3. Clamp the argument to prevent FP16/FP32 precision overflow in the sigmoid
-        # torch.sigmoid(50) is exactly 1.0. Anything higher is dangerous for gradients.
         safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
 
-        return self.mu_ratio_max * torch.sigmoid(safe_val)
+        # FIX: Subtract 1.0 from the max ratio here.
+        # When 1.0 is added in the forward pass, this will strictly peak at mu_ratio_max (80.0x)
+        return (self.mu_ratio_max - 1.0) * torch.sigmoid(safe_val)
 
     def mu2_sigmoid(self, fi):
         """Soft logic for Fibrin-driven viscosity multiplier with numerical safeguards."""
@@ -132,8 +145,11 @@ class GINO_DEQ_Tier3(nn.Module):
                     z_bio = z_bio_next
                     if diff < self.tol: break
 
-            current_species = F.softplus(self.biochem_decoder(z_bio))
-            current_species[:, 9:12] = current_species[:, 9:12] * batch.mask_wall.view(-1, 1).float()
+            raw_species = F.softplus(self.biochem_decoder(z_bio))
+            wall_mask_view = batch.mask_wall.view(-1, 1).float()
+
+            surface_species_loop = raw_species[:, 9:12] * wall_mask_view
+            current_species = torch.cat([raw_species[:, 0:9], surface_species_loop], dim=1)
 
             # --- 3. DYNAMIC CARREAU RHEOLOGY UPDATE ---
             u_nd = u_v_p[:, 0:1]
@@ -182,7 +198,8 @@ class GINO_DEQ_Tier3(nn.Module):
 
             # FIX 1: Use batch.mask_wall
             wall_mask_view = batch.mask_wall.view(-1, 1).float()
-            final_species[:, 9:12] = final_species[:, 9:12] * wall_mask_view
+            surface_species = final_species[:, 9:12] * wall_mask_view
+            final_species = torch.cat([final_species[:, 0:9], surface_species], dim=1)
 
             # FIX 2: Recompute the dynamic base Carreau viscosity for the gradient graph
             u_nd_train = u_v_p[:, 0:1]

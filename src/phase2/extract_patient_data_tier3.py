@@ -120,6 +120,33 @@ class PatientDataExtractor:
         grad_f = torch.bmm(M_inv, sum_W_V_df.unsqueeze(2)).squeeze(2)
         return grad_f[:, :2]
 
+    def _compute_boundary_normals(self, edge_index, boundary_mask, pos_tensor, num_nodes):
+        """Computes geometric unit normals for any boundary mask using adjacent edges."""
+        normals = torch.zeros((num_nodes, 2), dtype=torch.float32, device=pos_tensor.device)
+
+        row, col = edge_index
+        # Find edges where BOTH nodes are on the requested boundary
+        b_edges = boundary_mask[row] & boundary_mask[col]
+
+        r = row[b_edges]
+        c = col[b_edges]
+
+        # Compute edge vectors (dx, dy)
+        edge_vecs = pos_tensor[c] - pos_tensor[r]
+
+        # Perpendicular vector (-dy, dx)
+        edge_normals = torch.stack([-edge_vecs[:, 1], edge_vecs[:, 0]], dim=1)
+
+        # Accumulate normals at the respective nodes
+        normals.scatter_add_(0, r.unsqueeze(1).expand(-1, 2), edge_normals)
+        normals.scatter_add_(0, c.unsqueeze(1).expand(-1, 2), edge_normals)
+
+        # Normalize to create unit vectors
+        norm_mag = torch.linalg.norm(normals, dim=1, keepdim=True) + 1e-9
+        normals_unit = normals / norm_mag
+
+        return normals_unit
+
     def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
         """Robust KDTree mapping with unmapped coordinate reporting and silent failure prevention."""
         mask = torch.zeros(num_nodes, dtype=torch.bool)
@@ -185,7 +212,7 @@ class PatientDataExtractor:
         # 3. Effective Viscosity (The new plot)
         sc3 = axs[1, 0].scatter(x, y, c=mu_eff, cmap='magma', s=2)
         axs[1, 0].set_title(r"Non-Dimensional Viscosity ($\mu_{eff} / \mu_{ref}$)")
-        fig.colorbar(sc3, ax=axs[1, 0], label='ND Ratio'),
+        fig.colorbar(sc3, ax=axs[1, 0], label='ND Ratio')
 
         # 4. Thrombin Concentration (Updated Labels)
         sc4 = axs[1, 1].scatter(x, y, c=thrombin_transformed, cmap='plasma', s=2)
@@ -293,19 +320,24 @@ class PatientDataExtractor:
         G_x, G_y, Laplacian = self._precompute_sparse_operators(edge_index, num_nodes, M_inv, V, W)
 
         # 7. Mass Flux Calculation
-        # Convert CGS (cm/s) to SI (m/s)
+        # Convert CGS (comsol) (cm/s) to SI (m/s)
         u_raw = torch.tensor(df_matched['u'].values, dtype=torch.float32) * 0.01
         v_raw = torch.tensor(df_matched['v'].values, dtype=torch.float32) * 0.01
-
-        # --- NEW: Convert CGS (comsol unit sys) to SI for Pressure and Viscosity ---
-        # COMSOL Pressure is in Barye (dyn/cm^2). 1 Barye = 0.1 Pascals.
         p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32) * 0.1
-
-        # COMSOL Viscosity is in Poise (g/(cm*s)). 1 Poise = 0.1 Pascal-seconds.
         mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32) * 0.1
 
-        inlet_flux = torch.sqrt(u_raw[mask_inlet] ** 2 + v_raw[mask_inlet] ** 2).sum().item()
-        outlet_flux = torch.sqrt(u_raw[mask_outlet] ** 2 + v_raw[mask_outlet] ** 2).sum().item()
+        # Calculate true normals for the inlets and outlets
+        pos_tensor = torch.tensor(mesh_nodes, dtype=torch.float32)
+        inlet_normals = self._compute_boundary_normals(edge_index, mask_inlet, pos_tensor, num_nodes)
+        outlet_normals = self._compute_boundary_normals(edge_index, mask_outlet, pos_tensor, num_nodes)
+
+        # Calculate True Mass Flux via Dot Product (U dot N)
+        inlet_v = torch.stack([u_raw[mask_inlet], v_raw[mask_inlet]], dim=1)
+        outlet_v = torch.stack([u_raw[mask_outlet], v_raw[mask_outlet]], dim=1)
+
+        inlet_flux = torch.abs(torch.sum(inlet_v * inlet_normals[mask_inlet])).item()
+        outlet_flux = torch.abs(torch.sum(outlet_v * outlet_normals[mask_outlet])).item()
+
         flux_imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + 1e-8)
 
         # 8. Data-Driven ML Scaling
@@ -348,9 +380,7 @@ class PatientDataExtractor:
             wall_tree = KDTree(wall_coords)
             dist, idx = wall_tree.query(mesh_nodes)
             sdf = torch.tensor(dist / d_bar, dtype=torch.float32).unsqueeze(1)
-            normals = mesh_nodes - wall_coords[idx]
-            normals_unit = torch.tensor(normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9),
-                                        dtype=torch.float32)
+            normals_unit = self._compute_boundary_normals(edge_index, mask_wall, pos_tensor, num_nodes)
         else:
             sdf = torch.zeros((num_nodes, 1))
             normals_unit = torch.zeros((num_nodes, 2))
@@ -376,6 +406,7 @@ class PatientDataExtractor:
             json.dump(metadata, f, indent=4)
 
         # 11. Final PyG Data Save
+        uv_inlet_bc = torch.cat([u_nd.unsqueeze(1), v_nd.unsqueeze(1)], dim=1)
         data = Data(
             x=x_tensor, y=y_tensor, edge_index=edge_index, edge_attr=edge_attr,
             mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
@@ -384,7 +415,8 @@ class PatientDataExtractor:
             u_ref=torch.tensor([u_ref_actual], dtype=torch.float32),
             re_actual=torch.tensor([re_actual], dtype=torch.float32),
             G_x=G_x, G_y=G_y, Laplacian=Laplacian, V=V, W=W, M_inv=M_inv,
-            u_inlet_bc=u_nd.unsqueeze(1), mu_inlet_bc=mu_nd.unsqueeze(1), mu_wall_bc=mu_nd.unsqueeze(1)
+            u_inlet_bc=uv_inlet_bc,
+            mu_inlet_bc=mu_nd.unsqueeze(1), mu_wall_bc=mu_nd.unsqueeze(1)
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")

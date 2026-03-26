@@ -1,13 +1,20 @@
 import os
+import sys
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Only enable expandable_segments on Linux/Unix systems to prevent Windows warnings
+if sys.platform != "win32":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+else:
+    # Fallback for Windows if you face OOM issues, otherwise leave empty
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import random
-
+from torch_geometric.data import Dataset
 from src.utils.paths import get_project_root
 from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
 from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
@@ -17,9 +24,20 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import DynamicLossWeighter
 
+class PatientDataset(Dataset):
+    def __init__(self, root, file_list):
+        super().__init__(root, transform=None, pre_transform=None)
+        self.file_list = file_list
+
+    def len(self):
+        return len(self.file_list)
+
+    def get(self, idx):
+        # Loads data only when called by the DataLoader using the spaced brackets
+        return torch.load(self.file_list[ idx ], weights_only=False)
+
 
 def load_dataset():
-    # Update tier to match the PatientDataExtractor configuration
     cfg = VesselConfig(tier="tier3_patients")
     data_dir = cfg.graph_output_dir
 
@@ -27,20 +45,22 @@ def load_dataset():
         print(f"Directory not found: {data_dir}. Please generate Tier 3 data first.")
         return []
 
-    # Update glob pattern to find files without the "vessel_" prefix
     file_list = sorted(list(data_dir.glob("*.pt")))
 
-    dataset = []
-    print(f"📂 Loading {len(file_list)} Tier 3 patient graphs...")
-    for f in tqdm(file_list):
-        data = torch.load(f, weights_only=False)
-        dataset.append(data)
-    return dataset
+    # Removed the for-loop loading all graph nodes into a memory list
+    print(f"📂 Found {len(file_list)} Tier 3 patient graphs for lazy loading...")
+
+    return PatientDataset(root=str(data_dir), file_list=file_list)
 
 
 def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     print("❄️  Verifying Kinematic Backbone is Frozen.")
     print("🔥 Activating LoRA layers, Biochemistry Encoders/Decoders, and Loss Weighter.")
+
+    # Set the frozen kinematic backbone to eval mode!
+    model.kin_encoder.eval()
+    model.kin_processor.eval()
+    model.kinematics_decoder.eval()
 
     # Freeze everything by default to be absolutely safe
     for param in model.parameters():
@@ -62,7 +82,7 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
 
     return optim.AdamW([
         {'params': trainable_params, 'lr': base_lr},
-        {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
+        {'params': loss_weighter.parameters(), 'lr': 5e-2, 'weight_decay': 0.0}
     ], weight_decay=1e-5)
 
 
@@ -123,7 +143,7 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
 
     # 5. Biochemistry Residuals
     l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
-    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, mask_wall)
+    l_wall = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, data)
 
     # 6. Balance & Combine with PDE targets
     # Only pass active PDE losses
@@ -147,10 +167,11 @@ def calculate_validation_metrics(pred, data, kernels, device):
     # --- Morphological Metric: Clot Dice Coefficient ---
     mu_eff = pred[:, 3]
     mu_base = 0.0035  # Approximated reference viscosity
-    pred_clot = (mu_eff > 1000.0 * mu_base).float()
+    clot_threshold = 20.0 * mu_base
+    pred_clot = (mu_eff > clot_threshold).float()
 
     if data.y.shape[1] > 3:
-        gt_clot = (data.y[:, 3] > 1000.0 * mu_base).float()
+        gt_clot = (data.y[:, 3] > clot_threshold).float()
         intersection = (pred_clot * gt_clot).sum()
         dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
     else:
@@ -175,8 +196,8 @@ def calculate_validation_metrics(pred, data, kernels, device):
             tau_yy_p = 2.0 * mu_wall_p * dvdy_p[patent_wall_mask]
             tau_xy_p = mu_wall_p * (dudy_p[patent_wall_mask] + dvdx_p[patent_wall_mask])
 
-            nx = data.x[patent_wall_mask, 4]
-            ny = data.x[patent_wall_mask, 5]
+            nx = data.x[patent_wall_mask, 3]
+            ny = data.x[patent_wall_mask, 4]
 
             tx_p, ty_p = tau_xx_p * nx + tau_xy_p * ny, tau_xy_p * nx + tau_yy_p * ny
             tn_p = tx_p * nx + ty_p * ny
@@ -252,7 +273,8 @@ def train_tier3(epochs=50, lr=1e-3):
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
     dataset = load_dataset()
-    if not dataset: return
+    if len(dataset) == 0:
+        return
 
     # Separate anchors (labeled) and physics-only (unlabeled)
     anchors = [d for d in dataset if d.is_anchor.item()]
@@ -294,20 +316,22 @@ def train_tier3(epochs=50, lr=1e-3):
 
     for epoch in range(epochs):
         # --- Curriculum Learning Scheduler ---
+        # --- Curriculum Learning Scheduler ---
         if epoch < 10:
             current_mu_ratio = 2.0
-            current_t_scale = 10.0  # Very soft logic early on
+            current_T_scale = max(0.1, 3.0 - (epoch / epochs) * (3.0 - 0.1))
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
             current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
-            current_t_scale = 10.0 - progress * 9.0  # Anneals down to 1.0 (strict logic)
+            current_T_scale = 10.0 - progress * 9.0
 
-        # Push updates to the network and kernels
+            # Push updates to the network and kernels
         model.mu_ratio_max = current_mu_ratio
-        model.T_scale = current_t_scale
-        kernels.kinetics.T_scale = current_t_scale
+        model.T_scale = max(0.01, model.T_scale * 0.95)
+        kernels.kinetics.T_scale = current_T_scale
 
-        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | T_scale: {current_t_scale:.2f}")
+        # FIX: Capitalized 'T' here as well
+        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | T_scale: {current_T_scale:.2f}")
 
         model.train()
         total_loss_epoch = 0.0
@@ -345,6 +369,7 @@ def train_tier3(epochs=50, lr=1e-3):
 
         # Validation & Metrics
         if epoch % 2 == 0:
+            # 1. Explicitly set to evaluation mode
             model.eval()
             val_dice_total, val_pearson_total, val_fibrin_total = 0.0, 0.0, 0.0
 
@@ -356,14 +381,17 @@ def train_tier3(epochs=50, lr=1e-3):
                 for v_data in val_loader:
                     v_data = v_data.to(device)
                     v_pred = model(v_data)
-                    if isinstance(v_pred, tuple): v_pred = v_pred[0]
+                    if isinstance(v_pred, tuple):
+                        v_pred = v_pred[0]
 
-                    # 2. Unpack the third variable (f) and add it to the total
+                    # Ensure calculate_validation_metrics extracts dynamic velocity from v_pred[ :, 0:2 ]
                     d, p, f = calculate_validation_metrics(v_pred, v_data, kernels, device)
                     val_dice_total += d
                     val_pearson_total += p
                     val_fibrin_total += f
 
+            # 2. Return to training mode
+            model.train()
             avg_dice = val_dice_total / len(val_loader)
             avg_pearson = val_pearson_total / len(val_loader)
             # 3. Calculate the average before printing
@@ -373,6 +401,7 @@ def train_tier3(epochs=50, lr=1e-3):
 
             if avg_dice > best_dice:
                 best_dice = avg_dice
+                model_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), model_dir / "tier3_best_bio.pth")
                 print("⭐ Saved Best Biochemical Coupling Model")
 
