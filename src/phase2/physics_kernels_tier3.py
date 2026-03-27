@@ -183,7 +183,7 @@ class BiochemPhysicsKernels:
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
         # Convert d_RBC from cm to meters if your config stores it in cm
-        d_RBC_m = self.cfg.d_RBC * 0.01
+        d_RBC_m = self.cfg.d_RBC
 
         # Calculate D_s strictly in m^2/s
         D_s = 0.18 * (d_RBC_m ** 2) * shear_rate
@@ -360,7 +360,7 @@ class BiochemPhysicsKernels:
         ny = data.x[mask_wall, 4]
 
         # Convert to meters to keep D_s_wall strictly in m^2/s
-        d_RBC_m_wall = self.cfg.d_RBC * 0.01
+        d_RBC_m_wall = self.cfg.d_RBC
         D_s_wall = 0.18 * (d_RBC_m_wall ** 2) * shear_wall
         # THE MISSING LINE FIX:
         keller_indices = [0, 1, 4, 5, 6]

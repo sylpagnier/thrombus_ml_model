@@ -74,6 +74,9 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     for param in model.bio_encoder.parameters():
         param.requires_grad = True
 
+    for param in model.bio_processor.parameters():
+        param.requires_grad = True
+
     for name, param in model.biochem_decoder.named_parameters():
         if 'lora' not in name.lower():
             param.requires_grad = True
@@ -338,10 +341,8 @@ def train_tier3(epochs=50, lr=1e-3):
         # Push updates to the network and kernels
         model.mu_ratio_max = current_mu_ratio
 
-        # Keep model internal T_scale relatively low/stable for the sigmoid multipliers
-        model.T_scale = max(0.01, model.T_scale * 0.95)
-
-        # Push the macroscopic curriculum temperature to the kinetic step functions
+        # Unify the curriculum temperature
+        model.T_scale = current_T_scale
         kernels.kinetics.T_scale = current_T_scale
 
         # FIX: Capitalized 'T' here as well

@@ -397,7 +397,43 @@ class PatientDataExtractor:
             sdf = torch.zeros((num_nodes, 1))
             normals_unit = torch.zeros((num_nodes, 2))
 
-        x_tensor = torch.cat([nodes_nd, sdf, normals_unit], dim=1)
+        # --- NEW: Build the 15-Channel Input Tensor to match the Frozen Kinematic Backbone ---
+
+        # Boundary Masks
+        m_in = mask_inlet.float().unsqueeze(1)
+        m_out = mask_outlet.float().unsqueeze(1)
+        m_wall = mask_wall.float().unsqueeze(1)
+
+        # Velocity BCs (Inlet gets actual data values, Walls get 0 for no-slip)
+        u_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
+        v_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
+        u_bc[mask_inlet, 0] = u_nd[mask_inlet]
+        v_bc[mask_inlet, 0] = v_nd[mask_inlet]
+
+        # Pressure BC (Outlet gets relative 0)
+        p_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
+
+        # Active BC Masks (1 if BC is enforced at that node, 0 otherwise)
+        uv_mask = (mask_inlet | mask_wall).float().unsqueeze(1)
+        p_mask = mask_outlet.float().unsqueeze(1)
+
+        # Viscosity BC & Mask (Channels 13 & 14)
+        mu_bc = mu_nd.unsqueeze(1)
+        mu_mask = torch.ones((num_nodes, 1), dtype=torch.float32)
+
+        # Concatenate into the exact 15 channels the Tier 2 encoder expects
+        x_tensor = torch.cat([
+            nodes_nd,  #: (x, y) spatial coordinates
+            sdf,  #: Signed Distance Function
+            normals_unit,  #: (nx, ny) unit normals
+            m_in, m_out, m_wall,  #: Topological boundary masks
+            u_bc, v_bc,  #: Velocity Boundary Conditions
+            p_bc,  #: Pressure Boundary Condition
+            uv_mask,  #: Velocity BC Activation Mask
+            p_mask,  #: Pressure BC Activation Mask
+            mu_bc,  #: Viscosity Baseline Input
+            mu_mask  #: Viscosity Activation Mask
+        ], dim=1)  # Total = 15 Channels
 
         # 10. Metadata Export
         metadata = {

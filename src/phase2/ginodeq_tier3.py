@@ -35,9 +35,9 @@ class GINO_DEQ_Tier3(nn.Module):
         # 1. KINEMATICS BACKBONE (FROZEN)
         # ==========================================
         # Kinematics takes u, v, p + mu_eff (4 features)
-        self.kin_encoder = SpectralLinear(in_features=4, out_features=latent_dim)
+        self.kin_encoder = SpectralLinear(in_features=15, out_features=latent_dim)
         self.kin_processor = GINOBlock(latent_dim)
-        self.kinematics_decoder = SpectralLinear(in_features=latent_dim, out_features=3)
+        self.kinematics_decoder = SpectralLinear(in_features=latent_dim, out_features=5)
 
         # ==========================================
         # 2. BIOCHEMISTRY SOLVER
@@ -121,7 +121,14 @@ class GINO_DEQ_Tier3(nn.Module):
 
             # --- 1. Kinematics Inner Loop ---
             def f_kinematics(z):
-                kin_in = torch.cat([kin_init, mu_eff], dim=-1)
+                # Feed the actual geometry into the frozen backbone!
+                kin_in = batch.x.clone()
+
+                # Inject dynamic mu_eff into the viscosity BC channels
+                if kin_in.shape == 15:
+                    kin_in[:, 13] = mu_eff.squeeze(-1)
+                    kin_in[:, 14] = mu_eff.squeeze(-1)
+
                 return apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z)
 
             with torch.no_grad():
@@ -131,7 +138,8 @@ class GINO_DEQ_Tier3(nn.Module):
                     z_kin = z_kin_next
                     if diff < self.tol: break
 
-            u_v_p = self.kinematics_decoder(z_kin)
+                    # Slice only the [u, v, p] kinematics from the 5-channel decoder output
+                    u_v_p = self.kinematics_decoder(z_kin)[:, :3]
 
             # --- 2. Biochemistry Inner Loop ---
             def f_biochem(z):
@@ -184,9 +192,17 @@ class GINO_DEQ_Tier3(nn.Module):
         # ==========================================
         if self.training:
             # Final Kinematics pass (connected to autograd)
-            kin_in = torch.cat([kin_init, mu_eff], dim=-1)
+            kin_in = batch.x.clone()
+
+            # Inject dynamic mu_eff into the viscosity BC channels
+            if kin_in.shape == 15:
+                kin_in[:, 13] = mu_eff.squeeze(-1)
+                kin_in[:, 14] = mu_eff.squeeze(-1)
+
             z_kin = apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z_kin)
-            u_v_p = self.kinematics_decoder(z_kin)
+
+            # FIX: Ensure we slice only the [u, v, p] kinematics (3 channels)
+            u_v_p = self.kinematics_decoder(z_kin)[:, :3]
 
             # Final Biochemistry pass
             bio_in = torch.cat([bio_init, u_v_p], dim=-1)
