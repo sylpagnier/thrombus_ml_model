@@ -145,22 +145,22 @@ def _sample_params(
     path_loc = int(rng.choice([0, 1, 2])) if v_type != "straight" else 2
 
     # 2. Universal Centerline Tortuosity (Organic Meander)
-    # Applies a smooth, continuous wobble to ALL curves
-    f1, f2 = rng.uniform(1.0, 3.0), rng.uniform(3.0, 6.0)
+    # Lowered frequencies: Prevents B-spline loops between control points
+    f1, f2 = rng.uniform(0.5, 1.5), rng.uniform(1.5, 2.5)
     meander = np.sin(2 * np.pi * f1 * t + rng.uniform(0, 2 * np.pi)) + \
               0.5 * np.sin(2 * np.pi * f2 * t + rng.uniform(0, 2 * np.pi))
-    max_meander = 0.15 * width  # Meander up to 15% of width
+    max_meander = 0.10 * width  # Reduced to 10% of width to prevent acute angles
     meander = (meander / max(1e-9, float(np.max(np.abs(meander))))) * max_meander
     meander *= np.sin(np.pi * t)  # Taper exactly to 0 at inlet/outlet
     tortuosity = meander[2:n - 2].tolist()
 
     # 3. Independent Wall Roughness (Plaque/Irregularity)
     def get_wall_noise():
-        # FIX: Lowered frequencies so the 50-point spline can smoothly resolve the waves
-        f_h1, f_h2 = rng.uniform(2.0, 4.0), rng.uniform(4.0, 7.0)
+        # Lowered frequencies so the 50-point spline can smoothly resolve the waves
+        f_h1, f_h2 = rng.uniform(1.0, 2.5), rng.uniform(2.5, 4.0)
         noise = np.sin(2 * np.pi * f_h1 * t + rng.uniform(0, 2 * np.pi)) + \
                 0.5 * np.sin(2 * np.pi * f_h2 * t + rng.uniform(0, 2 * np.pi))
-        max_noise = 0.08 * width  # High-frequency bumps up to 8% of width
+        max_noise = 0.05 * width  # Reduced to 5% of width to prevent pinching
         noise = (noise / max(1e-9, float(np.max(np.abs(noise))))) * max_noise
         noise *= np.sin(np.pi * t) ** 0.5  # Taper smoothly to ends
         return noise.tolist()
@@ -176,8 +176,12 @@ def _sample_params(
     if curve_type == "straight":
         angle_span, amplitude = 0.0, 0.0
     elif curve_type in ("arc", "hook"):
-        target_angle = float(rng.uniform(np.deg2rad(45), np.deg2rad(100))) if curve_type == "arc" else float(
-            rng.uniform(np.deg2rad(110), np.deg2rad(160)))
+        if curve_type == "arc":
+            target_angle = float(rng.uniform(np.deg2rad(45), np.deg2rad(100)))
+        else:
+            # Cap hook angle at 125 degrees to prevent the outlet from curling back past L/3
+            target_angle = float(rng.uniform(np.deg2rad(100), np.deg2rad(125)))
+
         angle_span = min(target_angle, max_safe_angle_span)
         amplitude = 0.0
     else:  # s_curve
@@ -270,9 +274,15 @@ def _build_and_mesh(
             if np.any(step_lengths < (L / n) * 0.1):
                 raise ValueError("Self-intersection detected: Boundary spline collapsed.")
 
+            # Inside the Safety Check for Self-Intersection loop:
             cross_distances = np.linalg.norm(top_coords - bot_coords, axis=1)
-            if np.any(cross_distances < (width * 0.05)):
+            if np.any(cross_distances < (width * 0.20)):  # Increased margin to 20%
                 raise ValueError("Self-intersection detected: Walls pinched together.")
+
+            # --- NEW COMSOL OUTLET CHECK ---
+            # Ensure the physical X-coordinates of the outlet nodes are strictly > L/3
+            if top_coords[-1, 0] < (L / 3.0) or bot_coords[-1, 0] < (L / 3.0):
+                raise ValueError("Geometry rejected: Outlet curled back past L/3.")
 
             # Gmsh geometry
             gmsh.model.add(f"vessel_{idx}")
@@ -488,55 +498,82 @@ class VesselGenerator:
 
         else:
             # Existing multiprocessing logic for num_workers > 1
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {
-                    executor.submit(_worker_run_chunk, chunk, cfg_d, out_str): chunk
+            with mp.Pool(processes=num_workers) as pool:
+                # Submit all chunks
+                async_results = [
+                    (pool.apply_async(_worker_run_chunk, (chunk, cfg_d, out_str)), chunk)
                     for chunk in chunks
-                }
+                ]
+
                 with tqdm(total=n, desc="Generating vessels", unit="vessel") as pbar:
-                    for future in as_completed(futures):
+                    for async_result, chunk in async_results:
                         try:
-                            results = future.result()
+                            # Force a hard timeout (e.g., 60 seconds per chunk)
+                            # Adjust time based on your average mesh generation speed
+                            results = async_result.get(timeout=60)
+
+                            for idx, success, err in results:
+                                pbar.update(1)
+                                if success:
+                                    generated += 1
+                                else:
+                                    logger.warning(f"[ {idx} ] failed: {err}")
+                                    failed_params.append(all_params[idx])
+
+                        except mp.TimeoutError:
+                            logger.error(f"Worker hung (Timeout) — {len(chunk)} samples queued for retry")
+                            failed_params.extend(chunk)
+                            pbar.update(len(chunk))
+                            continue
                         except Exception as exc:
-                            chunk = futures[future]
                             logger.error(f"Worker crash: {exc} — {len(chunk)} samples queued for retry")
                             failed_params.extend(chunk)
                             pbar.update(len(chunk))
                             continue
 
+        # ---- Retry failed samples ----
+        for retry_round in range(1, max_retries + 1):
+            if not failed_params:
+                break
+            logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
+
+            # Give retried samples fresh indices AND roll BRAND NEW parameters
+            base = n + (retry_round - 1) * len(failed_params)
+            retry_batch = [_sample_params(base + i, level, self.cfg, rng) for i in
+                           range(len(failed_params))]
+
+            still_failed: List[Dict[str, Any]] = []
+            retry_chunks = [retry_batch[i: i + chunk_size] for i in
+                            range(0, len(retry_batch), chunk_size)]
+
+            # [FIX 1: Indented inside the loop]
+            # [FIX 2: Swapped to mp.Pool to prevent C++ deadlocks during retries]
+            with mp.Pool(processes=min(num_workers, len(retry_batch))) as pool:
+                async_results = [
+                    (pool.apply_async(_worker_run_chunk, (chunk, cfg_d, out_str)), chunk)
+                    for chunk in retry_chunks
+                ]
+
+                for async_result, chunk in async_results:
+                    try:
+                        # Apply the same 60-second timeout here
+                        results = async_result.get(timeout=60)
+
                         for idx, success, err in results:
-                            pbar.update(1)
                             if success:
                                 generated += 1
                             else:
-                                logger.warning(f"[ {idx} ] failed: {err}")
-                                failed_params.append(all_params[idx])
+                                # Find the original param dict to retry again
+                                failed_p = next((p for p in chunk if p["idx"] == idx), None)
+                                if failed_p:
+                                    still_failed.append(failed_p)
 
-            # ---- Retry failed samples ----
-            for retry_round in range(1, max_retries + 1):
-                if not failed_params:
-                    break
-                logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
-
-                # Give retried samples fresh indices AND roll BRAND NEW parameters
-                base = n + (retry_round - 1) * len(failed_params)
-                retry_batch = [_sample_params(base + i, level, self.cfg, rng) for i in range(len(failed_params))]
-
-                still_failed: List[Dict[str, Any]] = []
-                retry_chunks = [retry_batch[i: i + chunk_size] for i in range(0, len(retry_batch), chunk_size)]
-
-            with ProcessPoolExecutor(max_workers=min(num_workers, len(retry_batch))) as executor:
-                fs = {executor.submit(_worker_run_chunk, [p], cfg_d, out_str): p for p in retry_batch}
-                for future in as_completed(fs):
-                    try:
-                        [(_, success, err)] = future.result()
-                    except Exception:
-                        still_failed.append(fs[future])
-                        continue
-                    if success:
-                        generated += 1
-                    else:
-                        still_failed.append(fs[future])
+                    except mp.TimeoutError:
+                        logger.error(f"Retry worker hung (Timeout) — {len(chunk)} samples failed")
+                        still_failed.extend(chunk)
+                    except Exception as exc:
+                        logger.error(f"Retry worker crash: {exc}")
+                        still_failed.extend(chunk)
 
             failed_params = still_failed
 
@@ -550,15 +587,13 @@ class VesselGenerator:
 
 if __name__ == "__main__":
     import multiprocessing as mp
-
     mp.freeze_support()
 
-    vg = VesselGenerator(tier="tier1")
-    # 1. Run the generation
-    vg.run_pipeline(n=100, level=1, seed=123, num_workers=8, chunk_size=1)
+    # Run the generation
+    vg = VesselGenerator(tier="tier2")
+    vg.run_pipeline(n=500, level=1, seed=25, num_workers=8, chunk_size=1)
 
-    # 2. Call visualization explicitly here!
-    # This keeps the standalone script working as intended.
+    # Call visualization here
     saved_indices = sorted(
         int(p.stem.split("_")[-1])
         for p in vg.output_dir.glob("vessel_*.msh")

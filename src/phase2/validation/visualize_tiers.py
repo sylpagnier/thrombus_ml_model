@@ -2,9 +2,6 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
-from pathlib import Path
-
-# Project specific imports based on your file structure
 from src.utils.paths import get_project_root
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
@@ -179,7 +176,7 @@ def run_tier_comparison():
     _plot_field(fig1, axes1[2, 1], pos, mu_2, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
     _plot_field(fig1, axes1[2, 2], pos, mu_3, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
 
-    fig1.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig1.tight_layout(rect=(0, 0.03, 1, 0.95))
 
     # --- FIGURE 2: Tier 3 Biochemical Focus ---
     # Extract Biochemistry channels based on _CHANNEL dictionary indices
