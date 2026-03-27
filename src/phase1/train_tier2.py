@@ -73,7 +73,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
         if hasattr(data, 'is_anchor'):
             node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
             if node_is_anchor.sum() > 0:
-                l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+                l_data_kine = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
 
         l_rheo = kernels.rheology_loss(pred, data, props=props)
         l_bc = kernels.boundary_condition_loss(pred, data)
@@ -180,8 +180,9 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     dataset = load_dataset()
     if not dataset: return
 
-    anchors = [d for d in dataset if d.is_anchor.item()]
-    physics = [d for d in dataset if not d.is_anchor.item()]
+    # Check if ANY node in the graph is an anchor
+    anchors = [d for d in dataset if d.is_anchor.any().item()]
+    physics = [d for d in dataset if not d.is_anchor.any().item()]
 
     random.seed(42)
     random.shuffle(anchors)
@@ -223,7 +224,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
         else:
             phys_cfg.n = target_n
 
-        if is_distillation or lbfgs_initialized:
+        # Ensure Anderson remains active during L-BFGS to maintain gradient accuracy
+        if is_distillation:
             current_solver = "picard"
         else:
             current_solver = "anderson"

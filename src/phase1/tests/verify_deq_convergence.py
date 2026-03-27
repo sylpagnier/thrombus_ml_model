@@ -20,7 +20,16 @@ def setup_synthetic_batch(num_graphs=2, num_nodes_per_graph=100):
 
         x_full = torch.cat([pos, sdf, shear_pot, normals, rest], dim=-1)
         edge_index = torch.randint(0, num_nodes_per_graph, (2, num_nodes_per_graph * 5))
-        graph_list.append(Data(x=x_full, edge_index=edge_index))
+
+        # --- Generate synthetic edge attributes ---
+        row, col = edge_index
+        edge_vec = pos[col] - pos[row]
+        edge_dist = torch.norm(edge_vec, p=2, dim=-1, keepdim=True)
+        edge_attr = torch.cat([edge_vec, edge_dist], dim=-1)
+        # ----------------------------------------------------
+
+        # Add edge_attr to the Data object
+        graph_list.append(Data(x=x_full, edge_index=edge_index, edge_attr=edge_attr))
 
     return Batch.from_data_list(graph_list)
 

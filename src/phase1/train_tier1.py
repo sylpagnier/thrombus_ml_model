@@ -49,7 +49,6 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
     if hasattr(data, 'is_anchor'):
         node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
         if node_is_anchor.sum() > 0:
-            # Supervise: u, v, p (channels 0-2)
             l_data_kine = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
 
     # 1. Compute Momentum using precomputed props
@@ -112,8 +111,8 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10, adam_epochs=50):
     if not dataset: return
 
     # --- NEW STRATIFIED SPLIT LOGIC ---
-    anchors = [d for d in dataset if d.is_anchor.item()]
-    physics = [d for d in dataset if not d.is_anchor.item()]
+    anchors = [d for d in dataset if d.is_anchor.any().item()]
+    physics = [d for d in dataset if not d.is_anchor.any().item()]
 
     random.seed(42)
     random.shuffle(anchors)

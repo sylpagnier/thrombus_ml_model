@@ -144,11 +144,11 @@ class AnchorGenerator:
             except Exception:
                 pass
 
-    def run_batch(self, start_idx: int = 0, end_idx: int = 50, max_anchors: int = 500):
+    def run_batch(self, max_anchors: int = 500):
         if not self.model:
             raise RuntimeError("Model not loaded.")
 
-        logger.info(f"Batch processing ID {start_idx} to {end_idx}. Anchors limit: {max_anchors}")
+        logger.info(f"Batch processing up to {max_anchors} anchors.")
 
         try:
             mesh_j = self.model.java.component('comp1').mesh('mesh1')
@@ -157,16 +157,24 @@ class AnchorGenerator:
             logger.critical(f"Setup failed: {e}")
             return
 
-        for i in tqdm(range(start_idx, end_idx), desc="Processing"):
-            if i >= max_anchors:
+        # Dynamically find all JSON/NAS pairs to account for retry index gaps
+        # (e.g., vessel_2 might be missing, but vessel_502 exists from a retry)
+        json_files = sorted(self.mesh_dir.glob("vessel_*.json"))
+
+        for json_file in tqdm(json_files[:max_anchors], desc="Processing"):
+            file_stem = json_file.stem  # e.g., 'vessel_52'
+
+            # Extract the integer ID for logging/metadata
+            try:
+                i = int(file_stem.split('_')[1])
+            except (ValueError, TypeError, IndexError):
                 continue
 
-            nas_file = self.mesh_dir / f"vessel_{i}.nas"
-            msh_file = self.mesh_dir / f"vessel_{i}.msh"
-            json_file = self.mesh_dir / f"vessel_{i}.json"
-            out_file = self.output_dir / f"vessel_{i}.npz"
+            nas_file = self.mesh_dir / f"{file_stem}.nas"
+            msh_file = self.mesh_dir / f"{file_stem}.msh"
+            out_file = self.output_dir / f"{file_stem}.npz"
 
-            if not nas_file.exists() or not json_file.exists():
+            if not nas_file.exists():
                 continue
 
             # Skip empty files which cause Solver/Import crashes
@@ -332,8 +340,7 @@ class AnchorGenerator:
 if __name__ == "__main__":
     try:
         generator = AnchorGenerator(tier="tier2")
-
         with generator:
-            generator.run_batch(start_idx=0, end_idx=50)
+            generator.run_batch(max_anchors=50)
     except Exception as e:
         print(e)

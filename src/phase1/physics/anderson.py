@@ -41,7 +41,20 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
         else:
             # Standard Anderson least-squares mixing
             G = F - X
-            G_flat = G.view(bsz, n_history, -1)
+
+            # Apply component-wise weighting to the optimization matrix
+            if residual_weight is not None:
+                # Reshape G to [ bsz, n_history, n, d ] to apply node/channel weights
+                G_node = G.view(bsz, n_history, n, d)
+
+                # Expand weight to match history dimension: [ bsz, 1, n, d ]
+                weight = residual_weight.to(G.device).unsqueeze(1)
+                G_weighted = G_node * weight
+
+                # Flatten back for bmm
+                G_flat = G_weighted.view(bsz, n_history, -1)
+            else:
+                G_flat = G.view(bsz, n_history, -1)
 
             H = torch.bmm(G_flat, G_flat.transpose(1, 2))
             I_max = torch.eye(n_history, dtype=z0.dtype, device=z0.device).unsqueeze(0).expand(bsz, -1, -1)

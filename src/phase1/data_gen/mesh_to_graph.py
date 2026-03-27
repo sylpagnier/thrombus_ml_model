@@ -163,7 +163,7 @@ class MeshToGraphComplete:
         wall_pts = nodes[wall_node_indices]
 
         # 1. Standard distance from wall for interior nodes
-        tree_wall = KDTree(wall_pts)
+        tree_wall = cKDTree(wall_pts)
         dist_raw, indices_wall = tree_wall.query(nodes)
 
         nearest_wall_pts = wall_pts[indices_wall]
@@ -395,12 +395,12 @@ class MeshToGraphComplete:
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
     def run(self):
-        files = sorted([f for f in os.listdir(self.raw_dir) if f.endswith(".msh")])
+        files = sorted(self.raw_dir.glob("*.msh"))
         for f in tqdm(files):
-            self.process_file(f)
+            self.process_file(f.name)
 
 
 if __name__ == "__main__":
-    active_tier = "tier2"
+    active_tier = "tier1"
     processor = MeshToGraphComplete(tier=active_tier)
     processor.run()

@@ -590,8 +590,8 @@ if __name__ == "__main__":
     mp.freeze_support()
 
     # Run the generation
-    vg = VesselGenerator(tier="tier2")
-    vg.run_pipeline(n=500, level=1, seed=25, num_workers=8, chunk_size=1)
+    vg = VesselGenerator(tier="tier1")
+    vg.run_pipeline(n=100, level=1, seed=25, num_workers=8, chunk_size=1)
 
     # Call visualization here
     saved_indices = sorted(
