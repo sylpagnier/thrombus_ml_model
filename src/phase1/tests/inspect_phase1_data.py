@@ -3,9 +3,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch_geometric.utils import degree
 from src.config import PhysicsConfig, VesselConfig
-from src.phase1.physics.physics_kernels import PhysicsKernels, scatter_add
+from src.phase1.physics.physics_kernels import scatter_add
 
 
+# ============================================================
+# Geometry Analysis
+# ============================================================
 def analyze_geometric_quality(data):
     """Analyzes mesh quality via WLS condition numbers (2nd-order 5x5 matrix)."""
     row, col = data.edge_index
@@ -36,6 +39,24 @@ def analyze_geometric_quality(data):
         return np.zeros(num_nodes), np.zeros(num_nodes, dtype=bool)
 
 
+# ============================================================
+# Visualization Helper
+# ============================================================
+def plot_field(ax, pos, values, title, cmap="viridis", colorbar=True, **kwargs):
+    sc = ax.scatter(pos[:, 0], pos[:, 1], c=values, cmap=cmap, s=2, **kwargs)
+    ax.set_title(title)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    if colorbar:
+        plt.colorbar(sc, ax=ax)
+
+    return sc
+
+
+# ============================================================
+# Main Inspection Function
+# ============================================================
 def inspect_sample(filename="vessel_0.pt", tier="tier2"):
     phys_cfg = PhysicsConfig(tier=tier)
     vessel_cfg = VesselConfig(tier=tier)
@@ -48,99 +69,114 @@ def inspect_sample(filename="vessel_0.pt", tier="tier2"):
     print(f"\n{'=' * 60}\n INSPECTING: {data_path.name} | TIER: {tier.upper()}\n{'=' * 60}")
     data = torch.load(data_path, weights_only=False)
 
-    # --- 1. Structural & Feature Validation ---
+    # ------------------------------------------------------------
+    # 1. Structural Checks
+    # ------------------------------------------------------------
     print("\n Architecture & Invariants")
     expected_channels = 15
-    if data.x.shape != expected_channels:
+    if data.x.shape[1] != expected_channels:
         print(f" ❌ FAIL: Feature mismatch! Expected {expected_channels}, got {data.x.shape}.")
     else:
         print(f" ✅ PASS: Features aligned ({expected_channels} channels).")
 
-    # --- 2. Physical Consistency ---
+    # ------------------------------------------------------------
+    # 2. Physics Checks
+    # ------------------------------------------------------------
     print("\n Boundary & Physics Sanity")
     if data.y is not None:
         wall_vel = torch.norm(data.y[data.mask_wall, :2], dim=1).max().item()
         status = "✅ PASS" if wall_vel < 1e-3 else "❌ FAIL"
         print(f" {status}: No-slip condition (Max Wall Vel: {wall_vel:.2e})")
 
-    # --- 3. Geometric Quality ---
+    # ------------------------------------------------------------
+    # 3. Geometric Quality
+    # ------------------------------------------------------------
     cond_nums, mask_valid = analyze_geometric_quality(data)
     print(f"\n Mesh Stability (WLS Condition Numbers)")
     print(f" -> Mean: {np.mean(cond_nums[mask_valid]):.2e} | Max: {np.max(cond_nums[mask_valid]):.2e}")
 
-    # --- 4. Visualization Grid (3x4 Layout) ---
+    # ------------------------------------------------------------
+    # 4. Visualization
+    # ------------------------------------------------------------
     print("\nRendering visualization...")
-    pos = data.x[:, :2].numpy()
 
-    # PRE-CALCULATE MAGNITUDES FOR PHYSICAL ALIGNMENT
-    # GT Magnitude: sqrt(u^2 + v^2) from indices 0 and 1
+    pos = data.x[:, :2].cpu().numpy()
+
     vel_mag_gt = torch.norm(data.y[:, 0:2], dim=1).cpu().numpy()
-    # Prior Magnitude: sqrt(u_p^2 + v_p^2) from indices 11 and 12
     vel_mag_prior = torch.norm(data.x[:, 11:13], dim=1).cpu().numpy()
 
     fig, axes = plt.subplots(3, 4, figsize=(20, 12), constrained_layout=True)
     axes = axes.flatten()
 
-    # ROW 1: INPUTS & GEOMETRY
-    sc0 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 2], cmap='viridis', s=2)
-    axes.set_title("Input: ND-SDF")
-    plt.colorbar(sc0, ax=axes)
+    # ---- Plot definitions (clean + extensible) ----
+    plots = [
+        # Row 1
+        ("Input: ND-SDF", data.x[:, 2], "viridis"),
+        ("Mesh: Log10(WLS Cond)", np.log10(cond_nums + 1), "magma"),
+        ("Input: Wall Normals", None, None),  # special case
+        ("Input: Boundary Masks", None, None),
 
-    sc1 = axes.scatter(pos[:, 0], pos[:, 1], c=np.log10(cond_nums + 1), cmap='magma', s=2)
-    axes.set_title("Mesh: Log10(WLS Cond)")
-    plt.colorbar(sc1, ax=axes)
+        # Row 2
+        ("GT: Velocity Magnitude", vel_mag_gt, "jet"),
+        ("GT: Pressure", data.y[:, 2], "coolwarm"),
+        ("GT: ND-Viscosity", data.y[:, 3], "plasma"),
+        ("GT: Wall Shear Stress", data.y[:, 4], "inferno"),
 
-    mask_w = data.mask_wall.numpy()
-    axes.scatter(pos[:, 0], pos[:, 1], color='lightgray', s=1, alpha=0.1)
-    axes.quiver(pos[mask_w, 0], pos[mask_w, 1], data.x[mask_w, 4], data.x[mask_w, 5], color='red', scale=30)
-    axes.set_title("Input: Wall Normals")
+        # Row 3
+        ("Prior: Velocity Magnitude", vel_mag_prior, "jet"),
+        ("Prior: Viscosity", data.x[:, 13], "plasma"),
+        ("Prior: WSS", data.x[:, 14], "inferno"),
+    ]
 
-    axes.scatter(pos[data.mask_inlet, 0], pos[data.mask_inlet, 1], c='green', s=5, label='Inlet')
-    axes.scatter(pos[data.mask_outlet, 0], pos[data.mask_outlet, 1], c='blue', s=5, label='Outlet')
-    axes.scatter(pos[data.mask_wall, 0], pos[data.mask_wall, 1], c='black', s=2, label='Wall')
-    axes.set_title("Input: Boundary Masks")
-    axes.legend(loc='upper right', fontsize='x-small')
+    # ---- Loop through standard plots ----
+    for i, (title, values, cmap) in enumerate(plots):
+        ax = axes[i]
 
-    # ROW 2: GROUND TRUTH (Now with Magnitude)
-    sc4 = axes.scatter(pos[:, 0], pos[:, 1], c=vel_mag_gt, cmap='jet', s=2)
-    axes.set_title("GT: Velocity Magnitude")
-    plt.colorbar(sc4, ax=axes, label='ND Speed')
+        if values is not None:
+            if torch.is_tensor(values):
+                values = values.cpu().numpy()
+            plot_field(ax, pos, values, title, cmap=cmap)
+        else:
+            # Special cases
+            if title == "Input: Wall Normals":
+                mask_w = data.mask_wall.cpu().numpy()
+                ax.scatter(pos[:, 0], pos[:, 1], color='lightgray', s=1, alpha=0.1)
+                ax.quiver(
+                    pos[mask_w, 0],
+                    pos[mask_w, 1],
+                    data.x[mask_w, 4],
+                    data.x[mask_w, 5],
+                    color='red',
+                    scale=30
+                )
+                ax.set_title(title)
+                ax.set_aspect("equal")
+                ax.axis("off")
 
-    sc5 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 2], cmap='coolwarm', s=2)
-    axes.set_title("GT: Pressure")
-    plt.colorbar(sc5, ax=axes)
+            elif title == "Input: Boundary Masks":
+                ax.scatter(pos[data.mask_inlet, 0], pos[data.mask_inlet, 1], c='green', s=5, label='Inlet')
+                ax.scatter(pos[data.mask_outlet, 0], pos[data.mask_outlet, 1], c='blue', s=5, label='Outlet')
+                ax.scatter(pos[data.mask_wall, 0], pos[data.mask_wall, 1], c='black', s=2, label='Wall')
+                ax.legend(loc='upper right', fontsize='x-small')
+                ax.set_title(title)
+                ax.set_aspect("equal")
+                ax.axis("off")
 
-    sc6 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 3], cmap='plasma', s=2)
-    axes.set_title("GT: ND-Viscosity")
-    plt.colorbar(sc6, ax=axes)
-
-    sc7 = axes.scatter(pos[:, 0], pos[:, 1], c=data.y[:, 4], cmap='inferno', s=2)
-    axes.set_title("GT: Wall Shear Stress")
-    plt.colorbar(sc7, ax=axes)
-
-    # ROW 3: PHYSICAL PRIORS (Now with Magnitude)
-    sc8 = axes.scatter(pos[:, 0], pos[:, 1], c=vel_mag_prior, cmap='jet', s=2)
-    axes.set_title("Prior: Velocity Magnitude")
-    plt.colorbar(sc8, ax=axes, label='ND Speed')
-
-    sc9 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 13], cmap='plasma', s=2)
-    axes.set_title("Prior: Viscosity")
-    plt.colorbar(sc9, ax=axes)
-
-    sc10 = axes.scatter(pos[:, 0], pos[:, 1], c=data.x[:, 14], cmap='inferno', s=2)
-    axes.set_title("Prior: WSS")
-    plt.colorbar(sc10, ax=axes)
-
-    axes.axis('off')
-    axes.text(0, 0.5, f"File: {filename}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}", fontsize=10)
-
-    for ax in axes:
-        if ax.get_title():
-            ax.set_aspect('equal')
-            ax.axis('off')
+    # ---- Metadata panel ----
+    meta_ax = axes[-1]
+    meta_ax.axis("off")
+    meta_ax.text(
+        0,
+        0.5,
+        f"File: {filename}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}",
+        fontsize=10
+    )
 
     plt.show()
 
 
+# ============================================================
+# Entry Point
+# ============================================================
 if __name__ == "__main__":
-    inspect_sample(filename="vessel_6.pt", tier="tier1")
+    inspect_sample(filename="vessel_73.pt", tier="tier1")

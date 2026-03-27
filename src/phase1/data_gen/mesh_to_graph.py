@@ -9,7 +9,8 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig
 from src.utils.paths import get_project_root
-
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
 
 class MeshToGraphComplete:
     def __init__(self, tier="tier1", raw_dir=None, label_dir=None, proc_dir=None):
@@ -190,9 +191,15 @@ class MeshToGraphComplete:
         if len(wall_lines) > 0:
             node_normals = np.zeros((len(nodes), 2))
 
-            # Calculate vessel center to ensure normals point inward (into the fluid)
             interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
-            center_pt = np.mean(nodes[interior_mask], axis=0) if interior_mask.any() else np.mean(nodes, axis=0)
+            interior_nodes = nodes[interior_mask]
+
+            if len(interior_nodes) > 0:
+                interior_tree = cKDTree(interior_nodes)
+            else:
+                interior_tree = None
+                # Fallback if no interior nodes exist (highly unlikely)
+                center_pt = np.mean(nodes, axis=0)
 
             for line in wall_lines:
                 idx_a, idx_b = line[0], line[1]
@@ -206,7 +213,17 @@ class MeshToGraphComplete:
 
                 # Ensure the normal points towards the vessel interior
                 midpoint = (pt_a + pt_b) / 2.0
-                if np.dot(n, center_pt - midpoint) < 0:
+
+                if interior_tree is not None:
+                    # Find the strictly closest fluid node to this wall segment
+                    _, nearest_idx = interior_tree.query(midpoint)
+                    nearest_interior_pt = interior_nodes[nearest_idx]
+                    inward_vec = nearest_interior_pt - midpoint
+                else:
+                    inward_vec = center_pt - midpoint
+
+                # If the normal points away from the local inward vector, flip it
+                if np.dot(n, inward_vec) < 0:
                     n = -n
 
                 # Accumulate the normalized segment normal to the vertices
@@ -297,59 +314,7 @@ class MeshToGraphComplete:
             except Exception as e:
                 print(f"Error mapping labels: {e}")
 
-        # --- Refurbished Analytic Prior (SDF-Based) suitable for Curves ---
-        # 1. Use SDF to determine r_nd (0 at center, R at wall)
-        R_nd = 0.5
-        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
-
-        # 2. Velocity Magnitude Prior (Poiseuille)
-        u_max_nd = 1.5
-        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
-
-        # 3. Derive Flow Direction (Tangent) from Inward Wall Normals
-        # Since vessel_generator.py creates geometries from left to right (+X),
-        # we find the orthogonal vector to the wall normal that points in the +X direction.
-        n_x = wall_normal_vec[:, 0]
-        n_y = wall_normal_vec[:, 1]
-
-        # Handle exact zero to prevent sign() from returning 0
-        sign_ny = torch.sign(n_y)
-        sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
-
-        # Orthogonal tangent vector pointing rightward
-        t_x = torch.abs(n_y)
-        t_y = -sign_ny * n_x
-
-        # Normalize the tangent vector
-        t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
-        flow_dir_x = t_x / t_mag
-        flow_dir_y = t_y / t_mag
-
-        # Project magnitude onto the curved tangent directions
-        u_prior = u_prior_mag * flow_dir_x
-        v_prior = u_prior_mag * flow_dir_y
-
-        # 4. Viscosity Prior (Carreau)
-        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
-        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
-        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
-                    (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
-                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
-                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
-
-        # 5. WSS Prior: MASKED to wall boundary
-        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
-
-        # --- Final Assembly ---
-        x_tensor = torch.cat([
-            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
-            wall_normal_vec,
-            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
-            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
-            u_prior.view(-1, 1), v_prior.view(-1, 1),  # <-- UPDATED: Vectorized UV Prior
-            mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
-        ], dim=1)
-
+        # --- Refurbished Analytic Prior (Geodesic & SDF-Based) ---
         # --------------------------------------------------------------------------
         #  Compute Explicit Sparse Gradient Matrices (G_x, G_y) for GINO
         # --------------------------------------------------------------------------
@@ -379,6 +344,66 @@ class MeshToGraphComplete:
         # Create the sparse tensors that GINO DEQ uses for derivatives
         G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
+
+        # 1. Continuous SDF Profile (Fixes jagged viscosity seams in aneurysms)
+        R_nd = 0.5
+        r_nd = torch.clamp(R_nd - sdf_tensor.squeeze(), min=0.0)
+
+        # 2. Velocity Magnitude Prior (Poiseuille)
+        u_max_nd = 1.5
+        u_prior_mag = u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2)))
+
+        # 3. Derive Flow Direction (Geodesic Gradient)
+        # Calculate the shortest path distance from the inlet using the mesh edges
+        row_np, col_np = row.numpy(), col.numpy()
+        dist_np = edge_attr[:, 2].numpy()  # Edge lengths
+
+        adj = coo_matrix((dist_np, (row_np, col_np)), shape=(len(nodes), len(nodes)))
+        inlet_idx = np.where(mask_inlet.numpy())[0]
+
+        if len(inlet_idx) > 0:
+            geodesic_dist = dijkstra(adj, directed=False, indices=inlet_idx).min(axis=0)
+            phi = torch.tensor(geodesic_dist, dtype=torch.float32)
+
+            # The gradient of the distance from the inlet points exactly downstream
+            flow_dir_x = torch.sparse.mm(G_x, phi.unsqueeze(1)).squeeze()
+            flow_dir_y = torch.sparse.mm(G_y, phi.unsqueeze(1)).squeeze()
+
+            # Normalize the flow vectors
+            flow_mag = torch.sqrt(flow_dir_x ** 2 + flow_dir_y ** 2) + 1e-12
+            flow_dir_x /= flow_mag
+            flow_dir_y /= flow_mag
+        else:
+            flow_dir_x = torch.ones(len(nodes))
+            flow_dir_y = torch.zeros(len(nodes))
+
+        # Project magnitude onto the exact downstream directions
+        u_prior = u_prior_mag * flow_dir_x
+        v_prior = u_prior_mag * flow_dir_y
+
+        # 4. Viscosity Prior (Carreau)
+        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2))
+        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+
+        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
+                (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
+                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
+
+        # 5. WSS Prior: MASKED to wall boundary
+        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
+
+        # --- Final Assembly ---
+        x_tensor = torch.cat([
+            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
+            wall_normal_vec,
+            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
+            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
+            u_prior.view(-1, 1), v_prior.view(-1, 1),
+            mu_prior.view(-1, 1), wss_prior.view(-1, 1)
+        ], dim=1)
+
+
 
         # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
