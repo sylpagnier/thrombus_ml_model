@@ -356,14 +356,26 @@ class PatientDataExtractor:
 
         # Species Non-dimensionalization
         species_cols = list(self.species_map.keys())
-        species = torch.tensor(df_matched[species_cols].values, dtype=torch.float32)
-        species = torch.clamp(species, min=0.0)
+        raw_species_cgs = torch.tensor(df_matched[species_cols].values, dtype=torch.float32)
 
+        # Species Non-dimensionalization
+        species_cols = list(self.species_map.keys())
+        raw_bulk_cgs = torch.tensor(df_matched[species_cols[:9]].values, dtype=torch.float32)
+        raw_surf_cgs = torch.tensor(df_matched[species_cols[9:]].values, dtype=torch.float32)
+
+        # Convert volumetric (mol/cm3 -> mol/m3) and areal (mol/cm2 -> mol/m2)
+        bulk_si = raw_bulk_cgs * 1e6
+        surf_si = raw_surf_cgs * 1e4
+
+        species_si = torch.cat([bulk_si, surf_si], dim=1)
+        species = torch.clamp(species_si, min=0.0)
+
+        # Ensure your bio_cfg scales match these new SI units
         bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
         scales = torch.tensor([
-            bio_cfg.c_RP0, bio_cfg.c_RP0, bio_cfg.APRcrit, bio_cfg.APScrit,
-            bio_cfg.c_pT0, bio_cfg.c_pT0, bio_cfg.cAT0, bio_cfg.c_Fg0,
-            bio_cfg.c_Fg0, bio_cfg.Minf, bio_cfg.Minf, bio_cfg.Minf
+            bio_cfg.c_RP0 * 1e6, bio_cfg.c_RP0 * 1e6, bio_cfg.APRcrit * 1e6, bio_cfg.APScrit * 1e6,
+            bio_cfg.c_pT0 * 1e6, bio_cfg.c_pT0 * 1e6, bio_cfg.cAT0 * 1e6, bio_cfg.c_Fg0 * 1e6,
+            bio_cfg.c_Fg0 * 1e6, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4
         ], dtype=torch.float32)
 
         species_nd = species / scales

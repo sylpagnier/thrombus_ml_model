@@ -21,8 +21,8 @@ class BiochemPhysicsKernels:
             self.cfg.Minf, self.cfg.Minf, self.cfg.Minf
         ])
 
-        self.D_scale = 1e4
-        self.C_scale = 1e3
+        self.D_scale = 1e-4  # Convert cm^2/s to m^2/s
+        self.C_scale = 1e6
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
 
@@ -182,9 +182,11 @@ class BiochemPhysicsKernels:
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
-        # --- Shear-Enhanced Diffusion (Keller Effect) ---
-        # Ds = 0.18 * dRBC^2 * shear_rate
-        D_s = 0.18 * (self.cfg.d_RBC ** 2) * shear_rate
+        # Convert d_RBC from cm to meters if your config stores it in cm
+        d_RBC_m = self.cfg.d_RBC * 0.01
+
+        # Calculate D_s strictly in m^2/s
+        D_s = 0.18 * (d_RBC_m ** 2) * shear_rate
 
         # Split species based on kinetic timescale stiffness
         fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
@@ -303,18 +305,28 @@ class BiochemPhysicsKernels:
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
+        # --- Inside biochem_wall_residual, before the Adhesion Rates ---
+
+        # Convert CGS velocities (cm/s) to SI (m/s)
+        k_rs = self.cfg.k_rs * 1e-2
+        k_as = self.cfg.k_as * 1e-2
+        k_aa = self.cfg.k_aa * 1e-2
+
+        # Convert characteristic length (cm) to SI (m)
+        L_char = self.cfg.L_char * 1e-2
+
         # 5. Adhesion Rates (Matching COMSOL Inward Flux Rules)
         pathological_RP_adhesion = is_separation * (
-                    self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_rs * RP_wall
-        low_shear_RP_adhesion = is_low_shear * availability * self.cfg.k_rs * RP_wall
+                    L_char / self.cfg.gamma_m) * dshear_abs * availability * k_rs * RP_wall
+        low_shear_RP_adhesion = is_low_shear * availability * k_rs * RP_wall
 
         pathological_AP_adhesion = is_separation * (
-                    self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * availability * self.cfg.k_as * AP_wall
-        low_shear_AP_adhesion = is_low_shear * availability * self.cfg.k_as * AP_wall
+                    L_char / self.cfg.gamma_m) * dshear_abs * availability * k_as * AP_wall
+        low_shear_AP_adhesion = is_low_shear * availability * k_as * AP_wall
 
-        pathological_Mas_adhesion = is_separation * (self.cfg.L_char / self.cfg.gamma_m) * dshear_abs * (
-                    Mas / Minf) * self.cfg.k_aa * AP_wall
-        low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * self.cfg.k_aa * AP_wall
+        pathological_Mas_adhesion = is_separation * (L_char / self.cfg.gamma_m) * dshear_abs * (
+                    Mas / Minf) * k_aa * AP_wall
+        low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * k_aa * AP_wall
 
         # --- SURFACE RESIDUALS (ODEs) ---
         R_M = (pathological_RP_adhesion + low_shear_RP_adhesion) - (k_pa_wall * M)
@@ -322,7 +334,14 @@ class BiochemPhysicsKernels:
                     pathological_Mas_adhesion + low_shear_Mas_adhesion)
         R_Mat = k_pa_wall * M
 
-        loss_surface = torch.mean((R_M / Minf) ** 2 + (R_Mas / Minf) ** 2 + (R_Mat / Minf) ** 2)
+        # 1. Calculate characteristic time for non-dimensionalization
+        u_ref_wall = spatial_props['u_ref'].to(biochem_preds.device)[mask_wall]
+        t_ref = d_bar_wall / u_ref_wall
+
+        # 2. Scale residuals by t_ref to make them O(1) before squaring
+        loss_surface = torch.mean(((R_M / Minf) * t_ref) ** 2 +
+                                  ((R_Mas / Minf) * t_ref) ** 2 +
+                                  ((R_Mat / Minf) * t_ref) ** 2)
 
         # --- 6. FIX: NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
         # Inward Fluxes (J_in) mapped directly from COMSOL 'Flux 1' and 'Flux 2'
@@ -340,7 +359,9 @@ class BiochemPhysicsKernels:
         nx = data.x[mask_wall, 3]
         ny = data.x[mask_wall, 4]
 
-        D_s_wall = 0.18 * (self.cfg.d_RBC ** 2) * shear_wall
+        # Convert to meters to keep D_s_wall strictly in m^2/s
+        d_RBC_m_wall = self.cfg.d_RBC * 0.01
+        D_s_wall = 0.18 * (d_RBC_m_wall ** 2) * shear_wall
         # THE MISSING LINE FIX:
         keller_indices = [0, 1, 4, 5, 6]
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
@@ -366,22 +387,29 @@ class BiochemPhysicsKernels:
             predicted_flux = D_eff * dC_dn_wall
             flux_residual = predicted_flux - J_in
 
-            # Non-dimensionalize the flux residual using characteristic diffusion scaling
-            flux_residual_nd = flux_residual / (scales[idx] * (base_D / d_bar_wall) + 1e-8)
+            # Use convective flux for stable normalization
+            char_flux = scales[idx] * u_ref_wall
+            flux_residual_nd = flux_residual / (char_flux + 1e-8)
+
             loss_flux += F.huber_loss(flux_residual_nd, torch.zeros_like(flux_residual_nd), delta=1.0)
 
         return loss_surface, loss_flux
 
     def _compute_shear_rate(self, u, v, spatial_props):
-        """Helper to extract scalar shear rate magnitude from velocity fields."""
         c_u = self.core._compute_derivatives(u.unsqueeze(1), spatial_props)
         c_v = self.core._compute_derivatives(v.unsqueeze(1), spatial_props)
 
         du_dx, du_dy = c_u[:, 0, 0], c_u[:, 1, 0]
         dv_dx, dv_dy = c_v[:, 0, 0], c_v[:, 1, 0]
 
-        gamma_dot = torch.sqrt(2 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2 + 1e-8)
-        return gamma_dot
+        # This is non-dimensional
+        gamma_dot_nd = torch.sqrt(2 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2 + 1e-8)
+
+        # Redimensionalize to physical 1/s
+        u_ref = spatial_props['u_ref'].to(u.device)
+        d_bar = spatial_props['d_bar'].to(u.device)
+
+        return gamma_dot_nd * (u_ref / d_bar)
 
 
 class SoftStepSTE(torch.autograd.Function):
