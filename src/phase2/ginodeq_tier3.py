@@ -11,7 +11,7 @@ class GINO_DEQ_Tier3(nn.Module):
     incorporating COMSOL's Fibrin kinetics and dual-trigger rheology.
     """
 
-    def __init__(self, in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=25,
+    def __init__(self, in_channels=12, spatial_channels=16, latent_dim=64, max_outer_iters=3, max_inner_iters=25,
                  mu_ratio_max=80.0, mat_crit=2e7, fi_crit=0.6,
                  temp_mat=1e6, temp_fi=0.05, tol=1e-4):
         super().__init__()
@@ -34,16 +34,26 @@ class GINO_DEQ_Tier3(nn.Module):
         # ==========================================
         # 1. KINEMATICS BACKBONE (FROZEN)
         # ==========================================
-        # Kinematics takes u, v, p + mu_eff (4 features)
-        self.kin_encoder = SpectralLinear(in_features=15, out_features=latent_dim)
-        self.kin_processor = GINOBlock(latent_dim)
-        self.kinematics_decoder = SpectralLinear(in_features=latent_dim, out_features=5)
+        # Must strictly match the Tier 2 Architecture
+        self.num_fourier_freqs = 8
+        freqs = (2.0 ** torch.arange(self.num_fourier_freqs)) * torch.pi
+        self.register_buffer("fourier_freqs", freqs)
 
-        # ==========================================
-        # 2. BIOCHEMISTRY SOLVER
-        # ==========================================
-        # Biochemistry takes 12 species + newly updated kinematics (u, v, p) (15 features)
-        self.bio_encoder = SpectralLinear(in_features=in_channels + 3, out_features=latent_dim)
+        fourier_channels = 3 * self.num_fourier_freqs * 2
+        encoded_channels = (15 - 3) + 3 + fourier_channels
+
+        self.kin_encoder = nn.Sequential(
+            nn.Linear(encoded_channels, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+        self.kin_processor = GINOBlock(latent_dim)
+        self.kinematics_decoder = nn.Linear(latent_dim, 3)  # Back to 3 channels (u, v, p)
+        self.mu_encoder = nn.Linear(1, latent_dim)
+
+        # BIOCHEMISTRY SOLVER
+        # Biochemistry takes 12 species + 3 kinematics (u, v, p) + 16 spatial features = 31 features
+        self.bio_encoder = SpectralLinear(in_features=in_channels + 3 + spatial_channels, out_features=latent_dim)
         self.bio_processor = GINOBlock(latent_dim)
 
         # Decoder strictly matched to the updated 12 species count
@@ -60,6 +70,31 @@ class GINO_DEQ_Tier3(nn.Module):
         self.kin_encoder.eval()
         self.kin_processor.eval()
         self.kinematics_decoder.eval()
+        self.mu_encoder.eval()
+
+    def _apply_fourier_encoding(self, x):
+        nodes_nd = x[:, 0:2]
+        sdf_nd = x[:, 2:3]
+        shear_pot = torch.zeros_like(sdf_nd)
+        wall_normal = x[:, 3:5]
+
+        rest = x[:, 5:11]
+        uv_prior = x[:, 11:13]
+        mu_prior = x[:, 13:14]
+        wss_prior = x[:, 14:15]
+
+        features_to_encode = torch.cat([sdf_nd, wall_normal], dim=1)
+        N, C = features_to_encode.shape
+
+        x_proj = (features_to_encode.unsqueeze(-1) * self.fourier_freqs).contiguous()
+        x_proj = x_proj.view(N, -1)
+        fourier_feats = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+        encoded_x = torch.cat([
+            nodes_nd, shear_pot, features_to_encode, fourier_feats,
+            rest, uv_prior, mu_prior, wss_prior
+        ], dim=1)
+        return encoded_x
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
@@ -92,8 +127,11 @@ class GINO_DEQ_Tier3(nn.Module):
         u_ref = batch.u_ref.view(-1, 1)
         d_bar = batch.d_bar.view(-1, 1)
 
-        kin_init = torch.zeros(num_nodes, 3, dtype=torch.float32, device=device)
         bio_init = torch.zeros(num_nodes, 12, dtype=torch.float32, device=device)
+
+        if hasattr(batch, 'bio_inlet_bc'):
+            mask_inlet = batch.mask_inlet.view(-1).bool()
+            bio_init[mask_inlet, 0:9] = batch.bio_inlet_bc[mask_inlet]
 
         # Initialize with mu_inf instead of a static Newtonian constant
         mu_inf = 0.0035
@@ -118,18 +156,22 @@ class GINO_DEQ_Tier3(nn.Module):
         # BLOCK-SEIDEL OUTER LOOP
         # ==========================================
         for outer_idx in range(self.max_outer_iters):
-
-            # --- 1. Kinematics Inner Loop ---
             def f_kinematics(z):
-                # Feed the actual geometry into the frozen backbone!
-                kin_in = batch.x.clone()
+                # Slice only the first 15 channels (the foundational physics layout)
+                kin_in = batch.x[:, :15].clone()
 
-                # Inject dynamic mu_eff into the viscosity BC channels
-                if kin_in.shape == 15:
-                    kin_in[:, 13] = mu_eff.squeeze(-1)
-                    kin_in[:, 14] = mu_eff.squeeze(-1)
+                # Update the dynamic viscosity channel (Index 13 in the new layout)
+                kin_in[:, 13:14] = mu_eff / 0.056
 
-                return apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z)
+                # Now _apply_fourier_encoding will correctly find:
+                # nodes_nd at [0:2], sdf at [2:3], normals at [3:5]
+                kin_encoded = self._apply_fourier_encoding(kin_in)
+
+                # Correctly encode the dynamic viscosity for the latent sum
+                mu_nd = mu_eff / 0.056
+                mu_enc = self.mu_encoder(mu_nd)
+
+                return apply_processor(self.kin_processor, self.kin_encoder(kin_encoded) + mu_enc + z)
 
             with torch.no_grad():
                 for _ in range(self.max_inner_iters):
@@ -143,7 +185,8 @@ class GINO_DEQ_Tier3(nn.Module):
 
             # --- 2. Biochemistry Inner Loop ---
             def f_biochem(z):
-                bio_in = torch.cat([bio_init, u_v_p.detach()], dim=-1)
+                # Concatenate geometric features (batch.x) so the bio_encoder is spatially aware
+                bio_in = torch.cat([bio_init, u_v_p.detach(), batch.x], dim=-1)
                 return apply_processor(self.bio_processor, self.bio_encoder(bio_in) + z)
 
             with torch.no_grad():
@@ -192,20 +235,24 @@ class GINO_DEQ_Tier3(nn.Module):
         # ==========================================
         if self.training:
             # Final Kinematics pass (connected to autograd)
-            kin_in = batch.x.clone()
+            kin_in = batch.x[:, :15].clone()
 
-            # Inject dynamic mu_eff into the viscosity BC channels
-            if kin_in.shape == 15:
-                kin_in[:, 13] = mu_eff.squeeze(-1)
-                kin_in[:, 14] = mu_eff.squeeze(-1)
+            if kin_in.shape[-1] == 15:
+                kin_in[:, 13] = mu_eff.squeeze(-1) / 0.056
 
-            z_kin = apply_processor(self.kin_processor, self.kin_encoder(kin_in) + z_kin)
+            # Apply Fourier encoding and encode the dynamic viscosity
+            kin_encoded = self._apply_fourier_encoding(kin_in)
+            mu_nd_train = mu_eff / 0.056
+            mu_enc_train = self.mu_encoder(mu_nd_train)
 
-            # FIX: Ensure we slice only the [u, v, p] kinematics (3 channels)
+            # Reconstruct the exact 3-part latent sum
+            z_kin = apply_processor(self.kin_processor, self.kin_encoder(kin_encoded) + mu_enc_train + z_kin)
+
+            # Ensure we slice only the [u, v, p] kinematics (3 channels)
             u_v_p = self.kinematics_decoder(z_kin)[:, :3]
 
             # Final Biochemistry pass
-            bio_in = torch.cat([bio_init, u_v_p], dim=-1)
+            bio_in = torch.cat([bio_init, u_v_p, batch.x], dim=-1)
             z_bio = apply_processor(self.bio_processor, self.bio_encoder(bio_in) + z_bio)
 
             # Enforce non-negativity

@@ -251,6 +251,46 @@ class BiochemPhysicsKernels:
 
         return adr_losses_fast, adr_losses_slow
 
+    def biochem_inlet_outlet_residual(self, biochem_preds, spatial_props, data):
+        """
+        Enforces Danckwerts (Dirichlet-equivalent) concentration at the inlet
+        and Outflow (Zero normal gradient) conditions at the outlet.
+        """
+        mask_inlet = data.mask_inlet.view(-1).bool()
+        mask_outlet = data.mask_outlet.view(-1).bool()
+
+        loss_inlet = torch.tensor(0.0, device=biochem_preds.device)
+        loss_outlet = torch.tensor(0.0, device=biochem_preds.device)
+
+        # 1. Inlet: Force predictions to match the transformed baseline concentrations
+        if mask_inlet.any() and hasattr(data, 'bio_inlet_bc'):
+            preds_inlet = biochem_preds[mask_inlet, 0:9]
+            targs_inlet = data.bio_inlet_bc[mask_inlet, 0:9]
+            loss_inlet = F.mse_loss(preds_inlet, targs_inlet)
+
+        # 2. Outlet: Zero Diffusive Flux (n . grad(c) = 0)
+        if mask_outlet.any():
+            nx = data.x[mask_outlet, 3]
+            ny = data.x[mask_outlet, 4]
+
+            loss_outlet_species = 0.0
+            for i in range(9):
+                C_field = biochem_preds[:, i].unsqueeze(1)
+                grad_C = self.core._compute_derivatives(C_field, spatial_props)
+
+                dC_dx = grad_C[:, 0, 0]
+                dC_dy = grad_C[:, 1, 0]
+
+                # Dot product with the outward normal vector
+                dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
+
+                # Penalize any non-zero gradient normal to the outlet
+                loss_outlet_species += F.mse_loss(dC_dn, torch.zeros_like(dC_dn))
+
+            loss_outlet = loss_outlet_species / 9.0
+
+        return loss_inlet, loss_outlet
+
     def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, data):
         """
         Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary,

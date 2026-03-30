@@ -146,12 +146,14 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
 
     # 5. Biochemistry Residuals
     l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
-
-    # FIX: Unpack the newly split wall losses
     l_wall_bio, l_wall_phys = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, data)
 
+    # --- Inlet/Outlet Biochemistry Residuals ---
+    l_bio_inlet, l_bio_outlet = kernels.biochem_inlet_outlet_residual(biochem_preds, props, data)
+    l_bio_io = l_bio_inlet + l_bio_outlet
+
     # 6. Balance & Combine with PDE targets
-    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys]
+    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io]  # <-- ADDED l_bio_io
     weighted_pdes = loss_weighter(pde_losses)
 
     loss = weighted_pdes + (500.0 * l_data_bio) + l_data_kine
@@ -162,6 +164,7 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
         "L_ADR_S": l_adr_slow.item(),
         "L_W_Bio": l_wall_bio.item(),
         "L_W_Phy": l_wall_phys.item(),
+        "L_B_IO": l_bio_io.item(),
         "L_Data": l_data_bio.item()
     }
     return loss, metrics
@@ -257,26 +260,23 @@ def train_tier3(epochs=50, lr=1e-3):
     if tier2_path.exists():
         state_dict = torch.load(tier2_path, map_location=device, weights_only=True)
 
-        # --- NEW: Map Tier 1/2 keys to Tier 3 kinematic keys ---
         mapped_state_dict = {}
         for key, value in state_dict.items():
-            if key.startswith('encoder'):
-                mapped_state_dict[key.replace('encoder', 'kin_encoder')] = value
-            elif key.startswith('processor'):
-                mapped_state_dict[key.replace('processor', 'kin_processor')] = value
-            elif key.startswith('decoder'):
-                mapped_state_dict[key.replace('decoder', 'kinematics_decoder')] = value
-            elif key.startswith('mu_encoder') or key.startswith('mu_decoder'):
-                pass  # Ignore standalone mu layers if they exist from Tier 2
-            else:
+            if key.startswith('encoder.'):
+                mapped_state_dict[key.replace('encoder.', 'kin_encoder.')] = value
+            elif key.startswith('core.'):
+                mapped_state_dict[key.replace('core.', 'kin_processor.')] = value
+            elif key.startswith('kinematics_decoder.'):
+                mapped_state_dict[key] = value
+            # Extract the frozen mu_encoder
+            elif key.startswith('mu_encoder.'):
                 mapped_state_dict[key] = value
 
-        # Load the mapped dict
         model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
     # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=4).to(device)
+    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
 
     dataset = load_dataset()
     if len(dataset) == 0:
@@ -392,7 +392,7 @@ def train_tier3(epochs=50, lr=1e-3):
             with torch.no_grad():
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
-                print(f"⚖️ Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f}")
+                print(f"⚖️ Learned Weights -> ADR_F: {weights[ 0 ]:.2f} | ADR_S: {weights[ 1 ]:.2f} | W_Bio: {weights[ 2 ]:.2f} | W_Phys: {weights[ 3 ]:.2f} | Bio_IO: {weights[ 4 ]:.2f}")
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)

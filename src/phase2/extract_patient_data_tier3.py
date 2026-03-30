@@ -397,43 +397,62 @@ class PatientDataExtractor:
             sdf = torch.zeros((num_nodes, 1))
             normals_unit = torch.zeros((num_nodes, 2))
 
-        # --- NEW: Build the 15-Channel Input Tensor to match the Frozen Kinematic Backbone ---
-
         # Boundary Masks
         m_in = mask_inlet.float().unsqueeze(1)
         m_out = mask_outlet.float().unsqueeze(1)
         m_wall = mask_wall.float().unsqueeze(1)
 
-        # Velocity BCs (Inlet gets actual data values, Walls get 0 for no-slip)
+        # Velocity BCs
         u_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
         v_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
         u_bc[mask_inlet, 0] = u_nd[mask_inlet]
         v_bc[mask_inlet, 0] = v_nd[mask_inlet]
 
-        # Pressure BC (Outlet gets relative 0)
+        # Pressure BC
         p_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
 
-        # Active BC Masks (1 if BC is enforced at that node, 0 otherwise)
+        # Active BC Masks
         uv_mask = (mask_inlet | mask_wall).float().unsqueeze(1)
         p_mask = mask_outlet.float().unsqueeze(1)
 
-        # Viscosity BC & Mask (Channels 13 & 14)
+        # Viscosity BC & Mask
         mu_bc = mu_nd.unsqueeze(1)
         mu_mask = torch.ones((num_nodes, 1), dtype=torch.float32)
 
-        # Concatenate into the exact 15 channels the Tier 2 encoder expects
+        # Assuming you had 3 initial guess channels of zeros to make 15 total, like Tier 1
+        zero_init = torch.zeros((num_nodes, 3), dtype=torch.float32)
+
+        # --- FIX: Ensure x_tensor follows the Tier 2 foundational layout ---
         x_tensor = torch.cat([
-            nodes_nd,  #: (x, y) spatial coordinates
-            sdf,  #: Signed Distance Function
-            normals_unit,  #: (nx, ny) unit normals
-            m_in, m_out, m_wall,  #: Topological boundary masks
-            u_bc, v_bc,  #: Velocity Boundary Conditions
-            p_bc,  #: Pressure Boundary Condition
-            uv_mask,  #: Velocity BC Activation Mask
-            p_mask,  #: Pressure BC Activation Mask
-            mu_bc,  #: Viscosity Baseline Input
-            mu_mask  #: Viscosity Activation Mask
-        ], dim=1)  # Total = 15 Channels
+            nodes_nd,  # [0:2] - MUST be here for Fourier Encoding
+            sdf,  # [2:3]
+            normals_unit,  # [3:5]
+            m_in,  #
+            m_out,  #
+            m_wall,  #
+            u_bc,  #
+            v_bc,  #
+            p_bc,  #
+            uv_mask,  #
+            p_mask,  #
+            mu_bc,  #
+            mu_mask  #
+        ], dim=1)
+
+        # --- Use index assignment for the tensor ---
+        inlet_species_si = torch.zeros(9, dtype=torch.float32)
+        inlet_species_si[0] = bio_cfg.c_RP0 * 1e6  # RP  (Index 0)
+        inlet_species_si[4] = bio_cfg.c_pT0 * 1e6  # PT  (Index 4)
+        inlet_species_si[6] = bio_cfg.cAT0 * 1e6  # AT  (Index 6)
+        inlet_species_si[7] = bio_cfg.c_Fg0 * 1e6  # FG  (Index 7)
+        # Note: AP, APR, APS, T, FI remain 0.0 at the inlet
+
+        # Scale and transform
+        inlet_species_nd = inlet_species_si / scales[:9]
+        inlet_species_transformed = torch.log1p(inlet_species_nd)
+
+        # Broadcast to all nodes
+        bio_inlet_bc = inlet_species_transformed.unsqueeze(0).expand(num_nodes, -1)
 
         # 10. Metadata Export
         metadata = {
@@ -464,7 +483,8 @@ class PatientDataExtractor:
             re_actual=torch.tensor([re_actual], dtype=torch.float32),
             G_x=G_x, G_y=G_y, Laplacian=Laplacian, V=V, W=W, M_inv=M_inv,
             u_inlet_bc=uv_inlet_bc,
-            mu_inlet_bc=mu_nd.unsqueeze(1), mu_wall_bc=mu_nd.unsqueeze(1)
+            mu_inlet_bc=mu_nd.unsqueeze(1), mu_wall_bc=mu_nd.unsqueeze(1),
+            bio_inlet_bc=bio_inlet_bc
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
