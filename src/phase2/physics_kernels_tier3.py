@@ -177,18 +177,14 @@ class BiochemPhysicsKernels:
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
         return pseudo_huber_loss
 
-    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props):
-        """Computes Advection-Diffusion-Reaction (L_ADR) residuals."""
+    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props, d_pred_dt=None):
+        """Computes Advection-Diffusion-Reaction (L_ADR) residuals with Transient Time Derivatives."""
         u, v = velocity_field[..., 0], velocity_field[..., 1]
         shear_rate = self._compute_shear_rate(u, v, spatial_props)
 
-        # Convert d_RBC from cm to meters if your config stores it in cm
         d_RBC_m = self.cfg.d_RBC
-
-        # Calculate D_s strictly in m^2/s
         D_s = 0.18 * (d_RBC_m ** 2) * shear_rate
 
-        # Split species based on kinetic timescale stiffness
         fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
         slow_keys = ['AT', 'FG', 'FI']
 
@@ -202,48 +198,48 @@ class BiochemPhysicsKernels:
         v_raw = v * u_ref
 
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
-        # --- Reverse log1p and re-dimensionalize ---
-        # Move scales to the correct device automatically
         scales = self.species_scales.to(species_preds.device)
 
-        # Expand clamp max to 80.0 to allow massive physical spikes without float32 overflow
         species_preds_safe = torch.clamp(species_preds, min=-10.0, max=8.0)
-        # expm1 reverses log1p: (e^y - 1)
         nd_species_preds = torch.expm1(species_preds_safe)
         linear_species_preds = nd_species_preds * scales[:9]
 
-        # Build the dictionary using the linear values
         species_dict = {keys[i]: linear_species_preds[..., i] for i in range(len(keys))}
-
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
         keller_species = ['RP', 'AP', 'PT', 'T', 'AT']
 
         for key in fast_keys + slow_keys:
-            C = species_dict[key]
+            scale_idx = keys.index(key)
+            scale_c = scales[scale_idx]
 
-            # Add Keller diffusion dynamically
+            # --- TRANSIENT UPDATE: Re-dimensionalize temporal derivative ---
+            if d_pred_dt is not None:
+                exp_pred = torch.exp(species_preds_safe[:, scale_idx])
+                dC_dt = scale_c * exp_pred * d_pred_dt[:, scale_idx]
+            else:
+                dC_dt = torch.tensor(0.0, device=species_preds.device)
+
+            C = species_dict[key]
             base_D = self.D_coeff[key]
             D = base_D + D_s if key in keller_species else base_D
 
             R = reaction_terms[key]
             grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
 
-            # Re-dimensionalize Spatial Derivatives (1st Order)
             dC_dx = grad_C[:, 0, 0] / d_bar
             dC_dy = grad_C[:, 1, 0] / d_bar
             advection = u_raw * dC_dx + v_raw * dC_dy
 
-            # Re-dimensionalize Spatial Derivatives (2nd Order)
             dC_dxx = grad_C[:, 2, 0] / (d_bar ** 2)
             dC_dyy = grad_C[:, 4, 0] / (d_bar ** 2)
             diffusion = D * (dC_dxx + dC_dyy)
 
-            residual = advection - diffusion - R
-            scale_idx = keys.index(key)
-            scale_c = scales[scale_idx]
+            # Include dC_dt in the residual
+            residual = dC_dt + advection - diffusion - R
 
             residual_nd = residual / (scale_c + 1e-8)
             loss_c = F.huber_loss(residual_nd, torch.zeros_like(residual_nd), delta=1.0)
+
             if key in fast_keys:
                 adr_losses_fast += loss_c
             else:
@@ -291,36 +287,41 @@ class BiochemPhysicsKernels:
 
         return loss_inlet, loss_outlet
 
-    def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, data):
-        """
-        Enforces Surface Platelet Adhesion and Activation Kinetics at the boundary,
-        AND couples them to the bulk fluid via Neumann inward flux boundary conditions.
-        """
+    def biochem_wall_residual(self, biochem_preds, wall_preds, velocity_field, spatial_props, data, dM_pred_dt=None):
+        """Enforces Surface Platelet Adhesion with Transient Surface ODEs."""
         mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
-            return torch.tensor(0.0, device=biochem_preds.device)
+            return torch.tensor(0.0, device=biochem_preds.device), torch.tensor(0.0, device=biochem_preds.device)
 
-        # --- Reverse log1p and re-dimensionalize ---
         scales = self.species_scales.to(biochem_preds.device)
         biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
-
-        # 1. Extract Bulk Species (using the linear values)
         linear_biochem_preds = nd_biochem_preds * scales[:9]
 
         RP_wall = linear_biochem_preds[mask_wall, 0]
         AP_wall = linear_biochem_preds[mask_wall, 1]
         APR_wall = linear_biochem_preds[mask_wall, 2]
         APS_wall = linear_biochem_preds[mask_wall, 3]
-        PT_wall = linear_biochem_preds[mask_wall, 4]  # Needed for wall fluxes
+        PT_wall = linear_biochem_preds[mask_wall, 4]
         T_wall = linear_biochem_preds[mask_wall, 5]
 
-        # 2. Extract Surface Species
-        M = wall_preds[mask_wall, 0] * self.cfg.Minf
-        Mas = wall_preds[mask_wall, 1] * self.cfg.Minf
-        Mat = wall_preds[mask_wall, 2] * self.cfg.Minf
+        # --- FIX: Inverse transform the surface states ---
+        wall_preds_safe = torch.clamp(wall_preds, min=-10.0, max=8.0)
+        nd_wall_preds = torch.expm1(wall_preds_safe)
 
-        # 3. Compute Available Binding Sites (Saturation constraint)
+        M = nd_wall_preds[mask_wall, 0] * self.cfg.Minf
+        Mas = nd_wall_preds[mask_wall, 1] * self.cfg.Minf
+        Mat = nd_wall_preds[mask_wall, 2] * self.cfg.Minf
+
+        # --- FIX: Chain Rule for Surface Temporal Derivatives ---
+        if dM_pred_dt is not None:
+            exp_wall = torch.exp(wall_preds_safe[mask_wall])
+            dM_dt_phys = exp_wall[:, 0] * dM_pred_dt[mask_wall, 0] * self.cfg.Minf
+            dMas_dt_phys = exp_wall[:, 1] * dM_pred_dt[mask_wall, 1] * self.cfg.Minf
+            dMat_dt_phys = exp_wall[:, 2] * dM_pred_dt[mask_wall, 2] * self.cfg.Minf
+        else:
+            dM_dt_phys = dMas_dt_phys = dMat_dt_phys = 0.0
+
         M_tot = M + Mas + Mat
         Minf = self.cfg.Minf
 
@@ -368,20 +369,20 @@ class BiochemPhysicsKernels:
                     Mas / Minf) * k_aa * AP_wall
         low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * k_aa * AP_wall
 
-        # --- SURFACE RESIDUALS (ODEs) ---
+        # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
         R_M = (pathological_RP_adhesion + low_shear_RP_adhesion) - (k_pa_wall * M)
         R_Mas = (pathological_AP_adhesion + low_shear_AP_adhesion) + (
                     pathological_Mas_adhesion + low_shear_Mas_adhesion)
         R_Mat = k_pa_wall * M
 
-        # 1. Calculate characteristic time for non-dimensionalization
         u_ref_wall = spatial_props['u_ref'].to(biochem_preds.device)[mask_wall]
+        d_bar_wall = spatial_props['d_bar'].to(biochem_preds.device)[mask_wall]
         t_ref = d_bar_wall / u_ref_wall
 
-        # 2. Scale residuals by t_ref to make them O(1) before squaring
-        loss_surface = torch.mean(((R_M / Minf) * t_ref) ** 2 +
-                                  ((R_Mas / Minf) * t_ref) ** 2 +
-                                  ((R_Mat / Minf) * t_ref) ** 2)
+        # Include temporal derivative in the surface physics loss
+        loss_surface = torch.mean((((dM_dt_phys - R_M) / Minf) * t_ref) ** 2 +
+                                  (((dMas_dt_phys - R_Mas) / Minf) * t_ref) ** 2 +
+                                  (((dMat_dt_phys - R_Mat) / Minf) * t_ref) ** 2)
 
         # --- 6. FIX: NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
         # Inward Fluxes (J_in) mapped directly from COMSOL 'Flux 1' and 'Flux 2'

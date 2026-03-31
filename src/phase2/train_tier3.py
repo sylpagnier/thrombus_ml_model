@@ -16,7 +16,7 @@ from tqdm import tqdm
 import random
 from torch_geometric.data import Dataset
 from src.utils.paths import get_project_root
-from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
+from src.phase2.gnode_tier3 import GNODE_Tier3
 from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
 from src.phase1.physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
@@ -74,7 +74,7 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     for param in model.bio_encoder.parameters():
         param.requires_grad = True
 
-    for param in model.bio_processor.parameters():
+    for param in model.ode_func.parameters():
         param.requires_grad = True
 
     for name, param in model.biochem_decoder.named_parameters():
@@ -89,17 +89,19 @@ def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     ], weight_decay=1e-5)
 
 
-def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, device, phys_cfg):
-    # --- 1. DYNAMIC REYNOLDS NUMBER UPDATE ---
+def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bio_cfg):
     if hasattr(data, 're_actual'):
         phys_cfg.re_target = data.re_actual.mean().item()
 
-    # 2. Forward Pass
-    pred = model(data)
+    # To achieve a 3x density over N ground-truth points: (N - 1) * 3 + 1
+    dense_time_steps = (bio_cfg.num_time_steps - 1) * 3 + 1
+    evaluation_times = torch.linspace(0.0, bio_cfg.t_final, steps=dense_time_steps, device=device)
+
+    # 2. Forward Pass (Trajectory Generation)
+    # Returns shape: [ Time, Nodes, 16 ]
+    pred_series = model(data, evaluation_times)
 
     props = kernels.core._get_geometric_props(data)
-
-    # We use data.batch to ensure proper mapping if multiple graphs are batched together
     if hasattr(data, 'batch') and data.batch is not None:
         props['u_ref'] = data.u_ref[data.batch]
         props['d_bar'] = data.d_bar[data.batch]
@@ -107,53 +109,71 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, current_solver, devi
         props['u_ref'] = data.u_ref
         props['d_bar'] = data.d_bar
 
-    velocity_fields = pred[:, 0:2]
-    biochem_preds = pred[:, 4:13]
-    wall_preds = pred[:, 13:16]
-    mask_wall = data.mask_wall.view(-1).bool()
-
-    # 3. Supervised Data Loss (With SAFELY CLAMPED Variance Normalization)
+    # 3. Supervised Data Loss (Evaluated ONLY at final time step T)
+    pred_final = pred_series[-1]
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_bio = torch.tensor(0.0, device=device)
 
+    # [ 2 ] DENSE FINITE DIFFERENCE: Downsample the dense prediction trajectory back to the
+    # standard data frequency (taking every 3rd step) to match your ground-truth data shapes.
+    pred_series_data_freq = pred_series[::3]
+
+    # Supervised Data Loss (Evaluated over ENTIRE TRAJECTORY)
     if hasattr(data, 'is_anchor'):
         node_is_anchor = data.is_anchor[data.batch] if hasattr(data, 'batch') else data.is_anchor
         if node_is_anchor.sum() > 0:
-            # --- Kinematics Variance Normalization ---
-            pred_kine = pred[node_is_anchor, :4]
-            targ_kine = data.y[node_is_anchor, :4]
-            # FIX: Clamp variance to a physical minimum to prevent division by near-zero
-            kine_var = torch.clamp(torch.var(targ_kine, dim=0, keepdim=True), min=1e-2)
+            pred_kine = pred_series_data_freq[:, node_is_anchor, :4]
+            targ_kine = data.y[:, node_is_anchor, :4]
+            kine_var = torch.clamp(torch.var(targ_kine, dim=(0, 1), keepdim=True), min=1e-2)
             l_data_kine = torch.mean(((pred_kine - targ_kine) ** 2) / kine_var)
 
-            # --- Biochemistry Variance Normalization ---
-            pred_bio = pred[node_is_anchor, 4:16]
-            targ_bio = data.y[node_is_anchor, 4:16]
-            # FIX: Clamp variance to a physical minimum
-            bio_var = torch.clamp(torch.var(targ_bio, dim=0, keepdim=True), min=1e-2)
+            pred_bio = pred_series_data_freq[:, node_is_anchor, 4:16]
+            targ_bio = data.y[:, node_is_anchor, 4:16]
+            bio_var = torch.clamp(torch.var(targ_bio, dim=(0, 1), keepdim=True), min=1e-2)
             l_data_bio = torch.mean(((pred_bio - targ_bio) ** 2) / bio_var)
 
-    # 4. Fluid Mechanics (Inherited from Tiers 1 & 2)
-    l_mom = kernels.core.navier_stokes_residual(pred[:, 0:4], data, props=props)
+    # 4. Physics PDE Loss (Evaluated over dense time sequence)
+    # [ 2 ] DENSE FINITE DIFFERENCE: dt is now 3x smaller, drastically increasing the
+    # accuracy and stability of your dC/dt gradients during backprop.
+    dt = evaluation_times[1] - evaluation_times[0]
+    d_pred_dt = (pred_series[1:] - pred_series[:-1]) / dt
+    l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io = 0.0, 0.0, 0.0, 0.0, 0.0
+    num_steps = len(evaluation_times) - 1
 
-    c_u = kernels.core._compute_derivatives(pred[:, 0:1], props)
-    c_v = kernels.core._compute_derivatives(pred[:, 1:2], props)
-    du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
+    for t_idx in range(num_steps):
+        # Evaluate physics at step t+1 using finite difference gradient
+        pred_t = pred_series[t_idx + 1]
+        d_dt_t = d_pred_dt[t_idx]
 
-    l_cont = kernels.core.continuity_loss(du_ij)
-    l_bc = kernels.core.boundary_condition_loss(pred[:, 0:4], data)
-    l_io = kernels.core.inlet_outlet_loss(pred[:, 0:4], data)
+        vel_t = pred_t[:, 0:2]
+        biochem_t = pred_t[:, 4:13]
+        wall_t = pred_t[:, 13:16]
 
-    # 5. Biochemistry Residuals
-    l_adr_fast, l_adr_slow = kernels.biochem_adr_residual(biochem_preds, velocity_fields, props)
-    l_wall_bio, l_wall_phys = kernels.biochem_wall_residual(biochem_preds, wall_preds, velocity_fields, props, data)
+        dC_dt_t = d_dt_t[:, 4:13]
+        dM_dt_t = d_dt_t[:, 13:16]
 
-    # --- Inlet/Outlet Biochemistry Residuals ---
-    l_bio_inlet, l_bio_outlet = kernels.biochem_inlet_outlet_residual(biochem_preds, props, data)
-    l_bio_io = l_bio_inlet + l_bio_outlet
+        # Accumulate physics residuals
+        l_af, l_as = kernels.biochem_adr_residual(biochem_t, vel_t, props, dC_dt_t)
+        l_wb, l_wp = kernels.biochem_wall_residual(biochem_t, wall_t, vel_t, props, data, dM_dt_t)
+        l_bi, l_bo = kernels.biochem_inlet_outlet_residual(biochem_t, props, data)
 
-    # 6. Balance & Combine with PDE targets
-    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io]  # <-- ADDED l_bio_io
+        l_adr_fast += l_af
+        l_adr_slow += l_as
+        l_wall_bio += l_wb
+        l_wall_phys += l_wp
+        l_bio_io += (l_bi + l_bo)
+
+    # Average physics over time steps
+    l_adr_fast /= num_steps
+    l_adr_slow /= num_steps
+    l_wall_bio /= num_steps
+    l_wall_phys /= num_steps
+    l_bio_io /= num_steps
+
+    # Fluid Mechanics (Base flow is pseudo-steady, evaluate once at t_final)
+    l_mom = kernels.core.navier_stokes_residual(pred_final[:, 0:4], data, props=props)
+
+    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io]
     weighted_pdes = loss_weighter(pde_losses)
 
     loss = weighted_pdes + (500.0 * l_data_bio) + l_data_kine
@@ -250,7 +270,12 @@ def train_tier3(epochs=50, lr=1e-3):
     core_kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels = BiochemPhysicsKernels(biochem_cfg=bio_cfg, core_physics_kernels=core_kernels)
 
-    model = GINO_DEQ_Tier3(in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=15).to(device)
+    model = GNODE_Tier3(
+        in_channels=12,
+        spatial_channels=15,
+        latent_dim=64,
+        max_inner_iters=15
+    ).to(device)
 
     # 1. Load Tier 2 Checkpoint (Frozen Kinematic Backbone)
     root = get_project_root()
@@ -271,6 +296,18 @@ def train_tier3(epochs=50, lr=1e-3):
             # Extract the frozen mu_encoder
             elif key.startswith('mu_encoder.'):
                 mapped_state_dict[key] = value
+
+        # --- Dynamic channel expansion surgery (Tier 2 -> Tier 3) ---
+        if 'kin_encoder.0.weight' in mapped_state_dict:
+            tier2_weight = mapped_state_dict['kin_encoder.0.weight']
+            model_weight = model.kin_encoder[0].weight
+            if tier2_weight.shape[1] != model_weight.shape[1]:
+                print(f"🔧 Adapting Tier 2 encoder weights ({tier2_weight.shape[1]} -> {model_weight.shape[1]})...")
+                new_weight = torch.zeros_like(model_weight)
+                min_dim = min(tier2_weight.shape[1], model_weight.shape[1])
+                new_weight[:, :min_dim] = tier2_weight[:, :min_dim]
+                mapped_state_dict['kin_encoder.0.weight'] = new_weight
+        # ------------------------------------------------------------
 
         model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
@@ -357,7 +394,7 @@ def train_tier3(epochs=50, lr=1e-3):
             data = data.to(device)
             data.x.requires_grad_(True)
 
-            loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, "anderson", device, phys_cfg)
+            loss, metrics = compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bio_cfg)
             loss = loss / accumulation_steps
 
             if torch.isnan(loss):
@@ -392,16 +429,25 @@ def train_tier3(epochs=50, lr=1e-3):
             with torch.no_grad():
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
-                print(f"⚖️ Learned Weights -> ADR_F: {weights[ 0 ]:.2f} | ADR_S: {weights[ 1 ]:.2f} | W_Bio: {weights[ 2 ]:.2f} | W_Phys: {weights[ 3 ]:.2f} | Bio_IO: {weights[ 4 ]:.2f}")
+
+                # FIX: Index the weights tensor [ 0 ] through [ 4 ]
+                print(
+                    f"⚖️ Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f} | Bio_IO: {weights[4]:.2f}"
+                )
+
+                # Define evaluation times for the validation pass
+                val_eval_times = torch.linspace(0.0, bio_cfg.t_final, steps=bio_cfg.num_time_steps, device=device)
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    v_pred = model(v_data)
+                    # FIX: Pass val_eval_times to the model
+                    v_pred = model(v_data, val_eval_times)
+
                     if isinstance(v_pred, tuple):
                         v_pred = v_pred[0]
 
-                    # Ensure calculate_validation_metrics extracts dynamic velocity from v_pred[ :, 0:2 ]
-                    d, p, f = calculate_validation_metrics(v_pred, v_data, kernels, device)
+                    # v_pred is [ Time, Nodes, 16 ], slice [ -1 ] to evaluate final clot
+                    d, p, f = calculate_validation_metrics(v_pred[-1], v_data, kernels, device)
                     val_dice_total += d
                     val_pearson_total += p
                     val_fibrin_total += f

@@ -6,7 +6,7 @@ from src.utils.paths import get_project_root
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
 from src.phase1.physics.ginodeq import GINO_DEQ
-from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
+from src.phase2.gnode_tier3 import GINO_DEQ_Tier3
 from src.config import PhysicsConfig
 
 # Standard channel indices across all models for kinematics

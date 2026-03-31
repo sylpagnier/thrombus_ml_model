@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from src.config import BiochemConfig, PhysicsConfig
 from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
-from src.phase2.ginodeq_tier3 import GINO_DEQ_Tier3
+from src.phase2.gnode_tier3 import GINO_DEQ_Tier3
 from src.utils.paths import get_project_root
 
 class DummyCoreKernels:

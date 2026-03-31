@@ -109,6 +109,10 @@ class BiochemConfig:
     """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations."""
     tier: str = "tier3"
 
+    # --- Temporal Simulation Parameters ---
+    t_final: float = 6000  # Total simulation time to match COMSOL export [s]
+    num_time_steps: int = 60  # Number of evaluation points in the trajectory
+
     # --- Initial Concentrations ---
     c_RP0: float = 2.5e14  # Initial resting platelets [plt/m^3]
     c_pT0: float = 1.2e-3  # Initial prothrombin concentration [mol/m^3]
