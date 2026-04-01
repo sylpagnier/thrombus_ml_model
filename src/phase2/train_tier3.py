@@ -93,9 +93,12 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
     if hasattr(data, 're_actual'):
         phys_cfg.re_target = data.re_actual.mean().item()
 
-    # To achieve a 3x density over N ground-truth points: (N - 1) * 3 + 1
-    dense_time_steps = (bio_cfg.num_time_steps - 1) * 3 + 1
-    evaluation_times = torch.linspace(0.0, bio_cfg.t_final, steps=dense_time_steps, device=device)
+    # Dynamically extract actual time steps and final time from the ground truth
+    actual_num_steps = data.y.shape[ 0 ]
+    actual_t_final = data.t[-1].item() if hasattr(data, 't') else bio_cfg.t_final
+
+    dense_time_steps = actual_num_steps
+    evaluation_times = torch.linspace(0.0, actual_t_final, steps=dense_time_steps, device=device)
 
     # 2. Forward Pass (Trajectory Generation)
     # Returns shape: [ Time, Nodes, 16 ]
@@ -114,9 +117,9 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_bio = torch.tensor(0.0, device=device)
 
-    # [ 2 ] DENSE FINITE DIFFERENCE: Downsample the dense prediction trajectory back to the
-    # standard data frequency (taking every 3rd step) to match your ground-truth data shapes.
-    pred_series_data_freq = pred_series[::3]
+    # FIX: Since we removed the 3x dense multiplier, the prediction frequency
+    # perfectly matches the data frequency. No need to slice [::3] anymore!
+    pred_series_data_freq = pred_series
 
     # Supervised Data Loss (Evaluated over ENTIRE TRAJECTORY)
     if hasattr(data, 'is_anchor'):
@@ -125,16 +128,17 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
             pred_kine = pred_series_data_freq[:, node_is_anchor, :4]
             targ_kine = data.y[:, node_is_anchor, :4]
             kine_var = torch.clamp(torch.var(targ_kine, dim=(0, 1), keepdim=True), min=1e-2)
-            l_data_kine = torch.mean(((pred_kine - targ_kine) ** 2) / kine_var)
+            # Use Huber loss to prevent massive initial gradients, scaled by variance
+            l_data_kine = torch.mean(F.huber_loss(pred_kine, targ_kine, reduction='none') / kine_var)
 
             pred_bio = pred_series_data_freq[:, node_is_anchor, 4:16]
             targ_bio = data.y[:, node_is_anchor, 4:16]
             bio_var = torch.clamp(torch.var(targ_bio, dim=(0, 1), keepdim=True), min=1e-2)
-            l_data_bio = torch.mean(((pred_bio - targ_bio) ** 2) / bio_var)
+            # Huber loss Delta of 1.0 transitions from MSE to MAE at an error of 1.0
+            l_data_bio = torch.mean(F.huber_loss(pred_bio, targ_bio, reduction='none', delta=1.0) / bio_var)
 
     # 4. Physics PDE Loss (Evaluated over dense time sequence)
-    # [ 2 ] DENSE FINITE DIFFERENCE: dt is now 3x smaller, drastically increasing the
-    # accuracy and stability of your dC/dt gradients during backprop.
+    # The dt is now based on the actual physical data steps
     dt = evaluation_times[1] - evaluation_times[0]
     d_pred_dt = (pred_series[1:] - pred_series[:-1]) / dt
     l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -153,7 +157,7 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
         dM_dt_t = d_dt_t[:, 13:16]
 
         # Accumulate physics residuals
-        l_af, l_as = kernels.biochem_adr_residual(biochem_t, vel_t, props, dC_dt_t)
+        l_af, l_as = kernels.biochem_adr_residual(biochem_t, vel_t, props, data, d_pred_dt=dC_dt_t)
         l_wb, l_wp = kernels.biochem_wall_residual(biochem_t, wall_t, vel_t, props, data, dM_dt_t)
         l_bi, l_bo = kernels.biochem_inlet_outlet_residual(biochem_t, props, data)
 
@@ -173,10 +177,12 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
     # Fluid Mechanics (Base flow is pseudo-steady, evaluate once at t_final)
     l_mom = kernels.core.navier_stokes_residual(pred_final[:, 0:4], data, props=props)
 
-    pde_losses = [l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io]
-    weighted_pdes = loss_weighter(pde_losses)
-
-    loss = weighted_pdes + (500.0 * l_data_bio) + l_data_kine
+    # Pass ALL 7 losses to the dynamic weighter
+    all_losses = [
+        l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io,
+        l_data_kine, l_data_bio
+    ]
+    loss = loss_weighter(all_losses)
 
     metrics = {
         "L_mom": l_mom.item(),
@@ -194,13 +200,16 @@ def calculate_validation_metrics(pred, data, kernels, device):
     props = kernels.core._get_geometric_props(data)
 
     # --- Morphological Metric: Clot Dice Coefficient ---
-    mu_eff = pred[:, 3]
+    mu_eff = pred[ :, 3 ]
     mu_base = 0.0035  # Approximated reference viscosity
     clot_threshold = 20.0 * mu_base
     pred_clot = (mu_eff > clot_threshold).float()
 
-    if data.y.shape[1] > 3:
-        gt_clot = (data.y[:, 3] > clot_threshold).float()
+    # FIX 1: Check the last dimension (features) instead of dimension 1 (nodes)
+    if data.y.shape[ -1 ] > 3:
+        # Convert GT back to dimensional before checking threshold
+        mu_gt_dimensional = data.y[-1, :, 3] * mu_base if data.y.shape[-1] > 3 else torch.full_like(mu_eff, mu_base)
+        gt_clot = (mu_gt_dimensional > clot_threshold).float()
         intersection = (pred_clot * gt_clot).sum()
         dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
     else:
@@ -209,39 +218,41 @@ def calculate_validation_metrics(pred, data, kernels, device):
     # --- Hemodynamic Metric: WSS Pearson Correlation (Patent Lumen) ---
     mask_wall = data.mask_wall.view(-1).bool()
 
-    if mask_wall.any() and data.y.shape[1] > 1:
+    if mask_wall.any() and data.y.shape[ -1 ] > 1:
         # Patent Lumen Mask (Walls where there is NO ground truth clot)
-        patent_wall_mask = mask_wall & (gt_clot == 0) if data.y.shape[1] > 3 else mask_wall
+        patent_wall_mask = mask_wall & (gt_clot == 0) if data.y.shape[ -1 ] > 3 else mask_wall
 
         if patent_wall_mask.any():
             # Compute Predicted WSS
-            c_u = kernels.core._compute_derivatives(pred[:, 0:1], props)
-            c_v = kernels.core._compute_derivatives(pred[:, 1:2], props)
-            dudx_p, dudy_p = c_u[:, 0, 0], c_u[:, 1, 0]
-            dvdx_p, dvdy_p = c_v[:, 0, 0], c_v[:, 1, 0]
+            c_u = kernels.core._compute_derivatives(pred[ :, 0:1 ], props)
+            c_v = kernels.core._compute_derivatives(pred[ :, 1:2 ], props)
+            dudx_p, dudy_p = c_u[ :, 0, 0 ], c_u[ :, 1, 0 ]
+            dvdx_p, dvdy_p = c_v[ :, 0, 0 ], c_v[ :, 1, 0 ]
 
-            mu_wall_p = pred[patent_wall_mask, 3]
-            tau_xx_p = 2.0 * mu_wall_p * dudx_p[patent_wall_mask]
-            tau_yy_p = 2.0 * mu_wall_p * dvdy_p[patent_wall_mask]
-            tau_xy_p = mu_wall_p * (dudy_p[patent_wall_mask] + dvdx_p[patent_wall_mask])
+            mu_wall_p = pred[ patent_wall_mask, 3 ]
+            tau_xx_p = 2.0 * mu_wall_p * dudx_p[ patent_wall_mask ]
+            tau_yy_p = 2.0 * mu_wall_p * dvdy_p[ patent_wall_mask ]
+            tau_xy_p = mu_wall_p * (dudy_p[ patent_wall_mask ] + dvdx_p[ patent_wall_mask ])
 
-            nx = data.x[patent_wall_mask, 3]
-            ny = data.x[patent_wall_mask, 4]
+            nx = data.x[ patent_wall_mask, 3 ]
+            ny = data.x[ patent_wall_mask, 4 ]
 
             tx_p, ty_p = tau_xx_p * nx + tau_xy_p * ny, tau_xy_p * nx + tau_yy_p * ny
             tn_p = tx_p * nx + ty_p * ny
             wss_pred = torch.sqrt((tx_p - tn_p * nx) ** 2 + (ty_p - tn_p * ny) ** 2 + 1e-8)
 
             # Compute Target WSS
-            c_u_t = kernels.core._compute_derivatives(data.y[:, 0:1], props)
-            c_v_t = kernels.core._compute_derivatives(data.y[:, 1:2], props)
-            dudx_t, dudy_t = c_u_t[:, 0, 0], c_u_t[:, 1, 0]
-            dvdx_t, dvdy_t = c_v_t[:, 0, 0], c_v_t[:, 1, 0]
+            # FIX 3: Extract the final time step [-1] for ground truth velocity
+            c_u_t = kernels.core._compute_derivatives(data.y[ -1, :, 0:1 ], props)
+            c_v_t = kernels.core._compute_derivatives(data.y[ -1, :, 1:2 ], props)
+            dudx_t, dudy_t = c_u_t[ :, 0, 0 ], c_u_t[ :, 1, 0 ]
+            dvdx_t, dvdy_t = c_v_t[ :, 0, 0 ], c_v_t[ :, 1, 0 ]
 
-            mu_wall_t = data.y[patent_wall_mask, 3] if data.y.shape[1] > 3 else torch.full_like(mu_wall_p, mu_base)
-            tau_xx_t = 2.0 * mu_wall_t * dudx_t[patent_wall_mask]
-            tau_yy_t = 2.0 * mu_wall_t * dvdy_t[patent_wall_mask]
-            tau_xy_t = mu_wall_t * (dudy_t[patent_wall_mask] + dvdx_t[patent_wall_mask])
+            # FIX 4: Extract the final time step [-1] for ground truth viscosity
+            mu_wall_t = data.y[ -1, patent_wall_mask, 3 ] if data.y.shape[ -1 ] > 3 else torch.full_like(mu_wall_p, mu_base)
+            tau_xx_t = 2.0 * mu_wall_t * dudx_t[ patent_wall_mask ]
+            tau_yy_t = 2.0 * mu_wall_t * dvdy_t[ patent_wall_mask ]
+            tau_xy_t = mu_wall_t * (dudy_t[ patent_wall_mask ] + dvdx_t[ patent_wall_mask ])
 
             tx_t, ty_t = tau_xx_t * nx + tau_xy_t * ny, tau_xy_t * nx + tau_yy_t * ny
             tn_t = tx_t * nx + ty_t * ny
@@ -249,14 +260,14 @@ def calculate_validation_metrics(pred, data, kernels, device):
 
             # Pearson Correlation
             stacked = torch.stack([wss_pred, wss_targ])
-            pearson_corr = torch.corrcoef(stacked)[0, 1]
+            pearson_corr = torch.corrcoef(stacked)[ 0, 1 ]
             if torch.isnan(pearson_corr): pearson_corr = torch.tensor(0.0)
         else:
             pearson_corr = torch.tensor(0.0)
     else:
         pearson_corr = torch.tensor(0.0)
 
-    max_fibrin_pred = pred[:, 12].max().item()
+    max_fibrin_pred = pred[ :, 12 ].max().item()
 
     return dice.item(), pearson_corr.item(), max_fibrin_pred
 
@@ -274,7 +285,7 @@ def train_tier3(epochs=50, lr=1e-3):
         in_channels=12,
         spatial_channels=15,
         latent_dim=64,
-        max_inner_iters=15
+        max_inner_iters=10
     ).to(device)
 
     # 1. Load Tier 2 Checkpoint (Frozen Kinematic Backbone)
@@ -312,8 +323,8 @@ def train_tier3(epochs=50, lr=1e-3):
         model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
-    # 5 targets: L_NS, L_Rheo, L_Data, L_ADR, L_Wall
-    loss_weighter = DynamicLossWeighter(num_losses=5).to(device)
+    # 7 targets: L_ADR_F, L_ADR_S, L_W_Bio, L_W_Phys, L_B_IO, L_Data_Kine, L_Data_Bio
+    loss_weighter = DynamicLossWeighter(num_losses=7).to(device)
 
     dataset = load_dataset()
     if len(dataset) == 0:
@@ -359,21 +370,23 @@ def train_tier3(epochs=50, lr=1e-3):
 
     for epoch in range(epochs):
         # --- Smooth Curriculum Learning Scheduler ---
+        progress = 0.0
+
         # 1. Warmup Phase (Epochs 0-9): Keep mu_ratio low, keep step functions VERY smooth
         if epoch < 10:
             current_mu_ratio = 2.0
             # Start at T=10.0 (very smooth), gently cool to T=8.0
             current_T_scale = 10.0 - (epoch / 10.0) * 2.0
 
-            # 2. Coupling Phase (Epochs 10+): Ramp up physics severity, sharpen step functions
+        # 2. Coupling Phase (Epochs 10+): Ramp up physics severity, sharpen step functions
         else:
             progress = (epoch - 10) / max(1, (epochs - 11))
 
             # Linearly scale viscosity up to COMSOL max (80.0)
             current_mu_ratio = 2.0 + progress * (80.0 - 2.0)
 
-            # Continue cooling T_scale from 8.0 down to 0.1 (sharp, physical bounds)
-            current_T_scale = 8.0 - progress * (8.0 - 0.1)
+            # Continue cooling T_scale from 8.0 down to 1.0 (Saved the ODE solver!)
+            current_T_scale = 8.0 - progress * (8.0 - 1.0)
 
         # Push updates to the network and kernels
         model.mu_ratio_max = current_mu_ratio
@@ -430,17 +443,21 @@ def train_tier3(epochs=50, lr=1e-3):
                 safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
                 weights = torch.exp(-safe_vars)
 
-                # FIX: Index the weights tensor [ 0 ] through [ 4 ]
                 print(
-                    f"⚖️ Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f} | Bio_IO: {weights[4]:.2f}"
+                    f"⚖️ Learned Weights -> ADR_F: {weights[ 0 ]:.2f} | ADR_S: {weights[ 1 ]:.2f} | "
+                    f"W_Bio: {weights[ 2 ]:.2f} | W_Phys: {weights[ 3 ]:.2f} | Bio_IO: {weights[ 4 ]:.2f} | "
+                    f"Data_Kine: {weights[ 5 ]:.2f} | Data_Bio: {weights[ 6 ]:.2f}"
                 )
-
-                # Define evaluation times for the validation pass
-                val_eval_times = torch.linspace(0.0, bio_cfg.t_final, steps=bio_cfg.num_time_steps, device=device)
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    # FIX: Pass val_eval_times to the model
+
+                    # Define dynamic evaluation times for the validation pass
+                    actual_val_steps = v_data.y.shape[0]
+                    actual_val_t_final = v_data.t[-1].item() if hasattr(v_data, 't') else bio_cfg.t_final
+                    val_eval_times = torch.linspace(0.0, actual_val_t_final, steps=actual_val_steps, device=device)
+
+                    # Pass val_eval_times to the model
                     v_pred = model(v_data, val_eval_times)
 
                     if isinstance(v_pred, tuple):

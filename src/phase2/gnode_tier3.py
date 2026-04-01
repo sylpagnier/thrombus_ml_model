@@ -225,6 +225,11 @@ class GNODE_Tier3(nn.Module):
             if i < num_times - 1:
                 t_span = evaluation_times[i: i + 2]
 
+                # FIX 1: Normalize the time span to [0, ~0.016] to prevent the untrained
+                # Neural ODE from exploding and stalling the adaptive solver.
+                t_final_safe = evaluation_times[-1].clamp(min=1.0)
+                t_span_nd = t_span / t_final_safe
+
                 # Encode current physical state into latent representation
                 bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15]], dim=-1)
                 z_current = self.bio_encoder(bio_in)
@@ -233,7 +238,7 @@ class GNODE_Tier3(nn.Module):
                 z_out = odeint(
                     odefunc_wrapper,
                     z_current,
-                    t_span,
+                    t_span_nd,  # Pass the normalized time
                     method='dopri5',
                     rtol=self.rtol,
                     atol=self.atol,
@@ -244,8 +249,8 @@ class GNODE_Tier3(nn.Module):
                 z_next = z_out[1]
                 raw_species = self.biochem_decoder(z_next)
 
-                # Enforce Asymptotic Saturation
-                next_species_flat = 8.0 * torch.sigmoid(raw_species)
+                # Enforce an upper bound on the log1p space (e.g., max value of 15.0)
+                next_species_flat = 15.0 * torch.sigmoid(raw_species)
 
                 # Enforce surface species only on walls
                 wall_mask_view = batch.mask_wall.view(-1, 1).float()

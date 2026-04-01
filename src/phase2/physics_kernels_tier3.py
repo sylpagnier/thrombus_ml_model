@@ -143,7 +143,7 @@ class BiochemPhysicsKernels:
             phi_at = self.cfg.phi_at * self.cfg.beta
             phi_rt = self.cfg.phi_rt * self.cfg.beta
 
-            # FIX: Enzymatic conversion now correctly depends on available Prothrombin (PT)
+            # Enzymatic conversion now correctly depends on available Prothrombin (PT)
             enzymatic_term = PT * (phi_at * AP + phi_rt * RP)
             R_PT = -enzymatic_term
 
@@ -157,12 +157,11 @@ class BiochemPhysicsKernels:
                 'PT': R_PT, 'T': R_T, 'AT': R_AT, 'FG': R_FG, 'FI': R_FI
             }
 
-    def compute_dual_viscosity_penalty(self, M_wall, FI_field, spatial_props, delta=1e-3):
+    def compute_dual_viscosity_penalty(self, M_wall, FI_field, spatial_props, data, delta=1e-3):
         """
         Computes the Pseudo-Huber regularization loss for the spatial gradients
         of the dual viscosity field. Stabilizes PINN training.
         """
-        # FIX: Use the dynamically assigned config limits, not hardcoded 7000s
         max_ratio = self.cfg.mu_ratio_max
 
         # mu1 maxes out at (max_ratio - 1.0) so the base fluid remains 1.0x
@@ -171,16 +170,22 @@ class BiochemPhysicsKernels:
 
         mu_total = mu1_mat + mu2_fi
 
-        dmu_dx = self.core._compute_derivatives(mu_total.unsqueeze(1), spatial_props)
-        grad_mu_sq = torch.sum(dmu_dx ** 2, dim=-1)
+        # Sparse Matrix Gradient Calculation
+        mu_col = mu_total.unsqueeze(1)
+        dmu_dx = torch.sparse.mm(data.G_x, mu_col).squeeze(1)
+        dmu_dy = torch.sparse.mm(data.G_y, mu_col).squeeze(1)
+
+        grad_mu_sq = dmu_dx ** 2 + dmu_dy ** 2
 
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
         return pseudo_huber_loss
 
-    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props, d_pred_dt=None):
+    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props, data, d_pred_dt=None):
         """Computes Advection-Diffusion-Reaction (L_ADR) residuals with Transient Time Derivatives."""
         u, v = velocity_field[..., 0], velocity_field[..., 1]
-        shear_rate = self._compute_shear_rate(u, v, spatial_props)
+
+        # Pass `data` down into the shear computation
+        shear_rate = self._compute_shear_rate(u, v, spatial_props, data)
 
         d_RBC_m = self.cfg.d_RBC
         D_s = 0.18 * (d_RBC_m ** 2) * shear_rate
@@ -222,17 +227,17 @@ class BiochemPhysicsKernels:
             C = species_dict[key]
             base_D = self.D_coeff[key]
             D = base_D + D_s if key in keller_species else base_D
-
             R = reaction_terms[key]
-            grad_C = self.core._compute_derivatives(C.unsqueeze(1), spatial_props)
 
-            dC_dx = grad_C[:, 0, 0] / d_bar
-            dC_dy = grad_C[:, 1, 0] / d_bar
+            # Sparse Matrix Gradient Calculation
+            C_col = C.unsqueeze(1)
+            dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar
+            dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar
             advection = u_raw * dC_dx + v_raw * dC_dy
 
-            dC_dxx = grad_C[:, 2, 0] / (d_bar ** 2)
-            dC_dyy = grad_C[:, 4, 0] / (d_bar ** 2)
-            diffusion = D * (dC_dxx + dC_dyy)
+            # Use the precomputed Laplacian directly for diffusion!
+            laplacian_C = torch.sparse.mm(data.Laplacian, C_col).squeeze(1) / (d_bar ** 2)
+            diffusion = D * laplacian_C
 
             # Include dC_dt in the residual
             residual = dC_dt + advection - diffusion - R
@@ -272,10 +277,10 @@ class BiochemPhysicsKernels:
             loss_outlet_species = 0.0
             for i in range(9):
                 C_field = biochem_preds[:, i].unsqueeze(1)
-                grad_C = self.core._compute_derivatives(C_field, spatial_props)
 
-                dC_dx = grad_C[:, 0, 0]
-                dC_dy = grad_C[:, 1, 0]
+                # Sparse Matrix Gradient Calculation
+                dC_dx = torch.sparse.mm(data.G_x, C_field).squeeze(1)
+                dC_dy = torch.sparse.mm(data.G_y, C_field).squeeze(1)
 
                 # Dot product with the outward normal vector
                 dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
@@ -305,7 +310,6 @@ class BiochemPhysicsKernels:
         PT_wall = linear_biochem_preds[mask_wall, 4]
         T_wall = linear_biochem_preds[mask_wall, 5]
 
-        # --- FIX: Inverse transform the surface states ---
         wall_preds_safe = torch.clamp(wall_preds, min=-10.0, max=8.0)
         nd_wall_preds = torch.expm1(wall_preds_safe)
 
@@ -313,7 +317,6 @@ class BiochemPhysicsKernels:
         Mas = nd_wall_preds[mask_wall, 1] * self.cfg.Minf
         Mat = nd_wall_preds[mask_wall, 2] * self.cfg.Minf
 
-        # --- FIX: Chain Rule for Surface Temporal Derivatives ---
         if dM_pred_dt is not None:
             exp_wall = torch.exp(wall_preds_safe[mask_wall])
             dM_dt_phys = exp_wall[:, 0] * dM_pred_dt[mask_wall, 0] * self.cfg.Minf
@@ -326,15 +329,14 @@ class BiochemPhysicsKernels:
         Minf = self.cfg.Minf
 
         # 4. Compute Local Surface Activation & Spatial Gradients
-        global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props)
+        global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props, data)
         shear_wall = global_shear[mask_wall]
 
-        c_shear = self.core._compute_derivatives(global_shear.unsqueeze(1), spatial_props)
         d_bar = spatial_props['d_bar'].to(biochem_preds.device)
 
-        d_bar_wall = d_bar[mask_wall]
-
-        dshear_dx_wall = (c_shear[:, 0, 0] / d_bar)[mask_wall]
+        # Sparse Matrix Gradient Calculation for Shear Rate
+        dshear_dx = torch.sparse.mm(data.G_x, global_shear.unsqueeze(1)).squeeze(1)
+        dshear_dx_wall = (dshear_dx / d_bar)[mask_wall]
         dshear_abs = torch.abs(dshear_dx_wall) + 1e-6
 
         availability = torch.clamp(1.0 - (M_tot / Minf), min=1e-8, max=1.0)
@@ -345,8 +347,6 @@ class BiochemPhysicsKernels:
 
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
-
-        # --- Inside biochem_wall_residual, before the Adhesion Rates ---
 
         # Convert CGS velocities (cm/s) to SI (m/s)
         k_rs = self.cfg.k_rs * 1e-2
@@ -379,13 +379,17 @@ class BiochemPhysicsKernels:
         d_bar_wall = spatial_props['d_bar'].to(biochem_preds.device)[mask_wall]
         t_ref = d_bar_wall / u_ref_wall
 
-        # Include temporal derivative in the surface physics loss
-        loss_surface = torch.mean((((dM_dt_phys - R_M) / Minf) * t_ref) ** 2 +
-                                  (((dMas_dt_phys - R_Mas) / Minf) * t_ref) ** 2 +
-                                  (((dMat_dt_phys - R_Mat) / Minf) * t_ref) ** 2)
+        res_M = ((dM_dt_phys - R_M) / Minf) * t_ref
+        res_Mas = ((dMas_dt_phys - R_Mas) / Minf) * t_ref
+        res_Mat = ((dMat_dt_phys - R_Mat) / Minf) * t_ref
 
-        # --- 6. FIX: NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
-        # Inward Fluxes (J_in) mapped directly from COMSOL 'Flux 1' and 'Flux 2'
+        loss_surface = (
+                               F.huber_loss(res_M, torch.zeros_like(res_M), delta=1.0) +
+                               F.huber_loss(res_Mas, torch.zeros_like(res_Mas), delta=1.0) +
+                               F.huber_loss(res_Mat, torch.zeros_like(res_Mat), delta=1.0)
+                       ) / 3.0
+
+        # --- 6. NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
         J_in_RP = - (pathological_RP_adhesion + low_shear_RP_adhesion)
         J_in_AP = - (
                     pathological_AP_adhesion + low_shear_AP_adhesion + pathological_Mas_adhesion + low_shear_Mas_adhesion)
@@ -396,27 +400,22 @@ class BiochemPhysicsKernels:
 
         flux_targets = {0: J_in_RP, 1: J_in_AP, 2: J_in_APR, 3: J_in_APS, 4: J_in_PT, 5: J_in_T}
 
-        # Wall Outward Normals from the processed mesh
         nx = data.x[mask_wall, 3]
         ny = data.x[mask_wall, 4]
 
-        # Convert to meters to keep D_s_wall strictly in m^2/s
         d_RBC_m_wall = self.cfg.d_RBC
         D_s_wall = 0.18 * (d_RBC_m_wall ** 2) * shear_wall
-        # THE MISSING LINE FIX:
         keller_indices = [0, 1, 4, 5, 6]
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
 
         loss_flux = torch.tensor(0.0, device=biochem_preds.device)
 
         for idx, J_in in flux_targets.items():
-            # Get Full Field Gradient
             C_field = linear_biochem_preds[:, idx].unsqueeze(1)
-            grad_C = self.core._compute_derivatives(C_field, spatial_props)
 
-            # Redimensionalize gradient
-            dC_dx = grad_C[:, 0, 0] / d_bar
-            dC_dy = grad_C[:, 1, 0] / d_bar
+            # Sparse Matrix Gradient Calculation
+            dC_dx = torch.sparse.mm(data.G_x, C_field).squeeze(1) / d_bar
+            dC_dy = torch.sparse.mm(data.G_y, C_field).squeeze(1) / d_bar
 
             # Dot with outward normal vector (D * grad(C) dot n)
             dC_dn_wall = dC_dx[mask_wall] * nx + dC_dy[mask_wall] * ny
@@ -436,12 +435,12 @@ class BiochemPhysicsKernels:
 
         return loss_surface, loss_flux
 
-    def _compute_shear_rate(self, u, v, spatial_props):
-        c_u = self.core._compute_derivatives(u.unsqueeze(1), spatial_props)
-        c_v = self.core._compute_derivatives(v.unsqueeze(1), spatial_props)
-
-        du_dx, du_dy = c_u[:, 0, 0], c_u[:, 1, 0]
-        dv_dx, dv_dy = c_v[:, 0, 0], c_v[:, 1, 0]
+    def _compute_shear_rate(self, u, v, spatial_props, data):
+        # Sparse Matrix Gradient Calculation
+        du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
+        du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
+        dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
+        dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
 
         # This is non-dimensional
         gamma_dot_nd = torch.sqrt(2 * (du_dx ** 2 + dv_dy ** 2) + (du_dy + dv_dx) ** 2 + 1e-8)

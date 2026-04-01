@@ -5,7 +5,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from src.config import BiochemConfig, PhysicsConfig
 from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
-from src.phase2.gnode_tier3 import GINO_DEQ_Tier3
+# UPDATED: Import the new continuous-time Neural ODE module
+from src.phase2.gnode_tier3 import GNODE_Tier3
 from src.utils.paths import get_project_root
 
 class DummyCoreKernels:
@@ -36,9 +37,10 @@ class TestTier3Physics(unittest.TestCase):
         self.biochem_kernels = BiochemPhysicsKernels(self.bio_cfg, self.core)
         self.kinetics = self.biochem_kernels.kinetics
 
-        # Initialize ML model using config values to prevent hardcoding errors
-        self.model = GINO_DEQ_Tier3(
+        # UPDATED: Initialize the new GNODE_Tier3 model with matching params
+        self.model = GNODE_Tier3(
             in_channels=12,
+            spatial_channels=15,  # Added to match new signature
             latent_dim=16,
             mu_ratio_max=self.bio_cfg.mu_ratio_max
         )
@@ -48,24 +50,20 @@ class TestTier3Physics(unittest.TestCase):
         Approximates COMSOL's built-in smoothed step function.
         COMSOL uses a regularized polynomial over the transition zone interval.
         """
-        # Half-width of the transition zone
         delta = transition_zone / 2.0
         x0 = location - delta
         x1 = location + delta
 
-        # Normalize x into the [0, 1] range within the transition zone boundary
+        # Normalize x into the range within the transition zone boundary
         t = np.clip((x - x0) / (x1 - x0), 0.0, 1.0)
 
         # Smoothstep cubic polynomial: 3*t^2 - 2*t^3
-        # This matches the continuous first-derivative smoothing used in typical COMSOL setups
         smooth_factor = t * t * (3.0 - 2.0 * t)
 
         return val_from + (val_to - val_from) * smooth_factor
 
-
     def test_comsol_constants_mapping(self):
         """Verify fundamental COMSOL parameters are correctly inherited and scaled."""
-        # Using typical default bounds check based on the physics kernel initialization
         self.assertTrue(hasattr(self.bio_cfg, 'kfi'))
         self.assertTrue(hasattr(self.bio_cfg, 'kmfi'))
 
@@ -86,23 +84,17 @@ class TestTier3Physics(unittest.TestCase):
         num_nodes = 500
         T_tensor = torch.rand(num_nodes, dtype=torch.float32)
         FG_tensor = torch.rand(num_nodes, dtype=torch.float32) * 5.0
-
-        # 1. Generate the missing FI tensor (values between 0 and 1)
         FI_tensor = torch.rand(num_nodes, dtype=torch.float32) * 0.8
 
-        # 2. Pass FI_tensor into the function call
         R_FG_pt, R_FI_pt = self.kinetics.compute_fibrin_kinetics(T_tensor, FG_tensor, FI_tensor)
 
         T_np = T_tensor.numpy()
         FG_np = FG_tensor.numpy()
         FI_np = FI_tensor.numpy()
 
-        # COMSOL definition: kfi * T * FG / (kmfi + FG)
-        # Note: kmfi was scaled by C_scale in the kinetics class
         base_reaction_comsol = (self.bio_cfg.kfi * T_np * FG_np) / (
                 (self.bio_cfg.kmfi * self.kinetics.C_scale) + FG_np + 1e-8)
 
-        # 3. Add the NumPy equivalent of the PyTorch saturation term
         saturation_term = np.clip(1.0 - FI_np, 0.0, None)
         reaction_comsol = base_reaction_comsol * saturation_term
 
@@ -115,17 +107,14 @@ class TestTier3Physics(unittest.TestCase):
         COMSOL: Gamma = (k_1t * c_H * AT) / (K_at * K_T + T * K_at + AT * T)
         """
         num_nodes = 500
-        T_tensor = torch.rand(num_nodes, dtype=torch.float32) * 2.0  # T concentration
-        AT_tensor = torch.rand(num_nodes, dtype=torch.float32) * 5.0  # AT concentration
+        T_tensor = torch.rand(num_nodes, dtype=torch.float32) * 2.0
+        AT_tensor = torch.rand(num_nodes, dtype=torch.float32) * 5.0
 
-        # Run PyTorch Implementation
         gamma_pt = self.kinetics.compute_gamma(T_tensor, AT_tensor)
 
-        # Raw COMSOL Ground Truth (NumPy)
         T_np = T_tensor.numpy()
         AT_np = AT_tensor.numpy()
 
-        # Extracted from COMSOL Parameters
         k_1t = self.bio_cfg.k_1t
         c_H = self.bio_cfg.c_H
         K_at = self.bio_cfg.K_at
@@ -135,7 +124,6 @@ class TestTier3Physics(unittest.TestCase):
         denominator = (K_at * K_T) + (T_np * K_at) + (AT_np * T_np) + 1e-8
         gamma_comsol = numerator / denominator
 
-        # Validate similarity
         np.testing.assert_allclose(gamma_pt.numpy(), gamma_comsol, rtol=1e-5, atol=1e-8,
                                    err_msg="PyTorch Gamma (Thrombin Inhibition) does not match COMSOL.")
 
@@ -145,68 +133,54 @@ class TestTier3Physics(unittest.TestCase):
         against COMSOL's rigid if/else statements.
         """
         num_nodes = 1000
-        # Generate Omega values ranging from 0 to 600 (crosses the 500 threshold)
         omega_tensor = torch.linspace(0, 600, num_nodes)
-        # Generate shear rates ranging from 0 to 15000 (crosses the 10000 threshold)
         shear_tensor = torch.linspace(0, 15000, num_nodes)
 
-        # PyTorch Soft-Logic Evaluation (Force Strict Temperature for closer match)
         self.kinetics.T_scale = 0.01
         kpa_pt = self.kinetics.compute_k_pa(omega_tensor, shear_tensor)
 
-        # COMSOL Rigid Logic Evaluation
         omega_np = omega_tensor.numpy()
         shear_np = shear_tensor.numpy()
         t_act = self.bio_cfg.t_act
         shear_crit = self.bio_cfg.shear_crit
 
-        # kpa_chem: if(Omega<500, (Omega/t_act)*Act_step(Omega), 500)
-        # Act_step acts roughly as Omega > 1.0 based on COMSOL setup
         act_step = np.where(omega_np > 1.0, 1.0, 0.0)
         kpa_chem_np = np.where(omega_np < 500, (omega_np / t_act) * act_step, 500.0)
-
-        # kpa_mech: if(spf.sr>shear_crit, spf.sr/shear_crit, 0)
         kpa_mech_np = np.where(shear_np > shear_crit, shear_np / shear_crit, 0.0)
 
         kpa_comsol = kpa_chem_np + kpa_mech_np
 
-        # We don't use strict assert_allclose here because PyTorch is intentionally smooth (Sigmoids).
-        # Instead, we check Pearson correlation to ensure the curve shape maps correctly.
-        correlation = float(np.corrcoef(kpa_pt.numpy(), kpa_comsol)[0, 1])
+        correlation = float(np.corrcoef(kpa_pt.numpy(), kpa_comsol)[ 0, 1 ])
         self.assertGreater(correlation, 0.98,
                            "PyTorch soft-logic for k_pa deviates too far from COMSOL rigid logic.")
-
 
     def test_platelet_viscosity_mu1(self):
         """
         Validates PyTorch's mu1_sigmoid against COMSOL's mu1 Step function.
-        COMSOL: Location 2e7, Transition Zone 7e6, from 1.0 to mu_ratio_max.
+        COMSOL: Location 2e7, Transition Zone 7e6.
         """
         mat_range = torch.linspace(0, 4e7, 1000)
 
-        # Test Strict Logic
         self.model.T_scale = 1.0
         mu1_pt_strict = self.model.mu1_sigmoid(mat_range).numpy()
 
-        # COMSOL Exact Smoothed Step
         mat_np = mat_range.numpy()
+        # UPDATED: mu1 technically scales from 0 to (mu_ratio_max - 1.0) because the base fluid holds the 1.0
         mu1_comsol = self._comsol_smoothed_step(
             x=mat_np,
             location=2e7,
             transition_zone=7e6,
-            val_from=1.0,  # COMSOL mu1 starts at 1, not 0
-            val_to=self.bio_cfg.mu_ratio_max
+            val_from=0.0,
+            val_to=self.bio_cfg.mu_ratio_max - 1.0
         )
 
-        # Check Pearson correlation to ensure the smoothed PyTorch shape maps correctly to COMSOL
-        correlation = float(np.corrcoef(mu1_pt_strict, mu1_comsol)[0, 1])
+        correlation = float(np.corrcoef(mu1_pt_strict, mu1_comsol)[ 0, 1 ])
         self.assertGreater(correlation, 0.98,
                            "PyTorch soft-logic for mu1 deviates too far from COMSOL smooth step.")
 
-        # Ensure bounds are respected
-        self.assertLessEqual(np.max(mu1_pt_strict), self.model.mu_ratio_max + 1e-4)
+        # Ensure mathematical bounds are respected (0.0 to Max-1)
+        self.assertLessEqual(np.max(mu1_pt_strict), self.model.mu_ratio_max)
         self.assertGreaterEqual(np.min(mu1_pt_strict), 0.0)
-
 
     def test_fibrin_viscosity_mu2(self):
         """
@@ -217,14 +191,12 @@ class TestTier3Physics(unittest.TestCase):
         fi_range = np.linspace(0, 1.2, num_nodes)
         fi_tensor = torch.tensor(fi_range, dtype=torch.float32)
 
-        # Torch Soft Logic
-        self.model.T_scale = 1.0  # Fully annealed strict logic
+        self.model.T_scale = 1.0
         mu2_pt_strict = self.model.mu2_sigmoid(fi_tensor).numpy()
 
-        self.model.T_scale = 5.0  # Early training relaxed logic
+        self.model.T_scale = 5.0
         mu2_pt_relaxed = self.model.mu2_sigmoid(fi_tensor).numpy()
 
-        # COMSOL Exact Smoothed Step Function
         mu2_comsol = self._comsol_smoothed_step(
             x=fi_range,
             location=0.6,
@@ -247,7 +219,6 @@ class TestTier3Physics(unittest.TestCase):
         plt.tight_layout()
         plt.savefig(self.vis_dir / 'mu2_fibrin_viscosity.png', dpi=300)
         plt.close()
-
 
 if __name__ == "__main__":
     unittest.main()
