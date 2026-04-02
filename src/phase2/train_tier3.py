@@ -1,7 +1,7 @@
 import os
 import sys
+import math
 
-# Only enable expandable_segments on Linux/Unix systems to prevent Windows warnings
 if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 else:
@@ -52,6 +52,36 @@ def load_dataset():
 
     return PatientDataset(root=str(data_dir), file_list=file_list)
 
+
+def initialize_biochem_priors(model):
+    """
+    Initializes the biochem_decoder to output the exact resting physiological state
+    at t=0, matching the COMSOL baseline initial values.
+    """
+    print("🧬 Injecting physical priors into biochemistry decoder biases...")
+
+    # 1. Zero out the final weights so the initial output is driven entirely by the bias.
+    # Assuming SpectralLinear has an underlying 'linear' attribute.
+    # If it inherits directly from nn.Linear, use model.biochem_decoder.weight instead.
+    target_layer = model.biochem_decoder.linear if hasattr(model.biochem_decoder, 'linear') else model.biochem_decoder
+    torch.nn.init.zeros_(target_layer.weight)
+
+    # 2. Create the precise bias vector matching your 12 species order:
+    # [ 0 ]:RP, [ 1 ]:AP, [ 2 ]:APR, [ 3 ]:APS, [ 4 ]:PT, [ 5 ]:T, [ 6 ]:AT, [ 7 ]:FG, [ 8 ]:FI, [ 9 ]:M, [ 10 ]:Mas, [ 11 ]:Mat
+    bias_vals = torch.zeros(12, dtype=torch.float32)
+
+    # Resting bulk species start at non-dimensional C = 1.0.
+    # Your network predicts in log1p space: log(1 + 1.0) = ln(2.0)
+    resting_indices = [0, 4, 6, 7]  # RP, PT, AT, FG
+
+    for idx in resting_indices:
+        bias_vals[idx] = math.log(2.0)
+
+    # Active/Surface species (AP, APR, APS, T, FI, M, Mas, Mat) remain 0.0
+
+    # Apply the biases
+    with torch.no_grad():
+        target_layer.bias.copy_(bias_vals)
 
 def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
     print("❄️  Verifying Kinematic Backbone is Frozen.")
@@ -323,6 +353,7 @@ def train_tier3(epochs=50, lr=1e-3):
         model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
 
+    initialize_biochem_priors(model)
     # 7 targets: L_ADR_F, L_ADR_S, L_W_Bio, L_W_Phys, L_B_IO, L_Data_Kine, L_Data_Bio
     loss_weighter = DynamicLossWeighter(num_losses=7).to(device)
 

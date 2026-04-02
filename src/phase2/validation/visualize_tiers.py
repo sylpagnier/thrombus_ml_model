@@ -6,8 +6,8 @@ from src.utils.paths import get_project_root
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
 from src.phase1.physics.ginodeq import GINO_DEQ
-from src.phase2.gnode_tier3 import GINO_DEQ_Tier3
-from src.config import PhysicsConfig
+from src.phase2.gnode_tier3 import GNODE_Tier3
+from src.config import PhysicsConfig, BiochemConfig
 
 # Standard channel indices across all models for kinematics
 _CHANNEL = dict(u=0, v=1, p=2, mu_eff=3)
@@ -112,7 +112,13 @@ def run_tier_comparison():
     model_t2.eval()
 
     # Tier 3 Setup
-    model_t3 = GINO_DEQ_Tier3(in_channels=12, latent_dim=64, max_outer_iters=3, max_inner_iters=15).to(device)
+    bio_cfg = BiochemConfig(tier="tier3")
+    model_t3 = GNODE_Tier3(
+        in_channels=12,
+        spatial_channels=15,
+        latent_dim=64,
+        max_inner_iters=10
+    ).to(device)
     model_t3.load_state_dict(torch.load(model_dir / "tier3_best_bio.pth", map_location=device, weights_only=True))
     model_t3.eval()
 
@@ -123,13 +129,28 @@ def run_tier_comparison():
     with torch.no_grad():
         pred_t1 = model_t1(data_t1) if isinstance(model_t1(data_t1), tuple) else model_t1(data_t1)
         pred_t2 = model_t2(data_t2) if isinstance(model_t2(data_t2), tuple) else model_t2(data_t2)
-        pred_t3 = model_t3(data_t3) if isinstance(model_t3(data_t3), tuple) else model_t3(data_t3)
+
+        # Setup evaluation times for Tier 3 Neural ODE
+        t_final = data_t3.t[-1].item() if hasattr(data_t3, 't') else bio_cfg.t_final
+
+        # Explicitly define time points to query: 0s, 33%, 66%, 100%, and Extrapolated (150%)
+        custom_times = [0.0, t_final * 0.33, t_final * 0.66, t_final, t_final * 1.5]
+        eval_times = torch.tensor(custom_times, dtype=torch.float32, device=device)
+
+        # Forward pass returns [ Time, Nodes, Features ]
+        pred_t3_series = model_t3(data_t3, eval_times)
+
+        # Extract the final *trained* time step (index 3) for the static Fig 1 comparison
+        pred_t3 = pred_t3_series[3]
 
     pred_t1_np = pred_t1.cpu().numpy()
     pred_t2_np = pred_t2.cpu().numpy()
     pred_t3_np = pred_t3.cpu().numpy()
+    pred_t3_series_np = pred_t3_series.cpu().numpy()
 
-    # Extract Fields
+    # ------------------------------------------------------------------
+    # 5.5 Extract Fields & Calculate Bounds
+    # ------------------------------------------------------------------
     def get_kinematics(pred_np):
         u = pred_np[:, _CHANNEL['u']]
         v = pred_np[:, _CHANNEL['v']]
@@ -143,9 +164,12 @@ def run_tier_comparison():
     vel_3, p_3, mu_3 = get_kinematics(pred_t3_np)
 
     # Determine global min/max for fair colorbar comparisons across columns
-    vel_min, vel_max = min(vel_1.min(), vel_2.min(), vel_3.min()), max(vel_1.max(), vel_2.max(), vel_3.max())
-    p_min, p_max = min(p_1.min(), p_2.min(), p_3.min()), max(p_1.max(), p_2.max(), p_3.max())
-    mu_min, mu_max = min(mu_1.min(), mu_2.min(), mu_3.min()), max(mu_1.max(), mu_2.max(), mu_3.max())
+    vel_min = min(vel_1.min(), vel_2.min(), vel_3.min())
+    vel_max = max(vel_1.max(), vel_2.max(), vel_3.max())
+    p_min = min(p_1.min(), p_2.min(), p_3.min())
+    p_max = max(p_1.max(), p_2.max(), p_3.max())
+    mu_min = min(mu_1.min(), mu_2.min(), mu_3.min())
+    mu_max = max(mu_1.max(), mu_2.max(), mu_3.max())
 
     # ------------------------------------------------------------------
     # 6. Plotting
@@ -178,20 +202,43 @@ def run_tier_comparison():
 
     fig1.tight_layout(rect=(0, 0.03, 1, 0.95))
 
-    # --- FIGURE 2: Tier 3 Biochemical Focus ---
-    # Extract Biochemistry channels based on _CHANNEL dictionary indices
-    rp_3 = pred_t3_np[:, 4]
-    fibrin_3 = pred_t3_np[:, 11]
-    mat_s_3 = pred_t3_np[:, 13]
+    # --- FIGURE 2: Tier 3 Temporal Evolution ---
+    print("⏳ Plotting Temporal Evolution...")
+    num_times = len(custom_times)
+    fig2, axes2 = plt.subplots(3, num_times, figsize=(4 * num_times, 10))
+    fig2.suptitle(f"Tier 3 Temporal Evolution (Extrapolating past T={int(t_final)}s)", fontsize=18, y=0.98)
 
-    fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6))
-    fig2.suptitle("Tier 3 Focus: Biochemical & Thrombosis Markers", fontsize=18, y=1.05)
+    # Calculate global max for colorbars across all time steps
+    u_all = pred_t3_series_np[:, :, _CHANNEL['u']]
+    v_all = pred_t3_series_np[:, :, _CHANNEL['v']]
+    vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
+    vel_t_max = vel_all.max()
 
-    _plot_field(fig2, axes2[0], pos, rp_3, "Resting Platelets", 'Blues')
-    _plot_field(fig2, axes2[1], pos, fibrin_3, "Fibrin Concentration (Clotting)", 'Reds')
-    _plot_field(fig2, axes2[2], pos, mat_s_3, "Surface Platelet Deposit ($Mat_s$)", 'Oranges')
+    fib_all = pred_t3_series_np[:, :, 12]
+    fib_max = fib_all.max()
 
-    fig2.tight_layout()
+    mat_all = pred_t3_series_np[:, :, 15]
+    mat_max = mat_all.max()
+
+    for i, t_val in enumerate(custom_times):
+        t_str = f"T = {int(t_val)}s"
+
+        # Row 1: Velocity (Put the Time label on the top row)
+        vel_i = vel_all[i]
+        title_top = f"{t_str}\nVelocity Mag (m/s)" if i == 0 else t_str
+        _plot_field(fig2, axes2[0, i], pos, vel_i, title_top, 'jet', vmin=0, vmax=vel_t_max)
+
+        # Row 2: Fibrin
+        fib_i = fib_all[i]
+        title_mid = "Fibrin (Clotting)" if i == 0 else ""
+        _plot_field(fig2, axes2[1, i], pos, fib_i, title_mid, 'Reds', vmin=0, vmax=fib_max)
+
+        # Row 3: Surface Platelets (Mat_s)
+        mat_i = mat_all[i]
+        title_bot = "Surface Platelets ($Mat_s$)" if i == 0 else ""
+        _plot_field(fig2, axes2[2, i], pos, mat_i, title_bot, 'Oranges', vmin=0, vmax=mat_max)
+
+    fig2.tight_layout(rect=(0, 0.03, 1, 0.95))
 
     # Show both figures simultaneously
     plt.show()
