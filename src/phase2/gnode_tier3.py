@@ -28,7 +28,7 @@ class GNODE_Tier3(nn.Module):
     Replaces the steady-state DEQ with a continuous-time latent ODE solver.
     """
 
-    def __init__(self, in_channels=12, spatial_channels=15, latent_dim=64, max_inner_iters=25,
+    def __init__(self, phys_cfg, in_channels=12, spatial_channels=15, latent_dim=64, max_inner_iters=25,
                  mu_ratio_max=80.0, mat_crit=2e7, fi_crit=0.6,
                  temp_mat=1e6, temp_fi=0.05, rtol=1e-3, atol=1e-4):
         super().__init__()
@@ -37,6 +37,7 @@ class GNODE_Tier3(nn.Module):
         self.max_inner_iters = max_inner_iters
         self.rtol = rtol
         self.atol = atol
+        self.phys_cfg = phys_cfg  # Store physics config internally
 
         # COMSOL Step Function Approximations (Dual-Trigger)
         self.mu_ratio_max = mu_ratio_max
@@ -148,10 +149,11 @@ class GNODE_Tier3(nn.Module):
             mask_inlet = batch.mask_inlet.view(-1).bool()
             current_species[mask_inlet, 0:9] = batch.bio_inlet_bc[mask_inlet]
 
-        mu_inf = 0.0035
-        mu_0 = 0.056
-        lam = 3.313
-        n_idx = 0.358
+        # USE CENTRALIZED RHEOLOGY PARAMS
+        mu_inf = self.phys_cfg.mu_inf
+        mu_0 = self.phys_cfg.mu_0
+        lam = self.phys_cfg.lam
+        n_idx = self.phys_cfg.n
 
         current_mu_eff = torch.full((num_nodes, 1), mu_inf, dtype=torch.float32, device=device)
 
@@ -180,16 +182,22 @@ class GNODE_Tier3(nn.Module):
 
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = batch.x[:, :15].clone()
-            kin_in[:, 13:14] = current_mu_eff / mu_0
+
+            # Scale by mu_inf, NOT mu_0 to match Tier 2 training distribution
+            kin_in[:, 13:14] = current_mu_eff / mu_inf
             kin_encoded = self._apply_fourier_encoding(kin_in)
-            mu_nd = current_mu_eff / mu_0
+
+            # FIX: Scale by mu_inf here as well
+            mu_nd = current_mu_eff / mu_inf
             mu_enc = self.mu_encoder(mu_nd)
 
             with torch.no_grad():
                 for _ in range(self.max_inner_iters):
-                    z_kin_next = apply_kin_processor(self.kin_encoder(kin_encoded) + mu_enc + z_kin)
+                    injection = self.kin_encoder(kin_encoded) + mu_enc
+                    z_kin_next = apply_kin_processor(injection + z_kin)
                     diff = torch.norm(z_kin_next - z_kin, p=2, dim=-1).mean()
-                    z_kin = z_kin_next
+                    z_kin = 0.5 * z_kin + 0.5 * z_kin_next
+
                     if diff < 1e-4: break
 
             u_v_p = self.kinematics_decoder(z_kin)[:, :3]
@@ -216,9 +224,9 @@ class GNODE_Tier3(nn.Module):
             current_mu_eff = mu_base * total_multiplier
 
             # --- C. RECORD COUPLED STATE ---
-            pred_step = torch.cat([current_species, u_v_p, current_mu_eff], dim=-1)
-            # Reorder to match target tensor format: [u, v, p, mu, species...]
-            pred_step = torch.cat([u_v_p, current_mu_eff, current_species], dim=-1)
+            current_mu_eff_nd = current_mu_eff / mu_inf
+            # Use the ND version for the recorded trajectory
+            pred_step = torch.cat([u_v_p, current_mu_eff_nd, current_species], dim=-1)
             pred_trajectory.append(pred_step)
 
             # --- D. MICRO STEP: INTEGRATE BIOCHEMISTRY (Frozen Kinematics) ---

@@ -149,22 +149,20 @@ class PatientDataExtractor:
         return normals_unit
 
     def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
-        """Robust KDTree mapping with unmapped coordinate reporting and silent failure prevention."""
         mask = torch.zeros(num_nodes, dtype=torch.bool)
         unmapped_ratio = 0.0
 
         if not file_path.exists():
-            return mask, 1.0  # 100% missing
+            return mask, 1.0
 
         bnd_df = pd.read_csv(file_path, comment='%', sep=r'\s+', header=None)
 
-        # FIX: Apply the * 0.01 scale to convert boundary cm to domain m
-        bnd_coords = np.unique(bnd_df.iloc[ :, -2: ].values, axis=0) * 0.01
+        # USE CENTRALIZED SCALE
+        bnd_coords = np.unique(bnd_df.iloc[ :, -2: ].values, axis=0) * self.phys_cfg.cm_to_m
 
         distances, indices = tree.query(bnd_coords)
         valid_matches = indices[ distances < tolerance ]
 
-        # ROBUSTNESS: Prevent the "Silent Failure" PDE collapse
         if len(valid_matches) == 0 and len(bnd_coords) > 0:
             raise ValueError(
                 f"\nCRITICAL ERROR: Zero boundary nodes mapped for {file_path.name}!\n"
@@ -316,7 +314,7 @@ class PatientDataExtractor:
 
         # 2. Topology & Enhanced Boundary Mapping
         mesh = meshio.read(msh_path)
-        mesh_nodes = mesh.points[ :, :2 ] * 0.01 # cm --> m
+        mesh_nodes = mesh.points[ :, :2 ] * self.phys_cfg.cm_to_m
         num_nodes = len(mesh_nodes)
         mesh_tree = cKDTree(mesh_nodes)
 
@@ -376,50 +374,42 @@ class PatientDataExtractor:
         # --- Pre-Compute KDTree Mapping ONCE outside the loop ---
         # Load just the first timestep block to establish the spatial mapping
         df_first = time_blocks[ eval_times[ 0 ] ]
-        csv_coords_static = df_first[ [ 'x', 'y' ] ].values * 0.01  # cm to m
+        csv_coords_static = df_first[ [ 'x', 'y' ] ].values * self.phys_cfg.cm_to_m
 
         domain_tree = cKDTree(csv_coords_static)
         _, match_indices = domain_tree.query(mesh_nodes)
 
         # Iterate through the parsed time steps
         for t_idx, t_val in enumerate(eval_times):
-            df_csv = time_blocks[ t_val ]
+            df_csv = time_blocks[t_val]
+            df_matched = df_csv.iloc[match_indices].reset_index(drop=True)
 
-            # Reuse the pre-computed match_indices directly
-            df_matched = df_csv.iloc[ match_indices ].reset_index(drop=True)
-
-            # --- Apply your exact scaling math ---
-            u_raw = torch.tensor(df_matched['u'].values, dtype=torch.float32) * 0.01
-            v_raw = torch.tensor(df_matched['v'].values, dtype=torch.float32) * 0.01
-            p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32) * 0.1
-            mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32) * 0.1
+            # --- USE CENTRALIZED SCALES ---
+            u_raw = torch.tensor(df_matched['u'].values, dtype=torch.float32) * self.phys_cfg.cm_to_m
+            v_raw = torch.tensor(df_matched['v'].values, dtype=torch.float32) * self.phys_cfg.cm_to_m
+            p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32) * self.phys_cfg.cgs_p_to_pa
+            mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32) * self.phys_cfg.cgs_mu_to_pa_s
 
             u_ref_actual = self.phys_cfg.get_u_ref(d_bar)
             p_ref = self.phys_cfg.rho * (u_ref_actual ** 2)
-            p_relative = p_raw - (p_raw[ mask_outlet ].mean() if mask_outlet.any() else p_raw.min())
+            p_relative = p_raw - (p_raw[mask_outlet].mean() if mask_outlet.any() else p_raw.min())
 
             u_nd = u_raw / u_ref_actual
             v_nd = v_raw / u_ref_actual
             p_nd = p_relative / p_ref
             mu_nd = mu_eff / self.phys_cfg.mu_ref
 
-            # Species Non-dimensionalization (Matching your exact logic)
-            species_cols = list(self.species_map.keys())
-            raw_bulk_cgs = torch.tensor(df_matched[ species_cols[ :9 ] ].values, dtype=torch.float32)
-            raw_surf_cgs = torch.tensor(df_matched[ species_cols[ 9: ] ].values, dtype=torch.float32)
-
-            bulk_si = raw_bulk_cgs * 1e6
-            surf_si = raw_surf_cgs * 1e4
-            species = torch.clamp(torch.cat([ bulk_si, surf_si ], dim=1), min=0.0)
-
-            # Initialize bio_cfg locally for scales
+            # --- USE CENTRALIZED BIOCHEM SCALES ---
             bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
-            scales = torch.tensor([
-                bio_cfg.c_RP0 * 1e6, bio_cfg.c_RP0 * 1e6, bio_cfg.APRcrit * 1e6, bio_cfg.APScrit * 1e6,
-                bio_cfg.c_pT0 * 1e6, bio_cfg.c_pT0 * 1e6, bio_cfg.cAT0 * 1e6, bio_cfg.c_Fg0 * 1e6,
-                bio_cfg.c_Fg0 * 1e6, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4
-            ], dtype=torch.float32)
+            species_cols = list(self.species_map.keys())
+            raw_bulk_cgs = torch.tensor(df_matched[species_cols[:9]].values, dtype=torch.float32)
+            raw_surf_cgs = torch.tensor(df_matched[species_cols[9:]].values, dtype=torch.float32)
 
+            bulk_si = raw_bulk_cgs * bio_cfg.bulk_scale
+            surf_si = raw_surf_cgs * bio_cfg.surface_scale
+            species = torch.clamp(torch.cat([bulk_si, surf_si], dim=1), min=0.0)
+
+            scales = bio_cfg.get_species_scales(device='cpu')
             species_nd = species / scales
             species_transformed = torch.log1p(species_nd)
 
@@ -534,10 +524,10 @@ class PatientDataExtractor:
 
         # --- Use index assignment for the tensor ---
         inlet_species_si = torch.zeros(9, dtype=torch.float32)
-        inlet_species_si[ 0 ] = bio_cfg.c_RP0 * 1e6  # RP  (Index 0)
-        inlet_species_si[ 4 ] = bio_cfg.c_pT0 * 1e6  # PT  (Index 4)
-        inlet_species_si[ 6 ] = bio_cfg.cAT0 * 1e6  # AT  (Index 6)
-        inlet_species_si[ 7 ] = bio_cfg.c_Fg0 * 1e6  # FG  (Index 7)
+        inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
+        inlet_species_si[4] = bio_cfg.c_pT0 * bio_cfg.bulk_scale  # PT
+        inlet_species_si[6] = bio_cfg.cAT0 * bio_cfg.bulk_scale  # AT
+        inlet_species_si[7] = bio_cfg.c_Fg0 * bio_cfg.bulk_scale  # FG
         # Note: AP, APR, APS, T, FI remain 0.0 at the inlet
 
         # Scale and transform

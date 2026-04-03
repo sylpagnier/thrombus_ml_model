@@ -15,10 +15,7 @@ class VesselConfig:
     graph_output_dir: Path = field(init=False)
 
     def __post_init__(self):
-        """Dynamically resolve paths based on the selected tier."""
         self.template_path = self.project_root / "comsol_models/phase1_template.mph"
-
-        # Explicitly handle tier 3 patient data directory mapping
         if self.tier == "tier3_patients":
             self.mesh_input_dir = self.project_root / "data/raw/tier3_patients"
             self.output_dir = self.project_root / "data/processed/cfd_results_tier3_patients"
@@ -28,7 +25,6 @@ class VesselConfig:
             self.output_dir = self.project_root / f"data/processed/cfd_results_{self.tier}"
             self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
 
-    # Mesh Settings
     mesh_size_factor: float = 0.75
     mesh_lc: float = 1/1000  # [m]
 
@@ -47,10 +43,7 @@ class VesselConfig:
 
     # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {
-        "Inlet": 101,
-        "Outlet_1": 102,
-        "Walls": 103,
-        "Fluid_Domain": 201
+        "Inlet": 101, "Outlet_1": 102, "Walls": 103, "Fluid_Domain": 201
     })
 
 
@@ -59,17 +52,19 @@ class PhysicsConfig:
     """Configuration for physical properties and fluid dynamics."""
     tier: str = "tier1"
 
+    # --- Unit Conversion Scales (COMSOL CGS to SI) ---
+    cm_to_m: float = 0.01
+    cgs_p_to_pa: float = 0.1
+    cgs_mu_to_pa_s: float = 0.1
+
     # Fluid Properties
     rho: float = 1106.0  # [kg/m^3]
     re_target: float = 450  # Reynolds number [-]
-
     viscosity_model: str = field(init=False)
     mu_ref: float = field(init=False)
-
-    # Newtonian Reference (tier 1)
     mu_newtonian: float = 0.0035  # [Pa*s]
 
-    # Relaxed Carreau-Yasuda Rheology (Mild Shear-Thinning Proxy)
+    # Carreau-Yasuda Rheology (Mild Shear-Thinning Proxy)
     mu_inf: float = 0.0035  # [Pa*s]
     mu_0: float = 0.056  # [Pa*s]
     lam: float = 3.313  # Relaxation time [s]
@@ -97,8 +92,7 @@ class PhysicsConfig:
 
     def get_re(self, u_ref, d_bar, mu_custom=None):
         """
-        Calculate the Reynolds number.
-        Works with both raw floats and PyTorch tensors.
+        Calculate the Reynolds number
         """
         mu = mu_custom if mu_custom is not None else self.mu_ref
         return (self.rho * u_ref * d_bar) / mu
@@ -108,6 +102,11 @@ class PhysicsConfig:
 class BiochemConfig:
     """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations."""
     tier: str = "tier3"
+
+    # --- Centralized Scales ---
+    bulk_scale: float = 1e6      # SI Conversion for bulk species
+    surface_scale: float = 1e4   # SI Conversion for surface species
+    d_scale: float = 1e-4        # cm^2/s to m^2/s for diffusion
 
     # --- Temporal Simulation Parameters ---
     t_final: float = 6000  # Total simulation time to match COMSOL export [s]
@@ -178,3 +177,16 @@ class BiochemConfig:
         """Validate constraints on biochemical properties if needed."""
         if self.mu_ratio_max <= self.mu_ratio_init:
             raise ValueError("mu_ratio_max must be strictly greater than mu_ratio_init")
+
+    def get_species_scales(self, device='cpu'):
+        """Dynamically generates the scaling tensor for ND transformations."""
+        import torch
+        return torch.tensor([
+            self.c_RP0 * self.bulk_scale, self.c_RP0 * self.bulk_scale,
+            self.APRcrit * self.bulk_scale, self.APScrit * self.bulk_scale,
+            self.c_pT0 * self.bulk_scale, self.c_pT0 * self.bulk_scale,
+            self.cAT0 * self.bulk_scale, self.c_Fg0 * self.bulk_scale,
+            self.c_Fg0 * self.bulk_scale,
+            self.Minf * self.surface_scale, self.Minf * self.surface_scale,
+            self.Minf * self.surface_scale
+        ], dtype=torch.float32, device=device)

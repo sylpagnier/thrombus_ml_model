@@ -54,30 +54,21 @@ def load_dataset():
 
 
 def initialize_biochem_priors(model):
-    """
-    Initializes the biochem_decoder to output the exact resting physiological state
-    at t=0, matching the COMSOL baseline initial values.
-    """
     print("🧬 Injecting physical priors into biochemistry decoder biases...")
-
-    # 1. Zero out the final weights so the initial output is driven entirely by the bias.
-    # Assuming SpectralLinear has an underlying 'linear' attribute.
-    # If it inherits directly from nn.Linear, use model.biochem_decoder.weight instead.
     target_layer = model.biochem_decoder.linear if hasattr(model.biochem_decoder, 'linear') else model.biochem_decoder
-    torch.nn.init.zeros_(target_layer.weight)
 
-    # 2. Create the precise bias vector matching your 12 species order:
-    # [ 0 ]:RP, [ 1 ]:AP, [ 2 ]:APR, [ 3 ]:APS, [ 4 ]:PT, [ 5 ]:T, [ 6 ]:AT, [ 7 ]:FG, [ 8 ]:FI, [ 9 ]:M, [ 10 ]:Mas, [ 11 ]:Mat
+    # FIX: Do not use strict zeros. It kills the backward gradient (grad_in = grad_out @ W).
+    # Use a very small random initialization so the Neural ODE can learn.
+    torch.nn.init.normal_(target_layer.weight, std=1e-4)
+
     bias_vals = torch.zeros(12, dtype=torch.float32)
 
     # Resting bulk species start at non-dimensional C = 1.0.
     # Your network predicts in log1p space: log(1 + 1.0) = ln(2.0)
-    resting_indices = [0, 4, 6, 7]  # RP, PT, AT, FG
+    resting_indices = [ 0, 4, 6, 7 ]  # RP, PT, AT, FG
 
     for idx in resting_indices:
-        bias_vals[idx] = math.log(2.0)
-
-    # Active/Surface species (AP, APR, APS, T, FI, M, Mas, Mat) remain 0.0
+        bias_vals[ idx ] = math.log(2.0)
 
     # Apply the biases
     with torch.no_grad():
@@ -123,15 +114,15 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
     if hasattr(data, 're_actual'):
         phys_cfg.re_target = data.re_actual.mean().item()
 
-    # Dynamically extract actual time steps and final time from the ground truth
-    actual_num_steps = data.y.shape[ 0 ]
-    actual_t_final = data.t[-1].item() if hasattr(data, 't') else bio_cfg.t_final
-
-    dense_time_steps = actual_num_steps
-    evaluation_times = torch.linspace(0.0, actual_t_final, steps=dense_time_steps, device=device)
+    # Use the exact COMSOL timestamps from the graph
+    if hasattr(data, 't'):
+        evaluation_times = data.t.to(device)
+    else:
+        actual_t_final = bio_cfg.t_final
+        actual_num_steps = data.y.shape[0]
+        evaluation_times = torch.linspace(0.0, actual_t_final, steps=actual_num_steps, device=device)
 
     # 2. Forward Pass (Trajectory Generation)
-    # Returns shape: [ Time, Nodes, 16 ]
     pred_series = model(data, evaluation_times)
 
     props = kernels.core._get_geometric_props(data)
@@ -168,9 +159,8 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
             l_data_bio = torch.mean(F.huber_loss(pred_bio, targ_bio, reduction='none', delta=1.0) / bio_var)
 
     # 4. Physics PDE Loss (Evaluated over dense time sequence)
-    # The dt is now based on the actual physical data steps
-    dt = evaluation_times[1] - evaluation_times[0]
-    d_pred_dt = (pred_series[1:] - pred_series[:-1]) / dt
+    dt_intervals = (evaluation_times[1:] - evaluation_times[:-1]).view(-1, 1, 1)
+    d_pred_dt = (pred_series[1:] - pred_series[:-1]) / dt_intervals
     l_adr_fast, l_adr_slow, l_wall_bio, l_wall_phys, l_bio_io = 0.0, 0.0, 0.0, 0.0, 0.0
     num_steps = len(evaluation_times) - 1
 
@@ -229,16 +219,16 @@ def compute_tier3_loss(model, data, kernels, loss_weighter, device, phys_cfg, bi
 def calculate_validation_metrics(pred, data, kernels, device):
     props = kernels.core._get_geometric_props(data)
 
-    # --- Morphological Metric: Clot Dice Coefficient ---
-    mu_eff = pred[ :, 3 ]
-    mu_base = 0.0035  # Approximated reference viscosity
+    # USE CENTRALIZED MU
+    mu_eff_nd = pred[ :, 3 ]
+    mu_base = kernels.core.phys_cfg.mu_inf
     clot_threshold = 20.0 * mu_base
-    pred_clot = (mu_eff > clot_threshold).float()
 
-    # FIX 1: Check the last dimension (features) instead of dimension 1 (nodes)
+    mu_pred_dimensional = mu_eff_nd * mu_base
+    pred_clot = (mu_pred_dimensional > clot_threshold).float()
+
     if data.y.shape[ -1 ] > 3:
-        # Convert GT back to dimensional before checking threshold
-        mu_gt_dimensional = data.y[-1, :, 3] * mu_base if data.y.shape[-1] > 3 else torch.full_like(mu_eff, mu_base)
+        mu_gt_dimensional = data.y[ -1, :, 3 ] * mu_base if data.y.shape[ -1 ] > 3 else torch.full_like(mu_eff_nd, mu_base)
         gt_clot = (mu_gt_dimensional > clot_threshold).float()
         intersection = (pred_clot * gt_clot).sum()
         dice = (2.0 * intersection) / (pred_clot.sum() + gt_clot.sum() + 1e-8)
@@ -311,7 +301,9 @@ def train_tier3(epochs=50, lr=1e-3):
     core_kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels = BiochemPhysicsKernels(biochem_cfg=bio_cfg, core_physics_kernels=core_kernels)
 
+    # PASS PHYS_CFG TO MODEL
     model = GNODE_Tier3(
+        phys_cfg=phys_cfg,
         in_channels=12,
         spatial_channels=15,
         latent_dim=64,

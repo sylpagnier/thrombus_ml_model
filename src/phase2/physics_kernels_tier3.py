@@ -14,19 +14,13 @@ class BiochemPhysicsKernels:
         self.cfg = biochem_cfg
         self.core = core_physics_kernels
 
-        # --- Species Re-dimensionalization Scales ---
-        self.species_scales = torch.tensor([
-            self.cfg.c_RP0, self.cfg.c_RP0, self.cfg.APRcrit, self.cfg.APScrit,
-            self.cfg.c_pT0, self.cfg.c_pT0, self.cfg.cAT0, self.cfg.c_Fg0, self.cfg.c_Fg0,
-            self.cfg.Minf, self.cfg.Minf, self.cfg.Minf
-        ])
-
-        self.D_scale = 1e-4  # Convert cm^2/s to m^2/s
-        self.C_scale = 1e6
+        # --- USE CENTRALIZED SCALES ---
+        self.species_scales = self.cfg.get_species_scales()
+        self.D_scale = self.cfg.d_scale
+        self.C_scale = self.cfg.bulk_scale
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
 
-        # Diffusion coefficients mapped directly from COMSOL config with explicit PINN scaling
         self.D_coeff = {
             'RP': self.cfg.D_RP * self.D_scale,
             'AP': self.cfg.D_AP * self.D_scale,
@@ -313,20 +307,23 @@ class BiochemPhysicsKernels:
         wall_preds_safe = torch.clamp(wall_preds, min=-10.0, max=8.0)
         nd_wall_preds = torch.expm1(wall_preds_safe)
 
-        M = nd_wall_preds[mask_wall, 0] * self.cfg.Minf
-        Mas = nd_wall_preds[mask_wall, 1] * self.cfg.Minf
-        Mat = nd_wall_preds[mask_wall, 2] * self.cfg.Minf
+        # USE CENTRALIZED SCALE
+        Minf_scaled = self.cfg.Minf * self.cfg.surface_scale
+
+        M = nd_wall_preds[mask_wall, 0] * Minf_scaled
+        Mas = nd_wall_preds[mask_wall, 1] * Minf_scaled
+        Mat = nd_wall_preds[mask_wall, 2] * Minf_scaled
 
         if dM_pred_dt is not None:
             exp_wall = torch.exp(wall_preds_safe[mask_wall])
-            dM_dt_phys = exp_wall[:, 0] * dM_pred_dt[mask_wall, 0] * self.cfg.Minf
-            dMas_dt_phys = exp_wall[:, 1] * dM_pred_dt[mask_wall, 1] * self.cfg.Minf
-            dMat_dt_phys = exp_wall[:, 2] * dM_pred_dt[mask_wall, 2] * self.cfg.Minf
+            dM_dt_phys = exp_wall[:, 0] * dM_pred_dt[mask_wall, 0] * Minf_scaled
+            dMas_dt_phys = exp_wall[:, 1] * dM_pred_dt[mask_wall, 1] * Minf_scaled
+            dMat_dt_phys = exp_wall[:, 2] * dM_pred_dt[mask_wall, 2] * Minf_scaled
         else:
             dM_dt_phys = dMas_dt_phys = dMat_dt_phys = 0.0
 
         M_tot = M + Mas + Mat
-        Minf = self.cfg.Minf
+        Minf = self.cfg.Minf * self.cfg.surface_scale
 
         # 4. Compute Local Surface Activation & Spatial Gradients
         global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props, data)
@@ -349,12 +346,14 @@ class BiochemPhysicsKernels:
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
         # Convert CGS velocities (cm/s) to SI (m/s)
-        k_rs = self.cfg.k_rs * 1e-2
-        k_as = self.cfg.k_as * 1e-2
-        k_aa = self.cfg.k_aa * 1e-2
+        cm_to_m = self.core.phys_cfg.cm_to_m
+
+        k_rs = self.cfg.k_rs * cm_to_m
+        k_as = self.cfg.k_as * cm_to_m
+        k_aa = self.cfg.k_aa * cm_to_m
 
         # Convert characteristic length (cm) to SI (m)
-        L_char = self.cfg.L_char * 1e-2
+        L_char = self.cfg.L_char * cm_to_m
 
         # 5. Adhesion Rates (Matching COMSOL Inward Flux Rules)
         pathological_RP_adhesion = is_separation * (
