@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
 import math
-# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that. Adaptive ``dopri5`` in the
-# *adjoint* backward pass often hits non-finite augmented states (stiff VJP); we keep
-# ``dopri5`` for the forward pass only and use fixed-step ``rk4`` subdivisions backward.
+# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that. Forward and adjoint use
+# fixed-step ``rk4`` with shared substeps (stiff biochemistry + untrained nets blow up adaptive solvers).
 from torchdiffeq import odeint_adjoint
 
-# Substeps per macro-interval for adjoint ``rk4`` (backward only).
-_TIER3_ADJOINT_RK4_SUBSTEPS = 32
+# Substeps per macro-interval for fixed-step ``rk4`` (forward + adjoint).
+_TIER3_ADJOINT_RK4_SUBSTEPS = 128
 from src.phase1.physics.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig
 
@@ -272,7 +271,7 @@ class GNODE_Tier3(nn.Module):
                                                                                                             dtype=torch.long,
                                                                                                             device=device)
             dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx)
-            return torch.clamp(dz, min=-1e4, max=1e4)
+            return torch.clamp(dz, min=-10.0, max=10.0)
 
         pred_trajectory = []
 
