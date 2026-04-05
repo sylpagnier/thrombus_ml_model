@@ -271,7 +271,8 @@ class GNODE_Tier3(nn.Module):
             batch_idx = batch.batch if hasattr(batch, 'batch') and batch.batch is not None else torch.zeros(num_nodes,
                                                                                                             dtype=torch.long,
                                                                                                             device=device)
-            return self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx)
+            dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx)
+            return torch.clamp(dz, min=-1e4, max=1e4)
 
         pred_trajectory = []
 
@@ -348,7 +349,7 @@ class GNODE_Tier3(nn.Module):
                 dt_seg = float((t_span[-1] - t_span[0]).abs().item())
                 _min_dt = 1e-9
                 if dt_seg < _min_dt:
-                    # Duplicate/near-duplicate timestamps → dopri5 ``dt`` underflow; no evolution.
+                    # Duplicate/near-duplicate timestamps → no evolution.
                     z_next = z_current
                 else:
                     adjoint_step = max(dt_seg / float(_TIER3_ADJOINT_RK4_SUBSTEPS), 1e-9)
@@ -356,9 +357,8 @@ class GNODE_Tier3(nn.Module):
                         odefunc_wrapper,
                         z_current,
                         t_span,
-                        method="dopri5",
-                        rtol=self.rtol,
-                        atol=self.atol,
+                        method="rk4",
+                        options={"step_size": adjoint_step},
                         adjoint_method="rk4",
                         adjoint_options={"step_size": adjoint_step},
                         adjoint_params=tuple(self.ode_func.parameters()),
