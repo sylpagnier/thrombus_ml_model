@@ -6,29 +6,85 @@ from matplotlib.colors import LogNorm
 from pathlib import Path
 from torch_geometric.data import Batch
 import torch.nn as nn
+from typing import Optional, Sequence, Union, List
+
+Number = Union[int, float]
+
 
 class DynamicLossWeighter(nn.Module):
     """
     Dynamically weights multiple loss components using homoscedastic task uncertainty.
-    Includes a critical clamp to prevent the variance from collapsing to negative infinity
-    as PDE residuals approach zero.
-    Reference: Kendall et al., 2018.
+    Clamps log_var per task so effective weights exp(-log_var) stay in a sane range:
+    min_log_var lower-bounds log_var (caps maximum precision), max_log_var upper-bounds
+    log_var (floors minimum precision). Reference: Kendall et al., 2018.
     """
-    def __init__(self, num_losses=2, min_log_var=-8.0):
+    def __init__(
+        self,
+        num_losses: int = 2,
+        min_log_var: Union[Number, Sequence[Number]] = -8.0,
+        max_log_var: Optional[Union[Number, Sequence[Number]]] = None,
+    ):
         super().__init__()
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
-        self.min_log_var = min_log_var
 
-    def forward(self, losses, scales=None):
+        def _bound_vec(
+            value: Optional[Union[Number, Sequence[Number]]],
+            fill: float,
+        ) -> torch.Tensor:
+            if value is None:
+                return torch.full((num_losses,), fill, dtype=torch.float32)
+            if isinstance(value, (int, float)):
+                return torch.full((num_losses,), float(value), dtype=torch.float32)
+            t = torch.tensor(list(value), dtype=torch.float32)
+            if t.numel() != num_losses:
+                raise ValueError(
+                    f"Expected length {num_losses} for per-task bounds, got {t.numel()}"
+                )
+            return t
+
+        self.register_buffer("per_task_min_log_var", _bound_vec(min_log_var, -8.0))
+        self.register_buffer("per_task_max_log_var", _bound_vec(max_log_var, float("inf")))
+
+        self.min_log_var = (
+            float(min_log_var)
+            if isinstance(min_log_var, (int, float))
+            else float(self.per_task_min_log_var[0].item())
+        )
+
+    def clamped_log_vars(self) -> torch.Tensor:
+        return torch.clamp(
+            self.log_vars,
+            min=self.per_task_min_log_var,
+            max=self.per_task_max_log_var,
+        )
+
+    def forward(
+        self,
+        losses: Sequence,
+        scales: Optional[Sequence[float]] = None,
+        task_active: Optional[Union[Sequence[bool], torch.Tensor, List[bool]]] = None,
+    ):
         if scales is None:
             scales = [1.0] * len(losses)
         total_loss = 0
+        min_lv = self.per_task_min_log_var
+        max_lv = self.per_task_max_log_var
         for i, loss in enumerate(losses):
-            if loss > 0.0:
-                safe_log_var = torch.clamp(self.log_vars[i], min=self.min_log_var)
-                precision = torch.exp(-safe_log_var)
-                task_loss = precision * loss + safe_log_var
-                total_loss += scales[i] * task_loss
+            if task_active is not None:
+                act = task_active[i]
+                if hasattr(act, "item"):
+                    act = bool(act.item())
+                if not act:
+                    continue
+            else:
+                li = loss.item() if torch.is_tensor(loss) else float(loss)
+                if li <= 0.0:
+                    continue
+
+            safe_log_var = torch.clamp(self.log_vars[i], min=min_lv[i], max=max_lv[i])
+            precision = torch.exp(-safe_log_var)
+            task_loss = precision * loss + safe_log_var
+            total_loss += scales[i] * task_loss
         return total_loss
 
 def validate_and_plot(model, val_data, epoch, device, tier="tier1"):

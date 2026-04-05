@@ -5,7 +5,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from src.config import BiochemConfig, PhysicsConfig
 from src.phase2.physics_kernels_tier3 import BiochemPhysicsKernels
-# UPDATED: Import the new continuous-time Neural ODE module
 from src.phase2.gnode_tier3 import GNODE_Tier3
 from src.utils.paths import get_project_root
 
@@ -37,12 +36,17 @@ class TestTier3Physics(unittest.TestCase):
         self.biochem_kernels = BiochemPhysicsKernels(self.bio_cfg, self.core)
         self.kinetics = self.biochem_kernels.kinetics
 
-        # UPDATED: Initialize the new GNODE_Tier3 model with matching params
+        # FIXED: Pass phys_cfg to match the updated GNODE_Tier3 signature
         self.model = GNODE_Tier3(
+            phys_cfg=self.phys_cfg,
             in_channels=12,
-            spatial_channels=15,  # Added to match new signature
+            spatial_channels=15,
             latent_dim=16,
-            mu_ratio_max=self.bio_cfg.mu_ratio_max
+            mu_ratio_max=self.bio_cfg.mu_ratio_max,
+            mat_crit=self.bio_cfg.viscosity_mat_crit,
+            fi_crit=self.bio_cfg.viscosity_fi_crit,
+            temp_mat=self.bio_cfg.viscosity_gnode_temp_mat,
+            temp_fi=self.bio_cfg.viscosity_gnode_temp_fi,
         )
 
     def _comsol_smoothed_step(self, x, location, transition_zone, val_from, val_to):
@@ -80,11 +84,15 @@ class TestTier3Physics(unittest.TestCase):
             self.assertAlmostEqual(actual_val, expected_val, places=6)
 
     def test_fibrin_kinetics_math(self):
-        """Validates Fibrin kinetics formulation."""
+        """Validates Fibrin kinetics formulation (SI concentrations, same as biochem_adr_residual)."""
         num_nodes = 500
+        eps = 1e-8
+        c_max = self.bio_cfg.fi_reaction_saturation_si + eps
+        fg0 = self.bio_cfg.c_Fg0
         T_tensor = torch.rand(num_nodes, dtype=torch.float32)
-        FG_tensor = torch.rand(num_nodes, dtype=torch.float32) * 5.0
-        FI_tensor = torch.rand(num_nodes, dtype=torch.float32) * 0.8
+        # FG, FI are linear SI [mol/m^3] inside compute_species_reactions / ADR, not 0–1 ND.
+        FG_tensor = torch.rand(num_nodes, dtype=torch.float32) * (5.0 * fg0)
+        FI_tensor = torch.rand(num_nodes, dtype=torch.float32) * (0.95 * c_max)
 
         R_FG_pt, R_FI_pt = self.kinetics.compute_fibrin_kinetics(T_tensor, FG_tensor, FI_tensor)
 
@@ -92,14 +100,14 @@ class TestTier3Physics(unittest.TestCase):
         FG_np = FG_tensor.numpy()
         FI_np = FI_tensor.numpy()
 
-        base_reaction_comsol = (self.bio_cfg.kfi * T_np * FG_np) / (
-                (self.bio_cfg.kmfi * self.kinetics.C_scale) + FG_np + 1e-8)
+        base_reaction = (self.bio_cfg.kfi * T_np * FG_np) / (
+                (self.bio_cfg.kmfi * self.kinetics.C_scale) + FG_np + eps)
 
-        saturation_term = np.clip(1.0 - FI_np, 0.0, None)
-        reaction_comsol = base_reaction_comsol * saturation_term
+        saturation_term = np.clip(1.0 - FI_np / c_max, 0.0, 1.0)
+        reaction_expected = base_reaction * saturation_term
 
-        np.testing.assert_allclose(R_FI_pt.numpy(), reaction_comsol, rtol=1e-5, atol=1e-8)
-        np.testing.assert_allclose(R_FG_pt.numpy(), -reaction_comsol, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(R_FI_pt.numpy(), reaction_expected, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(R_FG_pt.numpy(), -reaction_expected, rtol=1e-5, atol=1e-8)
 
     def test_gamma_inhibition_math(self):
         """

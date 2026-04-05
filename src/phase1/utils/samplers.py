@@ -1,4 +1,5 @@
 import random
+import torch
 from torch.utils.data import Sampler
 
 
@@ -12,7 +13,15 @@ class StratifiedAnchorSampler(Sampler):
         self.warmup_mode = True
 
         for i, d in enumerate(dataset):
-            if hasattr(d, 'is_anchor') and d.is_anchor.item() is True:
+            if hasattr(d, "is_anchor"):
+                ia = d.is_anchor
+                if torch.is_tensor(ia):
+                    is_sup = bool(ia.any().item())
+                else:
+                    is_sup = bool(ia)
+            else:
+                is_sup = False
+            if is_sup:
                 self.anchor_indices.append(i)
             else:
                 self.physics_indices.append(i)

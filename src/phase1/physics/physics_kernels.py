@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 
 
 def scatter_add(src, index, dim=0, dim_size=None):
@@ -19,9 +20,10 @@ class PhysicsKernels:
     def __init__(self, phys_cfg):
         self.cfg = phys_cfg
 
-        # Normalize the viscosity extremes by the target reference
-        self.mu_inf_nd = self.cfg.mu_inf / self.cfg.mu_ref
-        self.mu_0_nd = self.cfg.mu_0 / self.cfg.mu_ref
+        # ND Carreau bounds use the same scale as label channel STATE_CHANNEL_MU_EFF_ND
+        _mu_nd_scale = self.cfg.mu_viscosity_nd_scale
+        self.mu_inf_nd = self.cfg.mu_inf / _mu_nd_scale
+        self.mu_0_nd = self.cfg.mu_0 / _mu_nd_scale
 
     def _get_geometric_props(self, data):
         """
@@ -40,6 +42,12 @@ class PhysicsKernels:
         """
         Computes 1st and 2nd derivatives using the precomputed 2nd-order WLS operator.
         Safely handles either a PyG Data object or a props dictionary.
+
+        Contract for ``u`` (no batch/time axis):
+            - ``[num_nodes]`` per-node scalar field, or
+            - ``[num_nodes, n_channels]`` stacked nodal channels.
+
+        Do not pass ``[1, N, C]`` or other ranks; edge indices address nodes along dim 0.
         """
         if isinstance(data_or_props, dict):
             row, col = data_or_props['row'], data_or_props['col']
@@ -52,6 +60,17 @@ class PhysicsKernels:
 
         if u.dim() == 1:
             u = u.unsqueeze(-1)
+
+        if u.dim() != 2:
+            raise ValueError(
+                "_compute_derivatives expects u shaped [num_nodes] or [num_nodes, n_channels]; "
+                f"got shape {tuple(u.shape)}."
+            )
+        if u.shape[0] != num_nodes:
+            raise ValueError(
+                "_compute_derivatives: length of u along dim 0 must equal num_nodes "
+                f"({u.shape[0]} != {num_nodes})."
+            )
 
         C = u.shape[1]
         du = u[col] - u[row]  # [E, C]
@@ -80,7 +99,7 @@ class PhysicsKernels:
         else:
             return c[:, 0:2, :].reshape(-1, 2 * C)
 
-    def navier_stokes_residual(self, pred, data, props=None):
+    def navier_stokes_residual(self, pred, data, props=None, re_ref: Optional[float] = None):
         if props is None:
             if hasattr(data, 'M_inv'):
                 props = data
@@ -111,14 +130,17 @@ class PhysicsKernels:
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         Re = self.cfg.get_re(u_ref, d_bar)
+        if re_ref is not None:
+            ref_t = torch.as_tensor(re_ref, device=Re.device, dtype=Re.dtype)
+            Re = ref_t.expand_as(Re)
 
         # --- Tier-Dependent Physics Formulation ---
         if self.cfg.viscosity_model == "carreau":
             # Extract predicted mu
             mu_eff = pred[:, 3]
 
-            # Detach mu_eff to prevent physics gradients from artificially smoothing viscosity
-            c_mu = self._compute_derivatives(mu_eff.detach().unsqueeze(1), props)
+            mu_for_grad = mu_eff.detach() if self.cfg.detach_mu_for_ns_gradient else mu_eff
+            c_mu = self._compute_derivatives(mu_for_grad.unsqueeze(1), props)
             mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
 
             # Full divergence of the stress tensor (NO strict incompressibility assumption)
@@ -163,7 +185,7 @@ class PhysicsKernels:
         # L2 norm of the divergence
         return torch.mean(div_u ** 2)
 
-    def _compute_carreau_viscosity(self, du_ij, data):
+    def _compute_carreau_viscosity(self, du_ij, data, carreau_n: Optional[float] = None):
         """
         Calculates local effective non-dimensional viscosity based on the Carreau-Yasuda model.
         Implements batch-aware variable broadcasting and pseudo-Huber smooth regularization.
@@ -192,7 +214,7 @@ class PhysicsKernels:
         lambda_nd = self.cfg.lam * (u_ref_b / d_bar_b)
 
         a = self.cfg.a
-        n = self.cfg.n
+        n = carreau_n if carreau_n is not None else self.cfg.n
 
         # Evaluate the Carreau-Yasuda equation
         shear_term = 1.0 + (lambda_nd * gamma_dot_nd) ** a
@@ -202,7 +224,7 @@ class PhysicsKernels:
 
         return mu_nd
 
-    def rheology_loss(self, pred, data, props=None):
+    def rheology_loss(self, pred, data, props=None, carreau_n: Optional[float] = None):
         """
         Detached Rheology Supervisor:
         Forces the network's surrogate viscosity output to perfectly match the
@@ -230,7 +252,7 @@ class PhysicsKernels:
         du_ij = torch.stack([u_x, u_y, v_x, v_y], dim=1)
 
         # 3. Compute the analytical target and explicitly detach it as the ground truth
-        mu_target = self._compute_carreau_viscosity(du_ij, data).detach()
+        mu_target = self._compute_carreau_viscosity(du_ij, data, carreau_n=carreau_n).detach()
 
         dynamic_max = self.mu_0_nd * 1.2
         mu_pred_safe = torch.clamp(mu_pred, min=1e-6, max=dynamic_max)

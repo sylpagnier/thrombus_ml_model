@@ -111,7 +111,8 @@ def _sample_params(
     Draw ALL random numbers for one vessel and return a plain picklable dict.
     Adds high-frequency biological roughness and global tortuosity.
     """
-    weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
+    level_key = min(max(int(level), 0), 1)
+    weights_map = _CURVE_WEIGHTS.get(level_key, _CURVE_WEIGHTS[1])
     active = {k: v for k, v in weights_map.items() if v > 0}
     keys = list(active.keys())
     probs = np.array(list(active.values()), dtype=float)
@@ -368,8 +369,22 @@ def _worker_run_chunk(
 class VesselGenerator:
     """Generates 2D vessel meshes with parametric pathologies using Gmsh."""
 
+    @staticmethod
+    def _normalize_tier_name(tier: str) -> str:
+        alias = {
+            "1": "tier1",
+            "2": "tier2",
+            "3": "tier3",
+            "tier1": "tier1",
+            "tier2": "tier2",
+            "tier3": "tier3",
+        }
+        key = str(tier).strip().lower()
+        return alias.get(key, key)
+
     def __init__(self, tier: str = "tier1", output_dir: Optional[str | Path] = None) -> None:
-        self.cfg          = VesselConfig(tier=tier)
+        tier_norm = self._normalize_tier_name(tier)
+        self.cfg          = VesselConfig(tier=tier_norm)
         self.project_root = get_project_root()
         self.output_dir   = Path(output_dir) if output_dir else self.project_root / self.cfg.mesh_input_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -589,9 +604,64 @@ if __name__ == "__main__":
     import multiprocessing as mp
     mp.freeze_support()
 
-    # Run the generation
-    vg = VesselGenerator(tier="tier1")
-    vg.run_pipeline(n=100, level=1, num_workers=8, chunk_size=1)
+    def _prompt_text(label, default):
+        raw = input(f"{label} [{default}]: ").strip()
+        return raw if raw else str(default)
+
+    def _prompt_int(label, default):
+        while True:
+            raw = input(f"{label} [{default}]: ").strip()
+            if raw == "":
+                return int(default)
+            try:
+                return int(raw)
+            except ValueError:
+                print("Invalid input. Enter an integer value.")
+
+    def _prompt_tier(default="tier1"):
+        valid = {"tier1", "tier2", "tier3"}
+        while True:
+            raw = input(f"Tier [{default}]: ").strip().lower()
+            tier_val = VesselGenerator._normalize_tier_name(raw if raw else default)
+            if tier_val in valid:
+                return tier_val
+            print("Invalid tier. Choose one of: tier1, tier2, tier3 (or 1, 2, 3).")
+
+    def _prompt_level(default_level: int = 1):
+        while True:
+            raw = input(f"Complexity level (0 or 1) [{default_level}]: ").strip()
+            if raw == "":
+                return int(default_level)
+            try:
+                level_val = int(raw)
+            except ValueError:
+                print("Invalid level. Enter 0 or 1.")
+                continue
+            if level_val in (0, 1):
+                return level_val
+            print("Invalid level. Enter 0 or 1.")
+
+    print("\nAvailable tiers:")
+    print("  - tier1: training stage for Newtonian fluid dynamics")
+    print("  - tier2: training stage for non-Newtonian hemodynamics")
+    print("  - tier3: training stage for biochemical thrombosis (blood clot) dynamics")
+
+    print("\nComplexity levels:")
+    print("  - level 0: mostly straight vessels with mild variation")
+    print("  - level 1: curved vessels with moderate tortuosity and roughness")
+
+    tier = _prompt_tier("tier1")
+    default_level_by_tier = {
+        "tier1": 0,
+        "tier2": 1,
+        "tier3": 1,
+    }
+    level = _prompt_level(default_level_by_tier.get(tier, 1))
+    n = _prompt_int("Number of vessels", 100)
+    workers = 8
+
+    vg = VesselGenerator(tier=tier)
+    vg.run_pipeline(n=n, level=level, num_workers=workers, chunk_size=1)
 
     # Call visualization here
     saved_indices = sorted(

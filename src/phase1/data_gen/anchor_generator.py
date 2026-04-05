@@ -339,8 +339,24 @@ class AnchorGenerator:
 
 if __name__ == "__main__":
     try:
-        generator = AnchorGenerator(tier="tier2")
+        def _prompt_text(label, default):
+            raw = input(f"{label} [{default}]: ").strip()
+            return raw if raw else str(default)
+
+        def _prompt_int(label, default):
+            while True:
+                raw = input(f"{label} [{default}]: ").strip()
+                if raw == "":
+                    return int(default)
+                try:
+                    return int(raw)
+                except ValueError:
+                    print("Invalid input. Enter an integer value.")
+
+        tier = _prompt_text("Tier", "tier2")
+        max_anchors = _prompt_int("Number of vessels", 50)
+        generator = AnchorGenerator(tier=tier)
         with generator:
-            generator.run_batch(max_anchors=50)
+            generator.run_batch(max_anchors=max_anchors)
     except Exception as e:
         print(e)

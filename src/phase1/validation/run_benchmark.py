@@ -3,6 +3,7 @@ matplotlib.use('Agg')
 import shutil
 import pandas as pd
 import time
+import argparse
 from datetime import datetime
 from tqdm import tqdm
 from src.utils.paths import get_project_root
@@ -72,17 +73,61 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
         return None
 
 
-if __name__ == "__main__":
-    target_tiers = ["tier1", "tier2"]
+def _prompt_text(label, default):
+    raw = input(f"{label} [{default}]: ").strip()
+    return raw if raw else str(default)
 
-    benchmarks = [
-        (0, "Level 0 (Straight pathologies)"),
-    ]
+
+def _prompt_int(label, default):
+    while True:
+        raw = input(f"{label} [{default}]: ").strip()
+        if raw == "":
+            return int(default)
+        try:
+            return int(raw)
+        except ValueError:
+            print("Invalid input. Enter an integer value.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run multi-fidelity benchmark pipeline")
+    parser.add_argument("--tiers", type=str, default=None, help='Comma-separated tiers (for example: "tier1,tier2")')
+    parser.add_argument("--num-samples", type=int, default=None, help="Number of vessels per benchmark level")
+    parser.add_argument("--levels", type=str, default=None, help='Comma-separated benchmark levels (for example: "0,1")')
+    args = parser.parse_args()
+
+    if args.tiers is None:
+        tiers_raw = _prompt_text("Tiers (comma-separated)", "tier1,tier2")
+    else:
+        tiers_raw = args.tiers
+    target_tiers = [t.strip() for t in tiers_raw.split(",") if t.strip()]
+
+    if args.num_samples is None:
+        num_samples = _prompt_int("Number of vessels per level", 10)
+    else:
+        num_samples = args.num_samples
+
+    if args.levels is None:
+        levels_raw = _prompt_text("Levels (comma-separated)", "0")
+    else:
+        levels_raw = args.levels
+
+    level_ids = []
+    for s in levels_raw.split(","):
+        s = s.strip()
+        if s:
+            level_ids.append(int(s))
+
+    level_names = {
+        0: "Level 0 (Straight pathologies)",
+        1: "Level 1 (Curved pathologies)",
+    }
+    benchmarks = [(lvl, level_names.get(lvl, f"Level {lvl}")) for lvl in level_ids]
 
     for current_tier in target_tiers:
         all_results = {}
         for lvl_idx, name in benchmarks:
-            metrics = run_pipeline_for_level(current_tier, lvl_idx, name, num_samples=10)
+            metrics = run_pipeline_for_level(current_tier, lvl_idx, name, num_samples=num_samples)
             if metrics is not None:
                 all_results[name] = metrics
             time.sleep(1)

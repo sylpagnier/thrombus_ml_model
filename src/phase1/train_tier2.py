@@ -9,7 +9,7 @@ import random
 from src.utils.paths import get_project_root
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase1.physics.physics_kernels import PhysicsKernels
-from src.config import VesselConfig, PhysicsConfig
+from src.config import VesselConfig, PhysicsConfig, CurriculumConfig
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from src.phase1.utils.samplers import StratifiedAnchorSampler
 from src.phase1.utils.metrics import quantify_performance, validate_and_plot, DynamicLossWeighter
@@ -53,7 +53,9 @@ def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
     ], weight_decay=1e-5)
 
 
-def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation):
+def compute_step_loss(
+    model, data, kernels, loss_weighter, current_solver, lambda_phys, device, is_distillation, carreau_n=None
+):
     out = model(data, solver=current_solver, anderson_beta=1.0 if is_distillation else 0.8, anderson_warmup_iters=5)
     if isinstance(out, tuple):
         pred, jac_loss = out
@@ -75,7 +77,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
             if node_is_anchor.sum() > 0:
                 l_data_kine = F.mse_loss(pred[node_is_anchor, :3], data.y[node_is_anchor, :3])
 
-        l_rheo = kernels.rheology_loss(pred, data, props=props)
+        l_rheo = kernels.rheology_loss(pred, data, props=props, carreau_n=carreau_n)
         l_bc = kernels.boundary_condition_loss(pred, data)
         l_io = kernels.inlet_outlet_loss(pred, data)
 
@@ -109,7 +111,7 @@ def compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambd
 
     l_bc = kernels.boundary_condition_loss(pred, data)
     l_io = kernels.inlet_outlet_loss(pred, data)
-    l_rheo = kernels.rheology_loss(pred, data, props=props)
+    l_rheo = kernels.rheology_loss(pred, data, props=props, carreau_n=carreau_n)
 
     pde_losses = [l_cont, l_mom]
     pde_scales = [lambda_phys, lambda_phys]
@@ -135,8 +137,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     # 1. Calculate physics bounds
     phys_cfg = PhysicsConfig(tier="tier2")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-    mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_ref
-    mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_ref
+    mu_inf_nd = kernels.mu_inf_nd
+    mu_0_nd = kernels.mu_0_nd
 
     # 2. Instantiate the model
     model = GINO_DEQ(
@@ -208,8 +210,9 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     scheduler = None
     lbfgs_initialized = False
 
+    curriculum = CurriculumConfig()
     target_n = phys_cfg.n
-    start_n = 0.8
+    start_n = curriculum.tier2_carreau_n_distill_start
 
     for epoch in range(epochs):
         is_distillation = epoch < distillation_epochs
@@ -218,11 +221,10 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
         if is_distillation:
             progress = epoch / max(1, (distillation_epochs - 1))
-            current_n = start_n - progress * (start_n - target_n)
-            phys_cfg.n = current_n
-            print(f"🔄 Curriculum: Annealed Carreau index 'n' to {current_n:.4f}")
+            carreau_n = start_n - progress * (start_n - target_n)
+            print(f"🔄 Curriculum: Annealed Carreau index 'n' to {carreau_n:.4f}")
         else:
-            phys_cfg.n = target_n
+            carreau_n = target_n
 
         # Ensure Anderson remains active during L-BFGS to maintain gradient accuracy
         if is_distillation:
@@ -277,8 +279,10 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                 data = data.to(device)
 
                 # Compute loss (scaled by accumulation steps)
-                loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys,
-                                                  device, is_distillation)
+                loss, metrics = compute_step_loss(
+                    model, data, kernels, loss_weighter, current_solver, lambda_phys,
+                    device, is_distillation, carreau_n=carreau_n,
+                )
                 loss = loss / accumulation_steps
 
                 if torch.isnan(loss):
@@ -315,8 +319,10 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
                 accumulated_loss = torch.tensor(0.0, device=device)
 
                 for closure_data in optimizer.static_batches:
-                    loss, _ = compute_step_loss(model, closure_data, kernels, loss_weighter, current_solver,
-                                                lambda_phys, device, is_distillation)
+                    loss, _ = compute_step_loss(
+                        model, closure_data, kernels, loss_weighter, current_solver,
+                        lambda_phys, device, is_distillation, carreau_n=carreau_n,
+                    )
                     loss = loss / len(optimizer.static_batches)
                     loss.backward()
                     accumulated_loss += loss.detach()
@@ -333,7 +339,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
             if physics_active:
                 with torch.no_grad():
-                    safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
+                    safe_vars = loss_weighter.clamped_log_vars()
                     weights = torch.exp(-safe_vars)
                     print(f"⚖️ Learned PDE Weights -> Cont: {weights[0]:.2f} | Mom: {weights[1]:.2f}")
 

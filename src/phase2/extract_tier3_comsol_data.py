@@ -4,7 +4,6 @@ import torch
 import numpy as np
 import pandas as pd
 import meshio
-import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.spatial import cKDTree, KDTree
 from torch_geometric.data import Data
@@ -18,6 +17,10 @@ from src.utils.paths import get_project_root
 class PatientDataExtractor:
     """
     Extracts and processes Eulerian node-wise COMSOL data into PyTorch Geometric Data objects.
+
+    State ``y`` layout: indices 0–2 are u, v, p (non-dimensional); channel index 3
+    (``STATE_CHANNEL_MU_EFF_ND`` in ``src.config``) is ``mu_effective`` via
+    ``PhysicsConfig.viscosity_si_to_nd`` (Carreau: scale ``mu_inf``).
 
     --- COMSOL Export Instructions ---
     To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
@@ -33,21 +36,16 @@ class PatientDataExtractor:
     ----------------------------------
     """
 
-    def __init__(self, tier="tier3_patients", raw_dir=None, label_dir=None, proc_dir=None, visualize=True):
+    def __init__(self, tier="tier3_patients", raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
         self.vessel_cfg = VesselConfig(tier=tier)
         self.phys_cfg = PhysicsConfig(tier=tier)
-        self.visualize = visualize
 
         # Directory handling
         self.raw_dir = Path(raw_dir) if raw_dir else self.root / self.vessel_cfg.mesh_input_dir
         self.label_dir = Path(label_dir) if label_dir else self.root / self.vessel_cfg.output_dir
         self.proc_dir = Path(proc_dir) if proc_dir else self.root / self.vessel_cfg.graph_output_dir
         self.proc_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.visualize:
-            self.vis_dir = self.proc_dir / "sanity_checks"
-            self.vis_dir.mkdir(exist_ok=True)
 
         # Dictionary mapping exact COMSOL export names to standardized internal names
         self.species_map = {
@@ -227,68 +225,6 @@ class PatientDataExtractor:
 
         return time_blocks
 
-    def _plot_sanity_check(self, data, stem):
-        """Generates a PNG visualization with updated Log1p scaling labels."""
-        x = data.x[ :, 0 ].numpy()
-        y = data.x[ :, 1 ].numpy()
-
-        # FIX: Slice the LAST time step [-1] from the [Time, Nodes, Features] tensor
-        p_rel = data.y[ -1, :, 2 ].numpy()
-        mu_eff = data.y[ -1, :, 3 ].numpy()
-        # Index 9 in y_tensor (4 kinematics + 5th species) is Thrombin
-        thrombin_transformed = data.y[ -1, :, 9 ].numpy()
-        sdf = data.x[ :, 2 ].numpy()
-
-        fig, axs = plt.subplots(3, 2, figsize=(16, 18))
-        fig.suptitle(f"Sanity Check (Final Time Step): {stem}", fontsize=18, fontweight='bold')
-
-        # 1. Mapped Velocity
-        # FIX: Slice the LAST time step [-1] for velocity components
-        u_comp = data.y[ -1, :, 0 ].numpy()
-        v_comp = data.y[ -1, :, 1 ].numpy()
-        vel_mag = np.sqrt(u_comp ** 2 + v_comp ** 2)
-
-        sc1 = axs[ 0, 0 ].scatter(x, y, c=vel_mag, cmap='viridis', s=2)
-        axs[ 0, 0 ].set_title(r"Normalized Velocity ($|U| / u_{ref}$)")
-        fig.colorbar(sc1, ax=axs[ 0, 0 ], label='ND')
-
-        # 2. Relative Pressure
-        sc2 = axs[ 0, 1 ].scatter(x, y, c=p_rel, cmap='RdBu_r', s=2)
-        axs[ 0, 1 ].set_title("Non-Dimensional Pressure (Relative)")
-        fig.colorbar(sc2, ax=axs[ 0, 1 ], label='ND (p / p_ref)')
-
-        # 3. Effective Viscosity
-        sc3 = axs[ 1, 0 ].scatter(x, y, c=mu_eff, cmap='magma', s=2)
-        axs[ 1, 0 ].set_title(r"Non-Dimensional Viscosity ($\mu_{eff} / \mu_{ref}$)")
-        fig.colorbar(sc3, ax=axs[ 1, 0 ], label='ND Ratio')
-
-        # 4. Thrombin Concentration
-        sc4 = axs[ 1, 1 ].scatter(x, y, c=thrombin_transformed, cmap='plasma', s=2)
-        axs[ 1, 1 ].set_title(r"Thrombin $\ln(1 + \hat{T})$")
-        fig.colorbar(sc4, ax=axs[ 1, 1 ], label='Transformed ND Units')
-
-        # 5. Wall Distance (SDF)
-        sc5 = axs[ 2, 0 ].scatter(x, y, c=sdf, cmap='coolwarm', s=2)
-        axs[ 2, 0 ].set_title("Wall Distance (SDF)")
-        fig.colorbar(sc5, ax=axs[ 2, 0 ])
-
-        # 6. Boundary Masks
-        axs[ 2, 1 ].scatter(x, y, c='gray', s=1, alpha=0.05, label='Internal')
-        axs[ 2, 1 ].scatter(x[ data.mask_wall ], y[ data.mask_wall ], c='black', s=5, label='Wall')
-        axs[ 2, 1 ].scatter(x[ data.mask_inlet ], y[ data.mask_inlet ], c='blue', s=8, label='Inlet')
-        axs[ 2, 1 ].scatter(x[ data.mask_outlet ], y[ data.mask_outlet ], c='red', s=8, label='Outlet')
-        axs[ 2, 1 ].set_title("Boundary Node Verification")
-        axs[ 2, 1 ].legend(loc='upper right')
-
-        # Formatting
-        for ax in axs.flat:
-            ax.axis('equal')
-            ax.axis('off')
-
-        plt.tight_layout(rect=[ 0, 0.03, 1, 0.95 ])
-        plt.savefig(self.vis_dir / f"{stem}_sanity.png", dpi=200, bbox_inches='tight')
-        plt.close()
-
     def process_patient(self, stem):
         """
         Full extraction pipeline with Physics-Informed Sanity Checks and
@@ -358,15 +294,12 @@ class PatientDataExtractor:
         eval_times = sorted(list(time_blocks.keys()))
         eval_times_tensor = torch.tensor(eval_times, dtype=torch.float32)
 
-        # Pre-compute WLS operators once based on geometry
+        # Pre-compute geometry-normalized node/edge features once
         nodes_nd = torch.tensor(mesh_nodes / d_bar, dtype=torch.float32)
         edge_attr = torch.cat([
             nodes_nd[ row ] - nodes_nd[ col ],
             torch.linalg.norm(nodes_nd[ row ] - nodes_nd[ col ], dim=1, keepdim=True)
         ], dim=1)
-
-        V, W, M_inv, max_cond = self._precompute_wls(edge_index, num_nodes, nodes_nd)
-        G_x, G_y, Laplacian = self._precompute_sparse_operators(edge_index, num_nodes, M_inv, V, W)
 
         y_trajectory = []
         u_raw_list = []
@@ -377,7 +310,20 @@ class PatientDataExtractor:
         csv_coords_static = df_first[ [ 'x', 'y' ] ].values * self.phys_cfg.cm_to_m
 
         domain_tree = cKDTree(csv_coords_static)
-        _, match_indices = domain_tree.query(mesh_nodes)
+        match_distances, match_indices = domain_tree.query(mesh_nodes)
+        tol_m = self.phys_cfg.comsol_spatial_match_tol_m
+        is_anchor = torch.tensor(match_distances < tol_m, dtype=torch.bool)
+        if int(is_anchor.sum()) == 0:
+            print(
+                f"⚠️ {stem}: no nodes within comsol_spatial_match_tol_m={tol_m} m of COMSOL export; "
+                f"raise PhysicsConfig.comsol_spatial_match_tol_m or verify mesh/CSV alignment."
+            )
+
+        # --- Pre-Compute Normals and initialize accumulator ---
+        pos_tensor = torch.tensor(mesh_nodes, dtype=torch.float32)
+        inlet_normals = self._compute_boundary_normals(edge_index, mask_inlet, pos_tensor, num_nodes)
+        outlet_normals = self._compute_boundary_normals(edge_index, mask_outlet, pos_tensor, num_nodes)
+        total_flux_imbalance = 0.0
 
         # Iterate through the parsed time steps
         for t_idx, t_val in enumerate(eval_times):
@@ -397,7 +343,7 @@ class PatientDataExtractor:
             u_nd = u_raw / u_ref_actual
             v_nd = v_raw / u_ref_actual
             p_nd = p_relative / p_ref
-            mu_nd = mu_eff / self.phys_cfg.mu_ref
+            mu_nd = self.phys_cfg.viscosity_si_to_nd(mu_eff)
 
             # --- USE CENTRALIZED BIOCHEM SCALES ---
             bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
@@ -422,6 +368,16 @@ class PatientDataExtractor:
             y_trajectory.append(y_t)
             u_raw_list.append(u_raw)
 
+            # --- DYNAMIC MASS FLUX CALCULATION ---
+            inlet_v = torch.stack([ u_raw[ mask_inlet ], v_raw[ mask_inlet ] ], dim=1)
+            outlet_v = torch.stack([ u_raw[ mask_outlet ], v_raw[ mask_outlet ] ], dim=1)
+
+            inlet_flux = torch.abs(torch.sum(inlet_v * inlet_normals[ mask_inlet ])).item()
+            outlet_flux = torch.abs(torch.sum(outlet_v * outlet_normals[ mask_outlet ])).item()
+
+            step_imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + 1e-8)
+            total_flux_imbalance += step_imbalance
+
             # Save the inlet/wall BCs explicitly from the FIRST timestep (t=0)
             if t_idx == 0:
                 u_nd_0 = u_nd
@@ -430,31 +386,16 @@ class PatientDataExtractor:
 
         # Stack into shape: [Time, Nodes, 16]
         y_tensor_series = torch.stack(y_trajectory, dim=0)
+        if y_tensor_series.shape[0] != len(eval_times):
+            raise ValueError(
+                f"{stem}: trajectory length {y_tensor_series.shape[0]} != time stamps {len(eval_times)}; "
+                "check COMSOL export headers (@ t=... columns)."
+            )
+        avg_flux_imbalance = total_flux_imbalance / len(eval_times)
 
         # 6. Gradients & Numerical Stability
         V, W, M_inv, max_cond = self._precompute_wls(edge_index, num_nodes, nodes_nd)
         G_x, G_y, Laplacian = self._precompute_sparse_operators(edge_index, num_nodes, M_inv, V, W)
-
-        # 7. Mass Flux Calculation
-        # Convert CGS (comsol) (cm/s) to SI (m/s)
-        u_raw = torch.tensor(df_matched['u'].values, dtype=torch.float32) * 0.01
-        v_raw = torch.tensor(df_matched['v'].values, dtype=torch.float32) * 0.01
-        p_raw = torch.tensor(df_matched['p'].values, dtype=torch.float32) * 0.1
-        mu_eff = torch.tensor(df_matched['mu_effective'].values, dtype=torch.float32) * 0.1
-
-        # Calculate true normals for the inlets and outlets
-        pos_tensor = torch.tensor(mesh_nodes, dtype=torch.float32)
-        inlet_normals = self._compute_boundary_normals(edge_index, mask_inlet, pos_tensor, num_nodes)
-        outlet_normals = self._compute_boundary_normals(edge_index, mask_outlet, pos_tensor, num_nodes)
-
-        # Calculate True Mass Flux via Dot Product (U dot N)
-        inlet_v = torch.stack([ u_raw[ mask_inlet ], v_raw[ mask_inlet ] ], dim=1)
-        outlet_v = torch.stack([ u_raw[ mask_outlet ], v_raw[ mask_outlet ] ], dim=1)
-
-        inlet_flux = torch.abs(torch.sum(inlet_v * inlet_normals[ mask_inlet ])).item()
-        outlet_flux = torch.abs(torch.sum(outlet_v * outlet_normals[ mask_outlet ])).item()
-
-        flux_imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + 1e-8)
 
         # 8. Data-Driven ML Scaling
         # Compute U_ref from the 99th percentile to clamp data strictly to ~[-1.0, 1.0]
@@ -463,11 +404,7 @@ class PatientDataExtractor:
 
         # Ensure your bio_cfg scales match these new SI units
         bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
-        scales = torch.tensor([
-            bio_cfg.c_RP0 * 1e6, bio_cfg.c_RP0 * 1e6, bio_cfg.APRcrit * 1e6, bio_cfg.APScrit * 1e6,
-            bio_cfg.c_pT0 * 1e6, bio_cfg.c_pT0 * 1e6, bio_cfg.cAT0 * 1e6, bio_cfg.c_Fg0 * 1e6,
-            bio_cfg.c_Fg0 * 1e6, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4, bio_cfg.Minf * 1e4
-        ], dtype=torch.float32)
+        scales = bio_cfg.get_species_scales(device='cpu')
 
         # 9. SDF and Normals
         wall_coords = mesh_nodes[ mask_wall.numpy() ]
@@ -542,7 +479,7 @@ class PatientDataExtractor:
             "stem": stem,
             "quality": {
                 "max_wls_condition_number": max_cond,
-                "mass_flux_imbalance": flux_imbalance,
+                "mass_flux_imbalance": avg_flux_imbalance,
                 "boundary_unmapped_ratio": max(inlet_fail, outlet_fail, wall_fail)
             },
             "field_stats": {
@@ -563,7 +500,7 @@ class PatientDataExtractor:
             t=eval_times_tensor,
             edge_index=edge_index, edge_attr=edge_attr,
             mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-            is_anchor=torch.tensor([ True ], dtype=torch.bool),
+            is_anchor=is_anchor,
             d_bar=torch.tensor([ d_bar ], dtype=torch.float32),
             u_ref=torch.tensor([ u_ref_actual ], dtype=torch.float32),
             re_actual=torch.tensor([ re_actual ], dtype=torch.float32),
@@ -574,10 +511,7 @@ class PatientDataExtractor:
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
-        print(f"✅ Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | Imbal={flux_imbalance:.2%}")
-
-        if self.visualize:
-            self._plot_sanity_check(data, stem)
+        print(f"✅ Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | Imbal={avg_flux_imbalance:.2%}")
 
     def run(self):
         # Look for the .nas files now!
@@ -593,5 +527,5 @@ class PatientDataExtractor:
             self.process_patient(stem)
 
 if __name__ == "__main__":
-    extractor = PatientDataExtractor(tier="tier3_patients", visualize=True)
+    extractor = PatientDataExtractor(tier="tier3_patients")
     extractor.run()

@@ -237,7 +237,7 @@ def train_tier1(epochs=50, lr=1e-4, warm_up_epochs=10, adam_epochs=50):
                   f"Wall Slip: {scores.get('wall_slip', 0):.4f}")
 
             with torch.no_grad():
-                safe_vars = torch.clamp(loss_weighter.log_vars, min=loss_weighter.min_log_var)
+                safe_vars = loss_weighter.clamped_log_vars()
                 weights = torch.exp(-safe_vars)
                 print(f"⚖️ Learned PDE Weights -> Cont: {weights[0]:.2f} | Mom: {weights[1]:.2f}")
 

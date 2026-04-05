@@ -28,9 +28,8 @@ class ModelValidator:
 
         print(f"⚡ Loading {self.tier.capitalize()} Model: {model_path}")
 
-        # --- THE FIX: Extract correct physical bounds for the Sigmoid ---
-        mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_ref
-        mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_ref
+        mu_inf_nd = self.kernels.mu_inf_nd
+        mu_0_nd = self.kernels.mu_0_nd
 
         # Pass the bounds into the model architecture
         self.model = GINO_DEQ(

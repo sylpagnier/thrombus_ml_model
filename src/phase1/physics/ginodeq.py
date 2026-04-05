@@ -70,13 +70,19 @@ class SpectralLinear(nn.Module):
         self.linear.parametrizations.weight.original.requires_grad = False
 
 
+def _spectral_or_plain_linear(in_features: int, out_features: int, bias: bool, spectral: bool) -> nn.Module:
+    if spectral:
+        return SpectralLinear(in_features, out_features, bias=bias)
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
 class GlobalMixingBlock(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, use_spectral_norm: bool = True):
         super().__init__()
         self.global_mlp = nn.Sequential(
-            SpectralLinear(latent_dim, latent_dim),
+            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
             nn.ReLU(),
-            SpectralLinear(latent_dim, latent_dim)
+            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
         )
 
     def forward(self, x, batch):
@@ -91,17 +97,24 @@ class MultiHeadPhysicsGATConv(MessagePassing):
     Strictly typed to satisfy IDE linters and PyG's message passing dispatcher.
     """
 
-    def __init__(self, latent_dim: int, edge_dim: int = 3, temperature: float = 1.5, **kwargs):
+    def __init__(
+        self,
+        latent_dim: int,
+        edge_dim: int = 3,
+        temperature: float = 1.5,
+        use_spectral_norm: bool = True,
+        **kwargs,
+    ):
         kwargs.setdefault('aggr', 'add')
         kwargs.setdefault('node_dim', 0)
         super().__init__(**kwargs)
 
         self.temperature = temperature
-        self.edge_proj = SpectralLinear(edge_dim, latent_dim)
+        self.edge_proj = _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm)
 
-        self.lin_src = SpectralLinear(latent_dim, latent_dim)
-        self.lin_dst = SpectralLinear(latent_dim, latent_dim)
-        self.att = SpectralLinear(latent_dim, 1)
+        self.lin_src = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
+        self.lin_dst = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
+        self.att = _spectral_or_plain_linear(latent_dim, 1, True, use_spectral_norm)
 
     def forward(self,
                 x: Union[Tensor, Tuple[Tensor, Tensor]],
@@ -140,12 +153,14 @@ class MultiHeadPhysicsGATConv(MessagePassing):
 
 
 class GINOBlock(nn.Module):
-    def __init__(self, latent_dim=64, edge_dim=3):
+    def __init__(self, latent_dim=64, edge_dim=3, use_spectral_norm: bool = True):
         super().__init__()
         assert latent_dim % 2 == 0, "latent_dim must be divisible by 2 for multi-head split"
 
-        self.conv = MultiHeadPhysicsGATConv(latent_dim, edge_dim=edge_dim)
-        self.global_mixer = GlobalMixingBlock(latent_dim)
+        self.conv = MultiHeadPhysicsGATConv(
+            latent_dim, edge_dim=edge_dim, use_spectral_norm=use_spectral_norm
+        )
+        self.global_mixer = GlobalMixingBlock(latent_dim, use_spectral_norm=use_spectral_norm)
         self.norm = nn.LayerNorm(latent_dim)
         self.relu = nn.ReLU()
 

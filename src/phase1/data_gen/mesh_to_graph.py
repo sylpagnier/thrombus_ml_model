@@ -7,7 +7,7 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
-from src.config import VesselConfig, PhysicsConfig
+from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from src.utils.paths import get_project_root
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -153,8 +153,8 @@ class MeshToGraphComplete:
 
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
 
-        # Scaling Factors
-        ref_mu = self.phys_cfg.mu_ref
+        # Scaling: u_ref uses mu_ref (Re); label mu_nd uses mu_viscosity_nd_scale (channel STATE_CHANNEL_MU_EFF_ND).
+        mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
         u_ref = self.phys_cfg.get_u_ref(d_bar)
         p_ref_scale = self.phys_cfg.get_p_ref(u_ref)
 
@@ -280,7 +280,7 @@ class MeshToGraphComplete:
                 # 3. Proceed with non-dimensionalization
                 u_nd, v_nd = u_raw / u_ref, v_raw / u_ref
                 p_nd = torch.tensor(cfd['p'].flatten()[idx] / p_ref_scale, dtype=torch.float32)
-                mu_nd = torch.tensor(cfd['mu'].flatten()[idx] / ref_mu,
+                mu_nd = torch.tensor(cfd['mu'].flatten()[idx] / mu_nd_scale,
                                      dtype=torch.float32) if 'mu' in cfd else torch.ones_like(u_nd)
 
                 # WLS Gradients for WSS
@@ -325,6 +325,7 @@ class MeshToGraphComplete:
         coeffs = torch.bmm(M_inv_row, W_V.unsqueeze(2)).squeeze(2)  # Shape: (E, 5)
         cx = coeffs[:, 0]
         cy = coeffs[:, 1]
+        c_lap = coeffs[:, 2] + coeffs[:, 4]
 
         N = len(nodes)
 
@@ -341,9 +342,14 @@ class MeshToGraphComplete:
         idx_y = torch.cat([edge_index, diag_indices], dim=1)
         val_y = torch.cat([cy, -diag_cy], dim=0)
 
+        diag_c_lap = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, c_lap)
+        idx_lap = torch.cat([edge_index, diag_indices], dim=1)
+        val_lap = torch.cat([c_lap, -diag_c_lap], dim=0)
+
         # Create the sparse tensors that GINO DEQ uses for derivatives
         G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
+        Laplacian = torch.sparse_coo_tensor(idx_lap, val_lap, size=(N, N)).coalesce()
 
         # 1. Continuous SDF Profile (Fixes jagged viscosity seams in aneurysms)
         R_nd = 0.5
@@ -385,8 +391,8 @@ class MeshToGraphComplete:
         gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2))
         lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
 
-        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
-                (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+        mu_prior = (self.phys_cfg.mu_inf / mu_nd_scale) + (
+                (self.phys_cfg.mu_0 / mu_nd_scale) - (self.phys_cfg.mu_inf / mu_nd_scale)) * \
                    (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
                            (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
 
@@ -405,27 +411,118 @@ class MeshToGraphComplete:
 
 
 
-        # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
-        data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
-                    mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                    is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
-                    d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                    u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                    u_inlet_bc=u_prior.view(-1, 1),
-                    mu_inlet_bc=mu_prior.view(-1, 1),
-                    mu_wall_bc=mu_prior.view(-1, 1),
-                    V=V, W=W, M_inv=M_inv,
-                    G_x=G_x, G_y=G_y)
+        # --- TIER 3 NON-ANCHOR FORMAT: build transient-compatible dummy trajectory ---
+        if self.vessel_cfg.tier == "tier3" and not is_anchor:
+            bio_cfg = BiochemConfig(tier="tier3")
+
+            # 1) Dummy time trajectory [T, N, 16] + time tensor
+            num_times = bio_cfg.num_time_steps
+            eval_times_tensor = torch.linspace(0.0, bio_cfg.t_final, num_times, dtype=torch.float32)
+            y_tensor_series = torch.zeros((num_times, len(nodes), 16), dtype=torch.float32)
+
+            # 2) Biochemical inlet BCs in transformed (log1p ND) space
+            scales = bio_cfg.get_species_scales(device="cpu")
+            inlet_species_si = torch.zeros(9, dtype=torch.float32)
+            inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
+            inlet_species_si[4] = bio_cfg.c_pT0 * bio_cfg.bulk_scale  # PT
+            inlet_species_si[6] = bio_cfg.cAT0 * bio_cfg.bulk_scale   # AT
+            inlet_species_si[7] = bio_cfg.c_Fg0 * bio_cfg.bulk_scale  # FG
+
+            inlet_species_nd = inlet_species_si / scales[:9]
+            inlet_species_transformed = torch.log1p(inlet_species_nd)
+            bio_inlet_bc = inlet_species_transformed.unsqueeze(0).expand(len(nodes), -1)
+
+            # 3) Build Tier 3-style Data object
+            uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
+            data = Data(
+                x=x_tensor,
+                y=y_tensor_series,
+                t=eval_times_tensor,
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                mask_inlet=mask_inlet,
+                mask_outlet=mask_outlet,
+                mask_wall=mask_wall,
+                is_anchor=torch.zeros(len(nodes), dtype=torch.bool),
+                d_bar=torch.tensor([d_bar], dtype=torch.float32),
+                u_ref=torch.tensor([u_ref], dtype=torch.float32),
+                re_actual=torch.tensor([self.phys_cfg.re_target], dtype=torch.float32),
+                G_x=G_x,
+                G_y=G_y,
+                Laplacian=Laplacian,
+                V=V,
+                W=W,
+                M_inv=M_inv,
+                u_inlet_bc=uv_inlet_bc,
+                mu_inlet_bc=mu_prior.view(-1, 1),
+                mu_wall_bc=mu_prior.view(-1, 1),
+                bio_inlet_bc=bio_inlet_bc,
+            )
+        else:
+            # Original Tier 1/2 format (steady labels + anchor flag)
+            data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
+                        mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
+                        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+                        d_bar=torch.tensor([d_bar], dtype=torch.float32),
+                        u_ref=torch.tensor([u_ref], dtype=torch.float32),
+                        u_inlet_bc=u_prior.view(-1, 1),
+                        mu_inlet_bc=mu_prior.view(-1, 1),
+                        mu_wall_bc=mu_prior.view(-1, 1),
+                        V=V, W=W, M_inv=M_inv,
+                        G_x=G_x, G_y=G_y, Laplacian=Laplacian)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
-    def run(self):
+    def run(self, max_files=None):
         files = sorted(self.raw_dir.glob("*.msh"))
+        if max_files is not None:
+            files = files[:max_files]
         for f in tqdm(files):
             self.process_file(f.name)
 
 
 if __name__ == "__main__":
-    active_tier = "tier1"
+    def _normalize_tier_name(tier: str) -> str:
+        alias = {
+            "1": "tier1",
+            "2": "tier2",
+            "3": "tier3",
+            "tier1": "tier1",
+            "tier2": "tier2",
+            "tier3": "tier3",
+        }
+        key = str(tier).strip().lower()
+        return alias.get(key, key)
+
+    def _prompt_tier(default="tier1"):
+        valid = {"tier1", "tier2", "tier3"}
+        while True:
+            raw = input(f"Tier [{default}]: ").strip().lower()
+            tier_val = _normalize_tier_name(raw if raw else default)
+            if tier_val in valid:
+                return tier_val
+            print("Invalid tier. Choose one of: tier1, tier2, tier3 (or 1, 2, 3).")
+
+    def _prompt_optional_int(label):
+        while True:
+            raw = input(f"{label} [all]: ").strip()
+            raw_l = raw.lower()
+            if raw == "" or raw_l == "all":
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                print("Invalid input. Enter an integer value, 'all', or leave blank for all.")
+
+    print("\nAvailable tiers:")
+    print("  - tier1: training stage for Newtonian fluid dynamics")
+    print("  - tier2: training stage for non-Newtonian hemodynamics")
+    print("  - tier3: training stage for biochemical thrombosis (blood clot) dynamics")
+    print("\nNumber of vessels:")
+    print("  - Enter an integer to process only that many meshes")
+    print("  - Enter 'all' (or leave blank) to process all meshes")
+
+    active_tier = _prompt_tier("tier1")
+    max_files = _prompt_optional_int("Number of vessels")
     processor = MeshToGraphComplete(tier=active_tier)
-    processor.run()
+    processor.run(max_files=max_files)

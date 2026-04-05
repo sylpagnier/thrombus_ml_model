@@ -20,6 +20,7 @@ class BiochemPhysicsKernels:
         self.C_scale = self.cfg.bulk_scale
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
+        self.adr_norm_scales = self.cfg.get_adr_norm_scales()
 
         self.D_coeff = {
             'RP': self.cfg.D_RP * self.D_scale,
@@ -43,12 +44,11 @@ class BiochemPhysicsKernels:
             self.cfg = cfg
             self.C_scale = C_scale
 
-            # --- Soft-Logic Temperature Parameters (ML Hyperparameters) ---
-            self.T_omega = 0.05  # Chemical activation threshold
-            self.T_shear = 500.0  # Mechanical shear threshold
-            self.T_grad = 50.0  # Spatial shear gradient threshold
-            self.T_low_shear = 5.0  # Low shear stagnation threshold
-            self.T_scale = 1.0  # Dynamic temperature scalar
+            self.T_omega = self.cfg.soft_step_T_omega
+            self.T_shear = self.cfg.soft_step_T_shear
+            self.T_grad = self.cfg.soft_step_T_grad
+            self.T_low_shear = self.cfg.soft_step_T_low_shear
+            self.T_scale = self.cfg.soft_step_T_scale
 
             # --- COMSOL Biochemical Parameters (Mapped & Scaled) ---
             self.APScrit = self.cfg.APScrit * self.C_scale
@@ -93,8 +93,8 @@ class BiochemPhysicsKernels:
             eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
 
-            # Enforce 1.0 maximum mass/volume limit constraint
-            saturation_term = torch.clamp(1.0 - FI, min=0.0)
+            c_max = self.cfg.fi_reaction_saturation_si + eps
+            saturation_term = torch.clamp(1.0 - FI / c_max, min=0.0, max=1.0)
 
             R_FI = reaction_rate * saturation_term
             R_FG = -reaction_rate * saturation_term  # Conservation of species mass
@@ -159,8 +159,12 @@ class BiochemPhysicsKernels:
         max_ratio = self.cfg.mu_ratio_max
 
         # mu1 maxes out at (max_ratio - 1.0) so the base fluid remains 1.0x
-        mu1_mat = self.kinetics._soft_step(M_wall, 2e7, 7e6) * (max_ratio - 1.0) + 1.0
-        mu2_fi = self.kinetics._soft_step(FI_field, 0.6, 0.01) * max_ratio
+        mu1_mat = self.kinetics._soft_step(
+            M_wall, self.cfg.viscosity_mat_crit, self.cfg.viscosity_penalty_soft_temp_mat
+        ) * (max_ratio - 1.0) + 1.0
+        mu2_fi = self.kinetics._soft_step(
+            FI_field, self.cfg.viscosity_fi_crit, self.cfg.viscosity_penalty_soft_temp_fi
+        ) * max_ratio
 
         mu_total = mu1_mat + mu2_fi
 
@@ -198,6 +202,7 @@ class BiochemPhysicsKernels:
 
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
         scales = self.species_scales.to(species_preds.device)
+        adr_norm = self.adr_norm_scales.to(species_preds.device)
 
         species_preds_safe = torch.clamp(species_preds, min=-10.0, max=8.0)
         nd_species_preds = torch.expm1(species_preds_safe)
@@ -236,7 +241,8 @@ class BiochemPhysicsKernels:
             # Include dC_dt in the residual
             residual = dC_dt + advection - diffusion - R
 
-            residual_nd = residual / (scale_c + 1e-8)
+            norm_scale = adr_norm[scale_idx]
+            residual_nd = residual / (norm_scale + 1e-8)
             loss_c = F.huber_loss(residual_nd, torch.zeros_like(residual_nd), delta=1.0)
 
             if key in fast_keys:
@@ -263,23 +269,23 @@ class BiochemPhysicsKernels:
             targs_inlet = data.bio_inlet_bc[mask_inlet, 0:9]
             loss_inlet = F.mse_loss(preds_inlet, targs_inlet)
 
-        # 2. Outlet: Zero Diffusive Flux (n . grad(c) = 0)
+        # 2. Outlet: zero normal gradient of physical concentration (same linear C as ADR / wall flux).
         if mask_outlet.any():
             nx = data.x[mask_outlet, 3]
             ny = data.x[mask_outlet, 4]
 
+            scales = self.species_scales.to(biochem_preds.device)
+            biochem_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
+            linear_bulk = torch.expm1(biochem_safe) * scales[:9]
+
+            d_bar = spatial_props['d_bar'].to(device=biochem_preds.device, dtype=biochem_preds.dtype)
+
             loss_outlet_species = 0.0
             for i in range(9):
-                C_field = biochem_preds[:, i].unsqueeze(1)
-
-                # Sparse Matrix Gradient Calculation
-                dC_dx = torch.sparse.mm(data.G_x, C_field).squeeze(1)
-                dC_dy = torch.sparse.mm(data.G_y, C_field).squeeze(1)
-
-                # Dot product with the outward normal vector
+                C_col = linear_bulk[:, i].unsqueeze(1)
+                dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar
+                dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar
                 dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
-
-                # Penalize any non-zero gradient normal to the outlet
                 loss_outlet_species += F.mse_loss(dC_dn, torch.zeros_like(dC_dn))
 
             loss_outlet = loss_outlet_species / 9.0
@@ -345,8 +351,10 @@ class BiochemPhysicsKernels:
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
-        # Convert CGS velocities (cm/s) to SI (m/s)
-        cm_to_m = self.core.phys_cfg.cm_to_m
+        # Convert CGS velocities (cm/s) to SI (m/s).
+        # PhysicsKernels stores config as `cfg`; keep a guarded fallback for legacy aliases.
+        core_phys_cfg = getattr(self.core, 'phys_cfg', self.core.cfg)
+        cm_to_m = core_phys_cfg.cm_to_m
 
         k_rs = self.cfg.k_rs * cm_to_m
         k_as = self.cfg.k_as * cm_to_m

@@ -2,15 +2,18 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
+import argparse
+from matplotlib.widgets import Slider
 from src.utils.paths import get_project_root
 from src.phase1.data_gen.vessel_generator import VesselGenerator
 from src.phase1.data_gen.mesh_to_graph import MeshToGraphComplete
 from src.phase1.physics.ginodeq import GINO_DEQ
 from src.phase2.gnode_tier3 import GNODE_Tier3
-from src.config import PhysicsConfig, BiochemConfig
+from src.phase2.tier3_time_utils import resolve_tier3_times
+from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND
 
 # Standard channel indices across all models for kinematics
-_CHANNEL = dict(u=0, v=1, p=2, mu_eff=3)
+_CHANNEL = dict(u=0, v=1, p=2, mu_eff=STATE_CHANNEL_MU_EFF_ND)
 
 
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
@@ -37,9 +40,71 @@ def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
 
 
-def run_tier_comparison():
+def _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times):
+    u_all = pred_t3_series_np[:, :, _CHANNEL["u"]]
+    v_all = pred_t3_series_np[:, :, _CHANNEL["v"]]
+    vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
+    p_all = pred_t3_series_np[:, :, _CHANNEL["p"]]
+    fib_all = pred_t3_series_np[:, :, 12]
+    mat_all = pred_t3_series_np[:, :, 15]
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    plt.subplots_adjust(bottom=0.10, hspace=0.2)
+    fig.suptitle(f"Tier 3 Temporal Inspector (t={custom_times[0]:.1f}s)", fontsize=16, fontweight="bold")
+
+    sc1 = axs[0, 0].scatter(pos[:, 0], pos[:, 1], c=vel_all[0], cmap="jet", s=3)
+    axs[0, 0].set_title("Velocity Magnitude")
+    fig.colorbar(sc1, ax=axs[0, 0], label="m/s")
+
+    sc2 = axs[0, 1].scatter(pos[:, 0], pos[:, 1], c=p_all[0], cmap="coolwarm", s=3)
+    axs[0, 1].set_title("Pressure")
+    fig.colorbar(sc2, ax=axs[0, 1], label="Pa")
+
+    sc3 = axs[1, 0].scatter(pos[:, 0], pos[:, 1], c=fib_all[0], cmap="Reds", s=3)
+    axs[1, 0].set_title("Fibrin")
+    fig.colorbar(sc3, ax=axs[1, 0])
+
+    sc4 = axs[1, 1].scatter(pos[:, 0], pos[:, 1], c=mat_all[0], cmap="Oranges", s=3)
+    axs[1, 1].set_title("Surface Platelets (Mat_s)")
+    fig.colorbar(sc4, ax=axs[1, 1])
+
+    for ax in axs.flat:
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    ax_slider = plt.axes([0.2, 0.02, 0.6, 0.03])
+    time_slider = Slider(
+        ax=ax_slider,
+        label="Time Step Index",
+        valmin=0,
+        valmax=len(custom_times) - 1,
+        valinit=0,
+        valstep=1,
+        color="teal",
+    )
+
+    def update(_):
+        idx = int(time_slider.val)
+        sc1.set_array(vel_all[idx])
+        sc2.set_array(p_all[idx])
+        sc3.set_array(fib_all[idx])
+        sc4.set_array(mat_all[idx])
+
+        sc1.set_clim(vmin=vel_all[idx].min(), vmax=vel_all[idx].max())
+        sc2.set_clim(vmin=p_all[idx].min(), vmax=p_all[idx].max())
+        sc3.set_clim(vmin=fib_all[idx].min(), vmax=fib_all[idx].max())
+        sc4.set_clim(vmin=mat_all[idx].min(), vmax=mat_all[idx].max())
+
+        fig.suptitle(f"Tier 3 Temporal Inspector (t={custom_times[idx]:.1f}s)", fontsize=16, fontweight="bold")
+        fig.canvas.draw_idle()
+
+    time_slider.on_changed(update)
+    plt.show()
+
+
+def run_tier_comparison(regenerate=True, seed=42):
     root = get_project_root()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ Using device: {device}")
 
     # ------------------------------------------------------------------
@@ -53,32 +118,38 @@ def run_tier_comparison():
 
     for d in [raw_dir, graph_t1_dir, graph_t2_dir, graph_t3_dir]:
         d.mkdir(parents=True, exist_ok=True)
-        # Clear old files
-        for f in d.glob("*"): f.unlink()
 
-    # ------------------------------------------------------------------
-    # 2. Generate a Single Shared Synthetic Geometry
-    # ------------------------------------------------------------------
-    print("\n📐 Generating 1 complex synthetic vessel for the comparison...")
-    vg = VesselGenerator(tier="tier3", output_dir=raw_dir)  # Use tier 3 to ensure rich geometry
-    vg.run_pipeline(n=1, level=1, num_workers=1, seed=42)
+    need_regen = regenerate
+    if not regenerate:
+        has_ready_data = (
+            any(raw_dir.glob("*.msh")) and
+            any(graph_t1_dir.glob("*.pt")) and
+            any(graph_t2_dir.glob("*.pt")) and
+            any(graph_t3_dir.glob("*.pt"))
+        )
+        if not has_ready_data:
+            print("⚠️ No existing cached synthetic data found. Regenerating now...")
+            need_regen = True
 
-    # ------------------------------------------------------------------
-    # 3. Convert Mesh to specific Graphs for each Tier
-    # ------------------------------------------------------------------
-    print("\n🕸️ Converting mesh to graphs for each tier's specific channel requirements...")
+    if need_regen:
+        for d in [raw_dir, graph_t1_dir, graph_t2_dir, graph_t3_dir]:
+            for f in d.glob("*"):
+                if f.is_file():
+                    f.unlink()
 
-    # Tier 1 (15 in_channels)
-    mg1 = MeshToGraphComplete(tier="tier1", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t1_dir)
-    mg1.run()
+        print("\n📐 Generating 1 complex synthetic vessel for the comparison...")
+        vg = VesselGenerator(tier="tier3", output_dir=raw_dir)
+        vg.run_pipeline(n=1, level=1, num_workers=1, seed=seed)
 
-    # Tier 2 (15 in_channels)
-    mg2 = MeshToGraphComplete(tier="tier2", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t2_dir)
-    mg2.run()
-
-    # Tier 3 (12 in_channels)
-    mg3 = MeshToGraphComplete(tier="tier3", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t3_dir)
-    mg3.run()
+        print("\n🕸️ Converting mesh to graphs for each tier's specific channel requirements...")
+        mg1 = MeshToGraphComplete(tier="tier1", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t1_dir)
+        mg1.run()
+        mg2 = MeshToGraphComplete(tier="tier2", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t2_dir)
+        mg2.run()
+        mg3 = MeshToGraphComplete(tier="tier3", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t3_dir)
+        mg3.run()
+    else:
+        print("\n♻️ Reusing existing single-case synthetic data.")
 
     # Load the specific graphs
     try:
@@ -105,19 +176,26 @@ def run_tier_comparison():
     phys_cfg_t2 = PhysicsConfig(tier="tier2")
     model_t2 = GINO_DEQ(
         in_channels=15, out_channels=5, latent_dim=64, max_iters=15,
-        mu_inf_nd=(phys_cfg_t2.mu_inf / phys_cfg_t2.mu_ref),
-        mu_0_nd=(phys_cfg_t2.mu_0 / phys_cfg_t2.mu_ref)
+        mu_inf_nd=(phys_cfg_t2.mu_inf / phys_cfg_t2.mu_viscosity_nd_scale),
+        mu_0_nd=(phys_cfg_t2.mu_0 / phys_cfg_t2.mu_viscosity_nd_scale)
     ).to(device)
     model_t2.load_state_dict(torch.load(model_dir / "tier2_best_physics.pth", map_location=device, weights_only=True))
     model_t2.eval()
 
-    # Tier 3 Setup
+    # Tier 3 Setup (same PhysicsConfig defaults as train_tier3.py / config.py)
+    phys_cfg_t3 = PhysicsConfig(tier="tier3")
     bio_cfg = BiochemConfig(tier="tier3")
     model_t3 = GNODE_Tier3(
+        phys_cfg=phys_cfg_t3,
         in_channels=12,
         spatial_channels=15,
         latent_dim=64,
-        max_inner_iters=10
+        max_inner_iters=10,
+        mu_ratio_max=bio_cfg.mu_ratio_max,
+        mat_crit=bio_cfg.viscosity_mat_crit,
+        fi_crit=bio_cfg.viscosity_fi_crit,
+        temp_mat=bio_cfg.viscosity_gnode_temp_mat,
+        temp_fi=bio_cfg.viscosity_gnode_temp_fi,
     ).to(device)
     model_t3.load_state_dict(torch.load(model_dir / "tier3_best_bio.pth", map_location=device, weights_only=True))
     model_t3.eval()
@@ -130,10 +208,11 @@ def run_tier_comparison():
         pred_t1 = model_t1(data_t1) if isinstance(model_t1(data_t1), tuple) else model_t1(data_t1)
         pred_t2 = model_t2(data_t2) if isinstance(model_t2(data_t2), tuple) else model_t2(data_t2)
 
-        # Setup evaluation times for Tier 3 Neural ODE
-        t_final = data_t3.t[-1].item() if hasattr(data_t3, 't') else bio_cfg.t_final
+        # Setup evaluation times for Tier 3 Neural ODE (same axis convention as training).
+        t_axis = resolve_tier3_times(data_t3, bio_cfg, device)
+        t_final = float(t_axis[-1].item())
 
-        # Explicitly define time points to query: 0s, 33%, 66%, 100%, and Extrapolated (150%)
+        # Query: 0s, 33%, 66%, 100%, and extrapolated (150%) past COMSOL end.
         custom_times = [0.0, t_final * 0.33, t_final * 0.66, t_final, t_final * 1.5]
         eval_times = torch.tensor(custom_times, dtype=torch.float32, device=device)
 
@@ -202,50 +281,42 @@ def run_tier_comparison():
 
     fig1.tight_layout(rect=(0, 0.03, 1, 0.95))
 
-    # --- FIGURE 2: Tier 3 Temporal Evolution ---
-    print("⏳ Plotting Temporal Evolution...")
-    num_times = len(custom_times)
-    fig2, axes2 = plt.subplots(3, num_times, figsize=(4 * num_times, 10))
-    fig2.suptitle(f"Tier 3 Temporal Evolution (Extrapolating past T={int(t_final)}s)", fontsize=18, y=0.98)
-
-    # Calculate global max for colorbars across all time steps
-    u_all = pred_t3_series_np[:, :, _CHANNEL['u']]
-    v_all = pred_t3_series_np[:, :, _CHANNEL['v']]
-    vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
-    vel_t_max = vel_all.max()
-
-    fib_all = pred_t3_series_np[:, :, 12]
-    fib_max = fib_all.max()
-
-    mat_all = pred_t3_series_np[:, :, 15]
-    mat_max = mat_all.max()
-
-    for i, t_val in enumerate(custom_times):
-        t_str = f"T = {int(t_val)}s"
-
-        # Row 1: Velocity (Put the Time label on the top row)
-        vel_i = vel_all[i]
-        title_top = f"{t_str}\nVelocity Mag (m/s)" if i == 0 else t_str
-        _plot_field(fig2, axes2[0, i], pos, vel_i, title_top, 'jet', vmin=0, vmax=vel_t_max)
-
-        # Row 2: Fibrin
-        fib_i = fib_all[i]
-        title_mid = "Fibrin (Clotting)" if i == 0 else ""
-        _plot_field(fig2, axes2[1, i], pos, fib_i, title_mid, 'Reds', vmin=0, vmax=fib_max)
-
-        # Row 3: Surface Platelets (Mat_s)
-        mat_i = mat_all[i]
-        title_bot = "Surface Platelets ($Mat_s$)" if i == 0 else ""
-        _plot_field(fig2, axes2[2, i], pos, mat_i, title_bot, 'Oranges', vmin=0, vmax=mat_max)
-
-    fig2.tight_layout(rect=(0, 0.03, 1, 0.95))
-
-    # Show both figures simultaneously
-    plt.show()
+    print("⏳ Opening interactive Tier 3 temporal slider...")
+    _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times)
 
 
 if __name__ == "__main__":
     import multiprocessing as mp
 
     mp.freeze_support()
-    run_tier_comparison()
+    parser = argparse.ArgumentParser(description="Visualize static + temporal behavior across tiers")
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="Regenerate temporary single-case synthetic data before plotting",
+    )
+    parser.add_argument(
+        "--reuse",
+        action="store_true",
+        help="Reuse previously generated temporary data (if available)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for the single synthetic case when regeneration is enabled",
+    )
+    args = parser.parse_args()
+
+    if args.regenerate and args.reuse:
+        raise ValueError("Use only one of --regenerate or --reuse")
+
+    if args.regenerate:
+        regenerate = True
+    elif args.reuse:
+        regenerate = False
+    else:
+        answer = input("Regenerate temporary synthetic case [y/N]: ").strip().lower()
+        regenerate = answer in [ "y", "yes" ]
+
+    run_tier_comparison(regenerate=regenerate, seed=args.seed)

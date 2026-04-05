@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Union
 from src.utils.paths import get_project_root
 from pathlib import Path
+
+# Channel index for effective viscosity in [u, v, p, mu_eff_nd, ...] state / label tensors.
+# Convention: mu_eff_nd = mu_eff_si / PhysicsConfig.mu_viscosity_nd_scale (see that property).
+STATE_CHANNEL_MU_EFF_ND = 3
 
 
 @dataclass
@@ -49,7 +53,13 @@ class VesselConfig:
 
 @dataclass
 class PhysicsConfig:
-    """Configuration for physical properties and fluid dynamics."""
+    """Configuration for physical properties and fluid dynamics.
+
+    Reynolds / velocity reference uses ``mu_ref`` (``get_u_ref``, ``get_re``). Stored labels and
+    predictions use ``mu_viscosity_nd_scale`` for channel ``STATE_CHANNEL_MU_EFF_ND``: non-dimensional
+    viscosity is always ``mu_eff_si / mu_viscosity_nd_scale`` so Re scaling can change without
+    relabeling graphs.
+    """
     tier: str = "tier1"
 
     # --- Unit Conversion Scales (COMSOL CGS to SI) ---
@@ -57,10 +67,14 @@ class PhysicsConfig:
     cgs_p_to_pa: float = 0.1
     cgs_mu_to_pa_s: float = 0.1
 
+    # Mesh nodes farther than this from a COMSOL export coordinate are not treated as labeled (Tier 3 patients).
+    comsol_spatial_match_tol_m: float = 1e-4
+
     # Fluid Properties
     rho: float = 1106.0  # [kg/m^3]
     re_target: float = 450  # Reynolds number [-]
     viscosity_model: str = field(init=False)
+    # Viscosity [Pa*s] used in Re / u_ref; may differ from mu_viscosity_nd_scale if extended.
     mu_ref: float = field(init=False)
     mu_newtonian: float = 0.0035  # [Pa*s]
 
@@ -70,6 +84,9 @@ class PhysicsConfig:
     lam: float = 3.313  # Relaxation time [s]
     n: float = 0.358  # Power law index
     a: float = 2.0  # Yasuda parameter
+
+    # Carreau momentum residual: if True, ∂μ/∂x does not backprop into predicted μ (PINN-style stability).
+    detach_mu_for_ns_gradient: bool = True
 
     def __post_init__(self):
         """Automatically set the correct physics based on the project tier."""
@@ -81,6 +98,24 @@ class PhysicsConfig:
             self.mu_ref = self.mu_inf
         else:
             raise ValueError(f"Unknown tier: {self.tier}")
+
+    @property
+    def mu_viscosity_nd_scale(self) -> float:
+        """SI viscosity [Pa*s] that non-dimensionalizes ``mu_eff`` in labels (channel STATE_CHANNEL_MU_EFF_ND).
+
+        Carreau: ``mu_inf``. Newtonian (tier 1): ``mu_newtonian``.
+        """
+        if self.viscosity_model == "carreau":
+            return self.mu_inf
+        return self.mu_newtonian
+
+    def viscosity_si_to_nd(self, mu_si: Union[float, "torch.Tensor"]):
+        """Effective viscosity SI [Pa*s] → non-dimensional label scale (same as stored in graphs)."""
+        return mu_si / self.mu_viscosity_nd_scale
+
+    def viscosity_nd_to_si(self, mu_nd: Union[float, "torch.Tensor"]):
+        """Non-dimensional ``mu_eff`` (channel STATE_CHANNEL_MU_EFF_ND) → SI [Pa*s]."""
+        return mu_nd * self.mu_viscosity_nd_scale
 
     def get_u_ref(self, d_bar) -> float:
         """Calculate the reference velocity for a given effective diameter."""
@@ -100,17 +135,30 @@ class PhysicsConfig:
 
 @dataclass
 class BiochemConfig:
-    """Configuration for Tier 3 HiFi dynamic biochemical thrombosis simulations."""
+    """Tier 3 biochemical + rheology parameters aligned with the COMSOL phase-2 model.
+
+    COMSOL global parameters are entered in a **CGS-style** convention for that file
+    (lengths in cm, diffusion in cm^2/s, adhesion in cm/s, platelet density in plt/cm^2,
+    many solute fields in uM). The **.mph does not non-dimensionalize** those species
+    or transport inputs: consistency is by unit-aware parameters in COMSOL.
+
+    This dataclass and ``physics_kernels_tier3`` use **SI** (m, m^2/s, m/s, mol/m^3, plt/m^2).
+    Conversions are centralized (e.g. ``d_scale`` for D coefficients, ``cm_to_m`` for
+    adhesion rates in kernels, ``bulk_scale`` / ``surface_scale`` for log1p species encoding).
+    """
+
     tier: str = "tier3"
 
     # --- Centralized Scales ---
-    bulk_scale: float = 1e6      # SI Conversion for bulk species
-    surface_scale: float = 1e4   # SI Conversion for surface species
-    d_scale: float = 1e-4        # cm^2/s to m^2/s for diffusion
+    bulk_scale: float = 1e6      # log1p encoding: nondim species * bulk_scale -> SI [mol/m^3] or plt/m^3
+    surface_scale: float = 1e4   # wall species: nondim * surface_scale -> SI [plt/m^2]
+    d_scale: float = 1e-4        # COMSOL D [cm^2/s] -> SI [m^2/s] (multiply by (cm_to_m)^2)
 
-    # --- Temporal Simulation Parameters ---
-    t_final: float = 6000  # Total simulation time to match COMSOL export [s]
-    num_time_steps: int = 60  # Number of evaluation points in the trajectory
+    # --- Temporal simulation (per-graph truth is authoritative) ---
+    # Prefer storing COMSOL sample times on each graph as ``data.t`` [s]; lengths can differ
+    # between patients/runs. These fields are fallbacks when ``data.t`` is missing.
+    t_final: float = 6000  # Default horizon [s] if graph has no ``data.t``
+    num_time_steps: int = 60  # Default count for synthetic linspace if not set by export
 
     # --- Initial Concentrations ---
     c_RP0: float = 2.5e14  # Initial resting platelets [plt/m^3]
@@ -146,6 +194,8 @@ class BiochemConfig:
     # --- Fibrin Kinetics ---
     kfi: float = 59.0  # Reaction rate fibrinogen [1/s]
     kmfi: float = 3.16e-3  # Rate constant fibrin reaction [mol/m^3]
+    # SI scale for (1 - FI/C_max) taper; COMSOL "Sat" is often a 0–1 proxy — here use ~ fibrinogen scale.
+    fi_reaction_saturation_si: float = 7.0e-3  # [mol/m^3], default matches c_Fg0
 
     # --- Surface Parameters & Diffusion ---
     Minf: float = 7.0e10  # Total deposition capacity / max surface saturation [plt/m^2]
@@ -173,6 +223,22 @@ class BiochemConfig:
     mu_ratio_init: float = 2.0
     mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
 
+    # Dual-trigger effective viscosity (COMSOL step proxies; shared by GNODE_Tier3 + penalty loss)
+    viscosity_mat_crit: float = 2e7
+    viscosity_fi_crit: float = 0.6
+    viscosity_gnode_temp_mat: float = 1e6
+    viscosity_gnode_temp_fi: float = 0.05
+    # Soft-step temperatures in BiochemPhysicsKernels.compute_dual_viscosity_penalty
+    viscosity_penalty_soft_temp_mat: float = 7e6
+    viscosity_penalty_soft_temp_fi: float = 0.01
+
+    # Soft-step temperatures for BiochemKinetics (STE forward / sigmoid backward). T_scale multiplies all.
+    soft_step_T_omega: float = 0.05
+    soft_step_T_shear: float = 500.0
+    soft_step_T_grad: float = 50.0
+    soft_step_T_low_shear: float = 5.0
+    soft_step_T_scale: float = 1.0
+
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""
         if self.mu_ratio_max <= self.mu_ratio_init:
@@ -190,3 +256,33 @@ class BiochemConfig:
             self.Minf * self.surface_scale, self.Minf * self.surface_scale,
             self.Minf * self.surface_scale
         ], dtype=torch.float32, device=device)
+
+    def get_adr_norm_scales(self, device='cpu'):
+        """Scales for ADR residual Huber (SI concentration-like); thrombin uses Tcrit, not c_pT0."""
+        import torch
+        s = self.get_species_scales(device=device).clone()
+        s[5] = max(self.Tcrit * self.bulk_scale, 1e-18)
+        return s
+
+
+@dataclass
+class CurriculumConfig:
+    """Training curriculum schedules (keeps magic numbers out of training loops)."""
+
+    # Tier 2: Carreau index n during viscosity distillation (anneals toward PhysicsConfig.n)
+    tier2_carreau_n_distill_start: float = 0.8
+
+    # Tier 3: warmup / teacher forcing / T_scale schedule
+    tier3_warmup_epochs: int = 10
+    tier3_teacher_force_decay_epochs: int = 20
+    tier3_t_scale_warmup_initial: float = 10.0
+    tier3_t_scale_warmup_final: float = 8.0
+    tier3_t_scale_coupled_initial: float = 8.0
+    tier3_t_scale_coupled_final: float = 1.0
+
+    # Tier 3: Kendall loss weighter — freeze during warmup; bound effective precisions
+    tier3_weighter_freeze_during_warmup: bool = True
+    # Cap exp(-log_var) for physics tasks (indices 0–5: ADR_F, ADR_S, W_Bio, W_Phy, Bio_IO, NS_mom).
+    tier3_physics_precision_ceiling: float = 100.0
+    # Floor exp(-log_var) for supervised tasks (indices 6–7: Data_Kine, Data_Bio).
+    tier3_data_precision_floor: float = 0.12
