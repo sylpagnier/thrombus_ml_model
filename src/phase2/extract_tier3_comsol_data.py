@@ -124,8 +124,8 @@ class PatientDataExtractor:
         normals = torch.zeros((num_nodes, 2), dtype=torch.float32, device=pos_tensor.device)
 
         row, col = edge_index
-        # Find edges where BOTH nodes are on the requested boundary
-        b_edges = boundary_mask[ row ] & boundary_mask[ col ]
+        # Use unique undirected boundary segments only; duplicated edge directions cancel exactly.
+        b_edges = boundary_mask[ row ] & boundary_mask[ col ] & (row < col)
 
         r = row[ b_edges ]
         c = col[ b_edges ]
@@ -135,6 +135,13 @@ class PatientDataExtractor:
 
         # Perpendicular vector (-dy, dx)
         edge_normals = torch.stack([ -edge_vecs[ :, 1 ], edge_vecs[ :, 0 ] ], dim=1)
+
+        # Orient normals consistently toward mesh center (inward) to avoid random sign flips.
+        center_pt = pos_tensor.mean(dim=0)
+        midpoints = (pos_tensor[ r ] + pos_tensor[ c ]) / 2.0
+        inward_vecs = center_pt - midpoints
+        dot_prods = (edge_normals * inward_vecs).sum(dim=1, keepdim=True)
+        edge_normals = torch.where(dot_prods < 0, -edge_normals, edge_normals)
 
         # Accumulate normals at the respective nodes
         normals.scatter_add_(0, r.unsqueeze(1).expand(-1, 2), edge_normals)
@@ -351,7 +358,13 @@ class PatientDataExtractor:
             raw_bulk_cgs = torch.tensor(df_matched[species_cols[:9]].values, dtype=torch.float32)
             raw_surf_cgs = torch.tensor(df_matched[species_cols[9:]].values, dtype=torch.float32)
 
-            bulk_si = raw_bulk_cgs * bio_cfg.bulk_scale
+            # COMSOL export convention for tier-3 species is mixed-CGS:
+            # - rp, ap: platelet number density in plt/ml  -> scaled linear field via x bulk_scale
+            # - apr, aps, PT, th, at, fg, fi: concentration in uM -> mol/m^3 (x1e-3), then x bulk_scale
+            # This keeps transformed ND channels consistent with BiochemConfig.get_species_scales().
+            bulk_si = torch.zeros_like(raw_bulk_cgs)
+            bulk_si[:, 0:2] = raw_bulk_cgs[:, 0:2] * bio_cfg.bulk_scale
+            bulk_si[:, 2:9] = raw_bulk_cgs[:, 2:9] * (bio_cfg.bulk_scale * 1e-3)
             surf_si = raw_surf_cgs * bio_cfg.surface_scale
             species = torch.clamp(torch.cat([bulk_si, surf_si], dim=1), min=0.0)
 
@@ -416,6 +429,11 @@ class PatientDataExtractor:
         else:
             sdf = torch.zeros((num_nodes, 1))
             normals_unit = torch.zeros((num_nodes, 2))
+
+        # Geometric outlet normals for ∂C/∂n (Bio_IO); x[:,3:5] are wall-based, not outlet face normals.
+        outlet_normals = self._compute_boundary_normals(
+            edge_index, mask_outlet, pos_tensor, num_nodes
+        )
 
         # Boundary Masks
         m_in = mask_inlet.float().unsqueeze(1)
@@ -507,7 +525,8 @@ class PatientDataExtractor:
             G_x=G_x, G_y=G_y, Laplacian=Laplacian, V=V, W=W, M_inv=M_inv,
             u_inlet_bc=uv_inlet_bc,
             mu_inlet_bc=mu_nd_0.unsqueeze(1), mu_wall_bc=mu_nd_0.unsqueeze(1),
-            bio_inlet_bc=bio_inlet_bc
+            bio_inlet_bc=bio_inlet_bc,
+            outlet_normal=outlet_normals,
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")

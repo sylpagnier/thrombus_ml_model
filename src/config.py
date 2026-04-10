@@ -126,8 +126,12 @@ class PhysicsConfig:
         return self.rho * (u_ref ** 2)
 
     def get_re(self, u_ref, d_bar, mu_custom=None):
-        """
-        Calculate the Reynolds number
+        """Reynolds number from stored reference scales: ``rho * u_ref * d_bar / mu``.
+
+        This is **not** the same as reading ``re_target`` off the config: ``re_target`` is used when
+        **building** graphs via ``get_u_ref(d_bar)`` so that, for consistent ``(u_ref, d_bar)``,
+        this call returns ``re_target`` again. If a graph stores inconsistent or zero ``u_ref`` /
+        ``d_bar``, this value can be zero or nonsensical regardless of ``re_target``.
         """
         mu = mu_custom if mu_custom is not None else self.mu_ref
         return (self.rho * u_ref * d_bar) / mu
@@ -215,9 +219,12 @@ class BiochemConfig:
     # Surface & Flow Pathology Constants mapped from COMSOL
     gamma_m: float = 150.0  # Reference shear rate for scaling [1/s]
     lss: float = 25.0  # Low shear rate threshold for stagnation [1/s]
-    sgt: float = -750.0  # Spatial shear gradient threshold [1/(m*s)]
-    L_char: float = 0.00075  # Characteristic length scale (converted 0.075 cm to m)
-    k_aa: float = 0.045  # Adhesion rate for activated platelets on Mas [m/s]
+    # COMSOL parameter is -750 [1/(cm*s)] -> SI is -7.5e4 [1/(m*s)].
+    sgt: float = -7.5e4  # Spatial shear gradient threshold [1/(m*s)]
+    # COMSOL parameter is 0.075 [cm] -> SI is 7.5e-4 [m].
+    L_char: float = 7.5e-4  # Characteristic length scale [m]
+    # COMSOL parameter is 0.045 [cm/s] -> SI is 4.5e-4 [m/s].
+    k_aa: float = 4.5e-4  # Adhesion rate for activated platelets on Mas [m/s]
 
     # Curriculum Learning Bounds (Corrected to match COMSOL mu1/mu2 max values)
     mu_ratio_init: float = 2.0
@@ -264,6 +271,47 @@ class BiochemConfig:
         s[5] = max(self.Tcrit * self.bulk_scale, 1e-18)
         return s
 
+    def _ensure_strictly_increasing_times(self, t):
+        """Force strictly increasing timestamps with representable float32 deltas."""
+        import torch
+
+        dev = t.device
+        dtype = t.dtype
+        t1d = t.reshape(-1).contiguous().to(dtype).cpu()
+        n = t1d.numel()
+        if n <= 1:
+            return t.reshape(-1).contiguous().to(dtype).to(dev)
+        out = t1d.clone()
+        pinf = torch.tensor(float("inf"), dtype=dtype)
+        for i in range(1, n):
+            lo = out[i - 1]
+            if not bool((out[i] > lo).item()):
+                out[i] = torch.nextafter(lo, pinf)
+        return out.to(device=dev)
+
+    def resolve_tier3_times(self, data, device):
+        """Return physical timestamps [s] with length data.y.shape[0]."""
+        import torch
+        import warnings
+
+        t_steps = int(data.y.shape[0])
+        if hasattr(data, "t") and data.t is not None and data.t.numel() > 0:
+            t = data.t.to(device=device, dtype=torch.float32).reshape(-1)
+            if t.numel() == t_steps:
+                return self._ensure_strictly_increasing_times(t)
+            t_last = float(t[-1].item()) if t.numel() else float(self.t_final)
+            warnings.warn(
+                f"data.t length {t.numel()} != y time dim {t_steps}; "
+                f"using linspace(0, {t_last:g}, {t_steps}). Re-export graphs with aligned t.",
+                stacklevel=2,
+            )
+            return self._ensure_strictly_increasing_times(
+                torch.linspace(0.0, t_last, steps=t_steps, device=device, dtype=torch.float32)
+            )
+        return self._ensure_strictly_increasing_times(
+            torch.linspace(0.0, float(self.t_final), steps=t_steps, device=device, dtype=torch.float32)
+        )
+
 
 @dataclass
 class CurriculumConfig:
@@ -284,5 +332,19 @@ class CurriculumConfig:
     tier3_weighter_freeze_during_warmup: bool = True
     # Cap exp(-log_var) for physics tasks (indices 0–5: ADR_F, ADR_S, W_Bio, W_Phy, Bio_IO, NS_mom).
     tier3_physics_precision_ceiling: float = 100.0
+    # Floors for specific physics terms that must not be down-weighted too aggressively.
+    # These apply to ADR_S (index 1) and W_Phy (index 3) only.
+    tier3_adr_s_precision_floor: float = 1.0
+    tier3_w_phys_precision_floor: float = 1.0
     # Floor exp(-log_var) for supervised tasks (indices 6–7: Data_Kine, Data_Bio).
     tier3_data_precision_floor: float = 0.12
+
+    # Tier 3: smoother curriculum than piecewise-linear (reduces loss cliffs).
+    # ``linear`` | ``smoothstep`` | ``cosine`` — applies to mu_ratio ramp and T_scale segments.
+    tier3_curriculum_easing: str = "smoothstep"
+    # Minimum unique anchor graphs before validation Dice / WSS are treated as generalization metrics.
+    tier3_min_anchors_for_trusted_metrics: int = 2
+    # After main warmup, keep physics-task log_vars frozen for extra epochs (data heads tune first).
+    tier3_weighter_physics_grace_epochs: int = 3
+    # Divide ADR/wall/IO/NS residuals by sqrt(num_nodes) so graphs of different sizes are comparable.
+    tier3_physics_geom_normalization: bool = True

@@ -66,7 +66,16 @@ class DynamicLossWeighter(nn.Module):
     ):
         if scales is None:
             scales = [1.0] * len(losses)
-        total_loss = 0
+        if len(losses) == 0:
+            return self.log_vars.sum() * 0.0
+
+        # Keep accumulator tensor-typed from the start so edge-case batches
+        # never return a Python scalar that breaks autograd expectations.
+        first = losses[0]
+        if torch.is_tensor(first):
+            total_loss = first.sum() * 0.0
+        else:
+            total_loss = self.log_vars.sum() * 0.0
         min_lv = self.per_task_min_log_var
         max_lv = self.per_task_max_log_var
         for i, loss in enumerate(losses):

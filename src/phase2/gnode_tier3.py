@@ -1,12 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
-# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that. Forward and adjoint use
-# fixed-step ``rk4`` with shared substeps (stiff biochemistry + untrained nets blow up adaptive solvers).
+# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
 from torchdiffeq import odeint_adjoint
-
-# Substeps per macro-interval for fixed-step ``rk4`` (forward + adjoint).
-_TIER3_ADJOINT_RK4_SUBSTEPS = 128
 from src.phase1.physics.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig
 
@@ -66,9 +63,11 @@ class BioODEFunc(nn.Module):
 
     def forward(self, t, z, edge_index, edge_attr, batch_idx):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
+        z = torch.clamp(z, min=-20.0, max=20.0)
         mod_dummy = torch.zeros(int(edge_index.shape[ 1 ]), 1, dtype=torch.float32, device=z.device)
         dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_dummy, mod_dummy)
         dz_dt = self.derivative_scale * dz_raw
+        dz_dt = torch.clamp(dz_dt, min=-10.0, max=10.0)
         if self.training:
             self.derivative_energy_sum += float(dz_dt.detach().pow(2).mean().item())
             self.derivative_eval_count += 1
@@ -172,8 +171,10 @@ class GNODE_Tier3(nn.Module):
         return encoded_x
 
     def _decode_species_log1p(self, raw_species: torch.Tensor) -> torch.Tensor:
-        """Map decoder output to the same log1p(species_nd) encoding as COMSOL graphs and physics kernels."""
-        return torch.clamp(raw_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+        """Map decoder output to log1p(species_nd) with nonnegative species_nd."""
+        species_nd = F.softplus(raw_species)
+        species_log1p = torch.log1p(species_nd)
+        return torch.clamp(species_log1p, max=_SPECIES_LOG1P_MAX)
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
@@ -212,7 +213,8 @@ class GNODE_Tier3(nn.Module):
         evaluation_times,
         y_true_trajectory=None,
         teacher_forcing_ratio=0.0,
-        start_idx=0
+        start_idx=0,
+        initial_species=None,
     ):
         """
         Forward pass for the Neural ODE with Two-Way Macro-Micro Coupling.
@@ -236,8 +238,11 @@ class GNODE_Tier3(nn.Module):
         # Default: physical resting prior everywhere. With TBPTT (start_idx > 0) or full-sequence TF,
         # anchor nodes take species from ``y`` / ``y_true_trajectory``; non-anchors keep the prior
         # (placeholder or unmatched nodes are never trusted). Synthetic graphs: all-prior at t=0.
+        # Optional ``initial_species`` lets the caller warm-start from a pre-rolled state.
         # ==========================================
-        if hasattr(batch, 'y') and batch.y is not None and start_idx > 0:
+        if initial_species is not None:
+            current_species = initial_species.to(device=device, dtype=species_prior.dtype)
+        elif hasattr(batch, 'y') and batch.y is not None and start_idx > 0:
             safe_start_idx = min(start_idx, int(batch.y.shape[0]) - 1)
             gt_species = batch.y[safe_start_idx, :, 4:16].to(device)
             current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, species_prior)
@@ -246,6 +251,7 @@ class GNODE_Tier3(nn.Module):
             current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, species_prior)
         else:
             current_species = species_prior
+        current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
         # USE CENTRALIZED RHEOLOGY PARAMS
         mu_inf = self.phys_cfg.mu_inf
@@ -280,9 +286,13 @@ class GNODE_Tier3(nn.Module):
         # ==========================================
         for i in range(num_times):
             if self.training and y_true_trajectory is not None and i > 0:
-                if torch.rand(1, device=device).item() < teacher_forcing_ratio:
+                # Smooth teacher forcing: blend predicted and target anchor states.
+                tf = float(max(0.0, min(1.0, teacher_forcing_ratio)))
+                if tf > 0.0:
                     gt_species = y_true_trajectory[i, :, 4:16].to(device)
-                    current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, current_species)
+                    blended_species = (1.0 - tf) * current_species + tf * gt_species
+                    current_species = torch.where(truth_mask.unsqueeze(-1), blended_species, current_species)
+                    current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = batch.x[:, :15].clone()
@@ -332,7 +342,8 @@ class GNODE_Tier3(nn.Module):
             # --- C. RECORD COUPLED STATE ---
             current_mu_eff_nd = current_mu_eff / mu_nd_scale
             # Use the ND version for the recorded trajectory
-            pred_step = torch.cat([u_v_p, current_mu_eff_nd, current_species], dim=-1)
+            safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+            pred_step = torch.cat([u_v_p, current_mu_eff_nd, safe_species], dim=-1)
             pred_trajectory.append(pred_step)
 
             # --- D. MICRO STEP: INTEGRATE BIOCHEMISTRY (Frozen Kinematics) ---
@@ -341,7 +352,8 @@ class GNODE_Tier3(nn.Module):
                 t_span = evaluation_times[i: i + 2]
 
                 # Encode current physical state into latent representation
-                bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15]], dim=-1)
+                safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+                bio_in = torch.cat([safe_species, u_v_p, batch.x[:, :15]], dim=-1)
                 z_current = self.bio_encoder(bio_in)
 
                 # Integrate ODE over the Delta t interval (adjoint: memory-safe backward).
@@ -351,16 +363,18 @@ class GNODE_Tier3(nn.Module):
                     # Duplicate/near-duplicate timestamps → no evolution.
                     z_next = z_current
                 else:
-                    adjoint_step = max(dt_seg / float(_TIER3_ADJOINT_RK4_SUBSTEPS), 1e-9)
                     z_out = odeint_adjoint(
                         odefunc_wrapper,
                         z_current,
                         t_span,
-                        method="rk4",
-                        options={"step_size": adjoint_step},
-                        adjoint_method="rk4",
-                        adjoint_options={"step_size": adjoint_step},
+                        method="implicit_adams",
+                        adjoint_method="implicit_adams",
                         adjoint_params=tuple(self.ode_func.parameters()),
+                        # Keep forward/backward solver tolerances aligned with model config.
+                        rtol=self.rtol,
+                        atol=self.atol,
+                        adjoint_rtol=self.rtol,
+                        adjoint_atol=self.atol,
                     )
                     z_next = z_out[1]
                 raw_species = self.biochem_decoder(z_next)
@@ -373,6 +387,7 @@ class GNODE_Tier3(nn.Module):
 
                 # Update species state for the next macro-step
                 current_species = torch.cat([next_species_flat[:, 0:9], surface_species], dim=1)
+                current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
         # Stack into shape: [ Time, Nodes, 16 ]
         pred_series = torch.stack(pred_trajectory, dim=0)

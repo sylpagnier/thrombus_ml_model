@@ -1,48 +1,32 @@
-Project PIRON: AI Coding Rules
-Context & Architecture
+Project PIRON: Practical AI Coding Rules
 
-    You are an expert in Physics-Informed Machine Learning (PIML), Graph Neural Operators (GINO), and Deep Equilibrium Models (DEQ).
+Project Reality
+- This is a multi-phase Python project with active work in `src/phase1` and `src/phase2`.
+- The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
+- Large binary and generated artifacts exist in `data/`, `models/`, `reports/`, and `comsol_models/`; do not treat them as source code.
 
-    The project implements an rGINO-DEQ to solve steady-state Navier-Stokes for non-Newtonian blood flow.
+Code Priorities
+- Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
+- Keep phase boundaries clear: Tier 1/2 logic stays in `phase1`; Tier 3 + COMSOL integration stays in `phase2`.
+- Prefer small, local changes over broad refactors unless explicitly requested.
+- Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
 
-    Core frameworks: PyTorch, PyTorch Geometric (PyG), and TorchDEQ.
+Physics and Modeling Guardrails
+- Carreau-Yasuda rheology and Navier-Stokes consistency are central; avoid edits that weaken these constraints without justification.
+- For DEQ-related changes, preserve solver stability and convergence behavior.
+- For Tier 3 work, preserve the intended split between trainable adaptation layers and physics kernels unless asked otherwise.
 
-Mathematical Standards
+Data and File Hygiene
+- Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints).
+- Do not create duplicate source files with mixed path separators (for example both `src/file.py` and `src\file.py` variants).
+- Keep reusable logic in `src/`; keep ad-hoc inspection scripts in `src/phase*/tests` or dedicated utility scripts.
 
-    Use LaTeX for all mathematical documentation in docstrings.
+Testing Expectations
+- Any meaningful logic change should include or update focused pytest coverage.
+- For physics kernels and extraction code, validate both numerical sanity and shape/index safety.
+- When touching training or data pipelines, run the smallest relevant test subset first, then expand if needed.
 
-    Viscosity Model: Carreau-Yasuda: μ(γ˙​)=μ∞​+(μ0​−μ∞​)[1+(λγ˙​)a]an−1​.
-
-    Loss Function: Ltotal​=λD​LData​+λNS​LNS​+λBrink​LBrinkman​+λRheo​LRheo​.
-
-Coding Standards
-
-    Mesh Agnosticism: Always assume unstructured graphs G=(V,E). Do not hardcode grid dimensions.
-
-    Dimensionality: Default to 2D (u,v,p,ϕ,μ) unless 3D is explicitly requested.
-
-    Variable Naming: Use u for velocity, p for pressure, phi for thrombus phase-field, and gamma_dot for shear rate.
-
-    DEQ Solvers: Prefer Anderson Acceleration or Broyden's method for fixed-point iterations.
-
-    Soft-Logic: Use Sigmoidal Gates for biochemical triggers to ensure ∇ stability.
-
-Specialized Instructions
-
-    When writing loss functions, always include the residual of the Navier-Stokes equations as a penalty.
-
-    Ensure all LoRA layers are applied only to the GNN/GINO weights, leaving the physics-informed kernels frozen during Tier 3.
-
-Testing & Validation (Mandatory)
-
-    Verified Additions: Every new function, layer, or loss term must be accompanied by a pytest unit test before being considered "done."
-
-    Mesh-Agnostic Validation: Tests must pass on graphs with varying node/edge counts to ensure no hardcoded dimensions exist.
-
-    Physical Sanity Checks: - Verify Carreau-Yasuda outputs against μ0​ and μ∞​ limits.
-
-        Validate Navier-Stokes residuals against a simple analytical case (e.g., Poiseuille flow) to ensure the implementation of the differential operators is correct.
-
-    Convergence Guard: For DEQ updates, include a test to verify that the fixed-point solver converges within 10−5 tolerance on a standard forward pass.
-
-    Gradient Integrity: Use torch.autograd.gradcheck or similar assertions to ensure that custom loss terms do not produce vanishing or exploding gradients.
+Documentation and Readability
+- Prefer concise docstrings/comments that explain why (not obvious what).
+- Keep equations plain text or LaTeX-compatible text where helpful, but prioritize clarity over notation density.
+- When behavior changes, update nearby docs or comments so phase/tier intent stays clear.

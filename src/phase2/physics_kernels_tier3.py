@@ -61,6 +61,11 @@ class BiochemPhysicsKernels:
             self.kfi = self.cfg.kfi
             self.kmfi = self.cfg.kmfi * self.C_scale
 
+            # Thrombin inhibition (Gamma) concentration constants in working concentration space
+            self.c_H = self.cfg.c_H * self.C_scale
+            self.K_at = self.cfg.K_at * self.C_scale
+            self.K_T = self.cfg.K_T * self.C_scale
+
         def _soft_step(self, x, threshold, temperature, reverse=False):
             """Smooth approximation of Heaviside step function using STE."""
             sign = -1.0 if reverse else 1.0
@@ -93,8 +98,11 @@ class BiochemPhysicsKernels:
             eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
 
-            c_max = self.cfg.fi_reaction_saturation_si + eps
-            saturation_term = torch.clamp(1.0 - FI / c_max, min=0.0, max=1.0)
+            c_max = self.cfg.fi_reaction_saturation_si * self.C_scale + eps
+            raw_sat = 1.0 - FI / c_max
+            # Smoothly approximate clamp(raw_sat, 0, 1) to avoid derivative kinks near saturation limits.
+            k_steep = 10.0
+            saturation_term = 0.5 * (torch.tanh(k_steep * (raw_sat - 0.5)) + 1.0)
 
             R_FI = reaction_rate * saturation_term
             R_FG = -reaction_rate * saturation_term  # Conservation of species mass
@@ -105,8 +113,8 @@ class BiochemPhysicsKernels:
             Analytic 3: Thrombin inhibition by Antithrombin/Heparin complex.
             Gamma = (k_1t * c_H * AT) / (K_at * K_T + T * K_at + AT * T)
             """
-            numerator = self.cfg.k_1t * self.cfg.c_H * AT
-            denominator = (self.cfg.K_at * self.cfg.K_T) + (T * self.cfg.K_at) + (AT * T) + 1e-8
+            numerator = self.cfg.k_1t * self.c_H * AT
+            denominator = (self.K_at * self.K_T) + (T * self.K_at) + (AT * T) + 1e-8
             return numerator / denominator
 
         def compute_species_reactions(self, species_dict, shear_rate):
@@ -137,8 +145,8 @@ class BiochemPhysicsKernels:
             phi_at = self.cfg.phi_at * self.cfg.beta
             phi_rt = self.cfg.phi_rt * self.cfg.beta
 
-            # Enzymatic conversion now correctly depends on available Prothrombin (PT)
-            enzymatic_term = PT * (phi_at * AP + phi_rt * RP)
+            # PT and platelet terms are in C_scale working concentration; divide once to keep rate dimensions stable.
+            enzymatic_term = PT * (phi_at * AP + phi_rt * RP) / self.C_scale
             R_PT = -enzymatic_term
 
             Gamma_inhibit = self.compute_gamma(T, AT)
@@ -167,6 +175,8 @@ class BiochemPhysicsKernels:
         ) * max_ratio
 
         mu_total = mu1_mat + mu2_fi
+        if mu_total.dim() > 1:
+            mu_total = mu_total.view(-1)
 
         # Sparse Matrix Gradient Calculation
         mu_col = mu_total.unsqueeze(1)
@@ -191,8 +201,9 @@ class BiochemPhysicsKernels:
         fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
         slow_keys = ['AT', 'FG', 'FI']
 
-        adr_losses_fast = 0.0
-        adr_losses_slow = 0.0
+        z = species_preds.sum() * 0.0
+        adr_losses_fast = z
+        adr_losses_slow = z
 
         u_ref = spatial_props['u_ref'].to(species_preds.device)
         d_bar = spatial_props['d_bar'].to(species_preds.device)
@@ -216,12 +227,13 @@ class BiochemPhysicsKernels:
             scale_idx = keys.index(key)
             scale_c = scales[scale_idx]
 
-            # --- TRANSIENT UPDATE: Re-dimensionalize temporal derivative ---
-            if d_pred_dt is not None:
+            # Fast chemistry is treated as quasi-steady over coarse macro timesteps.
+            # Only slow species receive explicit transient dC/dt supervision.
+            if d_pred_dt is not None and key in slow_keys:
                 exp_pred = torch.exp(species_preds_safe[:, scale_idx])
                 dC_dt = scale_c * exp_pred * d_pred_dt[:, scale_idx]
             else:
-                dC_dt = torch.tensor(0.0, device=species_preds.device)
+                dC_dt = species_preds_safe[:, scale_idx] * 0.0
 
             C = species_dict[key]
             base_D = self.D_coeff[key]
@@ -234,15 +246,29 @@ class BiochemPhysicsKernels:
             dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar
             advection = u_raw * dC_dx + v_raw * dC_dy
 
-            # Use the precomputed Laplacian directly for diffusion!
+            # Full diffusion operator: div(D grad(C)) = D laplacian(C) + grad(D) dot grad(C)
             laplacian_C = torch.sparse.mm(data.Laplacian, C_col).squeeze(1) / (d_bar ** 2)
-            diffusion = D * laplacian_C
+            if key in keller_species:
+                D_col = D.unsqueeze(1)
+                dD_dx = torch.sparse.mm(data.G_x, D_col).squeeze(1) / d_bar
+                dD_dy = torch.sparse.mm(data.G_y, D_col).squeeze(1) / d_bar
+                diffusion = (D * laplacian_C) + (dD_dx * dC_dx + dD_dy * dC_dy)
+            else:
+                diffusion = D * laplacian_C
+
+            if key == 'FI':
+                # Polymerized fibrin is a solid matrix; it does not advect or diffuse.
+                advection = torch.zeros_like(advection)
+                diffusion = torch.zeros_like(diffusion)
 
             # Include dC_dt in the residual
             residual = dC_dt + advection - diffusion - R
 
+            # Use fixed physically-meaningful normalization for ADR residuals.
             norm_scale = adr_norm[scale_idx]
-            residual_nd = residual / (norm_scale + 1e-8)
+            # Reaction-aware scaling stabilizes coarse-dt supervision for stiff kinetics.
+            local_stiffness = torch.abs(R) + norm_scale
+            residual_nd = residual / (local_stiffness + 1e-8)
             loss_c = F.huber_loss(residual_nd, torch.zeros_like(residual_nd), delta=1.0)
 
             if key in fast_keys:
@@ -260,8 +286,9 @@ class BiochemPhysicsKernels:
         mask_inlet = data.mask_inlet.view(-1).bool()
         mask_outlet = data.mask_outlet.view(-1).bool()
 
-        loss_inlet = torch.tensor(0.0, device=biochem_preds.device)
-        loss_outlet = torch.tensor(0.0, device=biochem_preds.device)
+        z = biochem_preds.sum() * 0.0
+        loss_inlet = z
+        loss_outlet = z
 
         # 1. Inlet: Force predictions to match the transformed baseline concentrations
         if mask_inlet.any() and hasattr(data, 'bio_inlet_bc'):
@@ -270,9 +297,28 @@ class BiochemPhysicsKernels:
             loss_inlet = F.mse_loss(preds_inlet, targs_inlet)
 
         # 2. Outlet: zero normal gradient of physical concentration (same linear C as ADR / wall flux).
+        # Use ``data.outlet_normal`` when present (Gmsh outlet lines in mesh_to_graph). Slots x[:,3:5] are
+        # wall-distance / wall-segment features, not the outlet face normal — wrong n gave huge erroneous
+        # dC/dn on synthetic vessels; raw MSE could overflow float32 to inf.
         if mask_outlet.any():
-            nx = data.x[mask_outlet, 3]
-            ny = data.x[mask_outlet, 4]
+            if hasattr(data, "outlet_normal") and data.outlet_normal is not None:
+                on = data.outlet_normal.to(device=biochem_preds.device, dtype=biochem_preds.dtype)
+                nx = on[mask_outlet, 0]
+                ny = on[mask_outlet, 1]
+                mag = torch.sqrt(nx * nx + ny * ny + 1e-12)
+                weak = mag < 1e-5
+                if weak.any():
+                    nx_fb = data.x[mask_outlet, 3]
+                    ny_fb = data.x[mask_outlet, 4]
+                    nx = torch.where(weak, nx_fb, nx)
+                    ny = torch.where(weak, ny_fb, ny)
+            else:
+                nx = data.x[mask_outlet, 3]
+                ny = data.x[mask_outlet, 4]
+
+            nmag = torch.sqrt(nx * nx + ny * ny + 1e-12)
+            nx = nx / nmag
+            ny = ny / nmag
 
             scales = self.species_scales.to(biochem_preds.device)
             biochem_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
@@ -280,15 +326,18 @@ class BiochemPhysicsKernels:
 
             d_bar = spatial_props['d_bar'].to(device=biochem_preds.device, dtype=biochem_preds.dtype)
 
-            loss_outlet_species = 0.0
+            flux_scale = self.adr_norm_scales[:9].to(biochem_preds.device).mean().clamp(min=1e-12)
+            loss_outlet_acc = torch.zeros((), device=biochem_preds.device, dtype=biochem_preds.dtype)
             for i in range(9):
                 C_col = linear_bulk[:, i].unsqueeze(1)
                 dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar
                 dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar
                 dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
-                loss_outlet_species += F.mse_loss(dC_dn, torch.zeros_like(dC_dn))
+                dC_dn = torch.nan_to_num(dC_dn, nan=0.0, posinf=0.0, neginf=0.0)
+                d_nd = dC_dn / flux_scale
+                loss_outlet_acc = loss_outlet_acc + F.huber_loss(d_nd, torch.zeros_like(d_nd), delta=1.0)
 
-            loss_outlet = loss_outlet_species / 9.0
+            loss_outlet = loss_outlet_acc / 9.0
 
         return loss_inlet, loss_outlet
 
@@ -296,7 +345,8 @@ class BiochemPhysicsKernels:
         """Enforces Surface Platelet Adhesion with Transient Surface ODEs."""
         mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
-            return torch.tensor(0.0, device=biochem_preds.device), torch.tensor(0.0, device=biochem_preds.device)
+            z = biochem_preds.sum() * 0.0
+            return z, z
 
         scales = self.species_scales.to(biochem_preds.device)
         biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
@@ -326,7 +376,10 @@ class BiochemPhysicsKernels:
             dMas_dt_phys = exp_wall[:, 1] * dM_pred_dt[mask_wall, 1] * Minf_scaled
             dMat_dt_phys = exp_wall[:, 2] * dM_pred_dt[mask_wall, 2] * Minf_scaled
         else:
-            dM_dt_phys = dMas_dt_phys = dMat_dt_phys = 0.0
+            z = M * 0.0
+            dM_dt_phys = z
+            dMas_dt_phys = z
+            dMat_dt_phys = z
 
         M_tot = M + Mas + Mat
         Minf = self.cfg.Minf * self.cfg.surface_scale
@@ -351,17 +404,11 @@ class BiochemPhysicsKernels:
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
-        # Convert CGS velocities (cm/s) to SI (m/s).
-        # PhysicsKernels stores config as `cfg`; keep a guarded fallback for legacy aliases.
-        core_phys_cfg = getattr(self.core, 'phys_cfg', self.core.cfg)
-        cm_to_m = core_phys_cfg.cm_to_m
-
-        k_rs = self.cfg.k_rs * cm_to_m
-        k_as = self.cfg.k_as * cm_to_m
-        k_aa = self.cfg.k_aa * cm_to_m
-
-        # Convert characteristic length (cm) to SI (m)
-        L_char = self.cfg.L_char * cm_to_m
+        # SI-only convention: adhesion rates and characteristic lengths are stored in SI in BiochemConfig.
+        k_rs = self.cfg.k_rs
+        k_as = self.cfg.k_as
+        k_aa = self.cfg.k_aa
+        L_char = self.cfg.L_char
 
         # 5. Adhesion Rates (Matching COMSOL Inward Flux Rules)
         pathological_RP_adhesion = is_separation * (
@@ -415,7 +462,7 @@ class BiochemPhysicsKernels:
         keller_indices = [0, 1, 4, 5, 6]
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
 
-        loss_flux = torch.tensor(0.0, device=biochem_preds.device)
+        loss_flux = biochem_preds.sum() * 0.0
 
         for idx, J_in in flux_targets.items():
             C_field = linear_biochem_preds[:, idx].unsqueeze(1)
@@ -431,7 +478,7 @@ class BiochemPhysicsKernels:
             base_D = self.D_coeff[keys[idx]]
             D_eff = base_D + D_s_wall if idx in keller_indices else base_D
 
-            predicted_flux = D_eff * dC_dn_wall
+            predicted_flux = -D_eff * dC_dn_wall
             flux_residual = predicted_flux - J_in
 
             # Use convective flux for stable normalization

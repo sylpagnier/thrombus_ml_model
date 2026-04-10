@@ -130,7 +130,7 @@ def compute_step_loss(
     return loss, metrics
 
 
-def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
+def train_tier2(epochs=200, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Device being used:", device)
 
@@ -150,13 +150,19 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
         mu_0_nd=mu_0_nd
     ).to(device)
 
-    # 3. Load the Tier 1 weights safely
+    # 3. Resume Tier 2 if checkpoint exists; otherwise bootstrap from Tier 1
     root = get_project_root()
     model_dir = root / "models"
     model_dir.mkdir(exist_ok=True)
+    tier2_resume_path = model_dir / "tier2_best_physics.pth"
     tier1_path = model_dir / "tier1_best_physics.pth"
+    resume_enabled = (os.environ.get("TIER2_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
 
-    if tier1_path.exists():
+    if resume_enabled and tier2_resume_path.exists():
+        resume_state = torch.load(tier2_resume_path, map_location=device, weights_only=True)
+        model.load_state_dict(resume_state, strict=False)
+        print(f"🔁 Resumed Tier 2 from checkpoint: {tier2_resume_path.name}")
+    elif resume_enabled and tier1_path.exists():
         state_dict = torch.load(tier1_path, map_location=device, weights_only=True)
 
         # --- Dynamic channel expansion surgery ---
@@ -173,8 +179,8 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
         model.load_state_dict(state_dict, strict=False)
         print("✅ Successfully loaded Tier 1 foundational physics weights.")
-    else:
-        print("⚠️ Warning: Tier 1 weights not found.")
+    elif resume_enabled:
+        print("⚠️ Warning: neither Tier 2 resume checkpoint nor Tier 1 weights were found.")
 
     # Synchronized to strictly handle [l_cont, l_mom]
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
@@ -209,12 +215,60 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
     optimizer = None
     scheduler = None
     lbfgs_initialized = False
+    start_epoch = 0
+    latest_ckpt_path = model_dir / "tier2_latest_checkpoint.pth"
+    ckpt_every = max(1, int(os.environ.get("TIER2_CKPT_EVERY", "1")))
 
     curriculum = CurriculumConfig()
     target_n = phys_cfg.n
     start_n = curriculum.tier2_carreau_n_distill_start
 
-    for epoch in range(epochs):
+    if resume_enabled and latest_ckpt_path.exists():
+        print(f"🔄 Resuming Tier 2 from checkpoint: {latest_ckpt_path}")
+        ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+        best_phys_score = float(ckpt.get("best_phys_score", best_phys_score))
+        best_loss = float(ckpt.get("best_loss", best_loss))
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+
+        if start_epoch >= adam_epochs:
+            for param in loss_weighter.parameters():
+                param.requires_grad = False
+            optimizer = optim.LBFGS(
+                model.parameters(),
+                lr=0.01,
+                max_iter=20,
+                history_size=30,
+                line_search_fn=None,
+                tolerance_grad=1e-6,
+                tolerance_change=1e-8
+            )
+            lbfgs_initialized = True
+            if ckpt.get("optimizer_type") == "LBFGS":
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        elif start_epoch >= distillation_epochs:
+            optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+            sampler.set_warmup_mode(False)
+            if ckpt.get("optimizer_type") == "AdamW":
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                if ckpt.get("scheduler_state_dict") is not None:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            optimizer = setup_distillation_phase(model)
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
+            sampler.set_warmup_mode(True)
+            if ckpt.get("optimizer_type") == "AdamW":
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                if ckpt.get("scheduler_state_dict") is not None:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        print(f"✅ Tier 2 resume complete at epoch {start_epoch}.")
+    elif resume_enabled:
+        print(f"ℹ️ TIER2_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
+
+    for epoch in range(start_epoch, epochs):
         is_distillation = epoch < distillation_epochs
         physics_active = not is_distillation
         lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
@@ -261,10 +315,7 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
             )
             lbfgs_initialized = True
 
-        if not lbfgs_initialized:
-            model.train()
-        else:
-            model.eval()
+        model.train()
 
         total_loss_epoch = 0.0
         grad_norm = 0.0
@@ -311,25 +362,28 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
         else:
             print(f"⏳ Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS)")
-            if not hasattr(optimizer, 'static_batches'):
-                optimizer.static_batches = [d.to(device) for d in loader]
+            # L-BFGS may reevaluate closure many times; keep batch set fixed per epoch.
+            # Snapshot batches on CPU and transfer one-by-one in closure to avoid VRAM spikes.
+            epoch_batches_cpu = list(loader)
+            n_batches = max(len(epoch_batches_cpu), 1)
 
             def closure():
                 optimizer.zero_grad()
                 accumulated_loss = torch.tensor(0.0, device=device)
 
-                for closure_data in optimizer.static_batches:
+                for closure_data in epoch_batches_cpu:
+                    closure_data = closure_data.to(device)
                     loss, _ = compute_step_loss(
                         model, closure_data, kernels, loss_weighter, current_solver,
                         lambda_phys, device, is_distillation, carreau_n=carreau_n,
                     )
-                    loss = loss / len(optimizer.static_batches)
+                    loss = loss / n_batches
                     loss.backward()
                     accumulated_loss += loss.detach()
                 return accumulated_loss
 
             loss_tensor = optimizer.step(closure)
-            total_loss_epoch = loss_tensor.item() * len(optimizer.static_batches)
+            total_loss_epoch = loss_tensor.item() * n_batches
             print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         if epoch % 2 == 0:
@@ -357,6 +411,21 @@ def train_tier2(epochs=50, distillation_epochs=15, adam_epochs=50, lr=1e-4):
 
         if epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier2")
+
+        should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
+        if should_save_ckpt:
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": (scheduler.state_dict() if (scheduler is not None and not lbfgs_initialized) else None),
+                "loss_weighter_state_dict": loss_weighter.state_dict(),
+                "best_phys_score": best_phys_score,
+                "best_loss": best_loss,
+                "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
+            }
+            torch.save(checkpoint, latest_ckpt_path)
+            print(f"💾 Saved Tier 2 checkpoint -> {latest_ckpt_path.name} (every {ckpt_every} epoch(s))")
 
     torch.save(model.state_dict(), model_dir / "tier2_final.pth")
     print(f"Tier 2 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")

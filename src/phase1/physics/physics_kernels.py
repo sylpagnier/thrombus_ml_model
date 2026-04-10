@@ -129,6 +129,8 @@ class PhysicsKernels:
         v_xy = c_v[:, 3, 0]
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
+        # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
+        # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.
         Re = self.cfg.get_re(u_ref, d_bar)
         if re_ref is not None:
             ref_t = torch.as_tensor(re_ref, device=Re.device, dtype=Re.dtype)
@@ -140,8 +142,16 @@ class PhysicsKernels:
             mu_eff = pred[:, 3]
 
             mu_for_grad = mu_eff.detach() if self.cfg.detach_mu_for_ns_gradient else mu_eff
-            c_mu = self._compute_derivatives(mu_for_grad.unsqueeze(1), props)
-            mu_x, mu_y = c_mu[:, 0, 0], c_mu[:, 1, 0]
+            # Compute viscosity gradients in log-space to reduce ringing across sharp clot interfaces.
+            log_mu = torch.log(mu_for_grad + 1e-8)
+            c_log_mu = self._compute_derivatives(log_mu.unsqueeze(1), props)
+            log_mu_x, log_mu_y = c_log_mu[:, 0, 0], c_log_mu[:, 1, 0]
+            mu_x = mu_for_grad * log_mu_x
+            mu_y = mu_for_grad * log_mu_y
+            # Bound viscosity-gradient spikes from strong-form WLS around sharp clot interfaces.
+            max_grad = 5.0 * self.cfg.mu_viscosity_nd_scale
+            mu_x = torch.clamp(mu_x, min=-max_grad, max=max_grad)
+            mu_y = torch.clamp(mu_y, min=-max_grad, max=max_grad)
 
             # Full divergence of the stress tensor (NO strict incompressibility assumption)
             visc_x = (1.0 / Re) * (2 * mu_x * u_x + mu_y * (u_y + v_x) + mu_eff * (2 * u_xx + u_yy + v_xy))
@@ -166,7 +176,7 @@ class PhysicsKernels:
         if interior_mask.any():
             loss_mom = torch.mean(mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
         else:
-            loss_mom = torch.tensor(0.0, device=pred.device)
+            loss_mom = pred.sum() * 0.0
 
         # Return ONLY momentum. Continuity is handled by the dedicated continuity_loss method.
         return loss_mom
@@ -232,7 +242,7 @@ class PhysicsKernels:
         from 'cheating' by artificially smoothing the underlying velocity fields.
         """
         if self.cfg.viscosity_model != "carreau":
-            return torch.tensor(0.0, device=pred.device)
+            return pred.sum() * 0.0
 
         if props is None:
             props = self._get_geometric_props(data)
@@ -310,7 +320,7 @@ class PhysicsKernels:
 
         mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
-            return torch.tensor(0.0, device=pred.device)
+            return pred.sum() * 0.0
 
         c_u = self._compute_derivatives(u, props)
         c_v = self._compute_derivatives(v, props)

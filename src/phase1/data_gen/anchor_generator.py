@@ -337,12 +337,23 @@ class AnchorGenerator:
                 continue
 
 
+def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
+    """Read an integer from stdin until it is one of ``allowed``."""
+    allowed_str = "/".join(str(x) for x in allowed)
+    while True:
+        raw = input(f"{label} ({allowed_str}): ").strip()
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"  Enter an integer: {allowed_str}")
+            continue
+        if v in allowed:
+            return v
+        print(f"  Must be one of: {allowed_str}")
+
+
 if __name__ == "__main__":
     try:
-        def _prompt_text(label, default):
-            raw = input(f"{label} [{default}]: ").strip()
-            return raw if raw else str(default)
-
         def _prompt_int(label, default):
             while True:
                 raw = input(f"{label} [{default}]: ").strip()
@@ -353,8 +364,9 @@ if __name__ == "__main__":
                 except ValueError:
                     print("Invalid input. Enter an integer value.")
 
-        tier = _prompt_text("Tier", "tier2")
-        max_anchors = _prompt_int("Number of vessels", 50)
+        tier_n = _prompt_int_choice("Tier", (1, 2))
+        tier = f"tier{tier_n}"
+        max_anchors = _prompt_int("Number of anchors", 50)
         generator = AnchorGenerator(tier=tier)
         with generator:
             generator.run_batch(max_anchors=max_anchors)

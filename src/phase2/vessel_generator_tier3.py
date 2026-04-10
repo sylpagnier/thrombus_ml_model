@@ -1,4 +1,4 @@
-"""
+﻿"""
 vessel_generator.py
 -------------------
 Generates 2D vessel meshes with parametric pathologies using Gmsh.
@@ -12,7 +12,7 @@ achieved via *processes*, not threads.  The strategy is:
      packages them as plain dicts (fully picklable, no Gmsh state).
   2. Worker processes each receive a *chunk* of those dicts.
   3. Every worker calls gmsh.initialize() once, iterates over its chunk, and
-     calls gmsh.finalize() before exiting — keeping Gmsh init overhead at
+     calls gmsh.finalize() before exiting ΓÇö keeping Gmsh init overhead at
      O(num_workers) rather than O(n).
   4. ProcessPoolExecutor dispatches chunks; tqdm tracks completion.
 
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Centerline generators
 # All accept pre-sampled scalar parameters so they are deterministic given
-# a params dict — no random calls inside.
+# a params dict ΓÇö no random calls inside.
 # ---------------------------------------------------------------------------
 
 def _centerline_straight(
@@ -111,7 +111,8 @@ def _sample_params(
     Draw ALL random numbers for one vessel and return a plain picklable dict.
     Adds high-frequency biological roughness and global tortuosity.
     """
-    weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
+    level_key = min(max(int(level), 0), 1)
+    weights_map = _CURVE_WEIGHTS.get(level_key, _CURVE_WEIGHTS[1])
     active = {k: v for k, v in weights_map.items() if v > 0}
     keys = list(active.keys())
     probs = np.array(list(active.values()), dtype=float)
@@ -365,11 +366,11 @@ def _worker_run_chunk(
     return results
 
 
-class VesselGenerator:
+class VesselGeneratorTier3:
     """Generates 2D vessel meshes with parametric pathologies using Gmsh."""
 
-    def __init__(self, tier: str = "tier1", output_dir: Optional[str | Path] = None) -> None:
-        self.cfg          = VesselConfig(tier=tier)
+    def __init__(self, output_dir: Optional[str | Path] = None) -> None:
+        self.cfg          = VesselConfig(tier="tier3")
         self.project_root = get_project_root()
         self.output_dir   = Path(output_dir) if output_dir else self.project_root / self.cfg.mesh_input_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -461,7 +462,7 @@ class VesselGenerator:
         num_workers = min(num_workers, n)
 
         logger.info(
-            f"Generating {n} Level-{level} vessels → {self.output_dir} "
+            f"Generating {n} Level-{level} vessels ΓåÆ {self.output_dir} "
             f"[{num_workers} workers / {phys_cores} logical cores]"
         )
 
@@ -472,7 +473,7 @@ class VesselGenerator:
         # Pre-sample everything in the main process
         all_params = [_sample_params(i, level, self.cfg, rng) for i in range(n)]
 
-        # Split into balanced chunks — larger chunks = less IPC overhead
+        # Split into balanced chunks ΓÇö larger chunks = less IPC overhead
         if chunk_size is None:
             chunk_size = max(1, math.ceil(n / num_workers))
         chunks = [all_params[i : i + chunk_size] for i in range(0, n, chunk_size)]
@@ -521,12 +522,12 @@ class VesselGenerator:
                                     failed_params.append(all_params[idx])
 
                         except mp.TimeoutError:
-                            logger.error(f"Worker hung (Timeout) — {len(chunk)} samples queued for retry")
+                            logger.error(f"Worker hung (Timeout) ΓÇö {len(chunk)} samples queued for retry")
                             failed_params.extend(chunk)
                             pbar.update(len(chunk))
                             continue
                         except Exception as exc:
-                            logger.error(f"Worker crash: {exc} — {len(chunk)} samples queued for retry")
+                            logger.error(f"Worker crash: {exc} ΓÇö {len(chunk)} samples queued for retry")
                             failed_params.extend(chunk)
                             pbar.update(len(chunk))
                             continue
@@ -569,7 +570,7 @@ class VesselGenerator:
                                     still_failed.append(failed_p)
 
                     except mp.TimeoutError:
-                        logger.error(f"Retry worker hung (Timeout) — {len(chunk)} samples failed")
+                        logger.error(f"Retry worker hung (Timeout) ΓÇö {len(chunk)} samples failed")
                         still_failed.extend(chunk)
                     except Exception as exc:
                         logger.error(f"Retry worker crash: {exc}")
@@ -585,48 +586,50 @@ class VesselGenerator:
         logger.info(f"Done. {generated}/{n} vessels saved.")
 
 
-def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
-    """Read an integer from stdin until it is one of ``allowed``."""
-    allowed_str = "/".join(str(x) for x in allowed)
-    while True:
-        raw = input(f"{label} ({allowed_str}): ").strip()
-        try:
-            v = int(raw)
-        except ValueError:
-            print(f"  Enter an integer: {allowed_str}")
-            continue
-        if v in allowed:
-            return v
-        print(f"  Must be one of: {allowed_str}")
-
-
-def _prompt_positive_int(label: str, default: int = 500) -> int:
-    """Read a positive integer from stdin; empty input returns ``default``."""
-    while True:
-        raw = input(f"{label} (>=1) [{default}]: ").strip()
-        if raw == "":
-            return default
-        try:
-            v = int(raw)
-        except ValueError:
-            print("  Enter a positive integer.")
-            continue
-        if v >= 1:
-            return v
-        print("  Must be at least 1.")
-
-
 if __name__ == "__main__":
     import multiprocessing as mp
     mp.freeze_support()
 
-    tier_n = _prompt_int_choice("Tier", (1, 2))
-    level = _prompt_int_choice("Level", (0, 1))
-    n_vessels = _prompt_positive_int("Number of vessels", 500)
-    tier = f"tier{tier_n}"
+    def _prompt_text(label, default):
+        raw = input(f"{label} [{default}]: ").strip()
+        return raw if raw else str(default)
 
-    vg = VesselGenerator(tier=tier)
-    vg.run_pipeline(n=n_vessels, level=level, seed=25, num_workers=8, chunk_size=1)
+    def _prompt_int(label, default):
+        while True:
+            raw = input(f"{label} [{default}]: ").strip()
+            if raw == "":
+                return int(default)
+            try:
+                return int(raw)
+            except ValueError:
+                print("Invalid input. Enter an integer value.")
+
+    def _prompt_level(default_level: int = 1):
+        while True:
+            raw = input(f"Complexity level (0 or 1) [{default_level}]: ").strip()
+            if raw == "":
+                return int(default_level)
+            try:
+                level_val = int(raw)
+            except ValueError:
+                print("Invalid level. Enter 0 or 1.")
+                continue
+            if level_val in (0, 1):
+                return level_val
+            print("Invalid level. Enter 0 or 1.")
+
+    print("\nTier 3: biochemical thrombosis (blood clot) dynamics")
+
+    print("\nComplexity levels:")
+    print("  - level 0: mostly straight vessels with mild variation")
+    print("  - level 1: curved vessels with moderate tortuosity and roughness")
+
+    level = _prompt_level(1)
+    n = _prompt_int("Number of vessels", 100)
+    workers = 8
+
+    vg = VesselGeneratorTier3()
+    vg.run_pipeline(n=n, level=level, num_workers=workers, chunk_size=1)
 
     # Call visualization here
     saved_indices = sorted(

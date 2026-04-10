@@ -1,0 +1,18 @@
+# PyTorch: `pip install torch` from PyPI is often CPU-only (+cpu). For NVIDIA GPUs run first:
+#   .\scripts\install_torch_cuda.ps1
+#   (uses --index-url https://download.pytorch.org/whl/cu124 — required so pip does not prefer +cpu)
+# Training auto-picks CUDA when torch.cuda.is_available(). Override: TIER3_DEVICE=cpu|cuda|auto
+
+numpy~=1.26.4
+gmsh~=4.15.0
+shapely~=2.1.2
+torch>=2.6.0,<3
+meshio~=5.3.5
+scipy~=1.17.0
+torch-geometric~=2.7.0
+torchdiffeq~=0.2.5
+tqdm~=4.67.3
+matplotlib~=3.10.8
+pytest~=9.0.2
+MPh~=1.3.1
+pandas~=3.0.0
