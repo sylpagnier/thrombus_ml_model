@@ -27,3 +27,8 @@ The model is trained via a multi-fidelity curriculum:
     Tier 2 (MidFi): Carreau-Yasuda Rheology (μ(γ˙​) sensitivity).
 
     Tier 3 (HiFi): 9-species biochemical triggers via Soft-Logic and LoRA.
+
+Tier intent in practice:
+- Tier 1 (`src/phase1/train_tier1.py`): train Newtonian kinematic baseline.
+- Tier 2 (`src/phase1/train_tier2.py`): improve flow fidelity with non-Newtonian rheology.
+- Tier 3 (`src/phase2/train_tier3.py`): add biochemical clot dynamics/coupling; not the primary stage for large velocity-accuracy gains.

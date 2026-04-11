@@ -5,7 +5,6 @@ import pandas as pd
 import time
 import argparse
 from datetime import datetime
-from tqdm import tqdm
 from src.utils.paths import get_project_root
 
 project_root = get_project_root()
@@ -33,8 +32,12 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
     try:
         print(f"\n[1/4] 📐 Generating {num_samples} Geometries in {base_dir.name}...")
         v_gen = VesselGenerator(tier=tier, output_dir=str(raw_mesh_dir))
-        for i in tqdm(range(num_samples), desc="Meshing"):
-            v_gen.generate(i, level=level_idx, show_viz=False)
+        v_gen.run_pipeline(
+            n=num_samples,
+            level=level_idx,
+            start_idx=0,
+            seed=None,
+        )
 
         print(f"\n[2/4] 🌪️ Solving Navier-Stokes in COMSOL...")
         template_absolute = project_root / "comsol_models" / "phase1_template.mph"
@@ -45,7 +48,7 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
                 mesh_dir=str(raw_mesh_dir),
                 output_dir=str(label_dir)
         ) as a_gen:
-            a_gen.run_batch(start_idx=0, end_idx=num_samples)
+            a_gen.run_batch(max_new=num_samples)
 
         print(f"\n[3/4] 🕸️ Converting to Graphs...")
         m_gen = MeshToGraphComplete(

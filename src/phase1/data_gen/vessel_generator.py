@@ -21,6 +21,7 @@ The result is near-linear scaling up to the physical core count.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -41,6 +42,43 @@ from src.config import VesselConfig
 from src.utils.paths import get_project_root
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def summarize_vessel_mesh_inventory(output_dir: Path) -> Dict[str, Any]:
+    """Scan ``output_dir`` for ``vessel_*.json`` (or ``.msh``) and report append state.
+
+    New runs default to **append**: indices continue after ``max_idx`` so existing meshes
+    are not overwritten. To regenerate from index 0, pass ``start_idx=0`` explicitly.
+    """
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return {"count": 0, "max_idx": -1, "next_idx": 0}
+    indices: List[int] = []
+    for pat in ("vessel_*.json", "vessel_*.msh"):
+        for p in output_dir.glob(pat):
+            try:
+                indices.append(int(p.stem.split("_")[1]))
+            except (ValueError, IndexError):
+                continue
+    uniq = sorted(set(indices))
+    if not uniq:
+        return {"count": 0, "max_idx": -1, "next_idx": 0}
+    mx = uniq[-1]
+    return {
+        "count": len(uniq),
+        "max_idx": mx,
+        "next_idx": mx + 1,
+    }
+
+
+def _next_vessel_index(output_dir: Path) -> int:
+    return int(summarize_vessel_mesh_inventory(output_dir)["next_idx"])
+
+
+def _params_by_idx(params_list: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    return {int(p["idx"]): p for p in params_list}
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -443,25 +481,33 @@ class VesselGenerator:
         num_workers: Optional[int] = None,
         chunk_size: Optional[int] = None,
         seed: Optional[int] = None,
+        start_idx: Optional[int] = None,
     ) -> None:
         """
         Parallel batch vessel generation.
 
         Parameters
         ----------
-        n           : total number of vessels to produce
+        n           : number of vessels to produce in this run (file indices ``start_idx`` …)
         level       : geometry complexity (0 = mostly straight, 1 = curved)
         max_retries : retry attempts for failed samples
         num_workers : worker processes (default: cpu_count - 1, min 1)
         chunk_size  : samples per worker chunk (default: auto-balanced)
         seed        : integer seed for reproducibility (None = random)
+        start_idx   : first vessel index ``vessel_{idx}.*``. If ``None``, appends after the
+                      highest existing index in ``output_dir`` (no overwrite). Pass ``0`` to
+                      fill from the beginning (may overwrite existing files).
         """
         phys_cores  = os.cpu_count() or 1
         num_workers = max(1, phys_cores - 1) if num_workers is None else num_workers
         num_workers = min(num_workers, n)
 
+        if start_idx is None:
+            start_idx = _next_vessel_index(self.output_dir)
+
         logger.info(
             f"Generating {n} Level-{level} vessels → {self.output_dir} "
+            f"[indices {start_idx}..{start_idx + n - 1}] "
             f"[{num_workers} workers / {phys_cores} logical cores]"
         )
 
@@ -470,7 +516,8 @@ class VesselGenerator:
         rng     = np.random.default_rng(seed)
 
         # Pre-sample everything in the main process
-        all_params = [_sample_params(i, level, self.cfg, rng) for i in range(n)]
+        all_params = [_sample_params(start_idx + i, level, self.cfg, rng) for i in range(n)]
+        params_lookup = _params_by_idx(all_params)
 
         # Split into balanced chunks — larger chunks = less IPC overhead
         if chunk_size is None:
@@ -494,7 +541,8 @@ class VesselGenerator:
                         generated += 1
                     else:
                         logger.warning(f"[ {idx} ] failed: {err}")
-                        failed_params.append(all_params[idx])
+                        if idx in params_lookup:
+                            failed_params.append(params_lookup[idx])
 
         else:
             # Existing multiprocessing logic for num_workers > 1
@@ -518,7 +566,8 @@ class VesselGenerator:
                                     generated += 1
                                 else:
                                     logger.warning(f"[ {idx} ] failed: {err}")
-                                    failed_params.append(all_params[idx])
+                                    if idx in params_lookup:
+                                        failed_params.append(params_lookup[idx])
 
                         except mp.TimeoutError:
                             logger.error(f"Worker hung (Timeout) — {len(chunk)} samples queued for retry")
@@ -532,15 +581,17 @@ class VesselGenerator:
                             continue
 
         # ---- Retry failed samples ----
+        cursor = start_idx + n
         for retry_round in range(1, max_retries + 1):
             if not failed_params:
                 break
             logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
 
-            # Give retried samples fresh indices AND roll BRAND NEW parameters
-            base = n + (retry_round - 1) * len(failed_params)
-            retry_batch = [_sample_params(base + i, level, self.cfg, rng) for i in
-                           range(len(failed_params))]
+            # Fresh indices after the main batch, and BRAND NEW parameters
+            retry_batch = []
+            for i in range(len(failed_params)):
+                retry_batch.append(_sample_params(cursor + i, level, self.cfg, rng))
+            cursor += len(failed_params)
 
             still_failed: List[Dict[str, Any]] = []
             retry_chunks = [retry_batch[i: i + chunk_size] for i in
@@ -616,22 +667,106 @@ def _prompt_positive_int(label: str, default: int = 500) -> int:
         print("  Must be at least 1.")
 
 
+def _prompt_write_mode_vessel() -> bool:
+    """Return True to overwrite from index 0, False to append with new indices."""
+    while True:
+        raw = input("Write mode [1=append new files / 2=overwrite from vessel_0] [1]: ").strip()
+        if raw in ("", "1"):
+            return False
+        if raw == "2":
+            return True
+        print("  Enter 1 or 2.")
+
+
+def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Generate 2D vessel meshes (Gmsh) for Phase 1 tiers.")
+    p.add_argument("--tier", type=int, choices=(1, 2), default=None, help="Tier (use with --level and -n)")
+    p.add_argument("--level", type=int, choices=(0, 1), default=None, help="Geometry complexity (use with --tier and -n)")
+    p.add_argument(
+        "-n",
+        "--num-vessels",
+        type=int,
+        default=None,
+        metavar="N",
+        help="How many vessels to generate (use with --tier and --level)",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for reproducibility. Omit for a fresh random draw each run (default).",
+    )
+    p.add_argument("--num-workers", type=int, default=None, help="Worker processes (default: auto)")
+    p.add_argument("--chunk-size", type=int, default=None, help="Samples per worker chunk (default: auto)")
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Start vessel indices at 0. Default is to append after existing meshes.",
+    )
+    p.add_argument("--no-plot", action="store_true", help="Skip matplotlib preview of saved meshes")
+    return p
+
+
 if __name__ == "__main__":
     import multiprocessing as mp
+
     mp.freeze_support()
 
-    tier_n = _prompt_int_choice("Tier", (1, 2))
-    level = _prompt_int_choice("Level", (0, 1))
-    n_vessels = _prompt_positive_int("Number of vessels", 500)
-    tier = f"tier{tier_n}"
+    parser = _vessel_gen_arg_parser()
+    args = parser.parse_args()
 
-    vg = VesselGenerator(tier=tier)
-    vg.run_pipeline(n=n_vessels, level=level, seed=25, num_workers=8, chunk_size=1)
+    trio = (args.tier is not None, args.level is not None, args.num_vessels is not None)
+    if any(trio) and not all(trio):
+        parser.error("Provide --tier, --level, and -n/--num-vessels together for non-interactive mode.")
 
-    # Call visualization here
-    saved_indices = sorted(
-        int(p.stem.split("_")[-1])
-        for p in vg.output_dir.glob("vessel_*.msh")
-    )[:9]
-    if saved_indices:
-        vg.visualize_saved(saved_indices)
+    if all(trio):
+        tier = f"tier{args.tier}"
+        level = args.level
+        n_vessels = args.num_vessels
+        start_idx = 0 if args.overwrite else None
+    else:
+        tier_n = _prompt_int_choice("Tier", (1, 2))
+        level = _prompt_int_choice("Level", (0, 1))
+        tier = f"tier{tier_n}"
+
+        vg = VesselGenerator(tier=tier)
+        inv = summarize_vessel_mesh_inventory(vg.output_dir)
+        n_on_disk = int(inv["count"])
+        max_idx = int(inv["max_idx"])
+        index_span = max_idx + 1 if max_idx >= 0 else 0
+        unused_slots = index_span - n_on_disk if max_idx >= 0 else 0
+        print("\n--- Vessel mesh inventory ---")
+        print(f"  Output: {vg.output_dir}")
+        print(f"  Total number of tier vessels: {index_span}")
+        print(f"  Number of vessel meshes already generated: {n_on_disk}")
+        print(f"  Number of non-anchors remaining: {unused_slots}")
+        print()
+        overwrite = True if args.overwrite else _prompt_write_mode_vessel()
+        default_n = 50 if n_on_disk > 0 else 500
+        n_vessels = _prompt_positive_int("How many vessels to generate", default_n)
+        start_idx = 0 if overwrite else None
+
+    if all(trio):
+        vg = VesselGenerator(tier=tier)
+
+    if args.seed is not None:
+        logger.info("Using fixed RNG seed=%s", args.seed)
+    else:
+        logger.info("Using random RNG seed (each run draws a new cohort)")
+
+    vg.run_pipeline(
+        n=n_vessels,
+        level=level,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        chunk_size=args.chunk_size,
+        start_idx=start_idx,
+    )
+
+    if not args.no_plot:
+        saved_indices = sorted(
+            int(p.stem.split("_")[-1])
+            for p in vg.output_dir.glob("vessel_*.msh")
+        )[:9]
+        if saved_indices:
+            vg.visualize_saved(saved_indices)

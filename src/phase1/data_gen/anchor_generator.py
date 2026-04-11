@@ -1,11 +1,12 @@
 import logging
 import json
+import random
 import numpy as np
 import mph
 import meshio
 from pathlib import Path
 from tqdm import tqdm
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any, List
 from src.config import VesselConfig, PhysicsConfig
 from src.utils.paths import get_project_root
 from scipy.interpolate import NearestNDInterpolator
@@ -17,6 +18,78 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+
+def list_anchor_candidate_json_paths(
+    mesh_dir: Path,
+    output_dir: Path,
+    *,
+    include_existing_npz: bool = False,
+) -> List[Path]:
+    """Meshes eligible for anchor CFD: ``vessel_*.json`` with non-empty ``.nas`` and ``.msh``.
+
+    By default skips stems that already have ``.npz``. With ``include_existing_npz=True``,
+    those stems are included so runs can overwrite outputs.
+    """
+    mesh_dir = Path(mesh_dir)
+    output_dir = Path(output_dir)
+    candidates: List[Path] = []
+    if not mesh_dir.exists():
+        return candidates
+    for json_file in sorted(mesh_dir.glob("vessel_*.json")):
+        stem = json_file.stem
+        try:
+            int(stem.split("_")[1])
+        except (ValueError, IndexError):
+            continue
+        nas_file = mesh_dir / f"{stem}.nas"
+        msh_file = mesh_dir / f"{stem}.msh"
+        if not nas_file.exists() or nas_file.stat().st_size == 0:
+            continue
+        if not msh_file.exists():
+            continue
+        if (output_dir / f"{stem}.npz").exists() and not include_existing_npz:
+            continue
+        candidates.append(json_file)
+    return candidates
+
+
+def summarize_anchor_inventory(mesh_dir: Path, output_dir: Path) -> Dict[str, Any]:
+    """Count existing CFD outputs and meshes still missing ``.npz`` (compatible with incremental runs).
+
+    By default ``run_batch`` skips existing ``.npz``; use ``allow_overwrite=True`` to replace them.
+
+    ``candidate_pool_ready`` counts meshes with ``.msh`` beside ``.nas`` and no ``.npz`` yet.
+    ``candidate_pool_including_npz`` is the same but includes stems that already have ``.npz``.
+    """
+    mesh_dir = Path(mesh_dir)
+    output_dir = Path(output_dir)
+    existing_npz = 0
+    if output_dir.exists():
+        existing_npz = len(list(output_dir.glob("vessel_*.npz")))
+    json_files = sorted(mesh_dir.glob("vessel_*.json")) if mesh_dir.exists() else []
+    mesh_with_nas = 0
+    pending_missing_npz = 0
+    for json_file in json_files:
+        stem = json_file.stem
+        nas_file = mesh_dir / f"{stem}.nas"
+        out_file = output_dir / f"{stem}.npz"
+        if not nas_file.exists() or nas_file.stat().st_size == 0:
+            continue
+        mesh_with_nas += 1
+        if not out_file.exists():
+            pending_missing_npz += 1
+    return {
+        "existing_npz": existing_npz,
+        "mesh_json_with_valid_nas": mesh_with_nas,
+        "pending_missing_npz": pending_missing_npz,
+        "candidate_pool_ready": len(
+            list_anchor_candidate_json_paths(mesh_dir, output_dir, include_existing_npz=False)
+        ),
+        "candidate_pool_including_npz": len(
+            list_anchor_candidate_json_paths(mesh_dir, output_dir, include_existing_npz=True)
+        ),
+    }
 
 
 def _get_import_feature_tag(mesh_j) -> str:
@@ -144,197 +217,251 @@ class AnchorGenerator:
             except Exception:
                 pass
 
-    def run_batch(self, max_anchors: int = 500):
+    def _process_single_anchor(
+        self, json_file: Path, mesh_j, import_tag, *, allow_overwrite: bool = False
+    ) -> bool:
+        """Run COMSOL for one vessel; write ``.npz`` if field checks pass. Returns True if saved."""
+        file_stem = json_file.stem
+        try:
+            i = int(file_stem.split("_")[1])
+        except (ValueError, TypeError, IndexError):
+            return False
+
+        nas_file = self.mesh_dir / f"{file_stem}.nas"
+        msh_file = self.mesh_dir / f"{file_stem}.msh"
+        out_file = self.output_dir / f"{file_stem}.npz"
+
+        if not nas_file.exists() or nas_file.stat().st_size == 0:
+            return False
+        if out_file.exists() and not allow_overwrite:
+            return False
+
+        try:
+            logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
+            for tag in self.model.java.sol().tags():
+                self.model.java.sol(tag).clearSolutionData()
+
+            with open(json_file, "r") as f:
+                meta = json.load(f)
+                d_bar = meta["d_bar"]
+
+            self.model.parameter("D_eff", f"{d_bar:.8f} [m]")
+            u_ref = self.phys_cfg.get_u_ref(d_bar)
+            self.model.parameter("U_inlet", f"{u_ref:.8f} [m/s]")
+
+            feat = mesh_j.feature(import_tag)
+            safe_nas_path = str(nas_file).replace("\\", "/")
+            feat.set("filename", safe_nas_path)
+
+            mesh_j.run()
+            try:
+                n_verts = mesh_j.getNumVertex()
+                logger.info(f"Sample {i}: Loaded Mesh with {n_verts} vertices.")
+                if n_verts < 10:
+                    raise RuntimeError(f"Mesh {i} is empty/corrupt (Vertices: {n_verts})")
+            except Exception as e:
+                logger.warning(f"Could not verify mesh stats for {i}: {e}")
+
+            self.model.solve()
+
+            mesh = meshio.read(msh_file)
+            target_nodes = mesh.points[:, :2]
+
+            u, v, p, mu = self._evaluate_at_coords(target_nodes)
+            u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
+
+            def fix_boundary_nans(field, coords):
+                mask = np.isnan(field)
+                if mask.any() and not mask.all():
+                    interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
+                    field[mask] = interpolator(coords[mask])
+                return field
+
+            u = fix_boundary_nans(u, target_nodes)
+            v = fix_boundary_nans(v, target_nodes)
+            p = fix_boundary_nans(p, target_nodes)
+            mu = fix_boundary_nans(mu, target_nodes)
+
+            try:
+                line_cells = mesh.get_cells_type("line")
+                line_tags = mesh.get_cell_data("gmsh:physical", "line")
+                has_lines = len(line_cells) > 0
+            except Exception:
+                has_lines = False
+
+            if has_lines:
+                outlet_node_indices = []
+                outlet_tags = [
+                    tag_id for name, tag_id in self.vessel_config.TAGS.items()
+                    if "Outlet" in name
+                ]
+                for j, tag in enumerate(line_tags):
+                    if tag in outlet_tags:
+                        outlet_node_indices.extend(line_cells[j])
+                if outlet_node_indices:
+                    unique_indices = np.unique(outlet_node_indices)
+                    valid_indices = unique_indices[unique_indices < len(p)]
+                    if len(valid_indices) > 0:
+                        p_offset = np.mean(p[valid_indices])
+                        p = p - p_offset
+
+            nan_u = np.isnan(u).sum()
+            nan_v = np.isnan(v).sum()
+            nan_p = np.isnan(p).sum()
+            nan_mu = np.isnan(mu).sum()
+            total_nodes = len(u)
+
+            if nan_u > 0 or nan_v > 0 or nan_p > 0 or nan_mu > 0:
+                logger.warning(
+                    f"NaNs detected in {nas_file.name} | Total Nodes: {total_nodes} | "
+                    f"NaN counts -> u: {nan_u}, v: {nan_v}, p: {nan_p}, mu: {nan_mu}"
+                )
+                if nan_u == total_nodes:
+                    logger.error(
+                        f"[{i}] FATAL: 100% of nodes are NaN. (Solver diverged or coordinate shape mismatch)"
+                    )
+                else:
+                    pct_failed = (nan_u / total_nodes) * 100
+                    logger.warning(
+                        f"[{i}] BOUNDARY ISSUE: {pct_failed:.2f}% of nodes are NaN. "
+                        "COMSOL thinks these nodes are outside the mesh."
+                    )
+                return False
+
+            p_std = np.std(p)
+            u_max = np.max(np.abs(u))
+            if p_std < 1e-9 or u_max < 1e-7:
+                logger.warning(
+                    f"[{i}] Skipping: Trivial solution detected (P_std: {p_std:.2e}, U_max: {u_max:.2e})"
+                )
+                return False
+
+            np.savez(
+                out_file,
+                x=target_nodes[:, 0],
+                y=target_nodes[:, 1],
+                u=u,
+                v=v,
+                p=p,
+                mu=mu,
+                d_bar=d_bar,
+                config_id=i,
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Error on {i}: {e}")
+            logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
+            for tag in self.model.java.sol().tags():
+                self.model.java.sol(tag).clearSolutionData()
+            return False
+
+    def run_batch(
+        self,
+        max_new: int = 500,
+        max_json_to_scan: Optional[int] = None,
+        shuffle_candidates: bool = False,
+        shuffle_seed: Optional[int] = None,
+        allow_overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Write up to ``max_new`` new healthy ``vessel_*.npz`` files.
+
+        Builds the pool of geometries (valid ``.nas`` + ``.msh``). By default only stems without
+        ``.npz`` are eligible; with ``allow_overwrite=True``, existing ``.npz`` files may be replaced.
+        Then walks that pool until enough saves succeed or the pool is exhausted. Failed solves (NaNs,
+        trivial flow, exceptions) do not count toward ``max_new``; the loop continues with the next
+        candidate.
+
+        Parameters
+        ----------
+        max_new
+            Target number of new ``.npz`` files to write this run.
+        max_json_to_scan
+            Optional cap on how many **candidates** to attempt (after building the pool). ``None`` = try
+            every candidate. Prefer a large pool of meshes or leave unset so failures can be offset by
+            later indices (the old behavior truncated the global sorted list *before* filtering, which
+            could hide viable vessels).
+        shuffle_candidates
+            If True, randomize candidate order (e.g. spread load across geometry types).
+        shuffle_seed
+            Seed for shuffling; only used when ``shuffle_candidates`` is True.
+        allow_overwrite
+            If True, include stems that already have ``.npz`` and replace files after a successful solve.
+        """
         if not self.model:
             raise RuntimeError("Model not loaded.")
 
-        logger.info(f"Batch processing up to {max_anchors} anchors.")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        existing_npz = len(list(self.output_dir.glob("vessel_*.npz")))
+        candidates = list_anchor_candidate_json_paths(
+            self.mesh_dir, self.output_dir, include_existing_npz=allow_overwrite
+        )
+        pool_full = len(candidates)
+
+        if shuffle_candidates:
+            rng = random.Random(shuffle_seed)
+            rng.shuffle(candidates)
+
+        if max_json_to_scan is not None:
+            candidates = candidates[: int(max_json_to_scan)]
+
+        logger.info(
+            f"Anchor batch: existing .npz={existing_npz}, target new successes={max_new}, "
+            f"candidate pool (no .npz, has .nas+.msh)={pool_full}, "
+            f"will attempt min(len(pool), cap)={len(candidates)} geometries."
+        )
 
         try:
-            mesh_j = self.model.java.component('comp1').mesh('mesh1')
+            mesh_j = self.model.java.component("comp1").mesh("mesh1")
             import_tag = _get_import_feature_tag(mesh_j)
         except Exception as e:
             logger.critical(f"Setup failed: {e}")
-            return
+            return {
+                "existing_before": existing_npz,
+                "requested_new": max_new,
+                "new_written": 0,
+                "attempted": 0,
+                "pool_full": pool_full,
+                "pool_attempted": len(candidates),
+                "pool_exhausted": True,
+                "setup_failed": True,
+            }
 
-        # Dynamically find all JSON/NAS pairs to account for retry index gaps
-        # (e.g., vessel_2 might be missing, but vessel_502 exists from a retry)
-        json_files = sorted(self.mesh_dir.glob("vessel_*.json"))
+        new_written = 0
+        attempted = 0
+        for json_file in tqdm(candidates, desc="Anchors"):
+            if new_written >= max_new:
+                break
+            attempted += 1
+            if self._process_single_anchor(
+                json_file, mesh_j, import_tag, allow_overwrite=allow_overwrite
+            ):
+                new_written += 1
 
-        for json_file in tqdm(json_files[:max_anchors], desc="Processing"):
-            file_stem = json_file.stem  # e.g., 'vessel_52'
-
-            # Extract the integer ID for logging/metadata
-            try:
-                i = int(file_stem.split('_')[1])
-            except (ValueError, TypeError, IndexError):
-                continue
-
-            nas_file = self.mesh_dir / f"{file_stem}.nas"
-            msh_file = self.mesh_dir / f"{file_stem}.msh"
-            out_file = self.output_dir / f"{file_stem}.npz"
-
-            if not nas_file.exists():
-                continue
-
-            # Skip empty files which cause Solver/Import crashes
-            if nas_file.stat().st_size == 0:
-                logger.warning(f"Skipping empty mesh file: {nas_file}")
-                continue
-
-            if out_file.exists():
-                continue
-
-            try:
-                # Guarantee that if the solve fails silently, we get an empty dataset
-                # rather than recycling the previous vessel's physics.
-                logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
-                for tag in self.model.java.sol().tags():
-                    self.model.java.sol(tag).clearSolutionData()
-
-                with open(json_file, 'r') as f:
-                    meta = json.load(f)
-                    d_bar = meta['d_bar']
-
-                self.model.parameter('D_eff', f'{d_bar:.8f} [m]')
-
-                # Use centralized reference viscosity
-                u_ref = self.phys_cfg.get_u_ref(d_bar)
-
-                self.model.parameter('U_inlet', f'{u_ref:.8f} [m/s]')
-
-                feat = mesh_j.feature(import_tag)
-                safe_nas_path = str(nas_file).replace("\\", "/")
-                feat.set('filename', safe_nas_path)
-
-                # Rebuild mesh and Solve
-                mesh_j.run()
-                # --- VERIFICATION BLOCK ---
-                try:
-                    # Get vertex count (Java integer)
-                    n_verts = mesh_j.getNumVertex()
-
-                    # 1. Log it so you can see it changing in the terminal
-                    logger.info(f"Sample {i}: Loaded Mesh with {n_verts} vertices.")
-
-                    # 2. Safety Check: If it's too small, the import probably failed
-                    if n_verts < 10:
-                        raise RuntimeError(f"Mesh {i} is empty/corrupt (Vertices: {n_verts})")
-
-                except Exception as e:
-                    # If the specific API call fails (version mismatch), just warn and continue
-                    logger.warning(f"Could not verify mesh stats for {i}: {e}")
-                # --------------------------
-
-                self.model.solve()
-
-                # --- Extraction & Pinning ---
-                mesh = meshio.read(msh_file)
-                target_nodes = mesh.points[:, :2]
-
-                u, v, p, mu = self._evaluate_at_coords(target_nodes)
-
-                # Flatten arrays to 1D (fixes shape mismatch bugs)
-                u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
-
-                # --- Handle Boundary NaNs ---
-                def fix_boundary_nans(field, coords):
-                    mask = np.isnan(field)
-                    if mask.any() and not mask.all():
-                        # Find the nearest valid neighbor and copy its value
-                        interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
-                        field[mask] = interpolator(coords[mask])
-                    return field
-
-                u = fix_boundary_nans(u, target_nodes)
-                v = fix_boundary_nans(v, target_nodes)
-                p = fix_boundary_nans(p, target_nodes)
-                mu = fix_boundary_nans(mu, target_nodes)
-                # ----------------------------
-
-                # Meshio Access
-                try:
-                    line_cells = mesh.get_cells_type("line")  # Returns (N, 2)
-                    line_tags = mesh.get_cell_data("gmsh:physical", "line")  # Returns (N,)
-
-                    has_lines = len(line_cells) > 0
-                except Exception:
-                    has_lines = False
-
-                if has_lines:
-                    outlet_node_indices = []
-                    # Dynamically fetch tags for any 'Outlet' defined in config
-                    outlet_tags = [
-                        tag_id for name, tag_id in self.vessel_config.TAGS.items()
-                        if "Outlet" in name
-                    ]
-
-                    for j, tag in enumerate(line_tags):
-                        if tag in outlet_tags:
-                            # line_cells[j] contains the vertex indices for that line segment
-                            outlet_node_indices.extend(line_cells[j])
-
-                    if outlet_node_indices:
-                        unique_indices = np.unique(outlet_node_indices)
-                        # Ensure indices are within the bounds of the pressure array
-                        valid_indices = unique_indices[unique_indices < len(p)]
-                        if len(valid_indices) > 0:
-                            # Pinning: Subtract mean outlet pressure to set relative gauge pressure
-                            p_offset = np.mean(p[valid_indices])
-                            p = p - p_offset
-                    # ---------------------------------
-
-                    # --- DEBUGGING BLOCK ---
-                nan_u = np.isnan(u).sum()
-                nan_v = np.isnan(v).sum()
-                nan_p = np.isnan(p).sum()
-                nan_mu = np.isnan(mu).sum()
-                total_nodes = len(u)
-
-                if nan_u > 0 or nan_v > 0 or nan_p > 0 or nan_mu > 0:
-                    logger.warning(
-                        f"NaNs detected in {nas_file.name} | Total Nodes: {total_nodes} | "
-                        f"NaN counts -> u: {nan_u}, v: {nan_v}, p: {nan_p}, mu: {nan_mu}"
-                    )
-
-                    if nan_u == total_nodes:
-                        logger.error(
-                            f"[{i}] FATAL: 100% of nodes are NaN. (Solver diverged or coordinate shape mismatch)")
-                    else:
-                        pct_failed = (nan_u / total_nodes) * 100
-                        logger.warning(
-                            f"[{i}] BOUNDARY ISSUE: {pct_failed:.2f}% of nodes are NaN. COMSOL thinks these nodes are outside the mesh.")
-
-                    continue  # Still skip saving so we don't write garbage data
-                # -----------------------
-
-                # --- FINAL NUMERICAL SANITY CHECK ---
-                # Ensure the pressure field isn't flat (trivial solution)
-                # and velocities are within a physical order of magnitude
-                p_std = np.std(p)
-                u_max = np.max(np.abs(u))
-
-                if p_std < 1e-9 or u_max < 1e-7:
-                    logger.warning(
-                        f"[{i}] Skipping: Trivial solution detected (P_std: {p_std:.2e}, U_max: {u_max:.2e})")
-                    continue
-                # ------------------------------------
-
-                np.savez(
-                    out_file,
-                    x=target_nodes[:, 0], y=target_nodes[:, 1],
-                    u=u, v=v, p=p, mu=mu,
-                    d_bar=d_bar,
-                    config_id=i
+        pool_exhausted = new_written < max_new and attempted >= len(candidates)
+        if new_written < max_new:
+            logger.warning(
+                f"Anchor batch finished short: wrote {new_written}/{max_new} new .npz "
+                f"after {attempted} attempt(s). "
+                + (
+                    "Candidate pool exhausted — generate more vessel meshes for this tier, then re-run."
+                    if pool_exhausted
+                    else "Raise max_json_to_scan (or leave it unset) to try more existing geometries."
                 )
+            )
+        else:
+            logger.info(f"Anchor batch: wrote {new_written} new .npz (target was {max_new}).")
 
-            except Exception as e:
-                logger.error(f"Error on {i}: {e}")
-                # Clear model results to save memory if solve failed
-                logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
-                for tag in self.model.java.sol().tags():
-                    self.model.java.sol(tag).clearSolutionData()
-                continue
+        return {
+            "existing_before": existing_npz,
+            "requested_new": max_new,
+            "new_written": new_written,
+            "attempted": attempted,
+            "pool_full": pool_full,
+            "pool_attempted": len(candidates),
+            "pool_exhausted": pool_exhausted,
+            "setup_failed": False,
+        }
 
 
 def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
@@ -360,15 +487,69 @@ if __name__ == "__main__":
                 if raw == "":
                     return int(default)
                 try:
-                    return int(raw)
+                    v = int(raw)
+                    if v < 0:
+                        print("Enter a non-negative integer.")
+                        continue
+                    return v
                 except ValueError:
                     print("Invalid input. Enter an integer value.")
 
+        def _prompt_write_mode() -> bool:
+            """Return True if overwrite mode, False for add-only."""
+            while True:
+                raw = input("Write mode [1=add new files only / 2=overwrite existing .npz] [1]: ").strip()
+                if raw in ("", "1"):
+                    return False
+                if raw == "2":
+                    return True
+                print("  Enter 1 or 2.")
+
         tier_n = _prompt_int_choice("Tier", (1, 2))
         tier = f"tier{tier_n}"
-        max_anchors = _prompt_int("Number of anchors", 50)
-        generator = AnchorGenerator(tier=tier)
-        with generator:
-            generator.run_batch(max_anchors=max_anchors)
+        gen = AnchorGenerator(tier=tier)
+        inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
+        total_v = int(inv["mesh_json_with_valid_nas"])
+        have_npz = int(inv["existing_npz"])
+        remaining = int(inv["pending_missing_npz"])
+        ready_add = int(inv["candidate_pool_ready"])
+        ready_all = int(inv["candidate_pool_including_npz"])
+        print("\n--- Anchor CFD inventory ---")
+        print(f"  Output: {gen.output_dir}")
+        print(f"  Mesh:   {gen.mesh_dir}")
+        print(f"  Total number of tier vessels: {total_v}")
+        print(f"  Number of anchors already generated: {have_npz}")
+        print(f"  Number of non-anchors remaining: {remaining}")
+        if remaining > ready_add:
+            print(
+                f"  ({remaining - ready_add} of those still need a .msh export before CFD.)"
+            )
+        print()
+        allow_overwrite = _prompt_write_mode()
+        pool = ready_all if allow_overwrite else ready_add
+        default_more = min(pool, 50) if pool > 0 else 0
+        if pool == 0:
+            if allow_overwrite:
+                print("No meshes are CFD-ready (need .json + non-empty .nas + .msh).")
+            else:
+                msg = "Nothing to add (need .json + non-empty .nas + .msh, and no .npz yet)."
+                if remaining > 0:
+                    msg += " Some meshes lack .msh — re-run mesh export for those vessels."
+                elif total_v == 0:
+                    msg = "No vessel meshes found in the mesh directory."
+                print(msg)
+            raise SystemExit(0)
+        mode_note = "CFD runs to attempt" if allow_overwrite else "new CFD samples to generate"
+        asked = _prompt_int(f"How many {mode_note}", default_more)
+        if asked == 0:
+            print("Exiting (0 requested).")
+            raise SystemExit(0)
+        max_new = min(asked, pool)
+        if asked > pool:
+            print(f"Requested {asked} but only {pool} mesh(es) match this mode; running {max_new}.")
+        with gen:
+            gen.run_batch(max_new=max_new, allow_overwrite=allow_overwrite)
+    except SystemExit:
+        raise
     except Exception as e:
         print(e)

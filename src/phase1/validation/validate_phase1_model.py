@@ -66,7 +66,7 @@ class ModelValidator:
             c_u = self.kernels._compute_derivatives(pred_opt[:, 0:1], props)
             c_v = self.kernels._compute_derivatives(pred_opt[:, 1:2], props)
             du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
-            l_cont = self.kernels.continuity_loss(du_ij)
+            l_cont = self.kernels.continuity_loss(du_ij, data=data)
 
             l_bc = self.kernels.boundary_condition_loss(pred_opt, data)
             l_io = self.kernels.inlet_outlet_loss(pred_opt, data)

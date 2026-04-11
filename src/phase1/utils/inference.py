@@ -34,7 +34,7 @@ def predict_with_physics_correction(model, data, kernels, correction_steps=25, l
         c_u = kernels._compute_derivatives(pred_opt[:, 0:1], props)
         c_v = kernels._compute_derivatives(pred_opt[:, 1:2], props)
         du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
-        l_cont = kernels.continuity_loss(du_ij)
+        l_cont = kernels.continuity_loss(du_ij, data=data)
 
         # Boundary Conditions
         l_bc = kernels.boundary_condition_loss(pred_opt, data)

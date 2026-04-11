@@ -5,6 +5,12 @@ Project Reality
 - The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
 - Large binary and generated artifacts exist in `data/`, `models/`, `reports/`, and `comsol_models/`; do not treat them as source code.
 
+Tier Definitions (authoritative)
+- Tier 1 (`src/phase1/train_tier1.py`): Newtonian hemodynamics baseline only.
+- Tier 2 (`src/phase1/train_tier2.py`): adds non-Newtonian rheology (Carreau-Yasuda style behavior).
+- Tier 3 (`src/phase2/train_tier3.py`): adds biochemical clot dynamics/coupling on top of flow backbone.
+- Do not assume Tier 3 is the primary stage for kinematic gains; major velocity quality should come from Tier 1/2.
+
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
 - Keep phase boundaries clear: Tier 1/2 logic stays in `phase1`; Tier 3 + COMSOL integration stays in `phase2`.

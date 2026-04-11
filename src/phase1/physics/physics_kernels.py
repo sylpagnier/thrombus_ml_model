@@ -99,6 +99,19 @@ class PhysicsKernels:
         else:
             return c[:, 0:2, :].reshape(-1, 2 * C)
 
+    def fluid_interior_mask(self, data) -> torch.Tensor:
+        """Boolean mask of nodes where steady NS momentum and ∇·u penalties are evaluated.
+
+        Excludes **wall**, **inlet**, and **outlet** nodes. Boundary conditions are enforced
+        via separate losses; WLS derivatives are least reliable on tagged boundaries, so bulk
+        collocation matches common PINN / physics-informed practice and aligns momentum with
+        continuity in training.
+        """
+        mask_wall_1d = data.mask_wall.view(-1).bool()
+        mask_inlet_1d = data.mask_inlet.view(-1).bool()
+        mask_outlet_1d = data.mask_outlet.view(-1).bool()
+        return ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
+
     def navier_stokes_residual(self, pred, data, props=None, re_ref: Optional[float] = None):
         if props is None:
             if hasattr(data, 'M_inv'):
@@ -166,12 +179,7 @@ class PhysicsKernels:
         mom_x = (u * u_x + v * u_y) + p_x - visc_x
         mom_y = (u * v_x + v * v_y) + p_y - visc_y
 
-        # Standard PINN procedure: evaluate PDE strictly on interior nodes
-        mask_wall_1d = data.mask_wall.view(-1).bool()
-        mask_inlet_1d = data.mask_inlet.view(-1).bool()
-        mask_outlet_1d = data.mask_outlet.view(-1).bool()
-
-        interior_mask = ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
+        interior_mask = self.fluid_interior_mask(data)
 
         if interior_mask.any():
             loss_mom = torch.mean(mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
@@ -181,19 +189,34 @@ class PhysicsKernels:
         # Return ONLY momentum. Continuity is handled by the dedicated continuity_loss method.
         return loss_mom
 
-    def continuity_loss(self, du_ij):
+    def continuity_loss(
+        self,
+        du_ij: torch.Tensor,
+        data=None,
+        interior_mask: Optional[torch.Tensor] = None,
+    ):
         """
-        Strictly penalizes mass creation/destruction.
-        du_ij: [du_dx, du_dy, dv_dx, dv_dy]
+        Mean squared divergence (∇·u)².
+
+        When ``data`` is provided (or ``interior_mask`` is passed), averages only over
+        :meth:`fluid_interior_mask` so continuity matches the momentum residual domain.
+        If neither is given, averages over all rows of ``du_ij`` (synthetic / unit tests).
         """
         du_dx = du_ij[:, 0]
         dv_dy = du_ij[:, 3]
 
-        # Divergence of velocity field
         div_u = du_dx + dv_dy
 
-        # L2 norm of the divergence
-        return torch.mean(div_u ** 2)
+        if interior_mask is not None:
+            m = interior_mask.view(-1).bool()
+        elif data is not None:
+            m = self.fluid_interior_mask(data)
+        else:
+            return torch.mean(div_u**2)
+
+        if m.any():
+            return torch.mean(div_u[m] ** 2)
+        return div_u.sum() * 0.0
 
     def _compute_carreau_viscosity(self, du_ij, data, carreau_n: Optional[float] = None):
         """
@@ -355,6 +378,14 @@ class PhysicsKernels:
 
 
     def inlet_outlet_loss(self, pred, data):
+        """Soft inlet/outlet alignment with COMSOL-style BCs.
+
+        **Outlet:** COMSOL uses fixed **pressure = 0** (gauge) on the outlet; labels use the
+        same ``p`` scaling as :meth:`PhysicsConfig.get_p_ref`, so we penalize ``p²`` on outlet
+        nodes to match that BC.
+
+        **Inlet:** velocity (and Carreau ``μ`` when present) vs stored BC targets on inlet nodes.
+        """
         u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
         device = pred.device # Get active device
 

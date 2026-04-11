@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 import math
@@ -102,6 +103,7 @@ from src.config import (
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import WeightedRandomSampler
 from src.phase1.utils.metrics import DynamicLossWeighter
+from src.phase1.utils.training_diary import TrainingDiary, env_snapshot
 
 
 def _ease01(t: float, easing: str) -> float:
@@ -1690,11 +1692,71 @@ def train_tier3(epochs=25, lr=1e-3):
     dice_ema_beta = float(os.environ.get("TIER3_VAL_DICE_EMA", "0.25"))
     ckpt_pearson_w = float(os.environ.get("TIER3_CKPT_PEARSON_WEIGHT", "0.02"))
 
+    cfg_paths = VesselConfig(tier="tier3")
+    diary = TrainingDiary("tier3")
+    diary.log_run_start(
+        device=str(device),
+        re_target=float(phys_cfg.re_target),
+        graph_dir=str(cfg_paths.graph_output_dir),
+        n_graphs_total=len(dataset),
+        n_files_indexed=len(all_files),
+        n_anchors_total=int(n_anchors_total),
+        n_train_graphs=len(train_data),
+        n_val_graphs=len(val_data),
+        n_train_anchors=len(train_anchors),
+        n_val_anchors=len(val_anchors),
+        n_train_physics=len(train_physics),
+        n_val_physics=len(val_physics),
+        low_anchor_mode=bool(low_anchor_mode),
+        metrics_trustworthy=bool(metrics_trustworthy),
+        accumulation_steps=int(accumulation_steps),
+        epochs=int(epochs),
+        lr=float(lr),
+        start_epoch=int(start_epoch),
+        best_composite_checkpoint=float(best_composite),
+        dice_ema_checkpoint=float(dice_ema) if dice_ema is not None else None,
+        teacher_best_dice=float(teacher_best_dice),
+        pseudo_w=float(pseudo_w),
+        pseudo_bank_size=len(pseudo_bank),
+        tier3_warmup_epochs=int(curriculum.tier3_warmup_epochs),
+        dice_ema_beta=float(dice_ema_beta),
+        ckpt_pearson_weight=float(ckpt_pearson_w),
+        resume_enabled=bool(resume_enabled),
+        resumed_latest_checkpoint=bool(resume_enabled and latest_ckpt_path.exists()),
+        ckpt_every=int(ckpt_every),
+        env_tier3_phase1=env_snapshot("TIER3_", "PHASE1_"),
+    )
+
+    run_end_emitted = False
+    last_epoch_completed: Optional[int] = None
+
+    def _emit_tier3_run_end(interrupted: bool = False) -> None:
+        nonlocal run_end_emitted
+        if run_end_emitted or not diary.enabled:
+            return
+        run_end_emitted = True
+        if interrupted:
+            print("\n⚠️ Training interrupted; appending training diary run_end (JSONL report).")
+        diary.log_run_end(
+            best_composite=float(best_composite),
+            teacher_best_dice=float(teacher_best_dice),
+            pseudo_w=float(pseudo_w),
+            dice_ema=float(dice_ema) if dice_ema is not None else None,
+            diary_path=str(diary.path) if diary.path else None,
+            tier3_best_bio=str(model_dir / "tier3_best_bio.pth"),
+            tier3_latest_checkpoint=str(latest_ckpt_path),
+            interrupted=bool(interrupted),
+            last_epoch_completed=last_epoch_completed,
+        )
+
+    atexit.register(lambda: _emit_tier3_run_end(True))
+
     print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
     watchdog_sec = float(os.environ.get("TIER3_BATCH_WATCHDOG_SEC", "300"))
 
     for epoch in range(start_epoch, epochs):
+        last_epoch_completed = epoch
         wu = curriculum.tier3_warmup_epochs
 
         ease = curriculum.tier3_curriculum_easing
@@ -1901,6 +1963,8 @@ def train_tier3(epochs=25, lr=1e-3):
                     "despite PDE_Steps>0 — check TBPTT windows / synthetic batches."
                 )
 
+        train_loss_mean = float(total_loss_epoch) / max(float(total_batches), 1.0)
+
         # Validation & Metrics
         val_log: Optional[Dict[str, Any]] = None
         if epoch % 2 == 0:
@@ -1921,6 +1985,16 @@ def train_tier3(epochs=25, lr=1e-3):
                     f"W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f} | Bio_IO: {weights[4]:.2f} | "
                     f"NS_mom: {weights[5]:.2f} | Data_Kine: {weights[6]:.2f} | Data_Bio: {weights[7]:.2f}"
                 )
+                learned_w = {
+                    "w_ADR_F": float(weights[0].item()),
+                    "w_ADR_S": float(weights[1].item()),
+                    "w_W_Bio": float(weights[2].item()),
+                    "w_W_Phys": float(weights[3].item()),
+                    "w_Bio_IO": float(weights[4].item()),
+                    "w_NS_mom": float(weights[5].item()),
+                    "w_Data_Kine": float(weights[6].item()),
+                    "w_Data_Bio": float(weights[7].item()),
+                }
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
@@ -1996,8 +2070,24 @@ def train_tier3(epochs=25, lr=1e-3):
                 "val_synth_dice": val_synth_dice_sum / max(n_val_synth, 1) if n_val_synth else None,
                 "metrics_trustworthy": metrics_trustworthy,
             }
+            diary.log_validation(epoch, val_log, **learned_w)
 
-        train_loss_mean = total_loss_epoch / max(total_batches, 1)
+        diary.log_epoch_end(
+            epoch,
+            train_loss_mean=float(train_loss_mean),
+            lr=float(optimizer.param_groups[0]["lr"]),
+            mu_ratio=float(current_mu_ratio),
+            T_scale=float(current_T_scale),
+            teacher_forcing_ratio=float(teacher_forcing_ratio),
+            best_composite_so_far=float(best_composite),
+            dice_ema=float(dice_ema) if dice_ema is not None else None,
+            total_batches=int(total_batches),
+            anchor_supervised_batches=int(anchor_supervised_batches),
+            pseudo_supervised_batches=int(pseudo_supervised_batches),
+            low_anchor_mode=bool(low_anchor_mode),
+            pseudo_w=float(pseudo_w),
+            teacher_best_dice=float(teacher_best_dice),
+        )
         log_row: Dict[str, Any] = {
             "epoch": int(epoch),
             "train_loss_mean_microbatch": float(train_loss_mean),
@@ -2025,6 +2115,8 @@ def train_tier3(epochs=25, lr=1e-3):
             }
             torch.save(checkpoint, latest_ckpt_path)
             print(f"💾 Saved Tier 3 checkpoint -> {latest_ckpt_path.name} (every {ckpt_every} epoch(s))")
+
+    _emit_tier3_run_end(interrupted=False)
 
 
 if __name__ == "__main__":

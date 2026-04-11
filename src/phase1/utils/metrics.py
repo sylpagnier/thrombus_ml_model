@@ -6,9 +6,21 @@ from matplotlib.colors import LogNorm
 from pathlib import Path
 from torch_geometric.data import Batch
 import torch.nn as nn
-from typing import Optional, Sequence, Union, List
+from typing import Optional, Sequence, Union, List, Dict, Any
 
 Number = Union[int, float]
+
+
+def _list_mean(vals: List[float]) -> float:
+    return float(np.mean(vals)) if len(vals) > 0 else float("nan")
+
+
+def _list_dispersion(vals: List[float]) -> tuple:
+    """Return (std, 90th percentile) for a list of per-batch scalars."""
+    if len(vals) == 0:
+        return float("nan"), float("nan")
+    a = np.asarray(vals, dtype=np.float64)
+    return float(np.std(a)), float(np.percentile(a, 90))
 
 
 class DynamicLossWeighter(nn.Module):
@@ -136,71 +148,130 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     plt.close()
 
 
-def quantify_performance(model, val_loader, kernels, device, tier="tier1"):
+def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Dict[str, Any]:
+    """Aggregate validation metrics over ``val_loader``.
+
+    **Rel L2** (and component breakdowns, shear, μ errors) are computed only on batches
+    that contain at least one anchor node with CFD labels; physics-only graphs have no
+    ground-truth ``y`` and are skipped for those terms. **Continuity** (mean ``|∇·u|``) is
+    averaged on the same **fluid interior** mask as training (excludes wall, inlet,
+    outlet). Rheology uses the full batch; wall slip uses wall nodes when present.
+    """
     model.eval()
 
-    # Initialize metric trackers dynamically
-    metrics = {"rel_l2": [], "continuity": [], "wall_slip": [], "shear_mse": []}
+    metrics: Dict[str, List[float]] = {
+        "rel_l2": [],
+        "rel_l2_u": [],
+        "rel_l2_v": [],
+        "rel_l2_p": [],
+        "continuity": [],
+        "wall_slip": [],
+        "shear_mse": [],
+    }
     if tier == "tier2":
         metrics.update({"rheology": [], "mu_mae": [], "mu_log_mse": []})
 
+    val_total_batches = 0
+    val_anchor_batches = 0
+
     with torch.no_grad():
         for data in val_loader:
+            val_total_batches += 1
             data = data.to(device)
             pred = model(data, solver="anderson", anderson_beta=0.8)
             props = kernels._get_geometric_props(data)
 
             # Resolve node mask safely for batched or unbatched data
-            if hasattr(data, 'is_anchor'):
-                node_mask = data.is_anchor[data.batch] if hasattr(data,
-                                                                  'batch') and data.batch is not None else data.is_anchor
+            if hasattr(data, "is_anchor"):
+                node_mask = (
+                    data.is_anchor[data.batch]
+                    if hasattr(data, "batch") and data.batch is not None
+                    else data.is_anchor
+                )
 
                 if node_mask.any():
-                    # 1. Kinematic Error (u, v, p) only
-                    diff_norm = torch.norm(pred[node_mask, :3] - data.y[node_mask, :3], p=2)
-                    target_norm = torch.norm(data.y[node_mask, :3], p=2)
+                    val_anchor_batches += 1
+                    y_a = data.y[node_mask, :3]
+                    p_a = pred[node_mask, :3]
+                    diff_norm = torch.norm(p_a - y_a, p=2)
+                    target_norm = torch.norm(y_a, p=2)
                     metrics["rel_l2"].append((diff_norm / (target_norm + 1e-8)).item())
+                    for j, key in enumerate(("rel_l2_u", "rel_l2_v", "rel_l2_p")):
+                        num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
+                        den = torch.norm(y_a[:, j], p=2) + 1e-8
+                        metrics[key].append((num / den).item())
 
-                    # 2. Explicit Shear Error
+                    # Explicit shear-rate MSE (anchors only; needs labeled fields)
                     u_t, v_t = data.y[:, 0:1], data.y[:, 1:2]
                     c_u_t, c_v_t = kernels._compute_derivatives(u_t, props), kernels._compute_derivatives(v_t, props)
-                    g_dot_t = torch.sqrt(2 * c_u_t[:, 0, 0] ** 2 + 2 * c_v_t[:, 1, 0] ** 2 + (
-                            c_u_t[:, 1, 0] + c_v_t[:, 0, 0]) ** 2 + 1e-8)
+                    g_dot_t = torch.sqrt(
+                        2 * c_u_t[:, 0, 0] ** 2
+                        + 2 * c_v_t[:, 1, 0] ** 2
+                        + (c_u_t[:, 1, 0] + c_v_t[:, 0, 0]) ** 2
+                        + 1e-8
+                    )
 
                     u_p, v_p = pred[:, 0:1], pred[:, 1:2]
                     c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
-                    g_dot_p = torch.sqrt(2 * c_u_p[:, 0, 0] ** 2 + 2 * c_v_p[:, 1, 0] ** 2 + (
-                            c_u_p[:, 1, 0] + c_v_p[:, 0, 0]) ** 2 + 1e-8)
+                    g_dot_p = torch.sqrt(
+                        2 * c_u_p[:, 0, 0] ** 2
+                        + 2 * c_v_p[:, 1, 0] ** 2
+                        + (c_u_p[:, 1, 0] + c_v_p[:, 0, 0]) ** 2
+                        + 1e-8
+                    )
 
                     metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
-                    # --- NEW: Viscosity Tracking (Tier 2) ---
                     if tier == "tier2" and data.y.shape[1] >= 4:
                         mu_p = pred[node_mask, 3]
                         mu_t = data.y[node_mask, 3]
-
-                        # Raw Mean Absolute Error (biased toward vessel center)
                         metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
-
-                        # Log-Space MSE (unbiased, captures boundary layer accuracy)
                         mu_p_safe = torch.clamp(mu_p, min=1e-6)
                         mu_t_safe = torch.clamp(mu_t, min=1e-6)
-                        metrics["mu_log_mse"].append(F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item())
+                        metrics["mu_log_mse"].append(
+                            F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item()
+                        )
 
-            # 3. Continuity (Divergence)
             u, v = pred[:, 0:1], pred[:, 1:2]
             grad_u, grad_v = kernels._compute_gradients(u, props), kernels._compute_gradients(v, props)
             div_u = grad_u[:, 0:1] + grad_v[:, 1:2]
-            metrics["continuity"].append(torch.abs(div_u).mean().item())
+            interior = kernels.fluid_interior_mask(data)
+            if interior.any():
+                metrics["continuity"].append(torch.abs(div_u.view(-1)[interior]).mean().item())
+            else:
+                metrics["continuity"].append(float("nan"))
 
-            # 4. Wall Slip
             if data.mask_wall.any():
                 wall_vel = torch.norm(pred[data.mask_wall, :2], p=2, dim=1)
                 metrics["wall_slip"].append(wall_vel.mean().item())
 
-            # 5. Physics Rheology Residual
             if tier == "tier2":
                 metrics["rheology"].append(kernels.rheology_loss(pred, data, props).item())
 
-    # Safely compute mean over batches
-    return {k: np.mean(v) if len(v) > 0 else float('nan') for k, v in metrics.items()}
+    out: Dict[str, Any] = {k: _list_mean(v) for k, v in metrics.items()}
+
+    rl2_std, rl2_p90 = _list_dispersion(metrics["rel_l2"])
+    out["rel_l2_std"] = rl2_std
+    out["rel_l2_p90"] = rl2_p90
+
+    c_std, c_p90 = _list_dispersion(metrics["continuity"])
+    out["continuity_std"] = c_std
+    out["continuity_p90"] = c_p90
+
+    ws_std, ws_p90 = _list_dispersion(metrics["wall_slip"])
+    out["wall_slip_std"] = ws_std
+    out["wall_slip_p90"] = ws_p90
+
+    sh_std, sh_p90 = _list_dispersion(metrics["shear_mse"])
+    out["shear_mse_std"] = sh_std
+    out["shear_mse_p90"] = sh_p90
+
+    out["val_total_batches"] = float(val_total_batches)
+    out["val_anchor_batches"] = float(val_anchor_batches)
+
+    if tier == "tier2" and metrics["rheology"]:
+        r_std, r_p90 = _list_dispersion(metrics["rheology"])
+        out["rheology_std"] = r_std
+        out["rheology_p90"] = r_p90
+
+    return out
