@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Union
-from src.utils.paths import get_project_root
+from src.utils.paths import comsol_models_dir, data_root, get_project_root
 from pathlib import Path
 
 # Channel index for effective viscosity in [u, v, p, mu_eff_nd, ...] state / label tensors.
@@ -19,15 +19,16 @@ class VesselConfig:
     graph_output_dir: Path = field(init=False)
 
     def __post_init__(self):
-        self.template_path = self.project_root / "comsol_models/phase1_template.mph"
+        self.template_path = comsol_models_dir() / "phase1_template.mph"
+        dr = data_root()
         if self.tier == "tier3_patients":
-            self.mesh_input_dir = self.project_root / "data/raw/tier3_patients"
-            self.output_dir = self.project_root / "data/processed/cfd_results_tier3_patients"
-            self.graph_output_dir = self.project_root / "data/processed/graphs_tier3_patients"
+            self.mesh_input_dir = dr / "raw/tier3_patients"
+            self.output_dir = dr / "processed/cfd_results_tier3_patients"
+            self.graph_output_dir = dr / "processed/graphs_tier3_patients"
         else:
-            self.mesh_input_dir = self.project_root / f"data/raw/{self.tier}"
-            self.output_dir = self.project_root / f"data/processed/cfd_results_{self.tier}"
-            self.graph_output_dir = self.project_root / f"data/processed/graphs_{self.tier}"
+            self.mesh_input_dir = dr / f"raw/{self.tier}"
+            self.output_dir = dr / f"processed/cfd_results_{self.tier}"
+            self.graph_output_dir = dr / f"processed/graphs_{self.tier}"
 
     mesh_size_factor: float = 0.75
     mesh_lc: float = 1/1000  # [m]
@@ -226,8 +227,8 @@ class BiochemConfig:
     # COMSOL parameter is 0.045 [cm/s] -> SI is 4.5e-4 [m/s].
     k_aa: float = 4.5e-4  # Adhesion rate for activated platelets on Mas [m/s]
 
-    # Curriculum Learning Bounds (Corrected to match COMSOL mu1/mu2 max values)
-    mu_ratio_init: float = 2.0
+    # Curriculum Learning Bounds (Predictor-Corrector Architecture)
+    mu_ratio_init: float = 1.0  # Stage A: Rheologically neutral flow field
     mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
 
     # Dual-trigger effective viscosity (COMSOL step proxies; shared by GNODE_Tier3 + penalty loss)

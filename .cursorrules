@@ -1,19 +1,20 @@
-Project PIRON: Practical AI Coding Rules
+HemoGINO: Practical AI Coding Rules
 
 Project Reality
-- This is a multi-phase Python project with active work in `src/phase1` and `src/phase2`.
+- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_pipeline/`, `src/training/`, `src/evaluation/`, `src/utils/`, and `src/tests/`.
 - The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
-- Large binary and generated artifacts exist in `data/`, `models/`, `reports/`, and `comsol_models/`; do not treat them as source code.
+- Large binary and generated artifacts: `data/` (`data_root()`), `outputs/stage_a` / `outputs/stage_b` (checkpoints), `outputs/reports/` (`reports_dir()`), and `comsol_models/`; do not treat them as source code.
 
 Tier Definitions (authoritative)
-- Tier 1 (`src/phase1/train_tier1.py`): Newtonian hemodynamics baseline only.
-- Tier 2 (`src/phase1/train_tier2.py`): adds non-Newtonian rheology (Carreau-Yasuda style behavior).
-- Tier 3 (`src/phase2/train_tier3.py`): adds biochemical clot dynamics/coupling on top of flow backbone.
+- Tier 1 (`src/training/train_t1_predictor.py`): Newtonian hemodynamics baseline only (Stage A predictor warm-up).
+- Tier 2 (`src/training/train_t2_predictor.py`): adds non-Newtonian rheology (Carreau-Yasuda style behavior; Stage A predictor).
+- Tier 3 (`src/training/train_t3_corrector.py`): adds biochemical clot dynamics/coupling on top of flow backbone (Stage B corrector).
+- Orchestrator: `python -m src.main {a|b|all}` chains Stage A (predictor) and Stage B (corrector) training.
 - Do not assume Tier 3 is the primary stage for kinematic gains; major velocity quality should come from Tier 1/2.
 
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
-- Keep phase boundaries clear: Tier 1/2 logic stays in `phase1`; Tier 3 + COMSOL integration stays in `phase2`.
+- Keep boundaries clear: shared physics lives in `core_physics`; GNODE/DEQ/LoRA in `architecture`; graphs/meshes in `data_pipeline`.
 - Prefer small, local changes over broad refactors unless explicitly requested.
 - Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
 
@@ -25,7 +26,7 @@ Physics and Modeling Guardrails
 Data and File Hygiene
 - Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints).
 - Do not create duplicate source files with mixed path separators (for example both `src/file.py` and `src\file.py` variants).
-- Keep reusable logic in `src/`; keep ad-hoc inspection scripts in `src/phase*/tests` or dedicated utility scripts.
+- Keep reusable logic in `src/`; interactive diagnostics live under `src/tools/`; automated tests under `src/tests/`.
 
 Testing Expectations
 - Any meaningful logic change should include or update focused pytest coverage.
