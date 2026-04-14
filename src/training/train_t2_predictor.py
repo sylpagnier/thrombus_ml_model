@@ -1,7 +1,9 @@
 import atexit
 import math
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import sys
+if sys.platform != "win32":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import random
 from pathlib import Path
 from typing import Optional
@@ -111,12 +113,12 @@ def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
 
 
 def _tier2_dynamic_loss_weighter(device: str, mom_precision_floor: float) -> DynamicLossWeighter:
-    """Kendall weights for [continuity, momentum]; floor momentum precision (default ≥ 0.8)."""
+    """Kendall weights for [momentum]; floor momentum precision (default >= 0.8)."""
     floor = max(float(mom_precision_floor), 1e-6)
     max_lv_mom = float(-math.log(floor))
     return DynamicLossWeighter(
-        num_losses=2,
-        max_log_var=[float("inf"), max_lv_mom],
+        num_losses=1,
+        max_log_var=[max_lv_mom],
     ).to(device)
 
 
@@ -174,8 +176,8 @@ def compute_step_loss(
         return loss, metrics
 
     # --- PHASE 2/3: FULLY COUPLED ROUTING ---
-    pde_losses = [l_cont, l_mom]
-    pde_scales = [lambda_phys, lambda_phys]
+    pde_losses = [l_mom]
+    pde_scales = [lambda_phys]
     weighted_pdes = loss_weighter(pde_losses, scales=pde_scales)
 
     loss = (
@@ -325,7 +327,11 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         print(f"🔄 TIER2_RESUME: restoring full training state from {latest_ckpt_path.name}")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+        try:
+            loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+        except RuntimeError:
+            # Backward compatibility: old checkpoints may store two PDE log_vars (cont, mom).
+            print("ℹ️ Reinitializing Tier 2 PDE loss weighter for momentum-only setup.")
         best_phys_score = float(ckpt.get("best_phys_score", best_phys_score))
         best_loss = float(ckpt.get("best_loss", best_loss))
         start_epoch = int(ckpt.get("epoch", -1)) + 1
@@ -664,8 +670,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             with torch.no_grad():
                 safe_vars = loss_weighter.clamped_log_vars()
                 weights = torch.exp(-safe_vars)
-                w_cont = float(weights[0].item())
-                w_mom = float(weights[1].item())
+                w_cont = 0.0
+                w_mom = float(weights[0].item())
                 print(f"⚖️ Learned PDE Weights -> Cont: {w_cont:.2f} | Mom: {w_mom:.2f}")
             print(f"📌 Val split: anchors={n_val_anchor} | physics={n_val_physics}")
 

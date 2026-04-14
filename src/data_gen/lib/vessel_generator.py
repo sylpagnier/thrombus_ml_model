@@ -732,7 +732,12 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start vessel indices at 0. Default is to append after existing meshes.",
     )
-    p.add_argument("--no-plot", action="store_true", help="Skip matplotlib preview of saved meshes")
+    p.add_argument(
+        "--show-vessel-plot",
+        action="store_true",
+        help="Show matplotlib preview of saved meshes (default: skip; avoids blocking on plot windows).",
+    )
+    p.add_argument("--no-plot", action="store_true", help=argparse.SUPPRESS)
     return p
 
 
@@ -792,7 +797,7 @@ if __name__ == "__main__":
         start_idx=start_idx,
     )
 
-    if not args.no_plot:
+    if args.show_vessel_plot:
         saved_indices = sorted(
             int(p.stem.split("_")[-1])
             for p in vg.output_dir.glob("vessel_*.msh")

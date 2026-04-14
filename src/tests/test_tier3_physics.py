@@ -1,4 +1,5 @@
 import unittest
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -10,7 +11,7 @@ from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
 from src.architecture.gnode_tier3 import GNODE_Tier3
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.training.train_t3_corrector import remap_stage_a_encoder_to_corrector
-from src.data_pipeline.extract_tier3_comsol_data import PatientDataExtractor
+from src.data_gen import PatientDataExtractor
 from src.utils.paths import get_project_root
 
 class DummyCoreKernels:
@@ -121,6 +122,12 @@ class TestTier3Physics(unittest.TestCase):
         smooth_factor = t * t * (3.0 - 2.0 * t)
 
         return val_from + (val_to - val_from) * smooth_factor
+
+    def _env_float(self, name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return float(default)
+        return float(raw)
 
     def test_comsol_constants_mapping(self):
         """Verify fundamental COMSOL parameters are correctly inherited and scaled."""
@@ -519,6 +526,135 @@ class TestTier3Physics(unittest.TestCase):
                 "ADR_fast is too insensitive in isolated advection case under +50% velocity perturbation: "
                 f"base={float(adr_base_iso.item()):.6e}, bad={float(adr_bad_iso.item()):.6e}"
             ),
+        )
+
+    def test_tier3_comsol_gt_residuals_are_close_vs_permuted_baseline(self):
+        """
+        Ground-truth trajectory should remain substantially closer to Tier-3 physics/biochem kernels
+        than a geometry-breaking node permutation baseline.
+        """
+        graph_path = self._find_extracted_tier3_graph()
+        if graph_path is None:
+            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+
+        data = torch.load(graph_path, map_location="cpu", weights_only=False)
+        if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
+            self.skipTest(f"{graph_path.name} does not contain a usable Tier-3 trajectory.")
+
+        ratio_ns_max = self._env_float("PHASE3_NS_RATIO_MAX", 0.5)
+        ratio_adr_fast_max = self._env_float("PHASE3_ADR_FAST_RATIO_MAX", 0.95)
+        ratio_adr_slow_max = self._env_float("PHASE3_ADR_SLOW_RATIO_MAX", 0.95)
+        abs_ns_p95_max = self._env_float("PHASE3_NS_P95_MAX", 80.0)
+        abs_adr_fast_p95_max = self._env_float("PHASE3_ADR_FAST_P95_MAX", 12.0)
+        abs_adr_slow_p95_max = self._env_float("PHASE3_ADR_SLOW_P95_MAX", 12.0)
+        abs_wall_bio_p95_max = self._env_float("PHASE3_WALL_BIO_P95_MAX", 6.0)
+        abs_wall_flux_p95_max = self._env_float("PHASE3_WALL_FLUX_P95_MAX", 6.0)
+
+        core = PhysicsKernels(phys_cfg=self.phys_cfg)
+        kernels = BiochemPhysicsKernels(self.bio_cfg, core)
+        props = core._get_geometric_props(data)
+        num_nodes = int(data.num_nodes)
+        u_ref = data.u_ref if torch.is_tensor(data.u_ref) else torch.tensor([float(data.u_ref)], dtype=torch.float32)
+        d_bar = data.d_bar if torch.is_tensor(data.d_bar) else torch.tensor([float(data.d_bar)], dtype=torch.float32)
+        if u_ref.numel() == 1:
+            u_ref = u_ref.view(1).expand(num_nodes)
+        if d_bar.numel() == 1:
+            d_bar = d_bar.view(1).expand(num_nodes)
+        props["u_ref"] = u_ref
+        props["d_bar"] = d_bar
+
+        def _eval_terms(state_t1, dstate_dt):
+            vel = state_t1[:, 0:2]
+            bio = state_t1[:, 4:13]
+            wall = state_t1[:, 13:16]
+            dC_dt = dstate_dt[:, 4:13]
+            dM_dt = dstate_dt[:, 13:16]
+
+            l_adr_f, l_adr_s = kernels.biochem_adr_residual(bio, vel, props, data, d_pred_dt=dC_dt)
+            l_w_bio, l_w_phy = kernels.biochem_wall_residual(bio, wall, vel, props, data, dM_pred_dt=dM_dt)
+
+            re_ref = None
+            if hasattr(data, "re_actual") and data.re_actual is not None:
+                re_ref = float(data.re_actual.mean().item()) if torch.is_tensor(data.re_actual) else float(data.re_actual)
+            l_ns = core.navier_stokes_residual(state_t1[:, 0:4], data, props=props, re_ref=re_ref)
+            return {
+                "NS": float(l_ns.item()),
+                "ADR_fast": float(l_adr_f.item()),
+                "ADR_slow": float(l_adr_s.item()),
+                "Wall_bio": float(l_w_bio.item()),
+                "Wall_flux": float(l_w_phy.item()),
+            }
+
+        good_terms = []
+        bad_terms = []
+        n_intervals = int(data.y.shape[0] - 1)
+        for i in range(n_intervals):
+            y0 = data.y[i].detach()
+            y1 = data.y[i + 1].detach()
+            dt = float((data.t[i + 1] - data.t[i]).item()) if hasattr(data, "t") else 1.0
+            dt = max(dt, 1e-9)
+            d_dt = (y1 - y0) / dt
+            good_terms.append(_eval_terms(y1, d_dt))
+
+            g = torch.Generator(device=y1.device)
+            g.manual_seed(hash((graph_path.stem, i, "tier3_perm")) % (2**31))
+            perm = torch.randperm(y1.shape[0], generator=g, device=y1.device)
+            y1_bad = y1[perm]
+            d_dt_bad = d_dt[perm]
+            bad_terms.append(_eval_terms(y1_bad, d_dt_bad))
+
+        def _mean(name: str, terms: list[dict]) -> float:
+            return float(np.mean(np.asarray([d[name] for d in terms], dtype=np.float64)))
+
+        def _p95(name: str, terms: list[dict]) -> float:
+            return float(np.percentile(np.asarray([d[name] for d in terms], dtype=np.float64), 95))
+
+        def _ratio(name: str) -> float:
+            return _mean(name, good_terms) / max(_mean(name, bad_terms), 1e-12)
+
+        ratio_ns = _ratio("NS")
+        ratio_adr_f = _ratio("ADR_fast")
+        ratio_adr_s = _ratio("ADR_slow")
+
+        self.assertLessEqual(
+            ratio_ns,
+            ratio_ns_max,
+            f"Tier3 NS gt/baseline ratio too high for {graph_path.name}: {ratio_ns:.3f} > {ratio_ns_max:.3f}",
+        )
+        self.assertLessEqual(
+            ratio_adr_f,
+            ratio_adr_fast_max,
+            f"Tier3 ADR_fast gt/baseline ratio too high for {graph_path.name}: {ratio_adr_f:.3f} > {ratio_adr_fast_max:.3f}",
+        )
+        self.assertLessEqual(
+            ratio_adr_s,
+            ratio_adr_slow_max,
+            f"Tier3 ADR_slow gt/baseline ratio too high for {graph_path.name}: {ratio_adr_s:.3f} > {ratio_adr_slow_max:.3f}",
+        )
+        self.assertLessEqual(
+            _p95("NS", good_terms),
+            abs_ns_p95_max,
+            f"Tier3 NS P95 residual too high for {graph_path.name}.",
+        )
+        self.assertLessEqual(
+            _p95("ADR_fast", good_terms),
+            abs_adr_fast_p95_max,
+            f"Tier3 ADR_fast P95 residual too high for {graph_path.name}.",
+        )
+        self.assertLessEqual(
+            _p95("ADR_slow", good_terms),
+            abs_adr_slow_p95_max,
+            f"Tier3 ADR_slow P95 residual too high for {graph_path.name}.",
+        )
+        self.assertLessEqual(
+            _p95("Wall_bio", good_terms),
+            abs_wall_bio_p95_max,
+            f"Tier3 Wall_bio P95 residual too high for {graph_path.name}.",
+        )
+        self.assertLessEqual(
+            _p95("Wall_flux", good_terms),
+            abs_wall_flux_p95_max,
+            f"Tier3 Wall_flux P95 residual too high for {graph_path.name}.",
         )
 
     def test_kpa_activation_logic(self):

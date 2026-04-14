@@ -195,8 +195,8 @@ class BiochemPhysicsKernels:
         # Pass `data` down into the shear computation
         shear_rate = self._compute_shear_rate(u, v, spatial_props, data)
 
-        d_RBC_m = self.cfg.d_RBC
-        D_s = 0.18 * (d_RBC_m ** 2) * shear_rate
+        a_RBC_m = self.cfg.d_RBC / 2.0
+        D_s = 0.18 * (a_RBC_m ** 2) * shear_rate
 
         fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
         slow_keys = ['AT', 'FG', 'FI']
@@ -328,7 +328,9 @@ class BiochemPhysicsKernels:
 
             flux_scale = self.adr_norm_scales[:9].to(biochem_preds.device).mean().clamp(min=1e-12)
             loss_outlet_acc = torch.zeros((), device=biochem_preds.device, dtype=biochem_preds.dtype)
-            for i in range(9):
+            # Exclude fibrin (FI, index 8): stationary solid matrix, no outlet flux constraint.
+            n_mobile = 8
+            for i in range(n_mobile):
                 C_col = linear_bulk[:, i].unsqueeze(1)
                 dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar
                 dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar
@@ -337,7 +339,7 @@ class BiochemPhysicsKernels:
                 d_nd = dC_dn / flux_scale
                 loss_outlet_acc = loss_outlet_acc + F.huber_loss(d_nd, torch.zeros_like(d_nd), delta=1.0)
 
-            loss_outlet = loss_outlet_acc / 9.0
+            loss_outlet = loss_outlet_acc / float(n_mobile)
 
         return loss_inlet, loss_outlet
 
@@ -457,8 +459,8 @@ class BiochemPhysicsKernels:
         nx = data.x[mask_wall, 3]
         ny = data.x[mask_wall, 4]
 
-        d_RBC_m_wall = self.cfg.d_RBC
-        D_s_wall = 0.18 * (d_RBC_m_wall ** 2) * shear_wall
+        a_RBC_m_wall = self.cfg.d_RBC / 2.0
+        D_s_wall = 0.18 * (a_RBC_m_wall ** 2) * shear_wall
         keller_indices = [0, 1, 4, 5, 6]
         keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
 
@@ -479,7 +481,9 @@ class BiochemPhysicsKernels:
             D_eff = base_D + D_s_wall if idx in keller_indices else base_D
 
             predicted_flux = -D_eff * dC_dn_wall
-            flux_residual = predicted_flux - J_in
+            # J_in is signed inward (negative for sinks), while predicted_flux is outward.
+            # Enforce outward + inward = 0 for consistent wall coupling.
+            flux_residual = predicted_flux + J_in
 
             # Use convective flux for stable normalization
             char_flux = scales[idx] * u_ref_wall

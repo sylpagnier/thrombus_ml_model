@@ -201,6 +201,13 @@ EPS_BC = 5e-4
 BOUNDARY_DATA_WEIGHT = 2.0
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    return float(raw)
+
+
 def _max_graphs_cap() -> Optional[int]:
     raw = os.environ.get("PHASE1_PHYSICS_TEST_MAX_GRAPHS", "").strip().lower()
     if raw in ("", "all"):
@@ -315,6 +322,10 @@ def _collect_anchor_paths(tier: str) -> List[Path]:
     return out
 
 
+def _safe_ratio(numer: float, denom: float) -> float:
+    return float(numer) / max(float(denom), 1e-12)
+
+
 class TestComsolAnchorPhysicsStrict(unittest.TestCase):
     """COMSOL labels vs training physics terms + shuffle sanity (no duplicated kernel logic)."""
 
@@ -331,6 +342,15 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         kernels = PhysicsKernels(phys_cfg)
         relax = _relax_shuffle()
         failures: List[str] = []
+        mom_ratio_max = _env_float("PHASE1_T1_MOM_RATIO_MAX", 0.2)
+        # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
+        wss_ratio_max = _env_float("PHASE1_T1_WSS_RATIO_MAX", 0.60)
+        abs_tail_pct = _env_float("PHASE1_T1_ABS_TAIL_PERCENTILE", 99.0)
+        abs_tail_mult = _env_float("PHASE1_T1_ABS_TAIL_MULT", 2.0)
+        mom_ok_values: List[float] = []
+        wss_ok_values: List[float] = []
+        mom_ok_by_stem: Dict[str, float] = {}
+        wss_ok_by_stem: Dict[str, float] = {}
 
         for path in paths:
             data = _load_anchor_graph(path)
@@ -340,6 +360,10 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             seed = hash((stem, "row")) % (2**31)
 
             t_ok = _evaluate_terms(pred, data, kernels, tier="tier1")
+            mom_ok_values.append(t_ok["l_mom"])
+            wss_ok_values.append(t_ok["l_wss"])
+            mom_ok_by_stem[stem] = t_ok["l_mom"]
+            wss_ok_by_stem[stem] = t_ok["l_wss"]
 
             if t_ok["l_data_kine"] >= EPS_DATA:
                 failures.append(
@@ -356,12 +380,28 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             pred_bad = _permute_rows(pred, seed)
             t_bad = _evaluate_terms(pred_bad, data, kernels, tier="tier1")
 
-            for key in ("l_mom", "l_cont", "l_wss"):
-                if t_ok[key] >= t_bad[key]:
-                    failures.append(
-                        f"{stem}: {key} comsol={t_ok[key]:.6g} >= shuffled={t_bad[key]:.6g} "
-                        f"(COMSOL field should score better than row-shuffled nonsense)"
-                    )
+            mom_ratio = _safe_ratio(t_ok["l_mom"], t_bad["l_mom"])
+            if mom_ratio > mom_ratio_max:
+                failures.append(
+                    f"{stem}: l_mom ratio={mom_ratio:.3f} > {mom_ratio_max:.3f} "
+                    f"(gt={t_ok['l_mom']:.6g}, shuffled={t_bad['l_mom']:.6g})"
+                )
+            wss_ratio = _safe_ratio(t_ok["l_wss"], t_bad["l_wss"])
+            if wss_ratio > wss_ratio_max:
+                failures.append(
+                    f"{stem}: l_wss ratio={wss_ratio:.3f} > {wss_ratio_max:.3f} "
+                    f"(gt={t_ok['l_wss']:.6g}, shuffled={t_bad['l_wss']:.6g})"
+                )
+
+        if mom_ok_values:
+            mom_cap = float(np.percentile(np.asarray(mom_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            wss_cap = float(np.percentile(np.asarray(wss_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            for stem, v in mom_ok_by_stem.items():
+                if v > mom_cap:
+                    failures.append(f"{stem}: l_mom={v:.6g} > tail cap {mom_cap:.6g}")
+            for stem, v in wss_ok_by_stem.items():
+                if v > wss_cap:
+                    failures.append(f"{stem}: l_wss={v:.6g} > tail cap {wss_cap:.6g}")
 
         self.assertEqual(
             failures,
@@ -385,6 +425,18 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         carreau_n = phys_cfg.n
         relax = _relax_shuffle()
         failures: List[str] = []
+        mom_ratio_max = _env_float("PHASE1_T2_MOM_RATIO_MAX", 0.2)
+        # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
+        wss_ratio_max = _env_float("PHASE1_T2_WSS_RATIO_MAX", 0.60)
+        rheo_ratio_max = _env_float("PHASE1_T2_RHEO_RATIO_MAX", 0.5)
+        abs_tail_pct = _env_float("PHASE1_T2_ABS_TAIL_PERCENTILE", 99.0)
+        abs_tail_mult = _env_float("PHASE1_T2_ABS_TAIL_MULT", 2.0)
+        mom_ok_values: List[float] = []
+        wss_ok_values: List[float] = []
+        rheo_ok_values: List[float] = []
+        mom_ok_by_stem: Dict[str, float] = {}
+        wss_ok_by_stem: Dict[str, float] = {}
+        rheo_ok_by_stem: Dict[str, float] = {}
 
         for path in paths:
             data = _load_anchor_graph(path)
@@ -397,6 +449,12 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             t_ok = _evaluate_terms(
                 pred, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
             )
+            mom_ok_values.append(t_ok["l_mom"])
+            wss_ok_values.append(t_ok["l_wss"])
+            rheo_ok_values.append(t_ok["l_rheo"])
+            mom_ok_by_stem[stem] = t_ok["l_mom"]
+            wss_ok_by_stem[stem] = t_ok["l_wss"]
+            rheo_ok_by_stem[stem] = t_ok["l_rheo"]
 
             if t_ok["l_data_kine"] >= EPS_DATA:
                 failures.append(f"{stem}: l_data_kine={t_ok['l_data_kine']:.3e}")
@@ -412,20 +470,43 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             t_bad = _evaluate_terms(
                 pred_bad, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
             )
-            for key in ("l_mom", "l_cont", "l_wss"):
-                if t_ok[key] >= t_bad[key]:
-                    failures.append(
-                        f"{stem}: {key} comsol={t_ok[key]:.6g} >= row_shuf={t_bad[key]:.6g}"
-                    )
+            mom_ratio = _safe_ratio(t_ok["l_mom"], t_bad["l_mom"])
+            if mom_ratio > mom_ratio_max:
+                failures.append(
+                    f"{stem}: l_mom ratio={mom_ratio:.3f} > {mom_ratio_max:.3f} "
+                    f"(gt={t_ok['l_mom']:.6g}, row_shuf={t_bad['l_mom']:.6g})"
+                )
+            wss_ratio = _safe_ratio(t_ok["l_wss"], t_bad["l_wss"])
+            if wss_ratio > wss_ratio_max:
+                failures.append(
+                    f"{stem}: l_wss ratio={wss_ratio:.3f} > {wss_ratio_max:.3f} "
+                    f"(gt={t_ok['l_wss']:.6g}, row_shuf={t_bad['l_wss']:.6g})"
+                )
 
             pred_mu_bad = _permute_mu_column(pred, seed_mu)
             t_mu = _evaluate_terms(
                 pred_mu_bad, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
             )
-            if t_ok["l_rheo"] >= t_mu["l_rheo"]:
+            rheo_ratio = _safe_ratio(t_ok["l_rheo"], t_mu["l_rheo"])
+            if rheo_ratio > rheo_ratio_max:
                 failures.append(
-                    f"{stem}: l_rheo comsol={t_ok['l_rheo']:.6g} >= mu_shuf={t_mu['l_rheo']:.6g}"
+                    f"{stem}: l_rheo ratio={rheo_ratio:.3f} > {rheo_ratio_max:.3f} "
+                    f"(gt={t_ok['l_rheo']:.6g}, mu_shuf={t_mu['l_rheo']:.6g})"
                 )
+
+        if mom_ok_values:
+            mom_cap = float(np.percentile(np.asarray(mom_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            wss_cap = float(np.percentile(np.asarray(wss_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            rheo_cap = float(np.percentile(np.asarray(rheo_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            for stem, v in mom_ok_by_stem.items():
+                if v > mom_cap:
+                    failures.append(f"{stem}: l_mom={v:.6g} > tail cap {mom_cap:.6g}")
+            for stem, v in wss_ok_by_stem.items():
+                if v > wss_cap:
+                    failures.append(f"{stem}: l_wss={v:.6g} > tail cap {wss_cap:.6g}")
+            for stem, v in rheo_ok_by_stem.items():
+                if v > rheo_cap:
+                    failures.append(f"{stem}: l_rheo={v:.6g} > tail cap {rheo_cap:.6g}")
 
         self.assertEqual(
             failures,

@@ -42,7 +42,7 @@ Do not assume **Tier 3** is where most kinematic accuracy comes from; Tier 1/2 a
 |------|---------|
 | `src/core_physics/` | Navier–Stokes–consistent kernels, rheology, biochem coupling interfaces. |
 | `src/architecture/` | GNODE / DEQ core, LoRA injection. |
-| `src/data_pipeline/` | Mesh → graph, COMSOL export ingestion, Tier 3 plumbing. |
+| `src/data_gen/` | `pipeline_tier12.py` / `pipeline_tier3.py` (runnable); `lib/` holds mesh/COMSOL/graph builders. |
 | `src/training/` | Curriculum, `train_t1_predictor`, `train_t2_predictor`, `train_t3_corrector`. |
 | `src/evaluation/` | Benchmarks, visualization helpers. |
 | `src/utils/` | Paths, metrics, inference, shared kinematics helpers. |

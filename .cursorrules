@@ -1,7 +1,7 @@
 HemoGINO: Practical AI Coding Rules
 
 Project Reality
-- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_pipeline/`, `src/training/`, `src/evaluation/`, `src/utils/`, and `src/tests/`.
+- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_gen/` (pipelines at package root; mesh/COMSOL/graph **lib** under `data_gen/lib/`), `src/training/`, `src/evaluation/`, `src/utils/`, and `src/tests/`.
 - The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
 - Large binary and generated artifacts: `data/` (`data_root()`), `outputs/stage_a` / `outputs/stage_b` (checkpoints), `outputs/reports/` (`reports_dir()`), and `comsol_models/`; do not treat them as source code.
 
@@ -14,7 +14,7 @@ Tier Definitions (authoritative)
 
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
-- Keep boundaries clear: shared physics lives in `core_physics`; GNODE/DEQ/LoRA in `architecture`; graphs/meshes in `data_pipeline`.
+- Keep boundaries clear: shared physics lives in `core_physics`; GNODE/DEQ/LoRA in `architecture`; graphs/meshes/datagen in `data_gen`.
 - Prefer small, local changes over broad refactors unless explicitly requested.
 - Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
 

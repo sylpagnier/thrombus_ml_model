@@ -1,5 +1,23 @@
+"""Tier 1 predictor training (GINO-DEQ).
+
+**Explorer / sweeps:** see ``src/training/t1_explorer.py`` and env vars ``TIER1_EXPERIMENT_NAME``,
+``TIER1_KINE_WEIGHT_MODE``, ``TIER1_GEOMETRY_LEVEL``, ``TIER1_LATENT_DIM``, …
+Use ``TIER1_EPOCHS`` (default 60) for short exploratory runs, e.g. ``25``.
+Each run writes ``outputs/reports/experiments/tier1_<name>_<ts>.json`` for comparing runs.
+
+Example (SDF-gradient–weighted kinematic loss, level-1 vessels only)::
+
+    set TIER1_EXPERIMENT_NAME=sdf_grad_l1
+    set TIER1_KINE_WEIGHT_MODE=sdf_grad
+    set TIER1_GEOMETRY_LEVEL=1
+    set TIER1_EPOCHS=25
+    py -m src.training.train_t1_predictor
+"""
+import argparse
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import sys
+if sys.platform != "win32":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import atexit
 import csv
 from typing import Optional
@@ -15,18 +33,35 @@ from src.config import VesselConfig, PhysicsConfig
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ReduceLROnPlateau
 from src.utils.metrics import quantify_performance, validate_and_plot, DynamicLossWeighter
 from src.utils.anchor_mask import graph_has_anchor, anchor_node_mask
-from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
+from src.utils.kinematics_physics_terms import (
+    compute_anchor_kinematic_importance,
+    compute_kinematics_physics_terms,
+)
 from src.utils.training_diary import TrainingDiary, env_snapshot
+from src.training.t1_explorer import (
+    T1ExplorerConfig,
+    filter_graph_paths_by_geometry_level,
+    write_t1_experiment_artifact,
+)
 import random
 
 
-def load_dataset():
+def load_dataset(explorer: Optional[T1ExplorerConfig] = None):
     cfg = VesselConfig(tier="tier1")
     if not cfg.graph_output_dir.exists():
         return []
+    paths = sorted(cfg.graph_output_dir.glob("vessel_*.pt"))
+    if explorer is not None and explorer.geometry_level is not None:
+        raw_dir = cfg.mesh_input_dir
+        before = len(paths)
+        paths = filter_graph_paths_by_geometry_level(list(paths), raw_dir, explorer.geometry_level)
+        print(
+            f"🔎 TIER1_GEOMETRY_LEVEL={explorer.geometry_level}: "
+            f"{len(paths)}/{before} graphs (json \"level\" filter)."
+        )
     dataset = []
     print(f"📂 Loading Tier 1 graphs from {cfg.graph_output_dir}...")
-    for f in tqdm(sorted(list(cfg.graph_output_dir.glob("vessel_*.pt")))):
+    for f in tqdm(paths):
         dataset.append(torch.load(f, weights_only=False))
     return dataset
 
@@ -45,20 +80,48 @@ def compute_step_loss(
     wss_scale=10.0,
     boundary_data_weight=2.0,
     is_distillation=False,
+    explorer: Optional[T1ExplorerConfig] = None,
+    tier1_kine_p_weight: float = 1.0,
+    re_ref: Optional[float] = None,
+    re_scale: Optional[float] = None,
+    train_loss_weighter: bool = True,
 ):
-    out = model(data, solver=current_solver, anderson_beta=0.8, anderson_warmup_iters=5)
+    if explorer is not None and explorer.ns_derivative_mode == "autograd":
+        data.x = data.x.clone().detach().requires_grad_(True)
+    anderson_beta = float(explorer.anderson_beta) if explorer is not None else 0.8
+    out = model(data, solver=current_solver, anderson_beta=anderson_beta, anderson_warmup_iters=5)
     if isinstance(out, tuple):
         pred, jac_loss = out
     else:
         pred = out
         jac_loss = torch.tensor(0.0, device=device)
 
+    node_is_anchor = anchor_node_mask(data)
+    kine_imp = None
+    if explorer is not None:
+        props = kernels._get_geometric_props(data)
+        kine_imp = compute_anchor_kinematic_importance(
+            data,
+            node_is_anchor,
+            mode=explorer.kine_weight_mode,
+            sdf_wall_beta=explorer.sdf_wall_beta,
+            sdf_wall_tau=explorer.sdf_wall_tau,
+            sdf_grad_beta=explorer.sdf_grad_beta,
+            shear_true_alpha=explorer.shear_true_alpha,
+            kernels=kernels,
+            props=props,
+        )
     terms = compute_kinematics_physics_terms(
         pred,
         data,
         kernels,
         tier="tier1",
         boundary_data_weight=boundary_data_weight,
+        tier1_kine_p_weight=float(tier1_kine_p_weight),
+        anchor_kine_importance=kine_imp,
+        re_ref=re_ref,
+        re_scale=re_scale,
+        kinematics_mode=(explorer.kinematics_mode if explorer is not None else None),
     )
     l_wss = terms["l_wss"]
     l_data_kine = terms["l_data_kine"]
@@ -67,18 +130,79 @@ def compute_step_loss(
     l_bc = terms["l_bc"]
     l_io = terms["l_io"]
 
-    node_is_anchor = anchor_node_mask(data)
-    pde_losses = [l_cont, l_mom]
+    lambda_cont = float(explorer.lambda_cont) if explorer is not None else 1.0
+    loss_weight_mode = (explorer.loss_weight_mode if explorer is not None else "dynamic").strip().lower()
+
+    # Optional gauge-invariant pressure supervision via pressure gradients on anchor nodes.
+    p_grad_loss = torch.tensor(0.0, device=device)
+    p_grad_weight = float(explorer.p_grad_supervision) if explorer is not None else 0.0
+    if p_grad_weight > 0.0:
+        props = kernels._get_geometric_props(data)
+        c_p_pred = kernels._compute_derivatives(pred[:, 2:3], props)
+        c_p_true = kernels._compute_derivatives(data.y[:, 2:3], props)
+        p_pred_grad = c_p_pred[:, 0:2, 0]
+        p_true_grad = c_p_true[:, 0:2, 0]
+        if node_is_anchor is not None and int(node_is_anchor.sum().item()) > 0:
+            p_grad_loss = torch.nn.functional.mse_loss(p_pred_grad[node_is_anchor], p_true_grad[node_is_anchor])
+        else:
+            # Never supervise pressure gradients on physics-only batches with no anchor labels.
+            p_grad_loss = torch.tensor(0.0, device=device)
+
+    pde_losses = [l_mom, lambda_cont * l_cont]
     pde_scales = [lambda_phys, lambda_phys]
-    weighted_pdes = loss_weighter(pde_losses, scales=pde_scales)
+    data_terms = [
+        float(data_scale) * l_data_kine,
+        float(bc_scale) * l_bc,
+        float(io_scale) * l_io,
+        float(wss_scale) * l_wss,
+        float(p_grad_weight) * p_grad_loss,
+    ]
+    if loss_weight_mode == "fixed" or loss_weighter is None:
+        weighted_pdes = (lambda_phys * l_mom) + (lambda_phys * lambda_cont * l_cont)
+        weighted_data = sum(data_terms)
+    elif loss_weight_mode == "grad_norm":
+        pde_term = l_mom + (lambda_cont * l_cont)
+        ref_param = next((p for p in model.parameters() if p.requires_grad), None)
+        if ref_param is None:
+            weighted_pdes = lambda_phys * pde_term
+        else:
+            g_data = torch.autograd.grad(
+                l_data_kine,
+                ref_param,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            g_pde = torch.autograd.grad(
+                pde_term,
+                ref_param,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            g_data_norm = torch.linalg.vector_norm(g_data) if g_data is not None else torch.tensor(0.0, device=device)
+            g_pde_norm = torch.linalg.vector_norm(g_pde) if g_pde is not None else torch.tensor(0.0, device=device)
+            ratio = torch.clamp(g_data_norm / (g_pde_norm + 1e-8), min=0.1, max=10.0).detach()
+            weighted_pdes = lambda_phys * ratio * pde_term
+        weighted_data = sum(data_terms)
+    else:
+        # Dynamically weight only PDE residuals; keep supervised terms on rigid static scales.
+        pde_losses = [
+            lambda_phys * l_mom,
+            lambda_phys * lambda_cont * l_cont,
+        ]
+        safe_log_vars = loss_weighter.clamped_log_vars()
+        if not train_loss_weighter:
+            safe_log_vars = safe_log_vars.detach()
+        weighted_terms = []
+        for idx, lv in enumerate(safe_log_vars):
+            precision = torch.exp(-lv)
+            weighted_terms.append(precision * pde_losses[idx] + lv)
+        weighted_pdes = sum(weighted_terms)
+        weighted_data = sum(data_terms)
 
     # Combine losses cleanly
     loss = (
         weighted_pdes
-        + (float(data_scale) * l_data_kine)
-        + (float(bc_scale) * l_bc)
-        + (float(io_scale) * l_io)
-        + (float(wss_scale) * l_wss)
+        + weighted_data
         + (0.1 * jac_loss)
     )
 
@@ -88,27 +212,82 @@ def compute_step_loss(
         "L_cont": l_cont.item(),
         "L_jac": jac_loss.item(),
         "L_wss": l_wss.item(),
+        "L_pgrad": p_grad_loss.item(),
         "A_nodes": int(node_is_anchor.sum().item()) if node_is_anchor is not None else 0,
     }
     return loss, metrics
 
 
-def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
+def train_t1_predictor(
+    epochs: Optional[int] = None,
+    lr: float = 1e-4,
+    warm_up_epochs: Optional[int] = None,
+    adam_epochs: Optional[int] = None,
+    explorer: Optional[T1ExplorerConfig] = None,
+):
+    explorer = explorer or T1ExplorerConfig.from_env()
+    if epochs is None:
+        epochs = max(1, int(os.environ.get("TIER1_EPOCHS", "60")))
+    if adam_epochs is None:
+        raw_adam = os.environ.get("TIER1_ADAM_EPOCHS", "").strip()
+        adam_epochs = int(raw_adam) if raw_adam else epochs
+    adam_epochs = max(1, min(int(adam_epochs), int(epochs)))
+    if warm_up_epochs is None:
+        raw_w = os.environ.get("TIER1_WARM_UP_EPOCHS", "").strip()
+        if raw_w:
+            warm_up_epochs = int(raw_w)
+        else:
+            warm_up_epochs = min(10, max(1, adam_epochs // 3))
+    warm_up_epochs = max(0, min(int(warm_up_epochs), adam_epochs - 1))
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Device being used:", device)
-    model = GINO_DEQ(in_channels=15, out_channels=5, latent_dim=64, max_iters=15).to(device)
+    print(
+        f"⏱️ epochs={epochs} | warm_up={warm_up_epochs} | adam_phase={adam_epochs} "
+        f"(set TIER1_EPOCHS / TIER1_WARM_UP_EPOCHS / TIER1_ADAM_EPOCHS to override)"
+    )
+    print(
+        f"🔬 Explorer: name={explorer.experiment_name!r} | "
+        f"kine_weight={explorer.kine_weight_mode} | "
+        f"latent={explorer.latent_dim} | deq_iters={explorer.deq_max_iters} | "
+        f"kinematics_mode={explorer.kinematics_mode} | ns_derivatives={explorer.ns_derivative_mode} | "
+        f"act={explorer.activation_fn} | fourier_base={explorer.fourier_base:.2f} | "
+        f"loss_weight={explorer.loss_weight_mode} | anderson_beta={explorer.anderson_beta:.2f} | "
+        f"lambda_cont={explorer.lambda_cont:.2f} | re_curriculum={explorer.re_curriculum} | "
+        f"p_grad_sup={explorer.p_grad_supervision:.3f}"
+    )
+    model = GINO_DEQ(
+        in_channels=15,
+        out_channels=5,
+        latent_dim=explorer.latent_dim,
+        max_iters=explorer.deq_max_iters,
+        num_fourier_freqs=explorer.num_fourier_freqs,
+        kinematics_mode=explorer.kinematics_mode,
+        activation_fn=explorer.activation_fn,
+        fourier_base=explorer.fourier_base,
+    ).to(device)
 
     phys_cfg = PhysicsConfig(tier="tier1")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
+    kernels.ns_derivative_mode = explorer.ns_derivative_mode
+    kernels.cfg.kinematics_mode = explorer.kinematics_mode
+    kernels.advect_detach = bool(explorer.advect_detach)
 
-    loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
+    # Keep dynamic weighing available for momentum+continuity when selected.
+    loss_weighter = None
+    if explorer.loss_weight_mode == "dynamic":
+        loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
-    fig_dir = reports_dir() / "figures" / "tier1"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    disable_figures = (os.environ.get("TIER1_DISABLE_FIGURES", "0").strip().lower() in ("1", "true", "yes", "on"))
+    if not disable_figures:
+        fig_dir = reports_dir() / "figures" / "tier1"
+        fig_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Initialize Phase 1 Optimizer (AdamW)
-    optimizer = optim.AdamW(list(model.parameters()) + list(loss_weighter.parameters()),
-                            lr=lr, weight_decay=1e-5)
+    opt_params = list(model.parameters())
+    if loss_weighter is not None:
+        opt_params += list(loss_weighter.parameters())
+    optimizer = optim.AdamW(opt_params, lr=lr, weight_decay=1e-5)
 
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warm_up_epochs)
     decay_epochs = adam_epochs - warm_up_epochs
@@ -118,8 +297,9 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
         optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=1e-6
     )
 
-    dataset = load_dataset()
-    if not dataset: return
+    dataset = load_dataset(explorer)
+    if not dataset:
+        return {"status": "no_data", "experiment_name": explorer.experiment_name}
 
     # --- NEW STRATIFIED SPLIT LOGIC ---
     anchors = [d for d in dataset if d.is_anchor.any().item()]
@@ -144,7 +324,13 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
     hard_alpha = max(float(os.environ.get("TIER1_HARD_MINING_ALPHA", "0.8")), 0.0)
     hard_refresh = max(int(os.environ.get("TIER1_HARD_MINING_REFRESH_EPOCHS", "4")), 1)
     boundary_data_weight = max(float(os.environ.get("TIER1_BOUNDARY_DATA_WEIGHT", "2.0")), 1.0)
-    use_lbfgs = (os.environ.get("TIER1_USE_LBFGS", "0").strip().lower() in ("1", "true", "yes", "on"))
+    tier1_kine_p_weight = max(float(os.environ.get("TIER1_KINE_P_WEIGHT", "1.0")), 0.0)
+    use_lbfgs_requested = (os.environ.get("TIER1_USE_LBFGS", "0").strip().lower() in ("1", "true", "yes", "on"))
+    use_lbfgs = bool(use_lbfgs_requested)
+    if use_lbfgs:
+        print("✅ TIER1_USE_LBFGS=1: AdamW warm-up/phase then L-BFGS refinement is enabled.")
+        print("ℹ️ Safety note: L-BFGS path snapshots the full loader and can be memory-heavy on large graph datasets.")
+    dynamic_freeze_during_warmup = (os.environ.get("TIER1_DYNAMIC_FREEZE_DURING_WARMUP", "1").strip().lower() in ("1", "true", "yes", "on"))
     n_anchor_train = len([d for d in train_data if d.is_anchor.any().item()])
     n_phys_train = max(0, len(train_data) - n_anchor_train)
     hard_anchor_multiplier = {}
@@ -209,7 +395,11 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
         print(f"🔄 Resuming Tier 1 from checkpoint: {latest_ckpt_path}")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+        try:
+            if loss_weighter is not None and ckpt.get("loss_weighter_state_dict") is not None:
+                loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+        except RuntimeError:
+            print("ℹ️ Reinitializing Tier 1 PDE loss weighter for current setup.")
 
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         best_phys_score = float(ckpt.get("best_phys_score", best_phys_score))
@@ -269,6 +459,7 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
         best_phys_score_checkpoint=float(best_phys_score),
         best_loss_checkpoint=float(best_loss),
         env_tier1_phase1=env_snapshot("TIER1_", "PHASE1_"),
+        t1_explorer=explorer.to_serializable(),
     )
 
     run_end_emitted = False
@@ -308,12 +499,12 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
                 # IMPORTANT: never move cached dataset items in-place to GPU.
                 # DataLoader expects CPU tensors and will fail on mixed CPU/CUDA batches.
                 dd = d.clone().to(device)
-                out = model(dd, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5)
+                out = model(dd, solver="anderson", anderson_beta=float(explorer.anderson_beta), anderson_warmup_iters=5)
                 pred = out[0] if isinstance(out, tuple) else out
                 mask = anchor_node_mask(dd)
                 if mask is None or int(mask.sum().item()) == 0:
                     continue
-                rel = torch.norm(pred[mask, :3] - dd.y[mask, :3]) / torch.clamp(torch.norm(dd.y[mask, :3]), min=1e-8)
+                rel = torch.norm(pred[mask, :2] - dd.y[mask, :2]) / torch.clamp(torch.norm(dd.y[mask, :2]), min=1e-8)
                 gkey = _graph_sampling_key(dd, gi)
                 rows.append((gkey, float(rel.item())))
         if not rows:
@@ -340,6 +531,9 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
         model.train()
         physics_active = epoch >= warm_up_epochs
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
+        if explorer.re_curriculum and epoch == start_epoch:
+            print("⚠️ TIER1_RE_CURRICULUM requested, but disabled for supervised Tier 1 to avoid Re/data contradiction.")
+        re_scale_epoch = 1.0
         stage_split = int(os.environ.get("TIER1_DATA_STAGE_EPOCHS", "12"))
         if epoch < stage_split:
             # Stage A: fit kinematics harder while physics ramps in.
@@ -360,9 +554,12 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
         if use_lbfgs and epoch >= adam_epochs and not lbfgs_initialized:
             print(f"\n⚡ Switching to L-BFGS Optimizer for the final {epochs - adam_epochs} epochs...")
             torch.cuda.empty_cache()
+            if loss_weighter is not None:
+                loss_weighter.requires_grad_(False)
+            lbfgs_params = [p for p in model.parameters() if p.requires_grad]
 
             optimizer = optim.LBFGS(
-                list(model.parameters()) + list(loss_weighter.parameters()),
+                lbfgs_params,
                 lr=0.01,
                 max_iter=20,
                 history_size=30,
@@ -378,31 +575,56 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
 
             # Zero gradients AT THE START of the epoch
             optimizer.zero_grad()
+            accum_counter = 0
 
             for batch_idx, data in enumerate(pbar):
                 data = data.to(device)
 
                 # Compute loss (scaled by accumulation steps so the final gradient magnitude is correct)
-                loss, metrics = compute_step_loss(model, data, kernels, loss_weighter, current_solver, lambda_phys,
-                                                  device, data_scale=data_scale, bc_scale=bc_scale,
-                                                  io_scale=io_scale, wss_scale=wss_scale,
-                                                  boundary_data_weight=boundary_data_weight, is_distillation=False)
-                loss = loss / accumulation_steps
+                loss, metrics = compute_step_loss(
+                    model,
+                    data,
+                    kernels,
+                    loss_weighter,
+                    current_solver,
+                    lambda_phys,
+                    device,
+                    data_scale=data_scale,
+                    bc_scale=bc_scale,
+                    io_scale=io_scale,
+                    wss_scale=wss_scale,
+                    boundary_data_weight=boundary_data_weight,
+                    is_distillation=False,
+                    explorer=explorer,
+                    tier1_kine_p_weight=tier1_kine_p_weight,
+                    re_scale=re_scale_epoch,
+                    train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
+                )
+                accum_counter += 1
+                loss = loss / float(accumulation_steps)
 
                 if torch.isnan(loss):
                     print(f"\n⚠️ NaN detected! Skipping micro-batch.")
+                    accum_counter = max(0, accum_counter - 1)
                     continue
 
                 loss.backward()
 
                 # Step optimizer ONLY when we've accumulated enough micro-batches
-                if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
+                is_step = ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader))
+                if is_step:
+                    if accum_counter > 0 and accum_counter < accumulation_steps:
+                        scale = float(accumulation_steps) / float(accum_counter)
+                        for p in opt_params:
+                            if p.grad is not None:
+                                p.grad.mul_(scale)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(model.parameters()) + list(loss_weighter.parameters()),
+                        opt_params,
                         max_norm=1.0,
                     )
                     optimizer.step()
                     optimizer.zero_grad()  # Reset for the next effective batch
+                    accum_counter = 0
 
                 # Multiply back for display purposes
                 total_loss_epoch += (loss.item() * accumulation_steps)
@@ -411,6 +633,7 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
                     "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
                     "L_mom": f"{metrics['L_mom']:.3f}",
                     "L_cont": f"{metrics['L_cont']:.3f}",
+                    "L_pgrad": f"{metrics['L_pgrad']:.3f}",
                     "L_jac": f"{metrics['L_jac']:.3f}",
                     "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
                 })
@@ -423,14 +646,14 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
             # L-BFGS calls closure multiple times per step; keep closure data fixed.
             # Snapshot once on CPU (safe for VRAM), then move one batch at a time in closure.
             epoch_batches_cpu = list(loader)
-            epoch_batches_device = [b.to(device) for b in epoch_batches_cpu]
-            n_batches = max(len(epoch_batches_device), 1)
+            n_batches = max(len(epoch_batches_cpu), 1)
 
             def closure():
                 optimizer.zero_grad()
                 accumulated_loss = torch.tensor(0.0, device=device)
 
-                for closure_data in epoch_batches_device:
+                for closure_data_cpu in epoch_batches_cpu:
+                    closure_data = closure_data_cpu.to(device)
                     loss, _ = compute_step_loss(
                         model,
                         closure_data,
@@ -445,10 +668,15 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
                         wss_scale=wss_scale,
                         boundary_data_weight=boundary_data_weight,
                         is_distillation=False,
+                        explorer=explorer,
+                        tier1_kine_p_weight=tier1_kine_p_weight,
+                        re_scale=re_scale_epoch,
+                        train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
                     )
                     loss = loss / n_batches
                     loss.backward()
                     accumulated_loss += loss.detach()
+                    del closure_data
 
                 return accumulated_loss
 
@@ -464,7 +692,7 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
             torch.save(model.state_dict(), save_path)
             print(f"⭐ Saved Best Loss Model to {save_path}")
 
-        if epoch % 5 == 0:
+        if (not disable_figures) and epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
@@ -474,7 +702,7 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
-                "loss_weighter_state_dict": loss_weighter.state_dict(),
+                "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
                 "best_phys_score": best_phys_score,
                 "best_loss": best_loss,
                 "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
@@ -524,15 +752,19 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
             )
 
             with torch.no_grad():
-                safe_vars = loss_weighter.clamped_log_vars()
-                weights = torch.exp(-safe_vars)
-                w_cont = float(weights[0].item())
-                w_mom = float(weights[1].item())
+                if loss_weighter is not None:
+                    safe_vars = loss_weighter.clamped_log_vars()
+                    weights = torch.exp(-safe_vars)
+                    w_mom = float(weights[0].item()) if weights.numel() > 0 else 1.0
+                    w_cont = float(weights[1].item()) if weights.numel() > 1 else float(explorer.lambda_cont)
+                else:
+                    w_mom = 1.0
+                    w_cont = float(explorer.lambda_cont)
                 print(f"⚖️ Learned PDE Weights -> Cont: {w_cont:.2f} | Mom: {w_mom:.2f}")
                 n_val_anchor = sum(1 for d in val_data if graph_has_anchor(d))
                 print(f"📌 Val split: anchors={n_val_anchor} | physics={max(0, len(val_data) - n_val_anchor)}")
 
-            phys_score = scores.get('rel_l2', 0) + scores.get('continuity', 0)
+            phys_score = scores.get('rel_l2', 0) + (100.0 * scores.get('continuity', 0))
             diary.log_validation(
                 epoch,
                 scores,
@@ -578,6 +810,46 @@ def train_t1_predictor(epochs=60, lr=1e-4, warm_up_epochs=10, adam_epochs=60):
     _emit_tier1_run_end(interrupted=False)
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
 
+    if os.environ.get("TIER1_SKIP_EXPERIMENT_ARTIFACT", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        write_t1_experiment_artifact(
+            explorer,
+            best_rel_l2=best_rel_l2,
+            best_phys_score=best_phys_score,
+            best_loss=best_loss,
+            early_stopped=early_stopped,
+            n_graphs=len(dataset),
+            n_train=len(train_data),
+            n_val=len(val_data),
+            graph_dir=str(cfg_paths.graph_output_dir),
+        )
+
+    return {
+        "status": "ok",
+        "experiment_name": explorer.experiment_name,
+        "best_rel_l2": float(best_rel_l2),
+        "best_phys_score": float(best_phys_score),
+        "best_loss": float(best_loss),
+        "early_stopped": bool(early_stopped),
+        "n_graphs": int(len(dataset)),
+        "n_train": int(len(train_data)),
+        "n_val": int(len(val_data)),
+        "graph_dir": str(cfg_paths.graph_output_dir),
+    }
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Tier 1 GINO-DEQ predictor training (explorer-friendly).")
+    p.add_argument(
+        "--experiment-name",
+        type=str,
+        default=None,
+        help="Sets TIER1_EXPERIMENT_NAME for reports/experiments JSON (same as env).",
+    )
+    return p.parse_args()
+
 
 if __name__ == "__main__":
+    args = _parse_args()
+    if args.experiment_name:
+        os.environ["TIER1_EXPERIMENT_NAME"] = args.experiment_name
     train_t1_predictor()

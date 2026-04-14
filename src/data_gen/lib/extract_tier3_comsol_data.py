@@ -184,6 +184,32 @@ class PatientDataExtractor:
 
         return mask, unmapped_ratio
 
+    def _compute_analytic_inlet_mu_nd(self, mask_inlet, mesh_nodes, u_raw_si, v_raw_si):
+        """Compute analytical Carreau inlet viscosity from a Poiseuille-style profile."""
+        num_nodes = mesh_nodes.shape[0]
+        mu_inlet_nd = torch.zeros((num_nodes, 1), dtype=torch.float32)
+
+        inlet_idx = torch.where(mask_inlet)[0]
+        if inlet_idx.numel() < 2:
+            return mu_inlet_nd
+
+        inlet_coords = torch.tensor(mesh_nodes[inlet_idx.cpu().numpy()], dtype=torch.float32)
+        inlet_center = inlet_coords.mean(dim=0, keepdim=True)
+        r = torch.linalg.norm(inlet_coords - inlet_center, dim=1)
+        R = torch.max(r)
+        if torch.isclose(R, torch.tensor(0.0), atol=1e-12):
+            return mu_inlet_nd
+
+        inlet_speed = torch.sqrt(u_raw_si[inlet_idx] ** 2 + v_raw_si[inlet_idx] ** 2)
+        Umax = torch.max(inlet_speed)
+        gamma_dot = 2.0 * Umax * (r / (R ** 2 + 1e-12))
+
+        shear_term = 1.0 + (self.phys_cfg.lam * gamma_dot) ** self.phys_cfg.a
+        power = (self.phys_cfg.n - 1.0) / self.phys_cfg.a
+        mu_inlet_si = self.phys_cfg.mu_inf + (self.phys_cfg.mu_0 - self.phys_cfg.mu_inf) * (shear_term ** power)
+        mu_inlet_nd[inlet_idx, 0] = self.phys_cfg.viscosity_si_to_nd(mu_inlet_si)
+        return mu_inlet_nd
+
     def load_comsol_trajectory(self, filepath):
         """Parses a single 'wide-format' COMSOL Spreadsheet export."""
 
@@ -310,6 +336,7 @@ class PatientDataExtractor:
 
         y_trajectory = []
         u_raw_list = []
+        v_raw_list = []
 
         # --- Pre-Compute KDTree Mapping ONCE outside the loop ---
         # Load just the first timestep block to establish the spatial mapping
@@ -380,6 +407,7 @@ class PatientDataExtractor:
 
             y_trajectory.append(y_t)
             u_raw_list.append(u_raw)
+            v_raw_list.append(v_raw)
 
             # --- DYNAMIC MASS FLUX CALCULATION ---
             inlet_v = torch.stack([ u_raw[ mask_inlet ], v_raw[ mask_inlet ] ], dim=1)
@@ -512,6 +540,12 @@ class PatientDataExtractor:
 
         # 11. Final PyG Data Save
         uv_inlet_bc = torch.cat([ u_nd_0.unsqueeze(1), v_nd_0.unsqueeze(1) ], dim=1)
+        mu_inlet_bc = self._compute_analytic_inlet_mu_nd(
+            mask_inlet=mask_inlet,
+            mesh_nodes=mesh_nodes,
+            u_raw_si=u_raw_list[0],
+            v_raw_si=v_raw_list[0],
+        )
         data = Data(
             x=x_tensor,
             y=y_tensor_series,
@@ -524,7 +558,7 @@ class PatientDataExtractor:
             re_actual=torch.tensor([ re_actual ], dtype=torch.float32),
             G_x=G_x, G_y=G_y, Laplacian=Laplacian, V=V, W=W, M_inv=M_inv,
             u_inlet_bc=uv_inlet_bc,
-            mu_inlet_bc=mu_nd_0.unsqueeze(1), mu_wall_bc=mu_nd_0.unsqueeze(1),
+            mu_inlet_bc=mu_inlet_bc,
             bio_inlet_bc=bio_inlet_bc,
             outlet_normal=outlet_normals,
         )

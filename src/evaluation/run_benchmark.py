@@ -8,9 +8,7 @@ from datetime import datetime
 from src.utils.paths import comsol_models_dir, data_root, get_project_root, reports_dir, resolve_checkpoint
 
 project_root = get_project_root()
-from src.data_pipeline.vessel_generator import VesselGenerator
-from src.data_pipeline.anchor_generator import AnchorGenerator
-from src.data_pipeline.mesh_to_graph import MeshToGraphComplete
+from src.data_gen import AnchorGenerator, MeshToGraphComplete, VesselGenerator
 from src.evaluation.validate_model import ModelValidator
 
 

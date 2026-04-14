@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
 import math
+from torch import Tensor
 # ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
 from torchdiffeq import odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig
+from src.core_physics.physics_kernels import scatter_add
 
 # Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
 _SPECIES_LOG1P_MIN = -10.0
@@ -64,7 +66,7 @@ class BioODEFunc(nn.Module):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
         z = torch.clamp(z, min=-20.0, max=20.0)
         mod_dummy = torch.zeros(int(edge_index.shape[ 1 ]), 1, dtype=torch.float32, device=z.device)
-        dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_dummy, mod_dummy)
+        dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
         dz_dt = self.derivative_scale * dz_raw
         dz_dt = torch.clamp(dz_dt, min=-10.0, max=10.0)
         if self.training:
@@ -116,7 +118,8 @@ class GNODE_Tier3(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
         self.kin_processor = GINOBlock(latent_dim)
-        self.kinematics_decoder = nn.Linear(latent_dim, 3)
+        # Stream-function formulation for kinematics: decoder predicts (psi, p).
+        self.kinematics_decoder = nn.Linear(latent_dim, 2)
         self.mu_encoder = nn.Linear(1, latent_dim)
 
         # ==========================================
@@ -145,8 +148,8 @@ class GNODE_Tier3(nn.Module):
         self.kinematics_decoder.eval()
         self.mu_encoder.eval()
 
-    def _apply_fourier_encoding(self, x):
-        nodes_nd = x[:, 0:2]
+    def _apply_fourier_encoding(self, x, pos_nd=None):
+        nodes_nd = pos_nd if pos_nd is not None else x[:, 0:2]
         sdf_nd = x[:, 2:3]
         shear_pot = torch.zeros_like(sdf_nd)
         wall_normal = x[:, 3:5]
@@ -168,6 +171,54 @@ class GNODE_Tier3(nn.Module):
             rest, uv_prior, mu_prior, wss_prior
         ], dim=1)
         return encoded_x
+
+    def _compute_wls_derivatives(self, field: Tensor, batch) -> Tensor:
+        """Compute WLS derivatives [d/dx, d/dy, d2/dx2, d2/dxdy, d2/dy2] for a nodal scalar."""
+        row, col = batch.edge_index
+        num_nodes = batch.num_nodes
+        V, W, M_inv = batch.V, batch.W, batch.M_inv
+
+        u = field if field.dim() == 2 else field.unsqueeze(-1)
+        du = u[col] - u[row]
+
+        w = W.view(-1, 1, 1)
+        v = V.unsqueeze(2)
+        du_unsq = du.unsqueeze(1)
+        b_e = w * torch.bmm(v, du_unsq)
+
+        c = u.shape[1]
+        b_flat = scatter_add(b_e.view(-1, 5 * c), row, dim=0, dim_size=num_nodes)
+        b = b_flat.view(num_nodes, 5, c)
+        return torch.bmm(M_inv, b)
+
+    def _stream_to_velocity(
+        self,
+        psi_raw: Tensor,
+        p: Tensor,
+        batch,
+        sdf: Tensor,
+        wall_normal: Tensor,
+    ) -> torch.Tensor:
+        """Convert (psi, p) -> (u, v, p) using WLS derivatives + manual product rule."""
+        c_psi = self._compute_wls_derivatives(psi_raw, batch)
+        psi_x = c_psi[:, 0:1, 0]
+        psi_y = c_psi[:, 1:2, 0]
+        n_x = wall_normal[:, 0:1]
+        n_y = wall_normal[:, 1:2]
+        u = (sdf ** 2) * psi_y + psi_raw * 2.0 * sdf * n_y
+        v = -((sdf ** 2) * psi_x + psi_raw * 2.0 * sdf * n_x)
+        return torch.cat([u, v, p], dim=1)
+
+    def _decode_constrained_uvp(self, z_kin: torch.Tensor, kin_in: torch.Tensor, batch) -> torch.Tensor:
+        """
+        Decode latent kinematics and recover velocity analytically via product rule.
+        """
+        psi_p = self.kinematics_decoder(z_kin)
+        psi_raw = psi_p[:, 0:1]
+        p = psi_p[:, 1:2]
+        sdf = kin_in[:, 2:3]
+        wall_normal = kin_in[:, 3:5]
+        return self._stream_to_velocity(psi_raw, p, batch, sdf, wall_normal)
 
     def _decode_species_log1p(self, raw_species: torch.Tensor) -> torch.Tensor:
         """Decoder predicts log1p(species_nd) directly; clamp to a safe training range."""
@@ -215,7 +266,7 @@ class GNODE_Tier3(nn.Module):
                 else torch.zeros(num_nodes, dtype=torch.long, device=device)
             )
             mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy)
+            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
 
         with torch.no_grad():
             for _ in range(self.max_inner_iters):
@@ -225,7 +276,8 @@ class GNODE_Tier3(nn.Module):
                 z_kin = 0.5 * z_kin + 0.5 * z_kin_next
                 if diff < 1e-4:
                     break
-            u_v_p = self.kinematics_decoder(z_kin)[:, :3]
+        with torch.enable_grad():
+            u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
 
         bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15]], dim=-1)
 
@@ -301,7 +353,7 @@ class GNODE_Tier3(nn.Module):
                                                                                                             dtype=torch.long,
                                                                                                             device=device)
             mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy)
+            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
 
         def odefunc_wrapper(t, z):
             batch_idx = batch.batch if hasattr(batch, 'batch') and batch.batch is not None else torch.zeros(num_nodes,
@@ -348,7 +400,7 @@ class GNODE_Tier3(nn.Module):
 
             injection = self.kin_encoder(kin_encoded) + mu_enc
             z_kin = apply_kin_processor(injection + z_kin_ws.detach())
-            u_v_p = self.kinematics_decoder(z_kin)[:, :3]
+            u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
 
             # --- B. UPDATE DYNAMIC RHEOLOGY FOR CURRENT TIME ---
             u_nd = u_v_p[:, 0:1]

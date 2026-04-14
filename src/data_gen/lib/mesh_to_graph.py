@@ -9,7 +9,7 @@ from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig
-from src.data_pipeline.mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
+from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from src.utils.paths import get_project_root
 
 
@@ -353,13 +353,13 @@ def build_mesh_converter(
     """
     t = (tier or "tier1").lower()
     if is_non_newtonian is True:
-        from src.data_pipeline.mesh_to_graph_tier3 import MeshToGraphTier3
+        from .mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)
     if is_non_newtonian is False:
         return MeshToGraphComplete(tier=tier, **kwargs)
     if t in ("tier3", "tier3_patients"):
-        from src.data_pipeline.mesh_to_graph_tier3 import MeshToGraphTier3
+        from .mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)
     return MeshToGraphComplete(tier=tier, **kwargs)

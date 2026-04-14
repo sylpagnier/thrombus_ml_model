@@ -58,10 +58,15 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
 
             H = torch.bmm(G_flat, G_flat.transpose(1, 2))
             I_max = torch.eye(n_history, dtype=z0.dtype, device=z0.device).unsqueeze(0).expand(bsz, -1, -1)
-            H = H + lam * I_max
+            # Keep regularization relative to the current residual scale so Anderson
+            # does not collapse into Picard as training residuals shrink.
+            diag_mean = torch.diagonal(H, dim1=1, dim2=2).mean(dim=1, keepdim=True).unsqueeze(-1)
+            eps_safe = 1e-6 * diag_mean + 1e-12
+            reg = lam * diag_mean + eps_safe
+            H = H + reg * I_max
 
             y_slice = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device)
-            alpha = torch.linalg.lstsq(H, y_slice).solution
+            alpha = torch.linalg.solve(H, y_slice)
             alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
             alpha = alpha.view(bsz, n_history, 1)
 

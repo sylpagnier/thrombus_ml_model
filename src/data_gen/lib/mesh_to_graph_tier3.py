@@ -3,7 +3,7 @@ Tier 3 synthetic mesh-to-graph conversion.
 
 Scope: non-anchor Tier 3 samples (synthetic meshes / priors-only trajectory setup).
 Anchor/patient samples with COMSOL trajectories are produced by:
-``src.data_pipeline.extract_tier3_comsol_data.PatientDataExtractor``.
+``src.data_gen.lib.extract_tier3_comsol_data.PatientDataExtractor``.
 """
 
 import os
@@ -16,7 +16,7 @@ from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
-from src.data_pipeline.mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
+from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from src.utils.paths import get_project_root
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -454,7 +454,6 @@ class MeshToGraphTier3:
                 M_inv=M_inv,
                 u_inlet_bc=uv_inlet_bc,
                 mu_inlet_bc=mu_prior.view(-1, 1),
-                mu_wall_bc=mu_prior.view(-1, 1),
                 bio_inlet_bc=bio_inlet_bc,
                 outlet_normal=outlet_normal,
             )
@@ -467,7 +466,6 @@ class MeshToGraphTier3:
                         u_ref=torch.tensor([u_ref], dtype=torch.float32),
                         u_inlet_bc=u_prior.view(-1, 1),
                         mu_inlet_bc=mu_prior.view(-1, 1),
-                        mu_wall_bc=mu_prior.view(-1, 1),
                         outlet_normal=outlet_normal,
                         V=V, W=W, M_inv=M_inv,
                         G_x=G_x, G_y=G_y, Laplacian=Laplacian)

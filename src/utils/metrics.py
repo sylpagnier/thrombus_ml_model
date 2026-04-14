@@ -115,18 +115,18 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     with torch.no_grad():
         data_on_device = Batch.from_data_list([val_data]).to(device)
         pred = model(data_on_device, solver="anderson", anderson_beta=0.8)
-        coords = data_on_device.x[:, :2].cpu().numpy()
+        coords = data_on_device.x[:, :2].detach().cpu().numpy()
 
     plt.figure(figsize=(10, 4))
 
     # --- Setup Tier-Specific Plotting Rules ---
     if tier == "tier1":
-        val_pred = pred[:, 0].cpu().numpy()  # u-velocity
+        val_pred = pred[:, 0].detach().cpu().numpy()  # u-velocity
         cmap, label = 'jet', r"Predicted ND-Velocity (u)"
         title = f"Tier 1 Validation - Epoch {epoch}"
         use_log_norm = False
     else:
-        val_pred = pred[:, 3].cpu().numpy()  # viscosity
+        val_pred = pred[:, 3].detach().cpu().numpy()  # viscosity
         cmap, label = 'viridis', r"Predicted ND-Viscosity ($\mu$)"
         title = f"Tier 2 Validation (Carreau) - Epoch {epoch}"
         # Viscosity MUST be plotted in log-scale to visualize the boundary layer

@@ -5,9 +5,7 @@ import matplotlib.tri as mtri
 import argparse
 from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
-from src.data_pipeline.mesh_to_graph import MeshToGraphComplete
-from src.data_pipeline.vessel_generator import VesselGeneratorTier3
-from src.data_pipeline.mesh_to_graph_tier3 import MeshToGraphTier3
+from src.data_gen import MeshToGraphComplete, MeshToGraphTier3, VesselGeneratorTier3
 from src.architecture.ginodeq import GINO_DEQ
 from src.architecture.gnode_tier3 import GNODE_Tier3
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND

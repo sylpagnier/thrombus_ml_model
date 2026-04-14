@@ -1,10 +1,10 @@
 """Inventory helpers for ``anchor_generator`` and ``vessel_generator`` (mesh/NPZ paths, next index)."""
 
-from src.data_pipeline.anchor_generator import (
+from src.data_gen.lib.anchor_generator import (
     list_anchor_candidate_json_paths,
     summarize_anchor_inventory,
 )
-from src.data_pipeline.vessel_generator import summarize_vessel_mesh_inventory
+from src.data_gen.lib.vessel_generator import summarize_vessel_mesh_inventory
 
 
 def test_summarize_anchor_inventory(tmp_path):

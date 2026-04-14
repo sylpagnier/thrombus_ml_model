@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Optional
 
@@ -19,6 +20,18 @@ def scatter_add(src, index, dim=0, dim_size=None):
 class PhysicsKernels:
     def __init__(self, phys_cfg):
         self.cfg = phys_cfg
+        self.ns_derivative_mode = os.environ.get("PHYSICS_NS_DERIVATIVE_MODE", "wls").strip().lower()
+        if self.ns_derivative_mode not in ("wls", "autograd"):
+            self.ns_derivative_mode = "wls"
+        self.advect_detach = os.environ.get("TIER1_ADVECT_DETACH", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.momentum_loss_mode = os.environ.get("TIER1_MOMENTUM_LOSS_MODE", "huber").strip().lower()
+        if self.momentum_loss_mode not in ("huber", "mse"):
+            self.momentum_loss_mode = "huber"
+        self.momentum_huber_delta = float(os.environ.get("TIER1_MOMENTUM_HUBER_DELTA", "0.01"))
+        self.pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "mean").strip().lower()
+        if self.pressure_bc_mode not in ("mean", "pointwise", "mean_var"):
+            self.pressure_bc_mode = "mean"
+        self._autograd_mode_warned = False
 
         # ND Carreau bounds use the same scale as label channel STATE_CHANNEL_MU_EFF_ND
         _mu_nd_scale = self.cfg.mu_viscosity_nd_scale
@@ -57,6 +70,10 @@ class PhysicsKernels:
             row, col = data_or_props.edge_index
             num_nodes = data_or_props.num_nodes
             V, W, M_inv = data_or_props.V, data_or_props.W, data_or_props.M_inv
+
+        # Backward compatibility: older graphs may store M_inv with shape [N, 1, 5, 5].
+        if M_inv.dim() == 4 and M_inv.shape[1] == 1:
+            M_inv = M_inv.squeeze(1)
 
         if u.dim() == 1:
             u = u.unsqueeze(-1)
@@ -112,7 +129,40 @@ class PhysicsKernels:
         mask_outlet_1d = data.mask_outlet.view(-1).bool()
         return ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
 
-    def navier_stokes_residual(self, pred, data, props=None, re_ref: Optional[float] = None):
+    @staticmethod
+    def _safe_grad(outputs, inputs, retain_graph=True, create_graph=True):
+        g = torch.autograd.grad(
+            outputs=outputs,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(outputs),
+            retain_graph=retain_graph,
+            create_graph=create_graph,
+            allow_unused=True,
+        )[0]
+        if g is None:
+            return torch.zeros_like(inputs)
+        return g
+
+    def _compute_autograd_derivatives(self, field: torch.Tensor, coords_xy: torch.Tensor):
+        """Compute [x, y, xx, xy, yy] derivatives using torch.autograd."""
+        d1 = self._safe_grad(field, coords_xy)
+        dfdx = d1[:, 0]
+        dfdy = d1[:, 1]
+        d2x = self._safe_grad(dfdx, coords_xy)
+        d2y = self._safe_grad(dfdy, coords_xy)
+        dfdxx = d2x[:, 0]
+        dfdxy = d2x[:, 1]
+        dfdyy = d2y[:, 1]
+        return dfdx, dfdy, dfdxx, dfdxy, dfdyy
+
+    def navier_stokes_residual(
+        self,
+        pred,
+        data,
+        props=None,
+        re_ref: Optional[float] = None,
+        re_scale: Optional[float] = None,
+    ):
         if props is None:
             if hasattr(data, 'M_inv'):
                 props = data
@@ -130,12 +180,18 @@ class PhysicsKernels:
             d_bar = data.d_bar.squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
         # --------------------------------------
 
-        # Compute first and second derivatives
+        if self.ns_derivative_mode == "autograd" and not self._autograd_mode_warned:
+            print("⚠️ ns_derivative_mode='autograd' requested, but PDE derivatives in message-passing GNNs are non-local. Falling back to WLS derivatives.")
+            self._autograd_mode_warned = True
+
+        # Compute first and second derivatives from the WLS operator.
         c_u = self._compute_derivatives(u.unsqueeze(1), props)
         c_v = self._compute_derivatives(v.unsqueeze(1), props)
         c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-        # Extract primary 1st and 2nd derivatives, plus cross derivatives (xy)
+        # Extract primary 1st and 2nd derivatives, plus cross derivatives (xy).
+        # NOTE: WLS basis is [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2] in mesh_wls.py,
+        # so c[:,2] and c[:,4] already correspond to true u_xx / u_yy (no extra factor of 2 needed).
         u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
         v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
         u_xy = c_u[:, 3, 0]
@@ -145,6 +201,9 @@ class PhysicsKernels:
         # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
         # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.
         Re = self.cfg.get_re(u_ref, d_bar)
+        if re_scale is not None:
+            scale_t = torch.as_tensor(re_scale, device=Re.device, dtype=Re.dtype)
+            Re = Re * scale_t
         if re_ref is not None:
             ref_t = torch.as_tensor(re_ref, device=Re.device, dtype=Re.dtype)
             Re = ref_t.expand_as(Re)
@@ -171,18 +230,27 @@ class PhysicsKernels:
             visc_y = (1.0 / Re) * (2 * mu_y * v_y + mu_x * (u_y + v_x) + mu_eff * (2 * v_yy + v_xx + u_xy))
 
         else:
-            # Full Newtonian formulation
-            visc_x = (1.0 / Re) * (2 * u_xx + u_yy + v_xy)
-            visc_y = (1.0 / Re) * (2 * v_yy + v_xx + u_xy)
+            # Newtonian stream-function formulation: robust Laplacian form.
+            visc_x = (1.0 / Re) * (u_xx + u_yy)
+            visc_y = (1.0 / Re) * (v_xx + v_yy)
 
         # Calculate Convective Momentum
-        mom_x = (u * u_x + v * u_y) + p_x - visc_x
-        mom_y = (u * v_x + v * v_y) + p_y - visc_y
+        if self.advect_detach:
+            mom_x = (u.detach() * u_x + v.detach() * u_y) + p_x - visc_x
+            mom_y = (u.detach() * v_x + v.detach() * v_y) + p_y - visc_y
+        else:
+            mom_x = (u * u_x + v * u_y) + p_x - visc_x
+            mom_y = (u * v_x + v * v_y) + p_y - visc_y
 
         interior_mask = self.fluid_interior_mask(data)
 
         if interior_mask.any():
-            loss_mom = torch.mean(mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2)
+            mom_sq = mom_x[interior_mask] ** 2 + mom_y[interior_mask] ** 2
+            if self.momentum_loss_mode == "mse":
+                loss_mom = torch.mean(mom_sq)
+            else:
+                delta = max(float(self.momentum_huber_delta), 1e-8)
+                loss_mom = torch.mean(delta ** 2 * (torch.sqrt(1.0 + mom_sq / (delta ** 2)) - 1.0))
         else:
             loss_mom = pred.sum() * 0.0
 
@@ -194,6 +262,7 @@ class PhysicsKernels:
         du_ij: torch.Tensor,
         data=None,
         interior_mask: Optional[torch.Tensor] = None,
+        disabled: bool = False,
     ):
         """
         Mean squared divergence (∇·u)².
@@ -202,6 +271,9 @@ class PhysicsKernels:
         :meth:`fluid_interior_mask` so continuity matches the momentum residual domain.
         If neither is given, averages over all rows of ``du_ij`` (synthetic / unit tests).
         """
+        if disabled:
+            return du_ij.sum() * 0.0
+
         du_dx = du_ij[:, 0]
         dv_dy = du_ij[:, 3]
 
@@ -306,28 +378,13 @@ class PhysicsKernels:
         return loss
 
     def boundary_condition_loss(self, pred, data):
-        u, v = pred[:, 0], pred[:, 1]
-        loss_wall = torch.tensor(0.0, device=pred.device)
-        mask_wall_1d = data.mask_wall.view(-1).bool()
-
-        if mask_wall_1d.any():
-            # 1. Kinematics (No-slip velocity)
-            u_wall = u[mask_wall_1d]
-            v_wall = v[mask_wall_1d]
-            loss_wall = torch.mean(u_wall ** 2 + v_wall ** 2)
-
-            # --- Rheology (Minimum Viscosity at Max Shear) ---
-            if self.cfg.viscosity_model == "carreau" and hasattr(data, 'mu_wall_bc'):
-                mu_pred = pred[:, 3]
-                mu_wall_pred = mu_pred[mask_wall_1d].squeeze()
-
-                # Ensure the BC is on the correct GPU device
-                mu_target_bc = data.mu_wall_bc[mask_wall_1d].squeeze().to(pred.device)
-
-                # Weight matches the inlet penalty
-                loss_wall += 2.0 * torch.nn.functional.smooth_l1_loss(mu_wall_pred, mu_target_bc)
-
-        return loss_wall
+        # Soft wall no-slip penalty is retained even when a hard architectural constraint exists,
+        # so direct-velocity and stream-function branches can be compared safely.
+        mask_wall = data.mask_wall.view(-1).bool()
+        if not mask_wall.any():
+            return pred.sum() * 0.0
+        uv_wall = pred[mask_wall, 0:2]
+        return torch.mean(torch.sum(uv_wall * uv_wall, dim=1))
 
     def wall_shear_stress_loss(self, pred, data, props=None):
         """
@@ -337,44 +394,37 @@ class PhysicsKernels:
         if props is None:
             props = self._get_geometric_props(data)
 
-        u, v = pred[:, 0:1], pred[:, 1:2]
-        mu = pred[:, 3:4]
         wss_pred = pred[:, 4]
 
         mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
             return pred.sum() * 0.0
 
+        if (not hasattr(data, "y")) or (data.y is None) or (data.y.shape[1] <= 4):
+            return pred.sum() * 0.0
+        # Supervise against precomputed COMSOL wall WSS target stored in label channel 4.
+        wss_mag_phys = data.y[:, 4]
+        wss_pred_wall = wss_pred[mask_wall]
+        wss_true_wall = wss_mag_phys[mask_wall]
+        loss_data = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_true_wall, beta=0.01)
+
+        # Couple WSS head to predicted near-wall kinematics through analytical shear-rate consistency.
+        u = pred[:, 0:1]
+        v = pred[:, 1:2]
         c_u = self._compute_derivatives(u, props)
         c_v = self._compute_derivatives(v, props)
+        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
+        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
+        strain_sq = 2.0 * (u_x ** 2 + v_y ** 2) + (u_y + v_x) ** 2
+        gamma_dot = torch.sqrt(strain_sq + 1e-8)
+        if self.cfg.viscosity_model == "carreau" and pred.shape[1] > 3:
+            mu_wall = pred[:, 3][mask_wall]
+        else:
+            mu_wall = torch.full_like(wss_pred_wall, float(self.cfg.mu_viscosity_nd_scale))
+        wss_phys_wall = mu_wall * gamma_dot[mask_wall]
+        loss_phys = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_phys_wall, beta=0.01)
 
-        dudx, dudy = c_u[:, 0, 0], c_u[:, 1, 0]
-        dvdx, dvdy = c_v[:, 0, 0], c_v[:, 1, 0]
-
-        # --- 1. Compute 2D Viscous Stress Tensor (tau) at the walls ---
-        mu_wall = mu[mask_wall, 0]
-        tau_xx = 2.0 * mu_wall * dudx[mask_wall]
-        tau_yy = 2.0 * mu_wall * dvdy[mask_wall]
-        tau_xy = mu_wall * (dudy[mask_wall] + dvdx[mask_wall])
-
-        # --- 2. Extract Wall Normals (Columns 4 and 5 in x_tensor) ---
-        nx = data.x[mask_wall, 4]
-        ny = data.x[mask_wall, 5]
-
-        # --- 3. Project to find Traction Vector (T = tau * n) ---
-        tx = tau_xx * nx + tau_xy * ny
-        ty = tau_xy * nx + tau_yy * ny
-
-        # --- 4. Extract Tangential Component (WSS) ---
-        t_n = tx * nx + ty * ny
-        wss_x_phys = tx - t_n * nx
-        wss_y_phys = ty - t_n * ny
-        wss_mag_phys = torch.sqrt(wss_x_phys ** 2 + wss_y_phys ** 2 + 1e-8)
-
-        # Target WSS is what the model explicitly predicted in channel 4
-        wss_pred_wall = wss_pred[mask_wall]
-
-        return torch.nn.functional.mse_loss(wss_pred_wall, wss_mag_phys)
+        return loss_data + (0.5 * loss_phys)
 
 
     def inlet_outlet_loss(self, pred, data):
@@ -394,16 +444,25 @@ class PhysicsKernels:
 
         if mask_inlet_1d.any():
             u_target = data.u_inlet_bc[mask_inlet_1d, 0].to(device)
+            has_v_target = (
+                torch.is_tensor(data.u_inlet_bc)
+                and data.u_inlet_bc.dim() > 1
+                and data.u_inlet_bc.shape[1] > 1
+            )
+            v_target = data.u_inlet_bc[mask_inlet_1d, 1].to(device) if has_v_target else None
 
-            u_in = u[mask_inlet_1d].squeeze()
-            v_in = v[mask_inlet_1d].squeeze()
+            u_in = u[mask_inlet_1d].squeeze(-1)
+            v_in = v[mask_inlet_1d].squeeze(-1)
 
-            loss_inlet = torch.mean((u_in - u_target) ** 2 + v_in ** 2)
+            if v_target is not None:
+                loss_inlet = torch.mean((u_in - u_target) ** 2 + (v_in - v_target) ** 2)
+            else:
+                loss_inlet = torch.mean((u_in - u_target) ** 2 + v_in ** 2)
 
             if self.cfg.viscosity_model == "carreau" and hasattr(data, 'mu_inlet_bc'):
                 mu_pred = pred[:, 3]
-                mu_in = mu_pred[mask_inlet_1d].squeeze()
-                mu_target_bc = data.mu_inlet_bc[mask_inlet_1d].squeeze().to(device)
+                mu_in = mu_pred[mask_inlet_1d].squeeze(-1)
+                mu_target_bc = data.mu_inlet_bc[mask_inlet_1d].squeeze(-1).to(device)
 
                 loss_inlet += 2.0 * torch.nn.functional.smooth_l1_loss(mu_in, mu_target_bc)
 
@@ -411,6 +470,11 @@ class PhysicsKernels:
         mask_outlet_1d = data.mask_outlet.view(-1).bool()
         if mask_outlet_1d.any():
             p_out = p[mask_outlet_1d]
-            loss_outlet = torch.mean(p_out ** 2)
+            if self.pressure_bc_mode == "pointwise":
+                loss_outlet = torch.mean(p_out ** 2)
+            elif self.pressure_bc_mode == "mean_var":
+                loss_outlet = (torch.mean(p_out) ** 2) + (0.1 * torch.var(p_out, unbiased=False))
+            else:
+                loss_outlet = torch.mean(p_out) ** 2
 
         return loss_inlet + loss_outlet

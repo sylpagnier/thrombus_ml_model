@@ -368,9 +368,10 @@ class AnchorGenerator:
 
         Builds the pool of geometries (valid ``.nas`` + ``.msh``). By default only stems without
         ``.npz`` are eligible; with ``allow_overwrite=True``, existing ``.npz`` files may be replaced.
-        Then walks that pool until enough saves succeed or the pool is exhausted. Failed solves (NaNs,
-        trivial flow, exceptions) do not count toward ``max_new``; the loop continues with the next
-        candidate.
+        Then walks candidates **in order** until enough saves succeed or the list is exhausted.
+        Failed solves (NaNs, trivial flow, exceptions) **do not** count toward ``max_new``; each
+        failure skips to the **next** CFD-ready geometry so the batch still aims for ``max_new``
+        successes when enough candidates exist.
 
         Parameters
         ----------
@@ -410,6 +411,11 @@ class AnchorGenerator:
             f"candidate pool (no .npz, has .nas+.msh)={pool_full}, "
             f"will attempt min(len(pool), cap)={len(candidates)} geometries."
         )
+        logger.info(
+            "Failed solves (exceptions, NaNs, trivial flow) do not count toward the target; "
+            "the batch continues with the next CFD-ready geometry until the target is met or "
+            "the candidate list is exhausted."
+        )
 
         try:
             mesh_j = self.model.java.component("comp1").mesh("mesh1")
@@ -421,6 +427,7 @@ class AnchorGenerator:
                 "requested_new": max_new,
                 "new_written": 0,
                 "attempted": 0,
+                "failed_or_discarded": 0,
                 "pool_full": pool_full,
                 "pool_attempted": len(candidates),
                 "pool_exhausted": True,
@@ -429,6 +436,7 @@ class AnchorGenerator:
 
         new_written = 0
         attempted = 0
+        n_failed = 0
         for json_file in tqdm(candidates, desc="Anchors"):
             if new_written >= max_new:
                 break
@@ -437,14 +445,18 @@ class AnchorGenerator:
                 json_file, mesh_j, import_tag, allow_overwrite=allow_overwrite
             ):
                 new_written += 1
+            else:
+                n_failed += 1
 
         pool_exhausted = new_written < max_new and attempted >= len(candidates)
         if new_written < max_new:
             logger.warning(
-                f"Anchor batch finished short: wrote {new_written}/{max_new} new .npz "
-                f"after {attempted} attempt(s). "
+                f"Anchor batch finished short: {new_written}/{max_new} new .npz after "
+                f"{attempted} attempt(s) ({n_failed} failed or discarded, {new_written} saved). "
                 + (
-                    "Candidate pool exhausted — generate more vessel meshes for this tier, then re-run."
+                    "All CFD-ready candidates in this pass were tried — no more geometries left to "
+                    "reach the target; generate more vessel meshes for this tier or raise "
+                    "max_json_to_scan / remove the scan cap."
                     if pool_exhausted
                     else "Raise max_json_to_scan (or leave it unset) to try more existing geometries."
                 )
@@ -457,6 +469,7 @@ class AnchorGenerator:
             "requested_new": max_new,
             "new_written": new_written,
             "attempted": attempted,
+            "failed_or_discarded": n_failed,
             "pool_full": pool_full,
             "pool_attempted": len(candidates),
             "pool_exhausted": pool_exhausted,

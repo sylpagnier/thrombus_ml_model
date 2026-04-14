@@ -19,6 +19,8 @@ This document gives **enough structure** to navigate the repo without re-reading
 | Tier 1 only | `python -m src.training.train_t1_predictor` |
 | Tier 2 only | `python -m src.training.train_t2_predictor` |
 | Tier 3 only | `python -m src.training.train_t3_corrector` |
+| Tier 1/2 datagen | `python -m src.data_gen.pipeline_tier12` |
+| Tier 3 datagen | `python -m src.data_gen.pipeline_tier3` |
 
 Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint` returns the canonical path under those dirs).
 
@@ -28,7 +30,7 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 
 - **`src/core_physics/`** — PDE-consistent building blocks (fluid kinematics, rheology, biochem kernels). Shared by training and tests.
 - **`src/architecture/`** — Model classes, DEQ loop, LoRA hooks.
-- **`src/data_pipeline/`** — Gmsh/mesh → PyG `Data`, WLS helpers, Tier 3-specific converters where split.
+- **`src/data_gen/`** — Top-level **pipelines** (`pipeline_tier12`, `pipeline_tier3`); **`lib/`** holds mesh/COMSOL/graph builders imported by those pipelines and re-exported from `src.data_gen`.
 - **`src/training/`** — `physics_curriculum.py` and the three `train_*` scripts; import LoRA helpers from `src.architecture.lora_injection` when needed.
 - **`src/evaluation/`** — Benchmark drivers, tier comparison plots (may reference checkpoint paths).
 - **`src/utils/`** — `paths`, `metrics`, `inference`, kinematics loss helpers aligned with training.

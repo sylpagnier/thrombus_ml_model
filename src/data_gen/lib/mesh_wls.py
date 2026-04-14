@@ -10,7 +10,7 @@ import torch
 
 def precompute_wls_operators(edge_index: torch.Tensor, num_nodes: int, pos_tensor: torch.Tensor):
     """
-    2nd-order polynomial WLS on edges; returns ``V``, ``W``, ``M_inv`` (with dummy dim on ``M_inv``).
+    2nd-order polynomial WLS on edges; returns ``V``, ``W``, ``M_inv``.
     """
     row, col = edge_index
     pos_diff = pos_tensor[col, :2] - pos_tensor[row, :2]
@@ -40,7 +40,7 @@ def precompute_wls_operators(edge_index: torch.Tensor, num_nodes: int, pos_tenso
     M_reg = M + epsilon * I
     M_inv = torch.linalg.pinv(M_reg)
 
-    return V, W, M_inv.unsqueeze(1)
+    return V, W, M_inv
 
 
 def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
