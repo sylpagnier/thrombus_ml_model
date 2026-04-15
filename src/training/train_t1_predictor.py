@@ -381,6 +381,9 @@ def train_t1_predictor(
     latest_ckpt_path = resolve_checkpoint("a", "tier1_latest_checkpoint.pth")
     best_physics_path = resolve_checkpoint("a", "tier1_best_physics.pth")
     ckpt_every = max(1, int(os.environ.get("TIER1_CKPT_EVERY", "1")))
+    disable_stage_a_artifacts = (
+        os.environ.get("TIER1_DISABLE_STAGE_A_ARTIFACTS", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
     resume_enabled = (os.environ.get("TIER1_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_from_best_enabled = (os.environ.get("TIER1_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_done = False
@@ -686,7 +689,7 @@ def train_t1_predictor(
             print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         avg_loss = total_loss_epoch / max(1, len(loader))
-        if avg_loss < best_loss and physics_active:
+        if (not disable_stage_a_artifacts) and avg_loss < best_loss and physics_active:
             best_loss = avg_loss
             save_path = model_dir / "tier1_best_loss.pth"
             torch.save(model.state_dict(), save_path)
@@ -697,18 +700,19 @@ def train_t1_predictor(
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
-                "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
-                "best_phys_score": best_phys_score,
-                "best_loss": best_loss,
-                "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
-            }
-            torch.save(checkpoint, latest_ckpt_save)
-            print(f"💾 Saved Tier 1 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
+            if not disable_stage_a_artifacts:
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
+                    "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
+                    "best_phys_score": best_phys_score,
+                    "best_loss": best_loss,
+                    "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
+                }
+                torch.save(checkpoint, latest_ckpt_save)
+                print(f"💾 Saved Tier 1 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
 
         diary.log_epoch_end(
             epoch,
@@ -801,7 +805,7 @@ def train_t1_predictor(
                     )
                     break
 
-            if phys_score < best_phys_score and physics_active:
+            if (not disable_stage_a_artifacts) and phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
                 save_path = model_dir / "tier1_best_physics.pth"
                 torch.save(model.state_dict(), save_path)

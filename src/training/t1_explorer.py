@@ -50,6 +50,7 @@ import atexit
 import json
 import os
 import signal
+import traceback
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -232,29 +233,41 @@ def write_t1_sweep_report(payload: Dict[str, Any], sweep_name: str) -> Path:
     return path
 
 
+def _safe_name(name: str, max_len: int = 80) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:max_len]
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return path
+
+
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    Surgical Tier 1 5-candidate sweep for a ~5 hour budget.
-
-    Fixed baseline for all candidates:
-    - direct_uvp kinematics
-    - SiLU activation
-    - kinematic pressure weight = 1.0
-    - L-BFGS enabled
-    - 12 total epochs, 10 AdamW epochs (final 2 epochs in L-BFGS phase)
+    Surgical Tier 1 3-candidate sweep for a ~10 hour budget (L-BFGS Disabled).
+    Targeting <5% Rel L2 error through high capacity, extended AdamW, and strict pressure pinning.
     """
     base_overrides = {
-        "TIER1_DISABLE_FIGURES": "1",
-        "TIER1_CKPT_EVERY": "10",
-        "TIER1_EARLY_STOP_PATIENCE": "5",
-        "TIER1_LOSS_WEIGHT_MODE": "fixed",
-        "TIER1_USE_LBFGS": "1",
+        "TIER1_DISABLE_FIGURES": "1", # Set to "0" if you want to watch the validation plots locally
+        "TIER1_CKPT_EVERY": "20",
+        "TIER1_EARLY_STOP_PATIENCE": "15", # Increased patience for longer 40-epoch runs
+        "TIER1_LOSS_WEIGHT_MODE": "dynamic", # Switch back to dynamic so it balances the stiff PDEs automatically
+        "TIER1_USE_LBFGS": "0", # Explicitly disabled
         "TIER1_KINEMATICS_MODE": "direct_uvp",
         "TIER1_ACTIVATION_FN": "silu",
-        "TIER1_KINE_P_WEIGHT": "1.0",
-        "TIER1_EPOCHS": "12",
-        "TIER1_ADAM_EPOCHS": "10",
+        
+        # --- Strict Pressure & Boundary Enforcement ---
+        "TIER1_KINE_P_WEIGHT": "5.0",
+        "TIER1_P_GRAD_SUPERVISION": "1.0",
+        "TIER1_PRESSURE_BC_MODE": "pointwise",
+        
+        # --- Time Horizon ---
+        "TIER1_EPOCHS": "40",
+        "TIER1_ADAM_EPOCHS": "40",
     }
+    
     def _env_for(cfg: T1ExplorerConfig) -> Dict[str, str]:
         return {
             "TIER1_EXPERIMENT_NAME": cfg.experiment_name,
@@ -279,28 +292,36 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_PRESSURE_BC_MODE": cfg.pressure_bc_mode,
             "TIER1_MOMENTUM_LOSS_MODE": cfg.momentum_loss_mode,
         }
+    
+    # Specs: (name, weight_mode, latent_dim, deq_iters, fourier_base, anchor_frac)
     candidate_specs = [
-        ("C_A_Standard", 1, "sdf_wall", 2.0, 0.5),
-        ("C_B_HighFreq", 1, "sdf_wall", 1.5, 0.5),
-        ("C_C_SDFGrad", 1, "sdf_grad", 2.0, 0.5),
-        ("C_D_AnchorHeavy", 1, "sdf_wall", 2.0, 0.7),
-        ("C_E_CoupledNS", 0, "sdf_wall", 2.0, 0.5),
+        # Moved to front to fail-fast if I/O crash persists
+        ("C2_MaxCap_SDFGrad",   "sdf_grad",   128, 25, 2.0, 0.7),
+
+        # C1: Max capacity + Ground-truth shear weighting (Often the best for CFD surrogate accuracy)
+        ("C1_MaxCap_ShearTrue", "shear_true", 128, 25, 2.0, 0.7),
+
+        # C3: Ultra-deep DEQ solver (30 iters) with high-frequency spatial encoding
+        ("C3_DeepSolve_HiFreq", "sdf_wall",   128, 30, 1.5, 0.7),
     ]
+    
     candidates: List[T1SweepCandidate] = []
-    for name, advect_detach, weight_mode, fourier_base, anchor_frac in candidate_specs:
+    for name, weight_mode, latent_dim, deq_iters, fourier_base, anchor_frac in candidate_specs:
         cfg = T1ExplorerConfig(
             experiment_name=name,
             kinematics_mode="direct_uvp",
             ns_derivative_mode="wls",
             activation_fn="silu",
-            loss_weight_mode="fixed",
+            loss_weight_mode="dynamic",
             fourier_base=float(fourier_base),
-            advect_detach=bool(advect_detach),
+            advect_detach=True,
             kine_weight_mode=weight_mode,
+            latent_dim=int(latent_dim),
+            deq_max_iters=int(deq_iters),
         )
         env = {
-            **base_overrides,
             **_env_for(cfg),
+            **base_overrides,
             "TIER1_TARGET_ANCHOR_FRACTION": str(anchor_frac),
         }
         candidates.append(
@@ -308,9 +329,9 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
                 name=cfg.experiment_name,
                 explorer=cfg,
                 env_overrides=env,
-                epochs=12,
-                warm_up_epochs=3,
-                adam_epochs=10,
+                epochs=40,
+                warm_up_epochs=5,
+                adam_epochs=40,
             )
         )
     return candidates
@@ -320,6 +341,13 @@ def run_sweep(sweep_name: str = "default") -> Path:
     from src.training.train_t1_predictor import train_t1_predictor
 
     started_at = time.time()
+    sweep_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_sweep_name = _safe_name(sweep_name)
+    sweep_dir = reports_dir() / "experiments" / "sweeps" / f"tier1_{safe_sweep_name}_{sweep_ts}"
+    entries_dir = sweep_dir / "entries"
+    summary_path = sweep_dir / "sweep_summary.json"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    entries_dir.mkdir(parents=True, exist_ok=True)
     candidates = build_sweep_candidates()
     interrupted = False
     out_path: Optional[Path] = None
@@ -330,8 +358,6 @@ def run_sweep(sweep_name: str = "default") -> Path:
 
     def _emit_once() -> None:
         nonlocal out_path
-        if out_path is not None:
-            return
         rows = sorted(
             [r for r in completed if r.get("status") == "ok"],
             key=lambda x: (x.get("best_rel_l2", float("inf")), x.get("best_phys_score", float("inf"))),
@@ -340,12 +366,14 @@ def run_sweep(sweep_name: str = "default") -> Path:
             "tier": "tier1",
             "sweep_name": sweep_name,
             "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
-            "sweep_defaults": {"epochs": 15, "warm_up_epochs": 3, "adam_epochs": 15},
+            "run_folder": str(sweep_dir),
+            "sweep_defaults": {"epochs": 40, "warm_up_epochs": 5, "adam_epochs": 40},
             "interrupted": interrupted,
             "active_candidate_when_stopped": state["active_candidate"],
             "elapsed_minutes": (time.time() - started_at) / 60.0,
             "n_candidates_total": len(candidates),
             "n_completed": len(completed),
+            "finished": (not interrupted) and (state["active_candidate"] is None),
             "sanity_check": sanity,
             "completed": completed,
             "failures": failures,
@@ -361,7 +389,42 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 for i, r in enumerate(rows)
             ],
         }
-        out_path = write_t1_sweep_report(payload, sweep_name=sweep_name)
+        out_path = _write_json(summary_path, payload)
+
+    def _write_entry_debug(
+        *,
+        phase: str,
+        idx: Optional[int],
+        name: str,
+        explorer: T1ExplorerConfig,
+        env_overrides: Dict[str, str],
+        duration_min: float,
+        status: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        tb: Optional[str] = None,
+    ) -> Path:
+        prefix = f"{idx:02d}_" if idx is not None else ""
+        safe_name = _safe_name(name, max_len=120)
+        entry_path = entries_dir / f"{prefix}{safe_name}.json"
+        payload: Dict[str, Any] = {
+            "tier": "tier1",
+            "sweep_name": sweep_name,
+            "phase": phase,
+            "candidate_name": name,
+            "status": status,
+            "duration_min": duration_min,
+            "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            "explorer": explorer.to_serializable(),
+            "env_overrides": env_overrides,
+        }
+        if result is not None:
+            payload["result"] = result
+        if error is not None:
+            payload["error"] = error
+        if tb is not None:
+            payload["traceback"] = tb
+        return _write_json(entry_path, payload)
 
     def _handle_interrupt(signum, _frame):
         nonlocal interrupted
@@ -382,7 +445,13 @@ def run_sweep(sweep_name: str = "default") -> Path:
     sanity_overrides = dict(sanity_cand.env_overrides)
     sanity_overrides["TIER1_SKIP_EXPERIMENT_ARTIFACT"] = "1"
     sanity_overrides["TIER1_DISABLE_FIGURES"] = "1"
+    sanity_overrides["TIER1_DISABLE_STAGE_A_ARTIFACTS"] = "1"
     sanity_overrides["PHASE1_TRAINING_DIARY"] = "0"
+    print(
+        "🔎 Sanity effective settings: "
+        f"TIER1_CKPT_EVERY={sanity_overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
+        f"TIER1_PRESSURE_BC_MODE={sanity_overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}"
+    )
     prev_env = _safe_env_set(sanity_overrides)
     t0 = time.time()
     try:
@@ -400,12 +469,14 @@ def run_sweep(sweep_name: str = "default") -> Path:
             "result": sanity_result if sanity_result is not None else {"status": "unknown"},
         }
     except Exception as exc:
+        tb = traceback.format_exc()
         sanity = {
             "enabled": True,
             "status": "failed",
             "candidate": sanity_cand.name,
             "duration_min": (time.time() - t0) / 60.0,
             "error": repr(exc),
+            "traceback": tb,
         }
         failures.append(
             {
@@ -414,6 +485,17 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 "duration_min": (time.time() - t0) / 60.0,
             }
         )
+        _write_entry_debug(
+            phase="sanity",
+            idx=None,
+            name=f"sanity::{sanity_cand.name}",
+            explorer=sanity_cand.explorer,
+            env_overrides=sanity_overrides,
+            duration_min=(time.time() - t0) / 60.0,
+            status="failed",
+            error=repr(exc),
+            tb=tb,
+        )
         _safe_env_restore(prev_env)
         _emit_once()
         signal.signal(signal.SIGINT, prev_sigint)
@@ -421,12 +503,30 @@ def run_sweep(sweep_name: str = "default") -> Path:
         return out_path
     finally:
         _safe_env_restore(prev_env)
+    if sanity.get("status") == "passed":
+        _write_entry_debug(
+            phase="sanity",
+            idx=None,
+            name=f"sanity::{sanity_cand.name}",
+            explorer=sanity_cand.explorer,
+            env_overrides=sanity_overrides,
+            duration_min=(time.time() - t0) / 60.0,
+            status="passed",
+            result=sanity.get("result") if isinstance(sanity.get("result"), dict) else None,
+        )
 
     for idx, cand in enumerate(candidates, start=1):
         state["active_candidate"] = cand.name
         print(f"\n=== [{idx}/{len(candidates)}] Tier1 sweep candidate: {cand.name} ===")
         overrides = dict(cand.env_overrides)
         overrides["TIER1_SKIP_EXPERIMENT_ARTIFACT"] = "1"
+        overrides["TIER1_DISABLE_FIGURES"] = "1"
+        overrides["TIER1_DISABLE_STAGE_A_ARTIFACTS"] = "1"
+        print(
+            "🔎 Candidate effective settings: "
+            f"TIER1_CKPT_EVERY={overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
+            f"TIER1_PRESSURE_BC_MODE={overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}"
+        )
         prev_env = _safe_env_set(overrides)
         t0 = time.time()
         try:
@@ -446,18 +546,54 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 **result,
             }
             completed.append(row)
+            _write_entry_debug(
+                phase="candidate",
+                idx=idx,
+                name=cand.name,
+                explorer=cand.explorer,
+                env_overrides=overrides,
+                duration_min=(time.time() - t0) / 60.0,
+                status="ok",
+                result=result if isinstance(result, dict) else {"status": "unknown"},
+            )
         except KeyboardInterrupt:
             interrupted = True
             failures.append({"name": cand.name, "error": "KeyboardInterrupt", "duration_min": (time.time() - t0) / 60.0})
+            _write_entry_debug(
+                phase="candidate",
+                idx=idx,
+                name=cand.name,
+                explorer=cand.explorer,
+                env_overrides=overrides,
+                duration_min=(time.time() - t0) / 60.0,
+                status="interrupted",
+                error="KeyboardInterrupt",
+                tb=traceback.format_exc(),
+            )
             break
         except Exception as exc:
+            tb = traceback.format_exc()
             failures.append({"name": cand.name, "error": repr(exc), "duration_min": (time.time() - t0) / 60.0})
+            _write_entry_debug(
+                phase="candidate",
+                idx=idx,
+                name=cand.name,
+                explorer=cand.explorer,
+                env_overrides=overrides,
+                duration_min=(time.time() - t0) / 60.0,
+                status="failed",
+                error=repr(exc),
+                tb=tb,
+            )
         finally:
             _safe_env_restore(prev_env)
 
+    state["active_candidate"] = None
     _emit_once()
     signal.signal(signal.SIGINT, prev_sigint)
     signal.signal(signal.SIGTERM, prev_sigterm)
+    print(f"📁 Sweep run folder: {sweep_dir}")
+    print(f"📘 Sweep summary: {summary_path}")
     return out_path
 
 

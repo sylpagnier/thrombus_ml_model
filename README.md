@@ -36,6 +36,18 @@ python -m src.main a --skip-tier1   # Start Stage A at Tier 2
 
 Do not assume **Tier 3** is where most kinematic accuracy comes from; Tier 1/2 are the primary transport-focused stages.
 
+## CFD boundary-condition assumptions (current dataset)
+
+- **Reynolds number definition**: `Re` is defined using the **inlet diameter** (`D_inlet`).
+- **Current policy**: `Re` is held consistent across all simulations for now.
+- **Flow BCs**: inlet uses **fully developed (FD) flow** with `v_avg` computed from the target `Re`; outlet uses **0 pressure**.
+- **Tier 3 transport BCs**: Tier 3 cases additionally include species boundary terms (for example, inlet concentrations and outlet flux conditions) on top of the flow BCs.
+
+## Sample types (anchor vs non-anchor)
+
+- **Anchor samples**: vessel geometries with full CFD supervision at graph nodes (COMSOL solution fields such as `u`, `v`, `p`, etc.).
+- **Non-anchor samples**: vessel geometries without COMSOL solution labels; they use geometry-derived analytical priors and physics constraints only.
+
 ## Repository layout (`src/`)
 
 | Path | Purpose |

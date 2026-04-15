@@ -26,6 +26,19 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 
 **Path helpers**: `data_root()`, `outputs_root()`, `stage_a_dir()`, `stage_b_dir()`, `reports_dir()`, `comsol_models_dir()`, `resolve_checkpoint()`.
 
+## Simulation boundary assumptions (current)
+
+- `Re` is defined from the **inlet diameter** (`D_inlet`).
+- `Re` is currently kept the same across simulations.
+- Inlet boundary condition is **fully developed (FD) flow**, with average velocity `v_avg` computed from `Re`.
+- Outlet flow boundary condition is **0 pressure**.
+- Tier 3 simulations add species transport boundary conditions in addition to flow (for example, inlet concentrations and outlet flux constraints).
+
+## Sample semantics (anchor vs non-anchor)
+
+- **Anchor samples** are vessel geometries with full CFD labels from COMSOL across the graph (supervised fields like `u`, `v`, `p`, and related targets).
+- **Non-anchor samples** are vessel geometries without COMSOL solution labels; they contribute geometry and analytical-prior/physics-based constraints only.
+
 ## Source map
 
 - **`src/core_physics/`** — PDE-consistent building blocks (fluid kinematics, rheology, biochem kernels). Shared by training and tests.
