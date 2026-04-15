@@ -68,19 +68,19 @@ class T1ExplorerConfig:
     sdf_wall_tau: float = 0.12
     sdf_grad_beta: float = 1.0
     shear_true_alpha: float = 1.0
-    latent_dim: int = 64
-    deq_max_iters: int = 15
-    num_fourier_freqs: int = 8
+    latent_dim: int = 128
+    deq_max_iters: int = 25
+    num_fourier_freqs: int = 16
     geometry_level: Optional[int] = None  # filter json "level"
     kinematics_mode: str = "direct_uvp"  # stream | direct_uvp
     ns_derivative_mode: str = "wls"  # wls | autograd
     activation_fn: str = "silu"  # relu | silu | gelu
-    fourier_base: float = 2.0
+    fourier_base: float = 1.5
     loss_weight_mode: str = "dynamic"  # dynamic | fixed | grad_norm
     anderson_beta: float = 0.8
     lambda_cont: float = 1.0
     re_curriculum: bool = False
-    p_grad_supervision: float = 0.0
+    p_grad_supervision: float = 1.0
     advect_detach: bool = False
     pressure_bc_mode: str = "mean"  # mean | pointwise | mean_var
     momentum_loss_mode: str = "huber"  # huber | mse
@@ -126,19 +126,19 @@ class T1ExplorerConfig:
             sdf_wall_tau=_f("TIER1_SDF_WALL_TAU", 0.12),
             sdf_grad_beta=_f("TIER1_SDF_GRAD_BETA", 1.0),
             shear_true_alpha=_f("TIER1_SHEAR_TRUE_ALPHA", 1.0),
-            latent_dim=int(os.environ.get("TIER1_LATENT_DIM", "64")),
-            deq_max_iters=int(os.environ.get("TIER1_DEQ_MAX_ITERS", "15")),
-            num_fourier_freqs=int(os.environ.get("TIER1_NUM_FOURIER_FREQS", "8")),
+            latent_dim=int(os.environ.get("TIER1_LATENT_DIM", "128")),
+            deq_max_iters=int(os.environ.get("TIER1_DEQ_MAX_ITERS", "25")),
+            num_fourier_freqs=int(os.environ.get("TIER1_NUM_FOURIER_FREQS", "16")),
             geometry_level=geometry_level,
             kinematics_mode=kinematics_mode,
             ns_derivative_mode=ns_derivative_mode,
             activation_fn=activation,
-            fourier_base=float(os.environ.get("TIER1_FOURIER_BASE", "2.0")),
+            fourier_base=float(os.environ.get("TIER1_FOURIER_BASE", "1.5")),
             loss_weight_mode=loss_weight_mode,
             anderson_beta=float(os.environ.get("TIER1_ANDERSON_BETA", "0.8")),
             lambda_cont=float(os.environ.get("TIER1_LAMBDA_CONT", "1.0")),
             re_curriculum=re_curriculum,
-            p_grad_supervision=float(os.environ.get("TIER1_P_GRAD_SUPERVISION", "0.0")),
+            p_grad_supervision=float(os.environ.get("TIER1_P_GRAD_SUPERVISION", "1.0")),
             advect_detach=os.environ.get("TIER1_ADVECT_DETACH", "0").strip().lower() in ("1", "true", "yes", "on"),
             pressure_bc_mode=pressure_bc_mode,
             momentum_loss_mode=momentum_loss_mode,
@@ -218,6 +218,7 @@ def write_t1_experiment_artifact(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"📒 Experiment artifact: {path}")
+    print("🧾 History reminder: append this run's key metrics to your Tier1 training history log.")
     return path
 
 
@@ -230,6 +231,7 @@ def write_t1_sweep_report(payload: Dict[str, Any], sweep_name: str) -> Path:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"📘 Sweep report: {path}")
+    print("🧾 History reminder: append this sweep result to your persistent Tier1 training history log.")
     return path
 
 
@@ -246,15 +248,15 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
 
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    Surgical Tier 1 3-candidate sweep for a ~10 hour budget (L-BFGS Disabled).
-    Targeting <5% Rel L2 error through high capacity, extended AdamW, and strict pressure pinning.
+    Tier 1 4-candidate ~10-hour sweep focused on known bottlenecks:
+    L-BFGS polishing, latent-width capacity, boundary-frequency density, and autograd derivatives.
     """
     base_overrides = {
         "TIER1_DISABLE_FIGURES": "1", # Set to "0" if you want to watch the validation plots locally
         "TIER1_CKPT_EVERY": "20",
-        "TIER1_EARLY_STOP_PATIENCE": "15", # Increased patience for longer 40-epoch runs
-        "TIER1_LOSS_WEIGHT_MODE": "dynamic", # Switch back to dynamic so it balances the stiff PDEs automatically
-        "TIER1_USE_LBFGS": "0", # Explicitly disabled
+        "TIER1_EARLY_STOP_PATIENCE": "15", # Increased patience for longer 60-epoch runs
+        "TIER1_LOSS_WEIGHT_MODE": "dynamic",
+        "TIER1_USE_LBFGS": "1",
         "TIER1_KINEMATICS_MODE": "direct_uvp",
         "TIER1_ACTIVATION_FN": "silu",
         
@@ -264,8 +266,12 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
         "TIER1_PRESSURE_BC_MODE": "pointwise",
         
         # --- Time Horizon ---
-        "TIER1_EPOCHS": "40",
+        "TIER1_EPOCHS": "60",
         "TIER1_ADAM_EPOCHS": "40",
+        "TIER1_DATA_STAGE_EPOCHS": "10",
+        "TIER1_LAMBDA_CONT": "1.0",
+        "TIER1_LAMBDA_CONT_START": "0.1",
+        "TIER1_LAMBDA_CONT_WARMUP_EPOCHS": "10",
     }
     
     def _env_for(cfg: T1ExplorerConfig) -> Dict[str, str]:
@@ -293,43 +299,62 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_MOMENTUM_LOSS_MODE": cfg.momentum_loss_mode,
         }
     
-    # Specs: (name, weight_mode, latent_dim, deq_iters, fourier_base, anchor_frac)
-    candidate_specs = [
-        # Moved to front to fail-fast if I/O crash persists
-        ("C2_MaxCap_SDFGrad",   "sdf_grad",   128, 25, 2.0, 0.7),
-
-        # C1: Max capacity + Ground-truth shear weighting (Often the best for CFD surrogate accuracy)
-        ("C1_MaxCap_ShearTrue", "shear_true", 128, 25, 2.0, 0.7),
-
-        # C3: Ultra-deep DEQ solver (30 iters) with high-frequency spatial encoding
-        ("C3_DeepSolve_HiFreq", "sdf_wall",   128, 30, 1.5, 0.7),
-    ]
-    
-    candidates: List[T1SweepCandidate] = []
-    for name, weight_mode, latent_dim, deq_iters, fourier_base, anchor_frac in candidate_specs:
-        cfg = T1ExplorerConfig(
-            experiment_name=name,
-            kinematics_mode="direct_uvp",
+    sweep_configs: List[T1ExplorerConfig] = [
+        # Candidate 1: The L-BFGS optimizer baseline.
+        T1ExplorerConfig(
+            experiment_name="S1_LBFGS_Baseline",
+            latent_dim=128,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.5,
             ns_derivative_mode="wls",
-            activation_fn="silu",
             loss_weight_mode="dynamic",
-            fourier_base=float(fourier_base),
-            advect_detach=True,
-            kine_weight_mode=weight_mode,
-            latent_dim=int(latent_dim),
-            deq_max_iters=int(deq_iters),
-        )
+        ),
+        # Candidate 2: Wider latent capacity.
+        T1ExplorerConfig(
+            experiment_name="S2_WideLatent_256",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.5,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+        ),
+        # Candidate 3: Hyper-dense boundary-focused Fourier spectrum.
+        T1ExplorerConfig(
+            experiment_name="S3_HyperDense_Boundary",
+            latent_dim=128,
+            deq_max_iters=25,
+            num_fourier_freqs=24,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+        ),
+        # Candidate 4: Deep Anderson (testing solver precision limits).
+        T1ExplorerConfig(
+            experiment_name="S4_DeepAnderson_35",
+            latent_dim=128,
+            deq_max_iters=35,
+            num_fourier_freqs=16,
+            fourier_base=1.5,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+        ),
+    ]
+
+    candidates: List[T1SweepCandidate] = []
+    for cfg in sweep_configs:
         env = {
             **_env_for(cfg),
             **base_overrides,
-            "TIER1_TARGET_ANCHOR_FRACTION": str(anchor_frac),
+            "TIER1_TARGET_ANCHOR_FRACTION": "0.7",
         }
         candidates.append(
             T1SweepCandidate(
                 name=cfg.experiment_name,
                 explorer=cfg,
                 env_overrides=env,
-                epochs=40,
+                epochs=60,
                 warm_up_epochs=5,
                 adam_epochs=40,
             )
@@ -339,6 +364,9 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
 
 def run_sweep(sweep_name: str = "default") -> Path:
     from src.training.train_t1_predictor import train_t1_predictor
+
+    # Keep allocator expansion active for wide latent sweeps unless caller explicitly overrides it.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     started_at = time.time()
     sweep_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -367,7 +395,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
             "sweep_name": sweep_name,
             "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
             "run_folder": str(sweep_dir),
-            "sweep_defaults": {"epochs": 40, "warm_up_epochs": 5, "adam_epochs": 40},
+            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 40},
             "interrupted": interrupted,
             "active_candidate_when_stopped": state["active_candidate"],
             "elapsed_minutes": (time.time() - started_at) / 60.0,
@@ -439,7 +467,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
     signal.signal(signal.SIGTERM, _handle_interrupt)
     atexit.register(_emit_once)
 
-    # Fail-fast sanity check: run a tiny 1-epoch probe before launching full sweep.
+    # Fail-fast sanity check: run a tiny 2-epoch probe (1 AdamW + 1 L-BFGS) before full sweep.
     sanity_cand = candidates[0]
     state["active_candidate"] = f"sanity::{sanity_cand.name}"
     sanity_overrides = dict(sanity_cand.env_overrides)
@@ -447,16 +475,23 @@ def run_sweep(sweep_name: str = "default") -> Path:
     sanity_overrides["TIER1_DISABLE_FIGURES"] = "1"
     sanity_overrides["TIER1_DISABLE_STAGE_A_ARTIFACTS"] = "1"
     sanity_overrides["PHASE1_TRAINING_DIARY"] = "0"
+    # Force a deterministic phase transition test: 1 AdamW epoch then 1 L-BFGS epoch.
+    sanity_overrides["TIER1_EPOCHS"] = "2"
+    sanity_overrides["TIER1_ADAM_EPOCHS"] = "1"
+    sanity_overrides["TIER1_USE_LBFGS"] = "1"
     print(
         "🔎 Sanity effective settings: "
         f"TIER1_CKPT_EVERY={sanity_overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
-        f"TIER1_PRESSURE_BC_MODE={sanity_overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}"
+        f"TIER1_PRESSURE_BC_MODE={sanity_overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}, "
+        f"TIER1_EPOCHS={sanity_overrides.get('TIER1_EPOCHS', 'unset')}, "
+        f"TIER1_ADAM_EPOCHS={sanity_overrides.get('TIER1_ADAM_EPOCHS', 'unset')}, "
+        f"TIER1_USE_LBFGS={sanity_overrides.get('TIER1_USE_LBFGS', 'unset')}"
     )
     prev_env = _safe_env_set(sanity_overrides)
     t0 = time.time()
     try:
         sanity_result = train_t1_predictor(
-            epochs=1,
+            epochs=2,
             warm_up_epochs=0,
             adam_epochs=1,
             explorer=None,  # Force the trainer to read from os.environ

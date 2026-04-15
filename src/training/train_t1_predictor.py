@@ -85,6 +85,7 @@ def compute_step_loss(
     re_ref: Optional[float] = None,
     re_scale: Optional[float] = None,
     train_loss_weighter: bool = True,
+    lambda_cont_override: Optional[float] = None,
 ):
     if explorer is not None and explorer.ns_derivative_mode == "autograd":
         data.x = data.x.clone().detach().requires_grad_(True)
@@ -130,7 +131,10 @@ def compute_step_loss(
     l_bc = terms["l_bc"]
     l_io = terms["l_io"]
 
-    lambda_cont = float(explorer.lambda_cont) if explorer is not None else 1.0
+    if lambda_cont_override is not None:
+        lambda_cont = float(lambda_cont_override)
+    else:
+        lambda_cont = float(explorer.lambda_cont) if explorer is not None else 1.0
     loss_weight_mode = (explorer.loss_weight_mode if explorer is not None else "dynamic").strip().lower()
 
     # Optional gauge-invariant pressure supervision via pressure gradients on anchor nodes.
@@ -230,7 +234,7 @@ def train_t1_predictor(
         epochs = max(1, int(os.environ.get("TIER1_EPOCHS", "60")))
     if adam_epochs is None:
         raw_adam = os.environ.get("TIER1_ADAM_EPOCHS", "").strip()
-        adam_epochs = int(raw_adam) if raw_adam else epochs
+        adam_epochs = int(raw_adam) if raw_adam else min(40, int(epochs))
     adam_epochs = max(1, min(int(adam_epochs), int(epochs)))
     if warm_up_epochs is None:
         raw_w = os.environ.get("TIER1_WARM_UP_EPOCHS", "").strip()
@@ -256,6 +260,9 @@ def train_t1_predictor(
         f"lambda_cont={explorer.lambda_cont:.2f} | re_curriculum={explorer.re_curriculum} | "
         f"p_grad_sup={explorer.p_grad_supervision:.3f}"
     )
+    lambda_cont_start = float(os.environ.get("TIER1_LAMBDA_CONT_START", "0.1"))
+    lambda_cont_warmup_epochs = max(0, int(os.environ.get("TIER1_LAMBDA_CONT_WARMUP_EPOCHS", "10")))
+    lambda_cont_start = max(0.0, lambda_cont_start)
     model = GINO_DEQ(
         in_channels=15,
         out_channels=5,
@@ -531,9 +538,18 @@ def train_t1_predictor(
         if epoch == start_epoch or (epoch % hard_refresh == 0):
             _refresh_hard_mining(epoch)
             loader = _make_train_loader()
-        model.train()
+        # Keep AdamW in train mode, but force deterministic forwards during L-BFGS line search.
+        if not lbfgs_initialized:
+            model.train()
+        else:
+            model.eval()
         physics_active = epoch >= warm_up_epochs
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
+        if lambda_cont_warmup_epochs > 0 and epoch < lambda_cont_warmup_epochs:
+            ramp = float(epoch + 1) / float(lambda_cont_warmup_epochs)
+            lambda_cont_epoch = lambda_cont_start + (float(explorer.lambda_cont) - lambda_cont_start) * ramp
+        else:
+            lambda_cont_epoch = float(explorer.lambda_cont)
         if explorer.re_curriculum and epoch == start_epoch:
             print("⚠️ TIER1_RE_CURRICULUM requested, but disabled for supervised Tier 1 to avoid Re/data contradiction.")
         re_scale_epoch = 1.0
@@ -602,6 +618,7 @@ def train_t1_predictor(
                     tier1_kine_p_weight=tier1_kine_p_weight,
                     re_scale=re_scale_epoch,
                     train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
+                    lambda_cont_override=lambda_cont_epoch,
                 )
                 accum_counter += 1
                 loss = loss / float(accumulation_steps)
@@ -675,6 +692,7 @@ def train_t1_predictor(
                         tier1_kine_p_weight=tier1_kine_p_weight,
                         re_scale=re_scale_epoch,
                         train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
+                        lambda_cont_override=lambda_cont_epoch,
                     )
                     loss = loss / n_batches
                     loss.backward()

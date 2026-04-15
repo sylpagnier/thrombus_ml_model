@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm
-from torch_geometric.nn import global_mean_pool, MessagePassing
+from torch_geometric.nn import GlobalAttention, MessagePassing
 from torch_geometric.utils import softmax
 from typing import Optional, Tuple, Union
 from torch import Tensor
@@ -31,6 +31,12 @@ def _make_activation(name: str) -> nn.Module:
 class GlobalMixingBlock(nn.Module):
     def __init__(self, latent_dim, use_spectral_norm: bool = True, activation_fn: str = "relu"):
         super().__init__()
+        self.gate_nn = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            _make_activation(activation_fn),
+            nn.Linear(latent_dim, 1),
+        )
+        self.attn_pool = GlobalAttention(gate_nn=self.gate_nn)
         self.global_mlp = nn.Sequential(
             _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
             _make_activation(activation_fn),
@@ -38,7 +44,8 @@ class GlobalMixingBlock(nn.Module):
         )
 
     def forward(self, x, batch):
-        global_context = global_mean_pool(x, batch)
+        # Let critical non-local nodes (e.g., inlet/outlet/wall neighborhoods) dominate the global state.
+        global_context = self.attn_pool(x, batch)
         global_update = self.global_mlp(global_context)
         return global_update[batch]
 
@@ -62,7 +69,11 @@ class MultiHeadPhysicsGATConv(MessagePassing):
         super().__init__(**kwargs)
 
         self.temperature = temperature
-        self.edge_proj = _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm)
+        self.edge_proj = nn.Sequential(
+            _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm),
+            _make_activation("silu"),
+            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
+        )
 
         self.lin_src = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
         self.lin_dst = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
@@ -137,13 +148,13 @@ class GINO_DEQ(nn.Module):
         out_channels=5,
         latent_dim=64,
         max_iters=25,
-        num_fourier_freqs=8,
+        num_fourier_freqs=16,
         outer_iters=3,
         mu_inf_nd=0.03,
         mu_0_nd=1.0,
         kinematics_mode: str = "direct_uvp",
         activation_fn: str = "silu",
-        fourier_base: float = 2.0,
+        fourier_base: float = 1.5,
     ):
         super().__init__()
         self.max_iters = max_iters
@@ -327,10 +338,12 @@ class GINO_DEQ(nn.Module):
                     max_iter=self.max_iters, beta=anderson_beta, warmup_iters=anderson_warmup_iters
                 )
 
-        # Re-attach once so kinematics keep a differentiable path to coordinates.
-        z_star_req = z_star.detach().requires_grad_(self.training)
+        # Keep DEQ backward connectivity whenever gradients are enabled, even in eval mode.
+        # This allows deterministic L-BFGS closures (model.eval()) to still optimize encoder/core weights.
+        z_star_req = z_star.detach().requires_grad_(torch.is_grad_enabled())
         z_out = f_coupled(z_star_req)
-        if self.training:
+        # Apply stochastic Jacobian trace regularization only during true training mode.
+        if self.training and torch.is_grad_enabled():
             eps = torch.randn_like(z_out)
             vjp = torch.autograd.grad(z_out, z_star_req, grad_outputs=eps, create_graph=True)[0]
             jac_loss = torch.mean(vjp ** 2)

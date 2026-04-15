@@ -180,23 +180,42 @@ class PhysicsKernels:
             d_bar = data.d_bar.squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
         # --------------------------------------
 
-        if self.ns_derivative_mode == "autograd" and not self._autograd_mode_warned:
-            print("⚠️ ns_derivative_mode='autograd' requested, but PDE derivatives in message-passing GNNs are non-local. Falling back to WLS derivatives.")
-            self._autograd_mode_warned = True
+        if self.ns_derivative_mode == "autograd":
+            coords_xy = data.x[:, 0:2]
+            if not coords_xy.requires_grad:
+                if not self._autograd_mode_warned:
+                    print(
+                        "⚠️ ns_derivative_mode='autograd' requested, but data.x does not require gradients. "
+                        "Falling back to WLS derivatives for this batch."
+                    )
+                    self._autograd_mode_warned = True
+                c_u = self._compute_derivatives(u.unsqueeze(1), props)
+                c_v = self._compute_derivatives(v.unsqueeze(1), props)
+                c_p = self._compute_derivatives(p.unsqueeze(1), props)
+                u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
+                v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
+                u_xy = c_u[:, 3, 0]
+                v_xy = c_v[:, 3, 0]
+                p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
+            else:
+                u_x, u_y, u_xx, u_xy, u_yy = self._compute_autograd_derivatives(u, coords_xy)
+                v_x, v_y, v_xx, v_xy, v_yy = self._compute_autograd_derivatives(v, coords_xy)
+                p_grad = self._safe_grad(p, coords_xy)
+                p_x, p_y = p_grad[:, 0], p_grad[:, 1]
+        else:
+            # Compute first and second derivatives from the WLS operator.
+            c_u = self._compute_derivatives(u.unsqueeze(1), props)
+            c_v = self._compute_derivatives(v.unsqueeze(1), props)
+            c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-        # Compute first and second derivatives from the WLS operator.
-        c_u = self._compute_derivatives(u.unsqueeze(1), props)
-        c_v = self._compute_derivatives(v.unsqueeze(1), props)
-        c_p = self._compute_derivatives(p.unsqueeze(1), props)
-
-        # Extract primary 1st and 2nd derivatives, plus cross derivatives (xy).
-        # NOTE: WLS basis is [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2] in mesh_wls.py,
-        # so c[:,2] and c[:,4] already correspond to true u_xx / u_yy (no extra factor of 2 needed).
-        u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
-        v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
-        u_xy = c_u[:, 3, 0]
-        v_xy = c_v[:, 3, 0]
-        p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
+            # Extract primary 1st and 2nd derivatives, plus cross derivatives (xy).
+            # NOTE: WLS basis is [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2] in mesh_wls.py,
+            # so c[:,2] and c[:,4] already correspond to true u_xx / u_yy (no extra factor of 2 needed).
+            u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
+            v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
+            u_xy = c_u[:, 3, 0]
+            v_xy = c_v[:, 3, 0]
+            p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
         # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.
@@ -216,8 +235,13 @@ class PhysicsKernels:
             mu_for_grad = mu_eff.detach() if self.cfg.detach_mu_for_ns_gradient else mu_eff
             # Compute viscosity gradients in log-space to reduce ringing across sharp clot interfaces.
             log_mu = torch.log(mu_for_grad + 1e-8)
-            c_log_mu = self._compute_derivatives(log_mu.unsqueeze(1), props)
-            log_mu_x, log_mu_y = c_log_mu[:, 0, 0], c_log_mu[:, 1, 0]
+            if self.ns_derivative_mode == "autograd":
+                coords_xy = data.x[:, 0:2]
+                log_mu_grad = self._safe_grad(log_mu, coords_xy)
+                log_mu_x, log_mu_y = log_mu_grad[:, 0], log_mu_grad[:, 1]
+            else:
+                c_log_mu = self._compute_derivatives(log_mu.unsqueeze(1), props)
+                log_mu_x, log_mu_y = c_log_mu[:, 0, 0], c_log_mu[:, 1, 0]
             mu_x = mu_for_grad * log_mu_x
             mu_y = mu_for_grad * log_mu_y
             # Bound viscosity-gradient spikes from strong-form WLS around sharp clot interfaces.
