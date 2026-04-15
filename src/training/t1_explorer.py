@@ -459,7 +459,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
             epochs=1,
             warm_up_epochs=0,
             adam_epochs=1,
-            explorer=sanity_cand.explorer,
+            explorer=None,  # Force the trainer to read from os.environ
         )
         sanity = {
             "enabled": True,
@@ -534,7 +534,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 epochs=cand.epochs,
                 warm_up_epochs=cand.warm_up_epochs,
                 adam_epochs=cand.adam_epochs,
-                explorer=cand.explorer,
+                explorer=None,  # Force the trainer to read from os.environ
             )
             if result is None:
                 result = {"status": "unknown"}
