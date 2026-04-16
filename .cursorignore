@@ -1,19 +1,19 @@
-# Data and Sim Outputs
-data/raw/*
-data/processed/*.pt
-outputs/plots/*
-outputs/checkpoints/*
-*.mph
-*.stl
-*.dxf
-*.msh
+#    
+//*
+//*.
+//*
+//*
+*.
+*.
+*.
+*.
 
-# Standard Python
-__pycache__/
-.venv/
-env/
-.DS_Store
+#  
+/
+./
+/
+.
 
-# Large Logs
-logs/
-*.log
+#  
+/
+*.

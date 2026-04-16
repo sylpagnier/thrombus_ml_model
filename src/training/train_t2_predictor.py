@@ -242,16 +242,12 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
 
     phys_cfg = PhysicsConfig(tier="tier2")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-    mu_inf_nd = kernels.mu_inf_nd
-    mu_0_nd = kernels.mu_0_nd
-
     model = GINO_DEQ(
         in_channels=15,
         out_channels=5,
         latent_dim=64,
         max_iters=15,
-        mu_inf_nd=mu_inf_nd,
-        mu_0_nd=mu_0_nd,
+        phys_cfg=phys_cfg,
     ).to(device)
 
     root = get_project_root()

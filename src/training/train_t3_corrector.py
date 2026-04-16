@@ -103,6 +103,7 @@ from src.config import (
 )
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import WeightedRandomSampler
+from src.utils.batching import get_batch_tensor
 from src.utils.metrics import DynamicLossWeighter
 from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.training.physics_curriculum import ease01 as _ease01
@@ -625,11 +626,7 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
                 z0 = model.bio_encoder(bio_in)
             z0 = z0.detach()
 
-            batch_idx_nodes = (
-                data.batch
-                if hasattr(data, "batch") and data.batch is not None
-                else torch.zeros(n_nodes, dtype=torch.long, device=device)
-            )
+            batch_idx_nodes = get_batch_tensor(data, n_nodes, device)
             edge_index = data.edge_index
             edge_attr = data.edge_attr
 
@@ -643,12 +640,12 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
             species_now_si = torch.clamp(torch.expm1(species_now), min=0.0) * scales
             species_dict = {k: species_now_si[:, i] for i, k in enumerate(rxn_keys)}
             props = kernels.core._get_geometric_props(data)
-            if hasattr(data, 'batch') and data.batch is not None:
-                props['u_ref'] = data.u_ref[data.batch]
-                props['d_bar'] = data.d_bar[data.batch]
-            else:
+            if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == n_nodes:
                 props['u_ref'] = data.u_ref
                 props['d_bar'] = data.d_bar
+            else:
+                props['u_ref'] = data.u_ref[batch_idx_nodes]
+                props['d_bar'] = data.d_bar[batch_idx_nodes]
             shear_rate = kernels._compute_shear_rate(u_det, v_det, props, data)
             reaction_terms = kernels.kinetics.compute_species_reactions(species_dict, shear_rate)
             target_dlog_dt = torch.stack(
@@ -825,12 +822,13 @@ def compute_tier3_loss(
     )
 
     props = kernels.core._get_geometric_props(data)
-    if hasattr(data, 'batch') and data.batch is not None:
-        props['u_ref'] = data.u_ref[data.batch]
-        props['d_bar'] = data.d_bar[data.batch]
-    else:
+    batch_idx_nodes = get_batch_tensor(data, data.num_nodes, device)
+    if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == data.num_nodes:
         props['u_ref'] = data.u_ref
         props['d_bar'] = data.d_bar
+    else:
+        props['u_ref'] = data.u_ref[batch_idx_nodes]
+        props['d_bar'] = data.d_bar[batch_idx_nodes]
 
     # 3. Supervised data loss (full supervised time window on anchor nodes)
     pred_final = pred_series[-1]

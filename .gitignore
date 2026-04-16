@@ -24,6 +24,9 @@ ENV/
 Thumbs.db
 /data/
 
+# Generated training artifacts (local runs; not versioned)
+outputs/
+
 # COMSOL models > GitHub 100 MB single-file limit (keep locally or use Git LFS)
 comsol_models/phase2_patient001.mph
 comsol_models/Portal_vein_thrombus_formationTPPOD1_concentration_variables_anastomosis_old_parameters_safe_5_02_2026.mph

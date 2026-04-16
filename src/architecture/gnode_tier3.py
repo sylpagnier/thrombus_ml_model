@@ -6,9 +6,13 @@ from torch import Tensor
 from torchdiffeq import odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig
-from src.core_physics.physics_kernels import PhysicsKernels
-from src.utils.kinematics import stream_to_velocity
-from src.utils.rheology import dual_viscosity_multiplier
+from src.core_physics.physics_kernels import scatter_add
+from src.utils.batching import get_batch_tensor
+
+# Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
+_SPECIES_LOG1P_MIN = -10.0
+_SPECIES_LOG1P_MAX = 8.0
+
 
 def tier3_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
@@ -22,8 +26,9 @@ def tier3_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.
         if bool(m.item()):
             return torch.ones(num_nodes, dtype=torch.bool, device=device)
         return torch.zeros(num_nodes, dtype=torch.bool, device=device)
-    if hasattr(batch, "batch") and batch.batch is not None:
-        return m[batch.batch].to(device)
+    batch_idx = getattr(batch, "batch", None)
+    if batch_idx is not None:
+        return m[batch_idx].to(device)
     if m.shape[0] != num_nodes:
         return torch.zeros(num_nodes, dtype=torch.bool, device=device)
     return m.to(device)
@@ -45,11 +50,9 @@ class BioODEFunc(nn.Module):
     """
     Calculates the temporal derivative dz/dt of the biochemical latent state.
     """
-    def __init__(self, latent_dim, ode_state_clamp: float, ode_derivative_clamp: float):
+    def __init__(self, latent_dim):
         super().__init__()
         self.latent_dim = latent_dim
-        self.ode_state_clamp = float(ode_state_clamp)
-        self.ode_derivative_clamp = float(ode_derivative_clamp)
         # Processor to compute spatial interactions for the derivative
         # Plain Linear (no spectral norm): ODE inner loop runs many times per dopri5 step;
         # spectral_norm power iterations + odeint backprop peak GPU memory.
@@ -63,11 +66,11 @@ class BioODEFunc(nn.Module):
 
     def forward(self, t, z, edge_index, edge_attr, batch_idx):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
-        z = torch.clamp(z, min=-self.ode_state_clamp, max=self.ode_state_clamp)
+        z = torch.clamp(z, min=-20.0, max=20.0)
         mod_dummy = torch.zeros(int(edge_index.shape[ 1 ]), 1, dtype=torch.float32, device=z.device)
         dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
         dz_dt = self.derivative_scale * dz_raw
-        dz_dt = torch.clamp(dz_dt, min=-self.ode_derivative_clamp, max=self.ode_derivative_clamp)
+        dz_dt = torch.clamp(dz_dt, min=-10.0, max=10.0)
         if self.training:
             self.derivative_energy_sum += float(dz_dt.detach().pow(2).mean().item())
             self.derivative_eval_count += 1
@@ -90,13 +93,6 @@ class GNODE_Tier3(nn.Module):
         self.rtol = rtol
         self.atol = atol
         self.phys_cfg = phys_cfg  # Store physics config internally
-        self.physics_kernels = PhysicsKernels(phys_cfg)
-        self.biochem_cfg = BiochemConfig(tier="tier3")
-        self.species_log1p_min = float(self.biochem_cfg.species_log1p_min)
-        self.species_log1p_max = float(self.biochem_cfg.species_log1p_max)
-        self.sigmoid_input_clamp = float(self.biochem_cfg.sigmoid_input_clamp)
-        self.ode_derivative_clamp = float(self.biochem_cfg.ode_derivative_clamp)
-        self.k_env = nn.Parameter(torch.tensor(float(self.biochem_cfg.stream_env_init_k)))
 
         # COMSOL Step Function Approximations (Dual-Trigger)
         self.mu_ratio_max = mu_ratio_max
@@ -135,16 +131,13 @@ class GNODE_Tier3(nn.Module):
         self.bio_encoder = SpectralLinear(in_features=in_channels + 3 + spatial_channels, out_features=latent_dim)
 
         # The ODE Function
-        self.ode_func = BioODEFunc(
-            latent_dim,
-            ode_state_clamp=float(self.biochem_cfg.ode_state_clamp),
-            ode_derivative_clamp=self.ode_derivative_clamp,
-        )
+        self.ode_func = BioODEFunc(latent_dim)
 
         # Physical Decoder
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
-        self.register_buffer("species_si_scales", self.biochem_cfg.get_species_scales(device="cpu"))
+        _bio = BiochemConfig(tier="tier3")
+        self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
 
     def train(self, mode=True):
         """
@@ -181,6 +174,25 @@ class GNODE_Tier3(nn.Module):
         ], dim=1)
         return encoded_x
 
+    def _compute_wls_derivatives(self, field: Tensor, batch) -> Tensor:
+        """Compute WLS derivatives [d/dx, d/dy, d2/dx2, d2/dxdy, d2/dy2] for a nodal scalar."""
+        row, col = batch.edge_index
+        num_nodes = batch.num_nodes
+        V, W, M_inv = batch.V, batch.W, batch.M_inv
+
+        u = field if field.dim() == 2 else field.unsqueeze(-1)
+        du = u[col] - u[row]
+
+        w = W.view(-1, 1, 1)
+        v = V.unsqueeze(2)
+        du_unsq = du.unsqueeze(1)
+        b_e = w * torch.bmm(v, du_unsq)
+
+        c = u.shape[1]
+        b_flat = scatter_add(b_e.view(-1, 5 * c), row, dim=0, dim_size=num_nodes)
+        b = b_flat.view(num_nodes, 5, c)
+        return torch.bmm(M_inv, b)
+
     def _stream_to_velocity(
         self,
         psi_raw: Tensor,
@@ -189,18 +201,15 @@ class GNODE_Tier3(nn.Module):
         sdf: Tensor,
         wall_normal: Tensor,
     ) -> torch.Tensor:
-        return stream_to_velocity(
-            psi_raw=psi_raw,
-            p=p,
-            edge_index=batch.edge_index,
-            num_nodes=batch.num_nodes,
-            V=batch.V,
-            W=batch.W,
-            M_inv=batch.M_inv,
-            sdf=sdf,
-            wall_normal=wall_normal,
-            k_env=self.k_env,
-        )
+        """Convert (psi, p) -> (u, v, p) using WLS derivatives + manual product rule."""
+        c_psi = self._compute_wls_derivatives(psi_raw, batch)
+        psi_x = c_psi[:, 0:1, 0]
+        psi_y = c_psi[:, 1:2, 0]
+        n_x = wall_normal[:, 0:1]
+        n_y = wall_normal[:, 1:2]
+        u = (sdf ** 2) * psi_y + psi_raw * 2.0 * sdf * n_y
+        v = -((sdf ** 2) * psi_x + psi_raw * 2.0 * sdf * n_x)
+        return torch.cat([u, v, p], dim=1)
 
     def _decode_constrained_uvp(self, z_kin: torch.Tensor, kin_in: torch.Tensor, batch) -> torch.Tensor:
         """
@@ -215,20 +224,20 @@ class GNODE_Tier3(nn.Module):
 
     def _decode_species_log1p(self, raw_species: torch.Tensor) -> torch.Tensor:
         """Decoder predicts log1p(species_nd) directly; clamp to a safe training range."""
-        return torch.clamp(raw_species, min=self.species_log1p_min, max=self.species_log1p_max)
+        return torch.clamp(raw_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
         safe_t_scale = max(self.T_scale, 1e-5)
         norm_val = (mat - self.mat_crit) / (self.temp_mat * safe_t_scale)
-        safe_val = torch.clamp(norm_val, min=-self.sigmoid_input_clamp, max=self.sigmoid_input_clamp)
+        safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
         return (self.mu_ratio_max - 1.0) * torch.sigmoid(safe_val)
 
     def mu2_sigmoid(self, fi):
         """Soft logic for Fibrin-driven viscosity multiplier with numerical safeguards."""
         safe_t_scale = max(self.T_scale, 1e-5)
         norm_val = (fi - self.fi_crit) / (self.temp_fi * safe_t_scale)
-        safe_val = torch.clamp(norm_val, min=-self.sigmoid_input_clamp, max=self.sigmoid_input_clamp)
+        safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
         return self.mu_ratio_max * torch.sigmoid(safe_val)
 
     def autoencode(self, batch):
@@ -253,11 +262,7 @@ class GNODE_Tier3(nn.Module):
         z_kin = torch.zeros(num_nodes, self.latent_dim, device=device)
 
         def apply_kin_processor(x):
-            batch_idx = (
-                batch.batch
-                if hasattr(batch, "batch") and batch.batch is not None
-                else torch.zeros(num_nodes, dtype=torch.long, device=device)
-            )
+            batch_idx = get_batch_tensor(batch, num_nodes, device)
             mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
             return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
 
@@ -326,10 +331,13 @@ class GNODE_Tier3(nn.Module):
             current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, species_prior)
         else:
             current_species = species_prior
-        current_species = torch.clamp(current_species, min=self.species_log1p_min, max=self.species_log1p_max)
+        current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
         # USE CENTRALIZED RHEOLOGY PARAMS
         mu_inf = self.phys_cfg.mu_inf
+        mu_0 = self.phys_cfg.mu_0
+        lam = self.phys_cfg.lam
+        n_idx = self.phys_cfg.n
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
         current_mu_eff = torch.full((num_nodes, 1), mu_inf, dtype=torch.float32, device=device)
@@ -339,18 +347,14 @@ class GNODE_Tier3(nn.Module):
         z_kin_ws = torch.zeros(num_nodes, self.latent_dim, device=device)
 
         def apply_kin_processor(x):
-            batch_idx = batch.batch if hasattr(batch, 'batch') and batch.batch is not None else torch.zeros(num_nodes,
-                                                                                                            dtype=torch.long,
-                                                                                                            device=device)
+            batch_idx = get_batch_tensor(batch, num_nodes, device)
             mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
             return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
 
         def odefunc_wrapper(t, z):
-            batch_idx = batch.batch if hasattr(batch, 'batch') and batch.batch is not None else torch.zeros(num_nodes,
-                                                                                                            dtype=torch.long,
-                                                                                                            device=device)
+            batch_idx = get_batch_tensor(batch, num_nodes, device)
             dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx)
-            return torch.clamp(dz, min=-self.ode_derivative_clamp, max=self.ode_derivative_clamp)
+            return torch.clamp(dz, min=-10.0, max=10.0)
 
         pred_trajectory = []
 
@@ -365,7 +369,7 @@ class GNODE_Tier3(nn.Module):
                     gt_species = y_true_trajectory[i, :, 4:16].to(device)
                     blended_species = (1.0 - tf) * current_species + tf * gt_species
                     current_species = torch.where(truth_mask.unsqueeze(-1), blended_species, current_species)
-                    current_species = torch.clamp(current_species, min=self.species_log1p_min, max=self.species_log1p_max)
+                    current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = batch.x[:, :15].clone()
@@ -396,32 +400,30 @@ class GNODE_Tier3(nn.Module):
             u_nd = u_v_p[:, 0:1]
             v_nd = u_v_p[:, 1:2]
 
-            c_u = self.physics_kernels._compute_derivatives(u_nd, batch)
-            c_v = self.physics_kernels._compute_derivatives(v_nd, batch)
-            du_dx_nd = c_u[:, 0:1, 0]
-            du_dy_nd = c_u[:, 1:2, 0]
-            dv_dx_nd = c_v[:, 0:1, 0]
-            dv_dy_nd = c_v[:, 1:2, 0]
+            du_dx_nd = torch.sparse.mm(batch.G_x, u_nd)
+            du_dy_nd = torch.sparse.mm(batch.G_y, u_nd)
+            dv_dx_nd = torch.sparse.mm(batch.G_x, v_nd)
+            dv_dy_nd = torch.sparse.mm(batch.G_y, v_nd)
 
             scale_grad = u_ref / d_bar
-            du_ij = torch.cat([du_dx_nd, du_dy_nd, dv_dx_nd, dv_dy_nd], dim=1)
-            mu_base = self.physics_kernels._compute_carreau_viscosity(du_ij, batch)
+            gamma_dot = torch.sqrt(2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2) +
+                                   ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2 + 1e-8)
+
+            mu_base = mu_inf + (mu_0 - mu_inf) * torch.pow(1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0)
 
             # mu1/mu2 thresholds (mat_crit, fi_crit) are in SI units; convert log1p state to linear SI.
             sc = self.species_si_scales.to(device=device, dtype=current_species.dtype)
-            sp_safe = torch.clamp(current_species, self.species_log1p_min, self.species_log1p_max)
+            sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
             FI_si = torch.expm1(sp_safe[:, 8:9]) * sc[8:9]
             Mat_si = torch.expm1(sp_safe[:, 11:12]) * sc[11:12]
 
-            total_multiplier = dual_viscosity_multiplier(
-                Mat_si, FI_si, self.mu_ratio_max, self.mu1_sigmoid, self.mu2_sigmoid
-            )
+            total_multiplier = 1.0 + self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
             current_mu_eff = mu_base * total_multiplier
 
             # --- C. RECORD COUPLED STATE ---
             current_mu_eff_nd = current_mu_eff / mu_nd_scale
             # Use the ND version for the recorded trajectory
-            safe_species = torch.clamp(current_species, min=self.species_log1p_min, max=self.species_log1p_max)
+            safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
             pred_step = torch.cat([u_v_p, current_mu_eff_nd, safe_species], dim=-1)
             pred_trajectory.append(pred_step)
 
@@ -431,7 +433,7 @@ class GNODE_Tier3(nn.Module):
                 t_span = evaluation_times[i: i + 2]
 
                 # Encode current physical state into latent representation
-                safe_species = torch.clamp(current_species, min=self.species_log1p_min, max=self.species_log1p_max)
+                safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
                 bio_in = torch.cat([safe_species, u_v_p, batch.x[:, :15]], dim=-1)
                 z_current = self.bio_encoder(bio_in)
 
@@ -466,7 +468,7 @@ class GNODE_Tier3(nn.Module):
 
                 # Update species state for the next macro-step
                 current_species = torch.cat([next_species_flat[:, 0:9], surface_species], dim=1)
-                current_species = torch.clamp(current_species, min=self.species_log1p_min, max=self.species_log1p_max)
+                current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
         # Stack into shape: [ Time, Nodes, 16 ]
         pred_series = torch.stack(pred_trajectory, dim=0)

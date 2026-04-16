@@ -30,21 +30,3 @@ To break the 15% barrier, the following structural changes to `src/architecture/
 * Expand `latent_dim` to 256.
 * Increase `num_fourier_freqs` to 16 or 24.
 * **Two-Stage Optimization:** 40 epochs of AdamW (to reach the 15% basin) -> 20 epochs of Full-Batch L-BFGS (to polish PDE residuals to < 5%).
-
----
-
-## 5. 🏆 Current Champion (Best Model)
-*Note: This section tracks the absolute best-performing architecture identified by `t1_explorer.py` and manual training runs. **This block will be overwritten** whenever a new configuration achieves a strictly better relative L2 error evaluated on a comparable compute budget (e.g., similar epoch counts, likelihood of convergence, and equivalent dataset splits).*
-
-**Current Best Configuration:**
-* **Kinematics Mode:** `direct_uvp`
-* **Activation Function:** `silu`
-* **NS Derivative Mode:** `wls` (for the initial descent phase)
-* **Fourier Encoding:** `fourier_base=1.5`, `num_fourier_freqs=16`
-* **Latent Dimension:** `256`
-* **Loss Weighting:** `dynamic`
-* **GNN Architecture:** `GlobalAttention` (pressure pooling) + `2-layer MLP` (edge upwinding)
-* **Optimizer Schedule:** 40 epochs AdamW $\rightarrow$ 20 epochs Full-Batch L-BFGS
-
-**Current Benchmark to Beat:**
-* **Relative L2 Error:** ~15.6% (Floor reached before L-BFGS refinement)
