@@ -1,0 +1,24 @@
+{
+  "tier": "tier1",
+  "sweep_name": "tier1",
+  "ts_utc": "20260415T204223Z",
+  "run_folder": "C:\\Users\\pgssy\\LadHyX_ml_cfd_thrombus_predictions\\outputs\\reports\\experiments\\sweeps\\tier1_tier1_20260415T203159Z",
+  "sweep_defaults": {
+    "epochs": 60,
+    "warm_up_epochs": 5,
+    "adam_epochs": 40
+  },
+  "interrupted": true,
+  "active_candidate_when_stopped": "sanity::S1_LBFGS_Baseline",
+  "elapsed_minutes": 10.394161140918731,
+  "n_candidates_total": 4,
+  "n_completed": 0,
+  "finished": false,
+  "sanity_check": {
+    "enabled": true,
+    "status": "pending"
+  },
+  "completed": [],
+  "failures": [],
+  "leaderboard": []
+}

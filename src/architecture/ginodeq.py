@@ -10,7 +10,7 @@ from torch import Tensor
 
 from src.core_physics.anderson import anderson_acceleration
 from src.architecture.lora_injection import LoRAParametrization, SpectralLinear
-from src.core_physics.physics_kernels import scatter_add
+from src.utils.kinematics import stream_to_velocity
 
 
 def _spectral_or_plain_linear(in_features: int, out_features: int, bias: bool, spectral: bool) -> nn.Module:
@@ -232,25 +232,6 @@ class GINO_DEQ(nn.Module):
             [shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior, wss_prior], dim=1)
         return encoded_x, uv_prior
 
-    def _compute_wls_derivatives(self, field: Tensor, data) -> Tensor:
-        """Compute WLS derivatives [d/dx, d/dy, d2/dx2, d2/dxdy, d2/dy2] for a nodal scalar."""
-        row, col = data.edge_index
-        num_nodes = data.num_nodes
-        V, W, M_inv = data.V, data.W, data.M_inv
-
-        u = field if field.dim() == 2 else field.unsqueeze(-1)
-        du = u[col] - u[row]
-
-        w = W.view(-1, 1, 1)
-        v = V.unsqueeze(2)
-        du_unsq = du.unsqueeze(1)
-        b_e = w * torch.bmm(v, du_unsq)
-
-        c = u.shape[1]
-        b_flat = scatter_add(b_e.view(-1, 5 * c), row, dim=0, dim_size=num_nodes)
-        b = b_flat.view(num_nodes, 5, c)
-        return torch.bmm(M_inv, b)
-
     def _stream_to_velocity(
         self,
         psi_raw: Tensor,
@@ -259,25 +240,18 @@ class GINO_DEQ(nn.Module):
         sdf: Tensor,
         wall_normal: Tensor,
     ) -> Tensor:
-        """
-        Derive velocity from stream function using WLS spatial derivatives and product rule.
-        d/dy (psi * envelope) = envelope * d(psi)/dy + psi * d(envelope)/dy
-        """
-        c_psi = self._compute_wls_derivatives(psi_raw, data)
-        psi_x = c_psi[:, 0:1, 0]
-        psi_y = c_psi[:, 1:2, 0]
-        n_x = wall_normal[:, 0:1]
-        n_y = wall_normal[:, 1:2]
-
-        # Squared saturating envelope makes both envelope and its gradient vanish at the wall.
-        # This enforces hard no-slip analytically for the stream-function branch.
-        k_safe = F.softplus(self.k_env) + 1e-3
-        base_env = 1.0 - torch.exp(-k_safe * sdf)
-        envelope = base_env * base_env
-        env_grad = 2.0 * base_env * (k_safe * torch.exp(-k_safe * sdf))
-        u = envelope * psi_y + psi_raw * env_grad * n_y
-        v = -(envelope * psi_x + psi_raw * env_grad * n_x)
-        return torch.cat([u, v, p], dim=1)
+        return stream_to_velocity(
+            psi_raw=psi_raw,
+            p=p,
+            edge_index=data.edge_index,
+            num_nodes=data.num_nodes,
+            V=data.V,
+            W=data.W,
+            M_inv=data.M_inv,
+            sdf=sdf,
+            wall_normal=wall_normal,
+            k_env=self.k_env,
+        )
 
     @torch.enable_grad()
     def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5):

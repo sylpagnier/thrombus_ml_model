@@ -707,11 +707,12 @@ def train_t1_predictor(
             print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
 
         avg_loss = total_loss_epoch / max(1, len(loader))
-        if (not disable_stage_a_artifacts) and avg_loss < best_loss and physics_active:
+        if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
-            save_path = model_dir / "tier1_best_loss.pth"
-            torch.save(model.state_dict(), save_path)
-            print(f"⭐ Saved Best Loss Model to {save_path}")
+            if not disable_stage_a_artifacts:
+                save_path = model_dir / "tier1_best_loss.pth"
+                torch.save(model.state_dict(), save_path)
+                print(f"⭐ Saved Best Loss Model to {save_path}")
 
         if (not disable_figures) and epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
@@ -823,11 +824,12 @@ def train_t1_predictor(
                     )
                     break
 
-            if (not disable_stage_a_artifacts) and phys_score < best_phys_score and physics_active:
+            if phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
-                save_path = model_dir / "tier1_best_physics.pth"
-                torch.save(model.state_dict(), save_path)
-                print(f"⭐ Saved Best Physics Model to {save_path}")
+                if not disable_stage_a_artifacts:
+                    save_path = model_dir / "tier1_best_physics.pth"
+                    torch.save(model.state_dict(), save_path)
+                    print(f"⭐ Saved Best Physics Model to {save_path}")
 
     _emit_tier1_run_end(interrupted=False)
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")

@@ -88,6 +88,13 @@ class PhysicsConfig:
 
     # Carreau momentum residual: if True, ∂μ/∂x does not backprop into predicted μ (PINN-style stability).
     detach_mu_for_ns_gradient: bool = True
+    # Physics-kernel behavior toggles (prefer config over process env for reproducibility/tests).
+    ns_derivative_mode: str = "wls"  # "wls" | "autograd"
+    advect_detach: bool = False
+    momentum_loss_mode: str = "huber"  # "huber" | "mse"
+    momentum_huber_delta: float = 0.01
+    pressure_bc_mode: str = "mean"  # "mean" | "pointwise" | "mean_var"
+    numeric_eps: float = 1e-8
 
     def __post_init__(self):
         """Automatically set the correct physics based on the project tier."""
@@ -246,6 +253,14 @@ class BiochemConfig:
     soft_step_T_grad: float = 50.0
     soft_step_T_low_shear: float = 5.0
     soft_step_T_scale: float = 1.0
+    # Centralized numeric guards/clamps for Tier 3 species + ODE stability.
+    species_log1p_min: float = -10.0
+    species_log1p_max: float = 8.0
+    sigmoid_input_clamp: float = 50.0
+    ode_state_clamp: float = 20.0
+    ode_derivative_clamp: float = 10.0
+    numeric_eps: float = 1e-8
+    stream_env_init_k: float = 5.0
 
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""

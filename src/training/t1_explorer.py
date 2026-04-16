@@ -256,7 +256,9 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
         "TIER1_CKPT_EVERY": "20",
         "TIER1_EARLY_STOP_PATIENCE": "15", # Increased patience for longer 60-epoch runs
         "TIER1_LOSS_WEIGHT_MODE": "dynamic",
-        "TIER1_USE_LBFGS": "1",
+        # Exploration mode: keep L-BFGS off for faster sweep turnaround.
+        # Re-enable in full production training runs.
+        "TIER1_USE_LBFGS": "0",
         "TIER1_KINEMATICS_MODE": "direct_uvp",
         "TIER1_ACTIVATION_FN": "silu",
         
@@ -467,7 +469,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
     signal.signal(signal.SIGTERM, _handle_interrupt)
     atexit.register(_emit_once)
 
-    # Fail-fast sanity check: run a tiny 2-epoch probe (1 AdamW + 1 L-BFGS) before full sweep.
+    # Fail-fast sanity check: run a tiny 1-epoch AdamW probe before full sweep.
     sanity_cand = candidates[0]
     state["active_candidate"] = f"sanity::{sanity_cand.name}"
     sanity_overrides = dict(sanity_cand.env_overrides)
@@ -475,10 +477,10 @@ def run_sweep(sweep_name: str = "default") -> Path:
     sanity_overrides["TIER1_DISABLE_FIGURES"] = "1"
     sanity_overrides["TIER1_DISABLE_STAGE_A_ARTIFACTS"] = "1"
     sanity_overrides["PHASE1_TRAINING_DIARY"] = "0"
-    # Force a deterministic phase transition test: 1 AdamW epoch then 1 L-BFGS epoch.
-    sanity_overrides["TIER1_EPOCHS"] = "2"
+    # Exploration mode sanity: keep this Adam-only for speed.
+    sanity_overrides["TIER1_EPOCHS"] = "1"
     sanity_overrides["TIER1_ADAM_EPOCHS"] = "1"
-    sanity_overrides["TIER1_USE_LBFGS"] = "1"
+    sanity_overrides["TIER1_USE_LBFGS"] = "0"
     print(
         "🔎 Sanity effective settings: "
         f"TIER1_CKPT_EVERY={sanity_overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
@@ -491,7 +493,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
     t0 = time.time()
     try:
         sanity_result = train_t1_predictor(
-            epochs=2,
+            epochs=1,
             warm_up_epochs=0,
             adam_epochs=1,
             explorer=None,  # Force the trainer to read from os.environ
