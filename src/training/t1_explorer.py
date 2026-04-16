@@ -8,8 +8,10 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 
 - Explorer sweeps are intentionally **Adam-only** (no L-BFGS) to maximize throughput for rapid
   architecture/loss screening.
+- Sweeps **always start fresh**: no ``tier1_best_physics.pth`` warm-start and no resume from
+  ``tier1_latest_checkpoint.pth`` (per-candidate checkpoint dirs only record *this* run).
 - Once a candidate architecture is selected, run full optimization (including optional L-BFGS)
-  in ``src/training/train_t1_predictor.py`` for best-model commitment.
+  and optional weight init/resume in ``src/training/train_t1_predictor.py`` for best-model commitment.
 
 **Kinematic supervision weighting** (anchor nodes only, COMSOL labels):
 
@@ -269,13 +271,12 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
         "TIER1_LOSS_WEIGHT_MODE": "dynamic",
         # Explorer mode is intentionally Adam-only for rapid candidate screening.
         "TIER1_USE_LBFGS": "0",
-        # Warm-start each run from the shared best Tier 1 checkpoint (same init for all).
-        "TIER1_INIT_FROM_BEST": "1",
+        # Never load pretrained weights — fair screening from random init only.
+        "TIER1_INIT_FROM_BEST": "0",
 
         # --- SWEEP ISOLATION ---
-        # RESUME is OFF so candidates never inherit another candidate's optimizer/epoch
-        # state.  Per-candidate TIER1_CKPT_DIR (set by run_sweep) keeps checkpoints
-        # separate, while INIT_FROM_BEST provides a common weight seed.
+        # RESUME is OFF; per-candidate TIER1_CKPT_DIR (set by run_sweep) only stores
+        # checkpoints from the current candidate run (no cross-candidate bleed).
         "TIER1_RESUME": "0",
         "TIER1_MICRO_BATCH_SIZE": "1",    # Cut memory footprint in half to survive 0.4 mesh
         "TIER1_ACCUMULATION_STEPS": "8",  # 1 * 8 = 8 (same effective batch size)
@@ -623,13 +624,21 @@ def run_sweep(sweep_name: str = "default") -> Path:
     sanity_overrides["TIER1_EPOCHS"] = "1"
     sanity_overrides["TIER1_ADAM_EPOCHS"] = "1"
     sanity_overrides["TIER1_USE_LBFGS"] = "0"
+    # Hard-pin: explorer must never inherit weights or resume (shell env cannot override).
+    sanity_overrides["TIER1_INIT_FROM_BEST"] = "0"
+    sanity_overrides["TIER1_RESUME"] = "0"
+    sanity_ckpt = sweep_dir / "checkpoints" / "sanity_probe"
+    sanity_ckpt.mkdir(parents=True, exist_ok=True)
+    sanity_overrides["TIER1_CKPT_DIR"] = str(sanity_ckpt)
     print(
         "🔎 Sanity effective settings: "
         f"TIER1_CKPT_EVERY={sanity_overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
         f"TIER1_PRESSURE_BC_MODE={sanity_overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}, "
         f"TIER1_EPOCHS={sanity_overrides.get('TIER1_EPOCHS', 'unset')}, "
         f"TIER1_ADAM_EPOCHS={sanity_overrides.get('TIER1_ADAM_EPOCHS', 'unset')}, "
-        f"TIER1_USE_LBFGS={sanity_overrides.get('TIER1_USE_LBFGS', 'unset')}"
+        f"TIER1_USE_LBFGS={sanity_overrides.get('TIER1_USE_LBFGS', 'unset')}, "
+        f"TIER1_INIT_FROM_BEST={sanity_overrides.get('TIER1_INIT_FROM_BEST', 'unset')}, "
+        f"TIER1_RESUME={sanity_overrides.get('TIER1_RESUME', 'unset')}"
     )
     prev_env = _safe_env_set(sanity_overrides)
     t0 = time.time()
@@ -712,11 +721,15 @@ def run_sweep(sweep_name: str = "default") -> Path:
         cand_ckpt_dir = ckpt_root / _safe_name(cand.name)
         cand_ckpt_dir.mkdir(parents=True, exist_ok=True)
         overrides["TIER1_CKPT_DIR"] = str(cand_ckpt_dir)
+        # Hard-pin: never warm-start or resume (shell env cannot override).
+        overrides["TIER1_INIT_FROM_BEST"] = "0"
+        overrides["TIER1_RESUME"] = "0"
 
         print(
             "🔎 Candidate effective settings: "
             f"TIER1_CKPT_EVERY={overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
             f"TIER1_PRESSURE_BC_MODE={overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}, "
+            f"TIER1_INIT_FROM_BEST={overrides.get('TIER1_INIT_FROM_BEST', 'unset')}, "
             f"TIER1_RESUME={overrides.get('TIER1_RESUME', 'unset')}, "
             f"TIER1_CKPT_DIR={cand_ckpt_dir}"
         )
