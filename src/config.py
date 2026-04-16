@@ -33,6 +33,10 @@ class NodeFeat:
     UV_PRIOR = slice(11, 13)
     MU_PRIOR = slice(13, 14)
     WSS_PRIOR = slice(14, 15)
+    # Local hydraulic width D(x) (non-dim) and derivatives along flow direction (WLS-consistent).
+    WIDTH_ND = slice(15, 16)
+    WIDTH_D1 = slice(16, 17)
+    WIDTH_D2 = slice(17, 18)
 
 
 class Tier3NodeFeat:

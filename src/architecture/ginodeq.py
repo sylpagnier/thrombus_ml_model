@@ -10,6 +10,7 @@ from torch import Tensor
 
 from src.core_physics.anderson import anderson_acceleration
 from src.architecture.lora_injection import LoRAParametrization, SpectralLinear
+from src.architecture.siren_decoder import SIRENDecoder
 from src.config import NodeFeat, PhysicsConfig, PredChannels
 from src.utils.batching import get_batch_tensor
 from src.utils.kinematics import stream_to_velocity
@@ -43,6 +44,54 @@ class GlobalMixingBlock(nn.Module):
         global_context = global_mean_pool(x, batch)
         global_update = self.global_mlp(global_context)
         return global_update[batch]
+
+
+class AttentionGlobalMixingBlock(nn.Module):
+    """
+    Perceiver-style bottleneck: global tokens read the graph via cross-attention,
+    reason with an MLP, then broadcast back to nodes. Runs **per graph** in the PyG batch.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        num_global_tokens: int = 16,
+        num_heads: int = 4,
+        use_spectral_norm: bool = True,
+    ):
+        super().__init__()
+        if latent_dim % num_heads != 0:
+            raise ValueError(f"latent_dim ({latent_dim}) must be divisible by num_heads ({num_heads})")
+        self.num_global_tokens = num_global_tokens
+        self.global_tokens = nn.Parameter(torch.randn(1, num_global_tokens, latent_dim))
+        self.cross_att_read = nn.MultiheadAttention(
+            embed_dim=latent_dim, num_heads=num_heads, batch_first=True
+        )
+        self.global_mlp = nn.Sequential(
+            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
+            nn.SiLU(),
+            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
+        )
+        self.cross_att_broadcast = nn.MultiheadAttention(
+            embed_dim=latent_dim, num_heads=num_heads, batch_first=True
+        )
+
+    def forward(self, x: Tensor, batch: Tensor) -> Tensor:
+        out = torch.zeros_like(x)
+        num_graphs = int(batch.max().item()) + 1
+        device = x.device
+        dtype = x.dtype
+        gt_all = self.global_tokens.to(device=device, dtype=dtype).expand(num_graphs, -1, -1).contiguous()
+        for b in range(num_graphs):
+            idx = batch == b
+            seq_x = x[idx].unsqueeze(0)
+            if seq_x.size(1) == 0:
+                continue
+            read_tokens, _ = self.cross_att_read(gt_all[b : b + 1], seq_x, seq_x)
+            processed_tokens = self.global_mlp(read_tokens)
+            broadcast_update, _ = self.cross_att_broadcast(seq_x, processed_tokens, processed_tokens)
+            out[idx] = broadcast_update.squeeze(0)
+        return out
 
 
 class MultiHeadPhysicsGATConv(MessagePassing):
@@ -111,18 +160,38 @@ class MultiHeadPhysicsGATConv(MessagePassing):
 
 
 class GINOBlock(nn.Module):
-    def __init__(self, latent_dim=64, edge_dim=3, use_spectral_norm: bool = True, activation_fn: str = "relu"):
+    def __init__(
+        self,
+        latent_dim=64,
+        edge_dim=3,
+        use_spectral_norm: bool = True,
+        activation_fn: str = "relu",
+        global_pool_mode: str = "mean",
+        num_global_tokens: int = 16,
+    ):
         super().__init__()
         assert latent_dim % 2 == 0, "latent_dim must be divisible by 2 for multi-head split"
 
+        self.global_pool_mode = (global_pool_mode or "mean").strip().lower()
         self.conv = MultiHeadPhysicsGATConv(
             latent_dim, edge_dim=edge_dim, use_spectral_norm=use_spectral_norm
         )
-        self.global_mixer = GlobalMixingBlock(
-            latent_dim,
-            use_spectral_norm=use_spectral_norm,
-            activation_fn=activation_fn,
-        )
+        if self.global_pool_mode == "attention":
+            self.global_mixer = AttentionGlobalMixingBlock(
+                latent_dim,
+                num_global_tokens=num_global_tokens,
+                use_spectral_norm=use_spectral_norm,
+            )
+        elif self.global_pool_mode == "mean":
+            self.global_mixer = GlobalMixingBlock(
+                latent_dim,
+                use_spectral_norm=use_spectral_norm,
+                activation_fn=activation_fn,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported global_pool_mode={global_pool_mode!r}; expected 'mean' or 'attention'."
+            )
         self.norm = nn.LayerNorm(latent_dim)
         self.activation = _make_activation(activation_fn)
 
@@ -147,6 +216,11 @@ class GINO_DEQ(nn.Module):
         kinematics_mode: str = "direct_uvp",
         activation_fn: str = "silu",
         fourier_base: float = 2.0,
+        use_hard_bcs: bool = False,
+        global_pool_mode: str = "mean",
+        num_global_tokens: int = 16,
+        use_siren_decoder: bool = False,
+        use_width_priors: bool = False,
     ):
         super().__init__()
         self.max_iters = max_iters
@@ -182,12 +256,17 @@ class GINO_DEQ(nn.Module):
             raise ValueError(
                 f"Unsupported kinematics_mode={self.kinematics_mode!r}; expected 'stream' or 'direct_uvp'."
             )
+        self.use_hard_bcs = bool(use_hard_bcs)
+        self.use_siren_decoder = bool(use_siren_decoder) and self.kinematics_mode == "direct_uvp"
+        self.use_width_priors = bool(use_width_priors)
+        self.global_pool_mode = (global_pool_mode or "mean").strip().lower()
 
         freqs = (self.fourier_base ** torch.arange(num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
 
         fourier_channels = 5 * num_fourier_freqs * 2
-        encoded_channels = (in_channels - 5) + 5 + fourier_channels
+        width_extra = 3 if self.use_width_priors else 0
+        encoded_channels = (in_channels - 5) + 5 + fourier_channels + width_extra
 
         self.encoder = nn.Sequential(
             nn.Linear(encoded_channels, latent_dim),
@@ -195,10 +274,24 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        self.core = GINOBlock(latent_dim, edge_dim=3, activation_fn=self.activation_fn)
+        self.core = GINOBlock(
+            latent_dim,
+            edge_dim=3,
+            activation_fn=self.activation_fn,
+            global_pool_mode=self.global_pool_mode,
+            num_global_tokens=num_global_tokens,
+        )
         # Stream-function formulation: decoder predicts (psi, p), then u,v are derived from psi.
         # Direct formulation: decoder predicts (u, v, p) directly (used to avoid WLS-on-WLS differentiation).
-        self.kinematics_decoder = nn.Linear(latent_dim, 2 if self.kinematics_mode == "stream" else 3)
+        if self.kinematics_mode == "stream":
+            self.kinematics_decoder = nn.Linear(latent_dim, 2)
+            self.siren_decoder = None
+        elif self.use_siren_decoder:
+            self.siren_decoder = SIRENDecoder(latent_dim)
+            self.kinematics_decoder = None
+        else:
+            self.kinematics_decoder = nn.Linear(latent_dim, 3)
+            self.siren_decoder = None
 
         self.mu_decoder = nn.Sequential(
             SpectralLinear(latent_dim, latent_dim),
@@ -218,15 +311,17 @@ class GINO_DEQ(nn.Module):
                 module.inject_lora(rank=rank, alpha=alpha)
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
-        nodes_nd = pos_nd if pos_nd is not None else x[:, NodeFeat.XY]
-        sdf_nd = x[:, NodeFeat.SDF]
-        shear_pot = x[:, NodeFeat.SHEAR_POT]
-        wall_normal = x[:, NodeFeat.WALL_NORMAL]
+        # Canonical Tier-1 layout is 15 channels; optional width priors append three more (see NodeFeat).
+        xb = x[:, :15] if x.size(1) >= 15 else x
+        nodes_nd = pos_nd if pos_nd is not None else xb[:, NodeFeat.XY]
+        sdf_nd = xb[:, NodeFeat.SDF]
+        shear_pot = xb[:, NodeFeat.SHEAR_POT]
+        wall_normal = xb[:, NodeFeat.WALL_NORMAL]
 
-        rest = x[:, NodeFeat.REST]
-        uv_prior = x[:, NodeFeat.UV_PRIOR]
-        mu_prior = x[:, NodeFeat.MU_PRIOR]
-        wss_prior = x[:, NodeFeat.WSS_PRIOR]
+        rest = xb[:, NodeFeat.REST]
+        uv_prior = xb[:, NodeFeat.UV_PRIOR]
+        mu_prior = xb[:, NodeFeat.MU_PRIOR]
+        wss_prior = xb[:, NodeFeat.WSS_PRIOR]
 
         features_to_encode = torch.cat([nodes_nd, sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
@@ -237,6 +332,12 @@ class GINO_DEQ(nn.Module):
 
         encoded_x = torch.cat(
             [shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior, wss_prior], dim=1)
+        if getattr(self, "use_width_priors", False):
+            if x.size(1) >= NodeFeat.WIDTH_D2.stop:
+                width_features = x[:, NodeFeat.WIDTH_ND.start : NodeFeat.WIDTH_D2.stop]
+            else:
+                width_features = torch.zeros(x.size(0), 3, device=x.device, dtype=x.dtype)
+            encoded_x = torch.cat([encoded_x, width_features], dim=1)
         return encoded_x, uv_prior
 
     @torch.enable_grad()
@@ -310,10 +411,17 @@ class GINO_DEQ(nn.Module):
         mu_raw = self.mu_decoder(z)
         mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
 
-        kinematics_out = self.kinematics_decoder(z)
-        if self.kinematics_mode == "direct_uvp":
+        if self.kinematics_mode == "direct_uvp" and self.siren_decoder is not None:
+            pos_nd = data.x[:, NodeFeat.XY]
+            uvp, _ = self.siren_decoder(z, pos_nd)
+            u_v_p = uvp[:, PredChannels.KINEMATICS]
+        elif self.kinematics_mode == "direct_uvp":
+            assert self.kinematics_decoder is not None
+            kinematics_out = self.kinematics_decoder(z)
             u_v_p = kinematics_out[:, PredChannels.KINEMATICS]
         else:
+            assert self.kinematics_decoder is not None
+            kinematics_out = self.kinematics_decoder(z)
             psi_raw = kinematics_out[:, 0:1]
             p = kinematics_out[:, 1:2]
             sdf = data.sdf_wall if hasattr(data, "sdf_wall") else data.x[:, NodeFeat.SDF]
@@ -330,6 +438,14 @@ class GINO_DEQ(nn.Module):
                 wall_normal=wall_normal,
                 k_env=self.k_env,
             )
+
+        if self.kinematics_mode == "direct_uvp" and self.use_hard_bcs:
+            # SDF is already [N, 1]; do not add another singleton (would break broadcast with [N, 2]).
+            sdf = data.x[:, NodeFeat.SDF]
+            uv_prior = data.x[:, NodeFeat.UV_PRIOR]
+            u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
+            u_v_p = torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
+
         wss_pred = self.wss_decoder(z)
         pred = torch.cat([u_v_p, mu, wss_pred], dim=1)
 

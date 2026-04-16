@@ -8,7 +8,7 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
-from src.config import VesselConfig, PhysicsConfig
+from src.config import NodeFeat, PhysicsConfig, VesselConfig
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from src.utils.paths import get_project_root
 
@@ -77,6 +77,8 @@ class MeshToGraphComplete:
             with open(json_path, 'r') as f:
                 meta = json.load(f)
                 d_bar = meta.get('d_bar')
+        if d_bar is None or (isinstance(d_bar, (int, float)) and float(d_bar) <= 0):
+            d_bar = float(np.max(np.ptp(nodes, axis=0)) + 1e-6)
 
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
 
@@ -268,34 +270,21 @@ class MeshToGraphComplete:
         # 5. WSS Prior: MASKED to wall boundary
         wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
 
-        # --- Final Assembly ---
-        x_tensor = torch.cat([
-            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
-            wall_normal_vec,
-            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
-            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
-            u_prior.view(-1, 1), v_prior.view(-1, 1),  # <-- UPDATED: Vectorized UV Prior
-            mu_prior.view(-1, 1), wss_prior.view(-1, 1)  # Mu and WSS Prior
-        ], dim=1)
-
         # --------------------------------------------------------------------------
-        #  Compute Explicit Sparse Gradient Matrices (G_x, G_y) for GINO
+        #  Sparse WLS gradient matrices (G_x, G_y) — required before width assembly
         # --------------------------------------------------------------------------
         W_V = W.unsqueeze(1) * V  # Shape: (E, 5)
         M_inv_row = M_inv[row]  # Shape: (E, 5, 5)
 
-        # Calculate the gradient coefficients for each edge
         coeffs = torch.bmm(M_inv_row, W_V.unsqueeze(2)).squeeze(2)  # Shape: (E, 5)
         cx = coeffs[:, 0]
         cy = coeffs[:, 1]
 
         N = len(nodes)
 
-        # The diagonal entries are the negative sum of the off-diagonal coefficients
         diag_cx = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cx)
         diag_cy = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cy)
 
-        # Assemble indices for sparse tensors (Off-diagonals + Diagonals)
         diag_indices = torch.arange(N, dtype=torch.long).unsqueeze(0).repeat(2, 1)
 
         idx_x = torch.cat([edge_index, diag_indices], dim=1)
@@ -304,9 +293,56 @@ class MeshToGraphComplete:
         idx_y = torch.cat([edge_index, diag_indices], dim=1)
         val_y = torch.cat([cy, -diag_cy], dim=0)
 
-        # Create the sparse tensors that GINO DEQ uses for derivatives
         G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
+
+        # --------------------------------------------------------------------------
+        #  Local width D(x) and flow-direction derivatives (sphere tracing + WLS)
+        # --------------------------------------------------------------------------
+        d_bar_f = float(d_bar)
+        width_nd = torch.zeros(N, 1, dtype=torch.float32)
+        t_march = sdf_tensor.clone() + 0.05
+        active = torch.ones(N, dtype=torch.bool)
+        for _ in range(30):
+            if not active.any():
+                break
+            idx = torch.nonzero(active, as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                break
+            probe = pos_nd_tensor[idx] + t_march[idx] * wall_normal_vec[idx]
+            probe_np = (probe * d_bar_f).detach().cpu().numpy()
+            dist, _ = tree_wall.query(probe_np)
+            dist_nd = torch.tensor(dist / d_bar_f, dtype=torch.float32, device=pos_nd_tensor.device).view(-1, 1)
+            hit_mask = (dist_nd < 0.02).squeeze(-1)
+            hit_idx = idx[hit_mask]
+            width_nd[hit_idx] = sdf_tensor[hit_idx] + t_march[hit_idx]
+            active[hit_idx] = False
+            still_idx = idx[~hit_mask]
+            if still_idx.numel() == 0:
+                break
+            dist_still = dist_nd[~hit_mask].view(-1)
+            t_march[still_idx] = t_march[still_idx] + torch.clamp(dist_still, min=0.01)
+
+        width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0
+
+        grad_w_x = torch.sparse.mm(G_x, width_nd)
+        grad_w_y = torch.sparse.mm(G_y, width_nd)
+        width_d1 = grad_w_x * flow_dir_x.unsqueeze(1) + grad_w_y * flow_dir_y.unsqueeze(1)
+        grad2_w_x = torch.sparse.mm(G_x, width_d1)
+        grad2_w_y = torch.sparse.mm(G_y, width_d1)
+        width_d2 = grad2_w_x * flow_dir_x.unsqueeze(1) + grad2_w_y * flow_dir_y.unsqueeze(1)
+
+        # --- Final Assembly ---
+        x_tensor = torch.cat([
+            pos_nd_tensor, sdf_tensor, torch.abs(1.0 - 2.0 * sdf_tensor),  # Pos, SDF, ShearPot
+            wall_normal_vec,
+            torch.zeros((len(nodes), 4)),  # Node Type (Placeholder)
+            torch.full((len(nodes), 1), 1.0 if self.phys_cfg.viscosity_model == "carreau" else 0.0),
+            u_prior.view(-1, 1), v_prior.view(-1, 1),  # Vectorized UV prior
+            mu_prior.view(-1, 1), wss_prior.view(-1, 1),
+            width_nd, width_d1, width_d2,
+        ], dim=1)
+        assert x_tensor.shape[1] == NodeFeat.WIDTH_D2.stop, "Tier-1 node feature width must match NodeFeat"
 
         # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
         data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,

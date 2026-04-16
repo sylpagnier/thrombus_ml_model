@@ -33,6 +33,12 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 - ``TIER1_LATENT_DIM``, ``TIER1_DEQ_MAX_ITERS``, ``TIER1_NUM_FOURIER_FREQS`` — GINO-DEQ width/depth.
 - ``TIER1_KINEMATICS_MODE`` — ``stream`` or ``direct_uvp``.
 - ``TIER1_NS_DERIVATIVE_MODE`` — ``wls`` or ``autograd`` (for PDE derivatives).
+- ``TIER1_USE_HARD_BCS`` — ``1``/``true`` to enforce no-slip at walls via SDF × residual (``direct_uvp`` only).
+- ``TIER1_GLOBAL_POOL_MODE`` — ``mean`` (legacy global mean pool) or ``attention`` (Perceiver-style bottleneck).
+- ``TIER1_NUM_GLOBAL_TOKENS`` — attention bottleneck width when ``GLOBAL_POOL_MODE=attention``.
+- ``TIER1_USE_SIREN`` — ``1``/``true`` to use the SIREN INR decoder for ``direct_uvp`` kinematics.
+- ``TIER1_USE_EQUIVARIANT`` — reserved flag for future vector-aware convolutions (currently no-op in the model).
+- ``TIER1_USE_WIDTH_PRIORS`` — ``1``/``true`` to feed sphere-traced width + WLS flow-direction derivatives (requires graphs with 18 node channels from ``mesh_to_graph``).
 
 We intentionally keep both options for kinematics and PDE derivatives because vessel meshes can
 favor different numerical behavior; use sweep artifacts to determine the best pair for your data.
@@ -94,6 +100,13 @@ class T1ExplorerConfig:
     advect_detach: bool = False
     pressure_bc_mode: str = "mean"  # mean | pointwise | mean_var
     momentum_loss_mode: str = "huber"  # huber | mse
+    # --- V2 architecture flags (feature-gated; defaults preserve legacy behavior) ---
+    use_hard_bcs: bool = False
+    global_pool_mode: str = "mean"  # mean | attention
+    num_global_tokens: int = 16
+    use_equivariant_conv: bool = False  # reserved for future conv path
+    use_siren_decoder: bool = False
+    use_width_priors: bool = False  # append width channels in encoder (graphs must include them)
 
     @staticmethod
     def from_env() -> "T1ExplorerConfig":
@@ -128,6 +141,28 @@ class T1ExplorerConfig:
         momentum_loss_mode = os.environ.get("TIER1_MOMENTUM_LOSS_MODE", "huber").strip().lower()
         if momentum_loss_mode not in ("huber", "mse"):
             momentum_loss_mode = "huber"
+        global_pool_mode = os.environ.get("TIER1_GLOBAL_POOL_MODE", "mean").strip().lower()
+        if global_pool_mode not in ("mean", "attention"):
+            global_pool_mode = "mean"
+        use_hard_bcs = os.environ.get("TIER1_USE_HARD_BCS", "0").strip().lower() in ("1", "true", "yes", "on")
+        use_equivariant_conv = os.environ.get("TIER1_USE_EQUIVARIANT", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        use_siren_decoder = os.environ.get("TIER1_USE_SIREN", "0").strip().lower() in ("1", "true", "yes", "on")
+        use_width_priors = os.environ.get("TIER1_USE_WIDTH_PRIORS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        raw_tok = os.environ.get("TIER1_NUM_GLOBAL_TOKENS", "16").strip()
+        try:
+            num_global_tokens = max(1, int(raw_tok))
+        except ValueError:
+            num_global_tokens = 16
 
         return T1ExplorerConfig(
             experiment_name=os.environ.get("TIER1_EXPERIMENT_NAME", "default").strip() or "default",
@@ -153,6 +188,12 @@ class T1ExplorerConfig:
             advect_detach=os.environ.get("TIER1_ADVECT_DETACH", "0").strip().lower() in ("1", "true", "yes", "on"),
             pressure_bc_mode=pressure_bc_mode,
             momentum_loss_mode=momentum_loss_mode,
+            use_hard_bcs=use_hard_bcs,
+            global_pool_mode=global_pool_mode,
+            num_global_tokens=num_global_tokens,
+            use_equivariant_conv=use_equivariant_conv,
+            use_siren_decoder=use_siren_decoder,
+            use_width_priors=use_width_priors,
         )
 
     def to_serializable(self) -> Dict[str, Any]:
@@ -322,6 +363,12 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_ADVECT_DETACH": ("1" if cfg.advect_detach else "0"),
             "TIER1_PRESSURE_BC_MODE": cfg.pressure_bc_mode,
             "TIER1_MOMENTUM_LOSS_MODE": cfg.momentum_loss_mode,
+            "TIER1_USE_HARD_BCS": ("1" if cfg.use_hard_bcs else "0"),
+            "TIER1_GLOBAL_POOL_MODE": cfg.global_pool_mode,
+            "TIER1_NUM_GLOBAL_TOKENS": str(cfg.num_global_tokens),
+            "TIER1_USE_EQUIVARIANT": ("1" if cfg.use_equivariant_conv else "0"),
+            "TIER1_USE_SIREN": ("1" if cfg.use_siren_decoder else "0"),
+            "TIER1_USE_WIDTH_PRIORS": ("1" if cfg.use_width_priors else "0"),
         }
     
     # RESTORED: Optimal Champion Hyperparameters from Training History
@@ -355,6 +402,66 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             fourier_base=1.25,
             ns_derivative_mode="wls",
             loss_weight_mode="dynamic",
+        ),
+        # Architecture A/B on a single resolution (medium mesh); toggles only V2 flags.
+        T1ExplorerConfig(
+            experiment_name="Baseline_Legacy",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            use_hard_bcs=False,
+            global_pool_mode="mean",
+            loss_weight_mode="dynamic",
+        ),
+        T1ExplorerConfig(
+            experiment_name="V2_Hard_BCs",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            use_hard_bcs=True,
+            global_pool_mode="mean",
+            loss_weight_mode="dynamic",
+        ),
+        T1ExplorerConfig(
+            experiment_name="V2_Hard_BCs_Plus_Attention",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            use_hard_bcs=True,
+            global_pool_mode="attention",
+            loss_weight_mode="dynamic",
+        ),
+        # Width priors A/B (regenerate graphs with mesh_to_graph so ``x`` has 18 channels).
+        T1ExplorerConfig(
+            experiment_name="Baseline_Width_Legacy",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+            use_width_priors=False,
+        ),
+        T1ExplorerConfig(
+            experiment_name="V2_Width_Derivatives",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,
+            deq_max_iters=25,
+            num_fourier_freqs=16,
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+            use_width_priors=True,
         ),
     ]
 

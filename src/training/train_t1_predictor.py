@@ -260,7 +260,9 @@ def train_t1_predictor(
         f"act={explorer.activation_fn} | fourier_base={explorer.fourier_base:.2f} | "
         f"loss_weight={explorer.loss_weight_mode} | anderson_beta={explorer.anderson_beta:.2f} | "
         f"lambda_cont={explorer.lambda_cont:.2f} | re_curriculum={explorer.re_curriculum} | "
-        f"p_grad_sup={explorer.p_grad_supervision:.3f}"
+        f"p_grad_sup={explorer.p_grad_supervision:.3f} | "
+        f"hard_bcs={explorer.use_hard_bcs} | global_pool={explorer.global_pool_mode} | "
+        f"siren={explorer.use_siren_decoder} | width_priors={explorer.use_width_priors}"
     )
     phys_cfg = PhysicsConfig(tier="tier1")
     model = GINO_DEQ(
@@ -273,6 +275,11 @@ def train_t1_predictor(
         kinematics_mode=explorer.kinematics_mode,
         activation_fn=explorer.activation_fn,
         fourier_base=explorer.fourier_base,
+        use_hard_bcs=explorer.use_hard_bcs,
+        global_pool_mode=explorer.global_pool_mode,
+        num_global_tokens=explorer.num_global_tokens,
+        use_siren_decoder=explorer.use_siren_decoder,
+        use_width_priors=explorer.use_width_priors,
     ).to(device)
 
     kernels = PhysicsKernels(phys_cfg=phys_cfg)

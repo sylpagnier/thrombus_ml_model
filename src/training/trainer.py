@@ -447,6 +447,11 @@ class DEQPredictorTrainer:
             kinematics_mode=explorer.kinematics_mode,
             activation_fn=explorer.activation_fn,
             fourier_base=explorer.fourier_base,
+            use_hard_bcs=explorer.use_hard_bcs,
+            global_pool_mode=explorer.global_pool_mode,
+            num_global_tokens=explorer.num_global_tokens,
+            use_siren_decoder=explorer.use_siren_decoder,
+            use_width_priors=explorer.use_width_priors,
         ).to(device)
 
         kernels = PhysicsKernels(phys_cfg=phys_cfg)
