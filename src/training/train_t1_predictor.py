@@ -43,12 +43,15 @@ from src.training.t1_explorer import (
     filter_graph_paths_by_geometry_level,
     write_t1_experiment_artifact,
 )
+from src.training.trainer import _resolve_t1_dataset_tier
 import random
 
 
 def load_dataset(explorer: Optional[T1ExplorerConfig] = None):
-    cfg = VesselConfig(tier="tier1")
+    dataset_tier = _resolve_t1_dataset_tier(explorer)
+    cfg = VesselConfig(tier=dataset_tier)
     if not cfg.graph_output_dir.exists():
+        print(f"⚠️ Tier 1 graph dir not found: {cfg.graph_output_dir} (dataset_tier={dataset_tier})")
         return []
     paths = sorted(cfg.graph_output_dir.glob("vessel_*.pt"))
     if explorer is not None and explorer.geometry_level is not None:
@@ -60,7 +63,7 @@ def load_dataset(explorer: Optional[T1ExplorerConfig] = None):
             f"{len(paths)}/{before} graphs (json \"level\" filter)."
         )
     dataset = []
-    print(f"📂 Loading Tier 1 graphs from {cfg.graph_output_dir}...")
+    print(f"📂 Loading Tier 1 graphs from {cfg.graph_output_dir} (dataset_tier={dataset_tier})...")
     for f in tqdm(paths):
         dataset.append(torch.load(f, weights_only=False))
     return dataset
@@ -85,7 +88,6 @@ def compute_step_loss(
     re_ref: Optional[float] = None,
     re_scale: Optional[float] = None,
     train_loss_weighter: bool = True,
-    lambda_cont_override: Optional[float] = None,
 ):
     if explorer is not None and explorer.ns_derivative_mode == "autograd":
         data.x = data.x.clone().detach().requires_grad_(True)
@@ -131,10 +133,7 @@ def compute_step_loss(
     l_bc = terms["l_bc"]
     l_io = terms["l_io"]
 
-    if lambda_cont_override is not None:
-        lambda_cont = float(lambda_cont_override)
-    else:
-        lambda_cont = float(explorer.lambda_cont) if explorer is not None else 1.0
+    lambda_cont = float(explorer.lambda_cont) if explorer is not None else 1.0
     loss_weight_mode = (explorer.loss_weight_mode if explorer is not None else "dynamic").strip().lower()
 
     # Optional gauge-invariant pressure supervision via pressure gradients on anchor nodes.
@@ -214,6 +213,8 @@ def compute_step_loss(
         "L_data": l_data_kine.item(),
         "L_mom": l_mom.item(),
         "L_cont": l_cont.item(),
+        "L_bc": l_bc.item(),
+        "L_io": l_io.item(),
         "L_jac": jac_loss.item(),
         "L_wss": l_wss.item(),
         "L_pgrad": p_grad_loss.item(),
@@ -234,7 +235,7 @@ def train_t1_predictor(
         epochs = max(1, int(os.environ.get("TIER1_EPOCHS", "60")))
     if adam_epochs is None:
         raw_adam = os.environ.get("TIER1_ADAM_EPOCHS", "").strip()
-        adam_epochs = int(raw_adam) if raw_adam else min(40, int(epochs))
+        adam_epochs = int(raw_adam) if raw_adam else epochs
     adam_epochs = max(1, min(int(adam_epochs), int(epochs)))
     if warm_up_epochs is None:
         raw_w = os.environ.get("TIER1_WARM_UP_EPOCHS", "").strip()
@@ -260,21 +261,19 @@ def train_t1_predictor(
         f"lambda_cont={explorer.lambda_cont:.2f} | re_curriculum={explorer.re_curriculum} | "
         f"p_grad_sup={explorer.p_grad_supervision:.3f}"
     )
-    lambda_cont_start = float(os.environ.get("TIER1_LAMBDA_CONT_START", "0.1"))
-    lambda_cont_warmup_epochs = max(0, int(os.environ.get("TIER1_LAMBDA_CONT_WARMUP_EPOCHS", "10")))
-    lambda_cont_start = max(0.0, lambda_cont_start)
+    phys_cfg = PhysicsConfig(tier="tier1")
     model = GINO_DEQ(
         in_channels=15,
         out_channels=5,
         latent_dim=explorer.latent_dim,
         max_iters=explorer.deq_max_iters,
         num_fourier_freqs=explorer.num_fourier_freqs,
+        phys_cfg=phys_cfg,
         kinematics_mode=explorer.kinematics_mode,
         activation_fn=explorer.activation_fn,
         fourier_base=explorer.fourier_base,
     ).to(device)
 
-    phys_cfg = PhysicsConfig(tier="tier1")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels.ns_derivative_mode = explorer.ns_derivative_mode
     kernels.cfg.kinematics_mode = explorer.kinematics_mode
@@ -304,9 +303,16 @@ def train_t1_predictor(
         optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=1e-6
     )
 
+    dataset_tier = _resolve_t1_dataset_tier(explorer)
+    dataset_cfg = VesselConfig(tier=dataset_tier)
     dataset = load_dataset(explorer)
     if not dataset:
-        return {"status": "no_data", "experiment_name": explorer.experiment_name}
+        return {
+            "status": "no_data",
+            "experiment_name": explorer.experiment_name,
+            "dataset_tier": dataset_tier,
+            "graph_dir": str(dataset_cfg.graph_output_dir),
+        }
 
     # --- NEW STRATIFIED SPLIT LOGIC ---
     anchors = [d for d in dataset if d.is_anchor.any().item()]
@@ -323,8 +329,8 @@ def train_t1_predictor(
     val_data = anchors[split_idx_a:] + physics[split_idx_p:]
 
     # Reduce physical batch size to save memory, but maintain effective batch size
-    micro_batch_size = 2
-    accumulation_steps = 4  # Effective batch size = 2 * 4 = 8
+    micro_batch_size = int(os.environ.get("TIER1_MICRO_BATCH_SIZE", "2"))
+    accumulation_steps = int(os.environ.get("TIER1_ACCUMULATION_STEPS", "4"))
 
     target_anchor_fraction = float(os.environ.get("TIER1_TARGET_ANCHOR_FRACTION", "0.5"))
     target_anchor_fraction = min(max(target_anchor_fraction, 0.0), 1.0)
@@ -388,9 +394,6 @@ def train_t1_predictor(
     latest_ckpt_path = resolve_checkpoint("a", "tier1_latest_checkpoint.pth")
     best_physics_path = resolve_checkpoint("a", "tier1_best_physics.pth")
     ckpt_every = max(1, int(os.environ.get("TIER1_CKPT_EVERY", "1")))
-    disable_stage_a_artifacts = (
-        os.environ.get("TIER1_DISABLE_STAGE_A_ARTIFACTS", "0").strip().lower() in ("1", "true", "yes", "on")
-    )
     resume_enabled = (os.environ.get("TIER1_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_from_best_enabled = (os.environ.get("TIER1_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_done = False
@@ -538,18 +541,9 @@ def train_t1_predictor(
         if epoch == start_epoch or (epoch % hard_refresh == 0):
             _refresh_hard_mining(epoch)
             loader = _make_train_loader()
-        # Keep AdamW in train mode, but force deterministic forwards during L-BFGS line search.
-        if not lbfgs_initialized:
-            model.train()
-        else:
-            model.eval()
+        model.train()
         physics_active = epoch >= warm_up_epochs
         lambda_phys = min(1.0, max(0.0, (epoch - warm_up_epochs) / 20.0))
-        if lambda_cont_warmup_epochs > 0 and epoch < lambda_cont_warmup_epochs:
-            ramp = float(epoch + 1) / float(lambda_cont_warmup_epochs)
-            lambda_cont_epoch = lambda_cont_start + (float(explorer.lambda_cont) - lambda_cont_start) * ramp
-        else:
-            lambda_cont_epoch = float(explorer.lambda_cont)
         if explorer.re_curriculum and epoch == start_epoch:
             print("⚠️ TIER1_RE_CURRICULUM requested, but disabled for supervised Tier 1 to avoid Re/data contradiction.")
         re_scale_epoch = 1.0
@@ -618,7 +612,6 @@ def train_t1_predictor(
                     tier1_kine_p_weight=tier1_kine_p_weight,
                     re_scale=re_scale_epoch,
                     train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
-                    lambda_cont_override=lambda_cont_epoch,
                 )
                 accum_counter += 1
                 loss = loss / float(accumulation_steps)
@@ -651,8 +644,12 @@ def train_t1_predictor(
 
                 pbar.set_postfix({
                     "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
+                    "L_data": f"{metrics['L_data']:.3f}",
                     "L_mom": f"{metrics['L_mom']:.3f}",
                     "L_cont": f"{metrics['L_cont']:.3f}",
+                    "L_bc": f"{metrics['L_bc']:.3f}",
+                    "L_io": f"{metrics['L_io']:.3f}",
+                    "L_wss": f"{metrics['L_wss']:.3f}",
                     "L_pgrad": f"{metrics['L_pgrad']:.3f}",
                     "L_jac": f"{metrics['L_jac']:.3f}",
                     "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
@@ -692,7 +689,6 @@ def train_t1_predictor(
                         tier1_kine_p_weight=tier1_kine_p_weight,
                         re_scale=re_scale_epoch,
                         train_loss_weighter=not (dynamic_freeze_during_warmup and epoch < warm_up_epochs),
-                        lambda_cont_override=lambda_cont_epoch,
                     )
                     loss = loss / n_batches
                     loss.backward()
@@ -709,29 +705,27 @@ def train_t1_predictor(
         avg_loss = total_loss_epoch / max(1, len(loader))
         if avg_loss < best_loss and physics_active:
             best_loss = avg_loss
-            if not disable_stage_a_artifacts:
-                save_path = model_dir / "tier1_best_loss.pth"
-                torch.save(model.state_dict(), save_path)
-                print(f"⭐ Saved Best Loss Model to {save_path}")
+            save_path = model_dir / "tier1_best_loss.pth"
+            torch.save(model.state_dict(), save_path)
+            print(f"⭐ Saved Best Loss Model to {save_path}")
 
         if (not disable_figures) and epoch % 5 == 0:
             validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:
-            if not disable_stage_a_artifacts:
-                checkpoint = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
-                    "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
-                    "best_phys_score": best_phys_score,
-                    "best_loss": best_loss,
-                    "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
-                }
-                torch.save(checkpoint, latest_ckpt_save)
-                print(f"💾 Saved Tier 1 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
+                "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
+                "best_phys_score": best_phys_score,
+                "best_loss": best_loss,
+                "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
+            }
+            torch.save(checkpoint, latest_ckpt_save)
+            print(f"💾 Saved Tier 1 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
 
         diary.log_epoch_end(
             epoch,
@@ -772,6 +766,12 @@ def train_t1_predictor(
                 f"(p90 {scores.get('shear_mse_p90', float('nan')):.4e}) | "
                 f"Batches w/ anchors: {int(scores.get('val_anchor_batches', 0))}/"
                 f"{int(scores.get('val_total_batches', 0))}"
+            )
+            print(
+                f"   Rel L2 near-wall (anchor low-|SDF|): {scores.get('rel_l2_near_wall', float('nan')):.4f} "
+                f"(p90 {scores.get('rel_l2_near_wall_p90', float('nan')):.4f}) | "
+                f"Rel L2 high-|∇SDF| (anchor): {scores.get('rel_l2_high_sdf_grad', float('nan')):.4f} "
+                f"(p90 {scores.get('rel_l2_high_sdf_grad_p90', float('nan')):.4f})"
             )
 
             with torch.no_grad():
@@ -826,10 +826,9 @@ def train_t1_predictor(
 
             if phys_score < best_phys_score and physics_active:
                 best_phys_score = phys_score
-                if not disable_stage_a_artifacts:
-                    save_path = model_dir / "tier1_best_physics.pth"
-                    torch.save(model.state_dict(), save_path)
-                    print(f"⭐ Saved Best Physics Model to {save_path}")
+                save_path = model_dir / "tier1_best_physics.pth"
+                torch.save(model.state_dict(), save_path)
+                print(f"⭐ Saved Best Physics Model to {save_path}")
 
     _emit_tier1_run_end(interrupted=False)
     print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")

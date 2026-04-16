@@ -27,6 +27,35 @@ def _list_dispersion(vals: List[float]) -> tuple:
     return float(np.std(a)), float(np.percentile(a, 90))
 
 
+def _masked_rel_l2(pred_uvp: torch.Tensor, true_uvp: torch.Tensor, mask: torch.Tensor) -> Optional[torch.Tensor]:
+    m = mask.view(-1).bool()
+    if not m.any():
+        return None
+    p = pred_uvp[m, :3]
+    y = true_uvp[m, :3]
+    den = torch.norm(y, p=2)
+    if den <= 0:
+        return None
+    return torch.norm(p - y, p=2) / (den + 1e-8)
+
+
+def _sdf_grad_proxy(data) -> Optional[torch.Tensor]:
+    if not hasattr(data, "edge_index") or data.edge_index is None:
+        return None
+    edge_index = data.edge_index
+    if edge_index.numel() == 0:
+        return None
+    sdf = data.x[:, 2].abs()
+    row, col = edge_index
+    diff = (sdf[row] - sdf[col]).abs()
+    n = int(data.num_nodes)
+    sum_d = torch.zeros(n, dtype=diff.dtype, device=diff.device)
+    cnt = torch.zeros(n, dtype=diff.dtype, device=diff.device)
+    sum_d.index_add_(0, row, diff)
+    cnt.index_add_(0, row, torch.ones_like(diff))
+    return sum_d / (cnt + 1e-8)
+
+
 class DynamicLossWeighter(nn.Module):
     """
     Dynamically weights multiple loss components using homoscedastic task uncertainty.
@@ -168,6 +197,8 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
         "rel_l2_u": [],
         "rel_l2_v": [],
         "rel_l2_p": [],
+        "rel_l2_near_wall": [],
+        "rel_l2_high_sdf_grad": [],
         "continuity": [],
         "wall_slip": [],
         "shear_mse": [],
@@ -204,6 +235,27 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
                         num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
                         den = torch.norm(y_a[:, j], p=2) + 1e-8
                         metrics[key].append((num / den).item())
+
+                    # Area-specific relative errors on anchor nodes:
+                    # near-wall region (low |SDF|) and high |∇SDF| proxy region.
+                    sdf_abs = data.x[:, 2].abs()
+                    sdf_anchor = sdf_abs[node_mask]
+                    if sdf_anchor.numel() > 0:
+                        sdf_q25 = torch.quantile(sdf_anchor, torch.tensor(0.25, device=sdf_anchor.device))
+                        near_wall_mask = node_mask & (sdf_abs <= sdf_q25)
+                        rel_near = _masked_rel_l2(pred, data.y, near_wall_mask)
+                        if rel_near is not None:
+                            metrics["rel_l2_near_wall"].append(float(rel_near.item()))
+
+                    grad_proxy = _sdf_grad_proxy(data)
+                    if grad_proxy is not None:
+                        gp_anchor = grad_proxy[node_mask]
+                        if gp_anchor.numel() > 0:
+                            gp_q75 = torch.quantile(gp_anchor, torch.tensor(0.75, device=gp_anchor.device))
+                            high_grad_mask = node_mask & (grad_proxy >= gp_q75)
+                            rel_high = _masked_rel_l2(pred, data.y, high_grad_mask)
+                            if rel_high is not None:
+                                metrics["rel_l2_high_sdf_grad"].append(float(rel_high.item()))
 
                     # Explicit shear-rate MSE (anchors only; needs labeled fields)
                     u_t = data.y[:, PredChannels.U:PredChannels.U + 1]
@@ -254,6 +306,14 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
     rl2_std, rl2_p90 = _list_dispersion(metrics["rel_l2"])
     out["rel_l2_std"] = rl2_std
     out["rel_l2_p90"] = rl2_p90
+
+    nw_std, nw_p90 = _list_dispersion(metrics["rel_l2_near_wall"])
+    out["rel_l2_near_wall_std"] = nw_std
+    out["rel_l2_near_wall_p90"] = nw_p90
+
+    hg_std, hg_p90 = _list_dispersion(metrics["rel_l2_high_sdf_grad"])
+    out["rel_l2_high_sdf_grad_std"] = hg_std
+    out["rel_l2_high_sdf_grad_p90"] = hg_p90
 
     c_std, c_p90 = _list_dispersion(metrics["continuity"])
     out["continuity_std"] = c_std
