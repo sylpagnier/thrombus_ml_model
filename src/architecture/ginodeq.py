@@ -3,13 +3,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm
-from torch_geometric.nn import GlobalAttention, MessagePassing
+from torch_geometric.nn import global_mean_pool, MessagePassing
 from torch_geometric.utils import softmax
 from typing import Optional, Tuple, Union
 from torch import Tensor
 
 from src.core_physics.anderson import anderson_acceleration
 from src.architecture.lora_injection import LoRAParametrization, SpectralLinear
+from src.config import NodeFeat, PhysicsConfig, PredChannels
+from src.utils.batching import get_batch_tensor
 from src.utils.kinematics import stream_to_velocity
 
 
@@ -31,12 +33,6 @@ def _make_activation(name: str) -> nn.Module:
 class GlobalMixingBlock(nn.Module):
     def __init__(self, latent_dim, use_spectral_norm: bool = True, activation_fn: str = "relu"):
         super().__init__()
-        self.gate_nn = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            _make_activation(activation_fn),
-            nn.Linear(latent_dim, 1),
-        )
-        self.attn_pool = GlobalAttention(gate_nn=self.gate_nn)
         self.global_mlp = nn.Sequential(
             _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
             _make_activation(activation_fn),
@@ -44,8 +40,7 @@ class GlobalMixingBlock(nn.Module):
         )
 
     def forward(self, x, batch):
-        # Let critical non-local nodes (e.g., inlet/outlet/wall neighborhoods) dominate the global state.
-        global_context = self.attn_pool(x, batch)
+        global_context = global_mean_pool(x, batch)
         global_update = self.global_mlp(global_context)
         return global_update[batch]
 
@@ -69,11 +64,7 @@ class MultiHeadPhysicsGATConv(MessagePassing):
         super().__init__(**kwargs)
 
         self.temperature = temperature
-        self.edge_proj = nn.Sequential(
-            _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm),
-            _make_activation("silu"),
-            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
-        )
+        self.edge_proj = _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm)
 
         self.lin_src = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
         self.lin_dst = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
@@ -148,20 +139,36 @@ class GINO_DEQ(nn.Module):
         out_channels=5,
         latent_dim=64,
         max_iters=25,
-        num_fourier_freqs=16,
+        num_fourier_freqs=8,
         outer_iters=3,
-        mu_inf_nd=0.03,
-        mu_0_nd=1.0,
+        mu_inf_nd: Optional[float] = None,
+        mu_0_nd: Optional[float] = None,
+        phys_cfg: Optional[PhysicsConfig] = None,
         kinematics_mode: str = "direct_uvp",
         activation_fn: str = "silu",
-        fourier_base: float = 1.5,
+        fourier_base: float = 2.0,
     ):
         super().__init__()
         self.max_iters = max_iters
         self.outer_iters = outer_iters
         self.num_fourier_freqs = num_fourier_freqs
-        self.mu_inf_nd = mu_inf_nd
-        self.mu_0_nd = mu_0_nd
+        if phys_cfg is not None:
+            mu_scale = float(phys_cfg.mu_viscosity_nd_scale)
+            default_mu_inf_nd = float(phys_cfg.mu_inf / mu_scale)
+            default_mu_0_nd = float(phys_cfg.mu_0 / mu_scale)
+            self.edge_decay_k = float(phys_cfg.gino_edge_decay_k)
+            self.curve_log_clamp_min = float(phys_cfg.gino_curve_log_clamp_min)
+            self.rheo_log_clamp_min = float(phys_cfg.gino_rheo_log_clamp_min)
+            self.adv_log_clamp_min = float(phys_cfg.gino_adv_log_clamp_min)
+        else:
+            default_mu_inf_nd = 0.03
+            default_mu_0_nd = 1.0
+            self.edge_decay_k = 5.0
+            self.curve_log_clamp_min = 1e-4
+            self.rheo_log_clamp_min = 1e-3
+            self.adv_log_clamp_min = 1e-3
+        self.mu_inf_nd = float(default_mu_inf_nd if mu_inf_nd is None else mu_inf_nd)
+        self.mu_0_nd = float(default_mu_0_nd if mu_0_nd is None else mu_0_nd)
         self.activation_fn = (activation_fn or "relu").strip().lower()
         self.fourier_base = float(fourier_base)
 
@@ -211,15 +218,15 @@ class GINO_DEQ(nn.Module):
                 module.inject_lora(rank=rank, alpha=alpha)
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
-        nodes_nd = pos_nd if pos_nd is not None else x[:, 0:2]
-        sdf_nd = x[:, 2:3]
-        shear_pot = x[:, 3:4]
-        wall_normal = x[:, 4:6]
+        nodes_nd = pos_nd if pos_nd is not None else x[:, NodeFeat.XY]
+        sdf_nd = x[:, NodeFeat.SDF]
+        shear_pot = x[:, NodeFeat.SHEAR_POT]
+        wall_normal = x[:, NodeFeat.WALL_NORMAL]
 
-        rest = x[:, 6:11]
-        uv_prior = x[:, 11:13]
-        mu_prior = x[:, 13:14]
-        wss_prior = x[:, 14:15]
+        rest = x[:, NodeFeat.REST]
+        uv_prior = x[:, NodeFeat.UV_PRIOR]
+        mu_prior = x[:, NodeFeat.MU_PRIOR]
+        wss_prior = x[:, NodeFeat.WSS_PRIOR]
 
         features_to_encode = torch.cat([nodes_nd, sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
@@ -231,27 +238,6 @@ class GINO_DEQ(nn.Module):
         encoded_x = torch.cat(
             [shear_pot, features_to_encode, fourier_feats, rest, uv_prior, mu_prior, wss_prior], dim=1)
         return encoded_x, uv_prior
-
-    def _stream_to_velocity(
-        self,
-        psi_raw: Tensor,
-        p: Tensor,
-        data,
-        sdf: Tensor,
-        wall_normal: Tensor,
-    ) -> Tensor:
-        return stream_to_velocity(
-            psi_raw=psi_raw,
-            p=p,
-            edge_index=data.edge_index,
-            num_nodes=data.num_nodes,
-            V=data.V,
-            W=data.W,
-            M_inv=data.M_inv,
-            sdf=sdf,
-            wall_normal=wall_normal,
-            k_env=self.k_env,
-        )
 
     @torch.enable_grad()
     def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5):
@@ -265,11 +251,9 @@ class GINO_DEQ(nn.Module):
         edge_attr = data.edge_attr
         edge_vec = edge_attr[:, :2]
 
-        batch_idx = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(
-            data.x.size(0), dtype=torch.long, device=data.x.device
-        )
+        batch_idx = get_batch_tensor(data, data.x.size(0), data.x.device)
 
-        wall_normals = data.x[:, 4:6]
+        wall_normals = data.x[:, NodeFeat.WALL_NORMAL]
         e_dir = F.normalize(edge_vec, p=2, dim=-1, eps=1e-8)
         n_dir_row = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
         n_dir_col = F.normalize(wall_normals[col], p=2, dim=-1, eps=1e-8)
@@ -277,16 +261,15 @@ class GINO_DEQ(nn.Module):
         dot_prod = torch.abs((e_dir * n_dir_row).sum(dim=-1, keepdim=True))
         dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        sdf_nd = data.x[:, 2:3]
+        sdf_nd = data.x[:, NodeFeat.SDF]
         sdf_edge = sdf_nd[row]
 
-        k_decay = 5.0
-        decay_factor = torch.exp(-k_decay * sdf_edge)
+        decay_factor = torch.exp(-self.edge_decay_k * sdf_edge)
         curve_dot = (n_dir_row * n_dir_col).sum(dim=-1, keepdim=True)
-        mod_curve = torch.log(torch.clamp(1.0 - curve_dot, min=1e-4, max=1.0)) * decay_factor
+        mod_curve = torch.log(torch.clamp(1.0 - curve_dot, min=self.curve_log_clamp_min, max=1.0)) * decay_factor
 
-        mod_rheo = torch.log(torch.clamp(dot_prod, min=1e-3, max=1.0)) * decay_factor
-        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=1e-3, max=1.0)) * decay_factor
+        mod_rheo = torch.log(torch.clamp(dot_prod, min=self.rheo_log_clamp_min, max=1.0)) * decay_factor
+        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=self.adv_log_clamp_min, max=1.0)) * decay_factor
 
         def f_coupled(curr_z):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
@@ -312,12 +295,10 @@ class GINO_DEQ(nn.Module):
                     max_iter=self.max_iters, beta=anderson_beta, warmup_iters=anderson_warmup_iters
                 )
 
-        # Keep DEQ backward connectivity whenever gradients are enabled, even in eval mode.
-        # This allows deterministic L-BFGS closures (model.eval()) to still optimize encoder/core weights.
-        z_star_req = z_star.detach().requires_grad_(torch.is_grad_enabled())
+        # Re-attach once so kinematics keep a differentiable path to coordinates.
+        z_star_req = z_star.detach().requires_grad_(self.training)
         z_out = f_coupled(z_star_req)
-        # Apply stochastic Jacobian trace regularization only during true training mode.
-        if self.training and torch.is_grad_enabled():
+        if self.training:
             eps = torch.randn_like(z_out)
             vjp = torch.autograd.grad(z_out, z_star_req, grad_outputs=eps, create_graph=True)[0]
             jac_loss = torch.mean(vjp ** 2)
@@ -331,18 +312,23 @@ class GINO_DEQ(nn.Module):
 
         kinematics_out = self.kinematics_decoder(z)
         if self.kinematics_mode == "direct_uvp":
-            u_v_p = kinematics_out[:, 0:3]
+            u_v_p = kinematics_out[:, PredChannels.KINEMATICS]
         else:
             psi_raw = kinematics_out[:, 0:1]
             p = kinematics_out[:, 1:2]
-            sdf = data.sdf_wall if hasattr(data, "sdf_wall") else data.x[:, 2:3]
-            wall_normal = data.x[:, 4:6]
-            u_v_p = self._stream_to_velocity(
-                psi_raw,
-                p,
-                data,
-                sdf,
-                wall_normal,
+            sdf = data.sdf_wall if hasattr(data, "sdf_wall") else data.x[:, NodeFeat.SDF]
+            wall_normal = data.x[:, NodeFeat.WALL_NORMAL]
+            u_v_p = stream_to_velocity(
+                psi_raw=psi_raw,
+                p=p,
+                edge_index=data.edge_index,
+                num_nodes=data.num_nodes,
+                V=data.V,
+                W=data.W,
+                M_inv=data.M_inv,
+                sdf=sdf,
+                wall_normal=wall_normal,
+                k_env=self.k_env,
             )
         wss_pred = self.wss_decoder(z)
         pred = torch.cat([u_v_p, mu, wss_pred], dim=1)

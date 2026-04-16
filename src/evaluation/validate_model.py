@@ -10,7 +10,7 @@ from torch_geometric.loader import DataLoader
 from src.utils.paths import get_project_root, reports_dir
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
-from src.config import PhysicsConfig
+from src.config import PhysicsConfig, PredChannels
 
 project_root = get_project_root()
 
@@ -111,15 +111,15 @@ class ModelValidator:
 
             def evaluate_prediction(pred, prefix):
                 # 1. Physics Metrics
-                grads_u = self.kernels._compute_gradients(pred[:, 0:1], props)
-                grads_v = self.kernels._compute_gradients(pred[:, 1:2], props)
+                grads_u = self.kernels._compute_gradients(pred[:, PredChannels.U:PredChannels.U + 1], props)
+                grads_v = self.kernels._compute_gradients(pred[:, PredChannels.V:PredChannels.V + 1], props)
                 div = torch.abs(grads_u[:, 0] + grads_v[:, 1]).mean()
                 metrics[f"{prefix}_div_res"].append(div.item())
 
                 mask_wall = data.mask_wall.view(-1).bool()
 
                 if mask_wall.any():
-                    slip = torch.norm(pred[mask_wall, :2], dim=1).mean()
+                    slip = torch.norm(pred[mask_wall, PredChannels.UV], dim=1).mean()
                     metrics[f"{prefix}_wall_slip"].append(slip.item())
                 else:
                     metrics[f"{prefix}_wall_slip"].append(0.0)

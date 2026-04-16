@@ -15,7 +15,7 @@ This document gives **enough structure** to navigate the repo without re-reading
 
 | Action | Command / module |
 |--------|------------------|
-| Chain training | `python -m src.main {a\|b\|all}` (`--skip-tier1` for Stage A starting at Tier 2) |
+| Chain training | `python -m src.bin.orchestrate {a\|b\|all}` (`--skip-tier1` for Stage A starting at Tier 2) |
 | Tier 1 only | `python -m src.training.train_t1_predictor` |
 | Tier 2 only | `python -m src.training.train_t2_predictor` |
 | Tier 3 only | `python -m src.training.train_t3_corrector` |
@@ -38,6 +38,13 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 
 - **Anchor samples** are vessel geometries with full CFD labels from COMSOL across the graph (supervised fields like `u`, `v`, `p`, and related targets).
 - **Non-anchor samples** are vessel geometries without COMSOL solution labels; they contribute geometry and analytical-prior/physics-based constraints only.
+
+## Unit system policy (authoritative)
+
+- **Tier 1 and Tier 2 COMSOL data path is SI-first**: COMSOL exports and raw anchor labels are treated as SI (MKS) before graph non-dimensionalization.
+- **Tier 3 COMSOL data path is CGS/mixed-CGS at export**: extraction must convert CGS -> SI exactly once at ingestion boundaries, then non-dimensionalize.
+- **PyTorch contract is strict ND only**: saved graph labels consumed by training/kernels must be non-dimensional and stamped with `units_contract="STRICT_ND"`.
+- **No in-kernel unit fallback**: physics/biochem kernels should not branch on label units metadata or redimensionalize intermediate shear/WSS terms inside residual paths.
 
 ## Source map
 

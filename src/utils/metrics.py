@@ -6,6 +6,8 @@ from matplotlib.colors import LogNorm
 from pathlib import Path
 
 from src.utils.paths import reports_dir
+from src.config import PredChannels
+from src.utils.rheology import compute_shear_rate
 from torch_geometric.data import Batch
 import torch.nn as nn
 from typing import Optional, Sequence, Union, List, Dict, Any
@@ -126,7 +128,7 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
         title = f"Tier 1 Validation - Epoch {epoch}"
         use_log_norm = False
     else:
-        val_pred = pred[:, 3].detach().cpu().numpy()  # viscosity
+        val_pred = pred[:, PredChannels.MU_EFF_ND].detach().cpu().numpy()  # viscosity
         cmap, label = 'viridis', r"Predicted ND-Viscosity ($\mu$)"
         title = f"Tier 2 Validation (Carreau) - Epoch {epoch}"
         # Viscosity MUST be plotted in log-scale to visualize the boundary layer
@@ -166,13 +168,6 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
         "rel_l2_u": [],
         "rel_l2_v": [],
         "rel_l2_p": [],
-        "max_err_u": [],
-        "max_err_v": [],
-        "max_err_p": [],
-        "dp_error": [],
-        "rel_l2_core": [],
-        "rel_l2_boundary": [],
-        "flow_mismatch_rel": [],
         "continuity": [],
         "wall_slip": [],
         "shear_mse": [],
@@ -200,84 +195,36 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
 
                 if node_mask.any():
                     val_anchor_batches += 1
-                    
-                    # Clone so we don't accidentally modify the underlying data tensors in-place
-                    y_a = data.y[node_mask, :3].clone()
-                    p_a = pred[node_mask, :3].clone()
-                    
-                    # --- THE GAUGE PRESSURE POST-PROCESSING FIX ---
-                    # Incompressible N-S only solves for \nabla p. Absolute pressure has no physical meaning.
-                    # We mean-shift both fields to 0 to remove the arbitrary constant 'C' before evaluating L2.
-                    p_a[:, 2] = p_a[:, 2] - p_a[:, 2].mean()
-                    y_a[:, 2] = y_a[:, 2] - y_a[:, 2].mean()
-                    # ----------------------------------------------
-
+                    y_a = data.y[node_mask, :3]
+                    p_a = pred[node_mask, :3]
                     diff_norm = torch.norm(p_a - y_a, p=2)
                     target_norm = torch.norm(y_a, p=2)
                     metrics["rel_l2"].append((diff_norm / (target_norm + 1e-8)).item())
-                    
                     for j, key in enumerate(("rel_l2_u", "rel_l2_v", "rel_l2_p")):
                         num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
                         den = torch.norm(y_a[:, j], p=2) + 1e-8
                         metrics[key].append((num / den).item())
 
-                    # Localized worst-case errors (L-infinity): useful for sharp stenosis corners/jets.
-                    metrics["max_err_u"].append(torch.max(torch.abs(p_a[:, 0] - y_a[:, 0])).item())
-                    metrics["max_err_v"].append(torch.max(torch.abs(p_a[:, 1] - y_a[:, 1])).item())
-                    metrics["max_err_p"].append(torch.max(torch.abs(p_a[:, 2] - y_a[:, 2])).item())
-
-                    # Clinical pressure-drop fidelity (gauge-invariant). Uses inlet/outlet masks if available.
-                    inlet_mask = getattr(data, "mask_inlet", None)
-                    outlet_mask = getattr(data, "mask_outlet", None)
-                    if inlet_mask is not None and outlet_mask is not None and inlet_mask.any() and outlet_mask.any():
-                        p_pred = pred[:, 2]
-                        p_true = data.y[:, 2]
-                        dp_pred = p_pred[inlet_mask].mean() - p_pred[outlet_mask].mean()
-                        dp_true = p_true[inlet_mask].mean() - p_true[outlet_mask].mean()
-                        dp_error = torch.abs(dp_pred - dp_true) / (torch.abs(dp_true) + 1e-8)
-                        metrics["dp_error"].append(dp_error.item())
-
-                    # Regional error split (core vs near-wall boundary) from SDF magnitude.
-                    # x[:,2] is |SDF|-like channel in this graph format.
-                    if data.x.shape[1] > 2:
-                        sdf_abs = torch.abs(data.x[node_mask, 2])
-                        sdf_max = torch.max(sdf_abs) if sdf_abs.numel() > 0 else torch.tensor(0.0, device=sdf_abs.device)
-                        if float(sdf_max.item()) > 0.0:
-                            core_mask = sdf_abs > 0.25 * sdf_max
-                            boundary_mask = ~core_mask
-                            if core_mask.any():
-                                core_num = torch.norm(p_a[core_mask] - y_a[core_mask], p=2)
-                                core_den = torch.norm(y_a[core_mask], p=2) + 1e-8
-                                metrics["rel_l2_core"].append((core_num / core_den).item())
-                            if boundary_mask.any():
-                                bnd_num = torch.norm(p_a[boundary_mask] - y_a[boundary_mask], p=2)
-                                bnd_den = torch.norm(y_a[boundary_mask], p=2) + 1e-8
-                                metrics["rel_l2_boundary"].append((bnd_num / bnd_den).item())
-
                     # Explicit shear-rate MSE (anchors only; needs labeled fields)
-                    u_t, v_t = data.y[:, 0:1], data.y[:, 1:2]
+                    u_t = data.y[:, PredChannels.U:PredChannels.U + 1]
+                    v_t = data.y[:, PredChannels.V:PredChannels.V + 1]
                     c_u_t, c_v_t = kernels._compute_derivatives(u_t, props), kernels._compute_derivatives(v_t, props)
-                    g_dot_t = torch.sqrt(
-                        2 * c_u_t[:, 0, 0] ** 2
-                        + 2 * c_v_t[:, 1, 0] ** 2
-                        + (c_u_t[:, 1, 0] + c_v_t[:, 0, 0]) ** 2
-                        + 1e-8
+                    g_dot_t = compute_shear_rate(
+                        c_u_t[:, 0, 0], c_u_t[:, 1, 0], c_v_t[:, 0, 0], c_v_t[:, 1, 0], eps=1e-6
                     )
 
-                    u_p, v_p = pred[:, 0:1], pred[:, 1:2]
+                    u_p = pred[:, PredChannels.U:PredChannels.U + 1]
+                    v_p = pred[:, PredChannels.V:PredChannels.V + 1]
                     c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
-                    g_dot_p = torch.sqrt(
-                        2 * c_u_p[:, 0, 0] ** 2
-                        + 2 * c_v_p[:, 1, 0] ** 2
-                        + (c_u_p[:, 1, 0] + c_v_p[:, 0, 0]) ** 2
-                        + 1e-8
+                    g_dot_p = compute_shear_rate(
+                        c_u_p[:, 0, 0], c_u_p[:, 1, 0], c_v_p[:, 0, 0], c_v_p[:, 1, 0], eps=1e-6
                     )
 
                     metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
                     if tier == "tier2" and data.y.shape[1] >= 4:
-                        mu_p = pred[node_mask, 3]
-                        mu_t = data.y[node_mask, 3]
+                        mu_p = pred[node_mask, PredChannels.MU_EFF_ND]
+                        mu_t = data.y[node_mask, PredChannels.MU_EFF_ND]
                         metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
                         mu_p_safe = torch.clamp(mu_p, min=1e-6)
                         mu_t_safe = torch.clamp(mu_t, min=1e-6)
@@ -285,7 +232,8 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
                             F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item()
                         )
 
-            u, v = pred[:, 0:1], pred[:, 1:2]
+            u = pred[:, PredChannels.U:PredChannels.U + 1]
+            v = pred[:, PredChannels.V:PredChannels.V + 1]
             grad_u, grad_v = kernels._compute_gradients(u, props), kernels._compute_gradients(v, props)
             div_u = grad_u[:, 0:1] + grad_v[:, 1:2]
             interior = kernels.fluid_interior_mask(data)
@@ -295,17 +243,8 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
                 metrics["continuity"].append(float("nan"))
 
             if data.mask_wall.any():
-                wall_vel = torch.norm(pred[data.mask_wall, :2], p=2, dim=1)
+                wall_vel = torch.norm(pred[data.mask_wall, PredChannels.UV], p=2, dim=1)
                 metrics["wall_slip"].append(wall_vel.mean().item())
-
-            # Global inlet/outlet flow proxy (mean normal velocity is unavailable, so use streamwise u).
-            inlet_mask = getattr(data, "mask_inlet", None)
-            outlet_mask = getattr(data, "mask_outlet", None)
-            if inlet_mask is not None and outlet_mask is not None and inlet_mask.any() and outlet_mask.any():
-                q_in = pred[inlet_mask, 0].mean()
-                q_out = pred[outlet_mask, 0].mean()
-                flow_mismatch_rel = torch.abs(q_in - q_out) / (torch.abs(q_in) + 1e-8)
-                metrics["flow_mismatch_rel"].append(flow_mismatch_rel.item())
 
             if tier == "tier2":
                 metrics["rheology"].append(kernels.rheology_loss(pred, data, props).item())
@@ -330,58 +269,6 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
 
     out["val_total_batches"] = float(val_total_batches)
     out["val_anchor_batches"] = float(val_anchor_batches)
-
-    # Optional pathology stratification: logged when metadata exists on Data objects.
-    out["rel_l2_healthy"] = float("nan")
-    out["rel_l2_aneurysm"] = float("nan")
-    out["rel_l2_stenosis"] = float("nan")
-
-    patho_vals: Dict[str, List[float]] = {"healthy": [], "aneurysm": [], "stenosis": []}
-    with torch.no_grad():
-        for data in val_loader:
-            data = data.to(device)
-            if not hasattr(data, "is_anchor"):
-                continue
-            node_mask = (
-                data.is_anchor[data.batch]
-                if hasattr(data, "batch") and data.batch is not None
-                else data.is_anchor
-            )
-            if not node_mask.any():
-                continue
-            label = None
-            for key in ("pathology_type", "geometry_type", "vessel_type"):
-                if hasattr(data, key):
-                    raw = getattr(data, key)
-                    if isinstance(raw, str):
-                        label = raw.lower()
-                    elif hasattr(raw, "item"):
-                        label = str(raw.item()).lower()
-                    else:
-                        label = str(raw).lower()
-                    break
-            if label is None:
-                continue
-            if "sten" in label:
-                bucket = "stenosis"
-            elif "aneu" in label:
-                bucket = "aneurysm"
-            elif "healthy" in label or "normal" in label or "straight" in label:
-                bucket = "healthy"
-            else:
-                continue
-            pred = model(data, solver="anderson", anderson_beta=0.8)
-            y_a = data.y[node_mask, :3].clone()
-            p_a = pred[node_mask, :3].clone()
-            p_a[:, 2] = p_a[:, 2] - p_a[:, 2].mean()
-            y_a[:, 2] = y_a[:, 2] - y_a[:, 2].mean()
-            diff_norm = torch.norm(p_a - y_a, p=2)
-            target_norm = torch.norm(y_a, p=2) + 1e-8
-            patho_vals[bucket].append((diff_norm / target_norm).item())
-
-    out["rel_l2_healthy"] = _list_mean(patho_vals["healthy"])
-    out["rel_l2_aneurysm"] = _list_mean(patho_vals["aneurysm"])
-    out["rel_l2_stenosis"] = _list_mean(patho_vals["stenosis"])
 
     if tier == "tier2" and metrics["rheology"]:
         r_std, r_p90 = _list_dispersion(metrics["rheology"])

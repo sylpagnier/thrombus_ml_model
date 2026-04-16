@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.config import BULK_SPECIES_ORDER, SPECIES_GROUPS, BulkSpecies, Tier3NodeFeat, WallSpecies
 from src.utils.rheology import compute_shear_rate
+
 
 class BiochemPhysicsKernels:
     """
@@ -14,17 +16,18 @@ class BiochemPhysicsKernels:
     def __init__(self, biochem_cfg, core_physics_kernels):
         self.cfg = biochem_cfg
         self.core = core_physics_kernels
-        self.numeric_eps = float(getattr(self.cfg, "numeric_eps", 1e-8))
-        self.species_log1p_min = float(getattr(self.cfg, "species_log1p_min", -10.0))
-        self.species_log1p_max = float(getattr(self.cfg, "species_log1p_max", 8.0))
+        self._biochem_huber_delta = max(float(self.cfg.biochem_huber_delta), 1e-8)
+        self._availability_negative_slope = max(float(self.cfg.availability_negative_slope), 0.0)
 
         # --- USE CENTRALIZED SCALES ---
-        self.species_scales = self.cfg.get_species_scales()
+        self.species_scales = self.cfg.get_species_scales(device="cpu")
         self.D_scale = self.cfg.d_scale
         self.C_scale = self.cfg.bulk_scale
 
         self.kinetics = self.BiochemKinetics(self.cfg, self.C_scale)
-        self.adr_norm_scales = self.cfg.get_adr_norm_scales()
+        self.adr_norm_scales = self.cfg.get_adr_norm_scales(device="cpu")
+        self._species_scales_cache = {}
+        self._adr_norm_scales_cache = {}
 
         self.D_coeff = {
             'RP': self.cfg.D_RP * self.D_scale,
@@ -37,6 +40,18 @@ class BiochemPhysicsKernels:
             'FG': self.cfg.D_FG * self.D_scale,
             'FI': self.cfg.D_FI * self.D_scale
         }
+
+    def _get_species_scales(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device.type, device.index, str(dtype))
+        if key not in self._species_scales_cache:
+            self._species_scales_cache[key] = self.species_scales.to(device=device, dtype=dtype)
+        return self._species_scales_cache[key]
+
+    def _get_adr_norm_scales(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device.type, device.index, str(dtype))
+        if key not in self._adr_norm_scales_cache:
+            self._adr_norm_scales_cache[key] = self.adr_norm_scales.to(device=device, dtype=dtype)
+        return self._adr_norm_scales_cache[key]
 
     class BiochemKinetics:
         """
@@ -99,7 +114,7 @@ class BiochemPhysicsKernels:
 
         # Update signature to include FI concentration
         def compute_fibrin_kinetics(self, T, FG, FI):
-            eps = self.cfg.numeric_eps
+            eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
 
             c_max = self.cfg.fi_reaction_saturation_si * self.C_scale + eps
@@ -118,7 +133,7 @@ class BiochemPhysicsKernels:
             Gamma = (k_1t * c_H * AT) / (K_at * K_T + T * K_at + AT * T)
             """
             numerator = self.cfg.k_1t * self.c_H * AT
-            denominator = (self.K_at * self.K_T) + (T * self.K_at) + (AT * T) + self.cfg.numeric_eps
+            denominator = (self.K_at * self.K_T) + (T * self.K_at) + (AT * T) + 1e-8
             return numerator / denominator
 
         def compute_species_reactions(self, species_dict, shear_rate):
@@ -182,25 +197,15 @@ class BiochemPhysicsKernels:
         if mu_total.dim() > 1:
             mu_total = mu_total.view(-1)
 
-        dmu_dx, dmu_dy = self._wls_gradient(mu_total, data)
+        # Sparse Matrix Gradient Calculation
+        mu_col = mu_total.unsqueeze(1)
+        dmu_dx = torch.sparse.mm(data.G_x, mu_col).squeeze(1)
+        dmu_dy = torch.sparse.mm(data.G_y, mu_col).squeeze(1)
 
         grad_mu_sq = dmu_dx ** 2 + dmu_dy ** 2
 
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
         return pseudo_huber_loss
-
-    def _wls_gradient(self, field, data, d_bar=None):
-        c = self.core._compute_derivatives(field.unsqueeze(1), data)
-        gx = c[:, 0, 0]
-        gy = c[:, 1, 0]
-        if d_bar is not None:
-            gx = gx / d_bar
-            gy = gy / d_bar
-        return gx, gy
-
-    def _wls_laplacian(self, field, data, d_bar):
-        c = self.core._compute_derivatives(field.unsqueeze(1), data)
-        return (c[:, 2, 0] + c[:, 4, 0]) / (d_bar ** 2)
 
     def biochem_adr_residual(self, species_preds, velocity_field, spatial_props, data, d_pred_dt=None):
         """Computes Advection-Diffusion-Reaction (L_ADR) residuals with Transient Time Derivatives."""
@@ -212,8 +217,8 @@ class BiochemPhysicsKernels:
         a_RBC_m = self.cfg.d_RBC / 2.0
         D_s = 0.18 * (a_RBC_m ** 2) * shear_rate
 
-        fast_keys = ['RP', 'AP', 'APR', 'APS', 'T']
-        slow_keys = ['AT', 'FG', 'FI']
+        fast_species = SPECIES_GROUPS["fast"]
+        slow_species = SPECIES_GROUPS["slow"]
 
         z = species_preds.sum() * 0.0
         adr_losses_fast = z
@@ -221,29 +226,32 @@ class BiochemPhysicsKernels:
 
         u_ref = spatial_props['u_ref'].to(species_preds.device)
         d_bar = spatial_props['d_bar'].to(species_preds.device)
+        d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
         u_raw = u * u_ref
         v_raw = v * u_ref
 
-        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
-        scales = self.species_scales.to(species_preds.device)
-        adr_norm = self.adr_norm_scales.to(species_preds.device)
+        keys = BULK_SPECIES_ORDER
+        bulk_n = len(keys)
+        scales = self._get_species_scales(species_preds.device, species_preds.dtype)
+        adr_norm = self._get_adr_norm_scales(species_preds.device, species_preds.dtype)
 
-        species_preds_safe = torch.clamp(species_preds, min=self.species_log1p_min, max=self.species_log1p_max)
+        species_preds_safe = torch.clamp(species_preds, min=-10.0, max=8.0)
         nd_species_preds = torch.expm1(species_preds_safe)
-        linear_species_preds = nd_species_preds * scales[:9]
+        linear_species_preds = nd_species_preds * scales[:bulk_n]
 
-        species_dict = {keys[i]: linear_species_preds[..., i] for i in range(len(keys))}
+        species_dict = {sp.name: linear_species_preds[..., sp.value] for sp in keys}
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
-        keller_species = ['RP', 'AP', 'PT', 'T', 'AT']
+        keller_species = SPECIES_GROUPS["keller"]
 
-        for key in fast_keys + slow_keys:
-            scale_idx = keys.index(key)
+        for sp in fast_species + slow_species:
+            key = sp.name
+            scale_idx = sp.value
             scale_c = scales[scale_idx]
 
             # Fast chemistry is treated as quasi-steady over coarse macro timesteps.
             # Only slow species receive explicit transient dC/dt supervision.
-            if d_pred_dt is not None and key in slow_keys:
+            if d_pred_dt is not None and sp in slow_species:
                 exp_pred = torch.exp(species_preds_safe[:, scale_idx])
                 dC_dt = scale_c * exp_pred * d_pred_dt[:, scale_idx]
             else:
@@ -251,21 +259,26 @@ class BiochemPhysicsKernels:
 
             C = species_dict[key]
             base_D = self.D_coeff[key]
-            D = base_D + D_s if key in keller_species else base_D
+            D = base_D + D_s if sp in keller_species else base_D
             R = reaction_terms[key]
 
-            dC_dx, dC_dy = self._wls_gradient(C, data, d_bar=d_bar)
+            # Sparse Matrix Gradient Calculation
+            C_col = C.unsqueeze(1)
+            dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar_safe
+            dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar_safe
             advection = u_raw * dC_dx + v_raw * dC_dy
 
             # Full diffusion operator: div(D grad(C)) = D laplacian(C) + grad(D) dot grad(C)
-            laplacian_C = self._wls_laplacian(C, data, d_bar=d_bar)
-            if key in keller_species:
-                dD_dx, dD_dy = self._wls_gradient(D, data, d_bar=d_bar)
+            laplacian_C = torch.sparse.mm(data.Laplacian, C_col).squeeze(1) / (d_bar_safe ** 2)
+            if sp in keller_species:
+                D_col = D.unsqueeze(1)
+                dD_dx = torch.sparse.mm(data.G_x, D_col).squeeze(1) / d_bar_safe
+                dD_dy = torch.sparse.mm(data.G_y, D_col).squeeze(1) / d_bar_safe
                 diffusion = (D * laplacian_C) + (dD_dx * dC_dx + dD_dy * dC_dy)
             else:
                 diffusion = D * laplacian_C
 
-            if key == 'FI':
+            if sp in SPECIES_GROUPS["solid"]:
                 # Polymerized fibrin is a solid matrix; it does not advect or diffuse.
                 advection = torch.zeros_like(advection)
                 diffusion = torch.zeros_like(diffusion)
@@ -277,10 +290,12 @@ class BiochemPhysicsKernels:
             norm_scale = adr_norm[scale_idx]
             # Reaction-aware scaling stabilizes coarse-dt supervision for stiff kinetics.
             local_stiffness = torch.abs(R) + norm_scale
-            residual_nd = residual / (local_stiffness + self.numeric_eps)
-            loss_c = F.huber_loss(residual_nd, torch.zeros_like(residual_nd), delta=1.0)
+            residual_nd = residual / (local_stiffness + 1e-8)
+            loss_c = F.huber_loss(
+                residual_nd, torch.zeros_like(residual_nd), delta=self._biochem_huber_delta
+            )
 
-            if key in fast_keys:
+            if sp in fast_species:
                 adr_losses_fast += loss_c
             else:
                 adr_losses_slow += loss_c
@@ -301,8 +316,9 @@ class BiochemPhysicsKernels:
 
         # 1. Inlet: Force predictions to match the transformed baseline concentrations
         if mask_inlet.any() and hasattr(data, 'bio_inlet_bc'):
-            preds_inlet = biochem_preds[mask_inlet, 0:9]
-            targs_inlet = data.bio_inlet_bc[mask_inlet, 0:9]
+            bulk_n = len(BULK_SPECIES_ORDER)
+            preds_inlet = biochem_preds[mask_inlet, :bulk_n]
+            targs_inlet = data.bio_inlet_bc[mask_inlet, :bulk_n]
             loss_inlet = F.mse_loss(preds_inlet, targs_inlet)
 
         # 2. Outlet: zero normal gradient of physical concentration (same linear C as ADR / wall flux).
@@ -317,34 +333,44 @@ class BiochemPhysicsKernels:
                 mag = torch.sqrt(nx * nx + ny * ny + 1e-12)
                 weak = mag < 1e-5
                 if weak.any():
-                    nx_fb = data.x[mask_outlet, 3]
-                    ny_fb = data.x[mask_outlet, 4]
+                    normals_fb = data.x[mask_outlet, Tier3NodeFeat.WALL_NORMAL]
+                    nx_fb = normals_fb[:, 0]
+                    ny_fb = normals_fb[:, 1]
                     nx = torch.where(weak, nx_fb, nx)
                     ny = torch.where(weak, ny_fb, ny)
             else:
-                nx = data.x[mask_outlet, 3]
-                ny = data.x[mask_outlet, 4]
+                normals_fb = data.x[mask_outlet, Tier3NodeFeat.WALL_NORMAL]
+                nx = normals_fb[:, 0]
+                ny = normals_fb[:, 1]
 
             nmag = torch.sqrt(nx * nx + ny * ny + 1e-12)
             nx = nx / nmag
             ny = ny / nmag
 
-            scales = self.species_scales.to(biochem_preds.device)
-            biochem_safe = torch.clamp(biochem_preds, min=self.species_log1p_min, max=self.species_log1p_max)
-            linear_bulk = torch.expm1(biochem_safe) * scales[:9]
+            scales = self._get_species_scales(biochem_preds.device, biochem_preds.dtype)
+            biochem_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
+            bulk_n = len(BULK_SPECIES_ORDER)
+            linear_bulk = torch.expm1(biochem_safe) * scales[:bulk_n]
 
             d_bar = spatial_props['d_bar'].to(device=biochem_preds.device, dtype=biochem_preds.dtype)
+            d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
-            flux_scale = self.adr_norm_scales[:9].to(biochem_preds.device).mean().clamp(min=1e-12)
+            flux_scale = self._get_adr_norm_scales(
+                biochem_preds.device, biochem_preds.dtype
+            )[:bulk_n].mean().clamp(min=1e-12)
             loss_outlet_acc = torch.zeros((), device=biochem_preds.device, dtype=biochem_preds.dtype)
-            # Exclude fibrin (FI, index 8): stationary solid matrix, no outlet flux constraint.
-            n_mobile = 8
-            for i in range(n_mobile):
-                dC_dx, dC_dy = self._wls_gradient(linear_bulk[:, i], data, d_bar=d_bar)
+            mobile_species = [sp for sp in BULK_SPECIES_ORDER if sp not in SPECIES_GROUPS["solid"]]
+            n_mobile = len(mobile_species)
+            for sp in mobile_species:
+                C_col = linear_bulk[:, sp.value].unsqueeze(1)
+                dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar_safe
+                dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar_safe
                 dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
                 dC_dn = torch.nan_to_num(dC_dn, nan=0.0, posinf=0.0, neginf=0.0)
                 d_nd = dC_dn / flux_scale
-                loss_outlet_acc = loss_outlet_acc + F.huber_loss(d_nd, torch.zeros_like(d_nd), delta=1.0)
+                loss_outlet_acc = loss_outlet_acc + F.huber_loss(
+                    d_nd, torch.zeros_like(d_nd), delta=self._biochem_huber_delta
+                )
 
             loss_outlet = loss_outlet_acc / float(n_mobile)
 
@@ -357,33 +383,34 @@ class BiochemPhysicsKernels:
             z = biochem_preds.sum() * 0.0
             return z, z
 
-        scales = self.species_scales.to(biochem_preds.device)
-        biochem_preds_safe = torch.clamp(biochem_preds, min=self.species_log1p_min, max=self.species_log1p_max)
+        scales = self._get_species_scales(biochem_preds.device, biochem_preds.dtype)
+        biochem_preds_safe = torch.clamp(biochem_preds, min=-10.0, max=8.0)
         nd_biochem_preds = torch.expm1(biochem_preds_safe)
-        linear_biochem_preds = nd_biochem_preds * scales[:9]
+        bulk_n = len(BULK_SPECIES_ORDER)
+        linear_biochem_preds = nd_biochem_preds * scales[:bulk_n]
 
-        RP_wall = linear_biochem_preds[mask_wall, 0]
-        AP_wall = linear_biochem_preds[mask_wall, 1]
-        APR_wall = linear_biochem_preds[mask_wall, 2]
-        APS_wall = linear_biochem_preds[mask_wall, 3]
-        PT_wall = linear_biochem_preds[mask_wall, 4]
-        T_wall = linear_biochem_preds[mask_wall, 5]
+        RP_wall = linear_biochem_preds[mask_wall, BulkSpecies.RP.value]
+        AP_wall = linear_biochem_preds[mask_wall, BulkSpecies.AP.value]
+        APR_wall = linear_biochem_preds[mask_wall, BulkSpecies.APR.value]
+        APS_wall = linear_biochem_preds[mask_wall, BulkSpecies.APS.value]
+        PT_wall = linear_biochem_preds[mask_wall, BulkSpecies.PT.value]
+        T_wall = linear_biochem_preds[mask_wall, BulkSpecies.T.value]
 
-        wall_preds_safe = torch.clamp(wall_preds, min=self.species_log1p_min, max=self.species_log1p_max)
+        wall_preds_safe = torch.clamp(wall_preds, min=-10.0, max=8.0)
         nd_wall_preds = torch.expm1(wall_preds_safe)
 
         # USE CENTRALIZED SCALE
         Minf_scaled = self.cfg.Minf * self.cfg.surface_scale
 
-        M = nd_wall_preds[mask_wall, 0] * Minf_scaled
-        Mas = nd_wall_preds[mask_wall, 1] * Minf_scaled
-        Mat = nd_wall_preds[mask_wall, 2] * Minf_scaled
+        M = nd_wall_preds[mask_wall, WallSpecies.M.value] * Minf_scaled
+        Mas = nd_wall_preds[mask_wall, WallSpecies.Mas.value] * Minf_scaled
+        Mat = nd_wall_preds[mask_wall, WallSpecies.Mat.value] * Minf_scaled
 
         if dM_pred_dt is not None:
             exp_wall = torch.exp(wall_preds_safe[mask_wall])
-            dM_dt_phys = exp_wall[:, 0] * dM_pred_dt[mask_wall, 0] * Minf_scaled
-            dMas_dt_phys = exp_wall[:, 1] * dM_pred_dt[mask_wall, 1] * Minf_scaled
-            dMat_dt_phys = exp_wall[:, 2] * dM_pred_dt[mask_wall, 2] * Minf_scaled
+            dM_dt_phys = exp_wall[:, WallSpecies.M.value] * dM_pred_dt[mask_wall, WallSpecies.M.value] * Minf_scaled
+            dMas_dt_phys = exp_wall[:, WallSpecies.Mas.value] * dM_pred_dt[mask_wall, WallSpecies.Mas.value] * Minf_scaled
+            dMat_dt_phys = exp_wall[:, WallSpecies.Mat.value] * dM_pred_dt[mask_wall, WallSpecies.Mat.value] * Minf_scaled
         else:
             z = M * 0.0
             dM_dt_phys = z
@@ -398,12 +425,23 @@ class BiochemPhysicsKernels:
         shear_wall = global_shear[mask_wall]
 
         d_bar = spatial_props['d_bar'].to(biochem_preds.device)
+        d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
-        dshear_dx, _ = self._wls_gradient(global_shear, data)
-        dshear_dx_wall = (dshear_dx / d_bar)[mask_wall]
+        # Sparse Matrix Gradient Calculation for Shear Rate
+        dshear_dx = torch.sparse.mm(data.G_x, global_shear.unsqueeze(1)).squeeze(1)
+        dshear_dx_wall = (dshear_dx / d_bar_safe)[mask_wall]
         dshear_abs = torch.abs(dshear_dx_wall) + 1e-6
 
-        availability = torch.clamp(1.0 - (M_tot / Minf), min=self.numeric_eps, max=1.0)
+        raw_availability = 1.0 - (M_tot / Minf)
+        if self._availability_negative_slope > 0.0:
+            availability = torch.where(
+                raw_availability >= 0.0,
+                raw_availability,
+                raw_availability * self._availability_negative_slope,
+            )
+            availability = torch.clamp(availability, max=1.0)
+        else:
+            availability = torch.clamp(raw_availability, min=1e-8, max=1.0)
 
         # COMSOL Pathological Conditionals (Soft-Logic)
         is_separation = self.kinetics._soft_step(dshear_dx_wall, self.cfg.sgt, self.kinetics.T_grad, reverse=True)
@@ -446,9 +484,9 @@ class BiochemPhysicsKernels:
         res_Mat = ((dMat_dt_phys - R_Mat) / Minf) * t_ref
 
         loss_surface = (
-                               F.huber_loss(res_M, torch.zeros_like(res_M), delta=1.0) +
-                               F.huber_loss(res_Mas, torch.zeros_like(res_Mas), delta=1.0) +
-                               F.huber_loss(res_Mat, torch.zeros_like(res_Mat), delta=1.0)
+                               F.huber_loss(res_M, torch.zeros_like(res_M), delta=self._biochem_huber_delta) +
+                               F.huber_loss(res_Mas, torch.zeros_like(res_Mas), delta=self._biochem_huber_delta) +
+                               F.huber_loss(res_Mat, torch.zeros_like(res_Mat), delta=self._biochem_huber_delta)
                        ) / 3.0
 
         # --- 6. NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
@@ -460,27 +498,39 @@ class BiochemPhysicsKernels:
         J_in_PT = - self.cfg.beta * self.cfg.phi_at * Mat * PT_wall
         J_in_T = self.cfg.beta * self.cfg.phi_at * Mat * PT_wall
 
-        flux_targets = {0: J_in_RP, 1: J_in_AP, 2: J_in_APR, 3: J_in_APS, 4: J_in_PT, 5: J_in_T}
+        flux_targets = {
+            BulkSpecies.RP: J_in_RP,
+            BulkSpecies.AP: J_in_AP,
+            BulkSpecies.APR: J_in_APR,
+            BulkSpecies.APS: J_in_APS,
+            BulkSpecies.PT: J_in_PT,
+            BulkSpecies.T: J_in_T,
+        }
 
-        nx = data.x[mask_wall, 3]
-        ny = data.x[mask_wall, 4]
+        wall_normals = data.x[mask_wall, Tier3NodeFeat.WALL_NORMAL]
+        nx = wall_normals[:, 0]
+        ny = wall_normals[:, 1]
 
         a_RBC_m_wall = self.cfg.d_RBC / 2.0
         D_s_wall = 0.18 * (a_RBC_m_wall ** 2) * shear_wall
-        keller_indices = [0, 1, 4, 5, 6]
-        keys = ['RP', 'AP', 'APR', 'APS', 'PT', 'T', 'AT', 'FG', 'FI']
+        keller_species = SPECIES_GROUPS["keller"]
 
         loss_flux = biochem_preds.sum() * 0.0
 
-        for idx, J_in in flux_targets.items():
-            dC_dx, dC_dy = self._wls_gradient(linear_biochem_preds[:, idx], data, d_bar=d_bar)
+        for sp, J_in in flux_targets.items():
+            idx = sp.value
+            C_field = linear_biochem_preds[:, idx].unsqueeze(1)
+
+            # Sparse Matrix Gradient Calculation
+            dC_dx = torch.sparse.mm(data.G_x, C_field).squeeze(1) / d_bar_safe
+            dC_dy = torch.sparse.mm(data.G_y, C_field).squeeze(1) / d_bar_safe
 
             # Dot with outward normal vector (D * grad(C) dot n)
             dC_dn_wall = dC_dx[mask_wall] * nx + dC_dy[mask_wall] * ny
 
             # Diffusion Coefficient at Wall
-            base_D = self.D_coeff[keys[idx]]
-            D_eff = base_D + D_s_wall if idx in keller_indices else base_D
+            base_D = self.D_coeff[sp.name]
+            D_eff = base_D + D_s_wall if sp in keller_species else base_D
 
             predicted_flux = -D_eff * dC_dn_wall
             # J_in is signed inward (negative for sinks), while predicted_flux is outward.
@@ -489,22 +539,30 @@ class BiochemPhysicsKernels:
 
             # Use convective flux for stable normalization
             char_flux = scales[idx] * u_ref_wall
-            flux_residual_nd = flux_residual / (char_flux + self.numeric_eps)
+            flux_residual_nd = flux_residual / (char_flux + 1e-8)
 
-            loss_flux += F.huber_loss(flux_residual_nd, torch.zeros_like(flux_residual_nd), delta=1.0)
+            loss_flux += F.huber_loss(
+                flux_residual_nd, torch.zeros_like(flux_residual_nd), delta=self._biochem_huber_delta
+            )
 
         return loss_surface, loss_flux
 
     def _compute_shear_rate(self, u, v, spatial_props, data):
-        du_dx, du_dy = self._wls_gradient(u, data)
-        dv_dx, dv_dy = self._wls_gradient(v, data)
-        gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=self.numeric_eps)
+        # Sparse Matrix Gradient Calculation
+        du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
+        du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
+        dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
+        dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
+
+        # This is non-dimensional.
+        gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
 
         # Redimensionalize to physical 1/s
         u_ref = spatial_props['u_ref'].to(u.device)
         d_bar = spatial_props['d_bar'].to(u.device)
+        d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
-        return gamma_dot_nd * (u_ref / d_bar)
+        return gamma_dot_nd * (u_ref / d_bar_safe)
 
 
 class SoftStepSTE(torch.autograd.Function):

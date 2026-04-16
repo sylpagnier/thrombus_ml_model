@@ -1,11 +1,100 @@
 from dataclasses import dataclass, field
-from typing import Dict, Union
+from enum import IntEnum
+from typing import Dict, Tuple, Union
 from src.utils.paths import comsol_models_dir, data_root, get_project_root
 from pathlib import Path
 
 # Channel index for effective viscosity in [u, v, p, mu_eff_nd, ...] state / label tensors.
 # Convention: mu_eff_nd = mu_eff_si / PhysicsConfig.mu_viscosity_nd_scale (see that property).
 STATE_CHANNEL_MU_EFF_ND = 3
+
+
+class PredChannels:
+    """Canonical channel indices for kinematic predictor outputs."""
+
+    U = 0
+    V = 1
+    P = 2
+    MU_EFF_ND = STATE_CHANNEL_MU_EFF_ND
+    WSS = 4
+    UV = slice(U, V + 1)
+    KINEMATICS = slice(U, P + 1)
+    ALL_PHYSICS = slice(U, WSS + 1)
+
+
+class NodeFeat:
+    """Canonical node-feature slices for Tier 1/2 predictor inputs."""
+
+    XY = slice(0, 2)
+    SDF = slice(2, 3)
+    SHEAR_POT = slice(3, 4)
+    WALL_NORMAL = slice(4, 6)
+    REST = slice(6, 11)
+    UV_PRIOR = slice(11, 13)
+    MU_PRIOR = slice(13, 14)
+    WSS_PRIOR = slice(14, 15)
+
+
+class Tier3NodeFeat:
+    """Canonical node-feature slices for Tier 3 graph inputs."""
+
+    XY = slice(0, 2)
+    SDF = slice(2, 3)
+    WALL_NORMAL = slice(3, 5)
+
+
+class BulkSpecies(IntEnum):
+    RP = 0
+    AP = 1
+    APR = 2
+    APS = 3
+    PT = 4
+    T = 5
+    AT = 6
+    FG = 7
+    FI = 8
+
+
+class WallSpecies(IntEnum):
+    M = 0
+    Mas = 1
+    Mat = 2
+
+
+BULK_SPECIES_ORDER: Tuple[BulkSpecies, ...] = (
+    BulkSpecies.RP,
+    BulkSpecies.AP,
+    BulkSpecies.APR,
+    BulkSpecies.APS,
+    BulkSpecies.PT,
+    BulkSpecies.T,
+    BulkSpecies.AT,
+    BulkSpecies.FG,
+    BulkSpecies.FI,
+)
+
+SPECIES_GROUPS = {
+    "fast": (
+        BulkSpecies.RP,
+        BulkSpecies.AP,
+        BulkSpecies.APR,
+        BulkSpecies.APS,
+        BulkSpecies.T,
+    ),
+    "slow": (
+        BulkSpecies.AT,
+        BulkSpecies.FG,
+        BulkSpecies.FI,
+    ),
+    "keller": (
+        BulkSpecies.RP,
+        BulkSpecies.AP,
+        BulkSpecies.PT,
+        BulkSpecies.T,
+        BulkSpecies.AT,
+    ),
+    "solid": (BulkSpecies.FI,),
+}
 
 
 @dataclass
@@ -29,6 +118,11 @@ class VesselConfig:
             self.mesh_input_dir = dr / f"raw/{self.tier}"
             self.output_dir = dr / f"processed/cfd_results_{self.tier}"
             self.graph_output_dir = dr / f"processed/graphs_{self.tier}"
+        
+        # --- RESTORED: Mesh Sweep Override ---
+        import os
+        if "GMSH_SIZE_FACTOR" in os.environ:
+            self.mesh_size_factor = float(os.environ["GMSH_SIZE_FACTOR"])
 
     mesh_size_factor: float = 0.75
     mesh_lc: float = 1/1000  # [m]
@@ -88,13 +182,11 @@ class PhysicsConfig:
 
     # Carreau momentum residual: if True, ∂μ/∂x does not backprop into predicted μ (PINN-style stability).
     detach_mu_for_ns_gradient: bool = True
-    # Physics-kernel behavior toggles (prefer config over process env for reproducibility/tests).
-    ns_derivative_mode: str = "wls"  # "wls" | "autograd"
-    advect_detach: bool = False
-    momentum_loss_mode: str = "huber"  # "huber" | "mse"
-    momentum_huber_delta: float = 0.01
-    pressure_bc_mode: str = "mean"  # "mean" | "pointwise" | "mean_var"
-    numeric_eps: float = 1e-8
+    # GINO graph-attention geometric modulation constants.
+    gino_edge_decay_k: float = 5.0
+    gino_curve_log_clamp_min: float = 1e-4
+    gino_rheo_log_clamp_min: float = 1e-3
+    gino_adv_log_clamp_min: float = 1e-3
 
     def __post_init__(self):
         """Automatically set the correct physics based on the project tier."""
@@ -253,14 +345,10 @@ class BiochemConfig:
     soft_step_T_grad: float = 50.0
     soft_step_T_low_shear: float = 5.0
     soft_step_T_scale: float = 1.0
-    # Centralized numeric guards/clamps for Tier 3 species + ODE stability.
-    species_log1p_min: float = -10.0
-    species_log1p_max: float = 8.0
-    sigmoid_input_clamp: float = 50.0
-    ode_state_clamp: float = 20.0
-    ode_derivative_clamp: float = 10.0
-    numeric_eps: float = 1e-8
-    stream_env_init_k: float = 5.0
+    # Shared Huber delta for Tier 3 biochemical residuals.
+    biochem_huber_delta: float = 1.0
+    # Optional non-zero slope keeps adhesion gradients alive when M_tot exceeds Minf.
+    availability_negative_slope: float = 0.0
 
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""

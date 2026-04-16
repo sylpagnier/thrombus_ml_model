@@ -12,8 +12,10 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
+from src.config import PredChannels
 from src.core_physics.physics_kernels import PhysicsKernels, scatter_add
 from src.utils.anchor_mask import anchor_node_mask
+from src.utils.rheology import compute_shear_rate
 
 
 def _sdf_edge_gradient_proxy(data) -> torch.Tensor:
@@ -64,14 +66,13 @@ def compute_anchor_kinematic_importance(
         if props is None:
             props = kernels._get_geometric_props(data)
         # Ground-truth kinematic gradients from labels (u, v) to emphasize accelerated/sheared zones.
-        c_u_true = kernels._compute_derivatives(data.y[:, 0:1], props)
-        c_v_true = kernels._compute_derivatives(data.y[:, 1:2], props)
+        c_u_true = kernels._compute_derivatives(data.y[:, PredChannels.U:PredChannels.U + 1], props)
+        c_v_true = kernels._compute_derivatives(data.y[:, PredChannels.V:PredChannels.V + 1], props)
         u_x_true = c_u_true[:, 0, 0]
         u_y_true = c_u_true[:, 1, 0]
         v_x_true = c_v_true[:, 0, 0]
         v_y_true = c_v_true[:, 1, 0]
-        strain_sq = 2.0 * (u_x_true ** 2 + v_y_true ** 2) + (u_y_true + v_x_true) ** 2
-        gamma_dot_true = torch.sqrt(strain_sq + 1e-6)
+        gamma_dot_true = compute_shear_rate(u_x_true, u_y_true, v_x_true, v_y_true, eps=1e-6)
         gamma_anchor = gamma_dot_true[node_is_anchor]
         gamma_mean = torch.clamp(gamma_anchor.mean(), min=1e-6)
         return 1.0 + float(shear_true_alpha) * (gamma_anchor / gamma_mean)
@@ -93,8 +94,8 @@ def boundary_weighted_mse(
     """
     if node_is_anchor is None or int(node_is_anchor.sum().item()) == 0:
         return pred_uvp.sum() * 0.0
-    p = pred_uvp[node_is_anchor, :3]
-    y = true_uvp[node_is_anchor, :3]
+    p = pred_uvp[node_is_anchor, PredChannels.KINEMATICS]
+    y = true_uvp[node_is_anchor, PredChannels.KINEMATICS]
     e = (p - y) ** 2
     wp = float(p_weight)
     channel_weights = e.new_tensor([1.0, 1.0, wp]).view(1, 3)
@@ -174,8 +175,8 @@ def compute_kinematics_physics_terms(
                 anchor_importance=anchor_kine_importance,
             )
         else:
-            pa = pred[node_is_anchor, :3]
-            ya = data.y[node_is_anchor, :3]
+            pa = pred[node_is_anchor, PredChannels.KINEMATICS]
+            ya = data.y[node_is_anchor, PredChannels.KINEMATICS]
             wp = float(tier2_kine_p_weight)
             if wp != 1.0:
                 d = pa - ya
@@ -184,7 +185,10 @@ def compute_kinematics_physics_terms(
             else:
                 l_data_kine = F.mse_loss(pa, ya)
             if not tier2_distillation:
-                l_data_mu = F.mse_loss(pred[node_is_anchor, 3], data.y[node_is_anchor, 3])
+                l_data_mu = F.mse_loss(
+                    pred[node_is_anchor, PredChannels.MU_EFF_ND],
+                    data.y[node_is_anchor, PredChannels.MU_EFF_ND],
+                )
 
     l_bc = kernels.boundary_condition_loss(pred, data)
     l_io = kernels.inlet_outlet_loss(pred, data)
@@ -197,8 +201,8 @@ def compute_kinematics_physics_terms(
             # discretization asymmetry from WLS mixed partials.
             l_cont = z
         else:
-            c_u = kernels._compute_derivatives(pred[:, 0:1], props)
-            c_v = kernels._compute_derivatives(pred[:, 1:2], props)
+            c_u = kernels._compute_derivatives(pred[:, PredChannels.U:PredChannels.U + 1], props)
+            c_v = kernels._compute_derivatives(pred[:, PredChannels.V:PredChannels.V + 1], props)
             du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
             l_cont = kernels.continuity_loss(du_ij, data=data)
         l_rheo = z
@@ -208,8 +212,8 @@ def compute_kinematics_physics_terms(
         l_rheo = kernels.rheology_loss(pred, data, props=props, carreau_n=carreau_n)
     else:
         l_mom = kernels.navier_stokes_residual(pred, data, props=props, re_ref=re_ref, re_scale=re_scale)
-        c_u = kernels._compute_derivatives(pred[:, 0:1], props)
-        c_v = kernels._compute_derivatives(pred[:, 1:2], props)
+        c_u = kernels._compute_derivatives(pred[:, PredChannels.U:PredChannels.U + 1], props)
+        c_v = kernels._compute_derivatives(pred[:, PredChannels.V:PredChannels.V + 1], props)
         du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
         l_cont = kernels.continuity_loss(du_ij, data=data)
         l_rheo = kernels.rheology_loss(pred, data, props=props, carreau_n=carreau_n)
