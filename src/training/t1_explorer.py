@@ -4,6 +4,13 @@ Tier 1 **architecture / loss explorer** — env-driven knobs for systematic expe
 Use this when iterating toward a tight anchor Rel L2 (e.g. <5% on level-1 vessels). After each run,
 compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 
+**Explorer execution policy**
+
+- Explorer sweeps are intentionally **Adam-only** (no L-BFGS) to maximize throughput for rapid
+  architecture/loss screening.
+- Once a candidate architecture is selected, run full optimization (including optional L-BFGS)
+  in ``src/training/train_t1_predictor.py`` for best-model commitment.
+
 **Kinematic supervision weighting** (anchor nodes only, COMSOL labels):
 
 - ``uniform`` — baseline (same as before).
@@ -63,6 +70,7 @@ from src.utils.paths import reports_dir
 @dataclass
 class T1ExplorerConfig:
     experiment_name: str = "default"
+    dataset_tier: str = "tier1"
     kine_weight_mode: str = "uniform"  # uniform | sdf_wall | sdf_grad | shear_true
     sdf_wall_beta: float = 2.0
     sdf_wall_tau: float = 0.12
@@ -121,6 +129,7 @@ class T1ExplorerConfig:
 
         return T1ExplorerConfig(
             experiment_name=os.environ.get("TIER1_EXPERIMENT_NAME", "default").strip() or "default",
+            dataset_tier=os.environ.get("TIER1_DATASET_TIER", "tier1").strip() or "tier1",
             kine_weight_mode=mode,
             sdf_wall_beta=_f("TIER1_SDF_WALL_BETA", 2.0),
             sdf_wall_tau=_f("TIER1_SDF_WALL_TAU", 0.12),
@@ -248,17 +257,29 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
 
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    Tier 1 4-candidate ~10-hour sweep focused on known bottlenecks:
-    L-BFGS polishing, latent-width capacity, boundary-frequency density, and autograd derivatives.
+    Tier 1 mesh-resolution sweep: hold architecture fixed at the current best-known
+    pre-L-BFGS setting while varying only dataset mesh density tiers.
+
+    IMPORTANT: explorer is Adam-only by design for fast architecture evaluation.
     """
     base_overrides = {
-        "TIER1_DISABLE_FIGURES": "1", # Set to "0" if you want to watch the validation plots locally
-        "TIER1_CKPT_EVERY": "20",
-        "TIER1_EARLY_STOP_PATIENCE": "15", # Increased patience for longer 60-epoch runs
+        "TIER1_DISABLE_FIGURES": "1", 
+        "TIER1_CKPT_EVERY": "5",          # Frequent checkpoints for crash safety
+        "TIER1_EARLY_STOP_PATIENCE": "15", 
         "TIER1_LOSS_WEIGHT_MODE": "dynamic",
-        # Exploration mode: keep L-BFGS off for faster sweep turnaround.
-        # Re-enable in full production training runs.
+        # Explorer mode is intentionally Adam-only for rapid candidate screening.
         "TIER1_USE_LBFGS": "0",
+        # Warm-start each run from the shared best Tier 1 checkpoint (same init for all).
+        "TIER1_INIT_FROM_BEST": "1",
+
+        # --- SWEEP ISOLATION ---
+        # RESUME is OFF so candidates never inherit another candidate's optimizer/epoch
+        # state.  Per-candidate TIER1_CKPT_DIR (set by run_sweep) keeps checkpoints
+        # separate, while INIT_FROM_BEST provides a common weight seed.
+        "TIER1_RESUME": "0",
+        "TIER1_MICRO_BATCH_SIZE": "1",    # Cut memory footprint in half to survive 0.4 mesh
+        "TIER1_ACCUMULATION_STEPS": "8",  # 1 * 8 = 8 (same effective batch size)
+
         "TIER1_KINEMATICS_MODE": "direct_uvp",
         "TIER1_ACTIVATION_FN": "silu",
         
@@ -269,7 +290,7 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
         
         # --- Time Horizon ---
         "TIER1_EPOCHS": "60",
-        "TIER1_ADAM_EPOCHS": "40",
+        "TIER1_ADAM_EPOCHS": "25",
         "TIER1_DATA_STAGE_EPOCHS": "10",
         "TIER1_LAMBDA_CONT": "1.0",
         "TIER1_LAMBDA_CONT_START": "0.1",
@@ -279,6 +300,7 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
     def _env_for(cfg: T1ExplorerConfig) -> Dict[str, str]:
         return {
             "TIER1_EXPERIMENT_NAME": cfg.experiment_name,
+            "TIER1_DATASET_TIER": cfg.dataset_tier,
             "TIER1_KINE_WEIGHT_MODE": cfg.kine_weight_mode,
             "TIER1_SDF_WALL_BETA": str(cfg.sdf_wall_beta),
             "TIER1_SDF_WALL_TAU": str(cfg.sdf_wall_tau),
@@ -301,44 +323,35 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_MOMENTUM_LOSS_MODE": cfg.momentum_loss_mode,
         }
     
+    # RESTORED: Optimal Champion Hyperparameters from Training History
     sweep_configs: List[T1ExplorerConfig] = [
-        # Candidate 1: The L-BFGS optimizer baseline.
         T1ExplorerConfig(
-            experiment_name="S1_LBFGS_Baseline",
-            latent_dim=128,
+            experiment_name="Res_Coarse_1.5",
+            dataset_tier="tier1_res_coarse",
+            latent_dim=256,              # Champion spec
             deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.5,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
-        ),
-        # Candidate 2: Wider latent capacity.
-        T1ExplorerConfig(
-            experiment_name="S2_WideLatent_256",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.5,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
-        ),
-        # Candidate 3: Hyper-dense boundary-focused Fourier spectrum.
-        T1ExplorerConfig(
-            experiment_name="S3_HyperDense_Boundary",
-            latent_dim=128,
-            deq_max_iters=25,
-            num_fourier_freqs=24,
+            num_fourier_freqs=16,        # Champion spec
             fourier_base=1.25,
             ns_derivative_mode="wls",
             loss_weight_mode="dynamic",
         ),
-        # Candidate 4: Deep Anderson (testing solver precision limits).
         T1ExplorerConfig(
-            experiment_name="S4_DeepAnderson_35",
-            latent_dim=128,
-            deq_max_iters=35,
-            num_fourier_freqs=16,
-            fourier_base=1.5,
+            experiment_name="Res_Medium_0.75",
+            dataset_tier="tier1_res_medium",
+            latent_dim=256,              # Champion spec
+            deq_max_iters=25,
+            num_fourier_freqs=16,        # Champion spec
+            fourier_base=1.25,
+            ns_derivative_mode="wls",
+            loss_weight_mode="dynamic",
+        ),
+        T1ExplorerConfig(
+            experiment_name="Res_Fine_0.4",
+            dataset_tier="tier1_res_fine",
+            latent_dim=256,              # Champion spec
+            deq_max_iters=25,
+            num_fourier_freqs=16,        # Champion spec
+            fourier_base=1.25,
             ns_derivative_mode="wls",
             loss_weight_mode="dynamic",
         ),
@@ -358,10 +371,132 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
                 env_overrides=env,
                 epochs=60,
                 warm_up_epochs=5,
-                adam_epochs=40,
+                adam_epochs=25,
             )
         )
     return candidates
+
+
+def _build_same_epoch_comparison(
+    completed: List[Dict[str, Any]],
+    sweep_dir: Path,
+) -> Dict[str, Any]:
+    """Build a same-epoch comparison table across all completed candidates.
+
+    Strategy: for each candidate we know ``best_rel_l2``, ``best_phys_score``,
+    ``best_loss``, and the actual epoch count trained.  We also parse the
+    training diary JSONL (if available) to extract the *last* validation
+    snapshot, giving per-candidate metrics at their respective final epoch.
+
+    The comparison aligns all candidates by the **minimum common epoch count**
+    so the reader can judge convergence at equal training effort.
+    """
+    import math
+
+    ok_runs = [r for r in completed if r.get("status") == "ok"]
+    if not ok_runs:
+        return {"note": "no completed candidates to compare"}
+
+    # Gather per-candidate final-epoch validation metrics from diary files.
+    per_candidate: List[Dict[str, Any]] = []
+    for run in ok_runs:
+        name = run.get("name", "?")
+        entry: Dict[str, Any] = {
+            "name": name,
+            "best_rel_l2": run.get("best_rel_l2"),
+            "best_phys_score": run.get("best_phys_score"),
+            "best_loss": run.get("best_loss"),
+            "early_stopped": run.get("early_stopped", False),
+            "n_graphs": run.get("n_graphs"),
+            "n_train": run.get("n_train"),
+            "n_val": run.get("n_val"),
+            "duration_min": run.get("duration_min"),
+            "dataset_tier": run.get("dataset_tier")
+                or run.get("explorer", {}).get("dataset_tier"),
+            "graph_dir": run.get("graph_dir"),
+            "ckpt_dir": run.get("ckpt_dir"),
+        }
+
+        # Try to parse last validation event from the candidate's training diary.
+        diary_metrics = _parse_last_validation_from_diary(run, sweep_dir)
+        if diary_metrics:
+            entry["last_val"] = diary_metrics
+
+        per_candidate.append(entry)
+
+    # Determine lowest common epoch across candidates (for fair comparison).
+    trained_epochs = []
+    for c in per_candidate:
+        lv = c.get("last_val")
+        if lv and isinstance(lv.get("epoch"), (int, float)) and not math.isinf(lv["epoch"]):
+            trained_epochs.append(int(lv["epoch"]))
+    min_common_epoch = min(trained_epochs) if trained_epochs else None
+
+    return {
+        "candidates": per_candidate,
+        "min_common_epoch": min_common_epoch,
+        "note": (
+            "Compare 'best_rel_l2' across candidates for overall winner. "
+            "'last_val' shows the final validation snapshot per candidate. "
+            "'min_common_epoch' is the lowest epoch any candidate reached — "
+            "use diary JSONL files to extract metrics at that epoch for a "
+            "strict same-epoch comparison."
+        ),
+    }
+
+
+def _parse_last_validation_from_diary(
+    run: Dict[str, Any],
+    sweep_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Extract the last ``validation`` event from a candidate's training diary JSONL."""
+    # The diary path is not stored in the run dict, but we can find it by
+    # scanning the reports directory for the diary started closest to the run.
+    # Simpler: the trainer stores it in the run result under an undocumented key
+    # or we can search by candidate name timestamp.  Since we don't have a
+    # guaranteed pointer, we try a robust fallback chain.
+    rep = reports_dir()
+    candidate_name = run.get("name", "")
+    # Heuristic: find diary files created during this sweep run.
+    diary_files = sorted(rep.glob("training_diary_tier1_*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not diary_files:
+        return None
+
+    # Walk diary files newest-first to find one whose run_start mentions this
+    # candidate (via experiment_name).
+    for diary_path in reversed(diary_files):
+        try:
+            last_val = None
+            matched = False
+            with open(diary_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = evt.get("event")
+                    if etype == "run_start":
+                        t1e = evt.get("t1_explorer") or {}
+                        if t1e.get("experiment_name") == candidate_name:
+                            matched = True
+                    if etype == "validation" and matched:
+                        last_val = {
+                            "epoch": evt.get("epoch"),
+                            "rel_l2": evt.get("scores", {}).get("rel_l2"),
+                            "rel_l2_near_wall": evt.get("scores", {}).get("rel_l2_near_wall"),
+                            "rel_l2_high_sdf_grad": evt.get("scores", {}).get("rel_l2_high_sdf_grad"),
+                            "continuity": evt.get("scores", {}).get("continuity"),
+                            "wall_slip": evt.get("scores", {}).get("wall_slip"),
+                            "shear_mse": evt.get("scores", {}).get("shear_mse"),
+                        }
+            if matched and last_val is not None:
+                return last_val
+        except OSError:
+            continue
+    return None
 
 
 def run_sweep(sweep_name: str = "default") -> Path:
@@ -392,12 +527,18 @@ def run_sweep(sweep_name: str = "default") -> Path:
             [r for r in completed if r.get("status") == "ok"],
             key=lambda x: (x.get("best_rel_l2", float("inf")), x.get("best_phys_score", float("inf"))),
         )
+
+        # Build a same-epoch comparison table from the training diary JSONL files.
+        # Each candidate writes a diary; we parse the last validation event from each
+        # and align by epoch count to enable fair apples-to-apples comparison.
+        same_epoch_comparison = _build_same_epoch_comparison(completed, sweep_dir)
+
         payload = {
             "tier": "tier1",
             "sweep_name": sweep_name,
             "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
             "run_folder": str(sweep_dir),
-            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 40},
+            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 25},
             "interrupted": interrupted,
             "active_candidate_when_stopped": state["active_candidate"],
             "elapsed_minutes": (time.time() - started_at) / 60.0,
@@ -418,6 +559,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 }
                 for i, r in enumerate(rows)
             ],
+            "same_epoch_comparison": same_epoch_comparison,
         }
         out_path = _write_json(summary_path, payload)
 
@@ -522,7 +664,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 "duration_min": (time.time() - t0) / 60.0,
             }
         )
-        _write_entry_debug(
+        entry_path = _write_entry_debug(
             phase="sanity",
             idx=None,
             name=f"sanity::{sanity_cand.name}",
@@ -533,6 +675,9 @@ def run_sweep(sweep_name: str = "default") -> Path:
             error=repr(exc),
             tb=tb,
         )
+        print("❌ Sanity check failed; aborting sweep before full candidates.")
+        print(f"🧾 Failure details written to: {entry_path}")
+        print(tb)
         _safe_env_restore(prev_env)
         _emit_once()
         signal.signal(signal.SIGINT, prev_sigint)
@@ -551,6 +696,9 @@ def run_sweep(sweep_name: str = "default") -> Path:
             status="passed",
             result=sanity.get("result") if isinstance(sanity.get("result"), dict) else None,
         )
+    # Per-candidate checkpoint directories live under the sweep folder so
+    # candidates never read/overwrite each other's optimizer state or epoch counter.
+    ckpt_root = sweep_dir / "checkpoints"
 
     for idx, cand in enumerate(candidates, start=1):
         state["active_candidate"] = cand.name
@@ -559,10 +707,18 @@ def run_sweep(sweep_name: str = "default") -> Path:
         overrides["TIER1_SKIP_EXPERIMENT_ARTIFACT"] = "1"
         overrides["TIER1_DISABLE_FIGURES"] = "1"
         overrides["TIER1_DISABLE_STAGE_A_ARTIFACTS"] = "1"
+
+        # Checkpoint isolation: each candidate saves/loads from its own directory.
+        cand_ckpt_dir = ckpt_root / _safe_name(cand.name)
+        cand_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        overrides["TIER1_CKPT_DIR"] = str(cand_ckpt_dir)
+
         print(
             "🔎 Candidate effective settings: "
             f"TIER1_CKPT_EVERY={overrides.get('TIER1_CKPT_EVERY', 'unset')}, "
-            f"TIER1_PRESSURE_BC_MODE={overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}"
+            f"TIER1_PRESSURE_BC_MODE={overrides.get('TIER1_PRESSURE_BC_MODE', 'unset')}, "
+            f"TIER1_RESUME={overrides.get('TIER1_RESUME', 'unset')}, "
+            f"TIER1_CKPT_DIR={cand_ckpt_dir}"
         )
         prev_env = _safe_env_set(overrides)
         t0 = time.time()
@@ -580,6 +736,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 "explorer": cand.explorer.to_serializable(),
                 "env_overrides": overrides,
                 "duration_min": (time.time() - t0) / 60.0,
+                "ckpt_dir": str(cand_ckpt_dir),
                 **result,
             }
             completed.append(row)

@@ -20,6 +20,7 @@ if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import atexit
 import csv
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -386,12 +387,21 @@ def train_t1_predictor(
     best_phys_score = float('inf')
     best_loss = float('inf')
     root = get_project_root()
-    model_dir = stage_a_dir()
+    # Allow sweep runner to redirect checkpoints into a per-candidate directory
+    # so candidates never read/overwrite each other's state.
+    ckpt_dir_override = os.environ.get("TIER1_CKPT_DIR", "").strip()
+    if ckpt_dir_override:
+        model_dir = Path(ckpt_dir_override)
+        model_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        model_dir = stage_a_dir()
     lbfgs_initialized = False
     start_epoch = 0
     latest_ckpt_save = model_dir / "tier1_latest_checkpoint.pth"
     best_physics_save = model_dir / "tier1_best_physics.pth"
-    latest_ckpt_path = resolve_checkpoint("a", "tier1_latest_checkpoint.pth")
+    # When a candidate-local ckpt dir is set, resume/load paths point there;
+    # otherwise fall back to the shared stage_a directory.
+    latest_ckpt_path = model_dir / "tier1_latest_checkpoint.pth"
     best_physics_path = resolve_checkpoint("a", "tier1_best_physics.pth")
     ckpt_every = max(1, int(os.environ.get("TIER1_CKPT_EVERY", "1")))
     resume_enabled = (os.environ.get("TIER1_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
