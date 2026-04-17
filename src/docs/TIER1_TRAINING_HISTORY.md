@@ -1,5 +1,5 @@
 # Tier 1 Predictor (GINO-DEQ) Training History & Insights
-*Last Updated: April 2026*
+*Last Updated: 2026-04-17*
 *Target Goal: < 5% Relative L2 Error on Tier 1 Hemodynamics*
 
 ## 1. The 15% Pareto Frontier (The Current Bottleneck)
@@ -43,3 +43,19 @@ Two comparable Tier-1 explorer candidates were run with identical optimizer/loss
 - **Optimal mesh resolution for Tier 1:** `tier1_res_medium` (mesh size factor `0.75`).
 - Rationale: best validation accuracy among tested candidates (about `3.95%` lower `best_rel_l2` than coarse) with improved physics score.
 - Trade-off: about `2x` candidate runtime versus coarse; accepted for default Tier-1 quality.
+
+## 6. V2 sweep → V3 continuity strategy (2026-04-17)
+
+**Goal:** Break the `<5%` relative L2 benchmark on Tier 1 (2D vessel) CFD.
+
+**V2 baseline:** `Baseline_Legacy` plateau ~`19.2%` validation error; bottleneck attributed to BC truncation and weak global pressure–velocity coupling.
+
+**V2_Hard_BCs:** Replaced soft BC penalties with SDF-masked exact constraints (`u_out = SDF × u_pred + u_inlet`). Wall `|u|` mean `0.0000` (was `~0.0520`), but validation error rose ~`21.6%` (“squeeze”: error shifts into the interior); mean `|∇·u|` rose `~0.42 → ~0.76` — rigid walls expose limited interior capacity / receptive field for the elliptic pressure field.
+
+**V2_Attention_MultiGrid:** `global_mean_pool` → Perceiver-style cross-attention bottleneck; run preempted ~epoch 4, but faster convergence (e.g. ~`33%` error by epoch 2 vs baseline pace).
+
+**Optimizer note:** LBFGS after AdamW warmup — prior best **~15.4%** relative L2; second-order polish on stiff NS residuals.
+
+**V3 plan:** Pair `hard_bcs=True` with enough model capacity to restore low interior continuity: `latent_dim=256`, **40 AdamW → 20 LBFGS** curriculum. Four-way A/B: `V3_Baseline_Legacy` (control); `V3_Attention_MultiGrid` (global elliptic coupling); `V3_Geometric_Priors` (sphere-traced width `D(x)` and derivatives as geometry shortcuts); `V3_SIREN_Implicit` (SIREN decoder + analytic spatial grads via autograd vs WLS mesh noise).
+
+**V3 success criteria:** Keep wall `|u|` at `0.0000` while driving interior mean `|∇·u|` back **below ~0.10**.

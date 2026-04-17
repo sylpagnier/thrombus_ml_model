@@ -6,12 +6,12 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 
 **Explorer execution policy**
 
-- Explorer sweeps are intentionally **Adam-only** (no L-BFGS) to maximize throughput for rapid
-  architecture/loss screening.
+- The active ``build_sweep_candidates()`` defines the sweep: **V3** uses **40 AdamW → 20 L-BFGS**
+  (``TIER1_USE_LBFGS=1``) to polish NS residuals; the pre-sweep **sanity probe** stays Adam-only
+  (1 epoch) for speed.
 - Sweeps **always start fresh**: no ``tier1_best_physics.pth`` warm-start and no resume from
   ``tier1_latest_checkpoint.pth`` (per-candidate checkpoint dirs only record *this* run).
-- Once a candidate architecture is selected, run full optimization (including optional L-BFGS)
-  and optional weight init/resume in ``src/training/train_t1_predictor.py`` for best-model commitment.
+- For ad-hoc fast screening, set ``TIER1_USE_LBFGS=0`` in env or swap in a shorter sweep builder.
 
 **Kinematic supervision weighting** (anchor nodes only, COMSOL labels):
 
@@ -300,18 +300,17 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
 
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    Tier 1 mesh-resolution sweep: hold architecture fixed at the current best-known
-    pre-L-BFGS setting while varying only dataset mesh density tiers.
+    V3 architecture sweep: high capacity (``latent_dim=256``) + hard BCs where indicated,
+    targeting ``<5%`` relative L2 with **40 AdamW → 20 L-BFGS** per candidate.
 
-    IMPORTANT: explorer is Adam-only by design for fast architecture evaluation.
+    Four-way comparison: legacy baseline vs attention bottleneck vs width priors vs SIREN decoder.
     """
     base_overrides = {
-        "TIER1_DISABLE_FIGURES": "1", 
-        "TIER1_CKPT_EVERY": "5",          # Frequent checkpoints for crash safety
-        "TIER1_EARLY_STOP_PATIENCE": "15", 
+        "TIER1_DISABLE_FIGURES": "1",
+        "TIER1_CKPT_EVERY": "5",  # Frequent checkpoints for crash safety
+        "TIER1_EARLY_STOP_PATIENCE": "15",
         "TIER1_LOSS_WEIGHT_MODE": "dynamic",
-        # Explorer mode is intentionally Adam-only for rapid candidate screening.
-        "TIER1_USE_LBFGS": "0",
+        "TIER1_USE_LBFGS": "1",
         # Never load pretrained weights — fair screening from random init only.
         "TIER1_INIT_FROM_BEST": "0",
 
@@ -319,26 +318,26 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
         # RESUME is OFF; per-candidate TIER1_CKPT_DIR (set by run_sweep) only stores
         # checkpoints from the current candidate run (no cross-candidate bleed).
         "TIER1_RESUME": "0",
-        "TIER1_MICRO_BATCH_SIZE": "1",    # Cut memory footprint in half to survive 0.4 mesh
+        "TIER1_MICRO_BATCH_SIZE": "1",  # Cut memory footprint in half to survive 0.4 mesh
         "TIER1_ACCUMULATION_STEPS": "8",  # 1 * 8 = 8 (same effective batch size)
 
         "TIER1_KINEMATICS_MODE": "direct_uvp",
         "TIER1_ACTIVATION_FN": "silu",
-        
+
         # --- Strict Pressure & Boundary Enforcement ---
         "TIER1_KINE_P_WEIGHT": "5.0",
         "TIER1_P_GRAD_SUPERVISION": "1.0",
         "TIER1_PRESSURE_BC_MODE": "pointwise",
-        
-        # --- Time Horizon ---
+
+        # --- Time horizon: AdamW then L-BFGS (see T1SweepCandidate adam_epochs / epochs) ---
         "TIER1_EPOCHS": "60",
-        "TIER1_ADAM_EPOCHS": "25",
+        "TIER1_ADAM_EPOCHS": "40",
         "TIER1_DATA_STAGE_EPOCHS": "10",
         "TIER1_LAMBDA_CONT": "1.0",
         "TIER1_LAMBDA_CONT_START": "0.1",
         "TIER1_LAMBDA_CONT_WARMUP_EPOCHS": "10",
     }
-    
+
     def _env_for(cfg: T1ExplorerConfig) -> Dict[str, str]:
         return {
             "TIER1_EXPERIMENT_NAME": cfg.experiment_name,
@@ -370,34 +369,46 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_USE_SIREN": ("1" if cfg.use_siren_decoder else "0"),
             "TIER1_USE_WIDTH_PRIORS": ("1" if cfg.use_width_priors else "0"),
         }
-    
-    # A/B architecture sweep candidates (Tier 1 baseline vs V2 toggles).
+
+    common_kwargs = dict(
+        dataset_tier="tier1",
+        loss_weight_mode="dynamic",
+        latent_dim=256,
+        deq_max_iters=25,
+    )
+
     sweep_configs: List[T1ExplorerConfig] = [
         T1ExplorerConfig(
-            experiment_name="Baseline_Legacy",
-            dataset_tier="tier1",
+            experiment_name="V3_Baseline_Legacy",
             use_hard_bcs=False,
             global_pool_mode="mean",
+            use_width_priors=False,
+            use_siren_decoder=False,
+            **common_kwargs,
         ),
         T1ExplorerConfig(
-            experiment_name="V2_Hard_BCs",
-            dataset_tier="tier1",
-            use_hard_bcs=True,
-            global_pool_mode="mean",
-        ),
-        T1ExplorerConfig(
-            experiment_name="V2_Attention_MultiGrid",
-            dataset_tier="tier1",
+            experiment_name="V3_Attention_MultiGrid",
             use_hard_bcs=True,
             global_pool_mode="attention",
             use_width_priors=False,
+            use_siren_decoder=False,
+            **common_kwargs,
         ),
         T1ExplorerConfig(
-            experiment_name="V2_Width_Priors",
-            dataset_tier="tier1",
+            experiment_name="V3_Geometric_Priors",
             use_hard_bcs=True,
-            global_pool_mode="attention",
+            global_pool_mode="mean",
             use_width_priors=True,
+            use_siren_decoder=False,
+            **common_kwargs,
+        ),
+        T1ExplorerConfig(
+            experiment_name="V3_SIREN_Implicit",
+            use_hard_bcs=True,
+            global_pool_mode="mean",
+            use_width_priors=False,
+            use_siren_decoder=True,
+            **common_kwargs,
         ),
     ]
 
@@ -415,7 +426,7 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
                 env_overrides=env,
                 epochs=60,
                 warm_up_epochs=5,
-                adam_epochs=25,
+                adam_epochs=40,
             )
         )
     return candidates
@@ -582,7 +593,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
             "sweep_name": sweep_name,
             "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
             "run_folder": str(sweep_dir),
-            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 25},
+            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 40},
             "interrupted": interrupted,
             "active_candidate_when_stopped": state["active_candidate"],
             "elapsed_minutes": (time.time() - started_at) / 60.0,
