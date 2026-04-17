@@ -371,96 +371,32 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_USE_WIDTH_PRIORS": ("1" if cfg.use_width_priors else "0"),
         }
     
-    # RESTORED: Optimal Champion Hyperparameters from Training History
+    # A/B architecture sweep candidates (Tier 1 baseline vs V2 toggles).
     sweep_configs: List[T1ExplorerConfig] = [
         T1ExplorerConfig(
-            experiment_name="Res_Coarse_1.5",
-            dataset_tier="tier1_res_coarse",
-            latent_dim=256,              # Champion spec
-            deq_max_iters=25,
-            num_fourier_freqs=16,        # Champion spec
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
-        ),
-        T1ExplorerConfig(
-            experiment_name="Res_Medium_0.75",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,              # Champion spec
-            deq_max_iters=25,
-            num_fourier_freqs=16,        # Champion spec
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
-        ),
-        T1ExplorerConfig(
-            experiment_name="Res_Fine_0.4",
-            dataset_tier="tier1_res_fine",
-            latent_dim=256,              # Champion spec
-            deq_max_iters=25,
-            num_fourier_freqs=16,        # Champion spec
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
-        ),
-        # Architecture A/B on a single resolution (medium mesh); toggles only V2 flags.
-        T1ExplorerConfig(
             experiment_name="Baseline_Legacy",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
+            dataset_tier="tier1",
             use_hard_bcs=False,
             global_pool_mode="mean",
-            loss_weight_mode="dynamic",
         ),
         T1ExplorerConfig(
             experiment_name="V2_Hard_BCs",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
+            dataset_tier="tier1",
             use_hard_bcs=True,
             global_pool_mode="mean",
-            loss_weight_mode="dynamic",
         ),
         T1ExplorerConfig(
-            experiment_name="V2_Hard_BCs_Plus_Attention",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
+            experiment_name="V2_Attention_MultiGrid",
+            dataset_tier="tier1",
             use_hard_bcs=True,
             global_pool_mode="attention",
-            loss_weight_mode="dynamic",
-        ),
-        # Width priors A/B (regenerate graphs with mesh_to_graph so ``x`` has 18 channels).
-        T1ExplorerConfig(
-            experiment_name="Baseline_Width_Legacy",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
             use_width_priors=False,
         ),
         T1ExplorerConfig(
-            experiment_name="V2_Width_Derivatives",
-            dataset_tier="tier1_res_medium",
-            latent_dim=256,
-            deq_max_iters=25,
-            num_fourier_freqs=16,
-            fourier_base=1.25,
-            ns_derivative_mode="wls",
-            loss_weight_mode="dynamic",
+            experiment_name="V2_Width_Priors",
+            dataset_tier="tier1",
+            use_hard_bcs=True,
+            global_pool_mode="attention",
             use_width_priors=True,
         ),
     ]

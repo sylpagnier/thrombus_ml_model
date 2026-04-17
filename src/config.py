@@ -100,6 +100,13 @@ SPECIES_GROUPS = {
     "solid": (BulkSpecies.FI,),
 }
 
+# Default mesh size-factor by data generation tier.
+# Tier-1 default is locked to the best explorer candidate from 2026-04-16:
+# `tier1_res_medium` (size factor 0.75).
+TIER_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
+    "tier1": 0.75,
+}
+
 
 @dataclass
 class VesselConfig:
@@ -113,6 +120,7 @@ class VesselConfig:
 
     def __post_init__(self):
         self.template_path = comsol_models_dir() / "phase1_template.mph"
+        self.mesh_size_factor = TIER_DEFAULT_MESH_SIZE_FACTOR.get(self.tier, self.mesh_size_factor)
         dr = data_root()
         if self.tier == "tier3_patients":
             self.mesh_input_dir = dr / "raw/tier3_patients"

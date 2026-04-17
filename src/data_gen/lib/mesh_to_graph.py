@@ -320,7 +320,7 @@ class MeshToGraphComplete:
             still_idx = idx[~hit_mask]
             if still_idx.numel() == 0:
                 break
-            dist_still = dist_nd[~hit_mask].view(-1)
+            dist_still = dist_nd[~hit_mask]
             t_march[still_idx] = t_march[still_idx] + torch.clamp(dist_still, min=0.01)
 
         width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0

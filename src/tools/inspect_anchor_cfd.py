@@ -193,7 +193,7 @@ def inspect_all_anchors(active_tier="tier1", export_csv=True):
                         "|".join(r.get("quality_flags", [])),
                     ]
                 )
-        print(f"📄 Wrote anchor health CSV: {out_path}")
+        print(f"Wrote anchor health CSV: {out_path}")
     return rows
 
 

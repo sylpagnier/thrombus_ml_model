@@ -775,7 +775,11 @@ if __name__ == "__main__":
         print(f"  Number of vessel meshes already generated: {n_on_disk}")
         print(f"  Number of non-anchors remaining: {unused_slots}")
         print()
-        overwrite = True if args.overwrite else _prompt_write_mode_vessel()
+        if n_on_disk == 0:
+            overwrite = True
+            print("  No meshes on disk — starting indices at 0 (overwrite).\n")
+        else:
+            overwrite = True if args.overwrite else _prompt_write_mode_vessel()
         default_n = 50 if n_on_disk > 0 else 500
         n_vessels = _prompt_positive_int("How many vessels to generate", default_n)
         start_idx = 0 if overwrite else None

@@ -19,33 +19,8 @@ from src.data_gen.lib.vessel_generator import (
     VesselGenerator,
     summarize_vessel_mesh_inventory,
     _prompt_int_choice as _vg_prompt_int_choice,
-    _prompt_positive_int as _vg_prompt_positive_int,
     _prompt_write_mode_vessel as _vg_prompt_write_mode_vessel,
 )
-
-
-def _prompt_yes_no(label: str, default: bool = True) -> bool:
-    default_hint = "Y/n" if default else "y/N"
-    while True:
-        raw = input(f"{label} [{default_hint}]: ").strip().lower()
-        if raw == "":
-            return default
-        if raw in ("y", "yes"):
-            return True
-        if raw in ("n", "no"):
-            return False
-        print("  Enter y or n.")
-
-
-def _prompt_optional_int(label: str) -> Optional[int]:
-    raw = input(f"{label} [empty = auto]: ").strip()
-    if raw == "":
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        print("  Invalid integer; using auto.")
-        return None
 
 
 def _prompt_anchor_write_mode() -> bool:
@@ -82,6 +57,7 @@ def _tier_str_from_n(tier_n: int) -> str:
 class TierInteractivePlan:
     """All interactive choices for one tier (collected before any long-running step)."""
 
+    anchor_target: int
     run_vessel: bool
     level: Optional[int]
     overwrite: Optional[bool]
@@ -89,7 +65,6 @@ class TierInteractivePlan:
     seed: Optional[int]
     num_workers: Optional[int]
     chunk_size: Optional[int]
-    no_plot: bool
     run_anchors: bool
     allow_overwrite_anchor: bool
     anchor_max_json_scan: Optional[int]
@@ -112,44 +87,20 @@ def run_interactive_pipeline() -> None:
     if len(tier_sequence) == 2:
         print(
             "\nBoth tiers run one after the other (separate `data/raw/tier*`, CFD dirs, and graphs). "
-            "Each tier gets an independent random cohort unless you set an explicit RNG seed.\n"
+            "Each tier uses a random vessel cohort (interactive pipeline does not prompt for RNG seed).\n"
         )
 
     print(
-        "\nEach COMSOL anchor needs meshes with .json + non-empty .nas + .msh. "
-        "Set a target anchor count to size the cohort; use 0 to skip COMSOL anchors in this run "
-        "(you can still enable them in a follow-up pass).\n"
+        "\nEach tier plan asks vessel generation -> COMSOL anchors (optional) first; "
+        "mesh-to-graph runs automatically after. No prompts during execution.\n"
     )
-    if len(tier_sequence) == 2:
-        print(
-            "When running both tiers, you can set **different** anchor targets (and vessel defaults) "
-            "for Tier 1 vs Tier 2.\n"
-        )
-        anchor_by_tier = {
-            1: _prompt_nonnegative_int(
-                "Tier 1 — how many COMSOL anchor CFD samples (.npz) should this run target?",
-                0,
-            ),
-            2: _prompt_nonnegative_int(
-                "Tier 2 — how many COMSOL anchor CFD samples (.npz) should this run target?",
-                0,
-            ),
-        }
-    else:
-        only = tier_sequence[0]
-        anchor_by_tier = {
-            only: _prompt_nonnegative_int(
-                "How many COMSOL anchor CFD samples (.npz) do you want this run to target?",
-                0,
-            ),
-        }
 
     print(
         "\n--- Planning: answer all questions now; the run after this has **no further prompts** ---\n"
     )
     plans: dict[int, TierInteractivePlan] = {}
     for tier_n in tier_sequence:
-        plans[tier_n] = _prompt_tier_interactive_plan(tier_n, anchor_by_tier[tier_n])
+        plans[tier_n] = _prompt_tier_interactive_plan(tier_n)
 
     print(
         f"\n{'=' * 60}\n"
@@ -158,163 +109,100 @@ def run_interactive_pipeline() -> None:
     )
 
     for tier_n in tier_sequence:
-        _execute_tier_interactive_plan(tier_n, anchor_by_tier[tier_n], plans[tier_n])
+        _execute_tier_interactive_plan(tier_n, plans[tier_n].anchor_target, plans[tier_n])
 
     print("\n=== Pipeline finished ===\n")
 
 
-def _prompt_tier_interactive_plan(tier_n: int, anchor_target: int) -> TierInteractivePlan:
+def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
     tier = _tier_str_from_n(tier_n)
     print(f"\n{'=' * 60}\n  PLAN — {tier.upper()} (independent cohort)\n{'=' * 60}\n")
 
-    run_vessel = _prompt_yes_no("Run vessel mesh generation (Gmsh)?", default=True)
+    # ==========================================================
+    # 1. VESSELS
+    # ==========================================================
+    vg = VesselGenerator(tier=tier)
+    inv = summarize_vessel_mesh_inventory(vg.output_dir)
+    n_on_disk = int(inv["count"])
+
+    print("\n--- Vessel mesh inventory ---")
+    print(f"  Meshes currently on disk: {n_on_disk}\n")
+
+    default_n = 50 if n_on_disk > 0 else 500
+    n_vessels = _prompt_nonnegative_int("How many vessels to generate? (0 = skip)", default=default_n)
+    run_vessel = n_vessels > 0
+
     level: Optional[int] = None
     overwrite: Optional[bool] = None
-    n_vessels: Optional[int] = None
     seed: Optional[int] = None
     num_workers: Optional[int] = None
     chunk_size: Optional[int] = None
-    no_plot = True
 
     if run_vessel:
         level = _vg_prompt_int_choice("Geometry level", (0, 1))
-        vg = VesselGenerator(tier=tier)
-        inv = summarize_vessel_mesh_inventory(vg.output_dir)
-        n_on_disk = int(inv["count"])
-        max_idx = int(inv["max_idx"])
-        index_span = max_idx + 1 if max_idx >= 0 else 0
-        unused_slots = index_span - n_on_disk if max_idx >= 0 else 0
-        print("\n--- Vessel mesh inventory (now) ---")
-        print(f"  Output: {vg.output_dir}")
-        print(f"  Total index span: {index_span}")
-        print(f"  Meshes on disk: {n_on_disk}")
-        print(f"  Unused index slots: {unused_slots}\n")
-
-        overwrite = _vg_prompt_write_mode_vessel()
-        base_default = 50 if n_on_disk > 0 else 500
-        if anchor_target > 0:
-            default_n = max(base_default, anchor_target)
-            print(
-                f"  Default vessel count = {default_n} (at least your anchor target of {anchor_target}).\n"
-            )
+        if n_on_disk == 0:
+            overwrite = True
+            print("  No meshes on disk — starting indices at 0 (overwrite).\n")
         else:
-            default_n = base_default
-        n_vessels = _vg_prompt_positive_int("How many vessels to generate", default_n)
-        seed = _prompt_optional_int(
-            "RNG seed (empty = random cohort — default; set an integer only to reproduce a run)"
-        )
-        num_workers = _prompt_optional_int("Worker processes")
-        chunk_size = _prompt_optional_int("Chunk size (samples per worker chunk)")
-        no_plot = _prompt_yes_no("Skip matplotlib preview of saved meshes?", default=True)
+            overwrite = _vg_prompt_write_mode_vessel()
 
-    if anchor_target > 0:
-        run_anchors = True
-        print(
-            f"\n--- {tier.upper()} COMSOL anchors: will target up to {anchor_target} new .npz "
-            "(subject to CFD-ready pool at run time) ---\n"
-        )
-    else:
-        run_anchors = _prompt_yes_no(
-            "Run COMSOL anchor CFD (requires COMSOL + MPh, writes .npz)?", default=False
-        )
-
-    allow_overwrite_anchor = False
-    anchor_max_json_scan: Optional[int] = None
-    anchor_shuffle = False
-    anchor_shuffle_seed: Optional[int] = None
-    anchor_manual_max_new: Optional[int] = None
-
-    if run_anchors:
-        from src.data_gen.lib.anchor_generator import (
-            AnchorGenerator,
-            summarize_anchor_inventory,
-        )
-
-        gen = AnchorGenerator(tier=tier)
-        inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
-        total_v = int(inv["mesh_json_with_valid_nas"])
-        have_npz = int(inv["existing_npz"])
-        remaining = int(inv["pending_missing_npz"])
-        ready_add = int(inv["candidate_pool_ready"])
-        ready_all = int(inv["candidate_pool_including_npz"])
-        print("\n--- Anchor CFD inventory (now; may change after vessel generation) ---")
-        print(f"  Output: {gen.output_dir}")
-        print(f"  Mesh:   {gen.mesh_dir}")
-        print(f"  Meshes with valid .nas: {total_v}")
-        print(f"  Anchors already generated: {have_npz}")
-        print(f"  Pending (no .npz yet): {remaining}")
-        if remaining > ready_add:
-            print(f"  ({remaining - ready_add} still need a .msh export before CFD.)")
-        print()
-
-        allow_overwrite_anchor = _prompt_anchor_write_mode()
-        pool = ready_all if allow_overwrite_anchor else ready_add
-        default_more = min(pool, 50) if pool > 0 else 0
-        if pool == 0:
-            if allow_overwrite_anchor:
-                print("No meshes are CFD-ready (need .json + non-empty .nas + .msh).")
-            else:
-                msg = "Nothing to add (need .json + non-empty .nas + .msh, and no .npz yet)."
-                if remaining > 0:
-                    msg += " Some meshes lack .msh — export meshes for those vessels first."
-                elif total_v == 0:
-                    msg = "No vessel meshes found in the mesh directory."
-                print(msg)
-        else:
-            if anchor_target > 0:
-                asked = min(anchor_target, pool)
-                if anchor_target > pool:
-                    print(
-                        f"  Only {pool} CFD-ready mesh(es) available now; at run time at most {asked} "
-                        f"anchors toward target {anchor_target} (more may exist after vessel generation).\n"
-                    )
-                else:
-                    print(
-                        f"  Toward anchor target {anchor_target}: up to {asked} in current pool "
-                        "(run will re-check pool after vessels).\n"
-                    )
-            else:
-                mode_note = (
-                    "CFD runs to attempt" if allow_overwrite_anchor else "new CFD samples to generate"
-                )
-                anchor_manual_max_new = _prompt_nonnegative_int(f"How many {mode_note}", default_more)
-
-        if anchor_target == 0 and anchor_manual_max_new is None:
-            mode_note = (
-                "CFD runs to attempt" if allow_overwrite_anchor else "new CFD samples to generate"
-            )
-            print(
-                "\n  Pool is empty now; if vessel generation creates CFD-ready meshes, "
-                "the run will use your count below.\n"
-            )
-            anchor_manual_max_new = _prompt_nonnegative_int(
-                f"How many {mode_note} (0 = skip anchor CFD for this tier)",
-                0,
-            )
-
-        cap_raw = input(
-            "Cap candidate JSON files to scan [empty = no cap, try all candidates]: "
-        ).strip()
-        anchor_max_json_scan = int(cap_raw) if cap_raw else None
-        anchor_shuffle = _prompt_yes_no("Shuffle candidate order?", default=False)
-        if anchor_shuffle:
-            s = input("Shuffle seed [empty = random]: ").strip()
-            anchor_shuffle_seed = int(s) if s else None
-
-    run_mesh = _prompt_yes_no(
-        "Convert all vessel_*.msh under raw/ to graphs (clears graphs *.pt first)?",
-        default=True,
+    # ==========================================================
+    # 2. ANCHORS
+    # ==========================================================
+    from src.data_gen.lib.anchor_generator import (
+        AnchorGenerator,
+        summarize_anchor_inventory,
     )
 
+    print(f"\n--- {tier.upper()} COMSOL anchors ---")
+
+    # Match anchor write mode to vessel overwrite (new cohort replaces old meshes + anchors).
+    if run_vessel and overwrite is True:
+        allow_overwrite_anchor = True
+        print(
+            "  Vessel generation overwrites mesh indices — using anchor overwrite (existing .npz can be replaced).\n"
+        )
+    else:
+        allow_overwrite_anchor = _prompt_anchor_write_mode()
+
+    gen = AnchorGenerator(tier=tier)
+    anchor_inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
+    have_npz = int(anchor_inv["existing_npz"])
+    ready_add = int(anchor_inv["candidate_pool_ready"])
+    ready_all = int(anchor_inv["candidate_pool_including_npz"])
+
+    if not allow_overwrite_anchor:
+        print(f"  Anchors already generated: {have_npz}\n")
+        pool = ready_add
+    else:
+        print("  Overwriting existing anchors.\n")
+        pool = ready_all
+
+    default_anchors = min(pool, 50) if pool > 0 else 0
+    anchor_manual_max_new = _prompt_nonnegative_int(
+        "How many anchors to generate? (0 = skip)", default=default_anchors
+    )
+    run_anchors = anchor_manual_max_new > 0
+
+    # No JSON scan cap; shuffle candidates with a random seed (interactive tier12 defaults).
+    anchor_max_json_scan: Optional[int] = None
+    anchor_shuffle = True
+    anchor_shuffle_seed: Optional[int] = None
+
+    # ==========================================================
+    # 3. MESH TO GRAPH (Automatic)
+    # ==========================================================
+    run_mesh = True
+
     return TierInteractivePlan(
+        anchor_target=0,  # Hardcoded to 0 to trigger the manual count in execution
         run_vessel=run_vessel,
         level=level,
         overwrite=overwrite,
-        n_vessels=n_vessels,
+        n_vessels=n_vessels if run_vessel else None,
         seed=seed,
         num_workers=num_workers,
         chunk_size=chunk_size,
-        no_plot=no_plot,
         run_anchors=run_anchors,
         allow_overwrite_anchor=allow_overwrite_anchor,
         anchor_max_json_scan=anchor_max_json_scan,
@@ -344,14 +232,6 @@ def _execute_tier_interactive_plan(
             chunk_size=plan.chunk_size,
             start_idx=start_idx,
         )
-
-        if not plan.no_plot:
-            saved_indices = sorted(
-                int(p.stem.split("_")[-1])
-                for p in vg.output_dir.glob("vessel_*.msh")
-            )[:9]
-            if saved_indices:
-                vg.visualize_saved(saved_indices)
 
     if plan.run_anchors:
         from src.data_gen.lib.anchor_generator import (

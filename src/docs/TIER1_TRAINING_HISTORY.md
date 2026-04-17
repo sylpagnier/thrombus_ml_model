@@ -30,3 +30,16 @@ To break the 15% barrier, the following structural changes to `src/architecture/
 * Expand `latent_dim` to 256.
 * Increase `num_fourier_freqs` to 16 or 24.
 * **Two-Stage Optimization:** 40 epochs of AdamW (to reach the 15% basin) -> 20 epochs of Full-Batch L-BFGS (to polish PDE residuals to < 5%).
+
+## 5. Tier-1 Mesh Resolution Sweep (2026-04-16)
+
+Two comparable Tier-1 explorer candidates were run with identical optimizer/loss settings and train/val split (`n_train=225`, `n_val=25`), differing primarily in dataset mesh resolution:
+
+- `Res_Coarse_1.5` (`tier1_res_coarse`): `best_rel_l2=0.1807801053`, `best_phys_score=38.5780247591`, duration `35.84 min`.
+- `Res_Medium_0.75` (`tier1_res_medium`): `best_rel_l2=0.1736430429`, `best_phys_score=46.0482775472`, duration `70.61 min`.
+
+### Decision (Tier 1 default)
+
+- **Optimal mesh resolution for Tier 1:** `tier1_res_medium` (mesh size factor `0.75`).
+- Rationale: best validation accuracy among tested candidates (about `3.95%` lower `best_rel_l2` than coarse) with improved physics score.
+- Trade-off: about `2x` candidate runtime versus coarse; accepted for default Tier-1 quality.
