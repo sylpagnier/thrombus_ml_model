@@ -23,6 +23,10 @@ from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.utils.paths import get_project_root, stage_a_dir, resolve_checkpoint
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 
+# Validation composite for ``tier2_best_physics.pth``: ``rel_l2 + continuity + rheology`` (all from
+# ``quantify_performance``). Lower is better — not the same as training loss. Logged as
+# ``best_val_composite_loss`` in checkpoints / run_end; per-validation rows use ``val_composite_loss``.
+
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
@@ -296,7 +300,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
     val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
 
-    best_phys_score = float("inf")
+    best_val_composite_loss = float("inf")
     best_loss = float("inf")
     optimizer = None
     scheduler = None
@@ -328,7 +332,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         except RuntimeError:
             # Backward compatibility: old checkpoints may store two PDE log_vars (cont, mom).
             print("ℹ️ Reinitializing Tier 2 PDE loss weighter for momentum-only setup.")
-        best_phys_score = float(ckpt.get("best_phys_score", best_phys_score))
+        best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
         best_loss = float(ckpt.get("best_loss", best_loss))
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         ckpt_optimizer_type = ckpt.get("optimizer_type", "AdamW")
@@ -402,7 +406,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         resume_training=bool(resume_training),
         resumed_full_checkpoint=bool(resumed_full_checkpoint),
         tier1_bootstrap_loaded=bool(tier1_bootstrap_loaded),
-        best_phys_score_checkpoint=float(best_phys_score),
+        best_val_composite_loss_checkpoint=float(best_val_composite_loss),
         best_loss_checkpoint=float(best_loss),
         use_lbfgs=use_lbfgs,
         ckpt_every=ckpt_every,
@@ -432,7 +436,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         if interrupted:
             print("\n⚠️ Training interrupted; appending training diary run_end (JSONL report).")
         diary.log_run_end(
-            best_phys_score=float(best_phys_score),
+            best_val_composite_loss=float(best_val_composite_loss),
             best_loss=float(best_loss),
             best_rel_l2=float(best_rel_l2),
             early_stopped=bool(early_stopped),
@@ -606,7 +610,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized and scheduler is not None else None),
                 "loss_weighter_state_dict": loss_weighter.state_dict(),
-                "best_phys_score": best_phys_score,
+                "best_val_composite_loss": best_val_composite_loss,
                 "best_loss": best_loss,
                 "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
             }
@@ -624,7 +628,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             physics_active=bool(physics_active),
             lbfgs=bool(lbfgs_initialized),
             best_loss_so_far=float(best_loss),
-            best_phys_score_so_far=float(best_phys_score),
+            best_val_composite_loss_so_far=float(best_val_composite_loss),
             best_rel_l2_so_far=float(best_rel_l2),
             val_no_improve=int(val_no_improve),
         )
@@ -671,7 +675,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 print(f"⚖️ Learned PDE Weights -> Cont: {w_cont:.2f} | Mom: {w_mom:.2f}")
             print(f"📌 Val split: anchors={n_val_anchor} | physics={n_val_physics}")
 
-            phys_score = float(
+            val_composite_loss = float(
                 scores.get("rel_l2", 0)
                 + scores.get("continuity", 0)
                 + scores.get("rheology", 0)
@@ -682,7 +686,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 scores,
                 weight_cont=w_cont,
                 weight_mom=w_mom,
-                phys_score=phys_score,
+                val_composite_loss=val_composite_loss,
                 carreau_n=float(carreau_n),
                 phase_distillation=bool(is_distillation),
                 best_rel_l2=float(best_rel_l2),
@@ -739,8 +743,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                     )
                     break
 
-            if physics_active and phys_score < best_phys_score:
-                best_phys_score = phys_score
+            if physics_active and val_composite_loss < best_val_composite_loss:
+                best_val_composite_loss = val_composite_loss
                 save_bp = model_dir / "tier2_best_physics.pth"
                 torch.save(model.state_dict(), save_bp)
                 print(f"⭐ Saved Best Physics Model to {save_bp}")
@@ -748,7 +752,10 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     torch.save(model.state_dict(), tier2_final_path)
     saved_final_weights = True
     _emit_tier2_run_end(interrupted=False)
-    print(f"Tier 2 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
+    print(
+        f"Tier 2 Training Complete. Best val composite loss: {best_val_composite_loss:.4f} "
+        f"(rel_l2 + continuity + rheology; lower is better) | Best Loss: {best_loss:.4f}"
+    )
 
 
 if __name__ == "__main__":

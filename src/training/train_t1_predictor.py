@@ -1,5 +1,12 @@
 """Tier 1 predictor training (GINO-DEQ).
 
+**Validation composite (``tier1_best_physics.pth``):** after the physics warm-up, each validation
+step computes ``val_composite_loss = rel_l2_anchor + 100 * continuity``, where ``continuity`` is the
+mean ``|∇·u|`` on the fluid interior (see ``quantify_performance``). **Lower is better**; the
+checkpoint with the smallest ``val_composite_loss`` so far is written to ``tier1_best_physics.pth``.
+This scalar is unrelated to the training loss and is logged as ``best_val_composite_loss`` in
+experiment JSONs and the training diary.
+
 **Explorer / sweeps:** see ``src/training/t1_explorer.py`` and env vars ``TIER1_EXPERIMENT_NAME``,
 ``TIER1_KINE_WEIGHT_MODE``, ``TIER1_GEOMETRY_LEVEL``, ``TIER1_LATENT_DIM``, …
 Use ``TIER1_EPOCHS`` (default 60) for short exploratory runs, e.g. ``25``.
@@ -20,6 +27,7 @@ if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import atexit
 import csv
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -46,6 +54,9 @@ from src.training.t1_explorer import (
     write_t1_experiment_artifact,
 )
 import random
+
+# Scale for continuity (mean |∇·u|) in the validation composite; see module docstring.
+TIER1_VAL_COMPOSITE_CONTINUITY_SCALE = 100.0
 
 
 def _resolve_t1_dataset_tier(explorer: Optional[T1ExplorerConfig] = None) -> str:
@@ -327,6 +338,16 @@ def train_t1_predictor(
         loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
     disable_figures = (os.environ.get("TIER1_DISABLE_FIGURES", "0").strip().lower() in ("1", "true", "yes", "on"))
+    skip_validation = os.environ.get("TIER1_SKIP_VALIDATION", "0").strip().lower() in ("1", "true", "yes", "on")
+    train_batch_trace = os.environ.get("TIER1_TRAIN_BATCH_TRACE", "0").strip().lower() in ("1", "true", "yes", "on")
+    _slow_raw = os.environ.get("TIER1_SLOW_BATCH_LOG_SEC", "20").strip()
+    if _slow_raw.lower() in ("0", "false", "no", "off"):
+        slow_batch_log_sec = 0.0
+    else:
+        try:
+            slow_batch_log_sec = float(_slow_raw)
+        except ValueError:
+            slow_batch_log_sec = 20.0
     if not disable_figures:
         fig_dir = reports_dir() / "figures" / "tier1"
         fig_dir.mkdir(parents=True, exist_ok=True)
@@ -360,6 +381,34 @@ def train_t1_predictor(
     train_data = split.train
     val_data = split.val
 
+    # --- Limit total training vessels for scaling law sweeps (validation set unchanged) ---
+    max_train_vessels = int(os.environ.get("TIER1_MAX_TRAIN_VESSELS", "0"))
+    if max_train_vessels > 0 and len(train_data) > max_train_vessels:
+        rng = random.Random(42)
+        rng.shuffle(train_data)
+        train_data = train_data[:max_train_vessels]
+        print(f"✂️ Truncated train_data to {max_train_vessels} vessels (TIER1_MAX_TRAIN_VESSELS).")
+
+    # Blind training anchors only so validation graphs stay identical across supervision sweeps.
+    # TIER1_TARGET_ANCHOR_FRACTION is separate: DataLoader anchor vs physics mix.
+    supervision_fraction = float(os.environ.get("TIER1_SUPERVISION_FRACTION", "1.0"))
+    if supervision_fraction < 1.0:
+        train_anchors = [d for d in train_data if d.is_anchor.any().item()]
+        num_to_keep = int(len(train_anchors) * supervision_fraction)
+        all_indices = list(range(len(train_anchors)))
+        rng = random.Random(42)
+        rng.shuffle(all_indices)
+        indices_to_convert_to_physics = all_indices[num_to_keep:]
+        for idx in indices_to_convert_to_physics:
+            train_anchors[idx].is_anchor = torch.tensor([False], dtype=torch.bool)
+        print(
+            f"🧬 Artificially blinded {len(indices_to_convert_to_physics)} training graphs "
+            "to act as pure physics nodes."
+        )
+
+    n_anchor_train = len([d for d in train_data if d.is_anchor.any().item()])
+    n_phys_train = max(0, len(train_data) - n_anchor_train)
+
     # Reduce physical batch size to save memory, but maintain effective batch size
     micro_batch_size = int(os.environ.get("TIER1_MICRO_BATCH_SIZE", "2"))
     accumulation_steps = int(os.environ.get("TIER1_ACCUMULATION_STEPS", "4"))
@@ -376,8 +425,6 @@ def train_t1_predictor(
         print("✅ TIER1_USE_LBFGS=1: AdamW warm-up/phase then L-BFGS refinement is enabled.")
         print("ℹ️ Safety note: L-BFGS path snapshots the full loader and can be memory-heavy on large graph datasets.")
     dynamic_freeze_during_warmup = (os.environ.get("TIER1_DYNAMIC_FREEZE_DURING_WARMUP", "1").strip().lower() in ("1", "true", "yes", "on"))
-    n_anchor_train = len([d for d in train_data if d.is_anchor.any().item()])
-    n_phys_train = max(0, len(train_data) - n_anchor_train)
     hard_anchor_multiplier = {}
 
     def _graph_sampling_key(data, list_idx: int) -> int:
@@ -415,7 +462,7 @@ def train_t1_predictor(
     )
     val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
 
-    best_phys_score = float('inf')
+    best_val_composite_loss = float("inf")
     best_loss = float('inf')
     root = get_project_root()
     # Allow sweep runner to redirect checkpoints into a per-candidate directory
@@ -456,7 +503,7 @@ def train_t1_predictor(
             print("ℹ️ Reinitializing Tier 1 PDE loss weighter for current setup.")
 
         start_epoch = int(ckpt.get("epoch", -1)) + 1
-        best_phys_score = float(ckpt.get("best_phys_score", best_phys_score))
+        best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
         best_loss = float(ckpt.get("best_loss", best_loss))
 
         ckpt_optimizer_type = ckpt.get("optimizer_type", "AdamW")
@@ -510,7 +557,7 @@ def train_t1_predictor(
         use_lbfgs=use_lbfgs,
         start_epoch=start_epoch,
         resumed_checkpoint=bool(resume_enabled and latest_ckpt_path.exists()),
-        best_phys_score_checkpoint=float(best_phys_score),
+        best_val_composite_loss_checkpoint=float(best_val_composite_loss),
         best_loss_checkpoint=float(best_loss),
         env_tier1_phase1=env_snapshot("TIER1_", "PHASE1_"),
         t1_explorer=explorer.to_serializable(),
@@ -527,7 +574,7 @@ def train_t1_predictor(
         if interrupted:
             print("\n⚠️ Training interrupted; appending training diary run_end (JSONL report).")
         diary.log_run_end(
-            best_phys_score=float(best_phys_score),
+            best_val_composite_loss=float(best_val_composite_loss),
             best_loss=float(best_loss),
             best_rel_l2=float(best_rel_l2),
             early_stopped=bool(early_stopped),
@@ -632,7 +679,14 @@ def train_t1_predictor(
             accum_counter = 0
 
             for batch_idx, data in enumerate(pbar):
+                t_batch = time.perf_counter()
                 data = data.to(device)
+                n_nodes_batch = int(getattr(data, "num_nodes", 0) or 0)
+                if train_batch_trace:
+                    tqdm.write(
+                        f"[Tier1] batch {batch_idx + 1}/{len(loader)}  num_nodes={n_nodes_batch}",
+                        flush=True,
+                    )
 
                 # Compute loss (scaled by accumulation steps so the final gradient magnitude is correct)
                 loss, metrics = compute_step_loss(
@@ -693,8 +747,16 @@ def train_t1_predictor(
                     "L_wss": f"{metrics['L_wss']:.3f}",
                     "L_pgrad": f"{metrics['L_pgrad']:.3f}",
                     "L_jac": f"{metrics['L_jac']:.3f}",
-                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
+                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "nodes": n_nodes_batch,
                 })
+                batch_elapsed = time.perf_counter() - t_batch
+                if slow_batch_log_sec > 0.0 and batch_elapsed >= slow_batch_log_sec:
+                    tqdm.write(
+                        f"[Tier1] slow micro-batch {batch_idx + 1}/{len(loader)} took {batch_elapsed:.1f}s "
+                        f"(num_nodes={n_nodes_batch}); autograd+DEQ time varies a lot by mesh size.",
+                        flush=True,
+                    )
 
             scheduler.step()
 
@@ -761,7 +823,7 @@ def train_t1_predictor(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized else None),
                 "loss_weighter_state_dict": (loss_weighter.state_dict() if loss_weighter is not None else None),
-                "best_phys_score": best_phys_score,
+                "best_val_composite_loss": best_val_composite_loss,
                 "best_loss": best_loss,
                 "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
             }
@@ -781,11 +843,18 @@ def train_t1_predictor(
             lbfgs=bool(lbfgs_initialized),
             physics_active=bool(physics_active),
             best_loss_so_far=float(best_loss),
-            best_phys_score_so_far=float(best_phys_score),
+            best_val_composite_loss_so_far=float(best_val_composite_loss),
             best_rel_l2_so_far=float(best_rel_l2),
         )
 
-        if epoch % 2 == 0:
+        if (not skip_validation) and (epoch % 2 == 0):
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            print(
+                f"\n⏳ Validation: {len(val_data)} graph(s), {len(val_loader)} minibatch(es) "
+                f"(set TIER1_SKIP_VALIDATION=1 to skip; TIER1_VAL_PROGRESS=0 disables the progress bar).",
+                flush=True,
+            )
             scores = quantify_performance(model, val_loader, kernels, device, tier="tier1")
 
             print(
@@ -828,7 +897,9 @@ def train_t1_predictor(
                 n_val_anchor = sum(1 for d in val_data if graph_has_anchor(d))
                 print(f"📌 Val split: anchors={n_val_anchor} | physics={max(0, len(val_data) - n_val_anchor)}")
 
-            phys_score = scores.get('rel_l2', 0) + (100.0 * scores.get('continuity', 0))
+            val_composite_loss = float(scores.get("rel_l2", 0.0)) + TIER1_VAL_COMPOSITE_CONTINUITY_SCALE * float(
+                scores.get("continuity", 0.0)
+            )
             diary.log_validation(
                 epoch,
                 scores,
@@ -836,7 +907,7 @@ def train_t1_predictor(
                 weight_mom=w_mom,
                 best_rel_l2=best_rel_l2,
                 val_no_improve=val_no_improve,
-                phys_score=float(phys_score),
+                val_composite_loss=val_composite_loss,
                 n_val_anchors=n_val_anchor,
                 n_val_physics=max(0, len(val_data) - n_val_anchor),
             )
@@ -865,20 +936,24 @@ def train_t1_predictor(
                     )
                     break
 
-            if phys_score < best_phys_score and physics_active:
-                best_phys_score = phys_score
+            if val_composite_loss < best_val_composite_loss and physics_active:
+                best_val_composite_loss = val_composite_loss
                 save_path = model_dir / "tier1_best_physics.pth"
                 torch.save(model.state_dict(), save_path)
                 print(f"⭐ Saved Best Physics Model to {save_path}")
 
     _emit_tier1_run_end(interrupted=False)
-    print(f"Tier 1 Training Complete. Best Physical Score: {best_phys_score:.4f} | Best Loss: {best_loss:.4f}")
+    print(
+        f"Tier 1 Training Complete. Best val composite loss: {best_val_composite_loss:.4f} "
+        f"(rel_l2 + {TIER1_VAL_COMPOSITE_CONTINUITY_SCALE:g}×continuity; lower is better) | "
+        f"Best Loss: {best_loss:.4f}"
+    )
 
     if os.environ.get("TIER1_SKIP_EXPERIMENT_ARTIFACT", "0").strip().lower() not in ("1", "true", "yes", "on"):
         write_t1_experiment_artifact(
             explorer,
             best_rel_l2=best_rel_l2,
-            best_phys_score=best_phys_score,
+            best_val_composite_loss=best_val_composite_loss,
             best_loss=best_loss,
             early_stopped=early_stopped,
             n_graphs=len(dataset),
@@ -891,7 +966,7 @@ def train_t1_predictor(
         "status": "ok",
         "experiment_name": explorer.experiment_name,
         "best_rel_l2": float(best_rel_l2),
-        "best_phys_score": float(best_phys_score),
+        "best_val_composite_loss": float(best_val_composite_loss),
         "best_loss": float(best_loss),
         "early_stopped": bool(early_stopped),
         "n_graphs": int(len(dataset)),

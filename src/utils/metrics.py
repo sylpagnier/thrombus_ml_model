@@ -1,7 +1,10 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from matplotlib.colors import LogNorm
 from pathlib import Path
 
@@ -192,6 +195,8 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
     """
     model.eval()
 
+    val_progress = os.environ.get("TIER1_VAL_PROGRESS", "1").strip().lower() not in ("0", "false", "no", "off")
+
     metrics: Dict[str, List[float]] = {
         "rel_l2": [],
         "rel_l2_u": [],
@@ -209,8 +214,12 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
     val_total_batches = 0
     val_anchor_batches = 0
 
+    val_iter = val_loader
+    if val_progress:
+        val_iter = tqdm(val_loader, desc="Validation", leave=False)
+
     with torch.no_grad():
-        for data in val_loader:
+        for data in val_iter:
             val_total_batches += 1
             data = data.to(device)
             pred = model(data, solver="anderson", anderson_beta=0.8)

@@ -154,12 +154,15 @@ class PhysicsKernels:
 
         # --- DERIVATIVE COMPUTATION ---
         if self.ns_derivative_mode == "autograd":
-            if not hasattr(data, "pos") or data.pos is None:
-                raise RuntimeError("data.pos must be set for autograd NS derivatives (e.g. clone of x[:, :2] with requires_grad).")
-            if not data.pos.requires_grad:
-                raise RuntimeError("data.pos requires_grad=True is necessary for autograd NS derivatives.")
-
-            coords_xy = data.pos[:, :2]
+            # Autograd needs to trace back to the exact tensor tracked during the forward pass.
+            # We differentiate w.r.t the base data.x (if it requires grad) to capture
+            # spatial gradients flowing through BOTH the SIREN decoder and the Fourier encoder.
+            if hasattr(data, "x") and data.x.requires_grad:
+                coords_xy = data.x
+            elif hasattr(data, "pos") and data.pos is not None and data.pos.requires_grad:
+                coords_xy = data.pos
+            else:
+                raise RuntimeError("data.x or data.pos requires_grad=True is necessary for autograd NS derivatives.")
 
             # Exact continuous derivatives via PyTorch Autograd
             u_x, u_y, u_xx, u_xy, u_yy = self._compute_autograd_derivatives(u, coords_xy)

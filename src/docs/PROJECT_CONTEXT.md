@@ -83,6 +83,7 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 
 - **Anchor samples** are vessel geometries with full CFD labels from COMSOL across the graph (supervised fields like `u`, `v`, `p`, and related targets).
 - **Non-anchor samples** are vessel geometries without COMSOL solution labels; they contribute geometry and analytical-prior/physics-based constraints only.
+- **Optimal Mix (Tier 1)**: We found that a **50/50 split** of anchor and non-anchor (physics-only) nodes yields the most robust generalization and physical continuity (lowest `|∇·u|` and optimal total loss). This acts as a powerful regularizer, forcing the network to solve the PDE on blinded nodes rather than over-fitting to the labels.
 
 ## Source map
 

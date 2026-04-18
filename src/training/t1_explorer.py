@@ -4,6 +4,14 @@ Tier 1 **architecture / loss explorer** — env-driven knobs for systematic expe
 Use this when iterating toward a tight anchor Rel L2 (e.g. <5% on level-1 vessels). After each run,
 compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 
+**Validation composite (``tier1_best_physics.pth``)**
+
+Training picks a **validation composite loss** (not an accuracy score) to decide which weights to
+keep as ``tier1_best_physics.pth`` after the physics warm-up. Tier 1 uses
+``best_val_composite_loss = rel_l2_anchor + 100 × continuity``, with ``continuity`` the mean ``|∇·u|``
+on the fluid interior. **Lower is better.** Sweep leaderboards sort by ``best_rel_l2`` first, then
+by this composite as a tie-break.
+
 **Explorer execution policy**
 
 - **Temporary (quick screening):** the active ``build_sweep_candidates()`` runs **30 AdamW-only**
@@ -12,7 +20,7 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 - Sweeps **always start fresh**: no ``tier1_best_physics.pth`` warm-start and no resume from
   ``tier1_latest_checkpoint.pth`` (per-candidate checkpoint dirs only record *this* run).
 - **Single candidate** (e.g. resume after interrupt): set ``TIER1_SWEEP_LAST_ONLY=1`` to run only
-  the last entry from ``build_sweep_candidates()``, or ``TIER1_SWEEP_ONLY=V3_SIREN_AUTOGRAD`` to
+  the last entry from ``build_sweep_candidates()``, or ``TIER1_SWEEP_ONLY=V3_WLS_50PCT_200V`` to
   pick by ``experiment_name`` (diary + sweep reports unchanged).
 
 **Kinematic supervision weighting** (anchor nodes only, COMSOL labels):
@@ -28,6 +36,10 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 **Training length**
 
 - ``TIER1_EPOCHS`` — total epochs (default ``60``); use ``~25`` for exploratory sweeps.
+- ``TIER1_SKIP_VALIDATION`` — skip periodic val metrics (explorer sanity sets this for speed).
+- ``TIER1_VAL_PROGRESS`` — set ``0`` to disable the validation tqdm bar if logs are too noisy.
+- ``TIER1_TRAIN_BATCH_TRACE=1`` — print each training micro-batch index and ``num_nodes`` (shows which mesh is running when the tqdm bar pauses).
+- ``TIER1_SLOW_BATCH_LOG_SEC`` — log lines for micro-batches slower than this many seconds (default ``20``; set ``0`` to disable).
 - ``TIER1_WARM_UP_EPOCHS``, ``TIER1_ADAM_EPOCHS`` — optional; default warm-up scales with ``adam_epochs`` (usually = ``TIER1_EPOCHS``).
 
 **Architecture**
@@ -44,6 +56,9 @@ different numerical behavior.
 
 **Data**
 
+- ``TIER1_MAX_TRAIN_VESSELS`` — if set to a positive integer, randomly subsample (deterministic
+  seed 42) the **training** split to at most that many graphs after ``split_anchor_physics``;
+  the **validation** split is unchanged (fair comparison across dataset-size sweeps).
 - ``TIER1_GEOMETRY_LEVEL`` — if set to ``0`` or ``1``, only load graphs whose ``vessel_*.json``
   has a matching ``level`` field (requires ``data/raw/tier1`` JSON next to meshes).
 
@@ -211,7 +226,7 @@ def write_t1_experiment_artifact(
     explorer: T1ExplorerConfig,
     *,
     best_rel_l2: float,
-    best_phys_score: float,
+    best_val_composite_loss: float,
     best_loss: float,
     early_stopped: bool,
     n_graphs: int,
@@ -220,7 +235,11 @@ def write_t1_experiment_artifact(
     graph_dir: str,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Write ``reports/experiments/tier1_<name>_<ts>.json`` for post-run comparison."""
+    """Write ``reports/experiments/tier1_<name>_<ts>.json`` for post-run comparison.
+
+    ``best_val_composite_loss`` is the minimum validation composite (Tier 1:
+    ``rel_l2_anchor + 100×continuity``); lower is better — see module docstring.
+    """
     rep = reports_dir() / "experiments"
     rep.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -234,7 +253,7 @@ def write_t1_experiment_artifact(
         "explorer": explorer.to_serializable(),
         "metrics": {
             "best_rel_l2": best_rel_l2,
-            "best_phys_score": best_phys_score,
+            "best_val_composite_loss": best_val_composite_loss,
             "best_loss": best_loss,
             "early_stopped": early_stopped,
         },
@@ -281,13 +300,18 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
 
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    V3 architecture sweep: Evaluating Discrete (WLS) vs Continuous (Autograd) PDEs.
+    Scaling law sweep: V3_SIREN_WLS baseline with optimal 50% supervision,
+    varying the total number of training vessels (``TIER1_MAX_TRAIN_VESSELS``) to find the
+    data saturation point.
+
+    ``TIER1_TARGET_ANCHOR_FRACTION`` in ``base_overrides`` is the DataLoader anchor vs physics mix.
+    ``TIER1_SUPERVISION_FRACTION`` is locked at 0.5 (fraction of training anchors that keep labels).
 
     Filter (optional, for interrupted sweeps — same ``run_sweep`` diary / JSON output):
 
     - ``TIER1_SWEEP_LAST_ONLY=1`` — keep only the last candidate in the list below.
     - ``TIER1_SWEEP_ONLY=<name>`` — keep only the candidate whose ``name`` equals ``<name>``
-      (e.g. ``V3_SIREN_AUTOGRAD``). Overrides ``TIER1_SWEEP_LAST_ONLY`` when set non-empty.
+      (e.g. ``V3_WLS_50PCT_200V``). Overrides ``TIER1_SWEEP_LAST_ONLY`` when set non-empty.
     """
     base_overrides = {
         "TIER1_DISABLE_FIGURES": "1",
@@ -343,71 +367,33 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
 
     candidates: List[T1SweepCandidate] = []
 
-    # --- Candidate 1: Pure GNN with WLS (Baseline) ---
-    cfg_gnn_wls = T1ExplorerConfig(
-        experiment_name="V3_GNN_WLS",
-        dataset_tier="tier1",
-        latent_dim=256,
-        deq_max_iters=25,
-        ns_derivative_mode="wls",
-        use_siren_decoder=False,  # Discrete representation
-        use_hard_bcs=True,
-        use_width_priors=True,
-    )
-    candidates.append(
-        T1SweepCandidate(
-            name=cfg_gnn_wls.experiment_name,
-            explorer=cfg_gnn_wls,
-            env_overrides={**_env_for(cfg_gnn_wls), **base_overrides},
-            epochs=30,
-            warm_up_epochs=5,
-            adam_epochs=30,
-        )
-    )
+    # Sweep total training vessels (90% split → max ~450 if corpus has 500 graphs).
+    train_sizes = [50, 100, 150, 200, 250, 300, 350, 400, 450]
 
-    # --- Candidate 2: Hybrid SIREN with WLS ---
-    cfg_siren_wls = T1ExplorerConfig(
-        experiment_name="V3_SIREN_WLS",
-        dataset_tier="tier1",
-        latent_dim=256,
-        deq_max_iters=25,
-        ns_derivative_mode="wls",
-        use_siren_decoder=True,  # Continuous representation
-        use_hard_bcs=True,
-        use_width_priors=True,
-    )
-    candidates.append(
-        T1SweepCandidate(
-            name=cfg_siren_wls.experiment_name,
-            explorer=cfg_siren_wls,
-            env_overrides={**_env_for(cfg_siren_wls), **base_overrides},
-            epochs=30,
-            warm_up_epochs=5,
-            adam_epochs=30,
+    for size in train_sizes:
+        cfg = T1ExplorerConfig(
+            experiment_name=f"V3_WLS_50PCT_{size}V",
+            dataset_tier="tier1",
+            latent_dim=256,
+            deq_max_iters=25,
+            ns_derivative_mode="wls",
+            use_siren_decoder=True,
+            use_hard_bcs=True,
+            use_width_priors=True,
         )
-    )
-
-    # --- Candidate 3: Pure PINN (SIREN + Autograd) ---
-    cfg_siren_auto = T1ExplorerConfig(
-        experiment_name="V3_SIREN_AUTOGRAD",
-        dataset_tier="tier1",
-        latent_dim=256,
-        deq_max_iters=25,
-        ns_derivative_mode="autograd",
-        use_siren_decoder=True,  # Mandatory for Autograd
-        use_hard_bcs=True,
-        use_width_priors=True,
-    )
-    candidates.append(
-        T1SweepCandidate(
-            name=cfg_siren_auto.experiment_name,
-            explorer=cfg_siren_auto,
-            env_overrides={**_env_for(cfg_siren_auto), **base_overrides},
-            epochs=30,
-            warm_up_epochs=5,
-            adam_epochs=30,
+        candidate_env = {**_env_for(cfg), **base_overrides}
+        candidate_env["TIER1_SUPERVISION_FRACTION"] = "0.50"
+        candidate_env["TIER1_MAX_TRAIN_VESSELS"] = str(size)
+        candidates.append(
+            T1SweepCandidate(
+                name=cfg.experiment_name,
+                explorer=cfg,
+                env_overrides=candidate_env,
+                epochs=30,
+                warm_up_epochs=5,
+                adam_epochs=30,
+            )
         )
-    )
 
     only = os.environ.get("TIER1_SWEEP_ONLY", "").strip()
     last_only = os.environ.get("TIER1_SWEEP_LAST_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -436,7 +422,7 @@ def _build_same_epoch_comparison(
 ) -> Dict[str, Any]:
     """Build a same-epoch comparison table across all completed candidates.
 
-    Strategy: for each candidate we know ``best_rel_l2``, ``best_phys_score``,
+    Strategy: for each candidate we know ``best_rel_l2``, ``best_val_composite_loss``,
     ``best_loss``, and the actual epoch count trained.  We also parse the
     training diary JSONL (if available) to extract the *last* validation
     snapshot, giving per-candidate metrics at their respective final epoch.
@@ -457,7 +443,7 @@ def _build_same_epoch_comparison(
         entry: Dict[str, Any] = {
             "name": name,
             "best_rel_l2": run.get("best_rel_l2"),
-            "best_phys_score": run.get("best_phys_score"),
+            "best_val_composite_loss": run.get("best_val_composite_loss"),
             "best_loss": run.get("best_loss"),
             "early_stopped": run.get("early_stopped", False),
             "n_graphs": run.get("n_graphs"),
@@ -578,7 +564,10 @@ def run_sweep(sweep_name: str = "default") -> Path:
         nonlocal out_path
         rows = sorted(
             [r for r in completed if r.get("status") == "ok"],
-            key=lambda x: (x.get("best_rel_l2", float("inf")), x.get("best_phys_score", float("inf"))),
+            key=lambda x: (
+                x.get("best_rel_l2", float("inf")),
+                x.get("best_val_composite_loss", float("inf")),
+            ),
         )
 
         # Build a same-epoch comparison table from the training diary JSONL files.
@@ -606,7 +595,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                     "rank": i + 1,
                     "name": r.get("name"),
                     "best_rel_l2": r.get("best_rel_l2"),
-                    "best_phys_score": r.get("best_phys_score"),
+                    "best_val_composite_loss": r.get("best_val_composite_loss"),
                     "best_loss": r.get("best_loss"),
                     "early_stopped": r.get("early_stopped"),
                 }
@@ -679,6 +668,9 @@ def run_sweep(sweep_name: str = "default") -> Path:
     # Hard-pin: explorer must never inherit weights or resume (shell env cannot override).
     sanity_overrides["TIER1_INIT_FROM_BEST"] = "0"
     sanity_overrides["TIER1_RESUME"] = "0"
+    # Sanity probe only checks that training runs; full-graph val forward can take a long time
+    # with no prior console output after the last checkpoint line (looks like a freeze).
+    sanity_overrides["TIER1_SKIP_VALIDATION"] = "1"
     sanity_ckpt = sweep_dir / "checkpoints" / "sanity_probe"
     sanity_ckpt.mkdir(parents=True, exist_ok=True)
     sanity_overrides["TIER1_CKPT_DIR"] = str(sanity_ckpt)
@@ -690,7 +682,8 @@ def run_sweep(sweep_name: str = "default") -> Path:
         f"TIER1_ADAM_EPOCHS={sanity_overrides.get('TIER1_ADAM_EPOCHS', 'unset')}, "
         f"TIER1_USE_LBFGS={sanity_overrides.get('TIER1_USE_LBFGS', 'unset')}, "
         f"TIER1_INIT_FROM_BEST={sanity_overrides.get('TIER1_INIT_FROM_BEST', 'unset')}, "
-        f"TIER1_RESUME={sanity_overrides.get('TIER1_RESUME', 'unset')}"
+        f"TIER1_RESUME={sanity_overrides.get('TIER1_RESUME', 'unset')}, "
+        f"TIER1_SKIP_VALIDATION={sanity_overrides.get('TIER1_SKIP_VALIDATION', 'unset')}"
     )
     prev_env = _safe_env_set(sanity_overrides)
     t0 = time.time()
@@ -877,5 +870,8 @@ def filter_graph_paths_by_geometry_level(
 
 
 if __name__ == "__main__":
-    # One-click PyCharm run: execute the Tier 1 sweep directly.
+    # Ensure any previous single-candidate filters are cleared
+    # so the full dataset-size scaling sweep can run.
+    os.environ.pop("TIER1_SWEEP_ONLY", None)
+
     run_sweep(sweep_name="tier1")
