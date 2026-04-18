@@ -172,7 +172,7 @@ def _attach_regenerate_patient_button(
     enable: bool,
 ) -> None:
     """Bottom-right button + ``r`` hotkey to switch to another patient (same stem list as phase1 anchor)."""
-    if not enable or len(all_stems) <= 1:
+    if not enable:
         return
 
     def _go(_event=None) -> None:
@@ -524,7 +524,7 @@ def run_tier3_default_inspector(
     print(f"\n{len(all_stems)} patient(s) available [{preview}]. One window at a time.\n")
 
     current = start_stem if (start_stem in all_stems) else random.choice(all_stems)
-    enable_btn = enable_regenerate and len(all_stems) > 1
+    enable_btn = enable_regenerate
 
     while True:
         next_holder: dict[str, str | None] = {"value": None}
@@ -896,13 +896,12 @@ def inspect_domain_interactive(*, export_dir: Path, start_stem: str | None, samp
             next_holder["value"] = nxt
             plt.close(fig)
 
-        if len(candidates) > 0:
-            btn_ax = fig.add_axes([0.72, 0.02, 0.25, 0.06])
-            Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
-            fig.canvas.mpl_connect(
-                "key_press_event",
-                lambda e: _regen() if getattr(e, "key", None) == "r" else None,
-            )
+        btn_ax = fig.add_axes([0.72, 0.02, 0.25, 0.06])
+        Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+        fig.canvas.mpl_connect(
+            "key_press_event",
+            lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+        )
         plt.show()
         if next_holder["value"] is None:
             break
@@ -951,13 +950,12 @@ def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> Non
             next_holder["value"] = nxt
             plt.close(fig)
 
-        if len(candidates) > 0:
-            btn_ax = fig.add_axes([0.76, 0.02, 0.2, 0.08])
-            Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
-            fig.canvas.mpl_connect(
-                "key_press_event",
-                lambda e: _regen() if getattr(e, "key", None) == "r" else None,
-            )
+        btn_ax = fig.add_axes([0.76, 0.02, 0.2, 0.08])
+        Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+        fig.canvas.mpl_connect(
+            "key_press_event",
+            lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+        )
         plt.show()
         if next_holder["value"] is None:
             break
@@ -1000,7 +998,7 @@ def main() -> None:
     parser.add_argument(
         "--no-regenerate",
         action="store_true",
-        help="Default mode only: hide Regenerate Random Patient (single stem view).",
+        help="Default mode: disable the Regenerate Random Patient button and 'r' hotkey (default is on).",
     )
     args = parser.parse_args()
 
