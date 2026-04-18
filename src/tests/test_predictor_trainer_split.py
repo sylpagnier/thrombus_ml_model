@@ -1,8 +1,8 @@
-"""Tests for shared dataset split logic in ``DEQPredictorTrainer``."""
+"""Tests for Tier 1 anchor/physics train/val split (``split_anchor_physics``)."""
 
 import torch
 
-from src.training.trainer import DEQPredictorTrainer
+from src.training.train_t1_predictor import split_anchor_physics
 
 
 class _GraphStub:
@@ -19,7 +19,7 @@ def _make_dataset(n_anchor: int, n_phys: int):
 
 def test_split_anchor_physics_counts_and_ratio():
     dataset = _make_dataset(n_anchor=10, n_phys=20)
-    split = DEQPredictorTrainer(seed=42, train_ratio=0.9).split_anchor_physics(dataset)
+    split = split_anchor_physics(dataset, seed=42, train_ratio=0.9)
     assert split.train_anchors == 9
     assert split.train_physics == 18
     assert len(split.train) == 27
@@ -30,17 +30,15 @@ def test_split_anchor_physics_counts_and_ratio():
 
 def test_split_deterministic_for_same_seed():
     dataset = _make_dataset(n_anchor=6, n_phys=6)
-    t1 = DEQPredictorTrainer(seed=7, train_ratio=0.5)
-    t2 = DEQPredictorTrainer(seed=7, train_ratio=0.5)
-    s1 = t1.split_anchor_physics(dataset)
-    s2 = t2.split_anchor_physics(dataset)
+    s1 = split_anchor_physics(dataset, seed=7, train_ratio=0.5)
+    s2 = split_anchor_physics(dataset, seed=7, train_ratio=0.5)
     assert [d.idx for d in s1.train] == [d.idx for d in s2.train]
     assert [d.idx for d in s1.val] == [d.idx for d in s2.val]
 
 
 def test_split_changes_with_seed():
     dataset = _make_dataset(n_anchor=8, n_phys=8)
-    s1 = DEQPredictorTrainer(seed=1, train_ratio=0.75).split_anchor_physics(dataset)
-    s2 = DEQPredictorTrainer(seed=99, train_ratio=0.75).split_anchor_physics(dataset)
+    s1 = split_anchor_physics(dataset, seed=1, train_ratio=0.75)
+    s2 = split_anchor_physics(dataset, seed=99, train_ratio=0.75)
     # Different RNG seed should generally produce different ordering in split membership.
     assert [d.idx for d in s1.train] != [d.idx for d in s2.train]

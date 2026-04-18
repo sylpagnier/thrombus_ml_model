@@ -27,7 +27,6 @@ class PhysicsKernels:
         self.pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "mean").strip().lower()
         if self.pressure_bc_mode not in ("mean", "pointwise", "mean_var"):
             self.pressure_bc_mode = "mean"
-        self._autograd_mode_warned = False
 
         # ND Carreau bounds use the same scale as label channel STATE_CHANNEL_MU_EFF_ND
         _mu_nd_scale = self.cfg.mu_viscosity_nd_scale
@@ -102,8 +101,14 @@ class PhysicsKernels:
             create_graph=create_graph,
             allow_unused=True,
         )[0]
+
         if g is None:
-            return torch.zeros_like(inputs)
+            # FAIL LOUDLY: The network architecture is not fully differentiable with respect to spatial coordinates.
+            raise RuntimeError(
+                "Autograd failed to compute spatial derivatives! "
+                "The computational graph from the spatial inputs (x,y) to the model outputs is broken or detached."
+            )
+
         return g
 
     def _compute_autograd_derivatives(self, field: torch.Tensor, coords_xy: torch.Tensor):
@@ -147,23 +152,31 @@ class PhysicsKernels:
             d_bar = data.d_bar[batch_idx]
         # --------------------------------------
 
-        if self.ns_derivative_mode == "autograd" and not self._autograd_mode_warned:
-            print("⚠️ ns_derivative_mode='autograd' requested, but PDE derivatives in message-passing GNNs are non-local. Falling back to WLS derivatives.")
-            self._autograd_mode_warned = True
+        # --- DERIVATIVE COMPUTATION ---
+        if self.ns_derivative_mode == "autograd":
+            if not hasattr(data, "pos") or data.pos is None:
+                raise RuntimeError("data.pos must be set for autograd NS derivatives (e.g. clone of x[:, :2] with requires_grad).")
+            if not data.pos.requires_grad:
+                raise RuntimeError("data.pos requires_grad=True is necessary for autograd NS derivatives.")
 
-        # Compute first and second derivatives from the WLS operator.
-        c_u = self._compute_derivatives(u.unsqueeze(1), props)
-        c_v = self._compute_derivatives(v.unsqueeze(1), props)
-        c_p = self._compute_derivatives(p.unsqueeze(1), props)
+            coords_xy = data.pos[:, :2]
 
-        # Extract primary 1st and 2nd derivatives, plus cross derivatives (xy).
-        # NOTE: WLS basis is [dx, dy, 0.5*dx^2, dx*dy, 0.5*dy^2] in mesh_wls.py,
-        # so c[:,2] and c[:,4] already correspond to true u_xx / u_yy (no extra factor of 2 needed).
-        u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
-        v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
-        u_xy = c_u[:, 3, 0]
-        v_xy = c_v[:, 3, 0]
-        p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
+            # Exact continuous derivatives via PyTorch Autograd
+            u_x, u_y, u_xx, u_xy, u_yy = self._compute_autograd_derivatives(u, coords_xy)
+            v_x, v_y, v_xx, v_xy, v_yy = self._compute_autograd_derivatives(v, coords_xy)
+            p_x, p_y, _, _, _ = self._compute_autograd_derivatives(p, coords_xy)
+
+        else:
+            # Discrete derivatives via precomputed WLS operator
+            c_u = self._compute_derivatives(u.unsqueeze(1), props)
+            c_v = self._compute_derivatives(v.unsqueeze(1), props)
+            c_p = self._compute_derivatives(p.unsqueeze(1), props)
+
+            u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
+            v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
+            u_xy = c_u[:, 3, 0]
+            v_xy = c_v[:, 3, 0]
+            p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
         # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.

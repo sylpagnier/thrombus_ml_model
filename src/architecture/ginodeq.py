@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm
-from torch_geometric.nn import global_mean_pool, MessagePassing
-from torch_geometric.utils import softmax
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax, to_dense_batch
 from typing import Optional, Tuple, Union
 from torch import Tensor
 
@@ -13,9 +13,6 @@ from src.architecture.lora_injection import LoRAParametrization, SpectralLinear
 from src.architecture.siren_decoder import SIRENDecoder
 from src.config import NodeFeat, PhysicsConfig, PredChannels
 from src.utils.batching import get_batch_tensor
-from src.utils.kinematics import stream_to_velocity
-
-
 def _spectral_or_plain_linear(in_features: int, out_features: int, bias: bool, spectral: bool) -> nn.Module:
     if spectral:
         return SpectralLinear(in_features, out_features, bias=bias)
@@ -31,25 +28,13 @@ def _make_activation(name: str) -> nn.Module:
     return nn.ReLU()
 
 
-class GlobalMixingBlock(nn.Module):
-    def __init__(self, latent_dim, use_spectral_norm: bool = True, activation_fn: str = "relu"):
-        super().__init__()
-        self.global_mlp = nn.Sequential(
-            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
-            _make_activation(activation_fn),
-            _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm),
-        )
-
-    def forward(self, x, batch):
-        global_context = global_mean_pool(x, batch)
-        global_update = self.global_mlp(global_context)
-        return global_update[batch]
-
-
 class AttentionGlobalMixingBlock(nn.Module):
     """
-    Perceiver-style bottleneck: global tokens read the graph via cross-attention,
-    reason with an MLP, then broadcast back to nodes. Runs **per graph** in the PyG batch.
+    Perceiver-style bottleneck: global tokens read each graph via cross-attention,
+    reason with an MLP, then broadcast back to nodes.
+
+    Uses :func:`torch_geometric.utils.to_dense_batch` so attention is **strictly within**
+    each graph — PyG's batched ``x`` is not treated as one long sequence across vessels.
     """
 
     def __init__(
@@ -75,23 +60,31 @@ class AttentionGlobalMixingBlock(nn.Module):
         self.cross_att_broadcast = nn.MultiheadAttention(
             embed_dim=latent_dim, num_heads=num_heads, batch_first=True
         )
+        # Broadcast attention starts ~inactive so local GNN / SIREN can stabilize first.
+        with torch.no_grad():
+            nn.init.zeros_(self.cross_att_broadcast.out_proj.weight)
+            nn.init.zeros_(self.cross_att_broadcast.out_proj.bias)
 
     def forward(self, x: Tensor, batch: Tensor) -> Tensor:
-        out = torch.zeros_like(x)
-        num_graphs = int(batch.max().item()) + 1
-        device = x.device
-        dtype = x.dtype
-        gt_all = self.global_tokens.to(device=device, dtype=dtype).expand(num_graphs, -1, -1).contiguous()
-        for b in range(num_graphs):
-            idx = batch == b
-            seq_x = x[idx].unsqueeze(0)
-            if seq_x.size(1) == 0:
-                continue
-            read_tokens, _ = self.cross_att_read(gt_all[b : b + 1], seq_x, seq_x)
-            processed_tokens = self.global_mlp(read_tokens)
-            broadcast_update, _ = self.cross_att_broadcast(seq_x, processed_tokens, processed_tokens)
-            out[idx] = broadcast_update.squeeze(0)
-        return out
+        dense_x, mask = to_dense_batch(x, batch)
+        batch_size = dense_x.size(0)
+        device, dtype = x.device, x.dtype
+        global_t = self.global_tokens.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
+        # MHA: True in key_padding_mask = positions to ignore (padding).
+        # mask is True for real nodes, so invert for padding slots.
+        read_tokens, _ = self.cross_att_read(
+            query=global_t,
+            key=dense_x,
+            value=dense_x,
+            key_padding_mask=~mask,
+        )
+        processed_tokens = self.global_mlp(read_tokens)
+        broadcast_update, _ = self.cross_att_broadcast(
+            query=dense_x,
+            key=processed_tokens,
+            value=processed_tokens,
+        )
+        return broadcast_update[mask]
 
 
 class MultiHeadPhysicsGATConv(MessagePassing):
@@ -166,32 +159,19 @@ class GINOBlock(nn.Module):
         edge_dim=3,
         use_spectral_norm: bool = True,
         activation_fn: str = "relu",
-        global_pool_mode: str = "mean",
         num_global_tokens: int = 16,
     ):
         super().__init__()
         assert latent_dim % 2 == 0, "latent_dim must be divisible by 2 for multi-head split"
 
-        self.global_pool_mode = (global_pool_mode or "mean").strip().lower()
         self.conv = MultiHeadPhysicsGATConv(
             latent_dim, edge_dim=edge_dim, use_spectral_norm=use_spectral_norm
         )
-        if self.global_pool_mode == "attention":
-            self.global_mixer = AttentionGlobalMixingBlock(
-                latent_dim,
-                num_global_tokens=num_global_tokens,
-                use_spectral_norm=use_spectral_norm,
-            )
-        elif self.global_pool_mode == "mean":
-            self.global_mixer = GlobalMixingBlock(
-                latent_dim,
-                use_spectral_norm=use_spectral_norm,
-                activation_fn=activation_fn,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported global_pool_mode={global_pool_mode!r}; expected 'mean' or 'attention'."
-            )
+        self.global_mixer = AttentionGlobalMixingBlock(
+            latent_dim,
+            num_global_tokens=num_global_tokens,
+            use_spectral_norm=use_spectral_norm,
+        )
         self.norm = nn.LayerNorm(latent_dim)
         self.activation = _make_activation(activation_fn)
 
@@ -213,11 +193,9 @@ class GINO_DEQ(nn.Module):
         mu_inf_nd: Optional[float] = None,
         mu_0_nd: Optional[float] = None,
         phys_cfg: Optional[PhysicsConfig] = None,
-        kinematics_mode: str = "direct_uvp",
         activation_fn: str = "silu",
         fourier_base: float = 2.0,
         use_hard_bcs: bool = False,
-        global_pool_mode: str = "mean",
         num_global_tokens: int = 16,
         use_siren_decoder: bool = False,
         use_width_priors: bool = False,
@@ -251,15 +229,9 @@ class GINO_DEQ(nn.Module):
             _make_activation(self.activation_fn),
             nn.Linear(latent_dim, 1)  # Non-recurrent output projection
         )
-        self.kinematics_mode = (kinematics_mode or "direct_uvp").strip().lower()
-        if self.kinematics_mode not in ("stream", "direct_uvp"):
-            raise ValueError(
-                f"Unsupported kinematics_mode={self.kinematics_mode!r}; expected 'stream' or 'direct_uvp'."
-            )
         self.use_hard_bcs = bool(use_hard_bcs)
-        self.use_siren_decoder = bool(use_siren_decoder) and self.kinematics_mode == "direct_uvp"
+        self.use_siren_decoder = bool(use_siren_decoder)
         self.use_width_priors = bool(use_width_priors)
-        self.global_pool_mode = (global_pool_mode or "mean").strip().lower()
 
         freqs = (self.fourier_base ** torch.arange(num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
@@ -278,15 +250,9 @@ class GINO_DEQ(nn.Module):
             latent_dim,
             edge_dim=3,
             activation_fn=self.activation_fn,
-            global_pool_mode=self.global_pool_mode,
             num_global_tokens=num_global_tokens,
         )
-        # Stream-function formulation: decoder predicts (psi, p), then u,v are derived from psi.
-        # Direct formulation: decoder predicts (u, v, p) directly (used to avoid WLS-on-WLS differentiation).
-        if self.kinematics_mode == "stream":
-            self.kinematics_decoder = nn.Linear(latent_dim, 2)
-            self.siren_decoder = None
-        elif self.use_siren_decoder:
+        if self.use_siren_decoder:
             self.siren_decoder = SIRENDecoder(latent_dim)
             self.kinematics_decoder = None
         else:
@@ -299,7 +265,6 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, 1)
         )
         self.mu_encoder = nn.Linear(1, latent_dim)
-        self.k_env = nn.Parameter(torch.tensor(5.0))
 
     def prepare_for_tier3_lora(self, rank: int = 4, alpha: float = 1.0):
         """
@@ -411,35 +376,23 @@ class GINO_DEQ(nn.Module):
         mu_raw = self.mu_decoder(z)
         mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
 
-        if self.kinematics_mode == "direct_uvp" and self.siren_decoder is not None:
-            pos_nd = data.x[:, NodeFeat.XY]
-            uvp, _ = self.siren_decoder(z, pos_nd)
+        if self.siren_decoder is not None:
+            pos_nd = getattr(data, "pos_nd", None)
+            if pos_nd is None:
+                pos_nd = getattr(data, "pos", None)
+            if pos_nd is None:
+                pos_nd = data.x[:, NodeFeat.XY]
+                # Leaf tensor so autograd can differentiate NS / hard-BC terms w.r.t. coordinates.
+                pos_nd = pos_nd.clone().requires_grad_(True)
+            uvp, siren_pos = self.siren_decoder(z, pos_nd)
+            data.siren_pos = siren_pos
             u_v_p = uvp[:, PredChannels.KINEMATICS]
-        elif self.kinematics_mode == "direct_uvp":
-            assert self.kinematics_decoder is not None
-            kinematics_out = self.kinematics_decoder(z)
-            u_v_p = kinematics_out[:, PredChannels.KINEMATICS]
         else:
             assert self.kinematics_decoder is not None
             kinematics_out = self.kinematics_decoder(z)
-            psi_raw = kinematics_out[:, 0:1]
-            p = kinematics_out[:, 1:2]
-            sdf = data.sdf_wall if hasattr(data, "sdf_wall") else data.x[:, NodeFeat.SDF]
-            wall_normal = data.x[:, NodeFeat.WALL_NORMAL]
-            u_v_p = stream_to_velocity(
-                psi_raw=psi_raw,
-                p=p,
-                edge_index=data.edge_index,
-                num_nodes=data.num_nodes,
-                V=data.V,
-                W=data.W,
-                M_inv=data.M_inv,
-                sdf=sdf,
-                wall_normal=wall_normal,
-                k_env=self.k_env,
-            )
+            u_v_p = kinematics_out[:, PredChannels.KINEMATICS]
 
-        if self.kinematics_mode == "direct_uvp" and self.use_hard_bcs:
+        if self.use_hard_bcs:
             # SDF is already [N, 1]; do not add another singleton (would break broadcast with [N, 2]).
             sdf = data.x[:, NodeFeat.SDF]
             uv_prior = data.x[:, NodeFeat.UV_PRIOR]

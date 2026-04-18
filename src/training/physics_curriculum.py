@@ -33,8 +33,12 @@ def update_physics_curriculum(
     """
     Controls transition from Predictor (Stage A) to Corrector (Stage B).
 
-    Stage A clamps ``mu_ratio_max`` to ``1.0`` (Newtonian clot feedback off). Stage B ramps toward
-    the target non-Newtonian cap using :func:`ease01`.
+    Stage A clamps ``mu_ratio_max`` to ``1.0`` (Newtonian clot feedback off) and
+    trains exclusively on synthetic data.
+
+    Stage B ramps toward the target non-Newtonian cap using :func:`ease01`. During
+    this stage, LoRA weights are unfrozen and trained on a mixed population dataset
+    (synthetic + real scans) to learn generalized geometry corrections.
 
     Returns ``True`` when Stage B is active (epoch >= ``stage_b_start``), i.e. when LoRA should be on.
 

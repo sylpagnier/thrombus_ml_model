@@ -17,9 +17,132 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
+from .graph_velocity_priors import (
+    dean_r_nd_effective,
+    kirchhoff_outlet_psi_values,
+    mass_conserving_umax_nd,
+    scale_stream_velocity_to_umax,
+    solve_laplace_stream_function,
+    stream_function_to_velocity,
+    width_nd_to_radius_nd,
+)
 from src.utils.paths import get_project_root
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
+
+
+def default_tier3_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
+    """Biochemical inlet BCs in transformed (log1p ND) space (same recipe as ``process_file``)."""
+    bio_cfg = BiochemConfig(tier="tier3")
+    scales = bio_cfg.get_species_scales(device="cpu")
+    inlet_species_si = torch.zeros(9, dtype=torch.float32)
+    inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
+    inlet_species_si[4] = bio_cfg.c_pT0 * bio_cfg.bulk_scale  # PT
+    inlet_species_si[6] = bio_cfg.cAT0 * bio_cfg.bulk_scale  # AT
+    inlet_species_si[7] = bio_cfg.c_Fg0 * bio_cfg.bulk_scale  # FG
+
+    inlet_species_nd = inlet_species_si / scales[:9]
+    inlet_species_transformed = torch.log1p(inlet_species_nd)
+    return inlet_species_transformed.unsqueeze(0).expand(num_nodes, -1)
+
+
+def assemble_tier3_transient_graph_data(
+    *,
+    x_tensor: torch.Tensor,
+    y_tensor_series: torch.Tensor,
+    eval_times_tensor: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    mask_inlet: torch.Tensor,
+    mask_outlet: torch.Tensor,
+    mask_wall: torch.Tensor,
+    d_bar: float,
+    u_ref: float,
+    re_target: float,
+    G_x: torch.Tensor,
+    G_y: torch.Tensor,
+    Laplacian: torch.Tensor,
+    V: torch.Tensor,
+    W: torch.Tensor,
+    M_inv: torch.Tensor,
+    uv_inlet_bc: torch.Tensor,
+    mu_prior: torch.Tensor,
+    bio_inlet_bc: torch.Tensor,
+    outlet_normal: torch.Tensor,
+) -> Data:
+    """Tier 3 non-anchor graphs: transient ``y`` + biochemistry + serialized sparse operators."""
+    num_nodes = x_tensor.shape[0]
+    return Data(
+        x=x_tensor,
+        y=y_tensor_series,
+        t=eval_times_tensor,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        mask_inlet=mask_inlet,
+        mask_outlet=mask_outlet,
+        mask_wall=mask_wall,
+        is_anchor=torch.zeros(num_nodes, dtype=torch.bool),
+        d_bar=torch.tensor([d_bar], dtype=torch.float32),
+        u_ref=torch.tensor([u_ref], dtype=torch.float32),
+        re_actual=torch.tensor([re_target], dtype=torch.float32),
+        G_x=G_x,
+        G_y=G_y,
+        Laplacian=Laplacian,
+        V=V,
+        W=W,
+        M_inv=M_inv,
+        u_inlet_bc=uv_inlet_bc,
+        mu_inlet_bc=mu_prior.view(-1, 1),
+        bio_inlet_bc=bio_inlet_bc,
+        outlet_normal=outlet_normal,
+    )
+
+
+def assemble_tier3_steady_graph_data(
+    *,
+    x_tensor: torch.Tensor,
+    y_labels: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    mask_inlet: torch.Tensor,
+    mask_outlet: torch.Tensor,
+    mask_wall: torch.Tensor,
+    is_anchor: bool,
+    d_bar: float,
+    u_ref: float,
+    u_prior: torch.Tensor,
+    mu_prior: torch.Tensor,
+    outlet_normal: torch.Tensor,
+    V: torch.Tensor,
+    W: torch.Tensor,
+    M_inv: torch.Tensor,
+    G_x: torch.Tensor,
+    G_y: torch.Tensor,
+    Laplacian: torch.Tensor,
+) -> Data:
+    """Tier 3 anchor graphs (steady labels) — same kinematic payload as Tier 1/2 plus ``Laplacian``."""
+    return Data(
+        x=x_tensor,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y_labels,
+        mask_inlet=mask_inlet,
+        mask_outlet=mask_outlet,
+        mask_wall=mask_wall,
+        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+        d_bar=torch.tensor([d_bar], dtype=torch.float32),
+        u_ref=torch.tensor([u_ref], dtype=torch.float32),
+        u_inlet_bc=u_prior.view(-1, 1),
+        mu_inlet_bc=mu_prior.view(-1, 1),
+        outlet_normal=outlet_normal,
+        V=V,
+        W=W,
+        M_inv=M_inv,
+        G_x=G_x,
+        G_y=G_y,
+        Laplacian=Laplacian,
+    )
+
 
 class MeshToGraphTier3:
     """Build Tier 3 non-anchor graphs from synthetic meshes."""
@@ -126,6 +249,8 @@ class MeshToGraphTier3:
             with open(json_path, 'r') as f:
                 meta = json.load(f)
                 d_bar = meta.get('d_bar')
+        if d_bar is None or (isinstance(d_bar, (int, float)) and float(d_bar) <= 0):
+            d_bar = float(np.max(np.ptp(nodes, axis=0)) + 1e-6)
 
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
         outlet_normal = self._compute_outlet_normals(mesh, nodes, mask_outlet)
@@ -328,44 +453,86 @@ class MeshToGraphTier3:
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
         Laplacian = torch.sparse_coo_tensor(idx_lap, val_lap, size=(N, N)).coalesce()
 
-        # 1. Continuous SDF Profile (Fixes jagged viscosity seams in aneurysms)
-        R_nd = 0.5
-        r_nd = torch.clamp(R_nd - sdf_tensor.squeeze(), min=0.0)
+        # Hydraulic width (sphere tracing) + geodesic flow + adaptive Poiseuille + Laplace stream function prior
+        d_bar_f = float(d_bar)
+        width_nd = torch.zeros(N, 1, dtype=torch.float32)
+        t_march = sdf_tensor.clone() + 0.05
+        active = torch.ones(N, dtype=torch.bool)
+        for _ in range(30):
+            if not active.any():
+                break
+            idx = torch.nonzero(active, as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                break
+            probe = pos_nd_tensor[idx] + t_march[idx] * wall_normal_vec[idx]
+            probe_np = (probe * d_bar_f).detach().cpu().numpy()
+            dist, _ = tree_wall.query(probe_np)
+            dist_nd = torch.tensor(dist / d_bar_f, dtype=torch.float32, device=pos_nd_tensor.device).view(-1, 1)
+            hit_mask = (dist_nd < 0.02).squeeze(-1)
+            hit_idx = idx[hit_mask]
+            width_nd[hit_idx] = sdf_tensor[hit_idx] + t_march[hit_idx]
+            active[hit_idx] = False
+            still_idx = idx[~hit_mask]
+            if still_idx.numel() == 0:
+                break
+            dist_still = dist_nd[~hit_mask]
+            t_march[still_idx] = t_march[still_idx] + torch.clamp(dist_still, min=0.01)
 
-        # 2. Velocity Magnitude Prior (Poiseuille)
-        u_max_nd = 1.5
-        u_prior_mag = u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2)))
+        width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0
 
-        # 3. Derive Flow Direction (Geodesic Gradient)
-        # Calculate the shortest path distance from the inlet using the mesh edges
         row_np, col_np = row.numpy(), col.numpy()
-        dist_np = edge_attr[:, 2].numpy()  # Edge lengths
-
+        dist_np = edge_attr[:, 2].numpy()
         adj = coo_matrix((dist_np, (row_np, col_np)), shape=(len(nodes), len(nodes)))
         inlet_idx = np.where(mask_inlet.numpy())[0]
 
         if len(inlet_idx) > 0:
             geodesic_dist = dijkstra(adj, directed=False, indices=inlet_idx).min(axis=0)
             phi = torch.tensor(geodesic_dist, dtype=torch.float32)
-
-            # The gradient of the distance from the inlet points exactly downstream
             flow_dir_x = torch.sparse.mm(G_x, phi.unsqueeze(1)).squeeze()
             flow_dir_y = torch.sparse.mm(G_y, phi.unsqueeze(1)).squeeze()
-
-            # Normalize the flow vectors
             flow_mag = torch.sqrt(flow_dir_x ** 2 + flow_dir_y ** 2) + 1e-12
             flow_dir_x /= flow_mag
             flow_dir_y /= flow_mag
         else:
-            flow_dir_x = torch.ones(len(nodes))
-            flow_dir_y = torch.zeros(len(nodes))
+            flow_dir_x = torch.ones(N, dtype=torch.float32)
+            flow_dir_y = torch.zeros(N, dtype=torch.float32)
 
-        # Project magnitude onto the exact downstream directions
-        u_prior = u_prior_mag * flow_dir_x
-        v_prior = u_prior_mag * flow_dir_y
+        R_nd = width_nd_to_radius_nd(width_nd)
+        u_max_nd = mass_conserving_umax_nd(R_nd)
+        r_nd = torch.clamp(R_nd - sdf_tensor.squeeze(), min=0.0)
+        r_nd = dean_r_nd_effective(
+            r_nd,
+            R_nd,
+            flow_dir_x,
+            flow_dir_y,
+            wall_normal_vec[:, 0],
+            wall_normal_vec[:, 1],
+            G_x,
+            G_y,
+        )
+        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
 
-        # 4. Viscosity Prior (Carreau)
-        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2))
+        psi_bc = kirchhoff_outlet_psi_values(
+            mask_inlet, mask_outlet, edge_index, edge_attr[:, 2:3], width_nd
+        )
+        psi_bc[mask_inlet] = 0.0
+        fixed = mask_inlet | mask_outlet
+        if mask_inlet.any() and mask_outlet.any():
+            try:
+                psi = solve_laplace_stream_function(Laplacian, psi_bc, fixed)
+                u_raw, v_raw = stream_function_to_velocity(G_x, G_y, psi, 1.0)
+                u_prior, v_prior, _ = scale_stream_velocity_to_umax(u_raw, v_raw, u_prior_mag)
+                if not torch.isfinite(u_prior).all() or not torch.isfinite(v_prior).all():
+                    raise ValueError("non-finite stream-function velocity prior")
+            except Exception:
+                u_prior = u_prior_mag * flow_dir_x
+                v_prior = u_prior_mag * flow_dir_y
+        else:
+            u_prior = u_prior_mag * flow_dir_x
+            v_prior = u_prior_mag * flow_dir_y
+
+        # Viscosity Prior (Carreau)
+        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
         lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
 
         mu_prior = (self.phys_cfg.mu_inf / mu_nd_scale) + (
@@ -411,7 +578,7 @@ class MeshToGraphTier3:
 
 
         # --- TIER 3 NON-ANCHOR FORMAT: build transient-compatible dummy trajectory ---
-        if self.vessel_cfg.tier == "tier3" and not is_anchor:
+        if self.vessel_cfg.tier in ("tier3", "tier3_mix") and not is_anchor:
             bio_cfg = BiochemConfig(tier="tier3")
 
             # 1) Dummy time trajectory [T, N, 16] + time tensor
@@ -419,56 +586,56 @@ class MeshToGraphTier3:
             eval_times_tensor = torch.linspace(0.0, bio_cfg.t_final, num_times, dtype=torch.float32)
             y_tensor_series = torch.zeros((num_times, len(nodes), 16), dtype=torch.float32)
 
-            # 2) Biochemical inlet BCs in transformed (log1p ND) space
-            scales = bio_cfg.get_species_scales(device="cpu")
-            inlet_species_si = torch.zeros(9, dtype=torch.float32)
-            inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
-            inlet_species_si[4] = bio_cfg.c_pT0 * bio_cfg.bulk_scale  # PT
-            inlet_species_si[6] = bio_cfg.cAT0 * bio_cfg.bulk_scale   # AT
-            inlet_species_si[7] = bio_cfg.c_Fg0 * bio_cfg.bulk_scale  # FG
-
-            inlet_species_nd = inlet_species_si / scales[:9]
-            inlet_species_transformed = torch.log1p(inlet_species_nd)
-            bio_inlet_bc = inlet_species_transformed.unsqueeze(0).expand(len(nodes), -1)
+            bio_inlet_bc = default_tier3_bio_inlet_bc(len(nodes))
 
             # 3) Build Tier 3-style Data object
             uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
-            data = Data(
-                x=x_tensor,
-                y=y_tensor_series,
-                t=eval_times_tensor,
+            data = assemble_tier3_transient_graph_data(
+                x_tensor=x_tensor,
+                y_tensor_series=y_tensor_series,
+                eval_times_tensor=eval_times_tensor,
                 edge_index=edge_index,
                 edge_attr=edge_attr,
                 mask_inlet=mask_inlet,
                 mask_outlet=mask_outlet,
                 mask_wall=mask_wall,
-                is_anchor=torch.zeros(len(nodes), dtype=torch.bool),
-                d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                re_actual=torch.tensor([self.phys_cfg.re_target], dtype=torch.float32),
+                d_bar=d_bar,
+                u_ref=u_ref,
+                re_target=float(self.phys_cfg.re_target),
                 G_x=G_x,
                 G_y=G_y,
                 Laplacian=Laplacian,
                 V=V,
                 W=W,
                 M_inv=M_inv,
-                u_inlet_bc=uv_inlet_bc,
-                mu_inlet_bc=mu_prior.view(-1, 1),
+                uv_inlet_bc=uv_inlet_bc,
+                mu_prior=mu_prior,
                 bio_inlet_bc=bio_inlet_bc,
                 outlet_normal=outlet_normal,
             )
         else:
             # Original Tier 1/2 format (steady labels + anchor flag)
-            data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
-                        mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
-                        d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                        u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                        u_inlet_bc=u_prior.view(-1, 1),
-                        mu_inlet_bc=mu_prior.view(-1, 1),
-                        outlet_normal=outlet_normal,
-                        V=V, W=W, M_inv=M_inv,
-                        G_x=G_x, G_y=G_y, Laplacian=Laplacian)
+            data = assemble_tier3_steady_graph_data(
+                x_tensor=x_tensor,
+                y_labels=y_labels,
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                mask_inlet=mask_inlet,
+                mask_outlet=mask_outlet,
+                mask_wall=mask_wall,
+                is_anchor=is_anchor,
+                d_bar=d_bar,
+                u_ref=u_ref,
+                u_prior=u_prior,
+                mu_prior=mu_prior,
+                outlet_normal=outlet_normal,
+                V=V,
+                W=W,
+                M_inv=M_inv,
+                G_x=G_x,
+                G_y=G_y,
+                Laplacian=Laplacian,
+            )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 

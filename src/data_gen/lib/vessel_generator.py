@@ -102,11 +102,18 @@ def _centerline_straight(
 
 
 def _centerline_arc(
-    n: int, length: float, angle_span: float
+    n: int,
+    length: float,
+    angle_span: float,
+    *,
+    bend_sign: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Circular arc: starts at (0,0) pointing +X, sweeps clockwise by angle_span.
-    radius = length / angle_span  so arc length == length.
+    Circular arc: starts at (0,0) pointing +X, sweeps by ``angle_span`` in the x–y plane.
+
+    Default ``bend_sign=1`` matches the historical clockwise sweep (negative y at the tip for
+    ``angle_span > 0``). Use ``bend_sign=-1`` to mirror across the x-axis (opposite vertical offset).
+    ``radius = length / angle_span`` so arc length ~= ``length`` for small angles.
     """
     radius = length / max(angle_span, 1e-3)
     theta = np.linspace(0.0, angle_span, n)
@@ -114,8 +121,11 @@ def _centerline_arc(
         radius * np.sin(theta),
         radius * (np.cos(theta) - 1.0),
     ])
-    tangents = np.column_stack([np.cos(theta), -np.sin(theta)])
-    return pts, tangents
+    bs = float(bend_sign)
+    pts[:, 1] *= bs
+    tangents = np.column_stack([np.cos(theta), -bs * np.sin(theta)])
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    return pts, tangents / np.maximum(norms, 1e-9)
 
 
 def _centerline_s_curve(

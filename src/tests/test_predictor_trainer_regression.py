@@ -1,14 +1,13 @@
-"""Regression tests for centralized predictor trainer behavior."""
+"""Regression tests for Tier 1 / Tier 2 predictor training helpers."""
 
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 
-import src.training.trainer as trainer_mod
+import src.training.train_t1_predictor as t1_mod
+import src.training.train_t2_predictor as t2_mod
 from src.training.t1_explorer import T1ExplorerConfig
-from src.training.train_t1_predictor import train_t1_predictor
-from src.training.train_t2_predictor import train_t2_predictor
 
 
 class _GraphStub:
@@ -47,22 +46,22 @@ class _SimpleWeighter:
 def test_assert_tier2_train_split_validation():
     ok_train = [_GraphStub(True), _GraphStub(False)]
     ok_val = [_GraphStub(True)]
-    trainer_mod._assert_tier2_train_split(ok_train, ok_val)
+    t2_mod._assert_tier2_train_split(ok_train, ok_val)
 
     try:
-        trainer_mod._assert_tier2_train_split([], ok_val)
+        t2_mod._assert_tier2_train_split([], ok_val)
         assert False, "expected empty train split to fail"
     except ValueError as e:
         assert "train_data is empty" in str(e)
 
     try:
-        trainer_mod._assert_tier2_train_split([_GraphStub(True)], [_GraphStub(True)])
+        t2_mod._assert_tier2_train_split([_GraphStub(True)], [_GraphStub(True)])
         assert False, "expected no physics-only split to fail"
     except ValueError as e:
         assert "no physics-only graphs" in str(e)
 
     try:
-        trainer_mod._assert_tier2_train_split([_GraphStub(False)], [_GraphStub(True)])
+        t2_mod._assert_tier2_train_split([_GraphStub(False)], [_GraphStub(True)])
         assert False, "expected no anchor split to fail"
     except ValueError as e:
         assert "no anchor" in str(e)
@@ -70,7 +69,7 @@ def test_assert_tier2_train_split_validation():
 
 def test_tier2_dynamic_loss_weighter_precision_floor():
     floor = 0.8
-    lw = trainer_mod._tier2_dynamic_loss_weighter(device="cpu", mom_precision_floor=floor)
+    lw = t2_mod._tier2_dynamic_loss_weighter(device="cpu", mom_precision_floor=floor)
     expected_max_lv = -torch.log(torch.tensor(floor))
     assert torch.allclose(lw.per_task_max_log_var, expected_max_lv.view(1), atol=1e-6)
 
@@ -88,13 +87,13 @@ def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
             "l_rheo": torch.tensor(0.7),
         }
 
-    monkeypatch.setattr(trainer_mod, "compute_kinematics_physics_terms", _fake_terms)
+    monkeypatch.setattr(t2_mod, "compute_kinematics_physics_terms", _fake_terms)
 
     n = 4
     model = _DummyModel(pred=torch.zeros((n, 5), dtype=torch.float32), jac=torch.tensor(0.5))
     data = SimpleNamespace(y=torch.zeros((n, 5), dtype=torch.float32))
 
-    loss_d, metrics_d = trainer_mod._compute_step_loss_t2(
+    loss_d, metrics_d = t2_mod.compute_step_loss(
         model=model,
         data=data,
         kernels=_DummyKernels(),
@@ -108,7 +107,7 @@ def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
     assert abs(float(loss_d.item()) - 17.55) < 1e-6
     assert metrics_d["L_mom"] == 0.0
 
-    loss_c, metrics_c = trainer_mod._compute_step_loss_t2(
+    loss_c, metrics_c = t2_mod.compute_step_loss(
         model=model,
         data=data,
         kernels=_DummyKernels(),
@@ -136,10 +135,10 @@ def test_compute_step_loss_t1_no_anchor_pgrad_is_zero(monkeypatch):
             "l_io": torch.tensor(0.2),
         }
 
-    monkeypatch.setattr(trainer_mod, "compute_kinematics_physics_terms", _fake_terms)
-    monkeypatch.setattr(trainer_mod, "compute_anchor_kinematic_importance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(t1_mod, "compute_kinematics_physics_terms", _fake_terms)
+    monkeypatch.setattr(t1_mod, "compute_anchor_kinematic_importance", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        trainer_mod,
+        t1_mod,
         "anchor_node_mask",
         lambda data: torch.zeros(data.y.shape[0], dtype=torch.bool),
     )
@@ -157,7 +156,7 @@ def test_compute_step_loss_t1_no_anchor_pgrad_is_zero(monkeypatch):
     explorer.p_grad_supervision = 1.0
     explorer.lambda_cont = 1.0
 
-    loss, metrics = trainer_mod._compute_step_loss_t1(
+    loss, metrics = t1_mod.compute_step_loss(
         model=model,
         data=data,
         kernels=_DummyKernels(),
@@ -184,33 +183,8 @@ def test_load_tier1_bootstrap_adapts_encoder_width(tmp_path):
     torch.save(state, ckpt_path)
 
     model = _TinyModel()
-    ok = trainer_mod._load_tier1_bootstrap(model, ckpt_path, device="cpu")
+    ok = t2_mod._load_tier1_bootstrap(model, ckpt_path, device="cpu")
     assert ok is True
     w = model.encoder[0].weight.detach()
     assert torch.allclose(w[:, :3], torch.ones((4, 3), dtype=torch.float32), atol=1e-6)
     assert torch.allclose(w[:, 3:], torch.zeros((4, 2), dtype=torch.float32), atol=1e-6)
-
-
-def test_predictor_shims_delegate_to_trainer(monkeypatch):
-    calls = {"t1": None, "t2": None}
-
-    def _fake_t1(self, **kwargs):
-        calls["t1"] = kwargs
-        return {"status": "ok"}
-
-    def _fake_t2(self, **kwargs):
-        calls["t2"] = kwargs
-        return {"status": "ok"}
-
-    monkeypatch.setattr(trainer_mod.DEQPredictorTrainer, "train_t1_predictor", _fake_t1)
-    monkeypatch.setattr(trainer_mod.DEQPredictorTrainer, "train_t2_predictor", _fake_t2)
-
-    t1_result = train_t1_predictor(epochs=3, lr=2e-4)
-    t2_result = train_t2_predictor(epochs=4, distillation_epochs=1, adam_epochs=2, lr=1e-4)
-
-    assert t1_result["status"] == "ok"
-    assert calls["t1"]["epochs"] == 3
-    assert abs(calls["t1"]["lr"] - 2e-4) < 1e-12
-    assert t2_result["status"] == "ok"
-    assert calls["t2"]["epochs"] == 4
-    assert calls["t2"]["distillation_epochs"] == 1

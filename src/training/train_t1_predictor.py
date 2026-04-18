@@ -20,8 +20,9 @@ if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import atexit
 import csv
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.optim as optim
@@ -44,8 +45,42 @@ from src.training.t1_explorer import (
     filter_graph_paths_by_geometry_level,
     write_t1_experiment_artifact,
 )
-from src.training.trainer import _resolve_t1_dataset_tier
 import random
+
+
+def _resolve_t1_dataset_tier(explorer: Optional[T1ExplorerConfig] = None) -> str:
+    if explorer is not None:
+        tier = str(getattr(explorer, "dataset_tier", "")).strip()
+        if tier:
+            return tier
+    return os.environ.get("TIER1_DATASET_TIER", "tier1").strip() or "tier1"
+
+
+@dataclass
+class DatasetSplit:
+    train: list
+    val: list
+    train_anchors: int
+    train_physics: int
+
+
+def split_anchor_physics(dataset: Sequence, seed: int = 42, train_ratio: float = 0.9) -> DatasetSplit:
+    anchors = [d for d in dataset if d.is_anchor.any().item()]
+    physics = [d for d in dataset if not d.is_anchor.any().item()]
+    rng = random.Random(seed)
+    rng.shuffle(anchors)
+    rng.shuffle(physics)
+    split_idx_a = int(train_ratio * len(anchors))
+    split_idx_p = int(train_ratio * len(physics))
+    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
+    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    n_train_anchors = len([d for d in train_data if d.is_anchor.any().item()])
+    return DatasetSplit(
+        train=train_data,
+        val=val_data,
+        train_anchors=n_train_anchors,
+        train_physics=max(0, len(train_data) - n_train_anchors),
+    )
 
 
 def load_dataset(explorer: Optional[T1ExplorerConfig] = None):
@@ -91,7 +126,10 @@ def compute_step_loss(
     train_loss_weighter: bool = True,
 ):
     if explorer is not None and explorer.ns_derivative_mode == "autograd":
-        data.x = data.x.clone().detach().requires_grad_(True)
+        # Enable gradients on the actual input feature tensor so the forward pass traces it
+        data.x.requires_grad_(True)
+        # Create a view (not a clone) so the computational graph stays connected
+        data.pos = data.x[:, :2]
     anderson_beta = float(explorer.anderson_beta) if explorer is not None else 0.8
     out = model(data, solver=current_solver, anderson_beta=anderson_beta, anderson_warmup_iters=5)
     if isinstance(out, tuple):
@@ -125,7 +163,6 @@ def compute_step_loss(
         anchor_kine_importance=kine_imp,
         re_ref=re_ref,
         re_scale=re_scale,
-        kinematics_mode=(explorer.kinematics_mode if explorer is not None else None),
     )
     l_wss = terms["l_wss"]
     l_data_kine = terms["l_data_kine"]
@@ -256,12 +293,12 @@ def train_t1_predictor(
         f"🔬 Explorer: name={explorer.experiment_name!r} | "
         f"kine_weight={explorer.kine_weight_mode} | "
         f"latent={explorer.latent_dim} | deq_iters={explorer.deq_max_iters} | "
-        f"kinematics_mode={explorer.kinematics_mode} | ns_derivatives={explorer.ns_derivative_mode} | "
+        f"ns_derivatives={explorer.ns_derivative_mode} | "
         f"act={explorer.activation_fn} | fourier_base={explorer.fourier_base:.2f} | "
         f"loss_weight={explorer.loss_weight_mode} | anderson_beta={explorer.anderson_beta:.2f} | "
         f"lambda_cont={explorer.lambda_cont:.2f} | re_curriculum={explorer.re_curriculum} | "
         f"p_grad_sup={explorer.p_grad_supervision:.3f} | "
-        f"hard_bcs={explorer.use_hard_bcs} | global_pool={explorer.global_pool_mode} | "
+        f"hard_bcs={explorer.use_hard_bcs} | "
         f"siren={explorer.use_siren_decoder} | width_priors={explorer.use_width_priors}"
     )
     phys_cfg = PhysicsConfig(tier="tier1")
@@ -272,11 +309,9 @@ def train_t1_predictor(
         max_iters=explorer.deq_max_iters,
         num_fourier_freqs=explorer.num_fourier_freqs,
         phys_cfg=phys_cfg,
-        kinematics_mode=explorer.kinematics_mode,
         activation_fn=explorer.activation_fn,
         fourier_base=explorer.fourier_base,
         use_hard_bcs=explorer.use_hard_bcs,
-        global_pool_mode=explorer.global_pool_mode,
         num_global_tokens=explorer.num_global_tokens,
         use_siren_decoder=explorer.use_siren_decoder,
         use_width_priors=explorer.use_width_priors,
@@ -284,7 +319,6 @@ def train_t1_predictor(
 
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels.ns_derivative_mode = explorer.ns_derivative_mode
-    kernels.cfg.kinematics_mode = explorer.kinematics_mode
     kernels.advect_detach = bool(explorer.advect_detach)
 
     # Keep dynamic weighing available for momentum+continuity when selected.
@@ -322,19 +356,9 @@ def train_t1_predictor(
             "graph_dir": str(dataset_cfg.graph_output_dir),
         }
 
-    # --- NEW STRATIFIED SPLIT LOGIC ---
-    anchors = [d for d in dataset if d.is_anchor.any().item()]
-    physics = [d for d in dataset if not d.is_anchor.any().item()]
-
-    random.seed(42)
-    random.shuffle(anchors)
-    random.shuffle(physics)
-
-    split_idx_a = int(0.9 * len(anchors))
-    split_idx_p = int(0.9 * len(physics))
-
-    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
-    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    split = split_anchor_physics(dataset, seed=42, train_ratio=0.9)
+    train_data = split.train
+    val_data = split.val
 
     # Reduce physical batch size to save memory, but maintain effective batch size
     micro_batch_size = int(os.environ.get("TIER1_MICRO_BATCH_SIZE", "2"))

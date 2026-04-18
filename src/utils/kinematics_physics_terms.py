@@ -132,7 +132,6 @@ def compute_kinematics_physics_terms(
     anchor_kine_importance: Optional[torch.Tensor] = None,
     re_ref: Optional[float] = None,
     re_scale: Optional[float] = None,
-    kinematics_mode: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute every scalar physics term used in Tier 1 or Tier 2 training (except DEQ ``jac_loss``).
@@ -195,16 +194,10 @@ def compute_kinematics_physics_terms(
 
     if tier == "tier1":
         l_mom = kernels.navier_stokes_residual(pred, data, props=props, re_ref=re_ref, re_scale=re_scale)
-        mode = (kinematics_mode or getattr(kernels.cfg, "kinematics_mode", "stream")).strip().lower()
-        if mode == "stream":
-            # Stream-function branch analytically satisfies incompressibility; avoid penalizing
-            # discretization asymmetry from WLS mixed partials.
-            l_cont = z
-        else:
-            c_u = kernels._compute_derivatives(pred[:, PredChannels.U:PredChannels.U + 1], props)
-            c_v = kernels._compute_derivatives(pred[:, PredChannels.V:PredChannels.V + 1], props)
-            du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
-            l_cont = kernels.continuity_loss(du_ij, data=data)
+        c_u = kernels._compute_derivatives(pred[:, PredChannels.U:PredChannels.U + 1], props)
+        c_v = kernels._compute_derivatives(pred[:, PredChannels.V:PredChannels.V + 1], props)
+        du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
+        l_cont = kernels.continuity_loss(du_ij, data=data)
         l_rheo = z
     elif tier2_distillation:
         l_mom = z

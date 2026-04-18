@@ -25,7 +25,7 @@ MODULE_MAP: dict[tuple[str, str], str] = {
     ("data", "tier3"): "src.data_gen.pipeline_tier3",
     ("eval", "benchmark"): "src.evaluation.run_benchmark",
     ("eval", "visualize"): "src.evaluation.visualize_tiers",
-    ("inspect", "anchor"): "src.tools.inspect_anchor_cfd",
+    ("inspect", "anchor"): "src.tools.inspect_phase1_data",
     ("inspect", "graph"): "src.tools.inspect_graph_sample",
     ("inspect", "phase1"): "src.tools.inspect_phase1_data",
     ("inspect", "tier3"): "src.tools.inspect_tier3_data",

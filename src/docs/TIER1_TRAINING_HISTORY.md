@@ -1,6 +1,20 @@
 # Tier 1 Predictor (GINO-DEQ) Training History & Insights
-*Last Updated: 2026-04-17*
+*Last Updated: 2026-04-18*
 *Target Goal: < 5% Relative L2 Error on Tier 1 Hemodynamics*
+
+## Implementation map (current architecture)
+
+This file is **historical narrative**. The live stack is:
+
+| Piece | Location |
+|-------|----------|
+| Training loop / checkpoints / diary | `src/training/train_t1_predictor.py` |
+| Sweep / explorer Knobs (`TIER1_*`, mesh resolution) | `src/training/t1_explorer.py` |
+| Model (DEQ, attention bottleneck, SIREN, LoRA hooks) | `src/architecture/ginodeq.py`, `siren_decoder.py`, `lora_injection.py` |
+| Physics residuals & losses | `src/core_physics/physics_kernels.py` + `src/utils/kinematics_physics_terms.py` |
+| Defaults (mesh size factor `0.75`, channel layouts) | `src/config.py` (`VesselConfig`, `PhysicsConfig`, `NodeFeat`, `PredChannels`) |
+
+Run: `python -m src.training.train_t1_predictor` or `python -m src.bin.main train t1`. Orchestrator: `python -m src.bin.orchestrate a` (Tier 1 then Tier 2 unless `--skip-tier1`). See **`PROJECT_CONTEXT.md`** for full architecture.
 
 ## 1. The 15% Pareto Frontier (The Current Bottleneck)
 Initial sweeps (14+ candidates) using AdamW successfully descended but hit a hard "noise floor" at ~15.6% Relative L2 Error. AdamW is excellent for finding the general basin of the PDE landscape but struggles to minimize the stiff Navier-Stokes residuals beyond this point.

@@ -122,7 +122,12 @@ class VesselConfig:
         self.template_path = comsol_models_dir() / "phase1_template.mph"
         self.mesh_size_factor = TIER_DEFAULT_MESH_SIZE_FACTOR.get(self.tier, self.mesh_size_factor)
         dr = data_root()
-        if self.tier == "tier3_patients":
+        if self.tier == "tier3_mix":
+            # Pooled synthetic + patient graphs for population-level Stage B training
+            self.mesh_input_dir = dr / "raw/tier3_mix"
+            self.output_dir = dr / "processed/cfd_results_tier3_mix"
+            self.graph_output_dir = dr / "processed/graphs_tier3_mix"
+        elif self.tier == "tier3_patients":
             self.mesh_input_dir = dr / "raw/tier3_patients"
             self.output_dir = dr / "processed/cfd_results_tier3_patients"
             self.graph_output_dir = dr / "processed/graphs_tier3_patients"
@@ -205,7 +210,7 @@ class PhysicsConfig:
         if self.tier == "tier1":
             self.viscosity_model = "newtonian"
             self.mu_ref = self.mu_newtonian
-        elif self.tier in ["tier2", "tier3", "tier3_patients"]:
+        elif self.tier in ["tier2", "tier3", "tier3_patients", "tier3_mix"]:
             self.viscosity_model = "carreau"
             self.mu_ref = self.mu_inf
         else:

@@ -10,7 +10,63 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 from src.config import NodeFeat, PhysicsConfig, VesselConfig
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
+from .graph_velocity_priors import (
+    dean_r_nd_effective,
+    kirchhoff_outlet_psi_values,
+    mass_conserving_umax_nd,
+    scale_stream_velocity_to_umax,
+    solve_laplace_stream_function,
+    stream_function_to_velocity,
+    width_nd_to_radius_nd,
+)
 from src.utils.paths import get_project_root
+
+
+def assemble_tier12_graph_data(
+    *,
+    x_tensor: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    y_labels: torch.Tensor,
+    mask_inlet: torch.Tensor,
+    mask_outlet: torch.Tensor,
+    mask_wall: torch.Tensor,
+    is_anchor: bool,
+    d_bar: float,
+    u_ref: float,
+    u_prior: torch.Tensor,
+    mu_prior: torch.Tensor,
+    V: torch.Tensor,
+    W: torch.Tensor,
+    M_inv: torch.Tensor,
+    G_x: torch.Tensor,
+    G_y: torch.Tensor,
+) -> Data:
+    """Build the Tier 1/2 ``Data`` object written to ``*.pt`` (single code path for tests + ``process_file``).
+
+    Tier 1/2 graphs store sparse WLS gradient operators ``G_x`` / ``G_y`` for physics kernels.
+    The Laplacian is used during conversion but is **not** serialized on these graphs.
+    """
+    return Data(
+        x=x_tensor,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y_labels,
+        mask_inlet=mask_inlet,
+        mask_outlet=mask_outlet,
+        mask_wall=mask_wall,
+        is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
+        d_bar=torch.tensor([d_bar], dtype=torch.float32),
+        u_ref=torch.tensor([u_ref], dtype=torch.float32),
+        u_inlet_bc=u_prior.view(-1, 1),
+        mu_inlet_bc=mu_prior.view(-1, 1),
+        mu_wall_bc=mu_prior.view(-1, 1),
+        V=V,
+        W=W,
+        M_inv=M_inv,
+        G_x=G_x,
+        G_y=G_y,
+    )
 
 
 class MeshToGraphComplete:
@@ -227,51 +283,8 @@ class MeshToGraphComplete:
             except Exception as e:
                 print(f"Error mapping labels: {e}")
 
-        # --- Refurbished Analytic Prior (SDF-Based) suitable for Curves ---
-        # 1. Use SDF to determine r_nd (0 at center, R at wall)
-        R_nd = 0.5
-        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
-
-        # 2. Velocity Magnitude Prior (Poiseuille)
-        u_max_nd = 1.5
-        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
-
-        # 3. Derive Flow Direction (Tangent) from Inward Wall Normals
-        # Since vessel_generator.py creates geometries from left to right (+X),
-        # we find the orthogonal vector to the wall normal that points in the +X direction.
-        n_x = wall_normal_vec[:, 0]
-        n_y = wall_normal_vec[:, 1]
-
-        # Handle exact zero to prevent sign() from returning 0
-        sign_ny = torch.sign(n_y)
-        sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
-
-        # Orthogonal tangent vector pointing rightward
-        t_x = torch.abs(n_y)
-        t_y = -sign_ny * n_x
-
-        # Normalize the tangent vector
-        t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
-        flow_dir_x = t_x / t_mag
-        flow_dir_y = t_y / t_mag
-
-        # Project magnitude onto the curved tangent directions
-        u_prior = u_prior_mag * flow_dir_x
-        v_prior = u_prior_mag * flow_dir_y
-
-        # 4. Viscosity Prior (Carreau)
-        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
-        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
-        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
-                    (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
-                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
-                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
-
-        # 5. WSS Prior: MASKED to wall boundary
-        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
-
         # --------------------------------------------------------------------------
-        #  Sparse WLS gradient matrices (G_x, G_y) — required before width assembly
+        #  Sparse WLS: G_x, G_y, Laplacian — then hydraulic width, then stream / Poiseuille priors
         # --------------------------------------------------------------------------
         W_V = W.unsqueeze(1) * V  # Shape: (E, 5)
         M_inv_row = M_inv[row]  # Shape: (E, 5, 5)
@@ -279,11 +292,13 @@ class MeshToGraphComplete:
         coeffs = torch.bmm(M_inv_row, W_V.unsqueeze(2)).squeeze(2)  # Shape: (E, 5)
         cx = coeffs[:, 0]
         cy = coeffs[:, 1]
+        c_lap = coeffs[:, 2] + coeffs[:, 4]
 
         N = len(nodes)
 
         diag_cx = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cx)
         diag_cy = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cy)
+        diag_c_lap = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, c_lap)
 
         diag_indices = torch.arange(N, dtype=torch.long).unsqueeze(0).repeat(2, 1)
 
@@ -293,11 +308,15 @@ class MeshToGraphComplete:
         idx_y = torch.cat([edge_index, diag_indices], dim=1)
         val_y = torch.cat([cy, -diag_cy], dim=0)
 
+        idx_lap = torch.cat([edge_index, diag_indices], dim=1)
+        val_lap = torch.cat([c_lap, -diag_c_lap], dim=0)
+
         G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
+        Laplacian = torch.sparse_coo_tensor(idx_lap, val_lap, size=(N, N)).coalesce()
 
         # --------------------------------------------------------------------------
-        #  Local width D(x) and flow-direction derivatives (sphere tracing + WLS)
+        #  Local width D(x) (sphere tracing; full lumen width along inward normal ray)
         # --------------------------------------------------------------------------
         d_bar_f = float(d_bar)
         width_nd = torch.zeros(N, 1, dtype=torch.float32)
@@ -325,6 +344,62 @@ class MeshToGraphComplete:
 
         width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0
 
+        # Flow tangent from inward wall normals (left-to-right +X bias for Tier 1 geometries)
+        n_x = wall_normal_vec[:, 0]
+        n_y = wall_normal_vec[:, 1]
+        sign_ny = torch.sign(n_y)
+        sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
+        t_x = torch.abs(n_y)
+        t_y = -sign_ny * n_x
+        t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
+        flow_dir_x = t_x / t_mag
+        flow_dir_y = t_y / t_mag
+
+        # Width-adaptive Poiseuille radius (R = full width / 2) and mass-style u_max ~ 1/R^2
+        R_nd = width_nd_to_radius_nd(width_nd)
+        u_max_nd = mass_conserving_umax_nd(R_nd)
+        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
+        r_nd = dean_r_nd_effective(
+            r_nd,
+            R_nd,
+            flow_dir_x,
+            flow_dir_y,
+            wall_normal_vec[:, 0],
+            wall_normal_vec[:, 1],
+            G_x,
+            G_y,
+        )
+        u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
+
+        # Laplace stream function ψ (Dirichlet), then u = ∂ψ/∂y, v = -∂ψ/∂x; fallback to Poiseuille × tangent
+        psi_bc = kirchhoff_outlet_psi_values(
+            mask_inlet, mask_outlet, edge_index, edge_attr[:, 2:3], width_nd
+        )
+        psi_bc[mask_inlet] = 0.0
+        fixed = mask_inlet | mask_outlet
+        if mask_inlet.any() and mask_outlet.any():
+            try:
+                psi = solve_laplace_stream_function(Laplacian, psi_bc, fixed)
+                u_raw, v_raw = stream_function_to_velocity(G_x, G_y, psi, 1.0)
+                u_prior, v_prior, _ = scale_stream_velocity_to_umax(u_raw, v_raw, u_prior_mag)
+                if not torch.isfinite(u_prior).all() or not torch.isfinite(v_prior).all():
+                    raise ValueError("non-finite stream-function velocity prior")
+            except Exception:
+                u_prior = u_prior_mag * flow_dir_x
+                v_prior = u_prior_mag * flow_dir_y
+        else:
+            u_prior = u_prior_mag * flow_dir_x
+            v_prior = u_prior_mag * flow_dir_y
+
+        # Viscosity prior (Carreau) + WSS (wall)
+        gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
+        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
+                    (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
+                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
+        wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
+
         grad_w_x = torch.sparse.mm(G_x, width_nd)
         grad_w_y = torch.sparse.mm(G_y, width_nd)
         width_d1 = grad_w_x * flow_dir_x.unsqueeze(1) + grad_w_y * flow_dir_y.unsqueeze(1)
@@ -344,17 +419,25 @@ class MeshToGraphComplete:
         ], dim=1)
         assert x_tensor.shape[1] == NodeFeat.WIDTH_D2.stop, "Tier-1 node feature width must match NodeFeat"
 
-        # Ensure you also update the Data object instantiation if you pass inlet BCs explicitly
-        data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y_labels,
-                    mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
-                    is_anchor=torch.tensor([is_anchor], dtype=torch.bool),
-                    d_bar=torch.tensor([d_bar], dtype=torch.float32),
-                    u_ref=torch.tensor([u_ref], dtype=torch.float32),
-                    u_inlet_bc=u_prior.view(-1, 1),
-                    mu_inlet_bc=mu_prior.view(-1, 1),
-                    mu_wall_bc=mu_prior.view(-1, 1),
-                    V=V, W=W, M_inv=M_inv,
-                    G_x=G_x, G_y=G_y)
+        data = assemble_tier12_graph_data(
+            x_tensor=x_tensor,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y_labels=y_labels,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            is_anchor=is_anchor,
+            d_bar=d_bar,
+            u_ref=u_ref,
+            u_prior=u_prior,
+            mu_prior=mu_prior,
+            V=V,
+            W=W,
+            M_inv=M_inv,
+            G_x=G_x,
+            G_y=G_y,
+        )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
@@ -385,7 +468,7 @@ def build_mesh_converter(
 
     If ``is_non_newtonian`` is True, the Tier-3 pipeline is selected regardless of ``tier``.
     If False, Tier 1/2-style graphs are built. If None (default), ``tier`` alone decides
-    (``tier3`` / ``tier3_patients`` → Tier 3).
+    (``tier3`` / ``tier3_patients`` / ``tier3_mix`` → Tier 3).
     """
     t = (tier or "tier1").lower()
     if is_non_newtonian is True:
@@ -394,7 +477,7 @@ def build_mesh_converter(
         return MeshToGraphTier3(**kwargs)
     if is_non_newtonian is False:
         return MeshToGraphComplete(tier=tier, **kwargs)
-    if t in ("tier3", "tier3_patients"):
+    if t in ("tier3", "tier3_patients", "tier3_mix"):
         from .mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)

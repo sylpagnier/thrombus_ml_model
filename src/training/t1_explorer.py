@@ -6,12 +6,14 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 
 **Explorer execution policy**
 
-- The active ``build_sweep_candidates()`` defines the sweep: **V3** uses **40 AdamW → 20 L-BFGS**
-  (``TIER1_USE_LBFGS=1``) to polish NS residuals; the pre-sweep **sanity probe** stays Adam-only
-  (1 epoch) for speed.
+- **Temporary (quick screening):** the active ``build_sweep_candidates()`` runs **30 AdamW-only**
+  epochs (``TIER1_USE_LBFGS=0``, no L-BFGS phase); restore longer schedules when committing winners.
+- The pre-sweep **sanity probe** stays Adam-only (1 epoch) for speed.
 - Sweeps **always start fresh**: no ``tier1_best_physics.pth`` warm-start and no resume from
   ``tier1_latest_checkpoint.pth`` (per-candidate checkpoint dirs only record *this* run).
-- For ad-hoc fast screening, set ``TIER1_USE_LBFGS=0`` in env or swap in a shorter sweep builder.
+- **Single candidate** (e.g. resume after interrupt): set ``TIER1_SWEEP_LAST_ONLY=1`` to run only
+  the last entry from ``build_sweep_candidates()``, or ``TIER1_SWEEP_ONLY=V3_SIREN_AUTOGRAD`` to
+  pick by ``experiment_name`` (diary + sweep reports unchanged).
 
 **Kinematic supervision weighting** (anchor nodes only, COMSOL labels):
 
@@ -31,17 +33,14 @@ compare ``reports/experiments/tier1_<name>_*.json`` and the training diary.
 **Architecture**
 
 - ``TIER1_LATENT_DIM``, ``TIER1_DEQ_MAX_ITERS``, ``TIER1_NUM_FOURIER_FREQS`` — GINO-DEQ width/depth.
-- ``TIER1_KINEMATICS_MODE`` — ``stream`` or ``direct_uvp``.
 - ``TIER1_NS_DERIVATIVE_MODE`` — ``wls`` or ``autograd`` (for PDE derivatives).
-- ``TIER1_USE_HARD_BCS`` — ``1``/``true`` to enforce no-slip at walls via SDF × residual (``direct_uvp`` only).
-- ``TIER1_GLOBAL_POOL_MODE`` — ``mean`` (legacy global mean pool) or ``attention`` (Perceiver-style bottleneck).
-- ``TIER1_NUM_GLOBAL_TOKENS`` — attention bottleneck width when ``GLOBAL_POOL_MODE=attention``.
-- ``TIER1_USE_SIREN`` — ``1``/``true`` to use the SIREN INR decoder for ``direct_uvp`` kinematics.
-- ``TIER1_USE_EQUIVARIANT`` — reserved flag for future vector-aware convolutions (currently no-op in the model).
+- ``TIER1_USE_HARD_BCS`` — ``1``/``true`` to enforce no-slip at walls via SDF × residual.
+- ``TIER1_NUM_GLOBAL_TOKENS`` — Perceiver-style attention bottleneck width (global mixing in each GINO block).
+- ``TIER1_USE_SIREN`` — ``1``/``true`` to use the SIREN INR decoder for kinematics.
 - ``TIER1_USE_WIDTH_PRIORS`` — ``1``/``true`` to feed sphere-traced width + WLS flow-direction derivatives (requires graphs with 18 node channels from ``mesh_to_graph``).
 
-We intentionally keep both options for kinematics and PDE derivatives because vessel meshes can
-favor different numerical behavior; use sweep artifacts to determine the best pair for your data.
+PDE derivative mode (``wls`` vs ``autograd``) remains configurable because vessel meshes can favor
+different numerical behavior.
 
 **Data**
 
@@ -53,7 +52,7 @@ favor different numerical behavior; use sweep artifacts to determine the best pa
 1. **Weighting**: ``shear_true`` vs ``sdf_wall`` vs ``sdf_grad`` vs ``uniform``.
 2. **Capacity**: latent 64 → 96/128; DEQ iters 15 → 20–30 (watch VRAM).
 3. **Loss schedule**: existing ``TIER1_DATA_SCALE_*`` / ``TIER1_BC_SCALE_*`` envs (stage A vs B).
-4. **Sampling**: ``TIER1_TARGET_ANCHOR_FRACTION``, hard mining (already in trainer).
+4. **Sampling**: ``TIER1_TARGET_ANCHOR_FRACTION``, hard mining (in ``train_t1_predictor``).
 5. **Robust loss**: future — Huber on kinematic channel (not wired yet).
 
 All settings are logged to the experiment JSON at run end.
@@ -88,7 +87,6 @@ class T1ExplorerConfig:
     deq_max_iters: int = 25
     num_fourier_freqs: int = 16
     geometry_level: Optional[int] = None  # filter json "level"
-    kinematics_mode: str = "direct_uvp"  # stream | direct_uvp
     ns_derivative_mode: str = "wls"  # wls | autograd
     activation_fn: str = "silu"  # relu | silu | gelu
     fourier_base: float = 1.5
@@ -100,11 +98,9 @@ class T1ExplorerConfig:
     advect_detach: bool = False
     pressure_bc_mode: str = "mean"  # mean | pointwise | mean_var
     momentum_loss_mode: str = "huber"  # huber | mse
-    # --- V2 architecture flags (feature-gated; defaults preserve legacy behavior) ---
+    # --- Architecture flags ---
     use_hard_bcs: bool = False
-    global_pool_mode: str = "mean"  # mean | attention
     num_global_tokens: int = 16
-    use_equivariant_conv: bool = False  # reserved for future conv path
     use_siren_decoder: bool = False
     use_width_priors: bool = False  # append width channels in encoder (graphs must include them)
 
@@ -122,9 +118,6 @@ class T1ExplorerConfig:
         mode = os.environ.get("TIER1_KINE_WEIGHT_MODE", "uniform").strip().lower()
         if mode not in ("uniform", "sdf_wall", "sdf_grad", "shear_true"):
             mode = "uniform"
-        kinematics_mode = os.environ.get("TIER1_KINEMATICS_MODE", "direct_uvp").strip().lower()
-        if kinematics_mode not in ("stream", "direct_uvp"):
-            kinematics_mode = "direct_uvp"
         ns_derivative_mode = os.environ.get("TIER1_NS_DERIVATIVE_MODE", "wls").strip().lower()
         if ns_derivative_mode not in ("wls", "autograd"):
             ns_derivative_mode = "wls"
@@ -141,16 +134,7 @@ class T1ExplorerConfig:
         momentum_loss_mode = os.environ.get("TIER1_MOMENTUM_LOSS_MODE", "huber").strip().lower()
         if momentum_loss_mode not in ("huber", "mse"):
             momentum_loss_mode = "huber"
-        global_pool_mode = os.environ.get("TIER1_GLOBAL_POOL_MODE", "mean").strip().lower()
-        if global_pool_mode not in ("mean", "attention"):
-            global_pool_mode = "mean"
         use_hard_bcs = os.environ.get("TIER1_USE_HARD_BCS", "0").strip().lower() in ("1", "true", "yes", "on")
-        use_equivariant_conv = os.environ.get("TIER1_USE_EQUIVARIANT", "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
         use_siren_decoder = os.environ.get("TIER1_USE_SIREN", "0").strip().lower() in ("1", "true", "yes", "on")
         use_width_priors = os.environ.get("TIER1_USE_WIDTH_PRIORS", "0").strip().lower() in (
             "1",
@@ -176,7 +160,6 @@ class T1ExplorerConfig:
             deq_max_iters=int(os.environ.get("TIER1_DEQ_MAX_ITERS", "25")),
             num_fourier_freqs=int(os.environ.get("TIER1_NUM_FOURIER_FREQS", "16")),
             geometry_level=geometry_level,
-            kinematics_mode=kinematics_mode,
             ns_derivative_mode=ns_derivative_mode,
             activation_fn=activation,
             fourier_base=float(os.environ.get("TIER1_FOURIER_BASE", "1.5")),
@@ -189,9 +172,7 @@ class T1ExplorerConfig:
             pressure_bc_mode=pressure_bc_mode,
             momentum_loss_mode=momentum_loss_mode,
             use_hard_bcs=use_hard_bcs,
-            global_pool_mode=global_pool_mode,
             num_global_tokens=num_global_tokens,
-            use_equivariant_conv=use_equivariant_conv,
             use_siren_decoder=use_siren_decoder,
             use_width_priors=use_width_priors,
         )
@@ -300,42 +281,35 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
 
 def build_sweep_candidates() -> List[T1SweepCandidate]:
     """
-    V3 architecture sweep: high capacity (``latent_dim=256``) + hard BCs where indicated,
-    targeting ``<5%`` relative L2 with **40 AdamW → 20 L-BFGS** per candidate.
+    V3 architecture sweep: Evaluating Discrete (WLS) vs Continuous (Autograd) PDEs.
 
-    Four-way comparison: legacy baseline vs attention bottleneck vs width priors vs SIREN decoder.
+    Filter (optional, for interrupted sweeps — same ``run_sweep`` diary / JSON output):
+
+    - ``TIER1_SWEEP_LAST_ONLY=1`` — keep only the last candidate in the list below.
+    - ``TIER1_SWEEP_ONLY=<name>`` — keep only the candidate whose ``name`` equals ``<name>``
+      (e.g. ``V3_SIREN_AUTOGRAD``). Overrides ``TIER1_SWEEP_LAST_ONLY`` when set non-empty.
     """
     base_overrides = {
         "TIER1_DISABLE_FIGURES": "1",
-        "TIER1_CKPT_EVERY": "5",  # Frequent checkpoints for crash safety
+        "TIER1_CKPT_EVERY": "5",
         "TIER1_EARLY_STOP_PATIENCE": "15",
         "TIER1_LOSS_WEIGHT_MODE": "dynamic",
-        "TIER1_USE_LBFGS": "1",
-        # Never load pretrained weights — fair screening from random init only.
+        "TIER1_USE_LBFGS": "0",
         "TIER1_INIT_FROM_BEST": "0",
-
-        # --- SWEEP ISOLATION ---
-        # RESUME is OFF; per-candidate TIER1_CKPT_DIR (set by run_sweep) only stores
-        # checkpoints from the current candidate run (no cross-candidate bleed).
         "TIER1_RESUME": "0",
-        "TIER1_MICRO_BATCH_SIZE": "1",  # Cut memory footprint in half to survive 0.4 mesh
-        "TIER1_ACCUMULATION_STEPS": "8",  # 1 * 8 = 8 (same effective batch size)
-
-        "TIER1_KINEMATICS_MODE": "direct_uvp",
+        "TIER1_MICRO_BATCH_SIZE": "1",
+        "TIER1_ACCUMULATION_STEPS": "8",
         "TIER1_ACTIVATION_FN": "silu",
-
-        # --- Strict Pressure & Boundary Enforcement ---
         "TIER1_KINE_P_WEIGHT": "5.0",
         "TIER1_P_GRAD_SUPERVISION": "1.0",
         "TIER1_PRESSURE_BC_MODE": "pointwise",
-
-        # --- Time horizon: AdamW then L-BFGS (see T1SweepCandidate adam_epochs / epochs) ---
-        "TIER1_EPOCHS": "60",
-        "TIER1_ADAM_EPOCHS": "40",
+        "TIER1_EPOCHS": "30",
+        "TIER1_ADAM_EPOCHS": "30",
         "TIER1_DATA_STAGE_EPOCHS": "10",
         "TIER1_LAMBDA_CONT": "1.0",
         "TIER1_LAMBDA_CONT_START": "0.1",
         "TIER1_LAMBDA_CONT_WARMUP_EPOCHS": "10",
+        "TIER1_TARGET_ANCHOR_FRACTION": "0.5",
     }
 
     def _env_for(cfg: T1ExplorerConfig) -> Dict[str, str]:
@@ -350,7 +324,6 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_LATENT_DIM": str(cfg.latent_dim),
             "TIER1_DEQ_MAX_ITERS": str(cfg.deq_max_iters),
             "TIER1_NUM_FOURIER_FREQS": str(cfg.num_fourier_freqs),
-            "TIER1_KINEMATICS_MODE": cfg.kinematics_mode,
             "TIER1_NS_DERIVATIVE_MODE": cfg.ns_derivative_mode,
             "TIER1_ACTIVATION_FN": cfg.activation_fn,
             "TIER1_FOURIER_BASE": str(cfg.fourier_base),
@@ -363,72 +336,97 @@ def build_sweep_candidates() -> List[T1SweepCandidate]:
             "TIER1_PRESSURE_BC_MODE": cfg.pressure_bc_mode,
             "TIER1_MOMENTUM_LOSS_MODE": cfg.momentum_loss_mode,
             "TIER1_USE_HARD_BCS": ("1" if cfg.use_hard_bcs else "0"),
-            "TIER1_GLOBAL_POOL_MODE": cfg.global_pool_mode,
             "TIER1_NUM_GLOBAL_TOKENS": str(cfg.num_global_tokens),
-            "TIER1_USE_EQUIVARIANT": ("1" if cfg.use_equivariant_conv else "0"),
             "TIER1_USE_SIREN": ("1" if cfg.use_siren_decoder else "0"),
             "TIER1_USE_WIDTH_PRIORS": ("1" if cfg.use_width_priors else "0"),
         }
 
-    common_kwargs = dict(
+    candidates: List[T1SweepCandidate] = []
+
+    # --- Candidate 1: Pure GNN with WLS (Baseline) ---
+    cfg_gnn_wls = T1ExplorerConfig(
+        experiment_name="V3_GNN_WLS",
         dataset_tier="tier1",
-        loss_weight_mode="dynamic",
         latent_dim=256,
         deq_max_iters=25,
+        ns_derivative_mode="wls",
+        use_siren_decoder=False,  # Discrete representation
+        use_hard_bcs=True,
+        use_width_priors=True,
+    )
+    candidates.append(
+        T1SweepCandidate(
+            name=cfg_gnn_wls.experiment_name,
+            explorer=cfg_gnn_wls,
+            env_overrides={**_env_for(cfg_gnn_wls), **base_overrides},
+            epochs=30,
+            warm_up_epochs=5,
+            adam_epochs=30,
+        )
     )
 
-    sweep_configs: List[T1ExplorerConfig] = [
-        T1ExplorerConfig(
-            experiment_name="V3_Baseline_Legacy",
-            use_hard_bcs=False,
-            global_pool_mode="mean",
-            use_width_priors=False,
-            use_siren_decoder=False,
-            **common_kwargs,
-        ),
-        T1ExplorerConfig(
-            experiment_name="V3_Attention_MultiGrid",
-            use_hard_bcs=True,
-            global_pool_mode="attention",
-            use_width_priors=False,
-            use_siren_decoder=False,
-            **common_kwargs,
-        ),
-        T1ExplorerConfig(
-            experiment_name="V3_Geometric_Priors",
-            use_hard_bcs=True,
-            global_pool_mode="mean",
-            use_width_priors=True,
-            use_siren_decoder=False,
-            **common_kwargs,
-        ),
-        T1ExplorerConfig(
-            experiment_name="V3_SIREN_Implicit",
-            use_hard_bcs=True,
-            global_pool_mode="mean",
-            use_width_priors=False,
-            use_siren_decoder=True,
-            **common_kwargs,
-        ),
-    ]
-
-    candidates: List[T1SweepCandidate] = []
-    for cfg in sweep_configs:
-        env = {
-            **_env_for(cfg),
-            **base_overrides,
-            "TIER1_TARGET_ANCHOR_FRACTION": "0.7",
-        }
-        candidates.append(
-            T1SweepCandidate(
-                name=cfg.experiment_name,
-                explorer=cfg,
-                env_overrides=env,
-                epochs=60,
-                warm_up_epochs=5,
-                adam_epochs=40,
-            )
+    # --- Candidate 2: Hybrid SIREN with WLS ---
+    cfg_siren_wls = T1ExplorerConfig(
+        experiment_name="V3_SIREN_WLS",
+        dataset_tier="tier1",
+        latent_dim=256,
+        deq_max_iters=25,
+        ns_derivative_mode="wls",
+        use_siren_decoder=True,  # Continuous representation
+        use_hard_bcs=True,
+        use_width_priors=True,
+    )
+    candidates.append(
+        T1SweepCandidate(
+            name=cfg_siren_wls.experiment_name,
+            explorer=cfg_siren_wls,
+            env_overrides={**_env_for(cfg_siren_wls), **base_overrides},
+            epochs=30,
+            warm_up_epochs=5,
+            adam_epochs=30,
         )
+    )
+
+    # --- Candidate 3: Pure PINN (SIREN + Autograd) ---
+    cfg_siren_auto = T1ExplorerConfig(
+        experiment_name="V3_SIREN_AUTOGRAD",
+        dataset_tier="tier1",
+        latent_dim=256,
+        deq_max_iters=25,
+        ns_derivative_mode="autograd",
+        use_siren_decoder=True,  # Mandatory for Autograd
+        use_hard_bcs=True,
+        use_width_priors=True,
+    )
+    candidates.append(
+        T1SweepCandidate(
+            name=cfg_siren_auto.experiment_name,
+            explorer=cfg_siren_auto,
+            env_overrides={**_env_for(cfg_siren_auto), **base_overrides},
+            epochs=30,
+            warm_up_epochs=5,
+            adam_epochs=30,
+        )
+    )
+
+    only = os.environ.get("TIER1_SWEEP_ONLY", "").strip()
+    last_only = os.environ.get("TIER1_SWEEP_LAST_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+    if only:
+        filtered = [c for c in candidates if c.name == only]
+        if not filtered:
+            raise ValueError(
+                f"TIER1_SWEEP_ONLY={only!r} did not match any candidate name "
+                f"({[c.name for c in candidates]})."
+            )
+        candidates = filtered
+        print(f"🔎 TIER1_SWEEP_ONLY={only!r}: running 1 candidate (diary + sweep report preserved).")
+    elif last_only:
+        candidates = [candidates[-1]]
+        print(
+            "🔎 TIER1_SWEEP_LAST_ONLY=1: running last candidate only → "
+            f"{candidates[0].name!r} (diary + sweep report preserved)."
+        )
+
     return candidates
 
 
@@ -507,7 +505,7 @@ def _parse_last_validation_from_diary(
     """Extract the last ``validation`` event from a candidate's training diary JSONL."""
     # The diary path is not stored in the run dict, but we can find it by
     # scanning the reports directory for the diary started closest to the run.
-    # Simpler: the trainer stores it in the run result under an undocumented key
+    # Simpler: training could store it in the run result under an undocumented key
     # or we can search by candidate name timestamp.  Since we don't have a
     # guaranteed pointer, we try a robust fallback chain.
     rep = reports_dir()
@@ -593,7 +591,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
             "sweep_name": sweep_name,
             "ts_utc": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
             "run_folder": str(sweep_dir),
-            "sweep_defaults": {"epochs": 60, "warm_up_epochs": 5, "adam_epochs": 40},
+            "sweep_defaults": {"epochs": 30, "warm_up_epochs": 5, "adam_epochs": 30},
             "interrupted": interrupted,
             "active_candidate_when_stopped": state["active_candidate"],
             "elapsed_minutes": (time.time() - started_at) / 60.0,
@@ -701,7 +699,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
             epochs=1,
             warm_up_epochs=0,
             adam_epochs=1,
-            explorer=None,  # Force the trainer to read from os.environ
+            explorer=None,  # Force train_t1_predictor to read explorer fields from os.environ
         )
         sanity = {
             "enabled": True,
@@ -794,7 +792,7 @@ def run_sweep(sweep_name: str = "default") -> Path:
                 epochs=cand.epochs,
                 warm_up_epochs=cand.warm_up_epochs,
                 adam_epochs=cand.adam_epochs,
-                explorer=None,  # Force the trainer to read from os.environ
+                explorer=None,  # Force train_t1_predictor to read explorer fields from os.environ
             )
             if result is None:
                 result = {"status": "unknown"}

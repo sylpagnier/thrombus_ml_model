@@ -1,25 +1,36 @@
 """
-Tier 3 export/graph inspector (restored + modernized, non-interactive first).
+Tier 3 export / graph inspector: boundary checks, unit audits, summaries, and matplotlib views.
+
+**Default:** one patient at a time — **brief** availability line, qualitative text (boundaries, unit audit, graph
+summary) for **that** stem only, then **one** matplotlib window (domain time-slider if multi-``@ t=``, else a
+single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). **Regenerate Random Patient** /
+``r`` cycles stems like ``inspect_phase1_data``. For the **full** stems/times table use ``--summary``.
 
 Examples:
+    python -m src.tools.inspect_tier3_data --tier tier3_patients
     python -m src.tools.inspect_tier3_data --tier tier3_patients --summary
+    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem patient001
     python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --unit-audit
     python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --graph-summary
+    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --plot-domain
+    python -m src.tools.inspect_tier3_data --tier tier3_mix --plot-domain-interactive
+    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --plot-graph
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import re
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from matplotlib.widgets import Button, Slider
 from scipy.spatial import cKDTree
-
 from src.config import BiochemConfig, VesselConfig
-from src.utils.paths import get_project_root
 
 
 FIELD_COLUMNS = [
@@ -42,6 +53,8 @@ FIELD_COLUMNS = [
     "Mas",
     "Mat",
 ]
+
+_TIER_CHOICES = ("tier3", "tier3_patients", "tier3_mix")
 
 
 def _resolve_export_dir(tier: str) -> Path:
@@ -76,6 +89,9 @@ def _parse_times_from_header(domain_file: Path) -> list[float]:
     return times
 
 
+VARS_PER_COMSOL_STEP = 18  # Wide COMSOL export: x,y + 16 fields per time column-group
+
+
 def _load_first_block(domain_file: Path, sample_rows: int = 100000) -> pd.DataFrame:
     df_full = pd.read_csv(domain_file, comment="%", sep=r"\s+", header=None, nrows=sample_rows)
     if df_full.shape[1] < 20:
@@ -83,6 +99,514 @@ def _load_first_block(domain_file: Path, sample_rows: int = 100000) -> pd.DataFr
     df = df_full.iloc[:, 2:20].copy()
     df.columns = FIELD_COLUMNS
     return df
+
+
+def _load_comsol_trajectory(domain_file: Path) -> tuple[list[float], dict[float, pd.DataFrame]]:
+    """Parse wide-format Tier3 COMSOL domain ``.txt`` (same layout as ``extract_tier3_comsol_data``)."""
+    with open(domain_file, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    header_line = ""
+    for line in lines:
+        if line.startswith("% x") and "@ t=" in line:
+            header_line = line
+            break
+
+    df_full = pd.read_csv(domain_file, comment="%", sep=r"\s+", header=None)
+    ncol = int(df_full.shape[1])
+
+    if not header_line or ncol < 2 + VARS_PER_COMSOL_STEP:
+        df0 = df_full.iloc[:, 2:20].copy()
+        df0.columns = FIELD_COLUMNS
+        return [0.0], {0.0: df0}
+
+    times: list[float] = []
+    for m in re.finditer(r"t=([0-9.]+)", header_line):
+        t_val = float(m.group(1))
+        if t_val not in times:
+            times.append(t_val)
+
+    if not times:
+        df0 = df_full.iloc[:, 2:20].copy()
+        df0.columns = FIELD_COLUMNS
+        return [0.0], {0.0: df0}
+
+    time_blocks: dict[float, pd.DataFrame] = {}
+    for i, t_val in enumerate(times):
+        start_col = 2 + i * VARS_PER_COMSOL_STEP
+        end_col = start_col + VARS_PER_COMSOL_STEP
+        if end_col > ncol:
+            raise ValueError(
+                f"{domain_file.name}: header lists {len(times)} times but columns only reach {ncol} "
+                f"(need up to {end_col} for step {i})."
+            )
+        df_step = df_full.iloc[:, start_col:end_col].copy()
+        df_step.columns = FIELD_COLUMNS
+        time_blocks[t_val] = df_step
+
+    return times, time_blocks
+
+
+def _subsample_node_idx(num_nodes: int, max_points: int) -> np.ndarray:
+    if num_nodes <= max_points:
+        return np.arange(num_nodes, dtype=np.int64)
+    rng = np.random.default_rng(0)
+    return np.sort(rng.choice(num_nodes, size=max_points, replace=False))
+
+
+def _list_graph_stems(graph_dir: Path) -> list[str]:
+    if not graph_dir.exists():
+        return []
+    return sorted(p.stem for p in graph_dir.glob("*.pt"))
+
+
+def _stem_candidates_union(export_dir: Path, graph_dir: Path) -> list[str]:
+    return sorted(set(_domain_txt_stems(export_dir)) | set(_list_graph_stems(graph_dir)))
+
+
+def _attach_regenerate_patient_button(
+    fig: plt.Figure,
+    *,
+    current_stem: str,
+    all_stems: list[str],
+    next_holder: dict[str, str | None],
+    enable: bool,
+) -> None:
+    """Bottom-right button + ``r`` hotkey to switch to another patient (same stem list as phase1 anchor)."""
+    if not enable or len(all_stems) <= 1:
+        return
+
+    def _go(_event=None) -> None:
+        candidates = [s for s in all_stems if s != current_stem]
+        if not candidates:
+            print("Only one patient available; cannot regenerate.")
+            return
+        nxt = random.choice(candidates)
+        print(f"\nRegenerating to patient: {nxt}")
+        next_holder["value"] = nxt
+        plt.close(fig)
+
+    btn_ax = fig.add_axes([0.74, 0.02, 0.23, 0.05])
+    Button(btn_ax, "Regenerate Random Patient").on_clicked(_go)
+    fig.canvas.mpl_connect(
+        "key_press_event",
+        lambda e: _go() if getattr(e, "key", None) == "r" else None,
+    )
+
+
+def plot_domain_trajectory_slider(
+    stem: str,
+    export_dir: Path,
+    *,
+    max_points: int = 65_000,
+    regen_stems: list[str] | None = None,
+    next_holder: dict[str, str | None] | None = None,
+    current_stem_for_regen: str | None = None,
+    enable_regenerate: bool = True,
+) -> None:
+    """Scroll through COMSOL domain snapshots in time (wide export), fixed color scales across times."""
+    domain_file = export_dir / f"{stem}.txt"
+    _times_hdr, blocks = _load_comsol_trajectory(domain_file)
+    times_sorted = sorted(blocks.keys())
+    df0 = blocks[times_sorted[0]]
+    n = len(df0)
+    idx = _subsample_node_idx(n, max_points)
+    x_s = df0["x"].to_numpy(dtype=np.float64)[idx]
+    y_s = df0["y"].to_numpy(dtype=np.float64)[idx]
+    tree = cKDTree(df0[["x", "y"]].values)
+    m_in = _boundary_mask(export_dir / f"{stem}_inlet.txt", tree, n)[idx]
+    m_out = _boundary_mask(export_dir / f"{stem}_outlet.txt", tree, n)[idx]
+    m_wall = _boundary_mask(export_dir / f"{stem}_wall.txt", tree, n)[idx]
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    t_axis = np.array(times_sorted, dtype=np.float64)
+    t_count = len(times_sorted)
+    vel = np.zeros((t_count, idx.size), dtype=np.float64)
+    p_all = np.zeros((t_count, idx.size), dtype=np.float64)
+    th_all = np.zeros((t_count, idx.size), dtype=np.float64)
+    for ti, tv in enumerate(times_sorted):
+        dfi = blocks[tv].iloc[idx].reset_index(drop=True)
+        u = dfi["u"].to_numpy(dtype=np.float64)
+        v = dfi["v"].to_numpy(dtype=np.float64)
+        vel[ti] = np.sqrt(u**2 + v**2)
+        p_all[ti] = dfi["p"].to_numpy(dtype=np.float64)
+        th_all[ti] = dfi["th"].to_numpy(dtype=np.float64)
+
+    vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
+    p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
+    th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
+    plt.subplots_adjust(bottom=bottom, hspace=0.25)
+    ti0 = 0
+    fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[ti0]:.6g})", fontsize=14, fontweight="bold")
+
+    sc0 = axs[0, 0].scatter(x_s, y_s, c=vel[ti0], cmap="viridis", s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
+    fig.colorbar(sc0, ax=axs[0, 0], label="|U|")
+    axs[0, 0].set_title("|U|")
+    sc1 = axs[0, 1].scatter(x_s, y_s, c=p_all[ti0], cmap="coolwarm", s=2, vmin=p_vmin, vmax=p_vmax, rasterized=True)
+    fig.colorbar(sc1, ax=axs[0, 1], label="p")
+    axs[0, 1].set_title("Pressure")
+    sc2 = axs[1, 0].scatter(x_s, y_s, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
+    fig.colorbar(sc2, ax=axs[1, 0], label="th")
+    axs[1, 0].set_title("th")
+    sc3 = axs[1, 1].scatter(x_s, y_s, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(sc3, ax=axs[1, 1], ticks=[0, 1, 2, 3])
+    axs[1, 1].set_title("BC category (static mesh)")
+
+    for ax in axs.flat:
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    if t_count > 1:
+        s_y = 0.09 if (regen_stems and next_holder is not None and enable_regenerate) else 0.02
+        ax_slider = plt.axes((0.2, s_y, 0.52, 0.03))
+        slider = Slider(
+            ax_slider,
+            "Time index",
+            valmin=0,
+            valmax=t_count - 1,
+            valinit=0,
+            valstep=1,
+            color="teal",
+        )
+
+        def _upd(_val: float) -> None:
+            k = int(slider.val)
+            sc0.set_array(vel[k])
+            sc1.set_array(p_all[k])
+            sc2.set_array(th_all[k])
+            fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[k]:.6g})", fontsize=14, fontweight="bold")
+            fig.canvas.draw_idle()
+
+        slider.on_changed(_upd)
+
+    if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
+        _attach_regenerate_patient_button(
+            fig,
+            current_stem=current_stem_for_regen,
+            all_stems=regen_stems,
+            next_holder=next_holder,
+            enable=enable_regenerate,
+        )
+
+    plt.show()
+
+
+def plot_graph_trajectory_slider(
+    data,
+    stem: str,
+    *,
+    max_points: int = 65_000,
+    regen_stems: list[str] | None = None,
+    next_holder: dict[str, str | None] | None = None,
+    current_stem_for_regen: str | None = None,
+    enable_regenerate: bool = True,
+) -> None:
+    """Time slider for transient graph labels ``y`` shaped ``[T, N, C]`` (Tier3 trajectories)."""
+    y = data.y
+    if not torch.is_tensor(y):
+        y = torch.as_tensor(y)
+    y = y.float().cpu().numpy()
+    if y.ndim != 3 or y.shape[0] < 2:
+        return
+
+    t_tensor = getattr(data, "t", None)
+    if t_tensor is None:
+        t_axis = np.arange(y.shape[0], dtype=np.float64)
+    else:
+        t_axis = t_tensor.detach().cpu().numpy().reshape(-1)
+
+    t_count, n, c = y.shape
+    pos = data.x[:, :2].detach().cpu().numpy()
+    idx = _subsample_node_idx(n, max_points)
+    x_s, y_coord = pos[idx, 0], pos[idx, 1]
+
+    u = y[:, idx, 0]
+    v = y[:, idx, 1]
+    vel = np.sqrt(u**2 + v**2)
+    p_all = y[:, idx, 2]
+    th_ch = min(11, c - 1)
+    th_all = y[:, idx, th_ch]
+
+    vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
+    p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
+    th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
+
+    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)[idx]
+    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)[idx]
+    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)[idx]
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
+    plt.subplots_adjust(bottom=bottom, hspace=0.25)
+    ti0 = 0
+    fig.suptitle(
+        f"Tier3 graph labels — {stem}  (t={float(t_axis[ti0]):.6g})",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    sc0 = axs[0, 0].scatter(x_s, y_coord, c=vel[ti0], cmap="viridis", s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
+    fig.colorbar(sc0, ax=axs[0, 0], label="|U|")
+    axs[0, 0].set_title("|U| (y)")
+    sc1 = axs[0, 1].scatter(x_s, y_coord, c=p_all[ti0], cmap="coolwarm", s=2, vmin=p_vmin, vmax=p_vmax, rasterized=True)
+    fig.colorbar(sc1, ax=axs[0, 1], label="p")
+    axs[0, 1].set_title("p (y)")
+    sc2 = axs[1, 0].scatter(x_s, y_coord, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
+    fig.colorbar(sc2, ax=axs[1, 0], label=f"ch{th_ch}")
+    axs[1, 0].set_title("th / channel")
+    sc3 = axs[1, 1].scatter(x_s, y_coord, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(sc3, ax=axs[1, 1], ticks=[0, 1, 2, 3])
+    axs[1, 1].set_title("BC masks")
+
+    for ax in axs.flat:
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    s_y = 0.09 if (regen_stems and next_holder is not None and enable_regenerate) else 0.02
+    ax_slider = plt.axes((0.2, s_y, 0.52, 0.03))
+    slider = Slider(
+        ax_slider,
+        "Time index",
+        valmin=0,
+        valmax=t_count - 1,
+        valinit=0,
+        valstep=1,
+        color="teal",
+    )
+
+    def _upd(_val: float) -> None:
+        k = int(slider.val)
+        sc0.set_array(vel[k])
+        sc1.set_array(p_all[k])
+        sc2.set_array(th_all[k])
+        tt = float(t_axis[k]) if k < len(t_axis) else float(k)
+        fig.suptitle(f"Tier3 graph labels — {stem}  (t={tt:.6g})", fontsize=14, fontweight="bold")
+        fig.canvas.draw_idle()
+
+    slider.on_changed(_upd)
+
+    if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
+        _attach_regenerate_patient_button(
+            fig,
+            current_stem=current_stem_for_regen,
+            all_stems=regen_stems,
+            next_holder=next_holder,
+            enable=enable_regenerate,
+        )
+
+    plt.show()
+
+
+def _plot_domain_single_time_dashboard(
+    stem: str,
+    export_dir: Path,
+    sample_rows: int,
+    *,
+    regen_stems: list[str],
+    next_holder: dict[str, str | None],
+    current_stem_for_regen: str,
+    enable_regenerate: bool,
+) -> None:
+    """One COMSOL time slice (narrow / first block), 2×2 + optional patient Regenerate."""
+    domain_file = export_dir / f"{stem}.txt"
+    df = _load_first_block(domain_file, sample_rows=sample_rows)
+    x = df["x"].to_numpy(dtype=np.float64)
+    y = df["y"].to_numpy(dtype=np.float64)
+    u = df["u"].to_numpy(dtype=np.float64)
+    v = df["v"].to_numpy(dtype=np.float64)
+    p = df["p"].to_numpy(dtype=np.float64)
+    vel = np.sqrt(u**2 + v**2)
+    m_in, m_out, m_wall, _ = _domain_boundary_masks(stem, export_dir, df)
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    plt.subplots_adjust(bottom=0.18, hspace=0.25)
+    fig.suptitle(f"Tier3 domain (single time) — {stem}", fontsize=14, fontweight="bold")
+    ax = axes.flatten()
+    s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+    fig.colorbar(s0, ax=ax[0], label="|U|")
+    ax[0].set_title("|U|")
+    s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
+    fig.colorbar(s1, ax=ax[1], label="p")
+    ax[1].set_title("Pressure")
+    s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], label="th")
+    ax[2].set_title("th")
+    s3 = ax[3].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(s3, ax=ax[3], ticks=[0, 1, 2, 3])
+    ax[3].set_title("BC category ('r' / Regenerate)")
+    for a in ax:
+        a.set_aspect("equal")
+        a.axis("off")
+    _attach_regenerate_patient_button(
+        fig,
+        current_stem=current_stem_for_regen,
+        all_stems=regen_stems,
+        next_holder=next_holder,
+        enable=enable_regenerate,
+    )
+    plt.show()
+
+
+def _plot_graph_steady_dashboard_with_regen(
+    data,
+    stem: str,
+    *,
+    regen_stems: list[str],
+    next_holder: dict[str, str | None],
+    current_stem_for_regen: str,
+    enable_regenerate: bool,
+) -> None:
+    pos = data.x[:, :2].detach().cpu().numpy()
+    y_s = data.y
+    if not torch.is_tensor(y_s):
+        y_s = torch.as_tensor(y_s)
+    y_s = y_s.float().cpu().numpy()
+    if y_s.ndim != 2:
+        return
+    u, v = y_s[:, 0], y_s[:, 1]
+    pr = y_s[:, 2] if y_s.shape[1] > 2 else np.zeros_like(u)
+    vel = np.sqrt(u**2 + v**2)
+    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
+    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
+    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    plt.subplots_adjust(bottom=0.18, hspace=0.25)
+    fig.suptitle(f"Tier3 graph (steady) — {stem}", fontsize=14, fontweight="bold")
+    ax = axes.flatten()
+    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+    fig.colorbar(s0, ax=ax[0], label="|U|")
+    ax[0].set_title("|U|")
+    s1 = ax[1].scatter(pos[:, 0], pos[:, 1], c=pr, cmap="coolwarm", s=2, rasterized=True)
+    fig.colorbar(s1, ax=ax[1], label="p")
+    ax[1].set_title("p")
+    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], ticks=[0, 1, 2, 3])
+    ax[2].set_title("BC")
+    mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
+    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+    fig.colorbar(s3, ax=ax[3])
+    ax[3].set_title("μ / ch3")
+    for a in ax:
+        a.set_aspect("equal")
+        a.axis("off")
+    _attach_regenerate_patient_button(
+        fig,
+        current_stem=current_stem_for_regen,
+        all_stems=regen_stems,
+        next_holder=next_holder,
+        enable=enable_regenerate,
+    )
+    plt.show()
+
+
+def run_tier3_default_inspector(
+    export_dir: Path,
+    graph_dir: Path,
+    *,
+    start_stem: str | None,
+    sample_rows: int,
+    enable_regenerate: bool = True,
+) -> None:
+    """One patient per figure; qualitative lines + matplotlib; Regenerate picks another stem (phase1-style)."""
+    all_stems = _stem_candidates_union(export_dir, graph_dir)
+    if not all_stems:
+        print("No domain *.txt or graph *.pt found.")
+        return
+
+    n_show = min(5, len(all_stems))
+    preview = ", ".join(all_stems[:n_show]) + (" …" if len(all_stems) > n_show else "")
+    print(f"\n{len(all_stems)} patient(s) available [{preview}]. One window at a time.\n")
+
+    current = start_stem if (start_stem in all_stems) else random.choice(all_stems)
+    enable_btn = enable_regenerate and len(all_stems) > 1
+
+    while True:
+        next_holder: dict[str, str | None] = {"value": None}
+        print(f"--- Patient: {current} ---")
+        domain_path = export_dir / f"{current}.txt"
+        graph_path = graph_dir / f"{current}.pt"
+
+        if domain_path.exists():
+            try:
+                inspect_boundaries(current, export_dir)
+            except Exception as exc:
+                print(f"(boundaries skipped: {exc})")
+            try:
+                audit_units(current, export_dir, sample_rows=max(1000, sample_rows))
+            except Exception as exc:
+                print(f"(unit audit skipped: {exc})")
+        if graph_path.exists():
+            try:
+                summarize_graph(current, graph_dir)
+            except Exception as exc:
+                print(f"(graph summary skipped: {exc})")
+
+        if domain_path.exists():
+            try:
+                _t, blocks = _load_comsol_trajectory(domain_path)
+                if len(blocks) > 1:
+                    plot_domain_trajectory_slider(
+                        current,
+                        export_dir,
+                        regen_stems=all_stems,
+                        next_holder=next_holder,
+                        current_stem_for_regen=current,
+                        enable_regenerate=enable_btn,
+                    )
+                else:
+                    _plot_domain_single_time_dashboard(
+                        current,
+                        export_dir,
+                        sample_rows,
+                        regen_stems=all_stems,
+                        next_holder=next_holder,
+                        current_stem_for_regen=current,
+                        enable_regenerate=enable_btn,
+                    )
+            except Exception as exc:
+                print(f"Domain plot failed ({exc}).")
+                return
+
+        elif graph_path.exists():
+            try:
+                data = torch.load(graph_path, map_location="cpu", weights_only=False)
+                y = getattr(data, "y", None)
+                if y is not None and torch.is_tensor(y) and y.dim() == 3 and y.shape[0] > 1:
+                    plot_graph_trajectory_slider(
+                        data,
+                        current,
+                        regen_stems=all_stems,
+                        next_holder=next_holder,
+                        current_stem_for_regen=current,
+                        enable_regenerate=enable_btn,
+                    )
+                elif y is not None and torch.is_tensor(y) and y.dim() == 2:
+                    _plot_graph_steady_dashboard_with_regen(
+                        data,
+                        current,
+                        regen_stems=all_stems,
+                        next_holder=next_holder,
+                        current_stem_for_regen=current,
+                        enable_regenerate=enable_btn,
+                    )
+                else:
+                    print("(Graph y not 2D/3D — nothing to plot.)")
+            except Exception as exc:
+                print(f"Graph plot failed ({exc}).")
+                return
+        else:
+            print(f"No domain or graph file for stem {current!r}.")
+            return
+
+        if next_holder["value"] is None:
+            break
+        current = next_holder["value"]
 
 
 def _boundary_mask(boundary_file: Path, tree: cKDTree, num_nodes: int, tolerance: float = 1e-6) -> np.ndarray:
@@ -127,18 +651,17 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
     df = _load_first_block(domain_file, sample_rows=sample_rows)
     bio = BiochemConfig(tier="tier3")
 
-    # Expected rough CGS baselines from config.
     expected_cgs = {
-        "rp": bio.c_RP0 / 1e6,  # plt/ml
-        "ap": (0.05 * bio.c_RP0) / 1e6,  # plt/ml
-        "apr": bio.APRcrit * 1e3,  # uM
-        "aps": bio.APScrit * 1e3,  # uM
-        "PT": bio.c_pT0 * 1e3,  # uM
-        "th": bio.Tcrit * 1e3,  # uM
-        "at": bio.cAT0 * 1e3,  # uM
-        "fg": bio.c_Fg0 * 1e3,  # uM
-        "fi": bio.c_Fg0 * 1e3,  # uM proxy
-        "M": bio.Minf / 1e4,  # plt/cm^2
+        "rp": bio.c_RP0 / 1e6,
+        "ap": (0.05 * bio.c_RP0) / 1e6,
+        "apr": bio.APRcrit * 1e3,
+        "aps": bio.APScrit * 1e3,
+        "PT": bio.c_pT0 * 1e3,
+        "th": bio.Tcrit * 1e3,
+        "at": bio.cAT0 * 1e3,
+        "fg": bio.c_Fg0 * 1e3,
+        "fi": bio.c_Fg0 * 1e3,
+        "M": bio.Minf / 1e4,
         "Mas": bio.Minf / 1e4,
         "Mat": bio.Minf / 1e4,
     }
@@ -199,15 +722,286 @@ def print_summary_table(tier: str, export_dir: Path, graph_dir: Path) -> None:
         print(f"{stem:<24} {len(times):>6} {str(g_exists):>8}")
 
 
+def _domain_boundary_masks(stem: str, export_dir: Path, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    tree = cKDTree(df[["x", "y"]].values)
+    n = len(df)
+    m_in = _boundary_mask(export_dir / f"{stem}_inlet.txt", tree, n)
+    m_out = _boundary_mask(export_dir / f"{stem}_outlet.txt", tree, n)
+    m_wall = _boundary_mask(export_dir / f"{stem}_wall.txt", tree, n)
+    m_int = ~(m_in | m_out | m_wall)
+    return m_in, m_out, m_wall, m_int
+
+
+def _bc_category_color(m_in: np.ndarray, m_out: np.ndarray, m_wall: np.ndarray) -> np.ndarray:
+    """Scalar category per node for scatter coloring."""
+    cat = np.zeros(len(m_in), dtype=np.float32)
+    cat[m_in] = 1.0
+    cat[m_out] = 2.0
+    cat[m_wall] = 3.0
+    return cat
+
+
+def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000) -> None:
+    """Scatter / quiver for the first loaded block of ``{stem}.txt`` (same sampling as audits)."""
+    domain_file = export_dir / f"{stem}.txt"
+    if not domain_file.exists():
+        raise FileNotFoundError(f"Missing domain export: {domain_file}")
+    df = _load_first_block(domain_file, sample_rows=sample_rows)
+    x = df["x"].to_numpy(dtype=np.float64)
+    y = df["y"].to_numpy(dtype=np.float64)
+    u = df["u"].to_numpy(dtype=np.float64)
+    v = df["v"].to_numpy(dtype=np.float64)
+    p = df["p"].to_numpy(dtype=np.float64)
+    mu = df["mu_eff"].to_numpy(dtype=np.float64)
+    vel = np.sqrt(u**2 + v**2)
+
+    m_in, m_out, m_wall, _ = _domain_boundary_masks(stem, export_dir, df)
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+    ax = axes.flatten()
+
+    s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+    fig.colorbar(s0, ax=ax[0], label="|U|")
+    ax[0].set_title("|U|")
+    s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
+    fig.colorbar(s1, ax=ax[1], label="p")
+    ax[1].set_title("Pressure")
+    s2 = ax[2].scatter(x, y, c=mu, cmap="magma", s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], label="mu_eff")
+    ax[2].set_title("mu_eff")
+
+    s3 = ax[3].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
+    fig.colorbar(s3, ax=ax[3], label="th")
+    ax[3].set_title("th (sample)")
+
+    s4 = ax[4].scatter(x, y, c=df["rp"].to_numpy(dtype=np.float64), cmap="cividis", s=2, rasterized=True)
+    fig.colorbar(s4, ax=ax[4], label="rp")
+    ax[4].set_title("rp (sample)")
+
+    scat_bc = ax[5].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(scat_bc, ax=ax[5], ticks=[0, 1, 2, 3], label="0=int 1=in 2=out 3=wall")
+    ax[5].set_title("BC category")
+
+    for a in ax:
+        a.set_aspect("equal")
+        a.axis("off")
+    fig.suptitle(f"Tier3 domain export — {stem} (first block, up to {sample_rows} rows)")
+    plt.tight_layout()
+    plt.show()
+
+
+def _y_slice_for_plot(data: Data) -> np.ndarray:
+    """Return a [N, C] numpy snapshot from ``data.y`` (steady or transient)."""
+    y = data.y
+    if not torch.is_tensor(y):
+        y = torch.as_tensor(y)
+    y = y.float().cpu()
+    if y.dim() == 3:
+        # [T, N, C] transient stores
+        y = y[-1]
+    return y.numpy()
+
+
+def plot_graph_static(stem: str, graph_dir: Path) -> None:
+    """Node scatter: kinematics + BC masks from a processed ``.pt`` graph."""
+    graph_file = graph_dir / f"{stem}.pt"
+    if not graph_file.exists():
+        raise FileNotFoundError(f"Missing graph file: {graph_file}")
+    data = torch.load(graph_file, map_location="cpu", weights_only=False)
+    pos = data.x[:, :2].detach().cpu().numpy()
+    y_s = _y_slice_for_plot(data)
+    u = y_s[:, 0]
+    v = y_s[:, 1]
+    pr = y_s[:, 2] if y_s.shape[1] > 2 else np.zeros_like(u)
+    vel = np.sqrt(u**2 + v**2)
+
+    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
+    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
+    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
+    bcat = _bc_category_color(m_in, m_out, m_wall)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    ax = axes.flatten()
+
+    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+    fig.colorbar(s0, ax=ax[0], label="|U| (labels)")
+    ax[0].set_title("|U| from y")
+    s1 = ax[1].scatter(pos[:, 0], pos[:, 1], c=pr, cmap="coolwarm", s=2, rasterized=True)
+    fig.colorbar(s1, ax=ax[1], label="p")
+    ax[1].set_title("Pressure from y")
+    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], ticks=[0, 1, 2, 3])
+    ax[2].set_title("BC masks (decoded)")
+    mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
+    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+    fig.colorbar(s3, ax=ax[3], label="mu / extra")
+    ax[3].set_title("Channel 3+ (mu_nd or extra)")
+    for a in ax:
+        a.set_aspect("equal")
+        a.axis("off")
+    fig.suptitle(f"Tier3 graph — {stem}")
+    plt.tight_layout()
+    plt.show()
+
+
+def inspect_domain_interactive(*, export_dir: Path, start_stem: str | None, sample_rows: int) -> None:
+    stems = _domain_txt_stems(export_dir)
+    if not stems:
+        print(f"No domain stems in {export_dir}")
+        return
+    current = start_stem if start_stem in stems else random.choice(stems)
+
+    while True:
+        next_holder: dict[str, str | None] = {"value": None}
+        print(f"\nPlotting domain stem: {current}")
+        domain_file = export_dir / f"{current}.txt"
+        df = _load_first_block(domain_file, sample_rows=sample_rows)
+        x = df["x"].to_numpy(dtype=np.float64)
+        y = df["y"].to_numpy(dtype=np.float64)
+        u = df["u"].to_numpy(dtype=np.float64)
+        v = df["v"].to_numpy(dtype=np.float64)
+        p = df["p"].to_numpy(dtype=np.float64)
+        vel = np.sqrt(u**2 + v**2)
+        m_in, m_out, m_wall, _ = _domain_boundary_masks(current, export_dir, df)
+        bcat = _bc_category_color(m_in, m_out, m_wall)
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        ax = axes.flatten()
+        s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+        fig.colorbar(s0, ax=ax[0], label="|U|")
+        ax[0].set_title(f"|U| — {current}")
+        s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
+        fig.colorbar(s1, ax=ax[1], label="p")
+        ax[1].set_title("Pressure")
+        s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
+        fig.colorbar(s2, ax=ax[2], label="th")
+        ax[2].set_title("th")
+        s3 = ax[3].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+        fig.colorbar(s3, ax=ax[3], ticks=[0, 1, 2, 3])
+        ax[3].set_title("BC category (press 'r' or Regenerate)")
+        for a in ax:
+            a.set_aspect("equal")
+            a.axis("off")
+        plt.tight_layout()
+
+        candidates = [s for s in stems if s != current]
+
+        def _regen() -> None:
+            if len(candidates) == 0:
+                print("Only one stem; cannot pick another.")
+                return
+            nxt = random.choice(candidates)
+            print(f"\nRegenerating domain view: {nxt}")
+            next_holder["value"] = nxt
+            plt.close(fig)
+
+        if len(candidates) > 0:
+            btn_ax = fig.add_axes([0.72, 0.02, 0.25, 0.06])
+            Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+            fig.canvas.mpl_connect(
+                "key_press_event",
+                lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+            )
+        plt.show()
+        if next_holder["value"] is None:
+            break
+        current = next_holder["value"]
+
+
+def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> None:
+    stems = _list_graph_stems(graph_dir)
+    if not stems:
+        print(f"No *.pt graphs in {graph_dir}")
+        return
+    current = start_stem if start_stem in stems else random.choice(stems)
+
+    while True:
+        next_holder: dict[str, str | None] = {"value": None}
+        print(f"\nPlotting graph stem: {current}")
+        data = torch.load(graph_dir / f"{current}.pt", map_location="cpu", weights_only=False)
+        pos = data.x[:, :2].detach().cpu().numpy()
+        y_s = _y_slice_for_plot(data)
+        u, v = y_s[:, 0], y_s[:, 1]
+        vel = np.sqrt(u**2 + v**2)
+        m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
+        m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
+        m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
+        bcat = _bc_category_color(m_in, m_out, m_wall)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        s0 = axes[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+        fig.colorbar(s0, ax=axes[0], label="|U|")
+        axes[0].set_title(f"|U| — {current}")
+        s1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
+        fig.colorbar(s1, ax=axes[1], ticks=[0, 1, 2, 3])
+        axes[1].set_title("BC (press 'r' or Regenerate)")
+        for a in axes:
+            a.set_aspect("equal")
+            a.axis("off")
+        plt.tight_layout()
+        candidates = [s for s in stems if s != current]
+
+        def _regen() -> None:
+            if len(candidates) == 0:
+                print("Only one graph; cannot pick another.")
+                return
+            nxt = random.choice(candidates)
+            print(f"\nRegenerating graph view: {nxt}")
+            next_holder["value"] = nxt
+            plt.close(fig)
+
+        if len(candidates) > 0:
+            btn_ax = fig.add_axes([0.76, 0.02, 0.2, 0.08])
+            Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+            fig.canvas.mpl_connect(
+                "key_press_event",
+                lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+            )
+        plt.show()
+        if next_holder["value"] is None:
+            break
+        current = next_holder["value"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect tier3 exports and processed graphs.")
-    parser.add_argument("--tier", type=str, default="tier3_patients", choices=["tier3", "tier3_patients"])
+    parser.add_argument("--tier", type=str, default="tier3_patients", choices=list(_TIER_CHOICES))
     parser.add_argument("--stem", type=str, default=None, help="Stem name without extension (e.g. vessel_001).")
-    parser.add_argument("--summary", action="store_true", help="Print summary table for all stems.")
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print the stems/times/graph table only, then exit (no matplotlib).",
+    )
     parser.add_argument("--boundaries", action="store_true", help="Print boundary node counts for the selected stem.")
     parser.add_argument("--unit-audit", action="store_true", help="Run unit-magnitude audit for the selected stem.")
     parser.add_argument("--graph-summary", action="store_true", help="Print processed .pt summary for the selected stem.")
-    parser.add_argument("--sample-rows", type=int, default=50000, help="Rows to sample for unit audit.")
+    parser.add_argument("--sample-rows", type=int, default=50000, help="Rows to sample for unit audit and domain plots.")
+    parser.add_argument(
+        "--plot-domain",
+        action="store_true",
+        help="Matplotlib scatter/quiver snapshot of the domain export (first CSV block).",
+    )
+    parser.add_argument(
+        "--plot-domain-interactive",
+        action="store_true",
+        help="Interactive domain view with random stem regenerate (button / 'r').",
+    )
+    parser.add_argument(
+        "--plot-graph",
+        action="store_true",
+        help="Static plot of a processed graph .pt (labels + BC masks).",
+    )
+    parser.add_argument(
+        "--plot-graph-interactive",
+        action="store_true",
+        help="Interactive graph view with random stem regenerate (button / 'r').",
+    )
+    parser.add_argument(
+        "--no-regenerate",
+        action="store_true",
+        help="Default mode only: hide Regenerate Random Patient (single stem view).",
+    )
     args = parser.parse_args()
 
     export_dir = _resolve_export_dir(args.tier)
@@ -215,26 +1009,77 @@ def main() -> None:
     if not export_dir.exists():
         raise FileNotFoundError(f"Export dir does not exist: {export_dir}")
 
+    plot_flags = (
+        args.boundaries,
+        args.unit_audit,
+        args.graph_summary,
+        args.plot_domain,
+        args.plot_domain_interactive,
+        args.plot_graph,
+        args.plot_graph_interactive,
+    )
+    any_explicit = any(plot_flags)
+
     if args.summary:
         print_summary_table(args.tier, export_dir, graph_dir)
+        return
 
-    # Auto-select first stem when not explicitly provided.
+    if not any_explicit:
+        run_tier3_default_inspector(
+            export_dir,
+            graph_dir,
+            start_stem=args.stem,
+            sample_rows=max(1000, args.sample_rows),
+            enable_regenerate=not args.no_regenerate,
+        )
+        return
+
     stem = args.stem
-    if stem is None and (args.boundaries or args.unit_audit or args.graph_summary):
-        stems = _domain_txt_stems(export_dir)
-        if not stems:
-            raise FileNotFoundError(f"No domain txt files found in {export_dir}")
-        stem = stems[0]
+    needs_auto_stem = stem is None and any(plot_flags) and not (
+        args.plot_domain_interactive or args.plot_graph_interactive
+    )
+    if needs_auto_stem:
+        domain_stems = _domain_txt_stems(export_dir)
+        graph_stems = _list_graph_stems(graph_dir)
+        needs_domain = args.boundaries or args.unit_audit or args.plot_domain
+        needs_graph_file = args.plot_graph or args.graph_summary
+        if needs_graph_file:
+            if not graph_stems:
+                raise FileNotFoundError(f"No graph *.pt files in {graph_dir}")
+            stem = graph_stems[0]
+        elif needs_domain:
+            if not domain_stems:
+                raise FileNotFoundError(f"No domain *.txt stems in {export_dir}")
+            stem = domain_stems[0]
+        elif domain_stems:
+            stem = domain_stems[0]
+        elif graph_stems:
+            stem = graph_stems[0]
+        else:
+            raise FileNotFoundError(f"No domain txt or graph stems under {export_dir} / {graph_dir}")
 
-    if args.boundaries:
+    if args.boundaries and stem:
         inspect_boundaries(stem, export_dir)
-    if args.unit_audit:
+    if args.unit_audit and stem:
         audit_units(stem, export_dir, sample_rows=max(1000, args.sample_rows))
-    if args.graph_summary:
+    if args.graph_summary and stem:
         summarize_graph(stem, graph_dir)
 
-    if not any([args.summary, args.boundaries, args.unit_audit, args.graph_summary]):
-        print_summary_table(args.tier, export_dir, graph_dir)
+    if args.plot_domain and stem:
+        plot_domain_static(stem, export_dir, sample_rows=max(1000, args.sample_rows))
+
+    if args.plot_graph and stem:
+        plot_graph_static(stem, graph_dir)
+
+    if args.plot_domain_interactive:
+        inspect_domain_interactive(
+            export_dir=export_dir,
+            start_stem=args.stem,
+            sample_rows=max(1000, args.sample_rows),
+        )
+
+    if args.plot_graph_interactive:
+        inspect_graph_interactive(graph_dir=graph_dir, start_stem=args.stem)
 
 
 if __name__ == "__main__":
