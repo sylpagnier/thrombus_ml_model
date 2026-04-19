@@ -35,12 +35,12 @@ Training is driven by **self-contained scripts** that own dataloading loops, sch
 
 | Script | Role |
 |--------|------|
-| `src.training.train_t1_predictor` | Tier 1 GINO-DEQ warm-up; explorer / sweeps via `t1_explorer.py` and env vars (`TIER1_*`) |
+| `src.training.train_t1_predictor` | Tier 1 GINO-DEQ warm-up; `Tier1TrainConfig` / env vars (`TIER1_*`) |
 | `src.training.train_t2_predictor` | Tier 2 non-Newtonian predictor; may bootstrap from Tier 1 `GINO_DEQ` weights in `outputs/stage_a/` |
 | `src.training.train_t3_corrector` | Stage B: Tier 3 coupled corrector and graph semantics |
 | `src.training.physics_curriculum` | Curriculum helpers consumed by training scripts |
 
-Thin wrappers `train_t1.py` / `train_t2.py` delegate to the predictor entrypoints and exist so `python -m src.bin.main train t1` can resolve a small module surface.
+`python -m src.bin.main train t1` / `train t2` run the same modules as `train_t1_predictor` / `train_t2_predictor` (see `MODULE_MAP` in `src/bin/main.py`).
 
 ### Routers
 
@@ -63,7 +63,7 @@ There is **no** separate `src.main` package for training; use **`src.bin.orchest
 | Tier 1 only | `python -m src.training.train_t1_predictor` or `python -m src.bin.main train t1` |
 | Tier 2 only | `python -m src.training.train_t2_predictor` or `python -m src.bin.main train t2` |
 | Tier 3 only | `python -m src.training.train_t3_corrector` or `python -m src.bin.main train t3` |
-| Tier 1 explorer | `python -m src.training.t1_explorer` or `python -m src.bin.main train explore` |
+| Tier 1 (`explore` alias) | `python -m src.bin.main train explore` → same as `train t1` / `train_t1_predictor` |
 | Tier 1/2 datagen | `python -m src.data_gen.pipeline_tier12` |
 | Tier 3 datagen | `python -m src.data_gen.pipeline_tier3` |
 
@@ -90,7 +90,7 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 - **`src/core_physics/`** — PDE-consistent building blocks (fluid kinematics, rheology, biochem kernels, Anderson). Shared by training and tests.
 - **`src/architecture/`** — `GINO_DEQ`, DEQ loop, LoRA, SIREN decoder, Tier 3 model variants.
 - **`src/data_gen/`** — Top-level **pipelines** (`pipeline_tier12`, `pipeline_tier3`); **`lib/`** holds mesh/COMSOL/graph builders imported by those pipelines and re-exported from `src.data_gen`.
-- **`src/training/`** — Predictor and corrector **scripts** (`train_*_predictor`, `train_t3_corrector`), `physics_curriculum.py`, `t1_explorer.py`; import LoRA helpers from `src.architecture.lora_injection` when needed.
+- **`src/training/`** — Predictor and corrector **scripts** (`train_*_predictor`, `train_t3_corrector`), `physics_curriculum.py`; import LoRA helpers from `src.architecture.lora_injection` when needed.
 - **`src/evaluation/`** — Benchmark drivers, tier comparison plots (may reference checkpoint paths).
 - **`src/utils/`** — `paths`, `metrics`, `batching`, `rheology`, `units`, kinematics helpers (`kinematics_physics_terms`), training diary, inference helpers aligned with training.
 - **`src/bin/`** — `main.py` (unified CLI router), `orchestrate.py` (stage runner).

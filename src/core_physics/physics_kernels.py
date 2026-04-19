@@ -24,9 +24,9 @@ class PhysicsKernels:
         if self.momentum_loss_mode not in ("huber", "mse"):
             self.momentum_loss_mode = "huber"
         self.momentum_huber_delta = float(os.environ.get("TIER1_MOMENTUM_HUBER_DELTA", "0.01"))
-        self.pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "mean").strip().lower()
+        self.pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "pointwise").strip().lower()
         if self.pressure_bc_mode not in ("mean", "pointwise", "mean_var"):
-            self.pressure_bc_mode = "mean"
+            self.pressure_bc_mode = "pointwise"
 
         # ND Carreau bounds use the same scale as label channel STATE_CHANNEL_MU_EFF_ND
         _mu_nd_scale = self.cfg.mu_viscosity_nd_scale

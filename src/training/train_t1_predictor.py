@@ -7,9 +7,10 @@ checkpoint with the smallest ``val_composite_loss`` so far is written to ``tier1
 This scalar is unrelated to the training loss and is logged as ``best_val_composite_loss`` in
 experiment JSONs and the training diary.
 
-**Explorer / sweeps:** see ``src/training/t1_explorer.py`` and env vars ``TIER1_EXPERIMENT_NAME``,
-``TIER1_KINE_WEIGHT_MODE``, ``TIER1_GEOMETRY_LEVEL``, ``TIER1_LATENT_DIM``, …
-Use ``TIER1_EPOCHS`` (default 60) for short exploratory runs, e.g. ``25``.
+**Configuration:** env vars ``TIER1_EXPERIMENT_NAME``, ``TIER1_KINE_WEIGHT_MODE``,
+``TIER1_GEOMETRY_LEVEL``, ``TIER1_LATENT_DIM``, … (see ``Tier1TrainConfig.from_env()``).
+Defaults follow the deep-run recipe: e.g. ``TIER1_EPOCHS=150`` with ``TIER1_ADAM_EPOCHS=120``
+and ``TIER1_USE_LBFGS=1`` (30 L-BFGS epochs). Use smaller ``TIER1_EPOCHS`` for quick trials.
 Each run writes ``outputs/reports/experiments/tier1_<name>_<ts>.json`` for comparing runs.
 
 Example (SDF-gradient–weighted kinematic loss, level-1 vessels only)::
@@ -27,10 +28,11 @@ if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import atexit
 import csv
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.optim as optim
@@ -47,19 +49,142 @@ from src.utils.kinematics_physics_terms import (
     compute_anchor_kinematic_importance,
     compute_kinematics_physics_terms,
 )
-from src.utils.training_diary import TrainingDiary, env_snapshot
-from src.training.t1_explorer import (
-    T1ExplorerConfig,
-    filter_graph_paths_by_geometry_level,
-    write_t1_experiment_artifact,
-)
+from src.utils.training_diary import TrainingDiary, env_snapshot, write_t1_experiment_artifact
 import random
 
 # Scale for continuity (mean |∇·u|) in the validation composite; see module docstring.
 TIER1_VAL_COMPOSITE_CONTINUITY_SCALE = 100.0
 
 
-def _resolve_t1_dataset_tier(explorer: Optional[T1ExplorerConfig] = None) -> str:
+@dataclass
+class Tier1TrainConfig:
+    """Tier 1 GINO-DEQ training knobs (env: ``TIER1_*``). Defaults match the V3_WLS architecture."""
+
+    experiment_name: str = "default"
+    dataset_tier: str = "tier1"
+    kine_weight_mode: str = "uniform"  # uniform | sdf_wall | sdf_grad | shear_true
+    sdf_wall_beta: float = 2.0
+    sdf_wall_tau: float = 0.12
+    sdf_grad_beta: float = 1.0
+    shear_true_alpha: float = 1.0
+    latent_dim: int = 256
+    deq_max_iters: int = 25
+    num_fourier_freqs: int = 16
+    geometry_level: Optional[int] = None
+    ns_derivative_mode: str = "wls"
+    activation_fn: str = "silu"
+    fourier_base: float = 1.5
+    loss_weight_mode: str = "dynamic"
+    anderson_beta: float = 0.8
+    lambda_cont: float = 1.0
+    re_curriculum: bool = False
+    p_grad_supervision: float = 1.0
+    advect_detach: bool = False
+    pressure_bc_mode: str = "pointwise"
+    momentum_loss_mode: str = "huber"
+    use_hard_bcs: bool = True
+    num_global_tokens: int = 16
+    use_siren_decoder: bool = True
+    use_width_priors: bool = True
+
+    @staticmethod
+    def from_env() -> "Tier1TrainConfig":
+        def _f(name: str, default: float) -> float:
+            raw = os.environ.get(name, "").strip()
+            return default if not raw else float(raw)
+
+        gl = os.environ.get("TIER1_GEOMETRY_LEVEL", "").strip()
+        geometry_level: Optional[int] = None
+        if gl in ("0", "1"):
+            geometry_level = int(gl)
+
+        mode = os.environ.get("TIER1_KINE_WEIGHT_MODE", "uniform").strip().lower()
+        if mode not in ("uniform", "sdf_wall", "sdf_grad", "shear_true"):
+            mode = "uniform"
+        ns_derivative_mode = os.environ.get("TIER1_NS_DERIVATIVE_MODE", "wls").strip().lower()
+        if ns_derivative_mode not in ("wls", "autograd"):
+            ns_derivative_mode = "wls"
+        activation = os.environ.get("TIER1_ACTIVATION_FN", "silu").strip().lower()
+        if activation not in ("relu", "silu", "gelu"):
+            activation = "silu"
+        loss_weight_mode = os.environ.get("TIER1_LOSS_WEIGHT_MODE", "dynamic").strip().lower()
+        if loss_weight_mode not in ("dynamic", "fixed", "grad_norm"):
+            loss_weight_mode = "dynamic"
+        re_curriculum = os.environ.get("TIER1_RE_CURRICULUM", "0").strip().lower() in ("1", "true", "yes", "on")
+        pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "pointwise").strip().lower()
+        if pressure_bc_mode not in ("mean", "pointwise", "mean_var"):
+            pressure_bc_mode = "pointwise"
+        momentum_loss_mode = os.environ.get("TIER1_MOMENTUM_LOSS_MODE", "huber").strip().lower()
+        if momentum_loss_mode not in ("huber", "mse"):
+            momentum_loss_mode = "huber"
+        use_hard_bcs = os.environ.get("TIER1_USE_HARD_BCS", "1").strip().lower() in ("1", "true", "yes", "on")
+        use_siren_decoder = os.environ.get("TIER1_USE_SIREN", "1").strip().lower() in ("1", "true", "yes", "on")
+        use_width_priors = os.environ.get("TIER1_USE_WIDTH_PRIORS", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        raw_tok = os.environ.get("TIER1_NUM_GLOBAL_TOKENS", "16").strip()
+        try:
+            num_global_tokens = max(1, int(raw_tok))
+        except ValueError:
+            num_global_tokens = 16
+
+        return Tier1TrainConfig(
+            experiment_name=os.environ.get("TIER1_EXPERIMENT_NAME", "default").strip() or "default",
+            dataset_tier=os.environ.get("TIER1_DATASET_TIER", "tier1").strip() or "tier1",
+            kine_weight_mode=mode,
+            sdf_wall_beta=_f("TIER1_SDF_WALL_BETA", 2.0),
+            sdf_wall_tau=_f("TIER1_SDF_WALL_TAU", 0.12),
+            sdf_grad_beta=_f("TIER1_SDF_GRAD_BETA", 1.0),
+            shear_true_alpha=_f("TIER1_SHEAR_TRUE_ALPHA", 1.0),
+            latent_dim=int(os.environ.get("TIER1_LATENT_DIM", "256")),
+            deq_max_iters=int(os.environ.get("TIER1_DEQ_MAX_ITERS", "25")),
+            num_fourier_freqs=int(os.environ.get("TIER1_NUM_FOURIER_FREQS", "16")),
+            geometry_level=geometry_level,
+            ns_derivative_mode=ns_derivative_mode,
+            activation_fn=activation,
+            fourier_base=float(os.environ.get("TIER1_FOURIER_BASE", "1.5")),
+            loss_weight_mode=loss_weight_mode,
+            anderson_beta=float(os.environ.get("TIER1_ANDERSON_BETA", "0.8")),
+            lambda_cont=float(os.environ.get("TIER1_LAMBDA_CONT", "1.0")),
+            re_curriculum=re_curriculum,
+            p_grad_supervision=float(os.environ.get("TIER1_P_GRAD_SUPERVISION", "1.0")),
+            advect_detach=os.environ.get("TIER1_ADVECT_DETACH", "0").strip().lower() in ("1", "true", "yes", "on"),
+            pressure_bc_mode=pressure_bc_mode,
+            momentum_loss_mode=momentum_loss_mode,
+            use_hard_bcs=use_hard_bcs,
+            num_global_tokens=num_global_tokens,
+            use_siren_decoder=use_siren_decoder,
+            use_width_priors=use_width_priors,
+        )
+
+    def to_serializable(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def filter_graph_paths_by_geometry_level(
+    graph_paths: List[Path], raw_tier_dir: Path, level: int
+) -> List[Path]:
+    """Keep only stems whose ``vessel_*.json`` lists ``\"level\"`` == ``level``."""
+    kept: List[Path] = []
+    for p in graph_paths:
+        stem = p.stem
+        js = raw_tier_dir / f"{stem}.json"
+        if not js.is_file():
+            continue
+        try:
+            with open(js, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if int(meta.get("level", -1)) == level:
+                kept.append(p)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return kept
+
+
+def _resolve_t1_dataset_tier(explorer: Optional[Tier1TrainConfig] = None) -> str:
     if explorer is not None:
         tier = str(getattr(explorer, "dataset_tier", "")).strip()
         if tier:
@@ -94,7 +219,7 @@ def split_anchor_physics(dataset: Sequence, seed: int = 42, train_ratio: float =
     )
 
 
-def load_dataset(explorer: Optional[T1ExplorerConfig] = None):
+def load_dataset(explorer: Optional[Tier1TrainConfig] = None):
     dataset_tier = _resolve_t1_dataset_tier(explorer)
     cfg = VesselConfig(tier=dataset_tier)
     if not cfg.graph_output_dir.exists():
@@ -130,7 +255,7 @@ def compute_step_loss(
     wss_scale=10.0,
     boundary_data_weight=2.0,
     is_distillation=False,
-    explorer: Optional[T1ExplorerConfig] = None,
+    explorer: Optional[Tier1TrainConfig] = None,
     tier1_kine_p_weight: float = 1.0,
     re_ref: Optional[float] = None,
     re_scale: Optional[float] = None,
@@ -277,21 +402,25 @@ def train_t1_predictor(
     lr: float = 1e-4,
     warm_up_epochs: Optional[int] = None,
     adam_epochs: Optional[int] = None,
-    explorer: Optional[T1ExplorerConfig] = None,
+    explorer: Optional[Tier1TrainConfig] = None,
 ):
-    explorer = explorer or T1ExplorerConfig.from_env()
+    explorer = explorer or Tier1TrainConfig.from_env()
     if epochs is None:
-        epochs = max(1, int(os.environ.get("TIER1_EPOCHS", "60")))
+        epochs = max(1, int(os.environ.get("TIER1_EPOCHS", "150")))
     if adam_epochs is None:
         raw_adam = os.environ.get("TIER1_ADAM_EPOCHS", "").strip()
-        adam_epochs = int(raw_adam) if raw_adam else epochs
+        if raw_adam:
+            adam_epochs = int(raw_adam)
+        else:
+            adam_epochs = min(120, int(epochs))
     adam_epochs = max(1, min(int(adam_epochs), int(epochs)))
     if warm_up_epochs is None:
         raw_w = os.environ.get("TIER1_WARM_UP_EPOCHS", "").strip()
         if raw_w:
             warm_up_epochs = int(raw_w)
         else:
-            warm_up_epochs = min(10, max(1, adam_epochs // 3))
+            # Scales with Adam phase length (e.g. ~5 for 30 Adam epochs, up to 10 for long phases).
+            warm_up_epochs = min(10, max(1, adam_epochs // 6))
     warm_up_epochs = max(0, min(int(warm_up_epochs), adam_epochs - 1))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -389,40 +518,28 @@ def train_t1_predictor(
         train_data = train_data[:max_train_vessels]
         print(f"✂️ Truncated train_data to {max_train_vessels} vessels (TIER1_MAX_TRAIN_VESSELS).")
 
-    # Blind training anchors only so validation graphs stay identical across supervision sweeps.
-    # TIER1_TARGET_ANCHOR_FRACTION is separate: DataLoader anchor vs physics mix.
-    supervision_fraction = float(os.environ.get("TIER1_SUPERVISION_FRACTION", "1.0"))
-    if supervision_fraction < 1.0:
-        train_anchors = [d for d in train_data if d.is_anchor.any().item()]
-        num_to_keep = int(len(train_anchors) * supervision_fraction)
-        all_indices = list(range(len(train_anchors)))
-        rng = random.Random(42)
-        rng.shuffle(all_indices)
-        indices_to_convert_to_physics = all_indices[num_to_keep:]
-        for idx in indices_to_convert_to_physics:
-            train_anchors[idx].is_anchor = torch.tensor([False], dtype=torch.bool)
-        print(
-            f"🧬 Artificially blinded {len(indices_to_convert_to_physics)} training graphs "
-            "to act as pure physics nodes."
-        )
-
     n_anchor_train = len([d for d in train_data if d.is_anchor.any().item()])
     n_phys_train = max(0, len(train_data) - n_anchor_train)
 
     # Reduce physical batch size to save memory, but maintain effective batch size
-    micro_batch_size = int(os.environ.get("TIER1_MICRO_BATCH_SIZE", "2"))
-    accumulation_steps = int(os.environ.get("TIER1_ACCUMULATION_STEPS", "4"))
+    micro_batch_size = int(os.environ.get("TIER1_MICRO_BATCH_SIZE", "1"))
+    accumulation_steps = int(os.environ.get("TIER1_ACCUMULATION_STEPS", "8"))
 
     target_anchor_fraction = float(os.environ.get("TIER1_TARGET_ANCHOR_FRACTION", "0.5"))
     target_anchor_fraction = min(max(target_anchor_fraction, 0.0), 1.0)
     hard_alpha = max(float(os.environ.get("TIER1_HARD_MINING_ALPHA", "0.8")), 0.0)
     hard_refresh = max(int(os.environ.get("TIER1_HARD_MINING_REFRESH_EPOCHS", "4")), 1)
     boundary_data_weight = max(float(os.environ.get("TIER1_BOUNDARY_DATA_WEIGHT", "2.0")), 1.0)
-    tier1_kine_p_weight = max(float(os.environ.get("TIER1_KINE_P_WEIGHT", "1.0")), 0.0)
-    use_lbfgs_requested = (os.environ.get("TIER1_USE_LBFGS", "0").strip().lower() in ("1", "true", "yes", "on"))
+    tier1_kine_p_weight = max(float(os.environ.get("TIER1_KINE_P_WEIGHT", "5.0")), 0.0)
+    use_lbfgs_requested = (os.environ.get("TIER1_USE_LBFGS", "1").strip().lower() in ("1", "true", "yes", "on"))
     use_lbfgs = bool(use_lbfgs_requested)
     if use_lbfgs:
+        _lbfgs_tail = max(0, int(epochs) - int(adam_epochs))
         print("✅ TIER1_USE_LBFGS=1: AdamW warm-up/phase then L-BFGS refinement is enabled.")
+        if _lbfgs_tail > 0:
+            print(f"   L-BFGS tail: {_lbfgs_tail} epoch(s) (epochs {adam_epochs}–{epochs - 1}).")
+        else:
+            print("   L-BFGS tail: 0 epochs — raise TIER1_EPOCHS above TIER1_ADAM_EPOCHS for a refinement phase.")
         print("ℹ️ Safety note: L-BFGS path snapshots the full loader and can be memory-heavy on large graph datasets.")
     dynamic_freeze_during_warmup = (os.environ.get("TIER1_DYNAMIC_FREEZE_DURING_WARMUP", "1").strip().lower() in ("1", "true", "yes", "on"))
     hard_anchor_multiplier = {}
@@ -481,7 +598,7 @@ def train_t1_predictor(
     # otherwise fall back to the shared stage_a directory.
     latest_ckpt_path = model_dir / "tier1_latest_checkpoint.pth"
     best_physics_path = resolve_checkpoint("a", "tier1_best_physics.pth")
-    ckpt_every = max(1, int(os.environ.get("TIER1_CKPT_EVERY", "1")))
+    ckpt_every = max(1, int(os.environ.get("TIER1_CKPT_EVERY", "5")))
     resume_enabled = (os.environ.get("TIER1_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_from_best_enabled = (os.environ.get("TIER1_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_done = False
@@ -521,7 +638,7 @@ def train_t1_predictor(
         print("✅ Started from tier1_best_physics.pth (fresh optimizer/schedulers).")
 
     best_rel_l2 = float("inf")
-    plateau_patience = int(os.environ.get("TIER1_EARLY_STOP_PATIENCE", "10"))
+    plateau_patience = int(os.environ.get("TIER1_EARLY_STOP_PATIENCE", "15"))
     plateau_min_delta = float(os.environ.get("TIER1_EARLY_STOP_MIN_DELTA", "0.005"))
     val_no_improve = 0
     early_stopped = False
@@ -547,7 +664,7 @@ def train_t1_predictor(
         warm_up_epochs=warm_up_epochs,
         adam_epochs=adam_epochs,
         lr=lr,
-        stage_split_epochs=int(os.environ.get("TIER1_DATA_STAGE_EPOCHS", "12")),
+        stage_split_epochs=int(os.environ.get("TIER1_DATA_STAGE_EPOCHS", "10")),
         plateau_patience=plateau_patience,
         plateau_min_delta=plateau_min_delta,
         ckpt_every=ckpt_every,
@@ -560,7 +677,7 @@ def train_t1_predictor(
         best_val_composite_loss_checkpoint=float(best_val_composite_loss),
         best_loss_checkpoint=float(best_loss),
         env_tier1_phase1=env_snapshot("TIER1_", "PHASE1_"),
-        t1_explorer=explorer.to_serializable(),
+        tier1_train_config=explorer.to_serializable(),
     )
 
     run_end_emitted = False
@@ -635,7 +752,7 @@ def train_t1_predictor(
         if explorer.re_curriculum and epoch == start_epoch:
             print("⚠️ TIER1_RE_CURRICULUM requested, but disabled for supervised Tier 1 to avoid Re/data contradiction.")
         re_scale_epoch = 1.0
-        stage_split = int(os.environ.get("TIER1_DATA_STAGE_EPOCHS", "12"))
+        stage_split = int(os.environ.get("TIER1_DATA_STAGE_EPOCHS", "10"))
         if epoch < stage_split:
             # Stage A: fit kinematics harder while physics ramps in.
             data_scale = float(os.environ.get("TIER1_DATA_SCALE_STAGE1", "700.0"))
@@ -977,7 +1094,7 @@ def train_t1_predictor(
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Tier 1 GINO-DEQ predictor training (explorer-friendly).")
+    p = argparse.ArgumentParser(description="Tier 1 GINO-DEQ predictor training (Tier1TrainConfig / TIER1_* env).")
     p.add_argument(
         "--experiment-name",
         type=str,

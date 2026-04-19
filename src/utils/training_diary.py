@@ -19,6 +19,59 @@ from typing import Any, Dict, Mapping, Optional
 from src.utils.paths import get_project_root, reports_dir
 
 
+def write_t1_experiment_artifact(
+    tier1_cfg: Any,
+    *,
+    best_rel_l2: float,
+    best_val_composite_loss: float,
+    best_loss: float,
+    early_stopped: bool,
+    n_graphs: int,
+    n_train: int,
+    n_val: int,
+    graph_dir: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Write ``reports/experiments/tier1_<name>_<ts>.json`` for post-run comparison.
+
+    ``tier1_cfg`` must provide ``experiment_name`` and ``to_serializable()`` (e.g. ``Tier1TrainConfig``).
+    ``best_val_composite_loss`` is the minimum validation composite (Tier 1:
+    ``rel_l2_anchor + 100×continuity``); lower is better.
+    """
+    rep = reports_dir() / "experiments"
+    rep.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = str(getattr(tier1_cfg, "experiment_name", "default"))
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:80]
+    path = rep / f"tier1_{safe_name}_{ts}.json"
+    ser = tier1_cfg.to_serializable() if callable(getattr(tier1_cfg, "to_serializable", None)) else {}
+    payload: Dict[str, Any] = {
+        "tier": "tier1",
+        "ts_utc": ts,
+        "tier1_train_config": ser,
+        "metrics": {
+            "best_rel_l2": best_rel_l2,
+            "best_val_composite_loss": best_val_composite_loss,
+            "best_loss": best_loss,
+            "early_stopped": early_stopped,
+        },
+        "data": {
+            "n_graphs": n_graphs,
+            "n_train": n_train,
+            "n_val": n_val,
+            "graph_dir": graph_dir,
+        },
+        "env_tier1": {k: v for k, v in sorted(os.environ.items()) if k.startswith("TIER1_")},
+    }
+    if extra:
+        payload["extra"] = extra
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"📒 Experiment artifact: {path}")
+    print("🧾 History reminder: append this run's key metrics to your Tier1 training history log.")
+    return path
+
+
 def _json_safe(v: Any) -> Any:
     if v is None:
         return None

@@ -12,7 +12,7 @@ Start here, then open the linked files for depth.
    - Data and checkpoint layout
    - Interactive inspection tools and pytest policy
 
-2. **[TIER1_TRAINING_HISTORY.md](TIER1_TRAINING_HISTORY.md)** — Tier 1 sweep history, mesh-resolution decision, V2/V3 strategy (complements the code paths in `train_t1_predictor` and `t1_explorer`).
+2. **[TIER1_TRAINING_HISTORY.md](TIER1_TRAINING_HISTORY.md)** — Tier 1 sweep history, mesh-resolution decision, V2/V3 strategy (complements `train_t1_predictor` / `Tier1TrainConfig`).
 
 ## Common commands
 
@@ -41,7 +41,7 @@ python -m src.data_gen.pipeline_tier3
 | `src/core_physics/` | Physics kernels, Anderson acceleration, PDE-consistent terms |
 | `src/config.py` | `PhysicsConfig`, `VesselConfig`, channel enums (`PredChannels`, `NodeFeat`) |
 | `src/data_gen/` | Tier 12 / Tier 3 pipelines and mesh→graph builders |
-| `src/training/` | `train_t1_predictor`, `train_t2_predictor`, `train_t3_corrector`, `physics_curriculum`, `t1_explorer` |
+| `src/training/` | `train_t1_predictor`, `train_t2_predictor`, `train_t3_corrector`, `physics_curriculum` |
 | `src/bin/` | `main` (router), `orchestrate` (stage runner) |
 
-Training is implemented as **explicit scripts** (not a shared trainer class). Tier 1 may use `train_t1.py` as a small wrapper that forwards into `train_t1_predictor`.
+Training is implemented as **explicit scripts** (not a shared trainer class). Invoke Tier 1 via `python -m src.training.train_t1_predictor` or `python -m src.bin.main train t1` (or `train explore`).

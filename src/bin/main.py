@@ -17,10 +17,11 @@ import sys
 
 
 MODULE_MAP: dict[tuple[str, str], str] = {
-    ("train", "t1"): "src.training.train_t1",
-    ("train", "t2"): "src.training.train_t2",
+    ("train", "t1"): "src.training.train_t1_predictor",
+    ("train", "t2"): "src.training.train_t2_predictor",
     ("train", "t3"): "src.training.train_t3_corrector",
-    ("train", "explore"): "src.training.t1_explorer",
+    # Alias: Tier 1 training (formerly a separate "explorer" entrypoint).
+    ("train", "explore"): "src.training.train_t1_predictor",
     ("data", "tier12"): "src.data_gen.pipeline_tier12",
     ("data", "tier3"): "src.data_gen.pipeline_tier3",
     ("eval", "benchmark"): "src.evaluation.run_benchmark",

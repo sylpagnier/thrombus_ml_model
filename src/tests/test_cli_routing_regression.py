@@ -18,7 +18,7 @@ def test_bin_main_routes_orchestrate_stage_and_args(monkeypatch):
     assert calls == [("src.bin.orchestrate", ["all", "--skip-tier1"])]
 
 
-def test_bin_main_routes_train_targets_to_thin_wrappers(monkeypatch):
+def test_bin_main_routes_train_targets_to_predictor_modules(monkeypatch):
     calls = []
 
     def _fake_run_module(module_name: str, forwarded_args: list[str]) -> None:
@@ -28,8 +28,8 @@ def test_bin_main_routes_train_targets_to_thin_wrappers(monkeypatch):
     cli_main.main(["train", "t1"])
     cli_main.main(["train", "t2", "--", "--epochs", "5"])
 
-    assert calls[0] == ("src.training.train_t1", [])
-    assert calls[1] == ("src.training.train_t2", ["--epochs", "5"])
+    assert calls[0] == ("src.training.train_t1_predictor", [])
+    assert calls[1] == ("src.training.train_t2_predictor", ["--epochs", "5"])
 
 
 def test_orchestrate_all_runs_t1_t2_t3_in_order(monkeypatch):

@@ -9,7 +9,7 @@ This file is **historical narrative**. The live stack is:
 | Piece | Location |
 |-------|----------|
 | Training loop / checkpoints / diary | `src/training/train_t1_predictor.py` |
-| Sweep / explorer Knobs (`TIER1_*`, mesh resolution) | `src/training/t1_explorer.py` |
+| Training knobs (`TIER1_*`, mesh resolution) | `src/training/train_t1_predictor.py` (`Tier1TrainConfig`) |
 | Model (DEQ, attention bottleneck, SIREN, LoRA hooks) | `src/architecture/ginodeq.py`, `siren_decoder.py`, `lora_injection.py` |
 | Physics residuals & losses | `src/core_physics/physics_kernels.py` + `src/utils/kinematics_physics_terms.py` |
 | Defaults (mesh size factor `0.75`, channel layouts) | `src/config.py` (`VesselConfig`, `PhysicsConfig`, `NodeFeat`, `PredChannels`) |
