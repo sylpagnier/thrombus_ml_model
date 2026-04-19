@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import json
 import numpy as np
@@ -8,9 +9,17 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
+
+# Running `python .../mesh_to_graph.py` sets __package__ to None; ensure project root is importable.
+if __name__ == "__main__":
+    _proj = Path(__file__).resolve().parents[3]
+    _ps = str(_proj)
+    if _ps not in sys.path:
+        sys.path.insert(0, _ps)
+
 from src.config import NodeFeat, PhysicsConfig, VesselConfig
-from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
-from .graph_velocity_priors import (
+from src.data_gen.lib.mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
+from src.data_gen.lib.graph_velocity_priors import (
     dean_r_nd_effective,
     kirchhoff_outlet_psi_values,
     mass_conserving_umax_nd,
@@ -472,13 +481,13 @@ def build_mesh_converter(
     """
     t = (tier or "tier1").lower()
     if is_non_newtonian is True:
-        from .mesh_to_graph_tier3 import MeshToGraphTier3
+        from src.data_gen.lib.mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)
     if is_non_newtonian is False:
         return MeshToGraphComplete(tier=tier, **kwargs)
     if t in ("tier3", "tier3_patients", "tier3_mix"):
-        from .mesh_to_graph_tier3 import MeshToGraphTier3
+        from src.data_gen.lib.mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)
     return MeshToGraphComplete(tier=tier, **kwargs)

@@ -215,4 +215,5 @@ def dean_r_nd_effective(
     align = cx * wall_normal_x + cy * wall_normal_y
     shift = strength * R_nd * kappa * torch.sign(align)
     r_eff = r_nd - shift
-    return torch.clamp(r_eff, min=0.0, max=R_nd * 1.5)
+    # clamp requires min/max both scalar or both tensor-broadcastable (not float + tensor).
+    return torch.clamp(r_eff, min=torch.zeros_like(r_eff), max=R_nd * 1.5)

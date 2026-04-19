@@ -500,7 +500,7 @@ class VesselGenerator:
         ----------
         n           : number of vessels to produce in this run (file indices ``start_idx`` …)
         level       : geometry complexity (0 = mostly straight, 1 = curved)
-        max_retries : retry attempts for failed samples
+        max_retries : retry attempts for failed samples (same ``idx`` as the failure; new parameters)
         num_workers : worker processes (default: cpu_count - 1, min 1)
         chunk_size  : samples per worker chunk (default: auto-balanced)
         seed        : integer seed for reproducibility (None = random)
@@ -591,17 +591,17 @@ class VesselGenerator:
                             continue
 
         # ---- Retry failed samples ----
-        cursor = start_idx + n
+        # Resample geometry parameters but keep the same vessel idx so outputs stay
+        # vessel_{start_idx}..vessel_{start_idx+n-1} (replacement, no extra indices).
         for retry_round in range(1, max_retries + 1):
             if not failed_params:
                 break
             logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
 
-            # Fresh indices after the main batch, and BRAND NEW parameters
-            retry_batch = []
-            for i in range(len(failed_params)):
-                retry_batch.append(_sample_params(cursor + i, level, self.cfg, rng))
-            cursor += len(failed_params)
+            retry_batch = [
+                _sample_params(int(failed_p["idx"]), level, self.cfg, rng)
+                for failed_p in failed_params
+            ]
 
             still_failed: List[Dict[str, Any]] = []
             retry_chunks = [retry_batch[i: i + chunk_size] for i in
