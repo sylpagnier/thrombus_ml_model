@@ -2,7 +2,7 @@ import torch
 from typing import Optional
 
 from src.config import PredChannels
-from src.utils.anchor_mask import wall_wss_supervision_mask
+from src.utils.anchor_mask import anchor_node_mask, wall_wss_supervision_mask
 from src.utils.batching import get_batch_tensor
 from src.utils.math_operators import scatter_add as shared_scatter_add, wls_derivatives
 from src.utils.rheology import carreau_yasuda_viscosity, compute_shear_rate
@@ -307,43 +307,30 @@ class PhysicsKernels:
         return torch.mean(torch.sum(uv_wall * uv_wall, dim=1))
 
     def wall_shear_stress_loss(self, pred, data, props=None):
-        """
-        Enforces that the model's predicted WSS strictly matches the physical WSS
-        derived from its own velocity gradients at the wall boundaries.
-        """
-        if props is None:
-            props = self._get_geometric_props(data)
+        """Supervised WSS only: ``wss_pred`` vs COMSOL label channel on **anchor ∩ wall** nodes.
 
+        Uses :func:`~src.utils.anchor_mask.wall_wss_supervision_mask` (drops inlet/outlet-adjacent
+        wall vertices). Physics-only graphs with no anchor flag contribute zero.
+        """
+        _ = props  # API compatibility with callers passing geometric props
         wss_pred = pred[:, PredChannels.WSS]
 
+        node_anchor = anchor_node_mask(data)
+        if node_anchor is None:
+            return pred.sum() * 0.0
+
         mask_wss = wall_wss_supervision_mask(data)
-        if not mask_wss.any():
+        mask = mask_wss & node_anchor.view(-1).bool()
+        if not mask.any():
             return pred.sum() * 0.0
 
         if (not hasattr(data, "y")) or (data.y is None) or (data.y.shape[1] <= 4):
             return pred.sum() * 0.0
-        # Supervise against precomputed COMSOL wall WSS target stored in label channel 4.
+
         wss_mag_phys = data.y[:, PredChannels.WSS]
-        wss_pred_wall = wss_pred[mask_wss]
-        wss_true_wall = wss_mag_phys[mask_wss]
-        loss_data = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_true_wall, beta=0.01)
-
-        # Couple WSS head to predicted near-wall kinematics through analytical shear-rate consistency.
-        u = pred[:, PredChannels.U:PredChannels.U + 1]
-        v = pred[:, PredChannels.V:PredChannels.V + 1]
-        c_u = self._compute_derivatives(u, props)
-        c_v = self._compute_derivatives(v, props)
-        u_x, u_y = c_u[:, 0, 0], c_u[:, 1, 0]
-        v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
-        gamma_dot = compute_shear_rate(u_x, u_y, v_x, v_y, eps=1e-6)
-        if self.cfg.viscosity_model == "carreau" and pred.shape[1] > PredChannels.MU_EFF_ND:
-            mu_wall = pred[:, PredChannels.MU_EFF_ND][mask_wss]
-        else:
-            mu_wall = torch.full_like(wss_pred_wall, float(self.cfg.mu_viscosity_nd_scale))
-        wss_phys_wall = mu_wall * gamma_dot[mask_wss]
-        loss_phys = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_phys_wall, beta=0.01)
-
-        return loss_data + (0.5 * loss_phys)
+        return torch.nn.functional.smooth_l1_loss(
+            wss_pred[mask], wss_mag_phys[mask], beta=0.01
+        )
 
 
     def inlet_outlet_loss(self, pred, data):

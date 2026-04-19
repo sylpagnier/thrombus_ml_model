@@ -142,7 +142,8 @@ def test_momentum_residual_execution():
     assert loss_mom >= 0
 
 
-def test_wall_shear_stress_consistency():
+def test_wall_shear_stress_data_loss_smoke():
+    """Anchor-only supervised WSS vs ``data.y``; no ``is_anchor`` => zero loss."""
     data, nodes, phys_cfg = create_physical_test_graph()
     kernels = PhysicsKernels(phys_cfg)
 
@@ -150,12 +151,18 @@ def test_wall_shear_stress_consistency():
     v = torch.zeros_like(u)
     p = torch.zeros_like(u)
     mu = torch.ones_like(u)
-    wss_pred = torch.ones_like(nodes[:, 0])
+    wss_pred = torch.ones_like(nodes[:, 0]).unsqueeze(1)
 
-    pred = torch.cat([u, v, p, mu, wss_pred.unsqueeze(1)], dim=1)
-    loss_wss = kernels.wall_shear_stress_loss(pred, data)
+    pred = torch.cat([u, v, p, mu, wss_pred], dim=1)
+    assert not torch.isnan(kernels.wall_shear_stress_loss(pred, data))
 
-    assert not torch.isnan(loss_wss)
+    n = int(data.num_nodes)
+    data.is_anchor = torch.tensor([True], dtype=torch.bool)
+    data.y = torch.zeros(n, 5)
+    data.y[:, 4] = 1.0
+    loss_match = kernels.wall_shear_stress_loss(pred, data)
+    assert not torch.isnan(loss_match)
+    assert float(loss_match.item()) < 1e-5
 
 
 # ---------------------------------------------------------------------------

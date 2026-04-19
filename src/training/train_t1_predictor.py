@@ -158,9 +158,8 @@ def compute_step_loss(
 ):
     """Forward pass and Tier 1 loss stack (dynamic PDE weighting only).
 
-    ``l_wss`` uses :func:`~src.utils.anchor_mask.wall_wss_supervision_mask` inside
-    :meth:`~src.core_physics.physics_kernels.PhysicsKernels.wall_shear_stress_loss` so inlet/outlet-adjacent
-    wall vertices do not contribute to WSS supervision.
+    ``l_wss`` is supervised WSS (pred vs label) on **anchor ∩ wall** nodes; see
+    :meth:`~src.core_physics.physics_kernels.PhysicsKernels.wall_shear_stress_loss`.
     """
     out = model(
         data,
