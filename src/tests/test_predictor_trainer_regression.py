@@ -7,7 +7,7 @@ import torch.nn as nn
 
 import src.training.train_t1_predictor as t1_mod
 import src.training.train_t2_predictor as t2_mod
-from src.training.train_t1_predictor import Tier1TrainConfig
+from src.utils.metrics import DynamicLossWeighter
 
 
 class _GraphStub:
@@ -136,7 +136,6 @@ def test_compute_step_loss_t1_no_anchor_pgrad_is_zero(monkeypatch):
         }
 
     monkeypatch.setattr(t1_mod, "compute_kinematics_physics_terms", _fake_terms)
-    monkeypatch.setattr(t1_mod, "compute_anchor_kinematic_importance", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         t1_mod,
         "anchor_node_mask",
@@ -151,20 +150,17 @@ def test_compute_step_loss_t1_no_anchor_pgrad_is_zero(monkeypatch):
         y=torch.zeros((n, 5), dtype=torch.float32),
         x=torch.zeros((n, 2), dtype=torch.float32),
     )
-    explorer = Tier1TrainConfig()
-    explorer.loss_weight_mode = "fixed"
-    explorer.p_grad_supervision = 1.0
-    explorer.lambda_cont = 1.0
+    # Dynamic PDE weighting with log_var=0 matches fixed-sum momentum+continuity when λ_phys is shared.
+    lw = DynamicLossWeighter(num_losses=2)
 
     loss, metrics = t1_mod.compute_step_loss(
         model=model,
         data=data,
         kernels=_DummyKernels(),
-        loss_weighter=None,
+        loss_weighter=lw,
         current_solver="anderson",
         lambda_phys=0.5,
         device="cpu",
-        explorer=explorer,
     )
 
     assert abs(float(loss.item()) - 107.39) < 1e-6

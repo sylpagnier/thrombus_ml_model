@@ -1,3 +1,8 @@
+"""
+Tier 1/2 mesh→graph pipeline: **2D planar** vessel lumen only (in-plane CFD / graphs).
+Velocity priors follow 2D plane Poiseuille and mass scaling; 3D pipe flow is not modeled.
+"""
+
 import os
 import sys
 import torch
@@ -20,15 +25,27 @@ if __name__ == "__main__":
 from src.config import NodeFeat, PhysicsConfig, VesselConfig
 from src.data_gen.lib.mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from src.data_gen.lib.graph_velocity_priors import (
-    dean_r_nd_effective,
-    kirchhoff_outlet_psi_values,
     mass_conserving_umax_nd,
-    scale_stream_velocity_to_umax,
-    solve_laplace_stream_function,
-    stream_function_to_velocity,
+    smooth_width_nd_on_edges,
     width_nd_to_radius_nd,
 )
 from src.utils.paths import get_project_root
+
+
+def _clip_wss_magnitude_quantile(
+    wss_mag: torch.Tensor, mask_wall: torch.Tensor, q: float = 0.995
+) -> torch.Tensor:
+    """Cap wall WSS magnitudes at the q-quantile of wall values (robust to WLS gradient spikes)."""
+    mw = mask_wall.view(-1).bool()
+    if not mw.any():
+        return wss_mag
+    w = wss_mag[mw]
+    if w.numel() == 0:
+        return wss_mag
+    cap = torch.quantile(w, q)
+    out = wss_mag.clone()
+    out[mw] = torch.clamp(wss_mag[mw], max=cap)
+    return out
 
 
 def assemble_tier12_graph_data(
@@ -54,7 +71,6 @@ def assemble_tier12_graph_data(
     """Build the Tier 1/2 ``Data`` object written to ``*.pt`` (single code path for tests + ``process_file``).
 
     Tier 1/2 graphs store sparse WLS gradient operators ``G_x`` / ``G_y`` for physics kernels.
-    The Laplacian is used during conversion but is **not** serialized on these graphs.
     """
     return Data(
         x=x_tensor,
@@ -138,6 +154,7 @@ class MeshToGraphComplete:
         tri_nodes = np.vstack(all_tris)
 
         d_bar = None
+        meta = None
         if json_path.exists():
             with open(json_path, 'r') as f:
                 meta = json.load(f)
@@ -287,13 +304,14 @@ class MeshToGraphComplete:
 
                 # True WSS magnitude is the magnitude of the traction vector at the wall
                 wss_mag = torch.sqrt(t_x ** 2 + t_y ** 2) * mask_wall.float()
+                wss_mag = _clip_wss_magnitude_quantile(wss_mag, mask_wall, q=0.995)
                 y_labels = torch.stack([u_nd, v_nd, p_nd, mu_nd, wss_mag], dim=1)
                 is_anchor = True
             except Exception as e:
                 print(f"Error mapping labels: {e}")
 
         # --------------------------------------------------------------------------
-        #  Sparse WLS: G_x, G_y, Laplacian — then hydraulic width, then stream / Poiseuille priors
+        #  Sparse WLS: G_x, G_y — then hydraulic width and Poiseuille-style velocity priors
         # --------------------------------------------------------------------------
         W_V = W.unsqueeze(1) * V  # Shape: (E, 5)
         M_inv_row = M_inv[row]  # Shape: (E, 5, 5)
@@ -301,13 +319,11 @@ class MeshToGraphComplete:
         coeffs = torch.bmm(M_inv_row, W_V.unsqueeze(2)).squeeze(2)  # Shape: (E, 5)
         cx = coeffs[:, 0]
         cy = coeffs[:, 1]
-        c_lap = coeffs[:, 2] + coeffs[:, 4]
 
         N = len(nodes)
 
         diag_cx = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cx)
         diag_cy = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, cy)
-        diag_c_lap = torch.zeros(N, dtype=torch.float32).scatter_add_(0, row, c_lap)
 
         diag_indices = torch.arange(N, dtype=torch.long).unsqueeze(0).repeat(2, 1)
 
@@ -317,12 +333,8 @@ class MeshToGraphComplete:
         idx_y = torch.cat([edge_index, diag_indices], dim=1)
         val_y = torch.cat([cy, -diag_cy], dim=0)
 
-        idx_lap = torch.cat([edge_index, diag_indices], dim=1)
-        val_lap = torch.cat([c_lap, -diag_c_lap], dim=0)
-
         G_x = torch.sparse_coo_tensor(idx_x, val_x, size=(N, N)).coalesce()
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
-        Laplacian = torch.sparse_coo_tensor(idx_lap, val_lap, size=(N, N)).coalesce()
 
         # --------------------------------------------------------------------------
         #  Local width D(x) (sphere tracing; full lumen width along inward normal ray)
@@ -352,61 +364,80 @@ class MeshToGraphComplete:
             t_march[still_idx] = t_march[still_idx] + torch.clamp(dist_still, min=0.01)
 
         width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0
+        width_nd = smooth_width_nd_on_edges(width_nd, edge_index, N)
+        width_nd = torch.clamp(width_nd, min=1e-6)
 
-        # Flow tangent from inward wall normals (left-to-right +X bias for Tier 1 geometries)
+        # Flow tangent from inward wall normals, oriented with vessel centerline (from mesh JSON).
         n_x = wall_normal_vec[:, 0]
         n_y = wall_normal_vec[:, 1]
-        sign_ny = torch.sign(n_y)
-        sign_ny = torch.where(sign_ny == 0, torch.tensor(1.0, dtype=sign_ny.dtype), sign_ny)
-        t_x = torch.abs(n_y)
-        t_y = -sign_ny * n_x
-        t_mag = torch.sqrt(t_x ** 2 + t_y ** 2) + 1e-12
-        flow_dir_x = t_x / t_mag
-        flow_dir_y = t_y / t_mag
+        t_x_unoriented = -n_y
+        t_y_unoriented = n_x
 
-        # Width-adaptive Poiseuille radius (R = full width / 2) and mass-style u_max ~ 1/R^2
+        if meta is None:
+            raise ValueError(
+                f"{stem}: missing sidecar JSON {json_path}; flow priors require centerline metadata."
+            )
+        spine_pts = meta.get("centerline_pts")
+        spine_tangents = meta.get("centerline_tangents")
+        if spine_pts is None or spine_tangents is None:
+            raise ValueError(
+                f"{stem}: JSON must define centerline_pts and centerline_tangents "
+                "(regenerate meshes with the current vessel_generator)."
+            )
+        spine_pts = np.asarray(spine_pts, dtype=np.float64)
+        spine_tangents = np.asarray(spine_tangents, dtype=np.float64)
+        if not (
+            spine_pts.ndim == 2
+            and spine_pts.shape[1] == 2
+            and spine_tangents.shape == spine_pts.shape
+            and spine_pts.shape[0] > 0
+        ):
+            raise ValueError(
+                f"{stem}: invalid centerline_pts / centerline_tangents "
+                f"(got pts {getattr(spine_pts, 'shape', None)}, tangents {getattr(spine_tangents, 'shape', None)})."
+            )
+        spine_tree = cKDTree(spine_pts)
+        _, nearest_spine_idx = spine_tree.query(pos_nd_tensor.detach().cpu().numpy())
+        local_flow_vec = torch.tensor(
+            spine_tangents[nearest_spine_idx], dtype=torch.float32, device=pos_nd_tensor.device
+        )
+
+        dot_prod = t_x_unoriented * local_flow_vec[:, 0] + t_y_unoriented * local_flow_vec[:, 1]
+        orientation = torch.sign(dot_prod)
+        orientation = torch.where(orientation == 0, torch.ones_like(orientation), orientation)
+
+        flow_dir_x = t_x_unoriented * orientation
+        flow_dir_y = t_y_unoriented * orientation
+        # Explicit unit direction: avoids FEM/interpolation drift from warping |u_prior| (mass balance).
+        flow_norm = torch.sqrt(flow_dir_x ** 2 + flow_dir_y ** 2).clamp_min(1e-8)
+        flow_dir_x = flow_dir_x / flow_norm
+        flow_dir_y = flow_dir_y / flow_norm
+
+        # Width-adaptive Poiseuille radius (R = full width / 2) and 2D mass-style u_max ~ 1/R
         R_nd = width_nd_to_radius_nd(width_nd)
         u_max_nd = mass_conserving_umax_nd(R_nd)
-        r_nd = torch.abs(R_nd - sdf_tensor.squeeze())
-        r_nd = dean_r_nd_effective(
-            r_nd,
-            R_nd,
-            flow_dir_x,
-            flow_dir_y,
-            wall_normal_vec[:, 0],
-            wall_normal_vec[:, 1],
-            G_x,
-            G_y,
-        )
+        # 2. Safely clamp SDF to prevent centerline dipping due to ray-tracing vs SDF misalignment
+        safe_sdf = torch.minimum(sdf_tensor.squeeze().clamp_min(0.0), R_nd)
+        r_nd = R_nd - safe_sdf
         u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
 
-        # Laplace stream function ψ (Dirichlet), then u = ∂ψ/∂y, v = -∂ψ/∂x; fallback to Poiseuille × tangent
-        psi_bc = kirchhoff_outlet_psi_values(
-            mask_inlet, mask_outlet, edge_index, edge_attr[:, 2:3], width_nd
-        )
-        psi_bc[mask_inlet] = 0.0
-        fixed = mask_inlet | mask_outlet
-        if mask_inlet.any() and mask_outlet.any():
-            try:
-                psi = solve_laplace_stream_function(Laplacian, psi_bc, fixed)
-                u_raw, v_raw = stream_function_to_velocity(G_x, G_y, psi, 1.0)
-                u_prior, v_prior, _ = scale_stream_velocity_to_umax(u_raw, v_raw, u_prior_mag)
-                if not torch.isfinite(u_prior).all() or not torch.isfinite(v_prior).all():
-                    raise ValueError("non-finite stream-function velocity prior")
-            except Exception:
-                u_prior = u_prior_mag * flow_dir_x
-                v_prior = u_prior_mag * flow_dir_y
-        else:
-            u_prior = u_prior_mag * flow_dir_x
-            v_prior = u_prior_mag * flow_dir_y
+        # Mass-conserving 2D Poiseuille-style profile along local flow tangent.
+        u_prior = u_prior_mag * flow_dir_x
+        v_prior = u_prior_mag * flow_dir_y
 
-        # Viscosity prior (Carreau) + WSS (wall)
+        # Viscosity prior + WSS (wall)
         gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))
-        lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
-        mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
-                    (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
-                   (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
-                           (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
+
+        if self.phys_cfg.viscosity_model == "newtonian":
+            mu_prior = torch.ones(N, dtype=torch.float32)
+        else:
+            # Carreau formulation for Tier 2 / Tier 3
+            lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
+            mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
+                        (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
+                       (1.0 + (lambda_nd * gamma_dot_prior) ** self.phys_cfg.a) ** (
+                               (self.phys_cfg.n - 1.0) / self.phys_cfg.a)
+
         wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
 
         grad_w_x = torch.sparse.mm(G_x, width_nd)

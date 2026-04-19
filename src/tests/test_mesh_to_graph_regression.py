@@ -168,3 +168,22 @@ def test_tier3_anchor_steady_graph_matches_steady_label_layout(tmp_path):
     assert data.is_anchor.item() is True
     assert data.u_inlet_bc.shape[1] == 1
     assert data.G_x.is_sparse and data.Laplacian.is_sparse
+
+
+def test_smooth_width_nd_on_edges_constant_unchanged():
+    from src.data_gen.lib.graph_velocity_priors import smooth_width_nd_on_edges
+
+    edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    w = torch.full((2, 1), 3.0, dtype=torch.float32)
+    out = smooth_width_nd_on_edges(w, edge_index, num_nodes=2, alpha=0.45, iters=3)
+    assert torch.allclose(out, w)
+
+
+def test_smooth_width_nd_on_edges_damps_spike():
+    from src.data_gen.lib.graph_velocity_priors import smooth_width_nd_on_edges
+
+    edge_index = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long)
+    w = torch.tensor([[1.0], [10.0], [1.0]], dtype=torch.float32)
+    out = smooth_width_nd_on_edges(w, edge_index, num_nodes=3, alpha=0.5, iters=5)
+    assert out[1, 0] < w[1, 0]
+    assert out[0, 0] > w[0, 0]

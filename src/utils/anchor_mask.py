@@ -41,3 +41,25 @@ def anchor_node_mask(data):
         return torch.full((n_nodes,), bool(ia.item()), dtype=torch.bool, device=dev)
 
     return None
+
+
+def wall_wss_supervision_mask(data) -> torch.Tensor:
+    """Wall nodes used for WSS supervision: exclude wall vertices adjacent to inlet/outlet (junction artifacts)."""
+    if not hasattr(data, "mask_wall"):
+        return torch.zeros(int(data.num_nodes), dtype=torch.bool, device=data.x.device)
+    mw = data.mask_wall.view(-1).bool()
+    mi = getattr(data, "mask_inlet", None)
+    mo = getattr(data, "mask_outlet", None)
+    if mi is None or mo is None:
+        return mw
+    mi = mi.view(-1).bool()
+    mo = mo.view(-1).bool()
+    if not mi.any() and not mo.any():
+        return mw
+    row, col = data.edge_index
+    io = mi | mo
+    # Neighbor of an IO node along the mesh edge: that wall vertex is a cap/junction
+    excl_nodes = torch.zeros_like(mw)
+    excl_nodes[col[io[row] & mw[col]]] = True
+    excl_nodes[row[io[col] & mw[row]]] = True
+    return mw & ~excl_nodes

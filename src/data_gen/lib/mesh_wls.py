@@ -38,7 +38,7 @@ def precompute_wls_operators(edge_index: torch.Tensor, num_nodes: int, pos_tenso
     epsilon = 1e-6
     I = torch.eye(5, dtype=M.dtype, device=M.device).unsqueeze(0).expand(num_nodes, 5, 5)
     M_reg = M + epsilon * I
-    M_inv = torch.linalg.pinv(M_reg)
+    M_inv = torch.linalg.pinv(M_reg, rcond=1e-5)
 
     return V, W, M_inv
 

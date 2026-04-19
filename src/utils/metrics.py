@@ -18,6 +18,18 @@ from typing import Optional, Sequence, Union, List, Dict, Any
 Number = Union[int, float]
 
 
+def poiseuille_2d_planar_volume_flux_nd(u_max_nd: torch.Tensor, width_nd: torch.Tensor) -> torch.Tensor:
+    """
+    Volume flux per unit out-of-plane depth for **2D planar** Poiseuille flow across full width ``width_nd``.
+
+    With ``u(r) = U_max (1 - (r/R)^2)`` across half-width ``R = width/2``, integrating across the
+    width gives ``Q = (2/3) U_max * width``. When validating against mean velocity, recall
+    ``U_mean = (2/3) U_max`` for this profile. Do **not** use ``0.5 * U_mean * width`` (that mixes
+    3D circular-pipe conventions).
+    """
+    return (2.0 / 3.0) * u_max_nd * width_nd
+
+
 def _list_mean(vals: List[float]) -> float:
     return float(np.mean(vals)) if len(vals) > 0 else float("nan")
 

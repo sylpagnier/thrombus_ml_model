@@ -1,6 +1,9 @@
 ﻿"""
 Tier 3 synthetic mesh-to-graph conversion.
 
+**2D planar vessels only** (in-plane lumen); velocity priors match 2D plane Poiseuille,
+not 3D pipe flow.
+
 Scope: non-anchor Tier 3 samples (synthetic meshes / priors-only trajectory setup).
 Anchor/patient samples with COMSOL trajectories are produced by:
 ``src.data_gen.lib.extract_tier3_comsol_data.PatientDataExtractor``.
@@ -18,12 +21,8 @@ from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from .graph_velocity_priors import (
-    dean_r_nd_effective,
-    kirchhoff_outlet_psi_values,
     mass_conserving_umax_nd,
-    scale_stream_velocity_to_umax,
-    solve_laplace_stream_function,
-    stream_function_to_velocity,
+    smooth_width_nd_on_edges,
     width_nd_to_radius_nd,
 )
 from src.utils.paths import get_project_root
@@ -453,7 +452,7 @@ class MeshToGraphTier3:
         G_y = torch.sparse_coo_tensor(idx_y, val_y, size=(N, N)).coalesce()
         Laplacian = torch.sparse_coo_tensor(idx_lap, val_lap, size=(N, N)).coalesce()
 
-        # Hydraulic width (sphere tracing) + geodesic flow + adaptive Poiseuille + Laplace stream function prior
+        # 2D planar: hydraulic width (sphere tracing) + geodesic flow + adaptive Poiseuille velocity prior
         d_bar_f = float(d_bar)
         width_nd = torch.zeros(N, 1, dtype=torch.float32)
         t_march = sdf_tensor.clone() + 0.05
@@ -479,6 +478,8 @@ class MeshToGraphTier3:
             t_march[still_idx] = t_march[still_idx] + torch.clamp(dist_still, min=0.01)
 
         width_nd[width_nd.squeeze(-1) < 1e-6] = 1.0
+        width_nd = smooth_width_nd_on_edges(width_nd, edge_index, N)
+        width_nd = torch.clamp(width_nd, min=1e-6)
 
         row_np, col_np = row.numpy(), col.numpy()
         dist_np = edge_attr[:, 2].numpy()
@@ -500,36 +501,10 @@ class MeshToGraphTier3:
         R_nd = width_nd_to_radius_nd(width_nd)
         u_max_nd = mass_conserving_umax_nd(R_nd)
         r_nd = torch.clamp(R_nd - sdf_tensor.squeeze(), min=0.0)
-        r_nd = dean_r_nd_effective(
-            r_nd,
-            R_nd,
-            flow_dir_x,
-            flow_dir_y,
-            wall_normal_vec[:, 0],
-            wall_normal_vec[:, 1],
-            G_x,
-            G_y,
-        )
         u_prior_mag = torch.clamp(u_max_nd * (1.0 - (r_nd ** 2 / (R_nd ** 2 + 1e-12))), min=0.0)
 
-        psi_bc = kirchhoff_outlet_psi_values(
-            mask_inlet, mask_outlet, edge_index, edge_attr[:, 2:3], width_nd
-        )
-        psi_bc[mask_inlet] = 0.0
-        fixed = mask_inlet | mask_outlet
-        if mask_inlet.any() and mask_outlet.any():
-            try:
-                psi = solve_laplace_stream_function(Laplacian, psi_bc, fixed)
-                u_raw, v_raw = stream_function_to_velocity(G_x, G_y, psi, 1.0)
-                u_prior, v_prior, _ = scale_stream_velocity_to_umax(u_raw, v_raw, u_prior_mag)
-                if not torch.isfinite(u_prior).all() or not torch.isfinite(v_prior).all():
-                    raise ValueError("non-finite stream-function velocity prior")
-            except Exception:
-                u_prior = u_prior_mag * flow_dir_x
-                v_prior = u_prior_mag * flow_dir_y
-        else:
-            u_prior = u_prior_mag * flow_dir_x
-            v_prior = u_prior_mag * flow_dir_y
+        u_prior = u_prior_mag * flow_dir_x
+        v_prior = u_prior_mag * flow_dir_y
 
         # Viscosity Prior (Carreau)
         gamma_dot_prior = torch.abs(-2.0 * u_max_nd * r_nd / (R_nd ** 2 + 1e-12))

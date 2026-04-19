@@ -150,12 +150,19 @@ class VesselConfig:
     width_max: float = 0.02  # [m]
     curvature_amplitude: float = 0.0025  # [m]
 
-    # Pathology Constraints
+    # Pathology Constraints (Gaussian depth scales vs nominal ``width``; not a lumen floor)
     stenosis_factor_min: float = 0.1
     stenosis_factor_max: float = 0.2
+    # Hard floor on local lumen width vs nominal ``width`` (mesh / degeneracy guard; noise stacks on pathology)
+    min_lumen_width_fraction: float = 0.2
     aneurysm_factor_min: float = 0.15
     aneurysm_factor_max: float = 0.2
     num_ctrl_pts: int = 50
+
+    # ND hydraulic priors (``graph_velocity_priors``): characteristic half-width and worst-case radius
+    # fraction vs nominal (e.g. severe stenosis). Used to set a physical floor on inferred R_nd.
+    nominal_radius: float = 0.5
+    min_radius_factor: float = 0.2
 
     # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {

@@ -266,6 +266,7 @@ def _build_and_mesh(
         n = cfg_dict["num_ctrl_pts"]
         L = cfg_dict["base_length"]
         lc = cfg_dict["mesh_lc"]
+        min_lumen_frac = float(cfg_dict["min_lumen_width_fraction"])
         curve_type = params["curve_type"]
         v_type = params["v_type"]
         width = params["width"]
@@ -308,7 +309,7 @@ def _build_and_mesh(
 
         if d_bar < 1e-5 or np.any(cross_widths < 0):
             raise ValueError(f"Degenerate geometry: d_bar={d_bar:.2e}")
-        if np.any(cross_widths < (width * 0.1)):
+        if np.any(cross_widths < (width * min_lumen_frac)):
             raise ValueError(f"Geometry too narrow at a control point.")
 
         # 4. Generate Final Coordinates
@@ -321,11 +322,6 @@ def _build_and_mesh(
             step_lengths = np.linalg.norm(step_vectors, axis=1)
             if np.any(step_lengths < (L / n) * 0.1):
                 raise ValueError("Self-intersection detected: Boundary spline collapsed.")
-
-            # Inside the Safety Check for Self-Intersection loop:
-            cross_distances = np.linalg.norm(top_coords - bot_coords, axis=1)
-            if np.any(cross_distances < (width * 0.20)):  # Increased margin to 20%
-                raise ValueError("Self-intersection detected: Walls pinched together.")
 
             # --- NEW COMSOL OUTLET CHECK ---
             # Ensure the physical X-coordinates of the outlet nodes are strictly > L/3
@@ -371,6 +367,9 @@ def _build_and_mesh(
             "level": params["level"],
             "d_bar": d_bar,
             "num_outlets": 1,
+            # Nondimensional centerline (same scaling as mesh graphs: nodes / d_bar) + unit tangents
+            "centerline_pts": (pts / d_bar).tolist(),
+            "centerline_tangents": tangents.tolist(),
         }
         with open(out / f"vessel_{idx}.json", "w") as f:
             json.dump(meta, f, indent=4)
@@ -432,6 +431,7 @@ class VesselGenerator:
             "width_max":          self.cfg.width_max,
             "stenosis_factor_min": self.cfg.stenosis_factor_min,
             "stenosis_factor_max": self.cfg.stenosis_factor_max,
+            "min_lumen_width_fraction": self.cfg.min_lumen_width_fraction,
             "aneurysm_factor_min": self.cfg.aneurysm_factor_min,
             "aneurysm_factor_max": self.cfg.aneurysm_factor_max,
             "TAGS":               dict(self.cfg.TAGS),

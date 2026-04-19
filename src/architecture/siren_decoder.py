@@ -21,7 +21,7 @@ class Sine(nn.Module):
 class SIRENDecoder(nn.Module):
     """
     Maps latent node features + (x, y) coordinates to (u, v, p).
-    Coordinates are cloned and marked for grad so callers can use autograd on spatial derivatives.
+    Coordinates may retain ``requires_grad`` when the encoder passes a leaf tensor (e.g. hard-BC paths).
 
     Uses Sitzmann et al. SIREN weight initialization (not Kaiming) so sine activations stay stable.
     """

@@ -1,8 +1,8 @@
-import os
 import torch
 from typing import Optional
 
 from src.config import PredChannels
+from src.utils.anchor_mask import wall_wss_supervision_mask
 from src.utils.batching import get_batch_tensor
 from src.utils.math_operators import scatter_add as shared_scatter_add, wls_derivatives
 from src.utils.rheology import carreau_yasuda_viscosity, compute_shear_rate
@@ -16,17 +16,11 @@ def scatter_add(src, index, dim=0, dim_size=None):
 class PhysicsKernels:
     def __init__(self, phys_cfg):
         self.cfg = phys_cfg
-        self.ns_derivative_mode = os.environ.get("PHYSICS_NS_DERIVATIVE_MODE", "wls").strip().lower()
-        if self.ns_derivative_mode not in ("wls", "autograd"):
-            self.ns_derivative_mode = "wls"
-        self.advect_detach = os.environ.get("TIER1_ADVECT_DETACH", "0").strip().lower() in ("1", "true", "yes", "on")
-        self.momentum_loss_mode = os.environ.get("TIER1_MOMENTUM_LOSS_MODE", "huber").strip().lower()
-        if self.momentum_loss_mode not in ("huber", "mse"):
-            self.momentum_loss_mode = "huber"
-        self.momentum_huber_delta = float(os.environ.get("TIER1_MOMENTUM_HUBER_DELTA", "0.01"))
-        self.pressure_bc_mode = os.environ.get("TIER1_PRESSURE_BC_MODE", "pointwise").strip().lower()
-        if self.pressure_bc_mode not in ("mean", "pointwise", "mean_var"):
-            self.pressure_bc_mode = "pointwise"
+        # Tier 1 / Tier 2 training use this strong-form stack; keep a single recipe (no env toggles).
+        self.advect_detach = False
+        self.momentum_loss_mode = "huber"
+        self.momentum_huber_delta = 0.01
+        self.pressure_bc_mode = "pointwise"
 
         # ND Carreau bounds use the same scale as label channel STATE_CHANNEL_MU_EFF_ND
         _mu_nd_scale = self.cfg.mu_viscosity_nd_scale
@@ -91,38 +85,6 @@ class PhysicsKernels:
         mask_outlet_1d = data.mask_outlet.view(-1).bool()
         return ~(mask_wall_1d | mask_inlet_1d | mask_outlet_1d)
 
-    @staticmethod
-    def _safe_grad(outputs, inputs, retain_graph=True, create_graph=True):
-        g = torch.autograd.grad(
-            outputs=outputs,
-            inputs=inputs,
-            grad_outputs=torch.ones_like(outputs),
-            retain_graph=retain_graph,
-            create_graph=create_graph,
-            allow_unused=True,
-        )[0]
-
-        if g is None:
-            # FAIL LOUDLY: The network architecture is not fully differentiable with respect to spatial coordinates.
-            raise RuntimeError(
-                "Autograd failed to compute spatial derivatives! "
-                "The computational graph from the spatial inputs (x,y) to the model outputs is broken or detached."
-            )
-
-        return g
-
-    def _compute_autograd_derivatives(self, field: torch.Tensor, coords_xy: torch.Tensor):
-        """Compute [x, y, xx, xy, yy] derivatives using torch.autograd."""
-        d1 = self._safe_grad(field, coords_xy)
-        dfdx = d1[:, 0]
-        dfdy = d1[:, 1]
-        d2x = self._safe_grad(dfdx, coords_xy)
-        d2y = self._safe_grad(dfdy, coords_xy)
-        dfdxx = d2x[:, 0]
-        dfdxy = d2x[:, 1]
-        dfdyy = d2y[:, 1]
-        return dfdx, dfdy, dfdxx, dfdxy, dfdyy
-
     def navier_stokes_residual(
         self,
         pred,
@@ -152,34 +114,16 @@ class PhysicsKernels:
             d_bar = data.d_bar[batch_idx]
         # --------------------------------------
 
-        # --- DERIVATIVE COMPUTATION ---
-        if self.ns_derivative_mode == "autograd":
-            # Autograd needs to trace back to the exact tensor tracked during the forward pass.
-            # We differentiate w.r.t the base data.x (if it requires grad) to capture
-            # spatial gradients flowing through BOTH the SIREN decoder and the Fourier encoder.
-            if hasattr(data, "x") and data.x.requires_grad:
-                coords_xy = data.x
-            elif hasattr(data, "pos") and data.pos is not None and data.pos.requires_grad:
-                coords_xy = data.pos
-            else:
-                raise RuntimeError("data.x or data.pos requires_grad=True is necessary for autograd NS derivatives.")
+        # Discrete derivatives via precomputed WLS operator
+        c_u = self._compute_derivatives(u.unsqueeze(1), props)
+        c_v = self._compute_derivatives(v.unsqueeze(1), props)
+        c_p = self._compute_derivatives(p.unsqueeze(1), props)
 
-            # Exact continuous derivatives via PyTorch Autograd
-            u_x, u_y, u_xx, u_xy, u_yy = self._compute_autograd_derivatives(u, coords_xy)
-            v_x, v_y, v_xx, v_xy, v_yy = self._compute_autograd_derivatives(v, coords_xy)
-            p_x, p_y, _, _, _ = self._compute_autograd_derivatives(p, coords_xy)
-
-        else:
-            # Discrete derivatives via precomputed WLS operator
-            c_u = self._compute_derivatives(u.unsqueeze(1), props)
-            c_v = self._compute_derivatives(v.unsqueeze(1), props)
-            c_p = self._compute_derivatives(p.unsqueeze(1), props)
-
-            u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
-            v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
-            u_xy = c_u[:, 3, 0]
-            v_xy = c_v[:, 3, 0]
-            p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
+        u_x, u_y, u_xx, u_yy = c_u[:, 0, 0], c_u[:, 1, 0], c_u[:, 2, 0], c_u[:, 4, 0]
+        v_x, v_y, v_xx, v_yy = c_v[:, 0, 0], c_v[:, 1, 0], c_v[:, 2, 0], c_v[:, 4, 0]
+        u_xy = c_u[:, 3, 0]
+        v_xy = c_v[:, 3, 0]
+        p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
         # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.
@@ -213,7 +157,7 @@ class PhysicsKernels:
             visc_y = (1.0 / Re) * (2 * mu_y * v_y + mu_x * (u_y + v_x) + mu_eff * (2 * v_yy + v_xx + u_xy))
 
         else:
-            # Newtonian stream-function formulation: robust Laplacian form.
+            # Newtonian: standard Laplacian viscous terms.
             visc_x = (1.0 / Re) * (u_xx + u_yy)
             visc_y = (1.0 / Re) * (v_xx + v_yy)
 
@@ -355,8 +299,7 @@ class PhysicsKernels:
         return loss
 
     def boundary_condition_loss(self, pred, data):
-        # Soft wall no-slip penalty is retained even when a hard architectural constraint exists,
-        # so direct-velocity and stream-function branches can be compared safely.
+        # Soft wall no-slip penalty is retained even when a hard architectural constraint exists.
         mask_wall = data.mask_wall.view(-1).bool()
         if not mask_wall.any():
             return pred.sum() * 0.0
@@ -373,16 +316,16 @@ class PhysicsKernels:
 
         wss_pred = pred[:, PredChannels.WSS]
 
-        mask_wall = data.mask_wall.view(-1).bool()
-        if not mask_wall.any():
+        mask_wss = wall_wss_supervision_mask(data)
+        if not mask_wss.any():
             return pred.sum() * 0.0
 
         if (not hasattr(data, "y")) or (data.y is None) or (data.y.shape[1] <= 4):
             return pred.sum() * 0.0
         # Supervise against precomputed COMSOL wall WSS target stored in label channel 4.
         wss_mag_phys = data.y[:, PredChannels.WSS]
-        wss_pred_wall = wss_pred[mask_wall]
-        wss_true_wall = wss_mag_phys[mask_wall]
+        wss_pred_wall = wss_pred[mask_wss]
+        wss_true_wall = wss_mag_phys[mask_wss]
         loss_data = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_true_wall, beta=0.01)
 
         # Couple WSS head to predicted near-wall kinematics through analytical shear-rate consistency.
@@ -394,10 +337,10 @@ class PhysicsKernels:
         v_x, v_y = c_v[:, 0, 0], c_v[:, 1, 0]
         gamma_dot = compute_shear_rate(u_x, u_y, v_x, v_y, eps=1e-6)
         if self.cfg.viscosity_model == "carreau" and pred.shape[1] > PredChannels.MU_EFF_ND:
-            mu_wall = pred[:, PredChannels.MU_EFF_ND][mask_wall]
+            mu_wall = pred[:, PredChannels.MU_EFF_ND][mask_wss]
         else:
             mu_wall = torch.full_like(wss_pred_wall, float(self.cfg.mu_viscosity_nd_scale))
-        wss_phys_wall = mu_wall * gamma_dot[mask_wall]
+        wss_phys_wall = mu_wall * gamma_dot[mask_wss]
         loss_phys = torch.nn.functional.smooth_l1_loss(wss_pred_wall, wss_phys_wall, beta=0.01)
 
         return loss_data + (0.5 * loss_phys)

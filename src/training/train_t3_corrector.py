@@ -1407,18 +1407,29 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
     ).to(device)
 
-    # 1. Resume Tier 3 if checkpoint exists; otherwise load Tier 2 backbone
+    # 1. Backbone weights: Tier 2 -> Tier 3 by default; optional tier3_best_bio or full latest resume
     root = get_project_root()
     model_dir = stage_b_dir()
     tier3_resume_path = resolve_checkpoint("b", "tier3_best_bio.pth")
     tier2_path = resolve_checkpoint("a", "tier2_best_physics.pth")
+    latest_ckpt_path = resolve_checkpoint("b", "tier3_latest_checkpoint.pth")
     resume_enabled = (os.environ.get("TIER3_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
+    init_from_best = (os.environ.get("TIER3_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
+    will_resume_from_latest = bool(resume_enabled and latest_ckpt_path.exists())
+    load_tier3_best_weights = (init_from_best or resume_enabled) and tier3_resume_path.exists()
 
-    if resume_enabled and tier3_resume_path.exists():
+    loaded_tier3_best_backbone = False
+    if will_resume_from_latest:
+        print(
+            "ℹ️ TIER3_RESUME: will restore full training state from tier3_latest_checkpoint.pth "
+            "(skipping backbone load here)."
+        )
+    elif load_tier3_best_weights:
         resume_state = torch.load(tier3_resume_path, map_location=device, weights_only=True)
         model.load_state_dict(resume_state, strict=False)
-        print(f"🔁 Resumed Tier 3 from checkpoint: {tier3_resume_path.name}")
-    elif resume_enabled and tier2_path.exists():
+        loaded_tier3_best_backbone = True
+        print(f"🔁 Initialized Tier 3 weights from {tier3_resume_path.name}")
+    elif tier2_path.exists():
         state_dict = torch.load(tier2_path, map_location=device, weights_only=True)
 
         mapped_state_dict = {}
@@ -1445,13 +1456,18 @@ def train_t3_corrector(epochs=25, lr=1e-3):
 
         model.load_state_dict(mapped_state_dict, strict=False)
         print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
-    elif resume_enabled:
-        print("⚠️ Warning: neither Tier 3 resume checkpoint nor Tier 2 weights were found.")
+    elif init_from_best or resume_enabled:
+        print(
+            f"⚠️ Warning: no Tier 3 best checkpoint at {tier3_resume_path.name} and no Tier 2 weights at "
+            f"{tier2_path.name}."
+        )
 
-    if not (resume_enabled and tier3_resume_path.exists()):
+    if will_resume_from_latest:
+        pass  # biochem + kinematics come from tier3_latest_checkpoint.pth
+    elif loaded_tier3_best_backbone:
+        print("⏭️ Skipping biochem prior initialization because Tier 3 best checkpoint was loaded.")
+    else:
         initialize_biochem_priors(model)
-    elif resume_enabled:
-        print("⏭️ Skipping biochem prior initialization because Tier 3 checkpoint was loaded.")
     loss_weighter = make_tier3_dynamic_loss_weighter(curriculum, device)
 
     print("💉 Injecting LoRA into kinematic modules (SpectralLinear layers)...")
@@ -1611,7 +1627,6 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     best_composite = -1.0e9
     dice_ema: Optional[float] = None
     latest_ckpt_save = model_dir / "tier3_latest_checkpoint.pth"
-    latest_ckpt_path = resolve_checkpoint("b", "tier3_latest_checkpoint.pth")
     ckpt_every = max(1, int(os.environ.get("TIER3_CKPT_EVERY", "1")))
 
     if resume_enabled and latest_ckpt_path.exists():
