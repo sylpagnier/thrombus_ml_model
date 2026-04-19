@@ -409,7 +409,6 @@ def train_t1_predictor(
 
     best_val_composite_loss = float("inf")
     best_loss = float('inf')
-    root = get_project_root()
     ckpt_dir_override = os.environ.get("TIER1_CKPT_DIR", "").strip()
     if ckpt_dir_override:
         model_dir = Path(ckpt_dir_override)
