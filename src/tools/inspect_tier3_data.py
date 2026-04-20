@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from torch_geometric.data import Data
 from matplotlib.widgets import Button, Slider
 from scipy.spatial import cKDTree
 from src.config import BiochemConfig, VesselConfig
