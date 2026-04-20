@@ -1,3 +1,4 @@
+import argparse
 import atexit
 import math
 import os
@@ -758,5 +759,45 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     )
 
 
+def _parse_args():
+    p = argparse.ArgumentParser(description="Tier 2 GINO-DEQ predictor training.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from tier2_latest_checkpoint.pth (sets TIER2_RESUME=1).",
+    )
+    mode.add_argument(
+        "--new",
+        action="store_true",
+        help="Start a new run (sets TIER2_RESUME=0).",
+    )
+    return p.parse_args()
+
+
+def _prompt_resume_or_new_t2() -> bool:
+    """Ask user whether to resume checkpointed training."""
+    while True:
+        raw = input("Training mode [1=resume / 2=start new] [1]: ").strip()
+        if raw in ("", "1"):
+            return True
+        if raw == "2":
+            return False
+        print("  Enter 1 or 2.")
+
+
 if __name__ == "__main__":
+    args = _parse_args()
+    if args.resume:
+        resume_enabled = True
+    elif args.new:
+        resume_enabled = False
+    else:
+        resume_enabled = _prompt_resume_or_new_t2()
+    os.environ["TIER2_RESUME"] = "1" if resume_enabled else "0"
+    print(
+        "🔄 Resuming Tier 2 from latest checkpoint."
+        if resume_enabled
+        else "🆕 Starting a new Tier 2 run."
+    )
     train_t2_predictor()

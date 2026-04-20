@@ -717,6 +717,20 @@ def _prompt_write_mode_vessel() -> bool:
         print("  Enter 1 or 2.")
 
 
+def _prompt_yes_no(label: str, default: bool = False) -> bool:
+    """Read a yes/no answer; empty input returns ``default``."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        raw = input(f"{label} {suffix}: ").strip().lower()
+        if raw == "":
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("  Enter y/yes or n/no.")
+
+
 def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Generate 2D vessel meshes (Gmsh) for Phase 1 tiers.")
     p.add_argument("--tier", type=int, choices=(1, 2), default=None, help="Tier (use with --level and -n)")
@@ -768,6 +782,7 @@ if __name__ == "__main__":
         level = args.level
         n_vessels = args.num_vessels
         start_idx = 0 if args.overwrite else None
+        show_vessel_plot = bool(args.show_vessel_plot)
     else:
         tier_n = _prompt_int_choice("Tier", (1, 2))
         level = _prompt_int_choice("Level", (0, 1))
@@ -793,6 +808,10 @@ if __name__ == "__main__":
         default_n = 50 if n_on_disk > 0 else 500
         n_vessels = _prompt_positive_int("How many vessels to generate", default_n)
         start_idx = 0 if overwrite else None
+        show_vessel_plot = bool(args.show_vessel_plot) or _prompt_yes_no(
+            "Show matplotlib preview of generated meshes after this run?",
+            default=False,
+        )
 
     if all(trio):
         vg = VesselGenerator(tier=tier)
@@ -811,7 +830,7 @@ if __name__ == "__main__":
         start_idx=start_idx,
     )
 
-    if args.show_vessel_plot:
+    if show_vessel_plot:
         saved_indices = sorted(
             int(p.stem.split("_")[-1])
             for p in vg.output_dir.glob("vessel_*.msh")

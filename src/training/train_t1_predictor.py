@@ -899,11 +899,45 @@ def _parse_args():
         default=None,
         help="Sets TIER1_EXPERIMENT_NAME for reports/experiments JSON (same as env).",
     )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from tier1_latest_checkpoint.pth (sets TIER1_RESUME=1).",
+    )
+    mode.add_argument(
+        "--new",
+        action="store_true",
+        help="Start a new run (sets TIER1_RESUME=0).",
+    )
     return p.parse_args()
+
+
+def _prompt_resume_or_new_t1() -> bool:
+    """Ask user whether to resume checkpointed training."""
+    while True:
+        raw = input("Training mode [1=resume / 2=start new] [1]: ").strip()
+        if raw in ("", "1"):
+            return True
+        if raw == "2":
+            return False
+        print("  Enter 1 or 2.")
 
 
 if __name__ == "__main__":
     args = _parse_args()
     if args.experiment_name:
         os.environ["TIER1_EXPERIMENT_NAME"] = args.experiment_name
+    if args.resume:
+        resume_enabled = True
+    elif args.new:
+        resume_enabled = False
+    else:
+        resume_enabled = _prompt_resume_or_new_t1()
+    os.environ["TIER1_RESUME"] = "1" if resume_enabled else "0"
+    print(
+        "🔄 Resuming Tier 1 from latest checkpoint."
+        if resume_enabled
+        else "🆕 Starting a new Tier 1 run."
+    )
     train_t1_predictor()

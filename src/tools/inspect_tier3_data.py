@@ -55,6 +55,7 @@ FIELD_COLUMNS = [
 ]
 
 _TIER_CHOICES = ("tier3", "tier3_patients", "tier3_mix")
+U_CMAP = "jet"
 
 
 def _resolve_export_dir(tier: str) -> Path:
@@ -213,16 +214,12 @@ def plot_domain_trajectory_slider(
     x_s = df0["x"].to_numpy(dtype=np.float64)[idx]
     y_s = df0["y"].to_numpy(dtype=np.float64)[idx]
     tree = cKDTree(df0[["x", "y"]].values)
-    m_in = _boundary_mask(export_dir / f"{stem}_inlet.txt", tree, n)[idx]
-    m_out = _boundary_mask(export_dir / f"{stem}_outlet.txt", tree, n)[idx]
-    m_wall = _boundary_mask(export_dir / f"{stem}_wall.txt", tree, n)[idx]
-    bcat = _bc_category_color(m_in, m_out, m_wall)
-
     t_axis = np.array(times_sorted, dtype=np.float64)
     t_count = len(times_sorted)
     vel = np.zeros((t_count, idx.size), dtype=np.float64)
     p_all = np.zeros((t_count, idx.size), dtype=np.float64)
     th_all = np.zeros((t_count, idx.size), dtype=np.float64)
+    mu_all = np.zeros((t_count, idx.size), dtype=np.float64)
     for ti, tv in enumerate(times_sorted):
         dfi = blocks[tv].iloc[idx].reset_index(drop=True)
         u = dfi["u"].to_numpy(dtype=np.float64)
@@ -230,10 +227,12 @@ def plot_domain_trajectory_slider(
         vel[ti] = np.sqrt(u**2 + v**2)
         p_all[ti] = dfi["p"].to_numpy(dtype=np.float64)
         th_all[ti] = dfi["th"].to_numpy(dtype=np.float64)
+        mu_all[ti] = dfi["mu_eff"].to_numpy(dtype=np.float64)
 
     vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
     p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
     th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
+    mu_vmin, mu_vmax = float(mu_all.min()), float(mu_all.max())
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
     bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
@@ -241,7 +240,7 @@ def plot_domain_trajectory_slider(
     ti0 = 0
     fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[ti0]:.6g})", fontsize=14, fontweight="bold")
 
-    sc0 = axs[0, 0].scatter(x_s, y_s, c=vel[ti0], cmap="viridis", s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
+    sc0 = axs[0, 0].scatter(x_s, y_s, c=vel[ti0], cmap=U_CMAP, s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
     fig.colorbar(sc0, ax=axs[0, 0], label="|U|")
     axs[0, 0].set_title("|U|")
     sc1 = axs[0, 1].scatter(x_s, y_s, c=p_all[ti0], cmap="coolwarm", s=2, vmin=p_vmin, vmax=p_vmax, rasterized=True)
@@ -250,9 +249,9 @@ def plot_domain_trajectory_slider(
     sc2 = axs[1, 0].scatter(x_s, y_s, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
     fig.colorbar(sc2, ax=axs[1, 0], label="th")
     axs[1, 0].set_title("th")
-    sc3 = axs[1, 1].scatter(x_s, y_s, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(sc3, ax=axs[1, 1], ticks=[0, 1, 2, 3])
-    axs[1, 1].set_title("BC category (static mesh)")
+    sc3 = axs[1, 1].scatter(x_s, y_s, c=mu_all[ti0], cmap="magma", s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
+    fig.colorbar(sc3, ax=axs[1, 1], label="mu_eff")
+    axs[1, 1].set_title("mu_eff")
 
     for ax in axs.flat:
         ax.set_aspect("equal")
@@ -276,6 +275,7 @@ def plot_domain_trajectory_slider(
             sc0.set_array(vel[k])
             sc1.set_array(p_all[k])
             sc2.set_array(th_all[k])
+            sc3.set_array(mu_all[k])
             fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[k]:.6g})", fontsize=14, fontweight="bold")
             fig.canvas.draw_idle()
 
@@ -328,15 +328,12 @@ def plot_graph_trajectory_slider(
     p_all = y[:, idx, 2]
     th_ch = min(11, c - 1)
     th_all = y[:, idx, th_ch]
+    mu_ch = y[:, idx, 3] if c > 3 else np.zeros((t_count, idx.size), dtype=np.float64)
 
     vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
     p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
     th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
-
-    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)[idx]
-    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)[idx]
-    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)[idx]
-    bcat = _bc_category_color(m_in, m_out, m_wall)
+    mu_vmin, mu_vmax = float(mu_ch.min()), float(mu_ch.max())
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
     bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
@@ -348,7 +345,7 @@ def plot_graph_trajectory_slider(
         fontweight="bold",
     )
 
-    sc0 = axs[0, 0].scatter(x_s, y_coord, c=vel[ti0], cmap="viridis", s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
+    sc0 = axs[0, 0].scatter(x_s, y_coord, c=vel[ti0], cmap=U_CMAP, s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
     fig.colorbar(sc0, ax=axs[0, 0], label="|U|")
     axs[0, 0].set_title("|U| (y)")
     sc1 = axs[0, 1].scatter(x_s, y_coord, c=p_all[ti0], cmap="coolwarm", s=2, vmin=p_vmin, vmax=p_vmax, rasterized=True)
@@ -357,9 +354,9 @@ def plot_graph_trajectory_slider(
     sc2 = axs[1, 0].scatter(x_s, y_coord, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
     fig.colorbar(sc2, ax=axs[1, 0], label=f"ch{th_ch}")
     axs[1, 0].set_title("th / channel")
-    sc3 = axs[1, 1].scatter(x_s, y_coord, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(sc3, ax=axs[1, 1], ticks=[0, 1, 2, 3])
-    axs[1, 1].set_title("BC masks")
+    sc3 = axs[1, 1].scatter(x_s, y_coord, c=mu_ch[ti0], cmap="magma", s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
+    fig.colorbar(sc3, ax=axs[1, 1], label="ch3")
+    axs[1, 1].set_title("mu / channel 3")
 
     for ax in axs.flat:
         ax.set_aspect("equal")
@@ -382,6 +379,7 @@ def plot_graph_trajectory_slider(
         sc0.set_array(vel[k])
         sc1.set_array(p_all[k])
         sc2.set_array(th_all[k])
+        sc3.set_array(mu_ch[k])
         tt = float(t_axis[k]) if k < len(t_axis) else float(k)
         fig.suptitle(f"Tier3 graph labels — {stem}  (t={tt:.6g})", fontsize=14, fontweight="bold")
         fig.canvas.draw_idle()
@@ -419,14 +417,11 @@ def _plot_domain_single_time_dashboard(
     v = df["v"].to_numpy(dtype=np.float64)
     p = df["p"].to_numpy(dtype=np.float64)
     vel = np.sqrt(u**2 + v**2)
-    m_in, m_out, m_wall, _ = _domain_boundary_masks(stem, export_dir, df)
-    bcat = _bc_category_color(m_in, m_out, m_wall)
-
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     plt.subplots_adjust(bottom=0.18, hspace=0.25)
     fig.suptitle(f"Tier3 domain (single time) — {stem}", fontsize=14, fontweight="bold")
     ax = axes.flatten()
-    s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+    s0 = ax[0].scatter(x, y, c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U|")
     ax[0].set_title("|U|")
     s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
@@ -435,9 +430,9 @@ def _plot_domain_single_time_dashboard(
     s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
     fig.colorbar(s2, ax=ax[2], label="th")
     ax[2].set_title("th")
-    s3 = ax[3].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(s3, ax=ax[3], ticks=[0, 1, 2, 3])
-    ax[3].set_title("BC category ('r' / Regenerate)")
+    s3 = ax[3].scatter(x, y, c=df["mu_eff"].to_numpy(dtype=np.float64), cmap="magma", s=2, rasterized=True)
+    fig.colorbar(s3, ax=ax[3], label="mu_eff")
+    ax[3].set_title("mu_eff ('r' / Regenerate)")
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
@@ -470,24 +465,20 @@ def _plot_graph_steady_dashboard_with_regen(
     u, v = y_s[:, 0], y_s[:, 1]
     pr = y_s[:, 2] if y_s.shape[1] > 2 else np.zeros_like(u)
     vel = np.sqrt(u**2 + v**2)
-    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
-    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
-    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
-    bcat = _bc_category_color(m_in, m_out, m_wall)
-
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     plt.subplots_adjust(bottom=0.18, hspace=0.25)
     fig.suptitle(f"Tier3 graph (steady) — {stem}", fontsize=14, fontweight="bold")
     ax = axes.flatten()
-    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U|")
     ax[0].set_title("|U|")
     s1 = ax[1].scatter(pos[:, 0], pos[:, 1], c=pr, cmap="coolwarm", s=2, rasterized=True)
     fig.colorbar(s1, ax=ax[1], label="p")
     ax[1].set_title("p")
-    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(s2, ax=ax[2], ticks=[0, 1, 2, 3])
-    ax[2].set_title("BC")
+    th_ch = min(11, y_s.shape[1] - 1)
+    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=y_s[:, th_ch], cmap="inferno", s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], label=f"ch{th_ch}")
+    ax[2].set_title("th / channel")
     mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
     s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
     fig.colorbar(s3, ax=ax[3])
@@ -722,25 +713,6 @@ def print_summary_table(tier: str, export_dir: Path, graph_dir: Path) -> None:
         print(f"{stem:<24} {len(times):>6} {str(g_exists):>8}")
 
 
-def _domain_boundary_masks(stem: str, export_dir: Path, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    tree = cKDTree(df[["x", "y"]].values)
-    n = len(df)
-    m_in = _boundary_mask(export_dir / f"{stem}_inlet.txt", tree, n)
-    m_out = _boundary_mask(export_dir / f"{stem}_outlet.txt", tree, n)
-    m_wall = _boundary_mask(export_dir / f"{stem}_wall.txt", tree, n)
-    m_int = ~(m_in | m_out | m_wall)
-    return m_in, m_out, m_wall, m_int
-
-
-def _bc_category_color(m_in: np.ndarray, m_out: np.ndarray, m_wall: np.ndarray) -> np.ndarray:
-    """Scalar category per node for scatter coloring."""
-    cat = np.zeros(len(m_in), dtype=np.float32)
-    cat[m_in] = 1.0
-    cat[m_out] = 2.0
-    cat[m_wall] = 3.0
-    return cat
-
-
 def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000) -> None:
     """Scatter / quiver for the first loaded block of ``{stem}.txt`` (same sampling as audits)."""
     domain_file = export_dir / f"{stem}.txt"
@@ -755,13 +727,10 @@ def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000
     mu = df["mu_eff"].to_numpy(dtype=np.float64)
     vel = np.sqrt(u**2 + v**2)
 
-    m_in, m_out, m_wall, _ = _domain_boundary_masks(stem, export_dir, df)
-    bcat = _bc_category_color(m_in, m_out, m_wall)
-
     fig, axes = plt.subplots(2, 3, figsize=(14, 9))
     ax = axes.flatten()
 
-    s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+    s0 = ax[0].scatter(x, y, c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U|")
     ax[0].set_title("|U|")
     s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
@@ -779,9 +748,9 @@ def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000
     fig.colorbar(s4, ax=ax[4], label="rp")
     ax[4].set_title("rp (sample)")
 
-    scat_bc = ax[5].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(scat_bc, ax=ax[5], ticks=[0, 1, 2, 3], label="0=int 1=in 2=out 3=wall")
-    ax[5].set_title("BC category")
+    scat_mu = ax[5].scatter(x, y, c=mu, cmap="magma", s=2, rasterized=True)
+    fig.colorbar(scat_mu, ax=ax[5], label="mu_eff")
+    ax[5].set_title("mu_eff")
 
     for a in ax:
         a.set_aspect("equal")
@@ -804,7 +773,7 @@ def _y_slice_for_plot(data: Data) -> np.ndarray:
 
 
 def plot_graph_static(stem: str, graph_dir: Path) -> None:
-    """Node scatter: kinematics + BC masks from a processed ``.pt`` graph."""
+    """Node scatter: kinematics + dynamic channels from a processed ``.pt`` graph."""
     graph_file = graph_dir / f"{stem}.pt"
     if not graph_file.exists():
         raise FileNotFoundError(f"Missing graph file: {graph_file}")
@@ -816,23 +785,19 @@ def plot_graph_static(stem: str, graph_dir: Path) -> None:
     pr = y_s[:, 2] if y_s.shape[1] > 2 else np.zeros_like(u)
     vel = np.sqrt(u**2 + v**2)
 
-    m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
-    m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
-    m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
-    bcat = _bc_category_color(m_in, m_out, m_wall)
-
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     ax = axes.flatten()
 
-    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+    s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U| (labels)")
     ax[0].set_title("|U| from y")
     s1 = ax[1].scatter(pos[:, 0], pos[:, 1], c=pr, cmap="coolwarm", s=2, rasterized=True)
     fig.colorbar(s1, ax=ax[1], label="p")
     ax[1].set_title("Pressure from y")
-    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-    fig.colorbar(s2, ax=ax[2], ticks=[0, 1, 2, 3])
-    ax[2].set_title("BC masks (decoded)")
+    th_ch = min(11, y_s.shape[1] - 1)
+    s2 = ax[2].scatter(pos[:, 0], pos[:, 1], c=y_s[:, th_ch], cmap="inferno", s=2, rasterized=True)
+    fig.colorbar(s2, ax=ax[2], label=f"ch{th_ch}")
+    ax[2].set_title("th / channel")
     mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
     s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
     fig.colorbar(s3, ax=ax[3], label="mu / extra")
@@ -863,12 +828,9 @@ def inspect_domain_interactive(*, export_dir: Path, start_stem: str | None, samp
         v = df["v"].to_numpy(dtype=np.float64)
         p = df["p"].to_numpy(dtype=np.float64)
         vel = np.sqrt(u**2 + v**2)
-        m_in, m_out, m_wall, _ = _domain_boundary_masks(current, export_dir, df)
-        bcat = _bc_category_color(m_in, m_out, m_wall)
-
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         ax = axes.flatten()
-        s0 = ax[0].scatter(x, y, c=vel, cmap="viridis", s=2, rasterized=True)
+        s0 = ax[0].scatter(x, y, c=vel, cmap=U_CMAP, s=2, rasterized=True)
         fig.colorbar(s0, ax=ax[0], label="|U|")
         ax[0].set_title(f"|U| — {current}")
         s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
@@ -877,9 +839,9 @@ def inspect_domain_interactive(*, export_dir: Path, start_stem: str | None, samp
         s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
         fig.colorbar(s2, ax=ax[2], label="th")
         ax[2].set_title("th")
-        s3 = ax[3].scatter(x, y, c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-        fig.colorbar(s3, ax=ax[3], ticks=[0, 1, 2, 3])
-        ax[3].set_title("BC category (press 'r' or Regenerate)")
+        s3 = ax[3].scatter(x, y, c=df["mu_eff"].to_numpy(dtype=np.float64), cmap="magma", s=2, rasterized=True)
+        fig.colorbar(s3, ax=ax[3], label="mu_eff")
+        ax[3].set_title("mu_eff (press 'r' or Regenerate)")
         for a in ax:
             a.set_aspect("equal")
             a.axis("off")
@@ -923,18 +885,14 @@ def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> Non
         y_s = _y_slice_for_plot(data)
         u, v = y_s[:, 0], y_s[:, 1]
         vel = np.sqrt(u**2 + v**2)
-        m_in = data.mask_inlet.detach().cpu().numpy().astype(bool)
-        m_out = data.mask_outlet.detach().cpu().numpy().astype(bool)
-        m_wall = data.mask_wall.detach().cpu().numpy().astype(bool)
-        bcat = _bc_category_color(m_in, m_out, m_wall)
-
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        s0 = axes[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap="viridis", s=2, rasterized=True)
+        s0 = axes[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap=U_CMAP, s=2, rasterized=True)
         fig.colorbar(s0, ax=axes[0], label="|U|")
         axes[0].set_title(f"|U| — {current}")
-        s1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=bcat, cmap="tab10", vmin=0, vmax=9, s=2, rasterized=True)
-        fig.colorbar(s1, ax=axes[1], ticks=[0, 1, 2, 3])
-        axes[1].set_title("BC (press 'r' or Regenerate)")
+        mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
+        s1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+        fig.colorbar(s1, ax=axes[1], label="ch3")
+        axes[1].set_title("mu / channel 3 (press 'r' or Regenerate)")
         for a in axes:
             a.set_aspect("equal")
             a.axis("off")
@@ -988,7 +946,7 @@ def main() -> None:
     parser.add_argument(
         "--plot-graph",
         action="store_true",
-        help="Static plot of a processed graph .pt (labels + BC masks).",
+        help="Static plot of a processed graph .pt (labels + channel views).",
     )
     parser.add_argument(
         "--plot-graph-interactive",

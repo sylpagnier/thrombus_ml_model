@@ -1,3 +1,4 @@
+import argparse
 import atexit
 import os
 import sys
@@ -2153,7 +2154,49 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     _emit_tier3_run_end(interrupted=False)
 
 
+def _parse_args():
+    p = argparse.ArgumentParser(description="Tier 3 GNODE corrector training.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from tier3_latest_checkpoint.pth (sets TIER3_RESUME=1).",
+    )
+    mode.add_argument(
+        "--new",
+        action="store_true",
+        help="Start a new run (sets TIER3_RESUME=0 and TIER3_INIT_FROM_BEST=0).",
+    )
+    return p.parse_args()
+
+
+def _prompt_resume_or_new_t3() -> bool:
+    """Ask user whether to resume checkpointed training."""
+    while True:
+        raw = input("Training mode [1=resume / 2=start new] [1]: ").strip()
+        if raw in ("", "1"):
+            return True
+        if raw == "2":
+            return False
+        print("  Enter 1 or 2.")
+
+
 if __name__ == "__main__":
+    args = _parse_args()
+    if args.resume:
+        resume_enabled = True
+    elif args.new:
+        resume_enabled = False
+    else:
+        resume_enabled = _prompt_resume_or_new_t3()
+    os.environ["TIER3_RESUME"] = "1" if resume_enabled else "0"
+    if not resume_enabled:
+        os.environ["TIER3_INIT_FROM_BEST"] = "0"
+    print(
+        "🔄 Resuming Tier 3 from latest checkpoint."
+        if resume_enabled
+        else "🆕 Starting a new Tier 3 run."
+    )
     try:
         train_t3_corrector()
     except KeyboardInterrupt:
