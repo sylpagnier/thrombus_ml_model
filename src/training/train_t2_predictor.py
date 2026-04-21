@@ -307,6 +307,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     scheduler = None
     lbfgs_initialized = False
     use_lbfgs = _env_truthy("TIER2_USE_LBFGS")
+    stop_after_adam = _env_truthy("TIER2_STOP_AFTER_ADAM")
     start_epoch = 0
     ckpt_every = max(1, int(os.environ.get("TIER2_CKPT_EVERY", "1")))
 
@@ -451,6 +452,24 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
 
     for epoch in range(start_epoch, epochs):
         last_epoch_completed = epoch
+        if use_lbfgs and stop_after_adam and epoch >= adam_epochs:
+            checkpoint = {
+                "epoch": epoch - 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": (scheduler.state_dict() if scheduler is not None else None),
+                "loss_weighter_state_dict": loss_weighter.state_dict(),
+                "best_val_composite_loss": best_val_composite_loss,
+                "best_loss": best_loss,
+                "optimizer_type": "AdamW",
+                "handoff_for_lbfgs": True,
+            }
+            torch.save(checkpoint, latest_ckpt_save)
+            print(
+                f"🧳 Saved Tier 2 Adam handoff checkpoint at epoch {epoch - 1} -> {latest_ckpt_save.name}. "
+                "Resume with TIER2_STOP_AFTER_ADAM=0 (or unset) to continue L-BFGS."
+            )
+            break
         is_distillation = epoch < distillation_epochs
         physics_active = not is_distillation
         lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))

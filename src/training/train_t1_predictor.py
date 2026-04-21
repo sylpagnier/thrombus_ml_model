@@ -359,6 +359,7 @@ def train_t1_predictor(
     boundary_data_weight = max(float(os.environ.get("TIER1_BOUNDARY_DATA_WEIGHT", "2.0")), 1.0)
     tier1_kine_p_weight = max(float(os.environ.get("TIER1_KINE_P_WEIGHT", "5.0")), 0.0)
     use_lbfgs_requested = (os.environ.get("TIER1_USE_LBFGS", "1").strip().lower() in ("1", "true", "yes", "on"))
+    stop_after_adam = (os.environ.get("TIER1_STOP_AFTER_ADAM", "0").strip().lower() in ("1", "true", "yes", "on"))
     use_lbfgs = bool(use_lbfgs_requested)
     if use_lbfgs:
         _lbfgs_tail = max(0, int(epochs) - int(adam_epochs))
@@ -368,6 +369,8 @@ def train_t1_predictor(
         else:
             print("   L-BFGS tail: 0 epochs — raise TIER1_EPOCHS above TIER1_ADAM_EPOCHS for a refinement phase.")
         print("ℹ️ Safety note: L-BFGS path snapshots the full loader and can be memory-heavy on large graph datasets.")
+        if stop_after_adam:
+            print("⏹️ TIER1_STOP_AFTER_ADAM=1: training will stop at Adam/L-BFGS boundary and save a handoff checkpoint.")
     dynamic_freeze_during_warmup = (os.environ.get("TIER1_DYNAMIC_FREEZE_DURING_WARMUP", "1").strip().lower() in ("1", "true", "yes", "on"))
     hard_anchor_multiplier = {}
 
@@ -562,6 +565,24 @@ def train_t1_predictor(
 
     for epoch in range(start_epoch, epochs):
         last_epoch_completed = epoch
+        if use_lbfgs and stop_after_adam and epoch >= adam_epochs:
+            checkpoint = {
+                "epoch": epoch - 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss_weighter_state_dict": loss_weighter.state_dict(),
+                "best_val_composite_loss": best_val_composite_loss,
+                "best_loss": best_loss,
+                "optimizer_type": "AdamW",
+                "handoff_for_lbfgs": True,
+            }
+            torch.save(checkpoint, latest_ckpt_save)
+            print(
+                f"🧳 Saved Tier 1 Adam handoff checkpoint at epoch {epoch - 1} -> {latest_ckpt_save.name}. "
+                "Resume with TIER1_STOP_AFTER_ADAM=0 (or unset) to continue L-BFGS."
+            )
+            break
         if epoch == start_epoch or (epoch % hard_refresh == 0):
             _refresh_hard_mining(epoch)
             loader = _make_train_loader()
