@@ -367,6 +367,27 @@ def load_dataset():
         return []
 
     file_list = patient_files + synthetic_files
+    max_load_raw = os.environ.get("TIER3_MAX_LOAD_VESSELS", "").strip()
+    if max_load_raw:
+        try:
+            max_load = max(1, int(max_load_raw))
+        except ValueError:
+            max_load = 0
+        if max_load > 0 and len(file_list) > max_load:
+            shuffle_before_cap = os.environ.get("TIER3_MAX_LOAD_SHUFFLE", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if shuffle_before_cap:
+                rng = random.Random(42)
+                rng.shuffle(file_list)
+            file_list = file_list[:max_load]
+            print(
+                f"✂️ Pre-load cap active (TIER3_MAX_LOAD_VESSELS={max_load}): "
+                f"using {len(file_list)} graph files before split."
+            )
     print(
         f"📂 Found {len(patient_files)} Tier 3 anchor/patient graphs + "
         f"{len(synthetic_files)} Tier 3 synthetic graphs for lazy loading..."

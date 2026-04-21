@@ -131,6 +131,27 @@ def load_dataset():
         print(f"⚠️ Tier 1 graph dir not found: {cfg.graph_output_dir}")
         return []
     paths = sorted(cfg.graph_output_dir.glob("vessel_*.pt"))
+    max_load_raw = os.environ.get("TIER1_MAX_LOAD_VESSELS", "").strip()
+    if max_load_raw:
+        try:
+            max_load = max(1, int(max_load_raw))
+        except ValueError:
+            max_load = 0
+        if max_load > 0 and len(paths) > max_load:
+            shuffle_before_cap = os.environ.get("TIER1_MAX_LOAD_SHUFFLE", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if shuffle_before_cap:
+                rng = random.Random(42)
+                rng.shuffle(paths)
+            paths = paths[:max_load]
+            print(
+                f"✂️ Pre-load cap active (TIER1_MAX_LOAD_VESSELS={max_load}): "
+                f"loading {len(paths)} graph files before split."
+            )
     dataset = []
     print(f"📂 Loading Tier 1 graphs from {cfg.graph_output_dir}...")
     for f in tqdm(paths):
