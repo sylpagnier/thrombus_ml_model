@@ -779,6 +779,11 @@ def train_t1_predictor(
                     accumulated_loss += loss.detach()
                     del closure_data
 
+                # Keep external watchdogs (e.g., Colab log readers) alive during long LBFGS steps.
+                print(
+                    f"   [L-BFGS Iteration] Current Closure Loss: {accumulated_loss.item():.4f}",
+                    flush=True,
+                )
                 return accumulated_loss
 
             loss_tensor = optimizer.step(closure)
