@@ -117,13 +117,12 @@ def load_dataset():
 
 
 def setup_distillation_phase(model):
-    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network.")
+    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing ONLY mu_decoder.")
     for param in model.parameters():
         param.requires_grad = False
 
+    # Keep mu_encoder frozen so latent injection behavior stays Tier-1 consistent.
     for param in model.mu_decoder.parameters():
-        param.requires_grad = True
-    for param in model.mu_encoder.parameters():
         param.requires_grad = True
 
     return optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
@@ -219,12 +218,10 @@ def compute_step_loss(
 
     # --- DISTILLATION ROUTING ---
     if is_distillation:
+        # Strictly supervise viscosity; do not penalize frozen kinematics terms.
         loss = (
             (10.0 * l_rheo)
             + (5.0 * l_data_mu)
-            + (5.0 * l_bc)
-            + (5.0 * l_io)
-            + (10.0 * l_wss)
             + (0.1 * jac_loss)
         )
 
