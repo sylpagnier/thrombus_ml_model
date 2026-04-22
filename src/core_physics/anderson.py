@@ -66,12 +66,19 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
             H = H + reg * I_max
 
             y_slice = torch.ones(bsz, n_history, 1, dtype=z0.dtype, device=z0.device)
-            alpha = torch.linalg.solve(H, y_slice)
-            alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
-            alpha = alpha.view(bsz, n_history, 1)
+            try:
+                alpha = torch.linalg.solve(H, y_slice)
+                alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
+                alpha = alpha.view(bsz, n_history, 1)
 
-            combined_X = (alpha * X).sum(dim=1)
-            combined_F = (alpha * F).sum(dim=1)
+                combined_X = (alpha * X).sum(dim=1)
+                combined_F = (alpha * F).sum(dim=1)
+            except Exception:
+                # If the matrix is singular, the solver fails. This means the
+                # residuals are linearly dependent or zero (perfect convergence).
+                # Safe fallback: ignore the history and just use the newest step.
+                combined_X = X[:, -1, :]
+                combined_F = F[:, -1, :]
 
         # Apply beta relaxation
         z_next = beta * combined_F + (1 - beta) * combined_X
