@@ -364,8 +364,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         )
     _assert_tier2_train_split(train_data, val_data)
 
-    micro_batch_size = 2
-    accumulation_steps = 4
+    micro_batch_size = 1
+    accumulation_steps = 8
 
     sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
     loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
