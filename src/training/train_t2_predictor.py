@@ -313,9 +313,16 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     model = GINO_DEQ(
         in_channels=15,
         out_channels=5,
-        latent_dim=64,
-        max_iters=15,
+        latent_dim=256,
+        max_iters=25,
+        num_fourier_freqs=16,
         phys_cfg=phys_cfg,
+        activation_fn="silu",
+        fourier_base=1.5,
+        use_hard_bcs=True,
+        num_global_tokens=16,
+        use_siren_decoder=True,
+        use_width_priors=True,
     ).to(device)
 
     root = get_project_root()
@@ -764,7 +771,19 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         )
 
         if epoch % 2 == 0:
-            scores = quantify_performance(model, val_loader, kernels, device, tier="tier2")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            scores = quantify_performance(
+                model,
+                val_loader,
+                kernels,
+                device,
+                tier="tier2",
+                solver=current_solver,
+                anderson_beta=(1.0 if is_distillation else 0.8),
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             print(
                 f"\n📊 [Validation] Rel L2 (anchor): {scores.get('rel_l2', float('nan')):.4f} "
                 f"(σ {scores.get('rel_l2_std', float('nan')):.4f}, p90 {scores.get('rel_l2_p90', float('nan')):.4f})"

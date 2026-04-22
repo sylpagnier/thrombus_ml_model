@@ -195,7 +195,15 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     plt.close()
 
 
-def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Dict[str, Any]:
+def quantify_performance(
+    model,
+    val_loader,
+    kernels,
+    device,
+    tier="tier1",
+    solver: Optional[str] = None,
+    anderson_beta: float = 0.8,
+) -> Dict[str, Any]:
     """Aggregate validation metrics over ``val_loader``.
 
     **Rel L2** (and component breakdowns, shear, μ errors) are computed only on batches
@@ -229,11 +237,13 @@ def quantify_performance(model, val_loader, kernels, device, tier="tier1") -> Di
     if val_progress:
         val_iter = tqdm(val_loader, desc="Validation", leave=False)
 
+    current_solver = solver or "anderson"
+
     with torch.no_grad():
         for data in val_iter:
             val_total_batches += 1
             data = data.to(device)
-            pred = model(data, solver="anderson", anderson_beta=0.8)
+            pred = model(data, solver=current_solver, anderson_beta=anderson_beta)
             props = kernels._get_geometric_props(data)
 
             # Resolve node mask safely for batched or unbatched data
