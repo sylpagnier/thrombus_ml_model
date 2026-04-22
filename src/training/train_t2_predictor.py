@@ -116,18 +116,6 @@ def load_dataset():
     return dataset
 
 
-def setup_distillation_phase(model):
-    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing ONLY mu_decoder.")
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Keep mu_encoder frozen so latent injection behavior stays Tier-1 consistent.
-    for param in model.mu_decoder.parameters():
-        param.requires_grad = True
-
-    return optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
-
-
 def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
     print("🔥 Unfreezing All Layers. Activating Coupled DEQ Optimization.")
     for param in model.parameters(): param.requires_grad = True
@@ -215,18 +203,6 @@ def compute_step_loss(
     l_bc = terms["l_bc"]
     l_io = terms["l_io"]
     l_rheo = terms["l_rheo"]
-
-    # --- DISTILLATION ROUTING ---
-    if is_distillation:
-        # Strictly supervise viscosity; do not penalize frozen kinematics terms.
-        loss = (
-            (10.0 * l_rheo)
-            + (5.0 * l_data_mu)
-            + (0.1 * jac_loss)
-        )
-
-        metrics = {"L_rh": l_rheo.item(), "L_jac": jac_loss.item(), "L_mom": 0.0, "L_cont": 0.0, "L_wss": l_wss.item()}
-        return loss, metrics
 
     # --- PHASE 2/3: FULLY COUPLED ROUTING ---
     # Navier-Stokes residual uses WLS derivatives through PhysicsKernels.navier_stokes_residual.
@@ -417,30 +393,18 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         ckpt_optimizer_type = ckpt.get("optimizer_type", "AdamW")
 
-        if start_epoch >= distillation_epochs:
-            optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            coupled_total_epochs = max(1, epochs - distillation_epochs)
-            scheduler = _build_warmup_cosine_scheduler(
-                optimizer,
-                total_epochs=coupled_total_epochs,
-                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
-                eta_min=tier2_cosine_eta_min,
-            )
-            plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
-            )
-            sampler.set_warmup_mode(False)
-        else:
-            optimizer = setup_distillation_phase(model)
-            distill_total_epochs = max(1, distillation_epochs)
-            scheduler = _build_warmup_cosine_scheduler(
-                optimizer,
-                total_epochs=distill_total_epochs,
-                warmup_epochs=min(tier2_warmup_epochs, distill_total_epochs - 1),
-                eta_min=1e-5,
-            )
-            plateau_scheduler = None
-            sampler.set_warmup_mode(True)
+        optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
+        coupled_total_epochs = max(1, epochs - distillation_epochs)
+        scheduler = _build_warmup_cosine_scheduler(
+            optimizer,
+            total_epochs=coupled_total_epochs,
+            warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
+            eta_min=tier2_cosine_eta_min,
+        )
+        plateau_scheduler = ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
+        )
+        sampler.set_warmup_mode(False)
 
         if ckpt_optimizer_type == "LBFGS":
             print("ℹ️ Ignoring stored LBFGS optimizer state in checkpoint; continuing with AdamW for this phase.")
@@ -574,7 +538,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             carreau_n = start_n - progress * (start_n - target_n)
             print(f"🔄 Curriculum: Annealed Carreau index 'n' to {carreau_n:.4f}")
             if epoch == 0:
-                print("ℹ️ Distillation phase: continuity/momentum losses are intentionally disabled (set to 0).")
+                print("ℹ️ Warmup uses full coupled losses; momentum PDE is softly gated by lambda_phys ramp.")
         else:
             carreau_n = target_n
 
@@ -585,17 +549,19 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             current_solver = "anderson"
 
         if epoch == 0 and not resumed_full_checkpoint:
-            print(f"\n🚀 --- Starting Phase 1: Viscosity Distillation (Epochs 0-{distillation_epochs - 1}) ---")
-            optimizer = setup_distillation_phase(model)
-            distill_total_epochs = max(1, distillation_epochs)
+            print(f"\n🚀 --- Starting Phase 1: Coupled Curriculum Warmup (Epochs 0-{distillation_epochs - 1}) ---")
+            optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
+            coupled_total_epochs = max(1, epochs - distillation_epochs)
             scheduler = _build_warmup_cosine_scheduler(
                 optimizer,
-                total_epochs=distill_total_epochs,
-                warmup_epochs=min(tier2_warmup_epochs, distill_total_epochs - 1),
-                eta_min=1e-5,
+                total_epochs=coupled_total_epochs,
+                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
+                eta_min=tier2_cosine_eta_min,
             )
-            plateau_scheduler = None
-            sampler.set_warmup_mode(True)
+            plateau_scheduler = ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
+            )
+            sampler.set_warmup_mode(False)
         elif epoch == distillation_epochs:
             print(
                 f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ via AdamW (Epochs {distillation_epochs}-{adam_epochs - 1}) ---")
