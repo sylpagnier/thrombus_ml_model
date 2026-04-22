@@ -37,7 +37,7 @@ import torch
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-from src.utils.paths import reports_dir, stage_a_dir, resolve_checkpoint
+from src.utils.paths import reports_training_dir, stage_a_dir, resolve_checkpoint
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
@@ -332,8 +332,7 @@ def train_t1_predictor(
         except ValueError:
             slow_batch_log_sec = 20.0
     if not disable_figures:
-        fig_dir = reports_dir() / "figures" / "tier1"
-        fig_dir.mkdir(parents=True, exist_ok=True)
+        fig_dir = reports_training_dir("tier1", "figures")
 
     opt_params = list(model.parameters()) + list(loss_weighter.parameters())
     optimizer = optim.AdamW(opt_params, lr=lr, weight_decay=1e-5)
@@ -552,7 +551,7 @@ def train_t1_predictor(
 
     atexit.register(lambda: _emit_tier1_run_end(True))
 
-    hard_csv_path = reports_dir() / "tier1_anchor_hardness.csv"
+    hard_csv_path = reports_training_dir("tier1") / "anchor_hardness.csv"
     hard_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _refresh_hard_mining(epoch_idx: int):

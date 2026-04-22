@@ -1,18 +1,130 @@
-import matplotlib
-matplotlib.use('Agg')
 import shutil
 import pandas as pd
 import time
 import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+from matplotlib.widgets import Button
+import torch
+import random
 from datetime import datetime
-from src.utils.paths import comsol_models_dir, data_root, get_project_root, reports_dir, resolve_checkpoint
+from src.utils.paths import (
+    comsol_models_dir,
+    data_root,
+    get_project_root,
+    reports_evaluation_dir,
+    resolve_checkpoint,
+)
 
 project_root = get_project_root()
 from src.data_gen import AnchorGenerator, MeshToGraphComplete, VesselGenerator
-from src.evaluation.validate_model import ModelValidator
+from src.evaluation.lib.validate_model import ModelValidator
+from src.config import PredChannels
 
 
-def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
+def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
+    triang = mtri.Triangulation(pos[:, 0], pos[:, 1])
+    tri_pts = pos[triang.triangles]
+    d1 = np.sum((tri_pts[:, 0, :] - tri_pts[:, 1, :]) ** 2, axis=1)
+    d2 = np.sum((tri_pts[:, 1, :] - tri_pts[:, 2, :]) ** 2, axis=1)
+    d3 = np.sum((tri_pts[:, 2, :] - tri_pts[:, 0, :]) ** 2, axis=1)
+    max_edge_sq = np.max(np.vstack([d1, d2, d3]), axis=0)
+    mask = max_edge_sq > (np.median(max_edge_sq) * 10.0)
+    triang.set_mask(mask)
+
+    tc = ax.tripcolor(triang, val, cmap=cmap, shading="gouraud", vmin=vmin, vmax=vmax)
+    ax.set_title(title, fontsize=11)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
+
+
+def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_name):
+    graph_path = graph_dir if hasattr(graph_dir, "glob") else project_root / graph_dir
+    files = sorted(graph_path.glob("*.pt"))
+    if not files:
+        print(f"⚠️ No graph files found for visualization in {graph_path}")
+        return
+    current_idx = random.randrange(len(files))
+    while True:
+        next_idx = None
+        data = torch.load(files[current_idx], weights_only=False).to(validator.device)
+        with torch.no_grad():
+            pred = validator.model(data, solver="anderson")
+        pred_np = pred.detach().cpu().numpy()
+        pos = data.x[:, :2].detach().cpu().numpy()
+
+        has_labels = hasattr(data, "y") and data.y is not None and data.y.abs().sum() > 1e-6
+        gt_np = data.y.detach().cpu().numpy() if has_labels else None
+
+        fields = [
+            ("Velocity Magnitude", "jet", lambda arr: np.linalg.norm(arr[:, PredChannels.UV], axis=1)),
+            ("Pressure", "coolwarm", lambda arr: arr[:, PredChannels.P]),
+        ]
+        if tier != "tier1":
+            fields.append(("Viscosity", "viridis", lambda arr: arr[:, PredChannels.MU_EFF_ND]))
+
+        ncols = 3 if has_labels else 1
+        fig, axes = plt.subplots(len(fields), ncols, figsize=(7 * ncols, 4 * len(fields)))
+        if len(fields) == 1:
+            axes = np.array([axes])
+        if ncols == 1:
+            axes = axes.reshape(len(fields), 1)
+
+        for row_idx, (name, cmap, extractor) in enumerate(fields):
+            pred_val = extractor(pred_np)
+            gt_val = extractor(gt_np) if gt_np is not None else None
+            vmin = min(pred_val.min(), gt_val.min()) if gt_val is not None else pred_val.min()
+            vmax = max(pred_val.max(), gt_val.max()) if gt_val is not None else pred_val.max()
+            if gt_val is not None:
+                _plot_field(fig, axes[row_idx, 0], pos, gt_val, f"GT {name}", cmap, vmin=vmin, vmax=vmax)
+                _plot_field(fig, axes[row_idx, 1], pos, pred_val, f"Pred {name}", cmap, vmin=vmin, vmax=vmax)
+                abs_err = np.abs(pred_val - gt_val)
+                _plot_field(
+                    fig,
+                    axes[row_idx, 2],
+                    pos,
+                    abs_err,
+                    f"|Pred-GT| {name}",
+                    "magma",
+                    vmin=0.0,
+                    vmax=float(abs_err.max()) if abs_err.size else 1.0,
+                )
+            else:
+                _plot_field(fig, axes[row_idx, 0], pos, pred_val, f"Pred {name}", cmap, vmin=vmin, vmax=vmax)
+
+        fig.suptitle(
+            f"{tier.upper()} Benchmark Visualization - {level_name} ({files[current_idx].name})",
+            fontsize=14,
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 0.97))
+
+        if len(files) > 1:
+            btn_ax = fig.add_axes([0.77, 0.01, 0.2, 0.045])
+            regen_btn = Button(btn_ax, "Regenerate Vessel", color="lightgray", hovercolor="gainsboro")
+
+            def _pick_next_index():
+                candidates = [i for i in range(len(files)) if i != current_idx]
+                return random.choice(candidates) if candidates else None
+
+            def _request_regen():
+                nonlocal next_idx
+                next_idx = _pick_next_index()
+                if next_idx is not None:
+                    print(f"🔁 Switching to vessel sample: {files[next_idx].name}")
+                    plt.close(fig)
+
+            regen_btn.on_clicked(lambda _event: _request_regen())
+            fig.canvas.mpl_connect("key_press_event", lambda event: _request_regen() if event.key == "r" else None)
+
+        plt.show()
+        if next_idx is None:
+            break
+        current_idx = next_idx
+
+
+def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualize=False):
     print(f"\n{'=' * 60}")
     print(f"🚀 STARTING BENCHMARK: [{tier.upper()}] {level_name} (Level {level_idx})")
     print(f"{'=' * 60}")
@@ -67,6 +179,14 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10):
 
         validator = ModelValidator(model_path=model_path, tier=tier)
         metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
+        if visualize:
+            _show_benchmark_visualization(
+                validator=validator,
+                graph_dir=graph_dir,
+                tier=tier,
+                level_idx=level_idx,
+                level_name=level_name,
+            )
 
         return metrics
 
@@ -96,6 +216,12 @@ if __name__ == "__main__":
     parser.add_argument("--tiers", type=str, default=None, help='Comma-separated tiers (for example: "tier1,tier2")')
     parser.add_argument("--num-samples", type=int, default=None, help="Number of vessels per benchmark level")
     parser.add_argument("--levels", type=str, default=None, help='Comma-separated benchmark levels (for example: "0,1")')
+    parser.add_argument(
+        "--visualize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save per-level benchmark field visualizations (default: enabled)",
+    )
     args = parser.parse_args()
 
     if args.tiers is None:
@@ -110,7 +236,7 @@ if __name__ == "__main__":
         num_samples = args.num_samples
 
     if args.levels is None:
-        levels_raw = _prompt_text("Levels (comma-separated)", "0")
+        levels_raw = _prompt_text("Levels (comma-separated: 0=Straight pathologies, 1=Curved pathologies)", "0,1")
     else:
         levels_raw = args.levels
 
@@ -129,7 +255,13 @@ if __name__ == "__main__":
     for current_tier in target_tiers:
         all_results = {}
         for lvl_idx, name in benchmarks:
-            metrics = run_pipeline_for_level(current_tier, lvl_idx, name, num_samples=num_samples)
+            metrics = run_pipeline_for_level(
+                current_tier,
+                lvl_idx,
+                name,
+                num_samples=num_samples,
+                visualize=bool(args.visualize),
+            )
             if metrics is not None:
                 all_results[name] = metrics
             time.sleep(1)
@@ -141,7 +273,7 @@ if __name__ == "__main__":
         if all_results:
             df = pd.DataFrame(all_results).T
             print(df)
-            save_path = reports_dir() / f"{current_tier}_full_benchmark.csv"
+            save_path = reports_evaluation_dir("benchmark", "tables") / f"{current_tier}_full_benchmark.csv"
             save_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(save_path)
             print(f"\n📄 Detailed report saved to: {save_path}")

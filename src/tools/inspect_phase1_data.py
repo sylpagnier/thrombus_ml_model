@@ -43,7 +43,7 @@ import torch
 from matplotlib.widgets import Button
 
 from src.config import NodeFeat, PhysicsConfig, PredChannels, VesselConfig
-from src.utils.paths import get_project_root, reports_dir
+from src.utils.paths import get_project_root, reports_inspection_dir
 
 
 def _resolve_anchor_dir(tier: str) -> Path:
@@ -212,8 +212,7 @@ def health_scan_anchors(tier: str, *, export_csv: bool = True) -> list[dict]:
             )
 
     if export_csv and rows:
-        out_path = reports_dir() / f"{tier}_anchor_health.csv"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path = reports_inspection_dir("phase1") / f"{tier}_anchor_health.csv"
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(

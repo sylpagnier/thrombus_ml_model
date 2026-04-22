@@ -22,11 +22,13 @@ from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.samplers import StratifiedAnchorSampler
 from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.utils.paths import get_project_root, stage_a_dir, resolve_checkpoint
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR, ReduceLROnPlateau
 
-# Validation composite for ``tier2_best_physics.pth``: ``rel_l2 + continuity + rheology`` (all from
-# ``quantify_performance``). Lower is better — not the same as training loss. Logged as
-# ``best_val_composite_loss`` in checkpoints / run_end; per-validation rows use ``val_composite_loss``.
+# Default physics-composite scales (overridable via environment variables in ``train_t2_predictor``).
+TIER2_VAL_COMPOSITE_CONTINUITY_SCALE_DEFAULT = 100.0
+TIER2_VAL_COMPOSITE_RHEOLOGY_SCALE_DEFAULT = 1.0
+TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT = 100.0
+TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT = 1.0
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -148,6 +150,34 @@ def _tier2_dynamic_loss_weighter(device: str, mom_precision_floor: float) -> Dyn
     ).to(device)
 
 
+def _build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_epochs: int,
+    warmup_epochs: int,
+    eta_min: float,
+    warmup_start_factor: float = 0.1,
+):
+    """Linear warm-up, then cosine decay (Tier 1 parity)."""
+    total_epochs = max(1, int(total_epochs))
+    warmup_epochs = max(0, min(int(warmup_epochs), total_epochs - 1))
+    decay_epochs = max(1, total_epochs - warmup_epochs)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=decay_epochs, eta_min=float(eta_min))
+    if warmup_epochs == 0:
+        return cosine_scheduler
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=float(warmup_start_factor),
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
+
 def compute_step_loss(
     model,
     data,
@@ -161,6 +191,8 @@ def compute_step_loss(
     *,
     tier2_kine_p_weight: float = 1.0,
     coupled_io_scale: float = 6.0,
+    train_continuity_scale: float = TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT,
+    train_rheology_scale: float = TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT,
 ):
     out = model(data, solver=current_solver, anderson_beta=1.0 if is_distillation else 0.8, anderson_warmup_iters=5)
     if isinstance(out, tuple):
@@ -202,13 +234,15 @@ def compute_step_loss(
         return loss, metrics
 
     # --- PHASE 2/3: FULLY COUPLED ROUTING ---
+    # Navier-Stokes residual uses WLS derivatives through PhysicsKernels.navier_stokes_residual.
     pde_losses = [l_mom]
     pde_scales = [lambda_phys]
     weighted_pdes = loss_weighter(pde_losses, scales=pde_scales)
 
     loss = (
         weighted_pdes
-        + (1.0 * l_rheo)
+        + (float(train_rheology_scale) * l_rheo)
+        + (float(train_continuity_scale) * l_cont)
         + (500.0 * l_data_kine)
         + (50.0 * l_data_mu)
         + (5.0 * l_bc)
@@ -245,11 +279,13 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         state on resume (fresh AdamW for the current phase, then L-BFGS activates again when due).
         **Early stopping (coupled phase only; validation every 2 epochs):**
         ``TIER2_EARLY_STOP_PATIENCE`` (default ``8``) and ``TIER2_EARLY_STOP_MIN_DELTA`` (default
-        ``0.002``) — stop if anchor Rel L2 fails to beat the prior *material* best by more than
-        ``min_delta`` for ``patience`` validation checks (mirrors Tier 1 logic).
+        ``0.002``) — stop if the validation composite
+        ``rel_l2 + TIER2_VAL_CONTINUITY_SCALE*continuity + TIER2_VAL_RHEOLOGY_SCALE*rheology``
+        fails to beat the prior *material* best by more than ``min_delta`` for ``patience``
+        validation checks.
         ``TIER2_EARLY_STOP_FLAT_EPS`` (default ``3e-4``) and ``TIER2_EARLY_STOP_FLAT_PATIENCE``
-        (default ``6``) — additionally stop if Rel L2 changes by less than ``flat_eps`` versus the
-        *previous* validation for ``flat_patience`` checks in a row (catches a fully flat tail).
+        (default ``6``) — additionally stop if that same validation composite changes by less than
+        ``flat_eps`` versus the *previous* validation for ``flat_patience`` checks in a row.
 
         **Coupled-phase stability / pressure emphasis (defaults tuned for Carreau DEQ):**
         ``TIER2_MOM_PRECISION_FLOOR`` (default ``0.8``) — Kendall momentum precision cannot drop
@@ -258,10 +294,16 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         kinematic MSE vs ``u,v``.
         ``TIER2_GRAD_CLIP_COUPLED`` (default ``0.5``) — global grad norm clip in the coupled phase
         (distillation still uses ``1.0``).
-        ``TIER2_COSINE_ETA_MIN`` / ``TIER2_PLATEAU_MIN_LR`` (default ``5e-6``) — floor for
-        ``CosineAnnealingWarmRestarts`` and ``ReduceLROnPlateau`` in the coupled phase.
+        ``TIER2_WARMUP_EPOCHS`` (default ``5``) — linear LR warm-up epochs before cosine decay
+        (SequentialLR: LinearLR -> CosineAnnealingLR; Tier 1 parity).
+        ``TIER2_COSINE_ETA_MIN`` / ``TIER2_PLATEAU_MIN_LR`` (default ``5e-6``) — LR floor for
+        cosine annealing and ``ReduceLROnPlateau`` in the coupled phase.
         ``TIER2_COUPLED_IO_SCALE`` (default ``6.0``) — multiplier on ``l_io`` (inlet velocity + outlet
         ``p=0`` soft penalty) after distillation.
+        ``TIER2_TRAIN_CONTINUITY_SCALE`` / ``TIER2_TRAIN_RHEOLOGY_SCALE`` (defaults ``100`` / ``1``) —
+        coupled-phase training weights for continuity and rheology in total loss.
+        ``TIER2_VAL_CONTINUITY_SCALE`` / ``TIER2_VAL_RHEOLOGY_SCALE`` (defaults ``100`` / ``1``) —
+        validation/checkpoint composite weights.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device being used:", device)
@@ -341,6 +383,19 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     tier2_plateau_min_lr = float(os.environ.get("TIER2_PLATEAU_MIN_LR", "5e-6"))
     tier2_grad_clip_coupled = float(os.environ.get("TIER2_GRAD_CLIP_COUPLED", "0.5"))
     tier2_coupled_io_scale = float(os.environ.get("TIER2_COUPLED_IO_SCALE", "6.0"))
+    tier2_warmup_epochs = max(0, int(os.environ.get("TIER2_WARMUP_EPOCHS", "5")))
+    train_continuity_scale = float(
+        os.environ.get("TIER2_TRAIN_CONTINUITY_SCALE", str(TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT))
+    )
+    train_rheology_scale = float(
+        os.environ.get("TIER2_TRAIN_RHEOLOGY_SCALE", str(TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT))
+    )
+    val_continuity_scale = float(
+        os.environ.get("TIER2_VAL_CONTINUITY_SCALE", str(TIER2_VAL_COMPOSITE_CONTINUITY_SCALE_DEFAULT))
+    )
+    val_rheology_scale = float(
+        os.environ.get("TIER2_VAL_RHEOLOGY_SCALE", str(TIER2_VAL_COMPOSITE_RHEOLOGY_SCALE_DEFAULT))
+    )
 
     resumed_full_checkpoint = False
     tier1_bootstrap_loaded = False
@@ -362,8 +417,12 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
 
         if start_epoch >= distillation_epochs:
             optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            scheduler = CosineAnnealingWarmRestarts(
-                optimizer, T_0=10, T_mult=2, eta_min=tier2_cosine_eta_min
+            coupled_total_epochs = max(1, epochs - distillation_epochs)
+            scheduler = _build_warmup_cosine_scheduler(
+                optimizer,
+                total_epochs=coupled_total_epochs,
+                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
+                eta_min=tier2_cosine_eta_min,
             )
             plateau_scheduler = ReduceLROnPlateau(
                 optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
@@ -371,7 +430,13 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             sampler.set_warmup_mode(False)
         else:
             optimizer = setup_distillation_phase(model)
-            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
+            distill_total_epochs = max(1, distillation_epochs)
+            scheduler = _build_warmup_cosine_scheduler(
+                optimizer,
+                total_epochs=distill_total_epochs,
+                warmup_epochs=min(tier2_warmup_epochs, distill_total_epochs - 1),
+                eta_min=1e-5,
+            )
             plateau_scheduler = None
             sampler.set_warmup_mode(True)
 
@@ -400,9 +465,9 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     plateau_min_delta = float(os.environ.get("TIER2_EARLY_STOP_MIN_DELTA", "0.002"))
     flat_eps = float(os.environ.get("TIER2_EARLY_STOP_FLAT_EPS", "3e-4"))
     flat_patience = max(1, int(os.environ.get("TIER2_EARLY_STOP_FLAT_PATIENCE", "6")))
-    best_rel_l2 = float("inf")
+    best_early_stop_metric = float("inf")
     val_no_improve = 0
-    prev_val_rel_l2: Optional[float] = None
+    prev_val_metric: Optional[float] = None
     flat_streak = 0
     early_stopped = False
 
@@ -440,10 +505,17 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         env_tier2_phase1=env_snapshot("TIER2_", "PHASE1_"),
         mom_precision_floor=float(mom_precision_floor),
         tier2_kine_p_weight=float(tier2_kine_p_weight),
+        tier2_kine_weight_mode="uniform" if abs(float(tier2_kine_p_weight) - 1.0) < 1e-9 else "uvp_nonuniform",
+        tier2_ns_residual_mode="wls",
+        tier2_warmup_epochs=int(tier2_warmup_epochs),
         tier2_cosine_eta_min=float(tier2_cosine_eta_min),
         tier2_plateau_min_lr=float(tier2_plateau_min_lr),
         tier2_grad_clip_coupled=float(tier2_grad_clip_coupled),
         tier2_coupled_io_scale=float(tier2_coupled_io_scale),
+        train_continuity_scale=float(train_continuity_scale),
+        train_rheology_scale=float(train_rheology_scale),
+        val_continuity_scale=float(val_continuity_scale),
+        val_rheology_scale=float(val_rheology_scale),
     )
 
     tier2_final_path = model_dir / "tier2_final.pth"
@@ -461,7 +533,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         diary.log_run_end(
             best_val_composite_loss=float(best_val_composite_loss),
             best_loss=float(best_loss),
-            best_rel_l2=float(best_rel_l2),
+            best_rel_l2=float(best_early_stop_metric),
             early_stopped=bool(early_stopped),
             interrupted=bool(interrupted),
             last_epoch_completed=last_epoch_completed,
@@ -499,6 +571,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             progress = epoch / max(1, (distillation_epochs - 1))
             carreau_n = start_n - progress * (start_n - target_n)
             print(f"🔄 Curriculum: Annealed Carreau index 'n' to {carreau_n:.4f}")
+            if epoch == 0:
+                print("ℹ️ Distillation phase: continuity/momentum losses are intentionally disabled (set to 0).")
         else:
             carreau_n = target_n
 
@@ -511,15 +585,25 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         if epoch == 0 and not resumed_full_checkpoint:
             print(f"\n🚀 --- Starting Phase 1: Viscosity Distillation (Epochs 0-{distillation_epochs - 1}) ---")
             optimizer = setup_distillation_phase(model)
-            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
+            distill_total_epochs = max(1, distillation_epochs)
+            scheduler = _build_warmup_cosine_scheduler(
+                optimizer,
+                total_epochs=distill_total_epochs,
+                warmup_epochs=min(tier2_warmup_epochs, distill_total_epochs - 1),
+                eta_min=1e-5,
+            )
             plateau_scheduler = None
             sampler.set_warmup_mode(True)
         elif epoch == distillation_epochs:
             print(
                 f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ via AdamW (Epochs {distillation_epochs}-{adam_epochs - 1}) ---")
             optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            scheduler = CosineAnnealingWarmRestarts(
-                optimizer, T_0=10, T_mult=2, eta_min=tier2_cosine_eta_min
+            coupled_total_epochs = max(1, epochs - distillation_epochs)
+            scheduler = _build_warmup_cosine_scheduler(
+                optimizer,
+                total_epochs=coupled_total_epochs,
+                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
+                eta_min=tier2_cosine_eta_min,
             )
             plateau_scheduler = ReduceLROnPlateau(
                 optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
@@ -568,6 +652,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                     carreau_n=carreau_n,
                     tier2_kine_p_weight=tier2_kine_p_weight,
                     coupled_io_scale=(5.0 if is_distillation else tier2_coupled_io_scale),
+                    train_continuity_scale=train_continuity_scale,
+                    train_rheology_scale=train_rheology_scale,
                 )
                 loss = loss / accumulation_steps
 
@@ -591,6 +677,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 pbar.set_postfix({
                     "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
                     "L_mom": f"{metrics['L_mom']:.3f}",
+                    "L_cont": f"{metrics['L_cont']:.3f}",
                     "L_rh": f"{metrics['L_rh']:.3f}",
                     "|g|": f"{grad_norm:.2f}",
                     "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
@@ -623,6 +710,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                         carreau_n=carreau_n,
                         tier2_kine_p_weight=tier2_kine_p_weight,
                         coupled_io_scale=(5.0 if is_distillation else tier2_coupled_io_scale),
+                        train_continuity_scale=train_continuity_scale,
+                        train_rheology_scale=train_rheology_scale,
                     )
                     loss = loss / n_batches
                     loss.backward()
@@ -670,7 +759,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             lbfgs=bool(lbfgs_initialized),
             best_loss_so_far=float(best_loss),
             best_val_composite_loss_so_far=float(best_val_composite_loss),
-            best_rel_l2_so_far=float(best_rel_l2),
+            best_rel_l2_so_far=float(best_early_stop_metric),
             val_no_improve=int(val_no_improve),
         )
 
@@ -718,8 +807,12 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
 
             val_composite_loss = float(
                 scores.get("rel_l2", 0)
-                + scores.get("continuity", 0)
-                + scores.get("rheology", 0)
+                + (float(val_continuity_scale) * scores.get("continuity", 0))
+                + (float(val_rheology_scale) * scores.get("rheology", 0))
+            )
+            print(
+                f"   Val composite: {val_composite_loss:.4f} = rel_l2 + "
+                f"{val_continuity_scale:g}*continuity + {val_rheology_scale:g}*rheology"
             )
 
             diary.log_validation(
@@ -730,46 +823,49 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 val_composite_loss=val_composite_loss,
                 carreau_n=float(carreau_n),
                 phase_distillation=bool(is_distillation),
-                best_rel_l2=float(best_rel_l2),
+                best_rel_l2=float(best_early_stop_metric),
                 val_no_improve=int(val_no_improve),
                 n_val_anchors=int(n_val_anchor),
                 n_val_physics=int(n_val_physics),
             )
 
             if plateau_scheduler is not None and not lbfgs_initialized:
-                plateau_scheduler.step(float(scores.get("rel_l2", 0.0)))
+                plateau_metric = val_composite_loss if physics_active else float(scores.get("rel_l2", 0.0))
+                plateau_scheduler.step(plateau_metric)
 
             rel_l2 = float(scores.get("rel_l2", float("inf")))
+            stop_metric = val_composite_loss if physics_active else rel_l2
             if not physics_active:
-                if rel_l2 < best_rel_l2:
-                    best_rel_l2 = rel_l2
+                if stop_metric < best_early_stop_metric:
+                    best_early_stop_metric = stop_metric
             else:
-                if (best_rel_l2 - rel_l2) > plateau_min_delta:
-                    best_rel_l2 = rel_l2
+                if (best_early_stop_metric - stop_metric) > plateau_min_delta:
+                    best_early_stop_metric = stop_metric
                     val_no_improve = 0
                     flat_streak = 0
                 else:
                     val_no_improve += 1
 
-                if prev_val_rel_l2 is not None and abs(rel_l2 - prev_val_rel_l2) < flat_eps:
+                if prev_val_metric is not None and abs(stop_metric - prev_val_metric) < flat_eps:
                     flat_streak += 1
                 else:
                     flat_streak = 0
-                prev_val_rel_l2 = rel_l2
+                prev_val_metric = stop_metric
 
                 stop_material = val_no_improve >= plateau_patience
                 stop_flat = flat_streak >= flat_patience
                 if stop_material or stop_flat:
                     if stop_material and stop_flat:
-                        reason = "val_rel_l2_plateau_and_flat"
+                        reason = "val_composite_plateau_and_flat"
                     elif stop_flat:
-                        reason = "val_rel_l2_flatline"
+                        reason = "val_composite_flatline"
                     else:
-                        reason = "val_rel_l2_plateau"
+                        reason = "val_composite_plateau"
                     print(
-                        f"🛑 Early stopping ({reason}): material plateau min_delta={plateau_min_delta:.4f} "
+                        f"🛑 Early stopping ({reason}) on val composite loss: "
+                        f"material plateau min_delta={plateau_min_delta:.4f} "
                         f"patience={plateau_patience} | flat_eps={flat_eps:.2e} flat_patience={flat_patience} "
-                        f"(last Rel L2={rel_l2:.4f})."
+                        f"(last val composite={stop_metric:.4f})."
                     )
                     early_stopped = True
                     diary.log_event(
@@ -780,7 +876,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                         plateau_patience=plateau_patience,
                         flat_eps=flat_eps,
                         flat_patience=flat_patience,
-                        last_rel_l2=rel_l2,
+                        last_val_composite=stop_metric,
                     )
                     break
 
@@ -795,7 +891,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
     _emit_tier2_run_end(interrupted=False)
     print(
         f"Tier 2 Training Complete. Best val composite loss: {best_val_composite_loss:.4f} "
-        f"(rel_l2 + continuity + rheology; lower is better) | Best Loss: {best_loss:.4f}"
+        f"(rel_l2 + {val_continuity_scale:g}×continuity + "
+        f"{val_rheology_scale:g}×rheology; lower is better) | Best Loss: {best_loss:.4f}"
     )
 
 

@@ -32,6 +32,28 @@ def reports_dir() -> Path:
     return p
 
 
+def reports_subdir(*parts: str) -> Path:
+    """Create and return a scoped reports subdirectory under ``outputs/reports``."""
+    p = reports_dir().joinpath(*parts)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def reports_training_dir(*parts: str) -> Path:
+    """Training-origin artifacts under ``outputs/reports/training``."""
+    return reports_subdir("training", *parts)
+
+
+def reports_evaluation_dir(*parts: str) -> Path:
+    """Evaluation / benchmark artifacts under ``outputs/reports/evaluation``."""
+    return reports_subdir("evaluation", *parts)
+
+
+def reports_inspection_dir(*parts: str) -> Path:
+    """Inspection-tool artifacts under ``outputs/reports/inspection``."""
+    return reports_subdir("inspection", *parts)
+
+
 def stage_a_dir() -> Path:
     """Predictor warm-up & Newtonian / Tier-1–2 checkpoints."""
     p = outputs_root() / "stage_a"

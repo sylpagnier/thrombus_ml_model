@@ -7,7 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
 
-from src.utils.paths import get_project_root, reports_dir
+from src.utils.paths import get_project_root, reports_evaluation_dir
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.config import PhysicsConfig, PredChannels
@@ -28,11 +28,34 @@ class ModelValidator:
         mu_inf_nd = self.kernels.mu_inf_nd
         mu_0_nd = self.kernels.mu_0_nd
 
-        # Pass the bounds into the model architecture
-        self.model = GINO_DEQ(
-            in_channels=15, out_channels=5, latent_dim=64, max_iters=15,
-            mu_inf_nd=mu_inf_nd, mu_0_nd=mu_0_nd
-        )
+        # Mirror training-time model recipes so checkpoint loading is shape-compatible.
+        if self.tier == "tier1":
+            self.model = GINO_DEQ(
+                in_channels=15,
+                out_channels=5,
+                latent_dim=256,
+                max_iters=25,
+                num_fourier_freqs=16,
+                phys_cfg=phys_cfg,
+                activation_fn="silu",
+                fourier_base=1.5,
+                use_hard_bcs=True,
+                num_global_tokens=16,
+                use_siren_decoder=True,
+                use_width_priors=True,
+                mu_inf_nd=mu_inf_nd,
+                mu_0_nd=mu_0_nd,
+            )
+        else:
+            self.model = GINO_DEQ(
+                in_channels=15,
+                out_channels=5,
+                latent_dim=64,
+                max_iters=15,
+                phys_cfg=phys_cfg,
+                mu_inf_nd=mu_inf_nd,
+                mu_0_nd=mu_0_nd,
+            )
 
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
@@ -41,7 +64,7 @@ class ModelValidator:
 
     def _predict_with_physics_correction(self, data, correction_steps=25, lr=1e-3):
         """
-        Inference-Time Physics Correction (ITPC) loop ("Tier 2.5").
+        Inference-Time Physics Correction (ITPC) loop.
         """
         # 1. Base Prediction (Smart Guess)
         with torch.no_grad():
@@ -93,19 +116,34 @@ class ModelValidator:
         dataset = [torch.load(f, weights_only=False) for f in files]
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
+        use_itpc = (self.tier == "tier2")
         metrics = {
-            "base_rel_l2_u": [], "itpc_rel_l2_u": [],
-            "base_div_res": [], "itpc_div_res": [],
-            "base_wall_slip": [], "itpc_wall_slip": [],
-            "base_wss_corr": [], "itpc_wss_corr": []
+            "base_rel_l2_u": [],
+            "base_div_res": [],
+            "base_wall_slip": [],
+            "base_wss_corr": [],
         }
+        if use_itpc:
+            metrics.update(
+                {
+                    "itpc_rel_l2_u": [],
+                    "itpc_div_res": [],
+                    "itpc_wall_slip": [],
+                    "itpc_wss_corr": [],
+                }
+            )
 
         print(f"\n🔍 A/B Testing {self.tier.capitalize()} - {level_name} (N={len(dataset)})...")
 
         for i, data in enumerate(tqdm(loader)):
             data = data.to(self.device)
 
-            pred_base, pred_itpc = self._predict_with_physics_correction(data, correction_steps=20)
+            if use_itpc:
+                pred_base, pred_itpc = self._predict_with_physics_correction(data, correction_steps=20)
+            else:
+                with torch.no_grad():
+                    pred_base = self.model(data, solver="anderson")
+                pred_itpc = None
             props = self.kernels._get_geometric_props(data)
             has_labels = (hasattr(data, 'y') and data.y is not None and data.y.abs().sum() > 1e-6)
 
@@ -151,22 +189,23 @@ class ModelValidator:
                     metrics[f"{prefix}_wss_corr"].append(np.nan)
 
             evaluate_prediction(pred_base, "base")
-            evaluate_prediction(pred_itpc, "itpc")
+            if use_itpc and pred_itpc is not None:
+                evaluate_prediction(pred_itpc, "itpc")
 
-            # Save the new comprehensive Tier 2.5 Visualization
-            if i < 3:
+            # Save comparison visualizations for the first few samples.
+            if use_itpc and i < 3:
                 self._plot_comparison(data, pred_base, pred_itpc, data.y if has_labels else None,
-                                      f"{level_name}_sample_{i}_Tier2.5")
+                                      f"{level_name}_sample_{i}_ITPC")
 
         df = pd.DataFrame(metrics)
         print(f"\n📊 A/B Test Results for {level_name}:")
 
-        mean_base = df["base_rel_l2_u"].mean()
-        mean_itpc = df["itpc_rel_l2_u"].mean()
-        improvement = ((mean_base - mean_itpc) / mean_base) * 100
-
         print(df.describe().loc[['mean']].T)
-        print(f"\n💡 ITPC reduced L2 Velocity Error by {improvement:.2f}%")
+        if use_itpc:
+            mean_base = df["base_rel_l2_u"].mean()
+            mean_itpc = df["itpc_rel_l2_u"].mean()
+            improvement = ((mean_base - mean_itpc) / mean_base) * 100
+            print(f"\n💡 ITPC reduced L2 Velocity Error by {improvement:.2f}%")
 
         return df.mean()
 
@@ -199,7 +238,7 @@ class ModelValidator:
 
                 sc2 = axes[row_idx, 2].scatter(wall_pos[:, 0], wall_pos[:, 1], c=itpc_val, cmap=cmap, s=20, vmin=vmin,
                                                vmax=vmax)
-                axes[row_idx, 2].set_title(f"Tier 2.5 (ITPC) {name}")
+                axes[row_idx, 2].set_title(f"ITPC {name}")
                 plt.colorbar(sc2, ax=axes[row_idx, 2])
             else:
                 if target is not None:
@@ -214,7 +253,7 @@ class ModelValidator:
                 plt.colorbar(sc1, ax=axes[row_idx, 1])
 
                 sc2 = axes[row_idx, 2].tripcolor(pos[:, 0], pos[:, 1], itpc_val, cmap=cmap)
-                axes[row_idx, 2].set_title(f"Tier 2.5 (ITPC) {name}")
+                axes[row_idx, 2].set_title(f"ITPC {name}")
                 plt.colorbar(sc2, ax=axes[row_idx, 2])
 
             for col in range(3):
@@ -242,8 +281,7 @@ class ModelValidator:
         wss_gt = target[mask_wall, 4].cpu().numpy() if target is not None else None
         plot_row(current_row, wss_gt, wss_base, wss_itpc, "WSS", 'plasma', is_wall=True)
 
-        save_dir = reports_dir() / f"validation_{self.tier}"
-        save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = reports_evaluation_dir("validation", self.tier)
         safe_title = title.replace("/", "_").replace(" ", "_")
         plt.tight_layout()
         plt.savefig(save_dir / f"{safe_title}.png", dpi=150, bbox_inches='tight')

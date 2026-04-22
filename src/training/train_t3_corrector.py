@@ -90,7 +90,13 @@ def configure_cuda_for_training(device: torch.device) -> None:
 from tqdm import tqdm
 import random
 from torch_geometric.data import Dataset
-from src.utils.paths import data_root, get_project_root, reports_dir, stage_b_dir, resolve_checkpoint
+from src.utils.paths import (
+    data_root,
+    get_project_root,
+    reports_training_dir,
+    stage_b_dir,
+    resolve_checkpoint,
+)
 from src.architecture.gnode_tier3 import GNODE_Tier3, tier3_truth_node_mask
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
@@ -111,7 +117,7 @@ from src.training.physics_curriculum import ease01 as _ease01
 
 
 def _tier3_metrics_jsonl_path():
-    return reports_dir() / "tier3_metrics.jsonl"
+    return reports_training_dir("tier3") / "metrics.jsonl"
 
 
 def _tier3_append_jsonl(record: Dict[str, Any]) -> None:
@@ -155,7 +161,7 @@ def _tier3_should_log_batch(epoch: int, batch_idx: int) -> bool:
 
 
 def _tier3_debug_log_path():
-    return reports_dir() / "tier3_debug.log"
+    return reports_training_dir("tier3") / "debug.log"
 
 
 def _tier3_dbg_line(msg: str) -> None:
@@ -2030,7 +2036,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             n_val_anchor, n_val_synth = 0, 0
             wss_reason_hist: Dict[str, int] = {}
             viz_every = int(os.environ.get("TIER3_VAL_VIZ_EVERY", "0"))
-            viz_dir = reports_dir() / "tier3_val_viz"
+            viz_dir = reports_training_dir("tier3", "val_viz")
 
             with torch.no_grad():
                 safe_vars = loss_weighter.clamped_log_vars()

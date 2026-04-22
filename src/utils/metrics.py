@@ -8,7 +8,7 @@ from tqdm import tqdm
 from matplotlib.colors import LogNorm
 from pathlib import Path
 
-from src.utils.paths import reports_dir
+from src.utils.paths import reports_training_dir
 from src.config import PredChannels
 from src.utils.rheology import compute_shear_rate
 from torch_geometric.data import Batch
@@ -190,8 +190,7 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     plt.title(title)
     plt.axis('equal')
 
-    save_dir = reports_dir() / "figures" / tier
-    save_dir.mkdir(parents=True, exist_ok=True)
+    save_dir = reports_training_dir(tier, "figures")
     plt.savefig(save_dir / f"val_epoch_{epoch}.png")
     plt.close()
 

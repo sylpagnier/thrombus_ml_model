@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from src.utils.paths import get_project_root, reports_dir
+from src.utils.paths import reports_training_dir
 
 
 def write_t1_experiment_artifact(
@@ -38,8 +38,7 @@ def write_t1_experiment_artifact(
     ``best_val_composite_loss`` is the minimum validation composite (Tier 1:
     ``rel_l2_anchor + 100×continuity``); lower is better.
     """
-    rep = reports_dir() / "experiments"
-    rep.mkdir(parents=True, exist_ok=True)
+    rep = reports_training_dir("tier1", "experiments")
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     name = str(getattr(tier1_cfg, "experiment_name", "default"))
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:80]
@@ -110,13 +109,13 @@ class TrainingDiary:
         self.path: Optional[Path] = None
         if not self.enabled:
             return
-        reports = reports_dir()
+        reports = reports_training_dir(self.tier)
         custom = os.environ.get("PHASE1_TRAINING_DIARY_PATH", "").strip()
         if custom:
             self.path = Path(custom)
             self.path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            self.path = reports / f"training_diary_{tier}_{self.run_id}.jsonl"
+            self.path = reports / f"diary_{self.run_id}.jsonl"
         print(f"📝 Training diary (JSONL): {self.path}")
 
     def _write(self, event: str, payload: Dict[str, Any]) -> None:
