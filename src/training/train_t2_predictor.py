@@ -117,15 +117,13 @@ def load_dataset():
 
 
 def setup_distillation_phase(model):
-    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network AND Encoder.")
+    print("❄️ Freezing Kinematics Backbone and Core. Unfreezing Viscosity Sub-network.")
     for param in model.parameters():
         param.requires_grad = False
 
     for param in model.mu_decoder.parameters():
         param.requires_grad = True
     for param in model.mu_encoder.parameters():
-        param.requires_grad = True
-    for param in model.encoder.parameters():
         param.requires_grad = True
 
     return optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
