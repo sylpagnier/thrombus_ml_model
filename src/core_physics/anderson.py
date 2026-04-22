@@ -61,7 +61,7 @@ def anderson_acceleration(f, z0, batch_idx=None, m=8, lam=1e-4, max_iter=50, tol
             # Keep regularization relative to the current residual scale so Anderson
             # does not collapse into Picard as training residuals shrink.
             diag_mean = torch.diagonal(H, dim1=1, dim2=2).mean(dim=1, keepdim=True).unsqueeze(-1)
-            eps_safe = 1e-6 * diag_mean + 1e-12
+            eps_safe = 1e-6 * diag_mean + 1e-4
             reg = lam * diag_mean + eps_safe
             H = H + reg * I_max
 
