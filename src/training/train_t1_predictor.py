@@ -381,6 +381,10 @@ def train_t1_predictor(
     tier1_kine_p_weight = max(float(os.environ.get("TIER1_KINE_P_WEIGHT", "5.0")), 0.0)
     use_lbfgs_requested = (os.environ.get("TIER1_USE_LBFGS", "1").strip().lower() in ("1", "true", "yes", "on"))
     stop_after_adam = (os.environ.get("TIER1_STOP_AFTER_ADAM", "0").strip().lower() in ("1", "true", "yes", "on"))
+    lbfgs_lr = float(os.environ.get("TIER1_LBFGS_LR", "0.01"))
+    lbfgs_max_iter = max(1, int(os.environ.get("TIER1_LBFGS_MAX_ITER", "20")))
+    lbfgs_history_size = max(1, int(os.environ.get("TIER1_LBFGS_HISTORY_SIZE", "30")))
+    lbfgs_max_batches = max(0, int(os.environ.get("TIER1_LBFGS_MAX_BATCHES", "0")))
     use_lbfgs = bool(use_lbfgs_requested)
     if use_lbfgs:
         _lbfgs_tail = max(0, int(epochs) - int(adam_epochs))
@@ -439,6 +443,7 @@ def train_t1_predictor(
     else:
         model_dir = stage_a_dir()
     lbfgs_initialized = False
+    static_lbfgs_batches_cpu = None
     start_epoch = 0
     latest_ckpt_save = model_dir / "tier1_latest_checkpoint.pth"
     latest_ckpt_path = model_dir / "tier1_latest_checkpoint.pth"
@@ -634,13 +639,28 @@ def train_t1_predictor(
 
             optimizer = optim.LBFGS(
                 lbfgs_params,
-                lr=0.01,
-                max_iter=20,
-                history_size=30,
+                lr=lbfgs_lr,
+                max_iter=lbfgs_max_iter,
+                history_size=lbfgs_history_size,
                 line_search_fn="strong_wolfe",
                 tolerance_grad=1e-6,
                 tolerance_change=1e-8
             )
+            print(
+                f"   L-BFGS settings: lr={lbfgs_lr:.3g}, max_iter={lbfgs_max_iter}, "
+                f"history_size={lbfgs_history_size}, max_batches={'all' if lbfgs_max_batches <= 0 else lbfgs_max_batches}"
+            )
+            static_lbfgs_batches_cpu = list(loader)
+            if lbfgs_max_batches > 0 and len(static_lbfgs_batches_cpu) > lbfgs_max_batches:
+                static_lbfgs_batches_cpu = static_lbfgs_batches_cpu[:lbfgs_max_batches]
+                print(
+                    f"   ⚡ TIER1_LBFGS_MAX_BATCHES cap active: using {len(static_lbfgs_batches_cpu)} "
+                    "mini-batch(es) in static closure subset."
+                )
+            else:
+                print(
+                    f"   📌 Cached static L-BFGS closure subset with {len(static_lbfgs_batches_cpu)} mini-batch(es)."
+                )
             lbfgs_initialized = True
 
         if not lbfgs_initialized:
@@ -728,7 +748,7 @@ def train_t1_predictor(
 
         else:
             print(f"⏳ Tier 1 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS Line Search...)")
-            epoch_batches_cpu = list(loader)
+            epoch_batches_cpu = static_lbfgs_batches_cpu if static_lbfgs_batches_cpu is not None else list(loader)
             n_batches = max(len(epoch_batches_cpu), 1)
 
             def closure():
