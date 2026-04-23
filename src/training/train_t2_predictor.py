@@ -565,15 +565,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         physics_active = True  # Physics are always strictly enforced now
         current_solver = "anderson"  # Always use Anderson
 
-        # --- PARAMETER CONTINUATION ---
-        # Morph viscosity from strictly Newtonian (n=1.0) to Carreau (n=target_n) over 20 epochs
-        morph_epochs = 20
-        if epoch < morph_epochs:
-            progress = epoch / morph_epochs
-            carreau_n = 1.0 - progress * (1.0 - target_n)
-            print(f"🔄 Curriculum: Morphed Carreau index 'n' to {carreau_n:.4f}")
-        else:
-            carreau_n = target_n
+        # The true fluid properties must exactly match the COMSOL ground truth data
+        carreau_n = target_n
 
         if epoch == 0 and not resumed_full_checkpoint:
             print(

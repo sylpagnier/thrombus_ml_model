@@ -17,7 +17,7 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 
 ### Model and physics
 
-- **`GINO_DEQ`** (`src/architecture/ginodeq.py`): graph encoder → fixed-point **DEQ** loop (`core_physics.anderson`) over latent states; optional **global mixing** (`AttentionGlobalMixingBlock`) for long-range pressure-like coupling; optional **SIREN** spatial decoder (`architecture/siren_decoder.py`) when enabled by `PhysicsConfig`.
+- **`GINO_DEQ`** (`src/architecture/ginodeq.py`): graph encoder → fixed-point **DEQ** loop (`core_physics.anderson`) over latent states with a required **global message/mixing** path (`AttentionGlobalMixingBlock`) for long-range pressure-like coupling and a required **SIREN** spatial decoder (`architecture/siren_decoder.py`).
 - **LoRA** adapters: `src/architecture/lora_injection.py` (spectral / low-rank hooks used where config enables LoRA for sim-to-real).
 - **`PhysicsKernels`** (`src/core_physics/physics_kernels.py`): residual / BC / rheology interfaces shared by training and tests.
 - **Kinematics losses** align with `src/utils/kinematics_physics_terms.py` (not legacy standalone `kinematics` wrappers).
