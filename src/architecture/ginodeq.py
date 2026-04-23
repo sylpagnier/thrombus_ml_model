@@ -20,12 +20,12 @@ def _spectral_or_plain_linear(in_features: int, out_features: int, bias: bool, s
 
 
 def _make_activation(name: str) -> nn.Module:
-    mode = (name or "relu").strip().lower()
+    mode = (name or "silu").strip().lower()
     if mode == "silu":
         return nn.SiLU()
     if mode == "gelu":
         return nn.GELU()
-    return nn.ReLU()
+    raise ValueError(f"Unsupported activation '{name}'. Supported: silu, gelu.")
 
 
 class AttentionGlobalMixingBlock(nn.Module):
@@ -158,7 +158,7 @@ class GINOBlock(nn.Module):
         latent_dim=64,
         edge_dim=3,
         use_spectral_norm: bool = True,
-        activation_fn: str = "relu",
+        activation_fn: str = "silu",
         num_global_tokens: int = 16,
     ):
         super().__init__()
@@ -221,7 +221,7 @@ class GINO_DEQ(nn.Module):
             self.adv_log_clamp_min = 1e-3
         self.mu_inf_nd = float(default_mu_inf_nd if mu_inf_nd is None else mu_inf_nd)
         self.mu_0_nd = float(default_mu_0_nd if mu_0_nd is None else mu_0_nd)
-        self.activation_fn = (activation_fn or "relu").strip().lower()
+        self.activation_fn = (activation_fn or "silu").strip().lower()
         self.fourier_base = float(fourier_base)
 
         self.wss_decoder = nn.Sequential(
