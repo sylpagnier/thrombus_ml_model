@@ -14,6 +14,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         pass
 import gc
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 if sys.platform != "win32":
@@ -117,6 +118,9 @@ from src.training.physics_curriculum import ease01 as _ease01
 
 
 def _tier3_metrics_jsonl_path():
+    run_dir = os.environ.get("PHASE1_TRAINING_RUN_DIR", "").strip()
+    if run_dir:
+        return Path(run_dir) / "metrics.jsonl"
     return reports_training_dir("tier3") / "metrics.jsonl"
 
 
@@ -161,6 +165,9 @@ def _tier3_should_log_batch(epoch: int, batch_idx: int) -> bool:
 
 
 def _tier3_debug_log_path():
+    run_dir = os.environ.get("PHASE1_TRAINING_RUN_DIR", "").strip()
+    if run_dir:
+        return Path(run_dir) / "debug.log"
     return reports_training_dir("tier3") / "debug.log"
 
 
@@ -1771,6 +1778,8 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         resumed_latest_checkpoint=bool(resume_enabled and latest_ckpt_path.exists()),
         ckpt_every=int(ckpt_every),
         env_tier3_phase1=env_snapshot("TIER3_", "PHASE1_"),
+        run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
+        diary_main_path=str(diary.path) if diary.path is not None else None,
     )
 
     run_end_emitted = False
@@ -2035,8 +2044,6 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             val_anchor_dice_sum, val_synth_dice_sum = 0.0, 0.0
             n_val_anchor, n_val_synth = 0, 0
             wss_reason_hist: Dict[str, int] = {}
-            viz_every = int(os.environ.get("TIER3_VAL_VIZ_EVERY", "0"))
-            viz_dir = reports_training_dir("tier3", "val_viz")
 
             with torch.no_grad():
                 safe_vars = loss_weighter.clamped_log_vars()
@@ -2078,8 +2085,6 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                     else:
                         val_synth_dice_sum += d
                         n_val_synth += 1
-                    if viz_every > 0 and (epoch % viz_every == 0) and is_anc:
-                        _tier3_save_val_debug_plot(viz_dir, epoch, v_pred[-1], v_data, kernels, device)
 
             model.train()
             n_val = max(len(val_loader), 1)

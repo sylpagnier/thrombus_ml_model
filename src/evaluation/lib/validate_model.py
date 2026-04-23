@@ -104,7 +104,7 @@ class ModelValidator:
 
         return base_pred.detach(), pred_opt.detach()
 
-    def validate_dataset(self, data_dir, level_name="Unknown"):
+    def validate_dataset(self, data_dir, level_name="Unknown", save_comparison_images=True):
         data_path = Path(data_dir)
         path = data_path if data_path.is_absolute() else project_root / data_dir
 
@@ -192,8 +192,8 @@ class ModelValidator:
             if use_itpc and pred_itpc is not None:
                 evaluate_prediction(pred_itpc, "itpc")
 
-            # Save comparison visualizations for the first few samples.
-            if use_itpc and i < 3:
+            # Optionally save comparison visualizations for the first few samples.
+            if save_comparison_images and use_itpc and i < 3:
                 self._plot_comparison(data, pred_base, pred_itpc, data.y if has_labels else None,
                                       f"{level_name}_sample_{i}_ITPC")
 

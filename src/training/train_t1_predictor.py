@@ -42,7 +42,7 @@ from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.config import VesselConfig, PhysicsConfig
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ReduceLROnPlateau
-from src.utils.metrics import quantify_performance, validate_and_plot, DynamicLossWeighter
+from src.utils.metrics import quantify_performance, DynamicLossWeighter
 from src.utils.anchor_mask import graph_has_anchor, anchor_node_mask
 from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.training_diary import TrainingDiary, env_snapshot, write_t1_experiment_artifact
@@ -320,7 +320,6 @@ def train_t1_predictor(
 
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
 
-    disable_figures = (os.environ.get("TIER1_DISABLE_FIGURES", "0").strip().lower() in ("1", "true", "yes", "on"))
     skip_validation = os.environ.get("TIER1_SKIP_VALIDATION", "0").strip().lower() in ("1", "true", "yes", "on")
     train_batch_trace = os.environ.get("TIER1_TRAIN_BATCH_TRACE", "0").strip().lower() in ("1", "true", "yes", "on")
     _slow_raw = os.environ.get("TIER1_SLOW_BATCH_LOG_SEC", "20").strip()
@@ -331,9 +330,6 @@ def train_t1_predictor(
             slow_batch_log_sec = float(_slow_raw)
         except ValueError:
             slow_batch_log_sec = 20.0
-    if not disable_figures:
-        fig_dir = reports_training_dir("tier1", "figures")
-
     opt_params = list(model.parameters()) + list(loss_weighter.parameters())
     optimizer = optim.AdamW(opt_params, lr=lr, weight_decay=1e-5)
 
@@ -527,6 +523,8 @@ def train_t1_predictor(
         best_loss_checkpoint=float(best_loss),
         env_tier1_phase1=env_snapshot("TIER1_", "PHASE1_"),
         tier1_train_config=explorer.to_serializable(),
+        run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
+        diary_main_path=str(diary.path) if diary.path is not None else None,
     )
 
     run_end_emitted = False
@@ -551,7 +549,8 @@ def train_t1_predictor(
 
     atexit.register(lambda: _emit_tier1_run_end(True))
 
-    hard_csv_path = reports_training_dir("tier1") / "anchor_hardness.csv"
+    hard_csv_base = diary.run_dir if diary.run_dir is not None else reports_training_dir("tier1")
+    hard_csv_path = hard_csv_base / "anchor_hardness.csv"
     hard_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _refresh_hard_mining(epoch_idx: int):
@@ -796,9 +795,6 @@ def train_t1_predictor(
             save_path = model_dir / "tier1_best_loss.pth"
             torch.save(model.state_dict(), save_path)
             print(f"⭐ Saved Best Loss Model to {save_path}")
-
-        if (not disable_figures) and epoch % 5 == 0:
-            validate_and_plot(model, val_data[0], epoch, device, tier="tier1")
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:

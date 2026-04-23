@@ -4,7 +4,7 @@ Phase 1 anchor inspector: COMSOL `vessel_*.npz` (tier1/tier2).
 **Default behavior** (no extra flags): same style as ``vessel_generator`` — if ``--tier`` is omitted, **Tier** is
 chosen interactively (``1`` or ``2``). Non-interactive scripts should pass ``--tier 1`` or ``--tier 2``. Then
 full-directory **health scan**
-(quality flags + optional CSV) and **interactive** matplotlib (random ``vessel_*.npz`` or ``--sample-idx``;
+(quality flags printed to console) and **interactive** matplotlib (random ``vessel_*.npz`` or ``--sample-idx``;
 Regenerate button / ``r`` key).
 
 When a matching processed graph ``vessel_<idx>.pt`` exists, the interactive plot shows **network targets (y)**
@@ -34,7 +34,6 @@ if (_REPO_ROOT / "src").is_dir() and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
-import csv
 import random
 
 import matplotlib.pyplot as plt
@@ -43,7 +42,7 @@ import torch
 from matplotlib.widgets import Button
 
 from src.config import NodeFeat, PhysicsConfig, PredChannels, VesselConfig
-from src.utils.paths import get_project_root, reports_inspection_dir
+from src.utils.paths import get_project_root
 
 
 def _resolve_anchor_dir(tier: str) -> Path:
@@ -158,8 +157,8 @@ def summary(tier: str) -> None:
         print(f"nan_ratio max   : {np.max([r['nan_ratio'] for r in valid]):.3e}")
 
 
-def health_scan_anchors(tier: str, *, export_csv: bool = True) -> list[dict]:
-    """Full-directory scan with optional quality flags and ``outputs/reports/<tier>_anchor_health.csv``."""
+def health_scan_anchors(tier: str) -> list[dict]:
+    """Full-directory scan with quality flags printed to console."""
     data_dir = _resolve_anchor_dir(tier)
     files = sorted(data_dir.glob("vessel_*.npz"))
     if not files:
@@ -211,52 +210,6 @@ def health_scan_anchors(tier: str, *, export_csv: bool = True) -> list[dict]:
                 f"p_std={r['p_std']:.2e} u_abs_max={r['u_abs_max']:.2e} nan_ratio={r['nan_ratio']:.2e}"
             )
 
-    if export_csv and rows:
-        out_path = reports_inspection_dir("phase1") / f"{tier}_anchor_health.csv"
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "sample_idx",
-                    "ok",
-                    "reason",
-                    "nodes",
-                    "vel_min",
-                    "vel_max",
-                    "vel_mean",
-                    "p_min",
-                    "p_max",
-                    "p_std",
-                    "u_abs_max",
-                    "has_mu",
-                    "mu_min",
-                    "mu_max",
-                    "nan_ratio",
-                    "quality_flags",
-                ]
-            )
-            for r in rows:
-                writer.writerow(
-                    [
-                        r.get("sample_idx"),
-                        r.get("ok"),
-                        r.get("reason"),
-                        r.get("nodes"),
-                        r.get("vel_min"),
-                        r.get("vel_max"),
-                        r.get("vel_mean"),
-                        r.get("p_min"),
-                        r.get("p_max"),
-                        r.get("p_std"),
-                        r.get("u_abs_max"),
-                        r.get("has_mu"),
-                        r.get("mu_min"),
-                        r.get("mu_max"),
-                        r.get("nan_ratio"),
-                        "|".join(r.get("quality_flags", [])),
-                    ]
-                )
-        print(f"Wrote anchor health CSV: {out_path}")
     return rows
 
 
@@ -739,7 +692,7 @@ def inspect_template_tags() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect Phase1 anchor data, health CSV, plots, and template tags.")
+    parser = argparse.ArgumentParser(description="Inspect Phase1 anchor data, health scan, plots, and template tags.")
     parser.add_argument(
         "--tier",
         type=int,
@@ -756,14 +709,13 @@ def main() -> None:
     parser.add_argument(
         "--scan-only",
         action="store_true",
-        help="Full-directory health scan + optional CSV, then exit (no matplotlib window).",
+        help="Full-directory health scan, then exit (no matplotlib window).",
     )
     parser.add_argument(
         "--skip-health-scan",
         action="store_true",
         help="Skip full-directory scan; open interactive plot only (after default, use with care).",
     )
-    parser.add_argument("--no-export-csv", action="store_true", help="Disable CSV export during health scan.")
     parser.add_argument("--sample-idx", type=int, default=None, help="Sample index (vessel_<idx>.npz) for plotting.")
     parser.add_argument(
         "--plot",
@@ -794,7 +746,7 @@ def main() -> None:
     tier = _resolve_tier_from_cli(args.tier)
 
     if args.scan_only:
-        health_scan_anchors(tier, export_csv=(not args.no_export_csv))
+        health_scan_anchors(tier)
         return
 
     if args.summary:
@@ -802,7 +754,7 @@ def main() -> None:
         return
 
     if not args.skip_health_scan:
-        health_scan_anchors(tier, export_csv=(not args.no_export_csv))
+        health_scan_anchors(tier)
 
     if args.plot_static:
         if args.sample_idx is None:

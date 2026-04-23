@@ -13,7 +13,7 @@ from src.utils.paths import (
     comsol_models_dir,
     data_root,
     get_project_root,
-    reports_evaluation_dir,
+    reports_subdir,
     resolve_checkpoint,
 )
 
@@ -178,7 +178,11 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
             return None
 
         validator = ModelValidator(model_path=model_path, tier=tier)
-        metrics = validator.validate_dataset(str(graph_dir), level_name=level_name)
+        metrics = validator.validate_dataset(
+            str(graph_dir),
+            level_name=level_name,
+            save_comparison_images=False,
+        )
         if visualize:
             _show_benchmark_visualization(
                 validator=validator,
@@ -273,7 +277,7 @@ if __name__ == "__main__":
         if all_results:
             df = pd.DataFrame(all_results).T
             print(df)
-            save_path = reports_evaluation_dir("benchmark", "tables") / f"{current_tier}_full_benchmark.csv"
+            save_path = reports_subdir("benchmark") / f"{current_tier}_full_benchmark.csv"
             save_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(save_path)
             print(f"\n📄 Detailed report saved to: {save_path}")

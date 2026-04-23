@@ -17,7 +17,7 @@ from tqdm import tqdm
 from src.config import VesselConfig, PhysicsConfig, CurriculumConfig
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
-from src.utils.metrics import DynamicLossWeighter, quantify_performance, validate_and_plot
+from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.samplers import StratifiedAnchorSampler
 from src.utils.training_diary import TrainingDiary, env_snapshot
@@ -116,11 +116,43 @@ def load_dataset():
     return dataset
 
 
-def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
-    print("🔥 Unfreezing All Layers. Activating Coupled DEQ Optimization.")
-    for param in model.parameters(): param.requires_grad = True
+def setup_rheology_warmup(model, loss_weighter, lr=1e-4):
+    print("❄️ Freezing Tier 1 Core. Warming up Rheology Decoder only.")
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze only the viscosity components
+    for param in model.mu_decoder.parameters():
+        param.requires_grad = True
+    for param in model.mu_encoder.parameters():
+        param.requires_grad = True
+
     return optim.AdamW([
-        {'params': model.parameters(), 'lr': base_lr},
+        {'params': model.mu_decoder.parameters(), 'lr': lr},
+        {'params': model.mu_encoder.parameters(), 'lr': lr},
+        {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
+    ], weight_decay=1e-5)
+
+
+def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
+    print("🔥 Unfreezing All Layers. Activating Differential Coupled Optimization.")
+    for param in model.parameters():
+        param.requires_grad = True
+
+    # Protect Tier 1 kinematics with 10x smaller LR, let Rheology learn faster
+    core_lr = base_lr * 0.1
+    rheo_lr = base_lr
+
+    kinematics_params = model.siren_decoder.parameters() if model.use_siren_decoder else model.kinematics_decoder.parameters()
+
+    return optim.AdamW([
+        {'params': model.encoder.parameters(), 'lr': core_lr},
+        {'params': model.core.parameters(), 'lr': core_lr},
+        {'params': kinematics_params, 'lr': core_lr},
+        {'params': model.wss_decoder.parameters(), 'lr': core_lr},
+        {'params': model.mu_decoder.parameters(), 'lr': rheo_lr},
+        {'params': model.mu_encoder.parameters(), 'lr': rheo_lr},
         {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
     ], weight_decay=1e-5)
 
@@ -169,9 +201,7 @@ def compute_step_loss(
     kernels,
     loss_weighter,
     current_solver,
-    lambda_phys,
     device,
-    is_distillation,
     carreau_n=None,
     *,
     tier2_kine_p_weight: float = 1.0,
@@ -179,7 +209,8 @@ def compute_step_loss(
     train_continuity_scale: float = TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT,
     train_rheology_scale: float = TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT,
 ):
-    out = model(data, solver=current_solver, anderson_beta=1.0 if is_distillation else 0.8, anderson_warmup_iters=5)
+    # Always use Anderson with beta=0.8 to maintain a consistent DEQ fixed-point
+    out = model(data, solver=current_solver, anderson_beta=0.8, anderson_warmup_iters=5)
     if isinstance(out, tuple):
         pred, jac_loss = out
     else:
@@ -191,7 +222,7 @@ def compute_step_loss(
         data,
         kernels,
         tier="tier2",
-        tier2_distillation=is_distillation,
+        tier2_distillation=False,  # Physics are ALWAYS active
         carreau_n=carreau_n,
         tier2_kine_p_weight=tier2_kine_p_weight,
     )
@@ -204,11 +235,8 @@ def compute_step_loss(
     l_io = terms["l_io"]
     l_rheo = terms["l_rheo"]
 
-    # --- PHASE 2/3: FULLY COUPLED ROUTING ---
-    # Navier-Stokes residual uses WLS derivatives through PhysicsKernels.navier_stokes_residual.
-    pde_losses = [l_mom]
-    pde_scales = [lambda_phys]
-    weighted_pdes = loss_weighter(pde_losses, scales=pde_scales)
+    # FIX: Pass raw loss to Kendall weighter. Do not manually scale it.
+    weighted_pdes = loss_weighter([l_mom])
 
     loss = (
         weighted_pdes
@@ -482,6 +510,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         train_rheology_scale=float(train_rheology_scale),
         val_continuity_scale=float(val_continuity_scale),
         val_rheology_scale=float(val_rheology_scale),
+        run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
+        diary_main_path=str(diary.path) if diary.path is not None else None,
     )
 
     tier2_final_path = model_dir / "tier2_final.pth"
@@ -511,6 +541,9 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
 
     for epoch in range(start_epoch, epochs):
         last_epoch_completed = epoch
+        rheology_warmup_epochs = distillation_epochs  # Repurposing the variable
+        is_rheology_warmup = epoch < rheology_warmup_epochs
+        lambda_phys = 1.0
         if use_lbfgs and stop_after_adam and epoch >= adam_epochs:
             checkpoint = {
                 "epoch": epoch - 1,
@@ -529,44 +562,42 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 "Resume with TIER2_STOP_AFTER_ADAM=0 (or unset) to continue L-BFGS."
             )
             break
-        is_distillation = epoch < distillation_epochs
-        physics_active = not is_distillation
-        lambda_phys = min(1.0, max(0.0, (epoch - distillation_epochs) / 20.0))
+        physics_active = True  # Physics are always strictly enforced now
+        current_solver = "anderson"  # Always use Anderson
 
-        if is_distillation:
-            progress = epoch / max(1, (distillation_epochs - 1))
-            carreau_n = start_n - progress * (start_n - target_n)
-            print(f"🔄 Curriculum: Annealed Carreau index 'n' to {carreau_n:.4f}")
-            if epoch == 0:
-                print("ℹ️ Warmup uses full coupled losses; momentum PDE is softly gated by lambda_phys ramp.")
+        # --- PARAMETER CONTINUATION ---
+        # Morph viscosity from strictly Newtonian (n=1.0) to Carreau (n=target_n) over 20 epochs
+        morph_epochs = 20
+        if epoch < morph_epochs:
+            progress = epoch / morph_epochs
+            carreau_n = 1.0 - progress * (1.0 - target_n)
+            print(f"🔄 Curriculum: Morphed Carreau index 'n' to {carreau_n:.4f}")
         else:
             carreau_n = target_n
 
-        # Ensure Anderson remains active during L-BFGS to maintain gradient accuracy
-        if is_distillation:
-            current_solver = "picard"
-        else:
-            current_solver = "anderson"
-
         if epoch == 0 and not resumed_full_checkpoint:
-            print(f"\n🚀 --- Starting Phase 1: Coupled Curriculum Warmup (Epochs 0-{distillation_epochs - 1}) ---")
-            optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            coupled_total_epochs = max(1, epochs - distillation_epochs)
+            print(
+                f"\n🚀 --- Starting Phase 1: Frozen Core Rheology Warmup "
+                f"(Epochs 0-{rheology_warmup_epochs - 1}) ---"
+            )
+            optimizer = setup_rheology_warmup(model, loss_weighter, lr=lr)
             scheduler = _build_warmup_cosine_scheduler(
                 optimizer,
-                total_epochs=coupled_total_epochs,
-                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
+                total_epochs=epochs,
+                warmup_epochs=tier2_warmup_epochs,
                 eta_min=tier2_cosine_eta_min,
             )
             plateau_scheduler = ReduceLROnPlateau(
                 optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
             )
             sampler.set_warmup_mode(False)
-        elif epoch == distillation_epochs:
+        elif epoch == rheology_warmup_epochs:
             print(
-                f"\n🚀 --- Starting Phase 2: Fully Coupled DEQ via AdamW (Epochs {distillation_epochs}-{adam_epochs - 1}) ---")
+                f"\n🚀 --- Starting Phase 2: Differential Coupled DEQ "
+                f"(Epochs {rheology_warmup_epochs}-{adam_epochs - 1}) ---"
+            )
             optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            coupled_total_epochs = max(1, epochs - distillation_epochs)
+            coupled_total_epochs = max(1, epochs - rheology_warmup_epochs)
             scheduler = _build_warmup_cosine_scheduler(
                 optimizer,
                 total_epochs=coupled_total_epochs,
@@ -576,6 +607,8 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             plateau_scheduler = ReduceLROnPlateau(
                 optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
             )
+            # Reset optimizer state for the Kendall weighter which carries over
+            loss_weighter.reset_parameters() if hasattr(loss_weighter, "reset_parameters") else None
             sampler.set_warmup_mode(False)
         elif use_lbfgs and epoch >= adam_epochs and not lbfgs_initialized:
             print(f"\n⚡ Switching to L-BFGS Optimizer for the final {max(0, epochs - adam_epochs)} epoch(s)...")
@@ -598,7 +631,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
         grad_norm = 0.0
 
         if not lbfgs_initialized:
-            phase_tag = "Distill" if is_distillation else "AdamW"
+            phase_tag = "Warmup" if is_rheology_warmup else "AdamW"
             pbar = tqdm(loader, desc=f"Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] ({phase_tag})")
 
             # Zero gradients AT THE START of the epoch
@@ -614,12 +647,10 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                     kernels,
                     loss_weighter,
                     current_solver,
-                    lambda_phys,
                     device,
-                    is_distillation,
                     carreau_n=carreau_n,
                     tier2_kine_p_weight=tier2_kine_p_weight,
-                    coupled_io_scale=(5.0 if is_distillation else tier2_coupled_io_scale),
+                    coupled_io_scale=tier2_coupled_io_scale,
                     train_continuity_scale=train_continuity_scale,
                     train_rheology_scale=train_rheology_scale,
                 )
@@ -634,7 +665,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 # Step optimizer ONLY when we've accumulated enough micro-batches
                 if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
                     clip_params = [p for g in optimizer.param_groups for p in g["params"]]
-                    clip_max = 1.0 if is_distillation else tier2_grad_clip_coupled
+                    clip_max = 1.0 if is_rheology_warmup else tier2_grad_clip_coupled
                     grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=clip_max)
                     optimizer.step()
                     optimizer.zero_grad()  # Reset for the next effective batch
@@ -672,12 +703,10 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                         kernels,
                         loss_weighter,
                         current_solver,
-                        lambda_phys,
                         device,
-                        is_distillation,
                         carreau_n=carreau_n,
                         tier2_kine_p_weight=tier2_kine_p_weight,
-                        coupled_io_scale=(5.0 if is_distillation else tier2_coupled_io_scale),
+                        coupled_io_scale=tier2_coupled_io_scale,
                         train_continuity_scale=train_continuity_scale,
                         train_rheology_scale=train_rheology_scale,
                     )
@@ -696,9 +725,6 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             save_bl = model_dir / "tier2_best_loss.pth"
             torch.save(model.state_dict(), save_bl)
             print(f"⭐ Saved Best Loss Model to {save_bl}")
-
-        if epoch % 5 == 0 and val_data:
-            validate_and_plot(model, val_data[0], epoch, device, tier="tier2")
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:
@@ -721,7 +747,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
             lr=float(optimizer.param_groups[0]["lr"]),
             lambda_phys=float(lambda_phys),
             carreau_n=float(carreau_n),
-            phase=("distillation" if is_distillation else ("lbfgs" if lbfgs_initialized else "coupled")),
+            phase=("rheology_warmup" if is_rheology_warmup else ("lbfgs" if lbfgs_initialized else "coupled")),
             solver=current_solver,
             physics_active=bool(physics_active),
             lbfgs=bool(lbfgs_initialized),
@@ -741,7 +767,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 device,
                 tier="tier2",
                 solver=current_solver,
-                anderson_beta=(1.0 if is_distillation else 0.8),
+                anderson_beta=0.8,
             )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -802,7 +828,7 @@ def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-
                 weight_mom=w_mom,
                 val_composite_loss=val_composite_loss,
                 carreau_n=float(carreau_n),
-                phase_distillation=bool(is_distillation),
+                phase_distillation=bool(is_rheology_warmup),
                 best_rel_l2=float(best_early_stop_metric),
                 val_no_improve=int(val_no_improve),
                 n_val_anchors=int(n_val_anchor),

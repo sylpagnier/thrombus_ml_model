@@ -97,7 +97,7 @@ def env_snapshot(*prefixes: str) -> Dict[str, str]:
 
 
 class TrainingDiary:
-    """Writes ``<reports_dir>/training_diary_{tier}_{run_id}.jsonl`` unless overridden."""
+    """Writes one main JSONL diary per run under a run-specific folder."""
 
     def __init__(self, tier: str, enabled: Optional[bool] = None):
         self.tier = tier
@@ -107,16 +107,22 @@ class TrainingDiary:
         self.enabled = enabled
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.path: Optional[Path] = None
+        self.run_dir: Optional[Path] = None
         if not self.enabled:
             return
         reports = reports_training_dir(self.tier)
+        self.run_dir = reports / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         custom = os.environ.get("PHASE1_TRAINING_DIARY_PATH", "").strip()
         if custom:
             self.path = Path(custom)
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.run_dir = self.path.parent
         else:
-            self.path = reports / f"diary_{self.run_id}.jsonl"
-        print(f"📝 Training diary (JSONL): {self.path}")
+            self.path = self.run_dir / "training_diary_main.jsonl"
+        os.environ["PHASE1_TRAINING_RUN_DIR"] = str(self.run_dir)
+        print(f"📝 Training diary (main JSONL): {self.path}")
+        print(f"📂 Training run folder: {self.run_dir}")
 
     def _write(self, event: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or self.path is None:
