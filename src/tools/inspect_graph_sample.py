@@ -1,9 +1,9 @@
 """
-Interactive inspection of processed graph ``.pt`` samples (Tier 1 / Tier 2 / Stage A).
+Interactive inspection of processed graph ``.pt`` samples (Kinematics / Kinematics / Kine phase).
 
 Run as a script (not via pytest)::
 
-    python -m src.tools.inspect_graph_sample --inspect-sample --tier tier1
+    python -m src.tools.inspect_graph_sample --inspect-sample --phase kinematics
 
 Lists graph/COMSOL overlap and visualizes features, labels, WLS condition numbers, and BC masks.
 """
@@ -22,21 +22,21 @@ from src.config import PhysicsConfig, VesselConfig
 from src.core_physics.physics_kernels import scatter_add
 
 
-def _tier2_final_n_subdir() -> str:
-    return f"n_{float(PhysicsConfig(tier='tier2').n):.3f}"
+def _kinematics_final_n_subdir() -> str:
+    return f"n_{float(PhysicsConfig(phase='kinematics').n):.3f}"
 
 
-def _default_graph_dir_for_tier(tier: str) -> Path:
-    d = Path(VesselConfig(tier=tier).graph_output_dir)
-    if tier == "tier2":
-        d = d / _tier2_final_n_subdir()
+def _default_graph_dir_for_phase(phase: str) -> Path:
+    d = Path(VesselConfig(phase=phase).graph_output_dir)
+    if phase == "kinematics":
+        d = d / _kinematics_final_n_subdir()
     return d
 
 
-def _default_cfd_dir_for_tier(tier: str) -> Path:
-    d = Path(VesselConfig(tier=tier).output_dir)
-    if tier == "tier2":
-        d = d / _tier2_final_n_subdir()
+def _default_cfd_dir_for_phase(phase: str) -> Path:
+    d = Path(VesselConfig(phase=phase).output_dir)
+    if phase == "kinematics":
+        d = d / _kinematics_final_n_subdir()
     return d
 
 
@@ -82,13 +82,13 @@ def plot_field(ax, pos, values, title, cmap="viridis", colorbar=True, **kwargs):
     return sc
 
 
-def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tier_options=None, restrict_to_overlap=True):
-    if tier_options is None:
-        tier_options = ["tier1", "tier2"]
+def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=None, phase_options=None, restrict_to_overlap=True):
+    if phase_options is None:
+        phase_options = ["kinematics", "kinematics"]
 
     requested_vessel_idx = _extract_vessel_idx(Path(filename)) if filename is not None else None
     state = {
-        "tier": tier,
+        "phase": phase,
         "vessel_idx": requested_vessel_idx,
         "overlap_indices": [],
         "key_cid": None,
@@ -96,21 +96,21 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
     }
     fig = plt.figure(figsize=(20, 12))
 
-    def _graph_dir_for_current_tier():
+    def _graph_dir_for_current_phase():
         if proc_dir is not None:
             return Path(proc_dir)
-        return _default_graph_dir_for_tier(state["tier"])
+        return _default_graph_dir_for_phase(state["phase"])
 
-    def _sync_overlap_for_current_tier():
+    def _sync_overlap_for_current_phase():
         if restrict_to_overlap:
             state["overlap_indices"] = list_indices_with_valid_comsol_results(
-                tier=state["tier"],
+                phase=state["phase"],
                 proc_dir=proc_dir,
                 cfd_dir=cfd_dir,
                 emit=False,
             )
         else:
-            graph_dir = _graph_dir_for_current_tier()
+            graph_dir = _graph_dir_for_current_phase()
             state["overlap_indices"] = sorted(
                 idx for idx in (_extract_vessel_idx(p) for p in graph_dir.glob("vessel_*.pt")) if idx is not None
             )
@@ -120,36 +120,36 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
             state["vessel_idx"] = state["overlap_indices"][0]
 
     def _render_current():
-        _sync_overlap_for_current_tier()
+        _sync_overlap_for_current_phase()
         fig.clf()
         state["widgets"] = []
         fig.subplots_adjust(bottom=0.18, left=0.03, right=0.98, top=0.95, wspace=0.15, hspace=0.18)
         overlap_sorted = sorted(state["overlap_indices"])
 
-        def _set_tier_and_redraw(new_tier):
-            if new_tier == state["tier"]:
+        def _set_phase_and_redraw(new_phase):
+            if new_phase == state["phase"]:
                 return
-            state["tier"] = new_tier
+            state["phase"] = new_phase
             state["vessel_idx"] = None
             _render_current()
 
         def _set_vessel_and_redraw(vessel_idx):
             if vessel_idx not in set(overlap_sorted):
-                print(f"Vessel {vessel_idx} is not in overlap set for {state['tier']}.")
+                print(f"Vessel {vessel_idx} is not in overlap set for {state['phase']}.")
                 return
             state["vessel_idx"] = vessel_idx
             _render_current()
 
-        tier_ax = fig.add_axes([0.01, 0.02, 0.15, 0.14])
-        tier_labels = [t.upper() for t in tier_options]
-        active_tier_idx = tier_options.index(state["tier"]) if state["tier"] in tier_options else 0
-        tier_radio = RadioButtons(tier_ax, tier_labels, active=active_tier_idx)
+        phase_ax = fig.add_axes([0.01, 0.02, 0.15, 0.14])
+        phase_labels = [t.upper() for t in phase_options]
+        active_phase_idx = phase_options.index(state["phase"]) if state["phase"] in phase_options else 0
+        phase_radio = RadioButtons(phase_ax, phase_labels, active=active_phase_idx)
 
-        def _on_tier_change(label):
-            _set_tier_and_redraw(label.lower())
+        def _on_phase_change(label):
+            _set_phase_and_redraw(label.lower())
 
-        tier_radio.on_clicked(_on_tier_change)
-        state["widgets"].append(tier_radio)
+        phase_radio.on_clicked(_on_phase_change)
+        state["widgets"].append(phase_radio)
 
         if len(overlap_sorted) == 0:
             msg_ax = fig.add_subplot(111)
@@ -158,28 +158,28 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
                 0.5,
                 0.5,
                 (
-                    f"No valid graph+COMSOL overlap for {state['tier'].upper()}"
+                    f"No valid graph+COMSOL overlap for {state['phase'].upper()}"
                     if restrict_to_overlap
-                    else f"No graph files found for {state['tier'].upper()}"
+                    else f"No graph files found for {state['phase'].upper()}"
                 ),
                 ha="center",
                 va="center",
                 fontsize=16,
                 color="crimson",
             )
-            fig.text(0.20, 0.02, "Switch tier with the radio toggles on the left.", fontsize=10)
+            fig.text(0.20, 0.02, "Switch phase with the radio toggles on the left.", fontsize=10)
             fig.canvas.draw_idle()
             return
 
         filename_local = f"vessel_{state['vessel_idx']}.pt"
-        data_path = _graph_dir_for_current_tier() / filename_local
+        data_path = _graph_dir_for_current_phase() / filename_local
         if not data_path.exists():
-            print(f"File {filename_local} not found in {_graph_dir_for_current_tier()}")
+            print(f"File {filename_local} not found in {_graph_dir_for_current_phase()}")
             fig.canvas.draw_idle()
             return
 
-        phys_cfg = PhysicsConfig(tier=state["tier"])
-        print(f"\n{'=' * 60}\n INSPECTING: {data_path.name} | TIER: {state['tier'].upper()}\n{'=' * 60}")
+        phys_cfg = PhysicsConfig(phase=state["phase"])
+        print(f"\n{'=' * 60}\n INSPECTING: {data_path.name} | PHASE: {state['phase'].upper()}\n{'=' * 60}")
         data = torch.load(data_path, weights_only=False)
 
         print("\n Architecture & Invariants")
@@ -254,7 +254,7 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
         meta_ax.text(
             0,
             0.5,
-            f"Tier: {state['tier']}\nFile: {filename_local}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}\n"
+            f"Phase: {state['phase']}\nFile: {filename_local}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}\n"
             f"{'Overlap' if restrict_to_overlap else 'Available'} count: {len(overlap_sorted)}",
             fontsize=10,
         )
@@ -299,7 +299,7 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
         if state["key_cid"] is not None:
             fig.canvas.mpl_disconnect(state["key_cid"])
         state["key_cid"] = fig.canvas.mpl_connect("key_press_event", _on_key)
-        fig.text(0.20, 0.02, "Tier toggle (left), vessel Prev/Next, Left/Right keys, or type vessel ID.", fontsize=10)
+        fig.text(0.20, 0.02, "Phase toggle (left), vessel Prev/Next, Left/Right keys, or type vessel ID.", fontsize=10)
 
         fig.canvas.draw_idle()
 
@@ -358,15 +358,15 @@ def _is_valid_comsol_result(npz_path):
 
 
 def list_indices_with_valid_comsol_results(
-    tier="tier1",
+    phase="kinematics",
     proc_dir=None,
     cfd_dir=None,
     verbose=False,
     print_indices=False,
     emit=True,
 ):
-    graph_dir = Path(proc_dir) if proc_dir is not None else _default_graph_dir_for_tier(tier)
-    comsol_dir = Path(cfd_dir) if cfd_dir is not None else _default_cfd_dir_for_tier(tier)
+    graph_dir = Path(proc_dir) if proc_dir is not None else _default_graph_dir_for_phase(phase)
+    comsol_dir = Path(cfd_dir) if cfd_dir is not None else _default_cfd_dir_for_phase(phase)
 
     if not graph_dir.exists():
         if emit:
@@ -394,7 +394,7 @@ def list_indices_with_valid_comsol_results(
 
     if verbose and emit:
         print(f"\n{'=' * 60}")
-        print(f" VALID GRAPH + COMSOL OVERLAP ({tier.upper()})")
+        print(f" VALID GRAPH + COMSOL OVERLAP ({phase.upper()})")
         print(f"{'=' * 60}")
         print(f"Graph dir: {graph_dir}")
         print(f"COMSOL dir: {comsol_dir}")
@@ -412,23 +412,23 @@ def list_indices_with_valid_comsol_results(
     return overlap_indices
 
 
-def _normalize_tier_value(raw_tier):
-    if raw_tier is None:
+def _normalize_phase_value(raw_phase):
+    if raw_phase is None:
         return None
-    normalized = str(raw_tier).strip().lower()
+    normalized = str(raw_phase).strip().lower()
     aliases = {
-        "1": "tier1",
-        "tier1": "tier1",
-        "2": "tier2",
-        "tier2": "tier2",
+        "1": "kinematics",
+        "kinematics": "kinematics",
+        "2": "kinematics",
+        "kinematics": "kinematics",
     }
     return aliases.get(normalized)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Inspect Stage A (Tier 1/2) graph samples")
+    parser = argparse.ArgumentParser(description="Inspect Kine phase (Kinematics/2) graph samples")
     parser.add_argument("--filename", type=str, default=None, help="Graph filename (e.g. vessel_73.pt).")
-    parser.add_argument("--tier", type=str, default=None, help="Tier for default directories")
+    parser.add_argument("--phase", type=str, default=None, help="Phase for default directories")
     parser.add_argument("--proc-dir", type=str, default=None, help="Directory with graph .pt files")
     parser.add_argument("--cfd-dir", type=str, default=None, help="Directory with COMSOL .npz CFD files")
     parser.add_argument(
@@ -440,20 +440,20 @@ if __name__ == "__main__":
     parser.add_argument("--verbose-overlap", action="store_true", help="Full overlap diagnostics")
     args = parser.parse_args()
 
-    if args.tier is not None:
-        selected_tier = _normalize_tier_value(args.tier)
-        if selected_tier is None:
-            print("Invalid --tier value. Use: tier1 or tier2 (also accepts 1/2).")
+    if args.phase is not None:
+        selected_phase = _normalize_phase_value(args.phase)
+        if selected_phase is None:
+            print("Invalid --phase value. Use: kinematics or kinematics (also accepts 1/2).")
             raise SystemExit(1)
     else:
-        selected_tier = "tier1"
+        selected_phase = "kinematics"
 
     inspect_mode = args.inspect_sample or (args.filename is not None)
     overlap_mode = args.list_cfd_overlap
 
     if overlap_mode:
         list_indices_with_valid_comsol_results(
-            tier=selected_tier,
+            phase=selected_phase,
             proc_dir=args.proc_dir,
             cfd_dir=args.cfd_dir,
             verbose=args.verbose_overlap,
@@ -461,7 +461,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if inspect_mode and args.filename is None:
-        default_dir = Path(args.proc_dir) if args.proc_dir is not None else _default_graph_dir_for_tier(selected_tier)
+        default_dir = Path(args.proc_dir) if args.proc_dir is not None else _default_graph_dir_for_phase(selected_phase)
         selected_filename = _pick_filename_interactively(default_dir)
         if selected_filename is None:
             print("Exiting without action.")
@@ -471,7 +471,7 @@ if __name__ == "__main__":
 
     inspect_sample(
         filename=selected_filename,
-        tier=selected_tier,
+        phase=selected_phase,
         proc_dir=args.proc_dir,
         cfd_dir=args.cfd_dir,
         restrict_to_overlap=not inspect_mode,

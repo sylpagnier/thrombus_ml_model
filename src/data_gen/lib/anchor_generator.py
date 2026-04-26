@@ -107,9 +107,9 @@ class AnchorGenerator:
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
-    def __init__(self, tier="tier1", mesh_dir=None, output_dir=None, template_path=None):
-        self.vessel_config = VesselConfig(tier=tier)
-        self.phys_cfg = PhysicsConfig(tier=tier)
+    def __init__(self, phase="kinematics", mesh_dir=None, output_dir=None, template_path=None):
+        self.vessel_config = VesselConfig(phase=phase)
+        self.phys_cfg = PhysicsConfig(phase=phase)
 
         self.root_dir = get_project_root()
 
@@ -143,10 +143,10 @@ class AnchorGenerator:
     def _final_target_output_dir(self) -> Path:
         """Directory for the final target n outputs.
 
-        Tier 2 now always writes final anchors to ``n_<target>`` for consistency with
-        continuation layouts. Tier 1 keeps the base output directory.
+        Kinematics now always writes final anchors to ``n_<target>`` for consistency with
+        continuation layouts. Kinematics keeps the base output directory.
         """
-        if self.vessel_config.tier == "tier2":
+        if self.vessel_config.phase == "kinematics":
             return self.output_dir / f"n_{float(self.phys_cfg.n):.3f}"
         return self.output_dir
 
@@ -486,7 +486,7 @@ class AnchorGenerator:
                 f"{attempted} attempt(s) ({n_failed} failed or discarded, {new_written} saved). "
                 + (
                     "All CFD-ready candidates in this pass were tried — no more geometries left to "
-                    "reach the target; generate more vessel meshes for this tier or raise "
+                    "reach the target; generate more vessel meshes for this phase or raise "
                     "max_json_to_scan / remove the scan cap."
                     if pool_exhausted
                     else "Raise max_json_to_scan (or leave it unset) to try more existing geometries."
@@ -549,9 +549,9 @@ if __name__ == "__main__":
                     return True
                 print("  Enter 1 or 2.")
 
-        tier_n = _prompt_int_choice("Tier", (1, 2))
-        tier = f"tier{tier_n}"
-        gen = AnchorGenerator(tier=tier)
+        phase_n = _prompt_int_choice("Phase", (1, 2))
+        phase = f"phase{phase_n}"
+        gen = AnchorGenerator(phase=phase)
         target_dir = gen.target_output_dir()
         inv = summarize_anchor_inventory(gen.mesh_dir, target_dir)
         total_v = int(inv["mesh_json_with_valid_nas"])
@@ -562,7 +562,7 @@ if __name__ == "__main__":
         print("\n--- Anchor CFD inventory ---")
         print(f"  Output: {target_dir}")
         print(f"  Mesh:   {gen.mesh_dir}")
-        print(f"  Total number of tier vessels: {total_v}")
+        print(f"  Total number of phase vessels: {total_v}")
         print(f"  Number of anchors already generated: {have_npz}")
         print(f"  Number of non-anchors remaining: {remaining}")
         if remaining > ready_add:

@@ -23,7 +23,7 @@ class PredChannels:
 
 
 class NodeFeat:
-    """Canonical node-feature slices for Tier 1/2 predictor inputs."""
+    """Canonical node-feature slices for Kinematics/2 predictor inputs."""
 
     XY = slice(0, 2)
     SDF = slice(2, 3)
@@ -39,8 +39,8 @@ class NodeFeat:
     WIDTH_D2 = slice(17, 18)
 
 
-class Tier3NodeFeat:
-    """Canonical node-feature slices for Tier 3 graph inputs."""
+class BiochemNodeFeat:
+    """Canonical node-feature slices for Biochem graph inputs."""
 
     XY = slice(0, 2)
     SDF = slice(2, 3)
@@ -100,18 +100,26 @@ SPECIES_GROUPS = {
     "solid": (BulkSpecies.FI,),
 }
 
-# Default mesh size-factor by data generation tier.
-# Tier-1 default is locked to the best explorer candidate from 2026-04-16:
-# `tier1_res_medium` (size factor 0.75).
-TIER_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
-    "tier1": 0.75,
+PHASE_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
+    "kinematics": 0.75,
 }
+
+
+def _map_phase_to_phase(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v in ("kinematics", "biochem"):
+        return v
+    if v == "kinematics":
+        return "kinematics"
+    if v == "biochem":
+        return "biochem"
+    raise ValueError(f"Unknown phase: {value}")
 
 
 @dataclass
 class VesselConfig:
     """Central configuration for vessel geometry and mesh generation."""
-    tier: str = "tier1"
+    phase: str = "kinematics"
     project_root: Path = field(default_factory=get_project_root)
     template_path: Path = field(init=False)
     mesh_input_dir: Path = field(init=False)
@@ -120,21 +128,17 @@ class VesselConfig:
 
     def __post_init__(self):
         self.template_path = comsol_models_dir() / "phase1_template.mph"
-        self.mesh_size_factor = TIER_DEFAULT_MESH_SIZE_FACTOR.get(self.tier, self.mesh_size_factor)
+        self.phase = _map_phase_to_phase(self.phase)
+        self.mesh_size_factor = PHASE_DEFAULT_MESH_SIZE_FACTOR.get(self.phase, self.mesh_size_factor)
         dr = data_root()
-        if self.tier == "tier3_mix":
-            # Pooled synthetic + patient graphs for population-level Stage B training
-            self.mesh_input_dir = dr / "raw/tier3_mix"
-            self.output_dir = dr / "processed/cfd_results_tier3_mix"
-            self.graph_output_dir = dr / "processed/graphs_tier3_mix"
-        elif self.tier == "tier3_patients":
-            self.mesh_input_dir = dr / "raw/tier3_patients"
-            self.output_dir = dr / "processed/cfd_results_tier3_patients"
-            self.graph_output_dir = dr / "processed/graphs_tier3_patients"
+        if self.phase == "kinematics":
+            self.mesh_input_dir = dr / "raw/kinematics"
+            self.output_dir = dr / "processed/cfd_results_kinematics"
+            self.graph_output_dir = dr / "processed/graphs_kinematics"
         else:
-            self.mesh_input_dir = dr / f"raw/{self.tier}"
-            self.output_dir = dr / f"processed/cfd_results_{self.tier}"
-            self.graph_output_dir = dr / f"processed/graphs_{self.tier}"
+            self.mesh_input_dir = dr / "raw/biochem"
+            self.output_dir = dr / "processed/cfd_results_biochem"
+            self.graph_output_dir = dr / "processed/graphs_biochem"
         
         # --- RESTORED: Mesh Sweep Override ---
         import os
@@ -179,14 +183,14 @@ class PhysicsConfig:
     viscosity is always ``mu_eff_si / mu_viscosity_nd_scale`` so Re scaling can change without
     relabeling graphs.
     """
-    tier: str = "tier1"
+    phase: str = "kinematics"
 
     # --- Unit Conversion Scales (COMSOL CGS to SI) ---
     cm_to_m: float = 0.01
     cgs_p_to_pa: float = 0.1
     cgs_mu_to_pa_s: float = 0.1
 
-    # Mesh nodes farther than this from a COMSOL export coordinate are not treated as labeled (Tier 3 patients).
+    # Mesh nodes farther than this from a COMSOL export coordinate are not treated as labeled (Biochem patients).
     comsol_spatial_match_tol_m: float = 1e-4
 
     # Fluid Properties
@@ -213,21 +217,19 @@ class PhysicsConfig:
     gino_adv_log_clamp_min: float = 1e-3
 
     def __post_init__(self):
-        """Automatically set the correct physics based on the project tier."""
-        if self.tier == "tier1":
-            self.viscosity_model = "newtonian"
-            self.mu_ref = self.mu_newtonian
-        elif self.tier in ["tier2", "tier3", "tier3_patients", "tier3_mix"]:
+        """Automatically set the correct physics based on the project phase."""
+        self.phase = _map_phase_to_phase(self.phase)
+        if self.phase in ("kinematics", "biochem"):
             self.viscosity_model = "carreau"
             self.mu_ref = self.mu_inf
         else:
-            raise ValueError(f"Unknown tier: {self.tier}")
+            raise ValueError(f"Unknown phase: {self.phase}")
 
     @property
     def mu_viscosity_nd_scale(self) -> float:
         """SI viscosity [Pa*s] that non-dimensionalizes ``mu_eff`` in labels (channel STATE_CHANNEL_MU_EFF_ND).
 
-        Carreau: ``mu_inf``. Newtonian (tier 1): ``mu_newtonian``.
+        Carreau: ``mu_inf``. Newtonian (phase 1): ``mu_newtonian``.
         """
         if self.viscosity_model == "carreau":
             return self.mu_inf
@@ -263,19 +265,19 @@ class PhysicsConfig:
 
 @dataclass
 class BiochemConfig:
-    """Tier 3 biochemical + rheology parameters aligned with the COMSOL phase-2 model.
+    """Biochem biochemical + rheology parameters aligned with the COMSOL phase-2 model.
 
     COMSOL global parameters are entered in a **CGS-style** convention for that file
     (lengths in cm, diffusion in cm^2/s, adhesion in cm/s, platelet density in plt/cm^2,
     many solute fields in uM). The **.mph does not non-dimensionalize** those species
     or transport inputs: consistency is by unit-aware parameters in COMSOL.
 
-    This dataclass and ``physics_kernels_tier3`` use **SI** (m, m^2/s, m/s, mol/m^3, plt/m^2).
+    This dataclass and ``physics_kernels_biochem`` use **SI** (m, m^2/s, m/s, mol/m^3, plt/m^2).
     Conversions are centralized (e.g. ``d_scale`` for D coefficients, ``cm_to_m`` for
     adhesion rates in kernels, ``bulk_scale`` / ``surface_scale`` for log1p species encoding).
     """
 
-    tier: str = "tier3"
+    phase: str = "biochem"
 
     # --- Centralized Scales ---
     bulk_scale: float = 1e6      # log1p encoding: nondim species * bulk_scale -> SI [mol/m^3] or plt/m^3
@@ -351,10 +353,10 @@ class BiochemConfig:
     k_aa: float = 4.5e-4  # Adhesion rate for activated platelets on Mas [m/s]
 
     # Curriculum Learning Bounds (Predictor-Corrector Architecture)
-    mu_ratio_init: float = 1.0  # Stage A: Rheologically neutral flow field
+    mu_ratio_init: float = 1.0  # Kine phase: Rheologically neutral flow field
     mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
 
-    # Dual-trigger effective viscosity (COMSOL step proxies; shared by GNODE_Tier3 + penalty loss)
+    # Dual-trigger effective viscosity (COMSOL step proxies; shared by GNODE_Phase3 + penalty loss)
     viscosity_mat_crit: float = 2e7
     viscosity_fi_crit: float = 0.6
     viscosity_gnode_temp_mat: float = 1e6
@@ -369,13 +371,14 @@ class BiochemConfig:
     soft_step_T_grad: float = 50.0
     soft_step_T_low_shear: float = 5.0
     soft_step_T_scale: float = 1.0
-    # Shared Huber delta for Tier 3 biochemical residuals.
+    # Shared Huber delta for Biochem biochemical residuals.
     biochem_huber_delta: float = 1.0
     # Optional non-zero slope keeps adhesion gradients alive when M_tot exceeds Minf.
     availability_negative_slope: float = 0.0
 
     def __post_init__(self):
         """Validate constraints on biochemical properties if needed."""
+        self.phase = _map_phase_to_phase(self.phase)
         if self.mu_ratio_max <= self.mu_ratio_init:
             raise ValueError("mu_ratio_max must be strictly greater than mu_ratio_init")
 
@@ -417,7 +420,7 @@ class BiochemConfig:
                 out[i] = torch.nextafter(lo, pinf)
         return out.to(device=dev)
 
-    def resolve_tier3_times(self, data, device):
+    def resolve_biochem_times(self, data, device):
         """Return physical timestamps [s] with length data.y.shape[0]."""
         import torch
         import warnings
@@ -445,34 +448,34 @@ class BiochemConfig:
 class CurriculumConfig:
     """Training curriculum schedules (keeps magic numbers out of training loops)."""
 
-    # Tier 2: Carreau index n during viscosity distillation (anneals toward PhysicsConfig.n)
-    tier2_carreau_n_distill_start: float = 0.8
+    # Kinematics: Carreau index n during viscosity distillation (anneals toward PhysicsConfig.n)
+    kinematics_carreau_n_distill_start: float = 0.8
 
-    # Tier 3: warmup / teacher forcing / T_scale schedule
-    tier3_warmup_epochs: int = 10
-    tier3_teacher_force_decay_epochs: int = 20
-    tier3_t_scale_warmup_initial: float = 10.0
-    tier3_t_scale_warmup_final: float = 8.0
-    tier3_t_scale_coupled_initial: float = 8.0
-    tier3_t_scale_coupled_final: float = 1.0
+    # Biochem: warmup / teacher forcing / T_scale schedule
+    biochem_warmup_epochs: int = 10
+    biochem_teacher_force_decay_epochs: int = 20
+    biochem_t_scale_warmup_initial: float = 10.0
+    biochem_t_scale_warmup_final: float = 8.0
+    biochem_t_scale_coupled_initial: float = 8.0
+    biochem_t_scale_coupled_final: float = 1.0
 
-    # Tier 3: Kendall loss weighter — freeze during warmup; bound effective precisions
-    tier3_weighter_freeze_during_warmup: bool = True
+    # Biochem: Kendall loss weighter — freeze during warmup; bound effective precisions
+    biochem_weighter_freeze_during_warmup: bool = True
     # Cap exp(-log_var) for physics tasks (indices 0–5: ADR_F, ADR_S, W_Bio, W_Phy, Bio_IO, NS_mom).
-    tier3_physics_precision_ceiling: float = 100.0
+    biochem_physics_precision_ceiling: float = 100.0
     # Floors for specific physics terms that must not be down-weighted too aggressively.
     # These apply to ADR_S (index 1) and W_Phy (index 3) only.
-    tier3_adr_s_precision_floor: float = 1.0
-    tier3_w_phys_precision_floor: float = 1.0
+    biochem_adr_s_precision_floor: float = 1.0
+    biochem_w_phys_precision_floor: float = 1.0
     # Floor exp(-log_var) for supervised tasks (indices 6–7: Data_Kine, Data_Bio).
-    tier3_data_precision_floor: float = 0.12
+    biochem_data_precision_floor: float = 0.12
 
-    # Tier 3: smoother curriculum than piecewise-linear (reduces loss cliffs).
+    # Biochem: smoother curriculum than piecewise-linear (reduces loss cliffs).
     # ``linear`` | ``smoothstep`` | ``cosine`` — applies to mu_ratio ramp and T_scale segments.
-    tier3_curriculum_easing: str = "smoothstep"
+    biochem_curriculum_easing: str = "smoothstep"
     # Minimum unique anchor graphs before validation Dice / WSS are treated as generalization metrics.
-    tier3_min_anchors_for_trusted_metrics: int = 2
+    biochem_min_anchors_for_trusted_metrics: int = 2
     # After main warmup, keep physics-task log_vars frozen for extra epochs (data heads tune first).
-    tier3_weighter_physics_grace_epochs: int = 3
+    biochem_weighter_physics_grace_epochs: int = 3
     # Divide ADR/wall/IO/NS residuals by sqrt(num_nodes) so graphs of different sizes are comparable.
-    tier3_physics_geom_normalization: bool = True
+    biochem_physics_geom_normalization: bool = True

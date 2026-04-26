@@ -5,9 +5,9 @@ import matplotlib.tri as mtri
 import argparse
 from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
-from src.data_gen import MeshToGraphComplete, MeshToGraphTier3, VesselGeneratorTier3
+from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
-from src.architecture.gnode_tier3 import GNODE_Tier3
+from src.architecture.gnode_biochem import GNODE_Phase3
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND
 
 # Standard channel indices across all models for kinematics
@@ -38,13 +38,13 @@ def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
 
 
-def _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=None):
+def _show_biochem_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=None):
     u_all = pred_t3_series_np[:, :, _CHANNEL["u"]]
     v_all = pred_t3_series_np[:, :, _CHANNEL["v"]]
     vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
     p_all = pred_t3_series_np[:, :, _CHANNEL["p"]]
-    # Tier-3 species channels are stored as log1p(species_nd); convert FI and Mat_s to SI for plotting.
-    bio_cfg = BiochemConfig(tier="tier3")
+    # Phase-3 species channels are stored as log1p(species_nd); convert FI and Mat_s to SI for plotting.
+    bio_cfg = BiochemConfig(phase="biochem")
     scales = bio_cfg.get_species_scales(device="cpu").cpu().numpy()
     fib_all = np.expm1(np.clip(pred_t3_series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
     mat_all = np.expm1(np.clip(pred_t3_series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
@@ -57,7 +57,7 @@ def _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
     plt.subplots_adjust(bottom=0.10, hspace=0.2)
-    fig.suptitle(f"Tier 3 Temporal Inspector (t={custom_times[0]:.1f}s)", fontsize=16, fontweight="bold")
+    fig.suptitle(f"Biochem Temporal Inspector (t={custom_times[0]:.1f}s)", fontsize=16, fontweight="bold")
 
     sc1 = axs[0, 0].scatter(pos[:, 0], pos[:, 1], c=vel_all[0], cmap="jet", s=3, vmin=vel_vmin, vmax=vel_vmax)
     axs[0, 0].set_title("Velocity Magnitude (ND)")
@@ -105,14 +105,14 @@ def _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh
         sc3.set_array(fib_all[idx])
         sc4.set_array(mat_all[idx])
 
-        fig.suptitle(f"Tier 3 Temporal Inspector (t={custom_times[idx]:.1f}s)", fontsize=16, fontweight="bold")
+        fig.suptitle(f"Biochem Temporal Inspector (t={custom_times[idx]:.1f}s)", fontsize=16, fontweight="bold")
         fig.canvas.draw_idle()
 
     time_slider.on_changed(update)
     plt.show()
 
 
-def run_tier_comparison(regenerate=True, seed=42):
+def run_phase_comparison(regenerate=True, seed=42):
     root = get_project_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ Using device: {device}")
@@ -122,7 +122,7 @@ def run_tier_comparison(regenerate=True, seed=42):
     # ------------------------------------------------------------------
     # 1. Setup Directories
     # ------------------------------------------------------------------
-    test_dir = root / "data" / "tier_comparison_test"
+    test_dir = root / "data" / "phase_comparison_test"
     raw_dir = test_dir / "raw_meshes"
     graph_t1_dir = test_dir / "graphs_t1"
     graph_t2_dir = test_dir / "graphs_t2"
@@ -150,15 +150,15 @@ def run_tier_comparison(regenerate=True, seed=42):
                     f.unlink()
 
         print("\n📐 Generating 1 complex synthetic vessel for the comparison...")
-        vg = VesselGeneratorTier3(output_dir=raw_dir)
+        vg = VesselGeneratorPhase3(output_dir=raw_dir)
         vg.run_pipeline(n=1, level=1, num_workers=1, seed=seed)
 
-        print("\n🕸️ Converting mesh to graphs for each tier's specific channel requirements...")
-        mg1 = MeshToGraphComplete(tier="tier1", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t1_dir)
+        print("\n🕸️ Converting mesh to graphs for each phase's specific channel requirements...")
+        mg1 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t1_dir)
         mg1.run()
-        mg2 = MeshToGraphComplete(tier="tier2", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t2_dir)
+        mg2 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t2_dir)
         mg2.run()
-        mg3 = MeshToGraphTier3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t3_dir)
+        mg3 = MeshToGraphPhase3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t3_dir)
         mg3.run()
     else:
         print("\n♻️ Reusing existing single-case synthetic data.")
@@ -177,29 +177,28 @@ def run_tier_comparison(regenerate=True, seed=42):
     # 4. Load Models
     # ------------------------------------------------------------------
     print("\n🧠 Loading trained models...")
-    t1_ckpt = resolve_checkpoint("a", "tier1_best_physics.pth")
-    t2_ckpt = resolve_checkpoint("a", "tier2_best_physics.pth")
-    t3_ckpt = resolve_checkpoint("b", "tier3_best_bio.pth")
+    kin_ckpt = resolve_checkpoint("a", "kinematics_ckpt_100.pth")
+    t3_ckpt = resolve_checkpoint("b", "biochem_best_bio.pth")
 
-    # Tier 1 Setup
+    # Kinematics Setup
     model_t1 = GINO_DEQ(in_channels=15, out_channels=5, latent_dim=64, max_iters=15).to(device)
-    model_t1.load_state_dict(torch.load(t1_ckpt, map_location=device, weights_only=True))
+    model_t1.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
     model_t1.eval()
 
-    # Tier 2 Setup (needs proper Non-Newtonian boundaries from config)
-    phys_cfg_t2 = PhysicsConfig(tier="tier2")
+    # Kinematics Setup (needs proper Non-Newtonian boundaries from config)
+    phys_cfg_t2 = PhysicsConfig(phase="kinematics")
     model_t2 = GINO_DEQ(
         in_channels=15, out_channels=5, latent_dim=64, max_iters=15,
         mu_inf_nd=(phys_cfg_t2.mu_inf / phys_cfg_t2.mu_viscosity_nd_scale),
         mu_0_nd=(phys_cfg_t2.mu_0 / phys_cfg_t2.mu_viscosity_nd_scale)
     ).to(device)
-    model_t2.load_state_dict(torch.load(t2_ckpt, map_location=device, weights_only=True))
+    model_t2.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
     model_t2.eval()
 
-    # Tier 3 Setup (same PhysicsConfig defaults as train_t3_corrector.py / config.py)
-    phys_cfg_t3 = PhysicsConfig(tier="tier3")
-    bio_cfg = BiochemConfig(tier="tier3")
-    model_t3 = GNODE_Tier3(
+    # Biochem Setup (same PhysicsConfig defaults as train_biochem_corrector.py / config.py)
+    phys_cfg_t3 = PhysicsConfig(phase="biochem")
+    bio_cfg = BiochemConfig(phase="biochem")
+    model_t3 = GNODE_Phase3(
         phys_cfg=phys_cfg_t3,
         in_channels=12,
         spatial_channels=15,
@@ -217,13 +216,13 @@ def run_tier_comparison(regenerate=True, seed=42):
     # ------------------------------------------------------------------
     # 5. Inference
     # ------------------------------------------------------------------
-    print("\n🔮 Running Inference across all Tiers...")
+    print("\n🔮 Running Inference across all Phases...")
     with torch.no_grad():
         pred_t1 = model_t1(data_t1) if isinstance(model_t1(data_t1), tuple) else model_t1(data_t1)
         pred_t2 = model_t2(data_t2) if isinstance(model_t2(data_t2), tuple) else model_t2(data_t2)
 
-        # Setup evaluation times for Tier 3 Neural ODE.
-        dense_times = bio_cfg.resolve_tier3_times(data_t3, device)
+        # Setup evaluation times for Biochem Neural ODE.
+        dense_times = bio_cfg.resolve_biochem_times(data_t3, device)
         t_final = float(dense_times[-1].item())
         dt = float((dense_times[1] - dense_times[0]).item())
 
@@ -284,10 +283,10 @@ def run_tier_comparison(regenerate=True, seed=42):
 
     # --- FIGURE 1: Kinematic Comparison ---
     fig1, axes1 = plt.subplots(3, 3, figsize=(20, 14))
-    fig1.suptitle("Kinematic Evolution: Tier 1 (Newtonian) vs Tier 2 (Non-Newtonian) vs Tier 3 (Bio-Coupled)",
+    fig1.suptitle("Kinematic Evolution: Kinematics (Newtonian) vs Kinematics (Non-Newtonian) vs Biochem (Bio-Coupled)",
                   fontsize=18, y=0.98)
 
-    columns = ["Tier 1 (Newtonian)", "Tier 2 (Carreau Rheology)", "Tier 3 (Coupled Biochemistry)"]
+    columns = ["Kinematics (Newtonian)", "Kinematics (Carreau Rheology)", "Biochem (Coupled Biochemistry)"]
     for ax, col in zip(axes1[0], columns):
         ax.set_title(col, fontsize=14, fontweight='bold', pad=20)
 
@@ -317,8 +316,8 @@ def run_tier_comparison(regenerate=True, seed=42):
 
     refresh_btn_main.on_clicked(lambda _: _request_refresh())
 
-    print("⏳ Opening interactive Tier 3 temporal slider...")
-    _show_tier3_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=_request_refresh)
+    print("⏳ Opening interactive Biochem temporal slider...")
+    _show_biochem_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=_request_refresh)
     return refresh_state["requested"]
 
 
@@ -326,7 +325,7 @@ if __name__ == "__main__":
     import multiprocessing as mp
 
     mp.freeze_support()
-    parser = argparse.ArgumentParser(description="Visualize static + temporal behavior across tiers")
+    parser = argparse.ArgumentParser(description="Visualize static + temporal behavior across phases")
     parser.add_argument(
         "--regenerate",
         action="store_true",
@@ -355,7 +354,7 @@ if __name__ == "__main__":
 
     seed = args.seed
     while True:
-        refresh_requested = run_tier_comparison(regenerate=regenerate, seed=seed)
+        refresh_requested = run_phase_comparison(regenerate=regenerate, seed=seed)
         if not refresh_requested:
             break
         regenerate = True

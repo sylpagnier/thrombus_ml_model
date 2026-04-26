@@ -1,8 +1,8 @@
 """
-Phase 1 anchor inspector: COMSOL `vessel_*.npz` (tier1/tier2).
+Kinematics anchor inspector: COMSOL `vessel_*.npz` (kinematics/kinematics).
 
-**Default behavior** (no extra flags): same style as ``vessel_generator`` — if ``--tier`` is omitted, **Tier** is
-chosen interactively (``1`` or ``2``). Non-interactive scripts should pass ``--tier 1`` or ``--tier 2``. Then
+**Default behavior** (no extra flags): same style as ``vessel_generator`` — if ``--phase`` is omitted, **Phase** is
+chosen interactively (``1`` or ``2``). Non-interactive scripts should pass ``--phase 1`` or ``--phase 2``. Then
 full-directory **health scan**
 (quality flags printed to console) and **interactive** matplotlib (random ``vessel_*.npz`` or ``--sample-idx``;
 Regenerate button / ``r`` key).
@@ -11,15 +11,15 @@ When a matching processed graph ``vessel_<idx>.pt`` exists, the interactive plot
 and **mesh-based priors (x)** in non-dimensional form; otherwise it falls back to raw SI fields from the ``.npz``.
 
 Examples:
-    python -m src.tools.inspect_phase1_data
-    python src/tools/inspect_phase1_data.py
-    python -m src.tools.inspect_phase1_data --tier 1
-    python -m src.tools.inspect_phase1_data --tier 1 --sample-idx 10
-    python -m src.tools.inspect_phase1_data --tier 1 --summary
-    python -m src.tools.inspect_phase1_data --tier 1 --scan-only
-    python -m src.tools.inspect_phase1_data --tier 1 --skip-health-scan
-    python -m src.tools.inspect_phase1_data --tier 1 --plot-static --sample-idx 0
-    python -m src.tools.inspect_phase1_data --inspect-template-tags
+    python -m src.tools.inspect_kinematics_data
+    python src/tools/inspect_kinematics_data.py
+    python -m src.tools.inspect_kinematics_data --phase 1
+    python -m src.tools.inspect_kinematics_data --phase 1 --sample-idx 10
+    python -m src.tools.inspect_kinematics_data --phase 1 --summary
+    python -m src.tools.inspect_kinematics_data --phase 1 --scan-only
+    python -m src.tools.inspect_kinematics_data --phase 1 --skip-health-scan
+    python -m src.tools.inspect_kinematics_data --phase 1 --plot-static --sample-idx 0
+    python -m src.tools.inspect_kinematics_data --inspect-template-tags
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
-# Allow running as ``python src/tools/inspect_phase1_data.py`` (IDE / full path): put repo root on sys.path.
+# Allow running as ``python src/tools/inspect_kinematics_data.py`` (IDE / full path): put repo root on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if (_REPO_ROOT / "src").is_dir() and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -49,26 +49,11 @@ def _format_n_subdir(n_value: float) -> str:
     return f"n_{float(n_value):.3f}"
 
 
-def _resolve_tier2_n_subdir(base_dir: Path, requested: str | None, *, kind: str) -> str:
-    """Resolve Tier-2 n-subdir for labels/graphs.
-
-    Priority:
-      1) Explicit ``requested`` (``n_0.800`` or numeric ``0.8``)
-      2) Final target ``n`` from ``PhysicsConfig(tier2)``
-    """
-    final_name = _format_n_subdir(PhysicsConfig(tier="tier2").n)
-
+def _resolve_kinematics_n_subdir(base_dir: Path, requested: str | None, *, kind: str) -> str:
+    """Resolve Phase-2 n-subdir. Legacy support only, defaults to root."""
     if requested:
         raw = requested.strip()
-        if raw.startswith("n_"):
-            chosen = raw
-        else:
-            try:
-                chosen = _format_n_subdir(float(raw))
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid --n-subdir value '{requested}'. Use n_0.800 or 0.8."
-                ) from exc
+        chosen = raw if raw.startswith("n_") else _format_n_subdir(float(raw))
         chosen_dir = base_dir / chosen
         if not chosen_dir.is_dir():
             raise FileNotFoundError(
@@ -76,22 +61,17 @@ def _resolve_tier2_n_subdir(base_dir: Path, requested: str | None, *, kind: str)
             )
         return chosen
 
-    if (base_dir / final_name).is_dir():
-        return final_name
-
-    raise FileNotFoundError(
-        f"Tier 2 {kind} require subfolder layout under {base_dir}. "
-        f"Expected {final_name}; use --n-subdir to select an existing n_* folder."
-    )
+    # Under the new unified setup, Kinematics data sits directly in the root directory.
+    return ""
 
 
-def _resolve_anchor_dir(tier: str, n_subdir: str | None = None) -> Path:
+def _resolve_anchor_dir(phase: str, n_subdir: str | None = None) -> Path:
     root = get_project_root()
-    cfg = VesselConfig(tier=tier)
+    cfg = VesselConfig(phase=phase)
     p = Path(cfg.output_dir)
     base = p if p.is_absolute() else root / p
-    if tier == "tier2":
-        chosen = _resolve_tier2_n_subdir(base, n_subdir, kind="anchor labels")
+    if phase == "kinematics":
+        chosen = _resolve_kinematics_n_subdir(base, n_subdir, kind="anchor labels")
         return base / chosen
     return base
 
@@ -107,9 +87,9 @@ def _extract_idx(path: Path) -> int | None:
         return None
 
 
-def _list_sample_indices(tier: str, n_subdir: str | None = None) -> list[int]:
+def _list_sample_indices(phase: str, n_subdir: str | None = None) -> list[int]:
     out: list[int] = []
-    for f in _iter_anchor_files(_resolve_anchor_dir(tier, n_subdir=n_subdir)):
+    for f in _iter_anchor_files(_resolve_anchor_dir(phase, n_subdir=n_subdir)):
         idx = _extract_idx(f)
         if idx is not None:
             out.append(idx)
@@ -171,8 +151,8 @@ def _compute_metrics_from_npz(data) -> dict:
     }
 
 
-def summary(tier: str, n_subdir: str | None = None) -> None:
-    anchor_dir = _resolve_anchor_dir(tier, n_subdir=n_subdir)
+def summary(phase: str, n_subdir: str | None = None) -> None:
+    anchor_dir = _resolve_anchor_dir(phase, n_subdir=n_subdir)
     files = list(_iter_anchor_files(anchor_dir))
     if not files:
         print(f"No vessel_*.npz files found in {anchor_dir}")
@@ -190,7 +170,7 @@ def summary(tier: str, n_subdir: str | None = None) -> None:
         rows.append(m)
 
     valid = [r for r in rows if r.get("ok")]
-    print(f"\n=== Phase1 anchor summary ({tier}) ===")
+    print(f"\n=== Phase1 anchor summary ({phase}) ===")
     print(f"anchor dir      : {anchor_dir}")
     print(f"files total     : {len(rows)}")
     print(f"files valid     : {len(valid)}")
@@ -201,9 +181,9 @@ def summary(tier: str, n_subdir: str | None = None) -> None:
         print(f"nan_ratio max   : {np.max([r['nan_ratio'] for r in valid]):.3e}")
 
 
-def health_scan_anchors(tier: str, n_subdir: str | None = None) -> list[dict]:
+def health_scan_anchors(phase: str, n_subdir: str | None = None) -> list[dict]:
     """Full-directory scan with quality flags printed to console."""
-    data_dir = _resolve_anchor_dir(tier, n_subdir=n_subdir)
+    data_dir = _resolve_anchor_dir(phase, n_subdir=n_subdir)
     files = sorted(data_dir.glob("vessel_*.npz"))
     if not files:
         print(f"No vessel_*.npz files found in {data_dir}")
@@ -272,35 +252,35 @@ def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
         print(f"  Must be one of: {allowed_str}")
 
 
-def _resolve_tier_from_cli(cli_tier: int | None) -> str:
-    """Use ``--tier`` (1 or 2) when set; else prompt like ``vessel_generator`` (no isatty shortcut)."""
-    if cli_tier is not None:
-        return f"tier{cli_tier}"
-    tier_n = _prompt_int_choice("Tier", (1, 2))
-    tier = f"tier{tier_n}"
-    anchor_dir = _resolve_anchor_dir(tier)
+def _resolve_phase_from_cli(cli_phase: int | None) -> str:
+    """Use ``--phase`` (1 or 2) when set; else prompt like ``vessel_generator`` (no isatty shortcut)."""
+    if cli_phase is not None:
+        return f"phase{cli_phase}"
+    phase_n = _prompt_int_choice("Phase", (1, 2))
+    phase = f"phase{phase_n}"
+    anchor_dir = _resolve_anchor_dir(phase)
     n_npz = len(list(_iter_anchor_files(anchor_dir)))
-    print("\n--- Phase 1 anchor inspection ---")
+    print("\n--- Kinematics anchor inspection ---")
     print(f"  Anchor NPZ directory: {anchor_dir}")
     print(f"  vessel_*.npz files found: {n_npz}")
     print()
-    return tier
+    return phase
 
 
-def _resolve_graph_pt_path(tier: str, sample_idx: int, n_subdir: str | None = None) -> Path:
+def _resolve_graph_pt_path(phase: str, sample_idx: int, n_subdir: str | None = None) -> Path:
     root = get_project_root()
-    cfg = VesselConfig(tier=tier)
+    cfg = VesselConfig(phase=phase)
     proc = Path(cfg.graph_output_dir)
     base = proc if proc.is_absolute() else root / proc
-    if tier == "tier2":
-        chosen = _resolve_tier2_n_subdir(base, n_subdir, kind="graph outputs")
+    if phase == "kinematics":
+        chosen = _resolve_kinematics_n_subdir(base, n_subdir, kind="graph outputs")
         return base / chosen
     return base
 
 
-def _try_load_graph_data(tier: str, sample_idx: int, n_subdir: str | None = None) -> dict | None:
+def _try_load_graph_data(phase: str, sample_idx: int, n_subdir: str | None = None) -> dict | None:
     """Load both mesh-based priors (x) and scaled training labels (y) from ``vessel_<idx>.pt``."""
-    pt_path = _resolve_graph_pt_path(tier, sample_idx, n_subdir=n_subdir) / f"vessel_{sample_idx}.pt"
+    pt_path = _resolve_graph_pt_path(phase, sample_idx, n_subdir=n_subdir) / f"vessel_{sample_idx}.pt"
     if not pt_path.exists():
         return None
     try:
@@ -362,7 +342,7 @@ def _try_load_graph_data(tier: str, sample_idx: int, n_subdir: str | None = None
 
 
 def _resolve_u_ref_anchor(
-    tier: str,
+    phase: str,
     *,
     graph_data: dict | None,
     d_bar_npz: float | None,
@@ -370,7 +350,7 @@ def _resolve_u_ref_anchor(
     """Reference velocity [m/s] for ``|U|_nd = |U|_SI / u_ref`` (same as ``mesh_to_graph``)."""
     if graph_data is not None and graph_data.get("u_ref") is not None:
         return float(graph_data["u_ref"])
-    phys = PhysicsConfig(tier=tier)
+    phys = PhysicsConfig(phase=phase)
     db = None
     if graph_data is not None and graph_data.get("d_bar") is not None:
         db = float(graph_data["d_bar"])
@@ -381,8 +361,8 @@ def _resolve_u_ref_anchor(
     return float(phys.get_u_ref(db))
 
 
-def _load_anchor_npz(sample_idx: int, tier: str, n_subdir: str | None = None):
-    data_dir = _resolve_anchor_dir(tier, n_subdir=n_subdir)
+def _load_anchor_npz(sample_idx: int, phase: str, n_subdir: str | None = None):
+    data_dir = _resolve_anchor_dir(phase, n_subdir=n_subdir)
     file_path = data_dir / f"vessel_{sample_idx}.npz"
     if not file_path.exists():
         print(f"File not found: {file_path}")
@@ -395,13 +375,13 @@ def _load_anchor_npz(sample_idx: int, tier: str, n_subdir: str | None = None):
         return None, None
 
 
-def plot_sample_static(tier: str, sample_idx: int, n_subdir: str | None = None) -> None:
+def plot_sample_static(phase: str, sample_idx: int, n_subdir: str | None = None) -> None:
     """Single-window scatter / quiver (no regenerate loop)."""
-    anchor_dir = _resolve_anchor_dir(tier, n_subdir=n_subdir)
+    anchor_dir = _resolve_anchor_dir(phase, n_subdir=n_subdir)
     file_path = anchor_dir / f"vessel_{sample_idx}.npz"
     if not file_path.exists():
         raise FileNotFoundError(f"Sample not found: {file_path}")
-    gd = _try_load_graph_data(tier, sample_idx, n_subdir=n_subdir)
+    gd = _try_load_graph_data(phase, sample_idx, n_subdir=n_subdir)
     with np.load(file_path) as npz:
         x = np.asarray(npz["x"]).reshape(-1)
         y = np.asarray(npz["y"]).reshape(-1)
@@ -414,7 +394,7 @@ def plot_sample_static(tier: str, sample_idx: int, n_subdir: str | None = None) 
 
     if gd is not None:
         fig, axes = plt.subplots(3, 3, figsize=(14, 12))
-        u_ref = _resolve_u_ref_anchor(tier, graph_data=gd, d_bar_npz=d_bar_npz)
+        u_ref = _resolve_u_ref_anchor(phase, graph_data=gd, d_bar_npz=d_bar_npz)
         if u_ref is not None and u_ref > 0.0:
             vel_plot = vel / u_ref
             vp = gd["vel_prior"]
@@ -498,20 +478,20 @@ def plot_sample_static(tier: str, sample_idx: int, n_subdir: str | None = None) 
             a.set_aspect("equal")
             a.axis("off")
 
-    fig.suptitle(f"{tier} sample vessel_{sample_idx}")
+    fig.suptitle(f"{phase} sample vessel_{sample_idx}")
     plt.tight_layout()
     plt.show()
 
 
 def inspect_anchor_interactive(
-    *, sample_idx: int, tier: str, n_subdir: str | None = None, enable_regenerate: bool = True
+    *, sample_idx: int, phase: str, n_subdir: str | None = None, enable_regenerate: bool = True
 ) -> None:
     """Interactive 2x2 view with optional random-resample button and ``r`` hotkey."""
     current_idx = int(sample_idx)
-    all_indices = _list_sample_indices(tier, n_subdir=n_subdir) if enable_regenerate else []
+    all_indices = _list_sample_indices(phase, n_subdir=n_subdir) if enable_regenerate else []
 
     while True:
-        data, file_path = _load_anchor_npz(sample_idx=current_idx, tier=tier, n_subdir=n_subdir)
+        data, file_path = _load_anchor_npz(sample_idx=current_idx, phase=phase, n_subdir=n_subdir)
         if data is None:
             return
 
@@ -535,7 +515,7 @@ def inspect_anchor_interactive(
             has_mu = "mu" in keys
             mu = data["mu"].flatten() if has_mu else None
 
-            graph_data = _try_load_graph_data(tier, current_idx, n_subdir=n_subdir)
+            graph_data = _try_load_graph_data(phase, current_idx, n_subdir=n_subdir)
 
             print(f"--- Data Summary (Sample {current_idx}) ---")
             if "d_bar" in keys:
@@ -634,7 +614,7 @@ def inspect_anchor_interactive(
                 axes[2, 2].axis("off")
             else:
                 print(
-                    f"No graph plotted (missing {_resolve_graph_pt_path(tier, current_idx, n_subdir=n_subdir) / f'vessel_{current_idx}.pt'}). "
+                    f"No graph plotted (missing {_resolve_graph_pt_path(phase, current_idx, n_subdir=n_subdir) / f'vessel_{current_idx}.pt'}). "
                     "Displaying raw unscaled SI COMSOL data."
                 )
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -705,7 +685,7 @@ def inspect_anchor_interactive(
 
 
 def inspect_template_tags() -> None:
-    cfg = VesselConfig(tier="tier1")
+    cfg = VesselConfig(phase="kinematics")
     template = Path(cfg.template_path)
     if not template.exists():
         raise FileNotFoundError(f"Template not found: {template}")
@@ -744,12 +724,12 @@ def inspect_template_tags() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect Phase1 anchor data, health scan, plots, and template tags.")
     parser.add_argument(
-        "--tier",
+        "--phase",
         type=int,
         choices=(1, 2),
         default=None,
         metavar="N",
-        help="Phase-1 anchor tier: 1=tier1, 2=tier2. Omit for an interactive prompt (see vessel_generator).",
+        help="Phase-1 anchor phase: 1=kinematics, 2=kinematics. Omit for an interactive prompt (see vessel_generator).",
     )
     parser.add_argument(
         "--summary",
@@ -785,14 +765,14 @@ def main() -> None:
     parser.add_argument(
         "--inspect-template-tags",
         action="store_true",
-        help="Run live COMSOL tag inspection for phase1 template (.mph + mph package required).",
+        help="Run live COMSOL tag inspection for kinematics template (.mph + mph package required).",
     )
     parser.add_argument(
         "--n-subdir",
         type=str,
         default=None,
         help=(
-            "Tier 2 only: choose continuation folder (e.g. 'n_0.800' or '0.8'). "
+            "Kinematics only: choose continuation folder (e.g. 'n_0.800' or '0.8'). "
             "Default: final n folder when present."
         ),
     )
@@ -802,26 +782,26 @@ def main() -> None:
         inspect_template_tags()
         return
 
-    tier = _resolve_tier_from_cli(args.tier)
+    phase = _resolve_phase_from_cli(args.phase)
 
     if args.scan_only:
-        health_scan_anchors(tier, n_subdir=args.n_subdir)
+        health_scan_anchors(phase, n_subdir=args.n_subdir)
         return
 
     if args.summary:
-        summary(tier, n_subdir=args.n_subdir)
+        summary(phase, n_subdir=args.n_subdir)
         return
 
     if not args.skip_health_scan:
-        health_scan_anchors(tier, n_subdir=args.n_subdir)
+        health_scan_anchors(phase, n_subdir=args.n_subdir)
 
     if args.plot_static:
         if args.sample_idx is None:
             raise ValueError("--plot-static requires --sample-idx")
-        plot_sample_static(tier, args.sample_idx, n_subdir=args.n_subdir)
+        plot_sample_static(phase, args.sample_idx, n_subdir=args.n_subdir)
         return
 
-    data_dir = _resolve_anchor_dir(tier, n_subdir=args.n_subdir)
+    data_dir = _resolve_anchor_dir(phase, n_subdir=args.n_subdir)
     if args.sample_idx is not None:
         sample_idx = args.sample_idx
     else:
@@ -834,7 +814,7 @@ def main() -> None:
 
     inspect_anchor_interactive(
         sample_idx=sample_idx,
-        tier=tier,
+        phase=phase,
         n_subdir=args.n_subdir,
         enable_regenerate=not args.no_regenerate,
     )

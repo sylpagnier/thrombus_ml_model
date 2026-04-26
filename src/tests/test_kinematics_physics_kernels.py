@@ -3,7 +3,7 @@ Physics kernel tests:
 
 * **Synthetic** WLS / Carreau smoke tests (no COMSOL).
 * **COMSOL anchors**: uses ``compute_kinematics_physics_terms`` — the **same** code path as
-  ``train_t1_predictor`` / ``train_t2_predictor`` — so training physics cannot drift from what we certify.
+  ``train_kinematics_predictor`` — so training physics cannot drift from what we certify.
 
 COMSOL fields are not exact solutions of the graph WLS strong form, so we **do not** demand
 near-zero NS residuals in absolute terms. We **do** require:
@@ -11,17 +11,17 @@ near-zero NS residuals in absolute terms. We **do** require:
 1. **Label identity** — with ``pred = data.y``, supervised anchor losses vanish (pipeline bug alarm).
 2. **Shuffle baseline** — the same discrete losses must be **strictly worse** when nodal state rows
    are permuted (geometry–field mismatch alarm if COMSOL/WLS is worse than random reassignment).
-3. **Tier 2 rheology** — Carreau supervisor on COMSOL ``μ`` must beat **μ-only** random permutation.
+3. **Kinematics rheology** — Carreau supervisor on COMSOL ``μ`` must beat **μ-only** random permutation.
 
 Tight absolute caps on ``l_bc`` (no-slip encoded in labels) catch gross export/mask errors.
 ``l_io`` is **not** asserted small (outlet pressure gauge vs training penalty).
 
 Environment:
 
-* ``PHASE1_PHYSICS_TEST_MAX_GRAPHS`` — max anchor graphs to scan (default: all found).
-* ``PHASE1_PHYSICS_MIN_ANCHORS`` — minimum anchors required or skip (default 1).
-* ``PHASE1_PHYSICS_RELAX_SHUFFLE=1`` — only run identity + BC checks (for debugging).
-* ``PHASE1_PHYSICS_CHECK_BC=0`` — skip ``l_bc`` assertions on COMSOL anchors (use when the corpus has
+* ``KINEMATICS_PHYSICS_TEST_MAX_GRAPHS`` — max anchor graphs to scan (default: all found).
+* ``KINEMATICS_PHYSICS_MIN_ANCHORS`` — minimum anchors required or skip (default 1).
+* ``KINEMATICS_PHYSICS_RELAX_SHUFFLE=1`` — only run identity + BC checks (for debugging).
+* ``KINEMATICS_PHYSICS_CHECK_BC=0`` — skip ``l_bc`` assertions on COMSOL anchors (use when the corpus has
   systematic wall-label vs. mask mismatch; shuffle/identity checks still run unless relaxed).
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ def create_physical_test_graph():
     data.x[:, 4] = 0.0
     data.x[:, 5] = torch.where(nodes[:, 1] > 0, -1.0, 1.0)
 
-    phys_cfg = PhysicsConfig(tier="tier2")
+    phys_cfg = PhysicsConfig(phase="kinematics")
     data.u_ref = torch.tensor([phys_cfg.get_u_ref(0.0015)])
     data.d_bar = torch.tensor([0.0015])
 
@@ -140,6 +140,35 @@ def test_momentum_residual_execution():
 
     assert not torch.isnan(loss_mom)
     assert loss_mom >= 0
+
+
+def test_dynamic_curriculum_parameters_change_physics_response():
+    data, nodes, phys_cfg = create_physical_test_graph()
+    kernels = PhysicsKernels(phys_cfg)
+
+    y_norm = nodes[:, 1] / 0.001
+    u = (1.0 - y_norm**2).unsqueeze(1)
+    v = torch.zeros_like(u)
+    p = torch.zeros_like(u)
+
+    # Fixed velocity gradients; only rheology parameters vary.
+    props = kernels._get_geometric_props(data)
+    c_u = kernels._compute_derivatives(u, props)
+    c_v = kernels._compute_derivatives(v, props)
+    du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
+
+    residuals = []
+    mu_means = []
+    for n_val, mu0_si in ((1.0, 0.0035), (0.8, 0.02), (0.6, 0.035), (0.358, 0.056)):
+        kernels.mu_0_nd = float(mu0_si / kernels.cfg.mu_viscosity_nd_scale)
+        mu = kernels._compute_carreau_viscosity(du_ij, data, carreau_n=n_val).unsqueeze(1)
+        pred = torch.cat([u, v, p, mu], dim=1)
+        residuals.append(float(kernels.navier_stokes_residual(pred, data).item()))
+        mu_means.append(float(mu.mean().item()))
+
+    # NS residual can be close on synthetic smooth fields, but should not be exactly invariant.
+    assert max(residuals) - min(residuals) > 0.0
+    assert max(mu_means) - min(mu_means) > 1e-9
 
 
 def test_wall_shear_stress_data_loss_smoke():
@@ -216,7 +245,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _max_graphs_cap() -> Optional[int]:
-    raw = os.environ.get("PHASE1_PHYSICS_TEST_MAX_GRAPHS", "").strip().lower()
+    raw = os.environ.get("KINEMATICS_PHYSICS_TEST_MAX_GRAPHS", "").strip().lower()
     if raw in ("", "all"):
         return None
     n = int(raw)
@@ -224,7 +253,7 @@ def _max_graphs_cap() -> Optional[int]:
 
 
 def _relax_shuffle() -> bool:
-    return os.environ.get("PHASE1_PHYSICS_RELAX_SHUFFLE", "").strip().lower() in (
+    return os.environ.get("KINEMATICS_PHYSICS_RELAX_SHUFFLE", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -234,7 +263,7 @@ def _relax_shuffle() -> bool:
 
 def _check_bc() -> bool:
     """When false, COMSOL anchor tests skip ``l_bc`` caps (identity + shuffle checks may still run)."""
-    return os.environ.get("PHASE1_PHYSICS_CHECK_BC", "1").strip().lower() not in (
+    return os.environ.get("KINEMATICS_PHYSICS_CHECK_BC", "1").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -242,15 +271,13 @@ def _check_bc() -> bool:
     )
 
 
-def _iter_anchor_graph_files(tier: str) -> Iterator[Path]:
-    cfg = VesselConfig(tier=tier)
+def _iter_anchor_graph_files(phase: str) -> Iterator[Path]:
+    cfg = VesselConfig(phase=phase)
     d = cfg.graph_output_dir
-    if tier == "tier2":
-        final_n = float(PhysicsConfig(tier="tier2").n)
-        d = d / f"n_{final_n:.3f}"
+    # Removed the legacy phase 2 subfolder logic!
     if not d.is_dir():
         return
-    for p in sorted(d.glob("vessel_*.pt")):
+    for p in sorted(d.rglob("vessel_*.pt")):
         yield p
 
 
@@ -304,26 +331,26 @@ def _evaluate_terms(
     data: Data,
     kernels: PhysicsKernels,
     *,
-    tier: str,
-    tier2_distillation: bool = False,
+    phase: str = "kinematics",
+    distillation: bool = False,
     carreau_n: Optional[float] = None,
 ) -> Dict[str, float]:
     t = compute_kinematics_physics_terms(
         pred,
         data,
         kernels,
-        tier=tier,
+        phase=phase,
         boundary_data_weight=BOUNDARY_DATA_WEIGHT,
-        tier2_distillation=tier2_distillation,
+        distillation=distillation,
         carreau_n=carreau_n,
     )
     return _terms_dict_to_float(t)
 
 
-def _collect_anchor_paths(tier: str) -> List[Path]:
+def _collect_anchor_paths(phase: str) -> List[Path]:
     cap = _max_graphs_cap()
     out: List[Path] = []
-    for p in _iter_anchor_graph_files(tier):
+    for p in _iter_anchor_graph_files(phase):
         if _load_anchor_graph(p) is None:
             continue
         out.append(p)
@@ -339,29 +366,29 @@ def _safe_ratio(numer: float, denom: float) -> float:
 class TestComsolAnchorPhysicsStrict(unittest.TestCase):
     """COMSOL labels vs training physics terms + shuffle sanity (no duplicated kernel logic)."""
 
-    def test_tier1_comsol_training_physics_consistency(self):
-        min_n = max(1, int(os.environ.get("PHASE1_PHYSICS_MIN_ANCHORS", "1")))
-        paths = _collect_anchor_paths("tier1")
+    def test_kinematics_comsol_training_physics_consistency(self):
+        min_n = max(1, int(os.environ.get("KINEMATICS_PHYSICS_MIN_ANCHORS", "1")))
+        paths = _collect_anchor_paths("kinematics")
         if len(paths) < min_n:
             self.skipTest(
-                f"Need at least {min_n} Tier 1 COMSOL anchor graphs; found {len(paths)} "
-                f"under {VesselConfig(tier='tier1').graph_output_dir}."
+                f"Need at least {min_n} Kinematics COMSOL anchor graphs; found {len(paths)} "
+                f"under {VesselConfig(phase='kinematics').graph_output_dir}."
             )
 
-        phys_cfg = PhysicsConfig(tier="tier1")
+        phys_cfg = PhysicsConfig(phase="kinematics")
         kernels = PhysicsKernels(phys_cfg)
         relax = _relax_shuffle()
         failures: List[str] = []
-        mom_ratio_max = _env_float("PHASE1_T1_MOM_RATIO_MAX", 0.2)
+        mom_ratio_max = _env_float("KINEMATICS_T1_MOM_RATIO_MAX", 0.2)
         # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
-        wss_ratio_max = _env_float("PHASE1_T1_WSS_RATIO_MAX", 0.60)
-        # Absolute closeness gates for Tier 1 COMSOL anchors (not only relative-vs-shuffle).
-        mom_abs_max = _env_float("PHASE1_T1_MOM_ABS_MAX", 1.0e-3)
-        wss_abs_max = _env_float("PHASE1_T1_WSS_ABS_MAX", 1.0e-4)
-        train_cont_scale = _env_float("PHASE1_T1_TRAIN_CONT_SCALE", 100.0)
-        train_conflict_budget_max = _env_float("PHASE1_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.3)
-        abs_tail_pct = _env_float("PHASE1_T1_ABS_TAIL_PERCENTILE", 99.0)
-        abs_tail_mult = _env_float("PHASE1_T1_ABS_TAIL_MULT", 2.0)
+        wss_ratio_max = _env_float("KINEMATICS_T1_WSS_RATIO_MAX", 0.60)
+        # Absolute closeness gates for Kinematics COMSOL anchors (not only relative-vs-shuffle).
+        mom_abs_max = _env_float("KINEMATICS_T1_MOM_ABS_MAX", 1.0e-3)
+        wss_abs_max = _env_float("KINEMATICS_T1_WSS_ABS_MAX", 1.0e-4)
+        train_cont_scale = _env_float("KINEMATICS_T1_TRAIN_CONT_SCALE", 100.0)
+        train_conflict_budget_max = _env_float("KINEMATICS_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.3)
+        abs_tail_pct = _env_float("KINEMATICS_T1_ABS_TAIL_PERCENTILE", 99.0)
+        abs_tail_mult = _env_float("KINEMATICS_T1_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
         wss_ok_values: List[float] = []
         cont_ok_values: List[float] = []
@@ -377,7 +404,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             pred = _state_from_labels(data)
             seed = hash((stem, "row")) % (2**31)
 
-            t_ok = _evaluate_terms(pred, data, kernels, tier="tier1")
+            t_ok = _evaluate_terms(pred, data, kernels, phase="kinematics")
             mom_ok_values.append(t_ok["l_mom"])
             wss_ok_values.append(t_ok["l_wss"])
             cont_ok_values.append(t_ok["l_cont"])
@@ -418,7 +445,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
                 continue
 
             pred_bad = _permute_rows(pred, seed)
-            t_bad = _evaluate_terms(pred_bad, data, kernels, tier="tier1")
+            t_bad = _evaluate_terms(pred_bad, data, kernels, phase="kinematics")
 
             mom_ratio = _safe_ratio(t_ok["l_mom"], t_bad["l_mom"])
             if mom_ratio > mom_ratio_max:
@@ -450,7 +477,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             io_arr = np.asarray(io_ok_values, dtype=np.float64)
             cb_arr = np.asarray(conflict_budget_values, dtype=np.float64)
             print(
-                "\n[Tier1 COMSOL Closeness] "
+                "\n[Phase1 COMSOL Closeness] "
                 f"anchors={len(mom_ok_values)} "
                 f"mom(mean/p95/max)={mom_arr.mean():.3e}/{np.percentile(mom_arr, 95):.3e}/{mom_arr.max():.3e} "
                 f"cont(mean/p95/max)={cont_arr.mean():.3e}/{np.percentile(cont_arr, 95):.3e}/{cont_arr.max():.3e} "
@@ -462,39 +489,39 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         self.assertEqual(
             failures,
             [],
-            "Tier 1 COMSOL / physics consistency failures:\n" + "\n".join(failures),
+            "Kinematics COMSOL / physics consistency failures:\n" + "\n".join(failures),
         )
 
-    def test_tier2_comsol_training_physics_consistency_coupled(self):
-        min_n = max(1, int(os.environ.get("PHASE1_PHYSICS_MIN_ANCHORS", "1")))
-        paths = _collect_anchor_paths("tier2")
+    def test_kinematics_comsol_training_physics_consistency_coupled(self):
+        min_n = max(1, int(os.environ.get("KINEMATICS_PHYSICS_MIN_ANCHORS", "1")))
+        paths = _collect_anchor_paths("kinematics")
         if len(paths) < min_n:
             self.skipTest(
-                f"Need at least {min_n} Tier 2 COMSOL anchor graphs; found {len(paths)} "
-                f"under {VesselConfig(tier='tier2').graph_output_dir}."
+                f"Need at least {min_n} Kinematics COMSOL anchor graphs; found {len(paths)} "
+                f"under {VesselConfig(phase='kinematics').graph_output_dir}."
             )
 
-        phys_cfg = PhysicsConfig(tier="tier2")
+        phys_cfg = PhysicsConfig(phase="kinematics")
         if phys_cfg.viscosity_model != "carreau":
-            self.skipTest("Tier 2 config is not Carreau.")
+            self.skipTest("Kinematics config is not Carreau.")
         kernels = PhysicsKernels(phys_cfg)
         carreau_n = phys_cfg.n
         relax = _relax_shuffle()
         failures: List[str] = []
-        mom_ratio_max = _env_float("PHASE1_T2_MOM_RATIO_MAX", 0.2)
+        mom_ratio_max = _env_float("KINEMATICS_T2_MOM_RATIO_MAX", 0.2)
         # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
-        wss_ratio_max = _env_float("PHASE1_T2_WSS_RATIO_MAX", 0.60)
-        rheo_ratio_max = _env_float("PHASE1_T2_RHEO_RATIO_MAX", 0.5)
+        wss_ratio_max = _env_float("KINEMATICS_T2_WSS_RATIO_MAX", 0.60)
+        rheo_ratio_max = _env_float("KINEMATICS_T2_RHEO_RATIO_MAX", 0.5)
         # Absolute closeness gates (not just better-than-shuffle), tuned to stay consistent with
-        # Tier 2 coupled training scales so physics terms do not conflict in optimization.
-        mom_abs_max = _env_float("PHASE1_T2_MOM_ABS_MAX", 1.0e-3)
-        cont_abs_max = _env_float("PHASE1_T2_CONT_ABS_MAX", 2.5e-3)
-        rheo_abs_max = _env_float("PHASE1_T2_RHEO_ABS_MAX", 0.55)
-        train_cont_scale = _env_float("PHASE1_T2_TRAIN_CONT_SCALE", 100.0)
-        train_rheo_scale = _env_float("PHASE1_T2_TRAIN_RHEO_SCALE", 1.0)
-        train_conflict_budget_max = _env_float("PHASE1_T2_TRAIN_CONFLICT_BUDGET_MAX", 0.9)
-        abs_tail_pct = _env_float("PHASE1_T2_ABS_TAIL_PERCENTILE", 99.0)
-        abs_tail_mult = _env_float("PHASE1_T2_ABS_TAIL_MULT", 2.0)
+        # Kinematics coupled training scales so physics terms do not conflict in optimization.
+        mom_abs_max = _env_float("KINEMATICS_T2_MOM_ABS_MAX", 1.0e-3)
+        cont_abs_max = _env_float("KINEMATICS_T2_CONT_ABS_MAX", 2.5e-3)
+        rheo_abs_max = _env_float("KINEMATICS_T2_RHEO_ABS_MAX", 0.55)
+        train_cont_scale = _env_float("KINEMATICS_T2_TRAIN_CONT_SCALE", 100.0)
+        train_rheo_scale = _env_float("KINEMATICS_T2_TRAIN_RHEO_SCALE", 1.0)
+        train_conflict_budget_max = _env_float("KINEMATICS_T2_TRAIN_CONFLICT_BUDGET_MAX", 0.9)
+        abs_tail_pct = _env_float("KINEMATICS_T2_ABS_TAIL_PERCENTILE", 99.0)
+        abs_tail_mult = _env_float("KINEMATICS_T2_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
         cont_ok_values: List[float] = []
         wss_ok_values: List[float] = []
@@ -513,9 +540,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             seed_row = hash((stem, "row")) % (2**31)
             seed_mu = hash((stem, "mu")) % (2**31)
 
-            t_ok = _evaluate_terms(
-                pred, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
-            )
+            t_ok = _evaluate_terms(pred, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n)
             mom_ok_values.append(t_ok["l_mom"])
             cont_ok_values.append(t_ok["l_cont"])
             wss_ok_values.append(t_ok["l_wss"])
@@ -562,7 +587,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
 
             pred_bad = _permute_rows(pred, seed_row)
             t_bad = _evaluate_terms(
-                pred_bad, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
+                pred_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n
             )
             mom_ratio = _safe_ratio(t_ok["l_mom"], t_bad["l_mom"])
             if mom_ratio > mom_ratio_max:
@@ -579,7 +604,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
 
             pred_mu_bad = _permute_mu_column(pred, seed_mu)
             t_mu = _evaluate_terms(
-                pred_mu_bad, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
+                pred_mu_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n
             )
             rheo_ratio = _safe_ratio(t_ok["l_rheo"], t_mu["l_rheo"])
             if rheo_ratio > rheo_ratio_max:
@@ -610,7 +635,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             io_arr = np.asarray(io_ok_values, dtype=np.float64)
             cb_arr = np.asarray(conflict_budget_values, dtype=np.float64)
             print(
-                "\n[Tier2 COMSOL Closeness] "
+                "\n[Phase2 COMSOL Closeness] "
                 f"anchors={len(mom_ok_values)} "
                 f"mom(mean/p95/max)={mom_arr.mean():.3e}/{np.percentile(mom_arr, 95):.3e}/{mom_arr.max():.3e} "
                 f"cont(mean/p95/max)={cont_arr.mean():.3e}/{np.percentile(cont_arr, 95):.3e}/{cont_arr.max():.3e} "
@@ -623,41 +648,8 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         self.assertEqual(
             failures,
             [],
-            "Tier 2 coupled COMSOL / physics consistency failures:\n" + "\n".join(failures),
+            "Kinematics coupled COMSOL / physics consistency failures:\n" + "\n".join(failures),
         )
-
-    def test_tier2_distillation_physics_terms_finite_and_identity(self):
-        """Distillation branch: same helper with ``tier2_distillation=True`` (mom/cont unused)."""
-        paths = _collect_anchor_paths("tier2")
-        if not paths:
-            self.skipTest("No Tier 2 anchor graphs.")
-
-        phys_cfg = PhysicsConfig(tier="tier2")
-        if phys_cfg.viscosity_model != "carreau":
-            self.skipTest("Tier 2 config is not Carreau.")
-        kernels = PhysicsKernels(phys_cfg)
-        carreau_n = phys_cfg.n
-        failures: List[str] = []
-
-        for path in paths:
-            data = _load_anchor_graph(path)
-            assert data is not None
-            stem = path.stem
-            pred = _state_from_labels(data)
-            t = _evaluate_terms(
-                pred, data, kernels, tier="tier2", tier2_distillation=True, carreau_n=carreau_n
-            )
-            if t["l_data_kine"] >= EPS_DATA:
-                failures.append(f"{stem}: distill l_data_kine={t['l_data_kine']:.3e}")
-            if not np.isfinite(t["l_rheo"]) or t["l_rheo"] < 0:
-                failures.append(f"{stem}: distill l_rheo bad: {t['l_rheo']}")
-            if abs(t["l_mom"]) > 1e-12 or abs(t["l_cont"]) > 1e-12:
-                failures.append(
-                    f"{stem}: distill expects l_mom=l_cont=0, got mom={t['l_mom']} cont={t['l_cont']}"
-                )
-
-        self.assertEqual(failures, [], "\n".join(failures))
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -55,7 +55,7 @@ def reports_inspection_dir(*parts: str) -> Path:
 
 
 def stage_a_dir() -> Path:
-    """Predictor warm-up & Newtonian / Tier-1–2 checkpoints."""
+    """Predictor warm-up & Newtonian / Phase-1–2 checkpoints."""
     p = outputs_root() / "stage_a"
     p.mkdir(parents=True, exist_ok=True)
     return p

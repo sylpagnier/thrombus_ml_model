@@ -26,7 +26,7 @@ class PatientDataExtractor:
     To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
 
     1. In COMSOL: Go to Results > Export > Data.
-    2. Main Domain: Export domain nodes to `data/processed/cfd_results_tier3_patients/<stem>.txt`
+    2. Main Domain: Export domain nodes to `data/processed/cfd_results_biochem_patients/<stem>.txt`
        Headers must map exactly to:
        x, y, u, v, p, mu_effective, rp, ap, apr, aps, PT, th, at, fg, fi, M, Mas, Mat
     3. Boundaries: Export Edge 2D coordinates (x, y) with "Time Selection: Last" to:
@@ -36,10 +36,10 @@ class PatientDataExtractor:
     ----------------------------------
     """
 
-    def __init__(self, tier="tier3_patients", raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, phase="biochem_patients", raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
-        self.vessel_cfg = VesselConfig(tier=tier)
-        self.phys_cfg = PhysicsConfig(tier=tier)
+        self.vessel_cfg = VesselConfig(phase=phase)
+        self.phys_cfg = PhysicsConfig(phase=phase)
 
         # Directory handling
         self.raw_dir = Path(raw_dir) if raw_dir else self.root / self.vessel_cfg.mesh_input_dir
@@ -380,12 +380,12 @@ class PatientDataExtractor:
             mu_nd = self.phys_cfg.viscosity_si_to_nd(mu_eff)
 
             # --- USE CENTRALIZED BIOCHEM SCALES ---
-            bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
+            bio_cfg = BiochemConfig(phase=self.vessel_cfg.phase)
             species_cols = list(self.species_map.keys())
             raw_bulk_cgs = torch.tensor(df_matched[species_cols[:9]].values, dtype=torch.float32)
             raw_surf_cgs = torch.tensor(df_matched[species_cols[9:]].values, dtype=torch.float32)
 
-            # COMSOL export convention for tier-3 species is mixed-CGS:
+            # COMSOL export convention for phase-3 species is mixed-CGS:
             # - rp, ap: platelet number density in plt/ml  -> scaled linear field via x bulk_scale
             # - apr, aps, PT, th, at, fg, fi: concentration in uM -> mol/m^3 (x1e-3), then x bulk_scale
             # This keeps transformed ND channels consistent with BiochemConfig.get_species_scales().
@@ -440,11 +440,11 @@ class PatientDataExtractor:
 
         # 8. Data-Driven ML Scaling
         # Compute U_ref from the 99th percentile to clamp data strictly to ~[-1.0, 1.0]
-        u_ref_actual = self.phys_cfg.get_u_ref(d_bar)  # Matches Tier 1/2 logic exactly
+        u_ref_actual = self.phys_cfg.get_u_ref(d_bar)  # Matches Kinematics/2 logic exactly
         re_actual = self.phys_cfg.re_target  # Locks the ML Re to your target
 
         # Ensure your bio_cfg scales match these new SI units
-        bio_cfg = BiochemConfig(tier=self.vessel_cfg.tier)
+        bio_cfg = BiochemConfig(phase=self.vessel_cfg.phase)
         scales = bio_cfg.get_species_scales(device='cpu')
 
         # 9. SDF and Normals
@@ -485,10 +485,10 @@ class PatientDataExtractor:
         mu_bc = mu_nd_0.unsqueeze(1)  # FIX: Was mu_nd
         mu_mask = torch.ones((num_nodes, 1), dtype=torch.float32)
 
-        # Assuming you had 3 initial guess channels of zeros to make 15 total, like Tier 1
+        # Assuming you had 3 initial guess channels of zeros to make 15 total, like Kinematics
         zero_init = torch.zeros((num_nodes, 3), dtype=torch.float32)
 
-        # --- FIX: Ensure x_tensor follows the Tier 2 foundational layout ---
+        # --- FIX: Ensure x_tensor follows the Kinematics foundational layout ---
         x_tensor = torch.cat([
             nodes_nd,  # [0:2] - MUST be here for Fourier Encoding
             sdf,  # [2:3]
@@ -576,9 +576,9 @@ class PatientDataExtractor:
 
         stems = sorted(list(set([ Path(f).stem for f in files ])))
 
-        for stem in tqdm(stems, desc="Extracting Tier 3 Patient Data"):
+        for stem in tqdm(stems, desc="Extracting Biochem Patient Data"):
             self.process_patient(stem)
 
 if __name__ == "__main__":
-    extractor = PatientDataExtractor(tier="tier3_patients")
+    extractor = PatientDataExtractor(phase="biochem_patients")
     extractor.run()

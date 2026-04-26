@@ -1,6 +1,6 @@
-"""Generate Tier-1 mesh-resolution sweep datasets.
+"""Generate Phase-1 mesh-resolution sweep datasets.
 
-Creates three dataset tiers by varying ``GMSH_SIZE_FACTOR``:
+Creates three dataset phases by varying ``GMSH_SIZE_FACTOR``:
 - coarse: 1.5
 - medium: 0.75
 - fine: 0.4
@@ -28,20 +28,20 @@ def generate_resolution_sweep(n_vessels: int = 100):
     for name, factor in resolutions.items():
         print(f"\n========== Generating Resolution: {name} (factor={factor}) ==========")
         os.environ["GMSH_SIZE_FACTOR"] = str(factor)
-        tier_name = f"tier1_res_{name}"
+        phase_name = f"kinematics_res_{name}"
         
         try:
             # 1. Generate Vessels
-            vg = VesselGenerator(tier=tier_name)
+            vg = VesselGenerator(phase=phase_name)
             vg.run_pipeline(n=n_vessels, level=1)
             
             # 2. Run COMSOL CFD for Anchors
-            ag = AnchorGenerator(tier=tier_name)
+            ag = AnchorGenerator(phase=phase_name)
             with ag:
                 ag.run_batch(max_new=n_vessels)
                 
             # 3. Convert to PyG Graphs
-            MeshToGraphComplete(tier=tier_name).run()
+            MeshToGraphComplete(phase=phase_name).run()
             
         finally:
             # Cleanup env to prevent bleeding between iterations

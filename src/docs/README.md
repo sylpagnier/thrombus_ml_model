@@ -7,30 +7,28 @@ Start here, then open the linked files for depth.
 1. **[PROJECT_CONTEXT.md](PROJECT_CONTEXT.md)** — Authoritative overview:
    - **Tier vs Stage** terminology
    - **Architecture** (model, training scripts, routers, config channels)
-   - Entry points (`bin.main`, `bin.orchestrate`, `train_*_predictor`)
-   - Pipelines (`pipeline_tier12`, `pipeline_tier3`)
+   - Entry points (`bin.main`, `bin.orchestrate`, unified training scripts)
+   - Pipelines (`pipeline_kinematics`, `pipeline_biochem`)
    - Data and checkpoint layout
    - Interactive inspection tools and pytest policy
 
-2. **[TIER1_TRAINING_HISTORY.md](TIER1_TRAINING_HISTORY.md)** — Tier 1 sweep history, mesh-resolution decision, V2/V3 strategy (complements `train_t1_predictor` / `Tier1TrainConfig`).
+2. **[KINEMATICS_TRAINING_HISTORY.md](KINEMATICS_TRAINING_HISTORY.md)** — Kinematics sweep history, mesh-resolution decision, V2/V3 strategy.
 
 ## Common commands
 
 ```text
-# Orchestrated training (same order as production): Stage A then Stage B
+# Orchestrated training (same order as production): kinematics then biochem
 python -m src.bin.orchestrate all
-python -m src.bin.orchestrate a --skip-tier1
-python -m src.bin.orchestrate b
+python -m src.bin.orchestrate biochem
 
 # Thin CLI router (see src/bin/main.py MODULE_MAP)
-python -m src.bin.main train t1
-python -m src.bin.main train t2
+python -m src.bin.main train kinematics
 python -m src.bin.main train t3
-python -m src.bin.main inspect phase1 -- --summary
+python -m src.bin.main inspect kinematics -- --summary
 
 # Datagen
-python -m src.data_gen.pipeline_tier12
-python -m src.data_gen.pipeline_tier3
+python -m src.data_gen.pipeline_kinematics
+python -m src.data_gen.pipeline_biochem
 ```
 
 ## Source layout (short)
@@ -40,8 +38,8 @@ python -m src.data_gen.pipeline_tier3
 | `src/architecture/` | `GINO_DEQ`, DEQ solver hooks, LoRA, SIREN decoder |
 | `src/core_physics/` | Physics kernels, Anderson acceleration, PDE-consistent terms |
 | `src/config.py` | `PhysicsConfig`, `VesselConfig`, channel enums (`PredChannels`, `NodeFeat`) |
-| `src/data_gen/` | Tier 12 / Tier 3 pipelines and mesh→graph builders |
-| `src/training/` | `train_t1_predictor`, `train_t2_predictor`, `train_t3_corrector`, `physics_curriculum` |
-| `src/bin/` | `main` (router), `orchestrate` (stage runner) |
+| `src/data_gen/` | Kinematics / Biochem pipelines and mesh→graph builders |
+| `src/training/` | `train_kinematics_predictor`, `train_biochem_corrector`, `physics_curriculum` |
+| `src/bin/` | `main` (router), `orchestrate` (phase runner) |
 
-Training is implemented as **explicit scripts** (not a shared trainer class). Invoke Tier 1 via `python -m src.training.train_t1_predictor` or `python -m src.bin.main train t1` (or `train explore`).
+Training is implemented as **explicit scripts** (not a shared trainer class). Invoke unified kinematics training via `python -m src.training.train_kinematics_predictor` or `python -m src.bin.main train kinematics`.

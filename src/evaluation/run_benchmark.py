@@ -22,7 +22,7 @@ from src.data_gen import AnchorGenerator, MeshToGraphComplete, VesselGenerator
 from src.evaluation.lib.validate_model import ModelValidator
 from src.config import PredChannels
 
-TIER2_FINAL_ANNEALED_N = 0.358
+KINEMATICS_FINAL_ANNEALED_N = 0.358
 
 
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
@@ -42,7 +42,7 @@ def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
 
 
-def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_name):
+def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_name):
     graph_path = graph_dir if hasattr(graph_dir, "glob") else project_root / graph_dir
     files = sorted(graph_path.glob("*.pt"))
     if not files:
@@ -64,7 +64,7 @@ def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_n
             ("Velocity Magnitude", "jet", lambda arr: np.linalg.norm(arr[:, PredChannels.UV], axis=1)),
             ("Pressure", "coolwarm", lambda arr: arr[:, PredChannels.P]),
         ]
-        if tier != "tier1":
+        if phase != "kinematics":
             fields.append(("Viscosity", "viridis", lambda arr: arr[:, PredChannels.MU_EFF_ND]))
 
         ncols = 3 if has_labels else 1
@@ -97,7 +97,7 @@ def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_n
                 _plot_field(fig, axes[row_idx, 0], pos, pred_val, f"Pred {name}", cmap, vmin=vmin, vmax=vmax)
 
         fig.suptitle(
-            f"{tier.upper()} Benchmark Visualization - {level_name} ({files[current_idx].name})",
+            f"{phase.upper()} Benchmark Visualization - {level_name} ({files[current_idx].name})",
             fontsize=14,
         )
         fig.tight_layout(rect=(0, 0.06, 1, 0.97))
@@ -126,13 +126,13 @@ def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_n
         current_idx = next_idx
 
 
-def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualize=False, carreau_n=None):
+def run_pipeline_for_level(phase, level_idx, level_name, num_samples=10, visualize=False, carreau_n=None):
     print(f"\n{'=' * 60}")
-    print(f"🚀 STARTING BENCHMARK: [{tier.upper()}] {level_name} (Level {level_idx})")
+    print(f"🚀 STARTING BENCHMARK: [{phase.upper()}] {level_name} (Level {level_idx})")
     print(f"{'=' * 60}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = data_root() / "benchmark" / f"{tier}_level_{level_idx}_{timestamp}"
+    base_dir = data_root() / "benchmark" / f"{phase}_level_{level_idx}_{timestamp}"
 
     raw_mesh_dir = base_dir / "raw_meshes"
     label_dir = base_dir / "comsol_solutions"
@@ -143,7 +143,7 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
 
     try:
         print(f"\n[1/4] 📐 Generating {num_samples} Geometries in {base_dir.name}...")
-        v_gen = VesselGenerator(tier=tier, output_dir=str(raw_mesh_dir))
+        v_gen = VesselGenerator(phase=phase, output_dir=str(raw_mesh_dir))
         v_gen.run_pipeline(
             n=num_samples,
             level=level_idx,
@@ -152,21 +152,21 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
         )
 
         print(f"\n[2/4] 🌪️ Solving Navier-Stokes in COMSOL...")
-        template_absolute = comsol_models_dir() / "phase1_template.mph"
+        template_absolute = comsol_models_dir() / "kinematics_template.mph"
 
         with AnchorGenerator(
-                tier=tier,
+                phase=phase,
                 template_path=str(template_absolute),
                 mesh_dir=str(raw_mesh_dir),
                 output_dir=str(label_dir)
         ) as a_gen:
-            if tier == "tier2":
-                # Tier 2 benchmark should default to the final continuation target.
-                target_n = TIER2_FINAL_ANNEALED_N if carreau_n is None else float(carreau_n)
+            if phase == "kinematics":
+                # Kinematics benchmark should default to the final continuation target.
+                target_n = KINEMATICS_FINAL_ANNEALED_N if carreau_n is None else float(carreau_n)
                 a_gen.phys_cfg.n = target_n
                 a_gen.model.parameter("n_index", str(target_n))
-                print(f"   ↳ Using Tier 2 Carreau n_index = {target_n:.3f}")
-            elif carreau_n is not None and tier != "tier1":
+                print(f"   ↳ Using Kinematics Carreau n_index = {target_n:.3f}")
+            elif carreau_n is not None and phase != "kinematics":
                 target_n = float(carreau_n)
                 a_gen.phys_cfg.n = target_n
                 a_gen.model.parameter("n_index", str(target_n))
@@ -175,7 +175,7 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
 
         print(f"\n[3/4] 🕸️ Converting to Graphs...")
         m_gen = MeshToGraphComplete(
-            tier=tier,
+            phase=phase,
             raw_dir=str(raw_mesh_dir),
             label_dir=str(label_dir),
             proc_dir=str(graph_dir)
@@ -183,14 +183,14 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
         m_gen.run()
 
         print(f"\n[4/4] 🧠 Running Model Inference & Metrics...")
-        ckpt_name = f"{tier}_best_physics.pth"
+        ckpt_name = "kinematics_ckpt_100.pth"
         model_path = resolve_checkpoint("a", ckpt_name)
 
         if not model_path.exists():
             print(f"❌ Model not found at {model_path} (expected under outputs/stage_a/). Skipping validation.")
             return None
 
-        validator = ModelValidator(model_path=model_path, tier=tier)
+        validator = ModelValidator(model_path=model_path, phase=phase)
         metrics = validator.validate_dataset(
             str(graph_dir),
             level_name=level_name,
@@ -200,7 +200,7 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
             _show_benchmark_visualization(
                 validator=validator,
                 graph_dir=graph_dir,
-                tier=tier,
+                phase=phase,
                 level_idx=level_idx,
                 level_name=level_name,
             )
@@ -230,14 +230,14 @@ def _prompt_int(label, default):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run multi-fidelity benchmark pipeline")
-    parser.add_argument("--tiers", type=str, default=None, help='Comma-separated tiers (for example: "tier1,tier2")')
+    parser.add_argument("--phases", type=str, default=None, help='Comma-separated phases (for example: "kinematics,kinematics")')
     parser.add_argument("--num-samples", type=int, default=None, help="Number of vessels per benchmark level")
     parser.add_argument("--levels", type=str, default=None, help='Comma-separated benchmark levels (for example: "0,1")')
     parser.add_argument(
         "--carreau-n",
         type=float,
         default=None,
-        help=f'Override Carreau n_index for non-tier1 runs (default for tier2: {TIER2_FINAL_ANNEALED_N:.3f})',
+        help=f'Override Carreau n_index for non-kinematics runs (default for kinematics: {KINEMATICS_FINAL_ANNEALED_N:.3f})',
     )
     parser.add_argument(
         "--visualize",
@@ -247,11 +247,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.tiers is None:
-        tiers_raw = _prompt_text("Tiers (comma-separated)", "tier1,tier2")
+    if args.phases is None:
+        phases_raw = _prompt_text("Phases (comma-separated)", "kinematics")
     else:
-        tiers_raw = args.tiers
-    target_tiers = [t.strip() for t in tiers_raw.split(",") if t.strip()]
+        phases_raw = args.phases
+    target_phases = [t.strip() for t in phases_raw.split(",") if t.strip()]
 
     if args.num_samples is None:
         num_samples = _prompt_int("Number of vessels per level", 10)
@@ -275,11 +275,11 @@ if __name__ == "__main__":
     }
     benchmarks = [(lvl, level_names.get(lvl, f"Level {lvl}")) for lvl in level_ids]
 
-    for current_tier in target_tiers:
+    for current_phase in target_phases:
         all_results = {}
         for lvl_idx, name in benchmarks:
             metrics = run_pipeline_for_level(
-                current_tier,
+                current_phase,
                 lvl_idx,
                 name,
                 num_samples=num_samples,
@@ -291,18 +291,18 @@ if __name__ == "__main__":
             time.sleep(1)
 
         print("\n\n" + "*" * 50)
-        print(f"🏆 FINAL MULTI-FIDELITY BENCHMARK REPORT: {current_tier.upper()}")
+        print(f"🏆 FINAL MULTI-FIDELITY BENCHMARK REPORT: {current_phase.upper()}")
         print("*" * 50)
 
         if all_results:
             df = pd.DataFrame(all_results).T
             print(df)
-            save_path = reports_subdir("benchmark") / f"{current_tier}_full_benchmark.csv"
+            save_path = reports_subdir("benchmark") / f"{current_phase}_full_benchmark.csv"
             save_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(save_path)
             print(f"\n📄 Detailed report saved to: {save_path}")
         else:
-            print(f"❌ No results generated for {current_tier}.")
+            print(f"❌ No results generated for {current_phase}.")
 
     # Full aggressive cleanup of all benchmark data once everything finishes
     benchmark_data_dir = data_root() / "benchmark"

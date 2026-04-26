@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.config import BULK_SPECIES_ORDER, SPECIES_GROUPS, BulkSpecies, Tier3NodeFeat, WallSpecies
+from src.config import BULK_SPECIES_ORDER, SPECIES_GROUPS, BulkSpecies, BiochemNodeFeat, WallSpecies
 from src.utils.rheology import compute_shear_rate
 
 
 class BiochemPhysicsKernels:
     """
-    Tier 3 Biochemical Physics Kernels for Eulerian Thrombosis Modeling.
+    Biochem Biochemical Physics Kernels for Eulerian Thrombosis Modeling.
     Translates COMSOL Phase 2 multiphysics equations into differentiable DEQ operations.
     Includes full Fibrin/Fibrinogen coagulation cascade and Dual Viscosity Pseudo-Huber Regularization.
     """
@@ -333,13 +333,13 @@ class BiochemPhysicsKernels:
                 mag = torch.sqrt(nx * nx + ny * ny + 1e-12)
                 weak = mag < 1e-5
                 if weak.any():
-                    normals_fb = data.x[mask_outlet, Tier3NodeFeat.WALL_NORMAL]
+                    normals_fb = data.x[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
                     nx_fb = normals_fb[:, 0]
                     ny_fb = normals_fb[:, 1]
                     nx = torch.where(weak, nx_fb, nx)
                     ny = torch.where(weak, ny_fb, ny)
             else:
-                normals_fb = data.x[mask_outlet, Tier3NodeFeat.WALL_NORMAL]
+                normals_fb = data.x[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
                 nx = normals_fb[:, 0]
                 ny = normals_fb[:, 1]
 
@@ -507,7 +507,7 @@ class BiochemPhysicsKernels:
             BulkSpecies.T: J_in_T,
         }
 
-        wall_normals = data.x[mask_wall, Tier3NodeFeat.WALL_NORMAL]
+        wall_normals = data.x[mask_wall, BiochemNodeFeat.WALL_NORMAL]
         nx = wall_normals[:, 0]
         ny = wall_normals[:, 1]
 

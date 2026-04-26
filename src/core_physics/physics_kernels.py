@@ -16,7 +16,7 @@ def scatter_add(src, index, dim=0, dim_size=None):
 class PhysicsKernels:
     def __init__(self, phys_cfg):
         self.cfg = phys_cfg
-        # Tier 1 / Tier 2 training use this strong-form stack; keep a single recipe (no env toggles).
+        # Kinematics / Kinematics training use this strong-form stack; keep a single recipe (no env toggles).
         self.advect_detach = False
         self.momentum_loss_mode = "huber"
         self.momentum_huber_delta = 0.01
@@ -126,7 +126,7 @@ class PhysicsKernels:
         p_x, p_y = c_p[:, 0, 0], c_p[:, 1, 0]
 
         # Re uses per-graph ``u_ref`` / ``d_bar`` (see ``PhysicsConfig.get_re``), not ``re_target`` directly.
-        # Callers (e.g. Tier 3 training) may override with ``re_ref`` from ``data.re_actual``.
+        # Callers (e.g. Biochem training) may override with ``re_ref`` from ``data.re_actual``.
         Re = self.cfg.get_re(u_ref, d_bar)
         if re_scale is not None:
             scale_t = torch.as_tensor(re_scale, device=Re.device, dtype=Re.dtype)
@@ -135,7 +135,7 @@ class PhysicsKernels:
             ref_t = torch.as_tensor(re_ref, device=Re.device, dtype=Re.dtype)
             Re = ref_t.expand_as(Re)
 
-        # --- Tier-Dependent Physics Formulation ---
+        # --- Phase-Dependent Physics Formulation ---
         if self.cfg.viscosity_model == "carreau":
             # Extract predicted mu
             mu_eff = pred[:, PredChannels.MU_EFF_ND]

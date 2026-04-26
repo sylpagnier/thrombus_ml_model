@@ -1,10 +1,10 @@
 """
-Append-only JSONL training diary for Phase 1 runs — machine- and human-readable context for
+Append-only JSONL training diary for Kinematics runs — machine- and human-readable context for
 post-hoc analysis (e.g. planning the next run).
 
-Each line is one JSON object: ``ts_utc``, ``run_id``, ``tier``, ``event``, plus event fields.
+Each line is one JSON object: ``ts_utc``, ``run_id``, ``phase``, ``event``, plus event fields.
 
-Disable with ``PHASE1_TRAINING_DIARY=0`` or set ``PHASE1_TRAINING_DIARY_PATH`` to a custom ``.jsonl`` file.
+Disable with ``KINEMATICS_TRAINING_DIARY=0`` or set ``KINEMATICS_TRAINING_DIARY_PATH`` to a custom ``.jsonl`` file.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from src.utils.paths import reports_training_dir
 
 
 def write_t1_experiment_artifact(
-    tier1_cfg: Any,
+    kinematics_cfg: Any,
     *,
     best_rel_l2: float,
     best_val_composite_loss: float,
@@ -32,22 +32,22 @@ def write_t1_experiment_artifact(
     graph_dir: str,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Write ``reports/experiments/tier1_<name>_<ts>.json`` for post-run comparison.
+    """Write ``reports/experiments/kinematics_<name>_<ts>.json`` for post-run comparison.
 
-    ``tier1_cfg`` must provide ``experiment_name`` and ``to_serializable()`` (e.g. ``Tier1TrainConfig``).
-    ``best_val_composite_loss`` is the minimum validation composite (Tier 1:
+    ``kinematics_cfg`` must provide ``experiment_name`` and ``to_serializable()`` (e.g. ``Phase1TrainConfig``).
+    ``best_val_composite_loss`` is the minimum validation composite (Kinematics:
     ``rel_l2_anchor + 100×continuity``); lower is better.
     """
-    rep = reports_training_dir("tier1", "experiments")
+    rep = reports_training_dir("kinematics", "experiments")
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    name = str(getattr(tier1_cfg, "experiment_name", "default"))
+    name = str(getattr(kinematics_cfg, "experiment_name", "default"))
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:80]
-    path = rep / f"tier1_{safe_name}_{ts}.json"
-    ser = tier1_cfg.to_serializable() if callable(getattr(tier1_cfg, "to_serializable", None)) else {}
+    path = rep / f"kinematics_{safe_name}_{ts}.json"
+    ser = kinematics_cfg.to_serializable() if callable(getattr(kinematics_cfg, "to_serializable", None)) else {}
     payload: Dict[str, Any] = {
-        "tier": "tier1",
+        "phase": "kinematics",
         "ts_utc": ts,
-        "tier1_train_config": ser,
+        "kinematics_train_config": ser,
         "metrics": {
             "best_rel_l2": best_rel_l2,
             "best_val_composite_loss": best_val_composite_loss,
@@ -60,14 +60,14 @@ def write_t1_experiment_artifact(
             "n_val": n_val,
             "graph_dir": graph_dir,
         },
-        "env_tier1": {k: v for k, v in sorted(os.environ.items()) if k.startswith("TIER1_")},
+        "env_kinematics": {k: v for k, v in sorted(os.environ.items()) if k.startswith("KINEMATICS_")},
     }
     if extra:
         payload["extra"] = extra
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"📒 Experiment artifact: {path}")
-    print("🧾 History reminder: append this run's key metrics to your Tier1 training history log.")
+    print("🧾 History reminder: append this run's key metrics to your Phase1 training history log.")
     return path
 
 
@@ -99,10 +99,10 @@ def env_snapshot(*prefixes: str) -> Dict[str, str]:
 class TrainingDiary:
     """Writes one main JSONL diary per run under a run-specific folder."""
 
-    def __init__(self, tier: str, enabled: Optional[bool] = None):
-        self.tier = tier
+    def __init__(self, phase: str, enabled: Optional[bool] = None):
+        self.phase = phase
         if enabled is None:
-            raw = os.environ.get("PHASE1_TRAINING_DIARY", "1").strip().lower()
+            raw = os.environ.get("KINEMATICS_TRAINING_DIARY", "1").strip().lower()
             enabled = raw not in ("0", "false", "no", "off")
         self.enabled = enabled
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -110,17 +110,17 @@ class TrainingDiary:
         self.run_dir: Optional[Path] = None
         if not self.enabled:
             return
-        reports = reports_training_dir(self.tier)
+        reports = reports_training_dir(self.phase)
         self.run_dir = reports / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        custom = os.environ.get("PHASE1_TRAINING_DIARY_PATH", "").strip()
+        custom = os.environ.get("KINEMATICS_TRAINING_DIARY_PATH", "").strip()
         if custom:
             self.path = Path(custom)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.run_dir = self.path.parent
         else:
             self.path = self.run_dir / "training_diary_main.jsonl"
-        os.environ["PHASE1_TRAINING_RUN_DIR"] = str(self.run_dir)
+        os.environ["KINEMATICS_TRAINING_RUN_DIR"] = str(self.run_dir)
         print(f"📝 Training diary (main JSONL): {self.path}")
         print(f"📂 Training run folder: {self.run_dir}")
 
@@ -130,7 +130,7 @@ class TrainingDiary:
         row: Dict[str, Any] = {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "run_id": self.run_id,
-            "tier": self.tier,
+            "phase": self.phase,
             "event": event,
         }
         row.update(_json_safe(payload))

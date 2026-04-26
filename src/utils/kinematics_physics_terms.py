@@ -1,8 +1,8 @@
 """
-Physics loss **terms** for Stage A predictor training (Tier 1 Newtonian / Tier 2 Carreau).
+Physics loss **terms** for unified Kine phase kinematics training.
 
-``train_t1_predictor.compute_step_loss`` and ``train_t2_predictor.compute_step_loss`` call this so
-validation tests exercise the **exact** same code path as training (no duplicated derivative stacks).
+``train_kinematics_predictor.compute_step_loss`` calls this so validation tests exercise
+the **exact** same code path as training (no duplicated derivative stacks).
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def boundary_weighted_mse(
     p_weight: float = 1.0,
     anchor_importance: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Supervised kinematic loss on anchor nodes (Tier 1 training).
+    """Supervised kinematic loss on anchor nodes (Kine phase anchor regime).
 
     ``anchor_importance`` — optional positive weights per anchor node (e.g. SDF-based explorer).
     """
@@ -123,36 +123,20 @@ def compute_kinematics_physics_terms(
     data,
     kernels: PhysicsKernels,
     *,
-    tier: str,
+    phase: str = "kinematics",
     boundary_data_weight: float = 2.0,
     carreau_n: Optional[float] = None,
-    tier2_distillation: bool = False,
-    tier1_kine_p_weight: float = 1.0,
-    tier2_kine_p_weight: float = 1.0,
+    distillation: bool = False,
+    kine_p_weight: float = 1.0,
     anchor_kine_importance: Optional[torch.Tensor] = None,
     re_ref: Optional[float] = None,
     re_scale: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Compute every scalar physics term used in Tier 1 or Tier 2 training (except DEQ ``jac_loss``).
+    Compute every scalar physics term used across Kine phase training (except DEQ ``jac_loss``).
 
-    Parameters
-    ----------
-    tier:
-        ``"tier1"`` (Newtonian) or ``"tier2"`` (Carreau).
-    tier2_distillation:
-        If True (Tier 2 only), skip momentum / continuity (distillation phase) and still compute
-        rheology + BC + IO + WSS + anchor kinematic loss.
-    tier2_kine_p_weight:
-        Tier 2 only: multiplies the pressure channel in anchor ``l_data_kine`` (u,v use weight 1).
-        ``1.0`` recovers uniform MSE over ``(u,v,p)``.
-    anchor_kine_importance:
-        Tier 1 only: optional per-anchor-node weights for ``l_data_kine`` (see
-        :func:`compute_anchor_kinematic_importance`).
+    ``phase`` is kept for naming consistency with config; Kine phase now uses unified kinematics physics.
     """
-    if tier not in ("tier1", "tier2"):
-        raise ValueError(f"tier must be 'tier1' or 'tier2', got {tier!r}")
-
     props = kernels._get_geometric_props(data)
     l_wss = kernels.wall_shear_stress_loss(pred, data, props=props)
 
@@ -162,44 +146,26 @@ def compute_kinematics_physics_terms(
     l_data_kine = z.clone()
     l_data_mu = z.clone()
     if node_is_anchor is not None and int(node_is_anchor.sum().item()) > 0:
-        if tier == "tier1":
-            wall_mask = getattr(data, "mask_wall", None)
-            l_data_kine = boundary_weighted_mse(
-                pred,
-                data.y,
-                node_is_anchor,
-                wall_mask=wall_mask,
-                wall_weight=boundary_data_weight,
-                p_weight=tier1_kine_p_weight,
-                anchor_importance=anchor_kine_importance,
+        wall_mask = getattr(data, "mask_wall", None)
+        l_data_kine = boundary_weighted_mse(
+            pred,
+            data.y,
+            node_is_anchor,
+            wall_mask=wall_mask,
+            wall_weight=boundary_data_weight,
+            p_weight=kine_p_weight,
+            anchor_importance=anchor_kine_importance,
+        )
+        if not distillation:
+            l_data_mu = F.mse_loss(
+                pred[node_is_anchor, PredChannels.MU_EFF_ND],
+                data.y[node_is_anchor, PredChannels.MU_EFF_ND],
             )
-        else:
-            pa = pred[node_is_anchor, PredChannels.KINEMATICS]
-            ya = data.y[node_is_anchor, PredChannels.KINEMATICS]
-            wp = float(tier2_kine_p_weight)
-            if wp != 1.0:
-                d = pa - ya
-                w = d.new_tensor([1.0, 1.0, wp]).view(1, 3)
-                l_data_kine = ((d * d) * w).mean()
-            else:
-                l_data_kine = F.mse_loss(pa, ya)
-            if not tier2_distillation:
-                l_data_mu = F.mse_loss(
-                    pred[node_is_anchor, PredChannels.MU_EFF_ND],
-                    data.y[node_is_anchor, PredChannels.MU_EFF_ND],
-                )
 
     l_bc = kernels.boundary_condition_loss(pred, data)
     l_io = kernels.inlet_outlet_loss(pred, data)
 
-    if tier == "tier1":
-        l_mom = kernels.navier_stokes_residual(pred, data, props=props, re_ref=re_ref, re_scale=re_scale)
-        c_u = kernels._compute_derivatives(pred[:, PredChannels.U:PredChannels.U + 1], props)
-        c_v = kernels._compute_derivatives(pred[:, PredChannels.V:PredChannels.V + 1], props)
-        du_ij = torch.stack([c_u[:, 0, 0], c_u[:, 1, 0], c_v[:, 0, 0], c_v[:, 1, 0]], dim=1)
-        l_cont = kernels.continuity_loss(du_ij, data=data)
-        l_rheo = z
-    elif tier2_distillation:
+    if distillation:
         l_mom = z
         l_cont = z
         l_rheo = kernels.rheology_loss(pred, data, props=props, carreau_n=carreau_n)

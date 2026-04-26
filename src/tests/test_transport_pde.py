@@ -1,4 +1,4 @@
-"""Stage A: ADR mass conservation checks (reaction sources, fibrin pair, soft-step gradients)."""
+"""Kine phase: ADR mass conservation checks (reaction sources, fibrin pair, soft-step gradients)."""
 
 import torch
 
@@ -9,8 +9,8 @@ from src.core_physics.physics_kernels import PhysicsKernels
 
 def test_fibrin_pair_conserves_mass_in_rate_equations():
     """``R_FG + R_FI`` vanishes for the fibrinogen→fibrin branch (no artificial creation)."""
-    cfg = BiochemConfig(tier="tier3")
-    core = PhysicsKernels(PhysicsConfig(tier="tier3"))
+    cfg = BiochemConfig(phase="biochem")
+    core = PhysicsKernels(PhysicsConfig(phase="biochem"))
     bio = BiochemPhysicsKernels(cfg, core)
     kin = bio.kinetics
 
@@ -24,8 +24,8 @@ def test_fibrin_pair_conserves_mass_in_rate_equations():
 
 def test_bulk_reaction_sources_balance_platelet_transfer():
     """RP drain equals AP source: ``R_RP + R_AP == 0`` for the activation channel."""
-    cfg = BiochemConfig(tier="tier3")
-    core = PhysicsKernels(PhysicsConfig(tier="tier3"))
+    cfg = BiochemConfig(phase="biochem")
+    core = PhysicsKernels(PhysicsConfig(phase="biochem"))
     bio = BiochemPhysicsKernels(cfg, core)
     kin = bio.kinetics
 
@@ -48,9 +48,9 @@ def test_bulk_reaction_sources_balance_platelet_transfer():
 
 
 def test_adr_residual_finite_under_static_flow_stub():
-    """With zero velocity and uniform species, ADR residuals stay finite (sanity for Stage A)."""
-    cfg = BiochemConfig(tier="tier3")
-    core = PhysicsKernels(PhysicsConfig(tier="tier3"))
+    """With zero velocity and uniform species, ADR residuals stay finite (sanity for Kine phase)."""
+    cfg = BiochemConfig(phase="biochem")
+    core = PhysicsKernels(PhysicsConfig(phase="biochem"))
     bio = BiochemPhysicsKernels(cfg, core)
 
     n = 8
@@ -83,8 +83,8 @@ def test_soft_step_ste_backward_is_smooth_near_threshold():
 
 def test_kinetics_soft_steps_finite_gradients():
     """Temperature-scaled soft gates yield finite grads w.r.t. inputs."""
-    cfg = BiochemConfig(tier="tier3")
-    core = PhysicsKernels(PhysicsConfig(tier="tier3"))
+    cfg = BiochemConfig(phase="biochem")
+    core = PhysicsKernels(PhysicsConfig(phase="biochem"))
     bio = BiochemPhysicsKernels(cfg, core)
     kin = bio.kinetics
 

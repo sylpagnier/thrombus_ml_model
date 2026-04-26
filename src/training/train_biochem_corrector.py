@@ -30,18 +30,18 @@ from torch_geometric.loader import DataLoader
 
 
 def resolve_training_device() -> torch.device:
-    """Pick compute device. Honors ``TIER3_DEVICE=auto|cuda|cpu`` (default ``auto``).
+    """Pick compute device. Honors ``BIOCHEM_DEVICE=auto|cuda|cpu`` (default ``auto``).
 
     Plain ``pip install torch`` is often CPU-only; use ``scripts/install_torch_cuda.ps1``
     or install from https://pytorch.org so ``torch.cuda.is_available()`` is True.
     """
-    want = (os.environ.get("TIER3_DEVICE") or "auto").strip().lower()
+    want = (os.environ.get("BIOCHEM_DEVICE") or "auto").strip().lower()
     cuda_ok = torch.cuda.is_available()
 
     if want in ("cuda", "gpu"):
         if not cuda_ok:
             print(
-                "TIER3_DEVICE=cuda but this PyTorch build has no CUDA "
+                "BIOCHEM_DEVICE=cuda but this PyTorch build has no CUDA "
                 "(torch.cuda.is_available() is False).\n"
                 "Install a GPU wheel, e.g. run: .\\scripts\\install_torch_cuda.ps1\n"
                 "or: py -3 -m pip install torch --upgrade "
@@ -57,7 +57,7 @@ def resolve_training_device() -> torch.device:
         return torch.device("cpu")
 
     if want != "auto":
-        print(f"Unknown TIER3_DEVICE={want!r}; use auto, cuda, or cpu.", file=sys.stderr)
+        print(f"Unknown BIOCHEM_DEVICE={want!r}; use auto, cuda, or cpu.", file=sys.stderr)
         sys.exit(1)
 
     if cuda_ok:
@@ -98,7 +98,7 @@ from src.utils.paths import (
     stage_b_dir,
     resolve_checkpoint,
 )
-from src.architecture.gnode_tier3 import GNODE_Tier3, tier3_truth_node_mask
+from src.architecture.gnode_biochem import GNODE_Phase3, biochem_truth_node_mask
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
 from src.core_physics.physics_kernels import PhysicsKernels
@@ -117,15 +117,15 @@ from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.training.physics_curriculum import ease01 as _ease01
 
 
-def _tier3_metrics_jsonl_path():
-    run_dir = os.environ.get("PHASE1_TRAINING_RUN_DIR", "").strip()
+def _biochem_metrics_jsonl_path():
+    run_dir = os.environ.get("KINEMATICS_TRAINING_RUN_DIR", "").strip()
     if run_dir:
         return Path(run_dir) / "metrics.jsonl"
-    return reports_training_dir("tier3") / "metrics.jsonl"
+    return reports_training_dir("biochem") / "metrics.jsonl"
 
 
-def _tier3_append_jsonl(record: Dict[str, Any]) -> None:
-    path = _tier3_metrics_jsonl_path()
+def _biochem_append_jsonl(record: Dict[str, Any]) -> None:
+    path = _biochem_metrics_jsonl_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
@@ -145,39 +145,39 @@ def _graph_has_anchor_nodes(data) -> bool:
 
 
 # --- Optional diagnostics (compare with f958b74 ~2026-04-03: that revision mutated
-# ``phys_cfg.re_target`` inside ``compute_tier3_loss``; current code keeps config fixed
+# ``phys_cfg.re_target`` inside ``compute_biochem_loss``; current code keeps config fixed
 # and passes ``re_ref`` from ``data.re_actual`` only into ``navier_stokes_residual``.)
-def _tier3_debug_enabled() -> bool:
-    return (os.environ.get("TIER3_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+def _biochem_debug_enabled() -> bool:
+    return (os.environ.get("BIOCHEM_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _tier3_debug_batches_cap() -> int:
+def _biochem_debug_batches_cap() -> int:
     try:
-        return max(0, int(os.environ.get("TIER3_DEBUG_BATCHES", "3")))
+        return max(0, int(os.environ.get("BIOCHEM_DEBUG_BATCHES", "3")))
     except ValueError:
         return 3
 
 
-def _tier3_should_log_batch(epoch: int, batch_idx: int) -> bool:
-    if not _tier3_debug_enabled():
+def _biochem_should_log_batch(epoch: int, batch_idx: int) -> bool:
+    if not _biochem_debug_enabled():
         return False
-    return batch_idx < _tier3_debug_batches_cap()
+    return batch_idx < _biochem_debug_batches_cap()
 
 
-def _tier3_debug_log_path():
-    run_dir = os.environ.get("PHASE1_TRAINING_RUN_DIR", "").strip()
+def _biochem_debug_log_path():
+    run_dir = os.environ.get("KINEMATICS_TRAINING_RUN_DIR", "").strip()
     if run_dir:
         return Path(run_dir) / "debug.log"
-    return reports_training_dir("tier3") / "debug.log"
+    return reports_training_dir("biochem") / "debug.log"
 
 
-def _tier3_dbg_line(msg: str) -> None:
-    """Stdout + append to ``<reports_dir>/tier3_debug.log`` (tqdm often obscures raw prints)."""
+def _biochem_dbg_line(msg: str) -> None:
+    """Stdout + append to ``<reports_dir>/biochem_debug.log`` (tqdm often obscures raw prints)."""
     print(msg, flush=True)
-    if not _tier3_debug_enabled():
+    if not _biochem_debug_enabled():
         return
     try:
-        path = _tier3_debug_log_path()
+        path = _biochem_debug_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
@@ -215,13 +215,13 @@ def _debug_kendall_terms(
     min_lv = loss_weighter.per_task_min_log_var
     max_lv = loss_weighter.per_task_max_log_var
     loss_weighter.clamped_log_vars().detach()
-    _tier3_dbg_line("   [Kendall breakdown] task | active | L_raw | prec=exp(-lv) | lv | contrib=prec*L+lv")
+    _biochem_dbg_line("   [Kendall breakdown] task | active | L_raw | prec=exp(-lv) | lv | contrib=prec*L+lv")
     with torch.no_grad():
         for i, loss in enumerate(losses):
             ta_i = task_active[i]
             act = bool(ta_i.item()) if torch.is_tensor(ta_i) else bool(ta_i)
             if not act:
-                _tier3_dbg_line(f"      {names[i]:9} | off")
+                _biochem_dbg_line(f"      {names[i]:9} | off")
                 continue
             li = loss.detach().item() if torch.is_tensor(loss) else float(loss)
             lv = float(
@@ -232,12 +232,12 @@ def _debug_kendall_terms(
             prec = math.exp(-lv)
             contrib = prec * li + lv
             flag = "" if math.isfinite(contrib) and math.isfinite(li) else " **NON-FINITE**"
-            _tier3_dbg_line(
+            _biochem_dbg_line(
                 f"      {names[i]:9} | on  | L={li:.6e} | prec={prec:.4g} | lv={lv:.4f} | contrib={contrib:.6e}{flag}"
             )
 
 
-def _debug_tier3_batch(
+def _debug_biochem_batch(
     *,
     epoch: int,
     batch_idx: int,
@@ -257,30 +257,30 @@ def _debug_tier3_batch(
     end_idx: int,
     truth_count: int,
 ) -> None:
-    src = getattr(data, "_tier3_path", None) or getattr(data, "_tier3_source", None)
-    _tier3_dbg_line(
-        f"\n[TIER3_DEBUG] epoch={epoch} batch={batch_idx} "
+    src = getattr(data, "_biochem_path", None) or getattr(data, "_biochem_source", None)
+    _biochem_dbg_line(
+        f"\n[BIOCHEM_DEBUG] epoch={epoch} batch={batch_idx} "
         f"src={src!r} "
         f"N={int(data.num_nodes)} T_y={int(data.y.shape[0])} T_eval={int(evaluation_times.shape[0])} "
         f"window=[{start_idx}:{end_idx}] truth_nodes={truth_count}"
     )
-    _tier3_dbg_line(
+    _biochem_dbg_line(
         f"   scales: u_ref={data.u_ref!r} d_bar={data.d_bar!r} "
         f"re_actual={getattr(data, 're_actual', None)!r} "
         f"re_ref_for_NS={re_ref!r} get_re(u,d)_range=[{r_lo:.4g},{r_hi:.4g}]"
     )
     if hasattr(data, "t") and data.t is not None:
-        _tier3_dbg_line(
+        _biochem_dbg_line(
             f"   data.t: shape={tuple(data.t.shape)} min={data.t.min().item():.6g} max={data.t.max().item():.6g}"
         )
     te = evaluation_times.detach().cpu()
     dt = te[1:] - te[:-1] if te.numel() > 1 else te
-    _tier3_dbg_line(
+    _biochem_dbg_line(
         f"   eval_times: min={te.min().item():.6g} max={te.max().item():.6g} "
         f"dt_min={(dt.min().item() if dt.numel() else float('nan')):.6g}"
     )
     ps = pred_series.detach()
-    _tier3_dbg_line(f"   pred_series last step: {_tensor_stat(ps[-1])}")
+    _biochem_dbg_line(f"   pred_series last step: {_tensor_stat(ps[-1])}")
     bad = []
     loss_names = [
         "L_ADR_F", "L_ADR_S", "L_W_Bio", "L_W_Phy", "L_B_IO", "L_mom", "L_Data_Kine", "L_Data_Bio",
@@ -290,13 +290,13 @@ def _debug_tier3_batch(
         if not ok:
             bad.append((ln, v))
     if bad:
-        _tier3_dbg_line(f"   ** non-finite raw losses: {bad}")
-    _tier3_dbg_line(
+        _biochem_dbg_line(f"   ** non-finite raw losses: {bad}")
+    _biochem_dbg_line(
         f"   metrics TF_eff={metrics.get('TF_eff')} L_Latent_Reg={metrics.get('L_Latent_Reg')}"
     )
     lt = loss_total.detach().item()
     lr = (1e-3 * l_latent_reg).detach().item() if torch.is_tensor(l_latent_reg) else 1e-3 * float(l_latent_reg)
-    _tier3_dbg_line(
+    _biochem_dbg_line(
         f"   loss_weighter()+1e-3*latent: total={lt:.6e} latent_term={lr:.6e} finite={math.isfinite(lt)}"
     )
     _debug_kendall_terms(loss_weighter, all_losses, task_active)
@@ -313,58 +313,58 @@ class PatientDataset(Dataset):
     def get(self, idx):
         path = self.file_list[idx]
         data = torch.load(path, weights_only=False)
-        # Provenance for TIER3_DEBUG=1 (PyG allows extra attributes on Data).
-        data._tier3_path = str(path)
+        # Provenance for BIOCHEM_DEBUG=1 (PyG allows extra attributes on Data).
+        data._biochem_path = str(path)
         # Also keep a public attribute name; some code paths / collate behavior are
         # more reliable with non-private keys.
-        data.tier3_path = str(path)
+        data.biochem_path = str(path)
         return data
 
 
-def _tier3_data_source_key(data) -> Optional[str]:
+def _biochem_data_source_key(data) -> Optional[str]:
     """Resolve a stable source-path key for pseudo-label lookup/debug."""
-    src = getattr(data, "tier3_path", None)
+    src = getattr(data, "biochem_path", None)
     if src is None:
-        src = getattr(data, "_tier3_path", None)
+        src = getattr(data, "_biochem_path", None)
     if src is None:
         return None
     return str(src)
 
 
 def remap_stage_a_encoder_to_corrector(
-    tier2_weight: torch.Tensor,
+    kinematics_weight: torch.Tensor,
     target_weight_template: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Remap Tier-2 encoder input channels to Tier-3 layout.
+    Remap Phase-2 encoder input channels to Phase-3 layout.
 
-    Tier-2 encoded input width is 63; Tier-3 is 64 because one channel was
+    Phase-2 encoded input width is 63; Phase-3 is 64 because one channel was
     inserted in the "rest" block before uv/mu/wss priors. Preserve the prior
-    channels by shifting the Tier-2 tail by +1.
+    channels by shifting the Phase-2 tail by +1.
     """
-    if tier2_weight.shape == target_weight_template.shape:
-        return tier2_weight
+    if kinematics_weight.shape == target_weight_template.shape:
+        return kinematics_weight
 
     new_weight = torch.zeros_like(target_weight_template)
-    old_in = int(tier2_weight.shape[1])
+    old_in = int(kinematics_weight.shape[1])
     new_in = int(target_weight_template.shape[1])
 
     if old_in == 63 and new_in == 64:
         # Keep shared prefix, reserve one inserted channel at index 59,
         # then shift uv/mu/wss-related tail by +1 to preserve semantics.
-        new_weight[:, :59] = tier2_weight[:, :59]
-        new_weight[:, 60:64] = tier2_weight[:, 59:63]
+        new_weight[:, :59] = kinematics_weight[:, :59]
+        new_weight[:, 60:64] = kinematics_weight[:, 59:63]
         return new_weight
 
     # Safe fallback for unexpected shape pairs.
     min_dim = min(old_in, new_in)
-    new_weight[:, :min_dim] = tier2_weight[:, :min_dim]
+    new_weight[:, :min_dim] = kinematics_weight[:, :min_dim]
     return new_weight
 
 
 def load_dataset():
-    cfg_patients = VesselConfig(tier="tier3_patients")
-    cfg_synthetic = VesselConfig(tier="tier3")
+    cfg_patients = VesselConfig(phase="biochem_patients")
+    cfg_synthetic = VesselConfig(phase="biochem")
 
     patient_dir = cfg_patients.graph_output_dir
     synthetic_dir = cfg_synthetic.graph_output_dir
@@ -374,20 +374,20 @@ def load_dataset():
 
     if not patient_files and not synthetic_files:
         print(
-            f"No Tier 3 graphs found in {patient_dir} or {synthetic_dir}. "
-            f"Please generate/extract Tier 3 data first."
+            f"No Biochem graphs found in {patient_dir} or {synthetic_dir}. "
+            f"Please generate/extract Biochem data first."
         )
         return []
 
     file_list = patient_files + synthetic_files
-    max_load_raw = os.environ.get("TIER3_MAX_LOAD_VESSELS", "").strip()
+    max_load_raw = os.environ.get("BIOCHEM_MAX_LOAD_VESSELS", "").strip()
     if max_load_raw:
         try:
             max_load = max(1, int(max_load_raw))
         except ValueError:
             max_load = 0
         if max_load > 0 and len(file_list) > max_load:
-            shuffle_before_cap = os.environ.get("TIER3_MAX_LOAD_SHUFFLE", "1").strip().lower() in (
+            shuffle_before_cap = os.environ.get("BIOCHEM_MAX_LOAD_SHUFFLE", "1").strip().lower() in (
                 "1",
                 "true",
                 "yes",
@@ -398,12 +398,12 @@ def load_dataset():
                 rng.shuffle(file_list)
             file_list = file_list[:max_load]
             print(
-                f"✂️ Pre-load cap active (TIER3_MAX_LOAD_VESSELS={max_load}): "
+                f"✂️ Pre-load cap active (BIOCHEM_MAX_LOAD_VESSELS={max_load}): "
                 f"using {len(file_list)} graph files before split."
             )
     print(
-        f"📂 Found {len(patient_files)} Tier 3 anchor/patient graphs + "
-        f"{len(synthetic_files)} Tier 3 synthetic graphs for lazy loading..."
+        f"📂 Found {len(patient_files)} Biochem anchor/patient graphs + "
+        f"{len(synthetic_files)} Biochem synthetic graphs for lazy loading..."
     )
 
     # PyG ``Dataset`` requires a ``root``; loads use absolute paths in ``file_list``.
@@ -471,13 +471,13 @@ def initialize_biochem_priors(model):
             model.ode_func.derivative_scale.fill_(1e-3)
 
 
-def make_tier3_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> DynamicLossWeighter:
+def make_biochem_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> DynamicLossWeighter:
     """Per-task Kendall bounds: cap physics weights, floor supervised data weights."""
     # Hard cap the physics precision so PDE terms cannot be effectively muted.
     phys_ceiling = 10.0
-    data_floor = max(float(curriculum.tier3_data_precision_floor), 1e-12)
-    adr_s_floor = max(float(curriculum.tier3_adr_s_precision_floor), 1e-12)
-    w_phys_floor = max(float(curriculum.tier3_w_phys_precision_floor), 1e-12)
+    data_floor = max(float(curriculum.biochem_data_precision_floor), 1e-12)
+    adr_s_floor = max(float(curriculum.biochem_adr_s_precision_floor), 1e-12)
+    w_phys_floor = max(float(curriculum.biochem_w_phys_precision_floor), 1e-12)
     phys_min_lv = -math.log(phys_ceiling)
     data_max_lv = -math.log(data_floor)
     adr_s_max_lv = -math.log(adr_s_floor)
@@ -495,17 +495,17 @@ def make_tier3_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> Dy
         data_max_lv,       # Data_Bio
     ]
     print(
-        f"⚖️ Tier 3 loss weighter: physics prec ≤ {phys_ceiling:g} (log_var ≥ {phys_min_lv:.3f}), "
+        f"⚖️ Biochem loss weighter: physics prec ≤ {phys_ceiling:g} (log_var ≥ {phys_min_lv:.3f}), "
         f"ADR_S prec ≥ {adr_s_floor:g} (log_var ≤ {adr_s_max_lv:.3f}), "
         f"W_Phys prec ≥ {w_phys_floor:g} (log_var ≤ {w_phys_max_lv:.3f}), "
         f"data prec ≥ {data_floor:g} (log_var ≤ {data_max_lv:.3f}), "
-        f"freeze_in_warmup={curriculum.tier3_weighter_freeze_during_warmup}"
+        f"freeze_in_warmup={curriculum.biochem_weighter_freeze_during_warmup}"
     )
     return DynamicLossWeighter(num_losses=8, min_log_var=min_lv, max_log_var=max_lv).to(device)
 
 
-def inject_tier3_kinematic_lora(model: GNODE_Tier3, rank: int = 4, alpha: float = 1.0) -> None:
-    """Attach LoRA to SpectralLinear layers in the kinematic stack (call before ``setup_tier3_optimization``)."""
+def inject_biochem_kinematic_lora(model: GNODE_Phase3, rank: int = 4, alpha: float = 1.0) -> None:
+    """Attach LoRA to SpectralLinear layers in the kinematic stack (call before ``setup_biochem_optimization``)."""
     n_enc = inject_lora_to_spectral_linears(model.kin_encoder, rank=rank, alpha=alpha)
     n_proc = inject_lora_to_spectral_linears(model.kin_processor, rank=rank, alpha=alpha)
     n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
@@ -516,7 +516,7 @@ def inject_tier3_kinematic_lora(model: GNODE_Tier3, rank: int = 4, alpha: float 
     )
 
 
-def setup_tier3_optimization(model, loss_weighter, base_lr=1e-3):
+def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3):
     print("❄️  Verifying Kinematic Backbone is Frozen.")
     print("🔥 Activating LoRA layers, Biochemistry Encoders/Decoders, and Loss Weighter.")
 
@@ -566,7 +566,7 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
 
         for data in loader:
             data = data.to(device)
-            mask = tier3_truth_node_mask(data, int(data.x.shape[0]), device)
+            mask = biochem_truth_node_mask(data, int(data.x.shape[0]), device)
             if not mask.any():
                 continue
 
@@ -599,10 +599,10 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
     base_lr = float(optimizer.param_groups[0].get("lr", 1e-3))
     ode_rxn_lr = base_lr * 3.0
     ode_rxn_optimizer = optim.AdamW(model.ode_func.parameters(), lr=ode_rxn_lr, weight_decay=0.0)
-    on_frac = float(os.environ.get("TIER3_ODE_MANIFOLD_FRAC", "0.6"))
+    on_frac = float(os.environ.get("BIOCHEM_ODE_MANIFOLD_FRAC", "0.6"))
     print(
         f"🧪 ODE-RXN optimizer: lr={ode_rxn_lr:.3e} (base_lr x3.0) | "
-        f"on-manifold COMSOL species frac ≈ {on_frac:.2f} (TIER3_ODE_MANIFOLD_FRAC)"
+        f"on-manifold COMSOL species frac ≈ {on_frac:.2f} (BIOCHEM_ODE_MANIFOLD_FRAC)"
     )
 
     # Species ordering must match kinetics.compute_species_reactions inputs.
@@ -722,7 +722,7 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
         param.requires_grad = prior_requires_grad.get(name, True)
 
 
-def compute_tier3_loss(
+def compute_biochem_loss(
     model,
     data,
     kernels,
@@ -739,14 +739,14 @@ def compute_tier3_loss(
     curriculum = curriculum or CurriculumConfig()
 
     num_nodes_d = int(data.x.shape[0])
-    truth_mask = tier3_truth_node_mask(data, num_nodes_d, device)
+    truth_mask = biochem_truth_node_mask(data, num_nodes_d, device)
 
     re_ref = None
     if hasattr(data, 're_actual') and data.re_actual is not None:
         ra = data.re_actual
         re_ref = float(ra.mean().item()) if torch.is_tensor(ra) else float(ra)
 
-    # NS momentum uses Re = get_re(u_ref, d_bar), not PhysicsConfig.re_target directly. Tier 3 can
+    # NS momentum uses Re = get_re(u_ref, d_bar), not PhysicsConfig.re_target directly. Biochem can
     # override via ``re_actual`` (passed as re_ref). Fail fast with tensor dumps if Re would be <= 0.
     phys_cfg_ns = kernels.core.cfg
     u_s = data.u_ref.squeeze() if torch.is_tensor(data.u_ref) else data.u_ref
@@ -767,7 +767,7 @@ def compute_tier3_loss(
             f"u_ref={data.u_ref!r}, d_bar={data.d_bar!r}, re_actual={getattr(data, 're_actual', None)!r}"
         )
 
-    full_times = bio_cfg.resolve_tier3_times(data, device)
+    full_times = bio_cfg.resolve_biochem_times(data, device)
 
     actual_num_steps = int(data.y.shape[0])
     start_idx = 0
@@ -775,16 +775,16 @@ def compute_tier3_loss(
     y_true_trajectory = data.y
     teacher_forcing_ratio = 0.0
 
-    wu = curriculum.tier3_warmup_epochs
+    wu = curriculum.biochem_warmup_epochs
     if model.training:
         if epoch < wu:
             teacher_forcing_ratio = 1.0
         else:
-            decay_progress = (epoch - wu) / float(curriculum.tier3_teacher_force_decay_epochs)
-            decay_progress = _ease01(decay_progress, curriculum.tier3_curriculum_easing)
+            decay_progress = (epoch - wu) / float(curriculum.biochem_teacher_force_decay_epochs)
+            decay_progress = _ease01(decay_progress, curriculum.biochem_curriculum_easing)
             teacher_forcing_ratio = max(0.0, 1.0 - decay_progress)
 
-        # Teacher forcing uses COMSOL labels only where ``tier3_truth_node_mask`` is True
+        # Teacher forcing uses COMSOL labels only where ``biochem_truth_node_mask`` is True
         # (synthetic graphs: all False; patient graphs: spatially matched nodes only).
         if not truth_mask.any():
             teacher_forcing_ratio = 0.0
@@ -796,8 +796,8 @@ def compute_tier3_loss(
         if actual_num_steps > 2:
             window_cap = max(2, actual_num_steps - 1)
             # Keep windows small for stability/speed; random start_idx covers different trajectory regions.
-            # Override via TIER3_TBPTT_MAX_WINDOW=5|8|... when needed.
-            tbptt_cap = max(2, int(os.environ.get("TIER3_TBPTT_MAX_WINDOW", "8")))
+            # Override via BIOCHEM_TBPTT_MAX_WINDOW=5|8|... when needed.
+            tbptt_cap = max(2, int(os.environ.get("BIOCHEM_TBPTT_MAX_WINDOW", "8")))
             proposed_window = 5 + (epoch // 4)
             window_size = min(proposed_window, tbptt_cap, window_cap)
             if truth_mask.any():
@@ -807,7 +807,7 @@ def compute_tier3_loss(
                 else:
                     start_idx = 0
             else:
-                early_frac = float(os.environ.get("TIER3_SYNTH_TBPTT_EARLY_FRAC", "0.4"))
+                early_frac = float(os.environ.get("BIOCHEM_SYNTH_TBPTT_EARLY_FRAC", "0.4"))
                 early_frac = min(max(early_frac, 0.0), 1.0)
                 early_epochs = max(1, int(total_epochs * early_frac))
                 if epoch < early_epochs:
@@ -970,7 +970,7 @@ def compute_tier3_loss(
     )
 
     # Scale volume-heavy residuals by ~1/sqrt(N) so different mesh sizes are comparable in Kendall weighting.
-    if curriculum.tier3_physics_geom_normalization:
+    if curriculum.biochem_physics_geom_normalization:
         geom_inv = 1.0 / math.sqrt(max(1.0, float(num_nodes_d)))
         l_adr_fast = l_adr_fast * geom_inv
         l_adr_slow = l_adr_slow * geom_inv
@@ -982,15 +982,15 @@ def compute_tier3_loss(
     # --- Auxiliary segmentation (soft clot Dice) + COMSOL temporal derivative match (physics-informed) ---
     l_seg = torch.tensor(0.0, device=device)
     l_phys_temp = torch.tensor(0.0, device=device)
-    w_seg = float(os.environ.get("TIER3_SOFT_DICE_WEIGHT", "0.05"))
-    w_pt = float(os.environ.get("TIER3_COMSOL_TEMPORAL_WEIGHT", "0.02"))
+    w_seg = float(os.environ.get("BIOCHEM_SOFT_DICE_WEIGHT", "0.05"))
+    w_pt = float(os.environ.get("BIOCHEM_COMSOL_TEMPORAL_WEIGHT", "0.02"))
     phys_cfg = kernels.core.cfg
     mu_ch = STATE_CHANNEL_MU_EFF_ND
     if model.training and has_anchor_supervision and w_seg > 0.0:
         mu_p = phys_cfg.viscosity_nd_to_si(pred_final[:, mu_ch])
         mu_g = phys_cfg.viscosity_nd_to_si(y_true_trajectory[-1, :, mu_ch])
         thr = 20.0 * phys_cfg.mu_viscosity_nd_scale
-        tau_si = max(float(os.environ.get("TIER3_SOFT_DICE_TEMP_SI", "5e-4")), 1e-12)
+        tau_si = max(float(os.environ.get("BIOCHEM_SOFT_DICE_TEMP_SI", "5e-4")), 1e-12)
         p = torch.sigmoid((mu_p - thr) / tau_si)
         g = (mu_g > thr).float()
         m = truth_mask
@@ -1012,7 +1012,7 @@ def compute_tier3_loss(
         gd = (target_series[1:, node_is_anchor] - target_series[:-1, node_is_anchor]) / dtv
         l_phys_temp = F.huber_loss(pd, gd, reduction="mean", delta=1.0)
 
-    latent_scale = float(os.environ.get("TIER3_LATENT_REG_SCALE", "1e-3"))
+    latent_scale = float(os.environ.get("BIOCHEM_LATENT_REG_SCALE", "1e-3"))
 
     # Eight Kendall tasks: skip supervised heads on non-anchor batches.
     all_losses = [
@@ -1074,7 +1074,7 @@ def compute_tier3_loss(
     }
     if debug_batch is not None:
         de, dbi = debug_batch
-        _debug_tier3_batch(
+        _debug_biochem_batch(
             epoch=de,
             batch_idx=dbi,
             data=data,
@@ -1100,7 +1100,7 @@ def calculate_validation_metrics(pred, data, kernels, device):
     props = kernels.core._get_geometric_props(data)
 
     num_nodes = int(data.num_nodes)
-    truth_mask = tier3_truth_node_mask(data, num_nodes, pred.device)
+    truth_mask = biochem_truth_node_mask(data, num_nodes, pred.device)
 
     if pred.shape[0] != num_nodes:
         raise ValueError(
@@ -1109,7 +1109,7 @@ def calculate_validation_metrics(pred, data, kernels, device):
         )
     if data.y.dim() != 3:
         raise ValueError(
-            "calculate_validation_metrics expects data.y shaped [T, N, C] (tier-3 trajectories); "
+            "calculate_validation_metrics expects data.y shaped [T, N, C] (phase-3 trajectories); "
             f"got {tuple(data.y.shape)}."
         )
     if data.y.shape[1] != num_nodes:
@@ -1237,7 +1237,7 @@ def calculate_validation_metrics(pred, data, kernels, device):
     return dice.item(), pearson_corr.item(), max_fibrin_pred, wss_diag
 
 
-def _tier3_save_val_debug_plot(
+def _biochem_save_val_debug_plot(
     out_dir,
     epoch: int,
     pred_last,
@@ -1253,7 +1253,7 @@ def _tier3_save_val_debug_plot(
         import matplotlib.pyplot as plt
     except Exception:
         return
-    truth_mask = tier3_truth_node_mask(v_data, int(v_data.num_nodes), device)
+    truth_mask = biochem_truth_node_mask(v_data, int(v_data.num_nodes), device)
     if not truth_mask.any():
         return
     phys_cfg = kernels.core.cfg
@@ -1271,7 +1271,7 @@ def _tier3_save_val_debug_plot(
     ax.set_ylabel("Pred μ (SI)")
     ax.set_title(f"Val μ (truth nodes) epoch {epoch}")
     fig.tight_layout()
-    fig.savefig(out_dir / f"tier3_val_mu_epoch_{epoch:04d}.png", dpi=120)
+    fig.savefig(out_dir / f"biochem_val_mu_epoch_{epoch:04d}.png", dpi=120)
     plt.close(fig)
 
 
@@ -1283,7 +1283,7 @@ def _compute_anchor_dice(model, loader, kernels, bio_cfg, device) -> float:
     with torch.no_grad():
         for v_data in loader:
             v_data = v_data.to(device)
-            val_eval_times = bio_cfg.resolve_tier3_times(v_data, device)
+            val_eval_times = bio_cfg.resolve_biochem_times(v_data, device)
             v_pred = model(v_data, val_eval_times)
             if isinstance(v_pred, tuple):
                 v_pred = v_pred[0]
@@ -1309,8 +1309,8 @@ def train_teacher_on_anchors(
         return None, 0.0
 
     teacher = copy.deepcopy(student_model).to(device)
-    teacher_weighter = make_tier3_dynamic_loss_weighter(curriculum, device)
-    teacher_optimizer = setup_tier3_optimization(teacher, teacher_weighter, base_lr=base_lr)
+    teacher_weighter = make_biochem_dynamic_loss_weighter(curriculum, device)
+    teacher_optimizer = setup_biochem_optimization(teacher, teacher_weighter, base_lr=base_lr)
     teacher_loader = DataLoader(train_anchor_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
     teacher_val_loader = DataLoader(val_anchor_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
     train_anchor_keys = {str(p) for p in getattr(train_anchor_dataset, "file_list", [])}
@@ -1331,8 +1331,8 @@ def train_teacher_on_anchors(
             f"({overlap_ratio:.1%}) shared between train and val."
         )
 
-    max_epochs = max(1, int(os.environ.get("TIER3_TEACHER_MAX_EPOCHS", "12")))
-    target_dice = float(os.environ.get("TIER3_TEACHER_TARGET_DICE", "0.55"))
+    max_epochs = max(1, int(os.environ.get("BIOCHEM_TEACHER_MAX_EPOCHS", "12")))
+    target_dice = float(os.environ.get("BIOCHEM_TEACHER_TARGET_DICE", "0.55"))
     accumulation_steps = 4
     best_state = None
     best_dice = -1.0
@@ -1350,7 +1350,7 @@ def train_teacher_on_anchors(
         for batch_idx, data in enumerate(teacher_loader):
             data = data.to(device)
             data.x.requires_grad_(True)
-            loss, _ = compute_tier3_loss(
+            loss, _ = compute_biochem_loss(
                 teacher,
                 data,
                 kernels,
@@ -1398,11 +1398,11 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
     print(f"🧾 Building pseudo-label bank for {len(synthetic_dataset)} synthetic graphs...")
     with torch.no_grad():
         for data in synth_loader:
-            src = _tier3_data_source_key(data)
+            src = _biochem_data_source_key(data)
             if src is None:
                 continue
             data = data.to(device)
-            eval_times = bio_cfg.resolve_tier3_times(data, device)
+            eval_times = bio_cfg.resolve_biochem_times(data, device)
             pred = teacher(data, eval_times)
             if isinstance(pred, tuple):
                 pred = pred[0]
@@ -1411,25 +1411,25 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
     return pseudo
 
 
-def train_t3_corrector(epochs=25, lr=1e-3):
+def train_biochem_corrector(epochs=25, lr=1e-3):
     device = resolve_training_device()
     print(f"Device: {device}")
     if device.type == "cpu":
         print(
             "CPU: biochem ODE uses 32 RK4 substeps per segment by default "
-            "(faster; set TIER3_ADJOINT_RK4_SUBSTEPS=128 to match GPU fidelity)."
+            "(faster; set BIOCHEM_ADJOINT_RK4_SUBSTEPS=128 to match GPU fidelity)."
         )
     else:
         configure_cuda_for_training(device)
 
-    phys_cfg = PhysicsConfig(tier="tier3")
-    bio_cfg = BiochemConfig(tier="tier3")
+    phys_cfg = PhysicsConfig(phase="biochem")
+    bio_cfg = BiochemConfig(phase="biochem")
     curriculum = CurriculumConfig()
     core_kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels = BiochemPhysicsKernels(biochem_cfg=bio_cfg, core_physics_kernels=core_kernels)
 
     # PASS PHYS_CFG TO MODEL
-    model = GNODE_Tier3(
+    model = GNODE_Phase3(
         phys_cfg=phys_cfg,
         in_channels=12,
         spatial_channels=15,
@@ -1442,30 +1442,31 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
     ).to(device)
 
-    # 1. Backbone weights: Tier 2 -> Tier 3 by default; optional tier3_best_bio or full latest resume
+    # 1. Backbone weights: Kinematics -> Biochem by default; optional biochem_best_bio or full latest resume
     root = get_project_root()
     model_dir = stage_b_dir()
-    tier3_resume_path = resolve_checkpoint("b", "tier3_best_bio.pth")
-    tier2_path = resolve_checkpoint("a", "tier2_best_physics.pth")
-    latest_ckpt_path = resolve_checkpoint("b", "tier3_latest_checkpoint.pth")
-    resume_enabled = (os.environ.get("TIER3_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
-    init_from_best = (os.environ.get("TIER3_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
+    biochem_resume_path = resolve_checkpoint("b", "biochem_best_bio.pth")
+    # Unified Kine phase handoff: prefer final unified kinematics checkpoint.
+    kinematics_path = resolve_checkpoint("a", "kinematics_ckpt_100.pth")
+    latest_ckpt_path = resolve_checkpoint("b", "biochem_latest_checkpoint.pth")
+    resume_enabled = (os.environ.get("BIOCHEM_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
+    init_from_best = (os.environ.get("BIOCHEM_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
     will_resume_from_latest = bool(resume_enabled and latest_ckpt_path.exists())
-    load_tier3_best_weights = (init_from_best or resume_enabled) and tier3_resume_path.exists()
+    load_biochem_best_weights = (init_from_best or resume_enabled) and biochem_resume_path.exists()
 
-    loaded_tier3_best_backbone = False
+    loaded_biochem_best_backbone = False
     if will_resume_from_latest:
         print(
-            "ℹ️ TIER3_RESUME: will restore full training state from tier3_latest_checkpoint.pth "
+            "ℹ️ BIOCHEM_RESUME: will restore full training state from biochem_latest_checkpoint.pth "
             "(skipping backbone load here)."
         )
-    elif load_tier3_best_weights:
-        resume_state = torch.load(tier3_resume_path, map_location=device, weights_only=True)
+    elif load_biochem_best_weights:
+        resume_state = torch.load(biochem_resume_path, map_location=device, weights_only=True)
         model.load_state_dict(resume_state, strict=False)
-        loaded_tier3_best_backbone = True
-        print(f"🔁 Initialized Tier 3 weights from {tier3_resume_path.name}")
-    elif tier2_path.exists():
-        state_dict = torch.load(tier2_path, map_location=device, weights_only=True)
+        loaded_biochem_best_backbone = True
+        print(f"🔁 Initialized Biochem weights from {biochem_resume_path.name}")
+    elif kinematics_path.exists():
+        state_dict = torch.load(kinematics_path, map_location=device, weights_only=True)
 
         mapped_state_dict = {}
         for key, value in state_dict.items():
@@ -1479,47 +1480,47 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             elif key.startswith('mu_encoder.'):
                 mapped_state_dict[key] = value
 
-        # --- Dynamic channel expansion surgery (Tier 2 -> Tier 3) ---
+        # --- Dynamic channel expansion surgery (Kinematics -> Biochem) ---
         if 'kin_encoder.0.weight' in mapped_state_dict:
-            tier2_weight = mapped_state_dict['kin_encoder.0.weight']
+            kinematics_weight = mapped_state_dict['kin_encoder.0.weight']
             model_weight = model.kin_encoder[0].weight
-            if tier2_weight.shape[1] != model_weight.shape[1]:
-                print(f"🔧 Adapting Tier 2 encoder weights ({tier2_weight.shape[1]} -> {model_weight.shape[1]})...")
-                new_weight = remap_stage_a_encoder_to_corrector(tier2_weight, model_weight)
+            if kinematics_weight.shape[1] != model_weight.shape[1]:
+                print(f"🔧 Adapting Kinematics encoder weights ({kinematics_weight.shape[1]} -> {model_weight.shape[1]})...")
+                new_weight = remap_stage_a_encoder_to_corrector(kinematics_weight, model_weight)
                 mapped_state_dict['kin_encoder.0.weight'] = new_weight
         # ------------------------------------------------------------
 
         model.load_state_dict(mapped_state_dict, strict=False)
-        print("✅ Successfully loaded Tier 2 kinematic weights into Tier 3 backbone.")
+        print("✅ Successfully loaded Kinematics kinematic weights into Biochem backbone.")
     elif init_from_best or resume_enabled:
         print(
-            f"⚠️ Warning: no Tier 3 best checkpoint at {tier3_resume_path.name} and no Tier 2 weights at "
-            f"{tier2_path.name}."
+            f"⚠️ Warning: no Biochem best checkpoint at {biochem_resume_path.name} and no Kinematics weights at "
+            f"{kinematics_path.name}."
         )
 
     if will_resume_from_latest:
-        pass  # biochem + kinematics come from tier3_latest_checkpoint.pth
-    elif loaded_tier3_best_backbone:
-        print("⏭️ Skipping biochem prior initialization because Tier 3 best checkpoint was loaded.")
+        pass  # biochem + kinematics come from biochem_latest_checkpoint.pth
+    elif loaded_biochem_best_backbone:
+        print("⏭️ Skipping biochem prior initialization because Biochem best checkpoint was loaded.")
     else:
         initialize_biochem_priors(model)
-    loss_weighter = make_tier3_dynamic_loss_weighter(curriculum, device)
+    loss_weighter = make_biochem_dynamic_loss_weighter(curriculum, device)
 
     print("💉 Injecting LoRA into kinematic modules (SpectralLinear layers)...")
-    inject_tier3_kinematic_lora(model)
+    inject_biochem_kinematic_lora(model)
 
-    if _tier3_debug_enabled():
-        cap = _tier3_debug_batches_cap()
+    if _biochem_debug_enabled():
+        cap = _biochem_debug_batches_cap()
         try:
-            lp = _tier3_debug_log_path()
+            lp = _biochem_debug_log_path()
             lp.parent.mkdir(parents=True, exist_ok=True)
             lp.write_text("", encoding="utf-8")
         except OSError:
             pass
-        _tier3_dbg_line(
-            f"[TIER3_DEBUG] Logging first {cap} batches each epoch → {_tier3_debug_log_path()} "
-            "(set TIER3_DEBUG_BATCHES). vs f958b74 (2026-04-03): that tree wrote phys_cfg.re_target "
-            "from each batch inside compute_tier3_loss; HEAD uses fixed PhysicsConfig + per-batch re_ref for NS only."
+        _biochem_dbg_line(
+            f"[BIOCHEM_DEBUG] Logging first {cap} batches each epoch → {_biochem_debug_log_path()} "
+            "(set BIOCHEM_DEBUG_BATCHES). vs f958b74 (2026-04-03): that tree wrote phys_cfg.re_target "
+            "from each batch inside compute_biochem_loss; HEAD uses fixed PhysicsConfig + per-batch re_ref for NS only."
         )
 
     dataset = load_dataset()
@@ -1529,7 +1530,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     # Keep loading lazy: split by file path metadata instead of materializing all graphs.
     all_files = list(dataset.file_list)
     anchors, physics = [], []
-    print("🔎 Indexing Tier 3 files by anchor flag (lazy split)...")
+    print("🔎 Indexing Biochem files by anchor flag (lazy split)...")
     for graph_path in all_files:
         graph = torch.load(graph_path, map_location="cpu", weights_only=False)
         ia = getattr(graph, "is_anchor", None)
@@ -1550,8 +1551,8 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     random.shuffle(anchors)
     random.shuffle(physics)
     n_anchors_total = len(anchors)
-    low_anchor_threshold = max(1, int(os.environ.get("TIER3_LOW_ANCHOR_THRESHOLD", "5")))
-    force_low_anchor_mode = (os.environ.get("TIER3_LOW_ANCHOR_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
+    low_anchor_threshold = max(1, int(os.environ.get("BIOCHEM_LOW_ANCHOR_THRESHOLD", "5")))
+    force_low_anchor_mode = (os.environ.get("BIOCHEM_LOW_ANCHOR_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
     low_anchor_mode = force_low_anchor_mode or (0 < n_anchors_total < low_anchor_threshold)
     if low_anchor_mode:
         print(
@@ -1559,7 +1560,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             "Training emphasizes pipeline health/debug over generalization."
         )
 
-    min_trust = int(curriculum.tier3_min_anchors_for_trusted_metrics)
+    min_trust = int(curriculum.biochem_min_anchors_for_trusted_metrics)
     metrics_trustworthy = n_anchors_total >= min_trust
     if not metrics_trustworthy:
         print(
@@ -1619,7 +1620,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     train_synth_dataset = PatientDataset(root=_ds_root, file_list=train_physics)
 
     # IMPORTANT:
-    # Tier 3 graphs store trajectories as y: [T, N, 16]. With vanilla PyG batching,
+    # Biochem graphs store trajectories as y: [T, N, 16]. With vanilla PyG batching,
     # x concatenates over nodes while y concatenates over time, which misaligns tensors.
     # Use batch_size=1 and gradient accumulation for stable/equivalent optimization.
     accumulation_steps = 4
@@ -1655,17 +1656,17 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
-    optimizer = setup_tier3_optimization(model, loss_weighter, base_lr=lr)
+    optimizer = setup_biochem_optimization(model, loss_weighter, base_lr=lr)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     start_epoch = 0
     best_composite = -1.0e9
     dice_ema: Optional[float] = None
-    latest_ckpt_save = model_dir / "tier3_latest_checkpoint.pth"
-    ckpt_every = max(1, int(os.environ.get("TIER3_CKPT_EVERY", "1")))
+    latest_ckpt_save = model_dir / "biochem_latest_checkpoint.pth"
+    ckpt_every = max(1, int(os.environ.get("BIOCHEM_CKPT_EVERY", "1")))
 
     if resume_enabled and latest_ckpt_path.exists():
-        print(f"🔄 Resuming Tier 3 from checkpoint: {latest_ckpt_path}")
+        print(f"🔄 Resuming Biochem from checkpoint: {latest_ckpt_path}")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -1680,7 +1681,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             dice_ema = float(dice_ema)
         teacher_best_dice = float(ckpt.get("teacher_best_dice", 0.0))
         pseudo_w = float(ckpt.get("pseudo_w", 0.0))
-        print("🧾 Rebuilding pseudo-label bank from resumed Tier 3 weights...")
+        print("🧾 Rebuilding pseudo-label bank from resumed Biochem weights...")
         temp_teacher = copy.deepcopy(model).to(device)
         temp_teacher.eval()
         for p in temp_teacher.parameters():
@@ -1698,9 +1699,9 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 f"🧾 Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
                 f"({pseudo_cov:.1%}) synthetic graphs."
             )
-        print(f"✅ Tier 3 resume complete at epoch {start_epoch}.")
+        print(f"✅ Biochem resume complete at epoch {start_epoch}.")
     elif resume_enabled:
-        print(f"ℹ️ TIER3_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
+        print(f"ℹ️ BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
     else:
         pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5)
         teacher, teacher_best_dice = train_teacher_on_anchors(
@@ -1726,27 +1727,27 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 f"🧾 Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
                 f"({pseudo_cov:.1%}) synthetic graphs."
             )
-        pseudo_w_base = float(os.environ.get("TIER3_SYNTH_PSEUDO_WEIGHT", "0.5"))
-        min_td = float(os.environ.get("TIER3_PSEUDO_MIN_TEACHER_DICE", "0.08"))
+        pseudo_w_base = float(os.environ.get("BIOCHEM_SYNTH_PSEUDO_WEIGHT", "0.5"))
+        min_td = float(os.environ.get("BIOCHEM_PSEUDO_MIN_TEACHER_DICE", "0.08"))
         if teacher_best_dice < min_td:
             pseudo_w = 0.0
             print(
                 f"🧷 Synthetic pseudo-label weight set to 0 (teacher val Dice {teacher_best_dice:.4f} < "
-                f"TIER3_PSEUDO_MIN_TEACHER_DICE={min_td})."
+                f"BIOCHEM_PSEUDO_MIN_TEACHER_DICE={min_td})."
             )
         else:
-            ramp = min(1.0, teacher_best_dice / max(float(os.environ.get("TIER3_PSEUDO_TEACHER_REF_DICE", "0.45")), 1e-6))
+            ramp = min(1.0, teacher_best_dice / max(float(os.environ.get("BIOCHEM_PSEUDO_TEACHER_REF_DICE", "0.45")), 1e-6))
             pseudo_w = pseudo_w_base * ramp
             print(
                 f"🧷 Synthetic pseudo-label loss weight: {pseudo_w:.3f} "
                 f"(base={pseudo_w_base:.3f}, teacher_dice={teacher_best_dice:.4f}, ramp={ramp:.3f})"
             )
 
-    dice_ema_beta = float(os.environ.get("TIER3_VAL_DICE_EMA", "0.25"))
-    ckpt_pearson_w = float(os.environ.get("TIER3_CKPT_PEARSON_WEIGHT", "0.02"))
+    dice_ema_beta = float(os.environ.get("BIOCHEM_VAL_DICE_EMA", "0.25"))
+    ckpt_pearson_w = float(os.environ.get("BIOCHEM_CKPT_PEARSON_WEIGHT", "0.02"))
 
-    cfg_paths = VesselConfig(tier="tier3")
-    diary = TrainingDiary("tier3")
+    cfg_paths = VesselConfig(phase="biochem")
+    diary = TrainingDiary("biochem")
     diary.log_run_start(
         device=str(device),
         re_target=float(phys_cfg.re_target),
@@ -1771,13 +1772,13 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         teacher_best_dice=float(teacher_best_dice),
         pseudo_w=float(pseudo_w),
         pseudo_bank_size=len(pseudo_bank),
-        tier3_warmup_epochs=int(curriculum.tier3_warmup_epochs),
+        biochem_warmup_epochs=int(curriculum.biochem_warmup_epochs),
         dice_ema_beta=float(dice_ema_beta),
         ckpt_pearson_weight=float(ckpt_pearson_w),
         resume_enabled=bool(resume_enabled),
         resumed_latest_checkpoint=bool(resume_enabled and latest_ckpt_path.exists()),
         ckpt_every=int(ckpt_every),
-        env_tier3_phase1=env_snapshot("TIER3_", "PHASE1_"),
+        env_biochem_kinematics=env_snapshot("BIOCHEM_", "KINEMATICS_"),
         run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
         diary_main_path=str(diary.path) if diary.path is not None else None,
     )
@@ -1785,7 +1786,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
     run_end_emitted = False
     last_epoch_completed: Optional[int] = None
 
-    def _emit_tier3_run_end(interrupted: bool = False) -> None:
+    def _emit_biochem_run_end(interrupted: bool = False) -> None:
         nonlocal run_end_emitted
         if run_end_emitted or not diary.enabled:
             return
@@ -1798,35 +1799,35 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             pseudo_w=float(pseudo_w),
             dice_ema=float(dice_ema) if dice_ema is not None else None,
             diary_path=str(diary.path) if diary.path else None,
-            tier3_best_bio=str(model_dir / "tier3_best_bio.pth"),
-            tier3_latest_checkpoint=str(latest_ckpt_save),
+            biochem_best_bio=str(model_dir / "biochem_best_bio.pth"),
+            biochem_latest_checkpoint=str(latest_ckpt_save),
             interrupted=bool(interrupted),
             last_epoch_completed=last_epoch_completed,
         )
 
-    atexit.register(lambda: _emit_tier3_run_end(True))
+    atexit.register(lambda: _emit_biochem_run_end(True))
 
     print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
-    watchdog_sec = float(os.environ.get("TIER3_BATCH_WATCHDOG_SEC", "300"))
+    watchdog_sec = float(os.environ.get("BIOCHEM_BATCH_WATCHDOG_SEC", "300"))
 
     for epoch in range(start_epoch, epochs):
         last_epoch_completed = epoch
-        wu = curriculum.tier3_warmup_epochs
+        wu = curriculum.biochem_warmup_epochs
 
-        ease = curriculum.tier3_curriculum_easing
+        ease = curriculum.biochem_curriculum_easing
         if epoch < wu:
             # --- STAGE A: THE PREDICTOR ---
             current_mu_ratio = 1.0  # Force strictly neutral rheology
             span = max(float(wu - 1), 1.0)
             t_w = _ease01(epoch / span, ease)
-            current_T_scale = curriculum.tier3_t_scale_warmup_initial - t_w * (
-                curriculum.tier3_t_scale_warmup_initial - curriculum.tier3_t_scale_warmup_final
+            current_T_scale = curriculum.biochem_t_scale_warmup_initial - t_w * (
+                curriculum.biochem_t_scale_warmup_initial - curriculum.biochem_t_scale_warmup_final
             )
 
             # Freeze LoRA to prevent overfitting to the static flow field
             if epoch == 0:
-                print("🔒 Stage A (Predictor): Freezing LoRA layers for pure transport learning.")
+                print("🔒 Kine phase (Predictor): Freezing LoRA layers for pure transport learning.")
             for _name, param in model.named_parameters():
                 if "lora" in _name.lower():
                     param.requires_grad = False
@@ -1837,13 +1838,13 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             current_mu_ratio = bio_cfg.mu_ratio_init + progress * (
                 bio_cfg.mu_ratio_max - bio_cfg.mu_ratio_init
             )
-            current_T_scale = curriculum.tier3_t_scale_coupled_initial - progress * (
-                curriculum.tier3_t_scale_coupled_initial - curriculum.tier3_t_scale_coupled_final
+            current_T_scale = curriculum.biochem_t_scale_coupled_initial - progress * (
+                curriculum.biochem_t_scale_coupled_initial - curriculum.biochem_t_scale_coupled_final
             )
 
             # Unfreeze LoRA to allow kinematic co-adaptation
             if epoch == wu:
-                print("🔥 Stage B (Corrector): Unfreezing LoRA layers. Activating rheological feedback.")
+                print("🔥 Biochem phase (Corrector): Unfreezing LoRA layers. Activating rheological feedback.")
             for _name, param in model.named_parameters():
                 if "lora" in _name.lower():
                     param.requires_grad = True
@@ -1858,8 +1859,8 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         # FIX: Capitalized 'T' here as well
         print(f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | T_scale: {current_T_scale:.2f}")
 
-        if curriculum.tier3_weighter_freeze_during_warmup:
-            phys_start = wu + int(curriculum.tier3_weighter_physics_grace_epochs)
+        if curriculum.biochem_weighter_freeze_during_warmup:
+            phys_start = wu + int(curriculum.biochem_weighter_physics_grace_epochs)
             if epoch < wu:
                 loss_weighter.log_vars.requires_grad_(False)
             elif epoch < phys_start:
@@ -1867,7 +1868,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 loss_weighter.log_vars[6:].requires_grad_(True)
                 if epoch == wu:
                     print(
-                        "⚖️  Tier 3 warmup done: unfreezing **data** Kendall log_vars "
+                        "⚖️  Biochem warmup done: unfreezing **data** Kendall log_vars "
                         f"(indices 6–7); physics log_vars frozen until epoch {phys_start}."
                     )
             else:
@@ -1881,12 +1882,12 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         total_loss_epoch = 0.0
         optimizer.zero_grad()
 
-        # Epoch-level TF schedule (matches compute_tier3_loss; per-batch TF_eff may be 0 without truth nodes).
+        # Epoch-level TF schedule (matches compute_biochem_loss; per-batch TF_eff may be 0 without truth nodes).
         if epoch < wu:
             teacher_forcing_ratio = 1.0
         else:
-            decay_progress = (epoch - wu) / float(curriculum.tier3_teacher_force_decay_epochs)
-            decay_progress = _ease01(decay_progress, curriculum.tier3_curriculum_easing)
+            decay_progress = (epoch - wu) / float(curriculum.biochem_teacher_force_decay_epochs)
+            decay_progress = _ease01(decay_progress, curriculum.biochem_curriculum_easing)
             teacher_forcing_ratio = max(0.0, 1.0 - decay_progress)
 
         # EMA-smoothed progress metrics for less noisy tqdm feedback.
@@ -1898,17 +1899,17 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         total_batches = 0
         ode_zero_batches = 0
 
-        pbar = tqdm(loader, desc=f"Tier 3 Ep {epoch:02d}")
+        pbar = tqdm(loader, desc=f"Biochem Ep {epoch:02d}")
         for batch_idx, data in enumerate(pbar):
             total_batches += 1
             batch_t0 = time.perf_counter()
             data = data.to(device)
             data.x.requires_grad_(True)
-            data_src = _tier3_data_source_key(data)
+            data_src = _biochem_data_source_key(data)
             pseudo_target = pseudo_bank.get(data_src) if (data_src is not None and data_src in pseudo_bank) else None
 
-            dbg = (epoch, batch_idx) if _tier3_should_log_batch(epoch, batch_idx) else None
-            loss, metrics = compute_tier3_loss(
+            dbg = (epoch, batch_idx) if _biochem_should_log_batch(epoch, batch_idx) else None
+            loss, metrics = compute_biochem_loss(
                 model,
                 data,
                 kernels,
@@ -1935,10 +1936,10 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 continue
 
             if not loss.requires_grad:
-                src = getattr(data, "_tier3_path", "<unknown>")
+                src = getattr(data, "_biochem_path", "<unknown>")
                 no_grad_skipped_batches += 1
-                _tier3_dbg_line(
-                    "⚠️ Tier3 loss has no grad_fn before backward(); skipping micro-batch. "
+                _biochem_dbg_line(
+                    "⚠️ Phase3 loss has no grad_fn before backward(); skipping micro-batch. "
                     f"epoch={epoch} batch={batch_idx} src={src} "
                     f"TF_eff={metrics.get('TF_eff')} "
                     f"Has_Anchor_Supervision={metrics.get('Has_Anchor_Supervision')} "
@@ -1950,14 +1951,14 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 )
                 continue
             loss.backward()
-            if _tier3_should_log_batch(epoch, batch_idx):
+            if _biochem_should_log_batch(epoch, batch_idx):
                 sq = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
                         g = p.grad.detach().data
                         sq += float((g * g).sum().item())
-                _tier3_dbg_line(
-                    f"[TIER3_DEBUG] epoch={epoch} batch={batch_idx} grad_L2={math.sqrt(sq):.4e} (micro-batch)"
+                _biochem_dbg_line(
+                    f"[BIOCHEM_DEBUG] epoch={epoch} batch={batch_idx} grad_L2={math.sqrt(sq):.4e} (micro-batch)"
                 )
 
             if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
@@ -1967,7 +1968,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
 
             batch_dt = time.perf_counter() - batch_t0
             if batch_dt > watchdog_sec:
-                _tier3_dbg_line(
+                _biochem_dbg_line(
                     f"⏱️ [Watchdog] slow batch epoch={epoch} batch={batch_idx} "
                     f"dt={batch_dt:.2f}s ODE_evals={int(metrics.get('ODE_Evals', 0))}"
                 )
@@ -2067,7 +2068,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    val_eval_times = bio_cfg.resolve_tier3_times(v_data, device)
+                    val_eval_times = bio_cfg.resolve_biochem_times(v_data, device)
                     v_pred = model(v_data, val_eval_times)
                     if isinstance(v_pred, tuple):
                         v_pred = v_pred[0]
@@ -2120,7 +2121,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
             if composite_score > best_composite:
                 best_composite = composite_score
                 model_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), model_dir / "tier3_best_bio.pth")
+                torch.save(model.state_dict(), model_dir / "biochem_best_bio.pth")
                 print(
                     f"⭐ Saved best checkpoint (composite={composite_score:.4f} = dice_ema + "
                     f"{ckpt_pearson_w:g}*pearson; dice_ema={dice_ema_local:.4f})"
@@ -2165,7 +2166,7 @@ def train_t3_corrector(epochs=25, lr=1e-3):
         }
         if val_log is not None:
             log_row.update(val_log)
-        _tier3_append_jsonl(log_row)
+        _biochem_append_jsonl(log_row)
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:
@@ -2181,23 +2182,23 @@ def train_t3_corrector(epochs=25, lr=1e-3):
                 "pseudo_w": pseudo_w,
             }
             torch.save(checkpoint, latest_ckpt_save)
-            print(f"💾 Saved Tier 3 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
+            print(f"💾 Saved Biochem checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
 
-    _emit_tier3_run_end(interrupted=False)
+    _emit_biochem_run_end(interrupted=False)
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Tier 3 GNODE corrector training.")
+    p = argparse.ArgumentParser(description="Biochem GNODE corrector training.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from tier3_latest_checkpoint.pth (sets TIER3_RESUME=1).",
+        help="Resume from biochem_latest_checkpoint.pth (sets BIOCHEM_RESUME=1).",
     )
     mode.add_argument(
         "--new",
         action="store_true",
-        help="Start a new run (sets TIER3_RESUME=0 and TIER3_INIT_FROM_BEST=0).",
+        help="Start a new run (sets BIOCHEM_RESUME=0 and BIOCHEM_INIT_FROM_BEST=0).",
     )
     return p.parse_args()
 
@@ -2221,22 +2222,22 @@ if __name__ == "__main__":
         resume_enabled = False
     else:
         resume_enabled = _prompt_resume_or_new_t3()
-    os.environ["TIER3_RESUME"] = "1" if resume_enabled else "0"
+    os.environ["BIOCHEM_RESUME"] = "1" if resume_enabled else "0"
     if not resume_enabled:
-        os.environ["TIER3_INIT_FROM_BEST"] = "0"
+        os.environ["BIOCHEM_INIT_FROM_BEST"] = "0"
     print(
-        "🔄 Resuming Tier 3 from latest checkpoint."
+        "🔄 Resuming Biochem from latest checkpoint."
         if resume_enabled
-        else "🆕 Starting a new Tier 3 run."
+        else "🆕 Starting a new Biochem run."
     )
     try:
-        train_t3_corrector()
+        train_biochem_corrector()
     except KeyboardInterrupt:
         print("\n🛑 Training interrupted by user (KeyboardInterrupt).")
         raise
     except torch.cuda.OutOfMemoryError as e:
-        print(f"\n💥 CUDA out of memory during Tier 3 training: {e}")
+        print(f"\n💥 CUDA out of memory during Biochem training: {e}")
         raise
     except Exception as e:
-        print(f"\n💥 Unhandled exception during Tier 3 training: {type(e).__name__}: {e}")
+        print(f"\n💥 Unhandled exception during Biochem training: {type(e).__name__}: {e}")
         raise

@@ -1,12 +1,12 @@
 ﻿"""
-Tier 3 synthetic mesh-to-graph conversion.
+Biochem synthetic mesh-to-graph conversion.
 
 **2D planar vessels only** (in-plane lumen); velocity priors match 2D plane Poiseuille,
 not 3D pipe flow.
 
-Scope: non-anchor Tier 3 samples (synthetic meshes / priors-only trajectory setup).
+Scope: non-anchor Biochem samples (synthetic meshes / priors-only trajectory setup).
 Anchor/patient samples with COMSOL trajectories are produced by:
-``src.data_gen.lib.extract_tier3_comsol_data.PatientDataExtractor``.
+``src.data_gen.lib.extract_biochem_comsol_data.PatientDataExtractor``.
 """
 
 import os
@@ -30,9 +30,9 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
 
-def default_tier3_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
+def default_biochem_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
     """Biochemical inlet BCs in transformed (log1p ND) space (same recipe as ``process_file``)."""
-    bio_cfg = BiochemConfig(tier="tier3")
+    bio_cfg = BiochemConfig(phase="biochem")
     scales = bio_cfg.get_species_scales(device="cpu")
     inlet_species_si = torch.zeros(9, dtype=torch.float32)
     inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
@@ -45,7 +45,7 @@ def default_tier3_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
     return inlet_species_transformed.unsqueeze(0).expand(num_nodes, -1)
 
 
-def assemble_tier3_transient_graph_data(
+def assemble_biochem_transient_graph_data(
     *,
     x_tensor: torch.Tensor,
     y_tensor_series: torch.Tensor,
@@ -69,7 +69,7 @@ def assemble_tier3_transient_graph_data(
     bio_inlet_bc: torch.Tensor,
     outlet_normal: torch.Tensor,
 ) -> Data:
-    """Tier 3 non-anchor graphs: transient ``y`` + biochemistry + serialized sparse operators."""
+    """Biochem non-anchor graphs: transient ``y`` + biochemistry + serialized sparse operators."""
     num_nodes = x_tensor.shape[0]
     return Data(
         x=x_tensor,
@@ -97,7 +97,7 @@ def assemble_tier3_transient_graph_data(
     )
 
 
-def assemble_tier3_steady_graph_data(
+def assemble_biochem_steady_graph_data(
     *,
     x_tensor: torch.Tensor,
     y_labels: torch.Tensor,
@@ -119,7 +119,7 @@ def assemble_tier3_steady_graph_data(
     G_y: torch.Tensor,
     Laplacian: torch.Tensor,
 ) -> Data:
-    """Tier 3 anchor graphs (steady labels) — same kinematic payload as Tier 1/2 plus ``Laplacian``."""
+    """Biochem anchor graphs (steady labels) — same kinematic payload as Kinematics/2 plus ``Laplacian``."""
     return Data(
         x=x_tensor,
         edge_index=edge_index,
@@ -143,14 +143,14 @@ def assemble_tier3_steady_graph_data(
     )
 
 
-class MeshToGraphTier3:
-    """Build Tier 3 non-anchor graphs from synthetic meshes."""
+class MeshToGraphPhase3:
+    """Build Biochem non-anchor graphs from synthetic meshes."""
 
     def __init__(self, raw_dir=None, label_dir=None, proc_dir=None):
-        tier = "tier3"
+        phase = "biochem"
         self.root = get_project_root()
-        self.vessel_cfg = VesselConfig(tier=tier)
-        self.phys_cfg = PhysicsConfig(tier=tier)
+        self.vessel_cfg = VesselConfig(phase=phase)
+        self.phys_cfg = PhysicsConfig(phase=phase)
 
         # Resolve Raw Dir
         if raw_dir:
@@ -552,20 +552,20 @@ class MeshToGraphTier3:
 
 
 
-        # --- TIER 3 NON-ANCHOR FORMAT: build transient-compatible dummy trajectory ---
-        if self.vessel_cfg.tier in ("tier3", "tier3_mix") and not is_anchor:
-            bio_cfg = BiochemConfig(tier="tier3")
+        # --- PHASE 3 NON-ANCHOR FORMAT: build transient-compatible dummy trajectory ---
+        if self.vessel_cfg.phase in ("biochem", "biochem_mix") and not is_anchor:
+            bio_cfg = BiochemConfig(phase="biochem")
 
             # 1) Dummy time trajectory [T, N, 16] + time tensor
             num_times = bio_cfg.num_time_steps
             eval_times_tensor = torch.linspace(0.0, bio_cfg.t_final, num_times, dtype=torch.float32)
             y_tensor_series = torch.zeros((num_times, len(nodes), 16), dtype=torch.float32)
 
-            bio_inlet_bc = default_tier3_bio_inlet_bc(len(nodes))
+            bio_inlet_bc = default_biochem_bio_inlet_bc(len(nodes))
 
-            # 3) Build Tier 3-style Data object
+            # 3) Build Biochem-style Data object
             uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
-            data = assemble_tier3_transient_graph_data(
+            data = assemble_biochem_transient_graph_data(
                 x_tensor=x_tensor,
                 y_tensor_series=y_tensor_series,
                 eval_times_tensor=eval_times_tensor,
@@ -589,8 +589,8 @@ class MeshToGraphTier3:
                 outlet_normal=outlet_normal,
             )
         else:
-            # Original Tier 1/2 format (steady labels + anchor flag)
-            data = assemble_tier3_steady_graph_data(
+            # Original Kinematics/2 format (steady labels + anchor flag)
+            data = assemble_biochem_steady_graph_data(
                 x_tensor=x_tensor,
                 y_labels=y_labels,
                 edge_index=edge_index,
@@ -634,12 +634,12 @@ if __name__ == "__main__":
             except ValueError:
                 print("Invalid input. Enter an integer value, 'all', or leave blank for all.")
 
-    print("\nTier 3 synthetic graph generation (non-anchor only)")
-    print("Anchor/patient graphs are generated via extract_tier3_comsol_data.py")
+    print("\nBiochem synthetic graph generation (non-anchor only)")
+    print("Anchor/patient graphs are generated via extract_biochem_comsol_data.py")
     print("\nNumber of vessels:")
     print("  - Enter an integer to process only that many meshes")
     print("  - Enter 'all' (or leave blank) to process all meshes")
 
     max_files = _prompt_optional_int("Number of vessels")
-    processor = MeshToGraphTier3()
+    processor = MeshToGraphPhase3()
     processor.run(max_files=max_files)

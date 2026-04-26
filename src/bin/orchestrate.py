@@ -1,4 +1,4 @@
-"""Stage orchestrator: Stage A (Tier 1/2) and Stage B (Tier 3)."""
+"""Training orchestrator: kinematics and biochem phases."""
 
 from __future__ import annotations
 
@@ -12,31 +12,24 @@ def _run_module(module_name: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Run Stage A and/or Stage B training.")
+    p = argparse.ArgumentParser(description="Run kinematics and/or biochem training.")
     p.add_argument(
-        "stage",
-        choices=("a", "b", "all"),
+        "phase",
+        choices=("kinematics", "biochem", "all"),
         help=(
-            "Stage A: Tier 1 + Tier 2 predictor warm-up. "
-            "Stage B: Tier 3 corrector. 'all' runs A then B."
+            "kinematics: unified kinematics pretraining. "
+            "biochem: biochem corrector. 'all' runs kinematics then biochem."
         ),
     )
-    p.add_argument(
-        "--skip-tier1",
-        action="store_true",
-        help="With stage 'a' or 'all', skip Tier 1 and start at Tier 2.",
-    )
     args = p.parse_args(argv)
+    phase = args.phase
 
-    if args.stage in ("a", "all") and not args.skip_tier1:
-        print("=== Stage A: Tier 1 ===")
-        _run_module("src.training.train_t1_predictor")
-    if args.stage in ("a", "all"):
-        print("=== Stage A: Tier 2 ===")
-        _run_module("src.training.train_t2_predictor")
-    if args.stage in ("b", "all"):
-        print("=== Stage B: Tier 3 (corrector) ===")
-        _run_module("src.training.train_t3_corrector")
+    if phase in ("kinematics", "all"):
+        print("=== Kinematics training ===")
+        _run_module("src.training.train_kinematics_predictor")
+    if phase in ("biochem", "all"):
+        print("=== Biochem training ===")
+        _run_module("src.training.train_biochem_corrector")
 
 
 if __name__ == "__main__":

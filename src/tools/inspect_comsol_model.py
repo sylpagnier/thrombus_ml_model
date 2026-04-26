@@ -3,7 +3,7 @@ Live COMSOL model inspector (restored + modernized).
 
 Examples:
     python -m src.tools.inspect_comsol_model --list-models
-    python -m src.tools.inspect_comsol_model --model comsol_models/phase1_template.mph
+    python -m src.tools.inspect_comsol_model --model comsol_models/kinematics_template.mph
     python -m src.tools.inspect_comsol_model --all-models --show-properties
     python -m src.tools.inspect_comsol_model   # interactive model picker
 """

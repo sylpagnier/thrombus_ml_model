@@ -156,7 +156,7 @@ class DynamicLossWeighter(nn.Module):
             total_loss += scales[i] * task_loss
         return total_loss
 
-def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
+def validate_and_plot(model, val_data, epoch, device, phase="kinematics"):
     model.eval()
     with torch.no_grad():
         data_on_device = Batch.from_data_list([val_data]).to(device)
@@ -165,16 +165,16 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
 
     plt.figure(figsize=(10, 4))
 
-    # --- Setup Tier-Specific Plotting Rules ---
-    if tier == "tier1":
+    # --- Setup Phase-Specific Plotting Rules ---
+    if phase == "kinematics":
         val_pred = pred[:, 0].detach().cpu().numpy()  # u-velocity
         cmap, label = 'jet', r"Predicted ND-Velocity (u)"
-        title = f"Tier 1 Validation - Epoch {epoch}"
+        title = f"Kinematics Validation - Epoch {epoch}"
         use_log_norm = False
     else:
         val_pred = pred[:, PredChannels.MU_EFF_ND].detach().cpu().numpy()  # viscosity
         cmap, label = 'viridis', r"Predicted ND-Viscosity ($\mu$)"
-        title = f"Tier 2 Validation (Carreau) - Epoch {epoch}"
+        title = f"Kinematics Validation (Carreau) - Epoch {epoch}"
         # Viscosity MUST be plotted in log-scale to visualize the boundary layer
         use_log_norm = True
 
@@ -190,7 +190,7 @@ def validate_and_plot(model, val_data, epoch, device, tier="tier1"):
     plt.title(title)
     plt.axis('equal')
 
-    save_dir = reports_training_dir(tier, "figures")
+    save_dir = reports_training_dir(phase, "figures")
     plt.savefig(save_dir / f"val_epoch_{epoch}.png")
     plt.close()
 
@@ -200,7 +200,7 @@ def quantify_performance(
     val_loader,
     kernels,
     device,
-    tier="tier1",
+    phase="kinematics",
     solver: Optional[str] = None,
     anderson_beta: float = 0.8,
 ) -> Dict[str, Any]:
@@ -214,7 +214,7 @@ def quantify_performance(
     """
     model.eval()
 
-    val_progress = os.environ.get("TIER1_VAL_PROGRESS", "1").strip().lower() not in ("0", "false", "no", "off")
+    val_progress = os.environ.get("KINEMATICS_VAL_PROGRESS", "1").strip().lower() not in ("0", "false", "no", "off")
 
     metrics: Dict[str, List[float]] = {
         "rel_l2": [],
@@ -227,7 +227,7 @@ def quantify_performance(
         "wall_slip": [],
         "shear_mse": [],
     }
-    if tier == "tier2":
+    if phase == "kinematics":
         metrics.update({"rheology": [], "mu_mae": [], "mu_log_mse": []})
 
     val_total_batches = 0
@@ -304,7 +304,7 @@ def quantify_performance(
 
                     metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
-                    if tier == "tier2" and data.y.shape[1] >= 4:
+                    if phase == "kinematics" and data.y.shape[1] >= 4:
                         mu_p = pred[node_mask, PredChannels.MU_EFF_ND]
                         mu_t = data.y[node_mask, PredChannels.MU_EFF_ND]
                         metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
@@ -328,7 +328,7 @@ def quantify_performance(
                 wall_vel = torch.norm(pred[data.mask_wall, PredChannels.UV], p=2, dim=1)
                 metrics["wall_slip"].append(wall_vel.mean().item())
 
-            if tier == "tier2":
+            if phase == "kinematics":
                 metrics["rheology"].append(kernels.rheology_loss(pred, data, props).item())
 
     out: Dict[str, Any] = {k: _list_mean(v) for k, v in metrics.items()}
@@ -360,7 +360,7 @@ def quantify_performance(
     out["val_total_batches"] = float(val_total_batches)
     out["val_anchor_batches"] = float(val_anchor_batches)
 
-    if tier == "tier2" and metrics["rheology"]:
+    if phase == "kinematics" and metrics["rheology"]:
         r_std, r_p90 = _list_dispersion(metrics["rheology"])
         out["rheology_std"] = r_std
         out["rheology_p90"] = r_p90

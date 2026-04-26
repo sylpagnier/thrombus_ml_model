@@ -3,10 +3,11 @@
 Examples:
     python -m src.bin.main train t1
     python -m src.bin.main train t3 -- --epochs 10
-    python -m src.bin.main data tier12
+    python -m src.bin.main data kinematics
     python -m src.bin.main eval benchmark
     python -m src.bin.main inspect graph
     python -m src.bin.main orchestrate all
+    python -m src.bin.main orchestrate biochem
 """
 
 from __future__ import annotations
@@ -17,23 +18,24 @@ import sys
 
 
 MODULE_MAP: dict[tuple[str, str], str] = {
-    ("train", "t1"): "src.training.train_t1_predictor",
-    ("train", "t2"): "src.training.train_t2_predictor",
-    ("train", "t3"): "src.training.train_t3_corrector",
-    # Alias: Tier 1 training (formerly a separate "explorer" entrypoint).
-    ("train", "explore"): "src.training.train_t1_predictor",
-    ("data", "tier12"): "src.data_gen.pipeline_tier12",
-    ("data", "tier3"): "src.data_gen.pipeline_tier3",
+    ("train", "kinematics"): "src.training.train_kinematics_predictor",
+    # Backward-compatible aliases; all map to unified kinematics trainer.
+    ("train", "t1"): "src.training.train_kinematics_predictor",
+    ("train", "t2"): "src.training.train_kinematics_predictor",
+    ("train", "t3"): "src.training.train_biochem_corrector",
+    ("train", "explore"): "src.training.train_kinematics_predictor",
+    ("data", "kinematics"): "src.data_gen.pipeline_kinematics",
+    ("data", "biochem"): "src.data_gen.pipeline_biochem",
     ("eval", "benchmark"): "src.evaluation.run_benchmark",
-    ("eval", "visualize"): "src.evaluation.visualize_tiers",
-    ("inspect", "anchor"): "src.tools.inspect_phase1_data",
+    ("eval", "visualize"): "src.evaluation.visualize_pipeline",
+    ("inspect", "anchor"): "src.tools.inspect_kinematics_data",
     ("inspect", "graph"): "src.tools.inspect_graph_sample",
-    ("inspect", "phase1"): "src.tools.inspect_phase1_data",
-    ("inspect", "tier3"): "src.tools.inspect_tier3_data",
+    ("inspect", "kinematics"): "src.tools.inspect_kinematics_data",
+    ("inspect", "biochem"): "src.tools.inspect_biochem_data",
     ("inspect", "comsol"): "src.tools.inspect_comsol_model",
     ("inspect", "deq"): "src.tools.verify_deq_convergence",
-    ("orchestrate", "a"): "src.bin.orchestrate",
-    ("orchestrate", "b"): "src.bin.orchestrate",
+    ("orchestrate", "kinematics"): "src.bin.orchestrate",
+    ("orchestrate", "biochem"): "src.bin.orchestrate",
     ("orchestrate", "all"): "src.bin.orchestrate",
 }
 

@@ -1,8 +1,8 @@
-"""Stage B: localized L2 velocity error in clotting zones (truth mask)."""
+"""Biochem phase: localized L2 velocity error in clotting zones (truth mask)."""
 
 import torch
 
-from src.architecture.gnode_tier3 import tier3_truth_node_mask
+from src.architecture.gnode_biochem import biochem_truth_node_mask
 
 
 def test_localized_l2_velocity_in_clot_zone():
@@ -17,7 +17,7 @@ def test_localized_l2_velocity_in_clot_zone():
         is_anchor = torch.zeros(n, dtype=torch.bool)
         is_anchor[4:9] = True
 
-    m = tier3_truth_node_mask(_B(), n, device)
+    m = biochem_truth_node_mask(_B(), n, device)
     assert m[4:9].all() and not m[0:4].any()
 
     diff = (pred_uv - true_uv)[m]
@@ -34,5 +34,5 @@ def test_empty_mask_yields_zero_norm_convention():
         batch = None
         is_anchor = torch.tensor(False)
 
-    m = tier3_truth_node_mask(_B(), n, device)
+    m = biochem_truth_node_mask(_B(), n, device)
     assert not m.any()

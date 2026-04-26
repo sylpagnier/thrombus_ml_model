@@ -16,20 +16,20 @@ project_root = get_project_root()
 
 
 class ModelValidator:
-    def __init__(self, model_path, tier="tier1", device=None):
+    def __init__(self, model_path, phase="kinematics", device=None):
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.tier = tier
+        self.phase = phase
 
-        phys_cfg = PhysicsConfig(tier=self.tier)
+        phys_cfg = PhysicsConfig(phase=self.phase)
         self.kernels = PhysicsKernels(phys_cfg)
 
-        print(f"⚡ Loading {self.tier.capitalize()} Model: {model_path}")
+        print(f"⚡ Loading {self.phase.capitalize()} Model: {model_path}")
 
         mu_inf_nd = self.kernels.mu_inf_nd
         mu_0_nd = self.kernels.mu_0_nd
 
         # Mirror training-time model recipes so checkpoint loading is shape-compatible.
-        if self.tier in {"tier1", "tier2"}:
+        if self.phase in {"kinematics", "kinematics"}:
             self.model = GINO_DEQ(
                 in_channels=15,
                 out_channels=5,
@@ -116,7 +116,7 @@ class ModelValidator:
         dataset = [torch.load(f, weights_only=False) for f in files]
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
-        use_itpc = (self.tier == "tier2")
+        use_itpc = (self.phase == "kinematics")
         metrics = {
             "base_rel_l2_u": [],
             "base_div_res": [],
@@ -133,7 +133,7 @@ class ModelValidator:
                 }
             )
 
-        print(f"\n🔍 A/B Testing {self.tier.capitalize()} - {level_name} (N={len(dataset)})...")
+        print(f"\n🔍 A/B Testing {self.phase.capitalize()} - {level_name} (N={len(dataset)})...")
 
         for i, data in enumerate(tqdm(loader)):
             data = data.to(self.device)
@@ -210,7 +210,7 @@ class ModelValidator:
         return df.mean()
 
     def _plot_comparison(self, data, pred_base, pred_itpc, target, title):
-        rows = 3 if self.tier == "tier2" else 2
+        rows = 3 if self.phase == "kinematics" else 2
         fig, axes = plt.subplots(rows, 3, figsize=(15, 4 * rows))
         if rows == 1: axes = np.array([axes])
 
@@ -266,9 +266,9 @@ class ModelValidator:
         u_gt = np.linalg.norm(target[:, :2].cpu().numpy(), axis=1) if target is not None else None
         plot_row(0, u_gt, u_base, u_itpc, "Velocity Mag", 'jet')
 
-        # Row 1 (Tier 2): Viscosity
+        # Row 1 (Kinematics): Viscosity
         current_row = 1
-        if self.tier == "tier2":
+        if self.phase == "kinematics":
             mu_base = pred_base[:, 3].cpu().numpy()
             mu_itpc = pred_itpc[:, 3].cpu().numpy()
             mu_gt = target[:, 3].cpu().numpy() if target is not None else None
@@ -281,7 +281,7 @@ class ModelValidator:
         wss_gt = target[mask_wall, 4].cpu().numpy() if target is not None else None
         plot_row(current_row, wss_gt, wss_base, wss_itpc, "WSS", 'plasma', is_wall=True)
 
-        save_dir = reports_evaluation_dir("validation", self.tier)
+        save_dir = reports_evaluation_dir("validation", self.phase)
         safe_title = title.replace("/", "_").replace(" ", "_")
         plt.tight_layout()
         plt.savefig(save_dir / f"{safe_title}.png", dpi=150, bbox_inches='tight')

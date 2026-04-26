@@ -77,7 +77,7 @@ def test_visualize_convergence_audit():
     batch_data = setup_synthetic_batch(num_graphs=1, num_nodes_per_graph=50)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    for idx, tier in enumerate(["tier1", "tier2"]):
+    for idx, phase in enumerate(["kinematics", "kinematics"]):
         ax = axes[idx]
         model = GINO_DEQ(in_channels=13, out_channels=5, latent_dim=16, max_iters=max_iters)
         model.eval()
@@ -120,7 +120,7 @@ def test_visualize_convergence_audit():
         ax.plot(res_p, label='Picard', marker='o', markersize=3)
         ax.plot(range(2, len(res_a) + 2), res_a, label='Anderson', marker='x')
         ax.set_yscale('log')
-        ax.set_title(f"Convergence Audit: {tier.upper()}")
+        ax.set_title(f"Convergence Audit: {phase.upper()}")
         ax.legend()
         ax.grid(True, alpha=0.3)
 

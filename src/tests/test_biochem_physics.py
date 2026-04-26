@@ -8,9 +8,9 @@ import statistics
 from types import SimpleNamespace
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
-from src.architecture.gnode_tier3 import GNODE_Tier3
+from src.architecture.gnode_biochem import GNODE_Phase3
 from src.core_physics.physics_kernels import PhysicsKernels
-from src.training.train_t3_corrector import remap_stage_a_encoder_to_corrector
+from src.training.train_biochem_corrector import remap_stage_a_encoder_to_corrector
 from src.data_gen import PatientDataExtractor
 from src.utils.paths import get_project_root
 
@@ -24,26 +24,26 @@ class DummyCoreKernels:
         return torch.ones(shape, dtype=tensor.dtype, device=tensor.device)
 
 
-class TestTier3Physics(unittest.TestCase):
+class TestPhase3Physics(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         """Create output directory for visualizations relative to project root."""
         root = get_project_root()
-        cls.vis_dir = root / "data/processed/graphs_tier3_patients/sanity_checks"
+        cls.vis_dir = root / "data/processed/graphs_biochem_patients/sanity_checks"
         cls.vis_dir.mkdir(parents=True, exist_ok=True)
 
     def setUp(self):
         """Initialize configurations and kernels."""
-        self.bio_cfg = BiochemConfig(tier="tier3")
-        self.phys_cfg = PhysicsConfig(tier="tier3")
+        self.bio_cfg = BiochemConfig(phase="biochem")
+        self.phys_cfg = PhysicsConfig(phase="biochem")
         self.core = DummyCoreKernels()
 
         self.biochem_kernels = BiochemPhysicsKernels(self.bio_cfg, self.core)
         self.kinetics = self.biochem_kernels.kinetics
 
-        # FIXED: Pass phys_cfg to match the updated GNODE_Tier3 signature
-        self.model = GNODE_Tier3(
+        # FIXED: Pass phys_cfg to match the updated GNODE_Phase3 signature
+        self.model = GNODE_Phase3(
             phys_cfg=self.phys_cfg,
             in_channels=12,
             spatial_channels=15,
@@ -55,12 +55,12 @@ class TestTier3Physics(unittest.TestCase):
             temp_fi=self.bio_cfg.viscosity_gnode_temp_fi,
         )
 
-    def _find_extracted_tier3_graph(self):
-        """Return one extracted Tier-3 graph path if present."""
+    def _find_extracted_biochem_graph(self):
+        """Return one extracted Phase-3 graph path if present."""
         root = get_project_root()
         candidate_dirs = [
-            root / "data/processed/graphs_tier3_patients",
-            root / "data/processed/graphs_tier3",
+            root / "data/processed/graphs_biochem_patients",
+            root / "data/processed/graphs_biochem",
         ]
         for directory in candidate_dirs:
             if not directory.exists():
@@ -72,15 +72,15 @@ class TestTier3Physics(unittest.TestCase):
 
     def _sample_anchor_species_si(self, max_samples=256):
         """
-        Extract SI species values from one existing extracted Tier-3 graph without any extra COMSOL export.
+        Extract SI species values from one existing extracted Phase-3 graph without any extra COMSOL export.
         Returns tensors T, AT, FG, FI in SI units.
         """
-        graph_path = self._find_extracted_tier3_graph()
+        graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
-            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
         if not hasattr(data, "y") or data.y.dim() != 3:
-            self.skipTest(f"{graph_path.name} does not have Tier-3 trajectory tensor y[T,N,C].")
+            self.skipTest(f"{graph_path.name} does not have Phase-3 trajectory tensor y[T,N,C].")
         y = data.y[0].detach()  # first timestep [N,16]
         if y.shape[1] < 13:
             self.skipTest(f"{graph_path.name} has unexpected channel count {y.shape[1]} (<13).")
@@ -318,7 +318,7 @@ class TestTier3Physics(unittest.TestCase):
         edge_index = torch.tensor(np.array(directed_edges, dtype=np.int64).T, dtype=torch.long)
 
         pos_tensor = torch.tensor(points, dtype=torch.float32)
-        extractor = PatientDataExtractor(tier="tier3_patients")
+        extractor = PatientDataExtractor(phase="biochem_patients")
         V, W, M_inv, _ = extractor._precompute_wls(edge_index, len(points), pos_tensor)
         G_x, G_y, _ = extractor._precompute_sparse_operators(edge_index, len(points), M_inv, V, W)
 
@@ -343,7 +343,7 @@ class TestTier3Physics(unittest.TestCase):
         Unit-scale audit guard:
         CGS baseline values from inspector should map to ND=1 and log1p(1) when converted correctly.
         """
-        bio = BiochemConfig(tier="tier3")
+        bio = BiochemConfig(phase="biochem")
         eps = 1e-15
 
         # Inspector-style CGS baselines:
@@ -438,13 +438,13 @@ class TestTier3Physics(unittest.TestCase):
         Negative test: perturbing velocity by +50% should raise NS and ADR_fast residuals
         relative to the pristine COMSOL trajectory.
         """
-        graph_path = self._find_extracted_tier3_graph()
+        graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
-            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
 
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
         if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
-            self.skipTest(f"{graph_path.name} does not contain a usable Tier-3 trajectory.")
+            self.skipTest(f"{graph_path.name} does not contain a usable Phase-3 trajectory.")
 
         core = PhysicsKernels(phys_cfg=self.phys_cfg)
         kernels = BiochemPhysicsKernels(self.bio_cfg, core)
@@ -528,18 +528,18 @@ class TestTier3Physics(unittest.TestCase):
             ),
         )
 
-    def test_tier3_comsol_gt_residuals_are_close_vs_permuted_baseline(self):
+    def test_biochem_comsol_gt_residuals_are_close_vs_permuted_baseline(self):
         """
-        Ground-truth trajectory should remain substantially closer to Tier-3 physics/biochem kernels
+        Ground-truth trajectory should remain substantially closer to Phase-3 physics/biochem kernels
         than a geometry-breaking node permutation baseline.
         """
-        graph_path = self._find_extracted_tier3_graph()
+        graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
-            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
 
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
         if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
-            self.skipTest(f"{graph_path.name} does not contain a usable Tier-3 trajectory.")
+            self.skipTest(f"{graph_path.name} does not contain a usable Phase-3 trajectory.")
 
         ratio_ns_max = self._env_float("PHASE3_NS_RATIO_MAX", 0.5)
         ratio_adr_fast_max = self._env_float("PHASE3_ADR_FAST_RATIO_MAX", 0.95)
@@ -597,7 +597,7 @@ class TestTier3Physics(unittest.TestCase):
             good_terms.append(_eval_terms(y1, d_dt))
 
             g = torch.Generator(device=y1.device)
-            g.manual_seed(hash((graph_path.stem, i, "tier3_perm")) % (2**31))
+            g.manual_seed(hash((graph_path.stem, i, "biochem_perm")) % (2**31))
             perm = torch.randperm(y1.shape[0], generator=g, device=y1.device)
             y1_bad = y1[perm]
             d_dt_bad = d_dt[perm]
@@ -619,42 +619,42 @@ class TestTier3Physics(unittest.TestCase):
         self.assertLessEqual(
             ratio_ns,
             ratio_ns_max,
-            f"Tier3 NS gt/baseline ratio too high for {graph_path.name}: {ratio_ns:.3f} > {ratio_ns_max:.3f}",
+            f"Phase3 NS gt/baseline ratio too high for {graph_path.name}: {ratio_ns:.3f} > {ratio_ns_max:.3f}",
         )
         self.assertLessEqual(
             ratio_adr_f,
             ratio_adr_fast_max,
-            f"Tier3 ADR_fast gt/baseline ratio too high for {graph_path.name}: {ratio_adr_f:.3f} > {ratio_adr_fast_max:.3f}",
+            f"Phase3 ADR_fast gt/baseline ratio too high for {graph_path.name}: {ratio_adr_f:.3f} > {ratio_adr_fast_max:.3f}",
         )
         self.assertLessEqual(
             ratio_adr_s,
             ratio_adr_slow_max,
-            f"Tier3 ADR_slow gt/baseline ratio too high for {graph_path.name}: {ratio_adr_s:.3f} > {ratio_adr_slow_max:.3f}",
+            f"Phase3 ADR_slow gt/baseline ratio too high for {graph_path.name}: {ratio_adr_s:.3f} > {ratio_adr_slow_max:.3f}",
         )
         self.assertLessEqual(
             _p95("NS", good_terms),
             abs_ns_p95_max,
-            f"Tier3 NS P95 residual too high for {graph_path.name}.",
+            f"Phase3 NS P95 residual too high for {graph_path.name}.",
         )
         self.assertLessEqual(
             _p95("ADR_fast", good_terms),
             abs_adr_fast_p95_max,
-            f"Tier3 ADR_fast P95 residual too high for {graph_path.name}.",
+            f"Phase3 ADR_fast P95 residual too high for {graph_path.name}.",
         )
         self.assertLessEqual(
             _p95("ADR_slow", good_terms),
             abs_adr_slow_p95_max,
-            f"Tier3 ADR_slow P95 residual too high for {graph_path.name}.",
+            f"Phase3 ADR_slow P95 residual too high for {graph_path.name}.",
         )
         self.assertLessEqual(
             _p95("Wall_bio", good_terms),
             abs_wall_bio_p95_max,
-            f"Tier3 Wall_bio P95 residual too high for {graph_path.name}.",
+            f"Phase3 Wall_bio P95 residual too high for {graph_path.name}.",
         )
         self.assertLessEqual(
             _p95("Wall_flux", good_terms),
             abs_wall_flux_p95_max,
-            f"Tier3 Wall_flux P95 residual too high for {graph_path.name}.",
+            f"Phase3 Wall_flux P95 residual too high for {graph_path.name}.",
         )
 
     def test_kpa_activation_logic(self):
@@ -750,8 +750,8 @@ class TestTier3Physics(unittest.TestCase):
         plt.savefig(self.vis_dir / 'mu2_fibrin_viscosity.png', dpi=300)
         plt.close()
 
-    def test_tier2_to_tier3_encoder_weight_remap_shifts_tail(self):
-        """Tier2->Tier3 transfer must preserve uv/mu/wss channels with +1 shift."""
+    def test_kinematics_to_biochem_encoder_weight_remap_shifts_tail(self):
+        """Phase2->Phase3 transfer must preserve uv/mu/wss channels with +1 shift."""
         out_dim = 3
         old_weight = torch.arange(out_dim * 63, dtype=torch.float32).view(out_dim, 63)
         target_template = torch.zeros((out_dim, 64), dtype=torch.float32)
@@ -800,8 +800,8 @@ class TestTier3Physics(unittest.TestCase):
         _, loss_outlet = self.biochem_kernels.biochem_inlet_outlet_residual(biochem_preds, spatial_props, data)
         self.assertGreater(float(loss_outlet.item()), 1e-8)
 
-    def test_tier3_feature_schema_matches_kin_encoder_input(self):
-        """Tier3 feature slicing contract must remain 15->64 encoded channels."""
+    def test_biochem_feature_schema_matches_kin_encoder_input(self):
+        """Phase3 feature slicing contract must remain 15->64 encoded channels."""
         n = 4
         x = torch.zeros((n, 15), dtype=torch.float32)
         x[:, 11:13] = torch.tensor([[0.2, -0.1], [0.3, -0.2], [0.4, -0.3], [0.5, -0.4]], dtype=torch.float32)
@@ -820,9 +820,9 @@ class TestTier3Physics(unittest.TestCase):
         COMSOL parity: along an extracted anchor trajectory, kinetics-implied d(log1p C)/dt
         should match finite differences of COMSOL labels (same construction as ODE-RXN pretraining).
         """
-        graph_path = self._find_extracted_tier3_graph()
+        graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
-            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
 
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
         if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
@@ -887,7 +887,7 @@ class TestTier3Physics(unittest.TestCase):
 
     def test_comsol_extracted_graph_physics_regression(self):
         """
-        Regression check on one extracted COMSOL Tier-3 graph:
+        Regression check on one extracted COMSOL Phase-3 graph:
         - compute the same residual terms used by training over all trajectory intervals,
         - report interval-wise statistics for each residual term,
         - convert aggregated residual into a trajectory-level percentage accuracy score,
@@ -901,13 +901,13 @@ class TestTier3Physics(unittest.TestCase):
         min_accuracy_pct_trajectory = 20.0
         # Late-time NS drift guard: max momentum residual allowed over final 20% of intervals.
         max_late_ns_residual = 70.0
-        graph_path = self._find_extracted_tier3_graph()
+        graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
-            self.skipTest("No extracted Tier-3 graph found under data/processed/graphs_tier3*.")
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
 
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
         if not hasattr(data, "y") or data.y.dim() != 3:
-            self.skipTest(f"{graph_path.name} does not have Tier-3 trajectory tensor y[T,N,C].")
+            self.skipTest(f"{graph_path.name} does not have Phase-3 trajectory tensor y[T,N,C].")
         if data.y.shape[0] < 2:
             self.skipTest(f"{graph_path.name} has <2 timesteps; cannot compute transient residuals.")
 
@@ -1038,7 +1038,7 @@ class TestTier3Physics(unittest.TestCase):
 
         # Always print residual breakdown for debugging, even when test passes.
         print(
-            f"\n[Tier3 Physics Debug] graph={graph_path.name} "
+            f"\n[Phase3 Physics Debug] graph={graph_path.name} "
             f"intervals={num_intervals} dt_mean={statistics.mean(dt_values):.6f}s"
         )
         print("  Per-term interval stats (min / mean / p95 / max):")

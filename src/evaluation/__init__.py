@@ -1,4 +1,4 @@
-"""Validation, benchmarks, and tier/stage visualization."""
+"""Validation, benchmarks, and phase/stage visualization."""
 
 from src.evaluation.lib.validate_model import ModelValidator
 

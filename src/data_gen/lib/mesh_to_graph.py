@@ -1,5 +1,5 @@
 """
-Tier 1/2 mesh→graph pipeline: **2D planar** vessel lumen only (in-plane CFD / graphs).
+Kinematics/2 mesh→graph pipeline: **2D planar** vessel lumen only (in-plane CFD / graphs).
 Velocity priors follow 2D plane Poiseuille and mass scaling; 3D pipe flow is not modeled.
 """
 
@@ -48,7 +48,7 @@ def _clip_wss_magnitude_quantile(
     return out
 
 
-def assemble_tier12_graph_data(
+def assemble_kinematics_graph_data(
     *,
     x_tensor: torch.Tensor,
     edge_index: torch.Tensor,
@@ -68,9 +68,9 @@ def assemble_tier12_graph_data(
     G_x: torch.Tensor,
     G_y: torch.Tensor,
 ) -> Data:
-    """Build the Tier 1/2 ``Data`` object written to ``*.pt`` (single code path for tests + ``process_file``).
+    """Build the Kinematics/2 ``Data`` object written to ``*.pt`` (single code path for tests + ``process_file``).
 
-    Tier 1/2 graphs store sparse WLS gradient operators ``G_x`` / ``G_y`` for physics kernels.
+    Kinematics/2 graphs store sparse WLS gradient operators ``G_x`` / ``G_y`` for physics kernels.
     """
     return Data(
         x=x_tensor,
@@ -95,10 +95,10 @@ def assemble_tier12_graph_data(
 
 
 class MeshToGraphComplete:
-    def __init__(self, tier="tier1", n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, phase="kinematics", n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
-        self.vessel_cfg = VesselConfig(tier=tier)
-        self.phys_cfg = PhysicsConfig(tier=tier)
+        self.vessel_cfg = VesselConfig(phase=phase)
+        self.phys_cfg = PhysicsConfig(phase=phase)
 
         # Resolve Raw Dir
         if raw_dir:
@@ -127,22 +127,22 @@ class MeshToGraphComplete:
 
 class MeshToGraph(MeshToGraphComplete):
     """
-    Tier 1 & Tier 2 specific graph conversion logic.
+    Kinematics & Kinematics specific graph conversion logic.
     Computes kinematics and packages variables.
     """
 
     def __init__(
         self,
-        tier: str,
+        phase: str,
         n_subdir: str = None,
         raw_dir=None,
         label_dir=None,
         proc_dir=None,
     ):
         # Keep explicit path overrides for callers (benchmark/pipeline/tests) that
-        # build temporary datasets outside default tier directories.
+        # build temporary datasets outside default phase directories.
         super().__init__(
-            tier=tier,
+            phase=phase,
             n_subdir=n_subdir,
             raw_dir=raw_dir,
             label_dir=label_dir,
@@ -460,7 +460,7 @@ class MeshToGraph(MeshToGraphComplete):
         if self.phys_cfg.viscosity_model == "newtonian":
             mu_prior = torch.ones(N, dtype=torch.float32)
         else:
-            # Carreau formulation for Tier 2 / Tier 3
+            # Carreau formulation for Kinematics / Biochem
             lambda_nd = self.phys_cfg.lam * (u_ref / d_bar)
             mu_prior = (self.phys_cfg.mu_inf / ref_mu) + (
                         (self.phys_cfg.mu_0 / ref_mu) - (self.phys_cfg.mu_inf / ref_mu)) * \
@@ -486,9 +486,9 @@ class MeshToGraph(MeshToGraphComplete):
             mu_prior.view(-1, 1), wss_prior.view(-1, 1),
             width_nd, width_d1, width_d2,
         ], dim=1)
-        assert x_tensor.shape[1] == NodeFeat.WIDTH_D2.stop, "Tier-1 node feature width must match NodeFeat"
+        assert x_tensor.shape[1] == NodeFeat.WIDTH_D2.stop, "Phase-1 node feature width must match NodeFeat"
 
-        data = assemble_tier12_graph_data(
+        data = assemble_kinematics_graph_data(
             x_tensor=x_tensor,
             edge_index=edge_index,
             edge_attr=edge_attr,
@@ -532,29 +532,29 @@ class MeshToGraphComplete(MeshToGraph):
 
 
 def build_mesh_converter(
-    tier: str = "tier1",
+    phase: str = "kinematics",
     *,
     is_non_newtonian: Optional[bool] = None,
     **kwargs,
 ):
-    """Return Tier 1/2 or Tier 3 graph builder (sparse operators + biochem tensors for Tier 3).
+    """Return Kinematics/2 or Biochem graph builder (sparse operators + biochem tensors for Biochem).
 
-    If ``is_non_newtonian`` is True, the Tier-3 pipeline is selected regardless of ``tier``.
-    If False, Tier 1/2-style graphs are built. If None (default), ``tier`` alone decides
-    (``tier3`` / ``tier3_patients`` / ``tier3_mix`` → Tier 3).
+    If ``is_non_newtonian`` is True, the Phase-3 pipeline is selected regardless of ``phase``.
+    If False, Kinematics/2-style graphs are built. If None (default), ``phase`` alone decides
+    (``biochem`` / ``biochem_patients`` / ``biochem_mix`` → Biochem).
     """
-    t = (tier or "tier1").lower()
+    t = (phase or "kinematics").lower()
     if is_non_newtonian is True:
-        from src.data_gen.lib.mesh_to_graph_tier3 import MeshToGraphTier3
+        from src.data_gen.lib.mesh_to_graph_biochem import MeshToGraphPhase3
 
-        return MeshToGraphTier3(**kwargs)
+        return MeshToGraphPhase3(**kwargs)
     if is_non_newtonian is False:
-        return MeshToGraph(tier=tier, **kwargs)
-    if t in ("tier3", "tier3_patients", "tier3_mix"):
-        from src.data_gen.lib.mesh_to_graph_tier3 import MeshToGraphTier3
+        return MeshToGraph(phase=phase, **kwargs)
+    if t in ("biochem", "biochem_patients", "biochem_mix"):
+        from src.data_gen.lib.mesh_to_graph_biochem import MeshToGraphPhase3
 
-        return MeshToGraphTier3(**kwargs)
-    return MeshToGraph(tier=tier, **kwargs)
+        return MeshToGraphPhase3(**kwargs)
+    return MeshToGraph(phase=phase, **kwargs)
 
 
 def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
@@ -573,7 +573,7 @@ def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
 
 
 if __name__ == "__main__":
-    tier_n = _prompt_int_choice("Tier", (1, 2))
-    tier = f"tier{tier_n}"
-    processor = MeshToGraph(tier=tier)
+    phase_n = _prompt_int_choice("Phase", (1, 2))
+    phase = f"phase{phase_n}"
+    processor = MeshToGraph(phase=phase)
     processor.run()

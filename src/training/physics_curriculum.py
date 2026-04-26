@@ -1,4 +1,4 @@
-"""Curriculum easing for Predictor (Stage A) → Corrector (Stage B) training."""
+"""Curriculum easing for Predictor (Kine phase) → Corrector (Biochem phase) training."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 
 def ease01(t: float, easing: str) -> float:
-    """Map ``[0, 1]`` progress with optional smoothing (matches Tier-3 training conventions)."""
+    """Map ``[0, 1]`` progress with optional smoothing (matches Phase-3 training conventions)."""
     t = min(1.0, max(0.0, float(t)))
     mode = (easing or "linear").strip().lower()
     if mode == "linear":
@@ -31,16 +31,16 @@ def update_physics_curriculum(
     target_mu_ratio_max: Optional[float] = None,
 ) -> bool:
     """
-    Controls transition from Predictor (Stage A) to Corrector (Stage B).
+    Controls transition from Predictor (Kine phase) to Corrector (Biochem phase).
 
-    Stage A clamps ``mu_ratio_max`` to ``1.0`` (Newtonian clot feedback off) and
+    Kine phase clamps ``mu_ratio_max`` to ``1.0`` (Newtonian clot feedback off) and
     trains exclusively on synthetic data.
 
-    Stage B ramps toward the target non-Newtonian cap using :func:`ease01`. During
+    Biochem phase ramps toward the target non-Newtonian cap using :func:`ease01`. During
     this stage, LoRA weights are unfrozen and trained on a mixed population dataset
     (synthetic + real scans) to learn generalized geometry corrections.
 
-    Returns ``True`` when Stage B is active (epoch >= ``stage_b_start``), i.e. when LoRA should be on.
+    Returns ``True`` when Biochem phase is active (epoch >= ``stage_b_start``), i.e. when LoRA should be on.
 
     The target viscosity ratio is captured once from ``target_mu_ratio_max``, or from
     ``base_cfg.mu_ratio_max`` on first call, and stored on ``base_cfg._pc_target_mu_ratio_max``.

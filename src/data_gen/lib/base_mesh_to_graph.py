@@ -20,20 +20,20 @@ logger = logging.getLogger(__name__)
 
 
 class BaseMeshToGraph(ABC):
-    """Shared mesh -> graph conversion pipeline used by Tier 1/2 and Tier 3."""
+    """Shared mesh -> graph conversion pipeline used by Kinematics/2 and Biochem."""
 
-    def __init__(self, tier: str, n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, phase: str, n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
         """
         Base class for converting .npz + .msh into PyG graphs.
-        :param tier: "tier1" or "tier2"
+        :param phase: "kinematics" or "kinematics"
         :param n_subdir: Optional n-subdirectory (e.g., "n_0.800") used for
-                         continuation/final Tier 2 datasets; redirects label/proc paths.
+                         continuation/final Kinematics datasets; redirects label/proc paths.
         """
         self.root = get_project_root()
-        self.cfg = VesselConfig(tier=tier)
+        self.cfg = VesselConfig(phase=phase)
         self.vessel_cfg = self.cfg
-        self.phys_cfg = PhysicsConfig(tier=tier)
-        self.tier = tier
+        self.phys_cfg = PhysicsConfig(phase=phase)
+        self.phase = phase
 
         # Apply continuation subdir logic if provided.
         label_base = Path(label_dir) if label_dir else (self.root / self.vessel_cfg.output_dir)

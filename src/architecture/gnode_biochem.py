@@ -14,7 +14,7 @@ _SPECIES_LOG1P_MIN = -10.0
 _SPECIES_LOG1P_MAX = 8.0
 
 
-def tier3_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
+def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
     if not hasattr(batch, "is_anchor"):
         return torch.zeros(num_nodes, dtype=torch.bool, device=device)
@@ -77,9 +77,9 @@ class BioODEFunc(nn.Module):
 
         return dz_dt
 
-class GNODE_Tier3(nn.Module):
+class GNODE_Phase3(nn.Module):
     """
-    Tier 3 Physics-Informed Graph Neural ODE for dynamic Thrombosis Simulation.
+    Biochem Physics-Informed Graph Neural ODE for dynamic Thrombosis Simulation.
     Replaces the steady-state DEQ with a continuous-time latent ODE solver.
     """
 
@@ -136,7 +136,7 @@ class GNODE_Tier3(nn.Module):
         # Physical Decoder
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
-        _bio = BiochemConfig(tier="tier3")
+        _bio = BiochemConfig(phase="biochem")
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
 
     def train(self, mode=True):
@@ -242,7 +242,7 @@ class GNODE_Tier3(nn.Module):
 
     def autoencode(self, batch):
         """
-        Phase 1: Pure spatial representation learning (no ODE time integration).
+        Kinematics: Pure spatial representation learning (no ODE time integration).
         Predict biochemical state at t=0 from priors + kinematics that match the rollout path
         (resting species, DEQ velocities from frozen backbone — not ground-truth ``batch.y``).
         """
@@ -306,7 +306,7 @@ class GNODE_Tier3(nn.Module):
             self.ode_func.derivative_energy_sum = 0.0
             self.ode_func.derivative_eval_count = 0
 
-        truth_mask = tier3_truth_node_mask(batch, num_nodes, device)
+        truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
         species_prior = _default_resting_species(num_nodes, device, batch)
 
         u_ref = batch.u_ref.view(-1, 1)

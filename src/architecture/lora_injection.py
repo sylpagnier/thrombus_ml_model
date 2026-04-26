@@ -1,7 +1,7 @@
 """
 LoRA parametrization and SpectralLinear for safe, dynamic low-rank adaptation.
 
-In HemoGINO, LoRA is trained during Stage B (Tier 3) across a population of
+In HemoGINO, LoRA is trained during Biochem phase (Biochem) across a population of
 patient and synthetic meshes to bridge the sim-to-real domain gap. Once trained,
 the LoRA weights are frozen to provide zero-shot generalized inference on new
 clinical scans.

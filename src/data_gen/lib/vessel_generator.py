@@ -415,8 +415,8 @@ def _worker_run_chunk(
 class VesselGenerator:
     """Generates 2D vessel meshes with parametric pathologies using Gmsh."""
 
-    def __init__(self, tier: str = "tier1", output_dir: Optional[str | Path] = None) -> None:
-        self.cfg          = VesselConfig(tier=tier)
+    def __init__(self, phase: str = "kinematics", output_dir: Optional[str | Path] = None) -> None:
+        self.cfg          = VesselConfig(phase=phase)
         self.project_root = get_project_root()
         self.output_dir   = Path(output_dir) if output_dir else self.project_root / self.cfg.mesh_input_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -646,11 +646,11 @@ class VesselGenerator:
         logger.info(f"Done. {generated}/{n} vessels saved.")
 
 
-class VesselGeneratorTier3(VesselGenerator):
-    """Synthetic Tier-3 vessel cohort (same geometry pipeline as ``VesselGenerator(tier='tier3')``)."""
+class VesselGeneratorPhase3(VesselGenerator):
+    """Synthetic Phase-3 vessel cohort (same geometry pipeline as ``VesselGenerator(phase='biochem')``)."""
 
     def __init__(self, output_dir: Optional[str | Path] = None) -> None:
-        super().__init__(tier="tier3", output_dir=output_dir)
+        super().__init__(phase="biochem", output_dir=output_dir)
 
     def run_pipeline(
         self,
@@ -732,16 +732,16 @@ def _prompt_yes_no(label: str, default: bool = False) -> bool:
 
 
 def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Generate 2D vessel meshes (Gmsh) for Phase 1 tiers.")
-    p.add_argument("--tier", type=int, choices=(1, 2), default=None, help="Tier (use with --level and -n)")
-    p.add_argument("--level", type=int, choices=(0, 1), default=None, help="Geometry complexity (use with --tier and -n)")
+    p = argparse.ArgumentParser(description="Generate 2D vessel meshes (Gmsh) for Kinematics phases.")
+    p.add_argument("--phase", type=int, choices=(1, 2), default=None, help="Phase (use with --level and -n)")
+    p.add_argument("--level", type=int, choices=(0, 1), default=None, help="Geometry complexity (use with --phase and -n)")
     p.add_argument(
         "-n",
         "--num-vessels",
         type=int,
         default=None,
         metavar="N",
-        help="How many vessels to generate (use with --tier and --level)",
+        help="How many vessels to generate (use with --phase and --level)",
     )
     p.add_argument(
         "--seed",
@@ -773,22 +773,22 @@ if __name__ == "__main__":
     parser = _vessel_gen_arg_parser()
     args = parser.parse_args()
 
-    trio = (args.tier is not None, args.level is not None, args.num_vessels is not None)
+    trio = (args.phase is not None, args.level is not None, args.num_vessels is not None)
     if any(trio) and not all(trio):
-        parser.error("Provide --tier, --level, and -n/--num-vessels together for non-interactive mode.")
+        parser.error("Provide --phase, --level, and -n/--num-vessels together for non-interactive mode.")
 
     if all(trio):
-        tier = f"tier{args.tier}"
+        phase = f"phase{args.phase}"
         level = args.level
         n_vessels = args.num_vessels
         start_idx = 0 if args.overwrite else None
         show_vessel_plot = bool(args.show_vessel_plot)
     else:
-        tier_n = _prompt_int_choice("Tier", (1, 2))
+        phase_n = _prompt_int_choice("Phase", (1, 2))
         level = _prompt_int_choice("Level", (0, 1))
-        tier = f"tier{tier_n}"
+        phase = f"phase{phase_n}"
 
-        vg = VesselGenerator(tier=tier)
+        vg = VesselGenerator(phase=phase)
         inv = summarize_vessel_mesh_inventory(vg.output_dir)
         n_on_disk = int(inv["count"])
         max_idx = int(inv["max_idx"])
@@ -796,7 +796,7 @@ if __name__ == "__main__":
         unused_slots = index_span - n_on_disk if max_idx >= 0 else 0
         print("\n--- Vessel mesh inventory ---")
         print(f"  Output: {vg.output_dir}")
-        print(f"  Total number of tier vessels: {index_span}")
+        print(f"  Total number of phase vessels: {index_span}")
         print(f"  Number of vessel meshes already generated: {n_on_disk}")
         print(f"  Number of non-anchors remaining: {unused_slots}")
         print()
@@ -814,7 +814,7 @@ if __name__ == "__main__":
         )
 
     if all(trio):
-        vg = VesselGenerator(tier=tier)
+        vg = VesselGenerator(phase=phase)
 
     if args.seed is not None:
         logger.info("Using fixed RNG seed=%s", args.seed)

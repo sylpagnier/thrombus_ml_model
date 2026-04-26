@@ -1,18 +1,24 @@
-"""Regression tests for Tier 1 / Tier 2 predictor training helpers."""
+"""Regression tests for unified kinematics predictor training helpers."""
+
+from __future__ import annotations
 
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 
-import src.training.train_t1_predictor as t1_mod
-import src.training.train_t2_predictor as t2_mod
-from src.utils.metrics import DynamicLossWeighter
+import src.training.train_kinematics_predictor as kin_mod
 
 
-class _GraphStub:
-    def __init__(self, is_anchor: bool):
+class _SimpleGraph:
+    def __init__(self, is_anchor: bool = False):
         self.is_anchor = torch.tensor([is_anchor], dtype=torch.bool)
+
+    def clone(self):
+        return _SimpleGraph(bool(self.is_anchor.any().item()))
+
+    def to(self, _device):
+        return self
 
 
 class _DummyModel:
@@ -25,173 +31,193 @@ class _DummyModel:
 
 
 class _DummyKernels:
-    def _get_geometric_props(self, data):
-        return {"n": data.y.shape[0]}
+    def __init__(self):
+        self.cfg = SimpleNamespace(mu_viscosity_nd_scale=0.0035)
+        self.mu_0_nd = 1.0
 
-    def _compute_derivatives(self, field, props):
-        _ = field
-        n = int(props["n"])
+    def _get_geometric_props(self, _data):
+        return {"n": 1}
+
+    def _compute_derivatives(self, field, _props):
+        n = int(field.shape[0])
         return torch.zeros((n, 2, 1), dtype=torch.float32)
 
 
 class _SimpleWeighter:
     def __call__(self, losses, scales=None):
         scales = scales or [1.0] * len(losses)
-        out = torch.tensor(0.0, dtype=torch.float32)
+        total = torch.tensor(0.0, dtype=torch.float32)
         for loss, scale in zip(losses, scales):
-            out = out + (loss * float(scale))
-        return out
+            total = total + (loss * float(scale))
+        return total
 
 
-def test_assert_tier2_train_split_validation():
-    ok_train = [_GraphStub(True), _GraphStub(False)]
-    ok_val = [_GraphStub(True)]
-    t2_mod._assert_tier2_train_split(ok_train, ok_val)
-
-    try:
-        t2_mod._assert_tier2_train_split([], ok_val)
-        assert False, "expected empty train split to fail"
-    except ValueError as e:
-        assert "train_data is empty" in str(e)
-
-    try:
-        t2_mod._assert_tier2_train_split([_GraphStub(True)], [_GraphStub(True)])
-        assert False, "expected no physics-only split to fail"
-    except ValueError as e:
-        assert "no physics-only graphs" in str(e)
-
-    try:
-        t2_mod._assert_tier2_train_split([_GraphStub(False)], [_GraphStub(True)])
-        assert False, "expected no anchor split to fail"
-    except ValueError as e:
-        assert "no anchor" in str(e)
-
-
-def test_tier2_dynamic_loss_weighter_precision_floor():
-    floor = 0.8
-    cap = 20.0
-    lw = t2_mod._tier2_dynamic_loss_weighter(device="cpu", mom_precision_floor=floor, mom_weight_cap=cap)
-    expected_max_lv = -torch.log(torch.tensor(floor))
-    expected_min_lv = -torch.log(torch.tensor(cap))
-    assert torch.allclose(
-        lw.per_task_max_log_var,
-        torch.tensor([expected_max_lv.item(), 10.0], dtype=torch.float32),
-        atol=1e-6,
-    )
-    assert torch.allclose(
-        lw.per_task_min_log_var,
-        torch.tensor([expected_min_lv.item(), -8.0], dtype=torch.float32),
-        atol=1e-6,
-    )
-
-
-def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
-    def _fake_terms(*_args, **_kwargs):
-        is_distillation = bool(_kwargs.get("tier2_distillation", False))
-        return {
-            "l_wss": torch.tensor(0.6),
-            "l_data_kine": torch.tensor(0.1),
-            "l_data_mu": torch.tensor(0.2),
-            "l_mom": torch.tensor(0.0 if is_distillation else 0.5),
-            "l_cont": torch.tensor(0.0 if is_distillation else 0.25),
-            "l_bc": torch.tensor(0.3),
-            "l_io": torch.tensor(0.4),
-            "l_rheo": torch.tensor(0.0 if is_distillation else 0.7),
-        }
-
-    monkeypatch.setattr(t2_mod, "compute_kinematics_physics_terms", _fake_terms)
-
-    n = 4
-    model = _DummyModel(pred=torch.zeros((n, 5), dtype=torch.float32), jac=torch.tensor(0.5))
-    data = SimpleNamespace(y=torch.zeros((n, 5), dtype=torch.float32))
-
-    loss_d, metrics_d = t2_mod.compute_step_loss(
-        model=model,
-        data=data,
-        kernels=_DummyKernels(),
-        loss_weighter=_SimpleWeighter(),
-        current_solver="anderson",
-        device="cpu",
-        carreau_n=0.7,
-        physics_active=False,
-    )
-    assert abs(float(loss_d.item()) - 609.95) < 1e-6
-    assert metrics_d["L_mom"] == 0.0
-
-    loss_c, metrics_c = t2_mod.compute_step_loss(
-        model=model,
-        data=data,
-        kernels=_DummyKernels(),
-        loss_weighter=_SimpleWeighter(),
-        current_solver="anderson",
-        device="cpu",
-        carreau_n=0.7,
-        tier2_kine_p_weight=1.35,
-        coupled_io_scale=6.0,
-        train_continuity_scale=100.0,
-        physics_active=True,
-    )
-    assert abs(float(loss_c.item()) - 636.15) < 1e-5
-    assert abs(metrics_c["L_mom"] - 0.5) < 1e-6
-
-
-def test_compute_step_loss_t1_no_anchor_pgrad_is_zero(monkeypatch):
+def test_compute_step_loss_respects_curriculum_stage_logic(monkeypatch):
     def _fake_terms(*_args, **_kwargs):
         return {
-            "l_wss": torch.tensor(0.5),
-            "l_data_kine": torch.tensor(0.2),
-            "l_mom": torch.tensor(0.4),
-            "l_cont": torch.tensor(0.3),
+            "l_wss": torch.tensor(2.0),
+            "l_data_kine": torch.tensor(1.0),
+            "l_data_mu": torch.tensor(3.0),
+            "l_mom": torch.tensor(0.5),
+            "l_cont": torch.tensor(0.25),
             "l_bc": torch.tensor(0.1),
             "l_io": torch.tensor(0.2),
         }
 
-    monkeypatch.setattr(t1_mod, "compute_kinematics_physics_terms", _fake_terms)
-    monkeypatch.setattr(
-        t1_mod,
-        "anchor_node_mask",
-        lambda data: torch.zeros(data.y.shape[0], dtype=torch.bool),
-    )
+    monkeypatch.setattr(kin_mod, "compute_kinematics_physics_terms", _fake_terms)
 
-    n = 3
-    pred = torch.zeros((n, 5), dtype=torch.float32)
-    jac = torch.tensor(0.4)
-    model = _DummyModel(pred=pred, jac=jac)
-    data = SimpleNamespace(
-        y=torch.zeros((n, 5), dtype=torch.float32),
-        x=torch.zeros((n, 2), dtype=torch.float32),
-    )
-    # Dynamic PDE weighting with log_var=0 matches fixed-sum momentum+continuity when λ_phys is shared.
-    lw = DynamicLossWeighter(num_losses=2)
+    n = 4
+    model = _DummyModel(pred=torch.zeros((n, 5), dtype=torch.float32), jac=torch.tensor(0.1))
+    data = SimpleNamespace(y=torch.zeros((n, 5), dtype=torch.float32))
+    kernels = _DummyKernels()
+    weighter = _SimpleWeighter()
 
-    loss, metrics = t1_mod.compute_step_loss(
+    _, m1 = kin_mod.compute_step_loss(
         model=model,
         data=data,
-        kernels=_DummyKernels(),
-        loss_weighter=lw,
-        current_solver="anderson",
-        lambda_phys=0.5,
+        kernels=kernels,
+        loss_weighter=weighter,
+        solver="anderson",
         device="cpu",
+        stage=1,
+        current_n=1.0,
+        current_mu_0=0.0035,
+    )
+    assert m1["L_data"] > 0.0
+    assert m1["L_mu"] > 0.0
+    assert abs(kernels.mu_0_nd - 1.0) < 1e-6
+
+    _, m2 = kin_mod.compute_step_loss(
+        model=model,
+        data=data,
+        kernels=kernels,
+        loss_weighter=weighter,
+        solver="anderson",
+        device="cpu",
+        stage=2,
+        current_n=0.8,
+        current_mu_0=0.02,
+    )
+    assert m2["L_data"] == 0.0
+    assert m2["L_mu"] == 0.0
+    assert abs(kernels.mu_0_nd - (0.02 / 0.0035)) < 1e-6
+
+
+def test_fast_forward_curriculum_three_epochs(monkeypatch):
+    stage_calls = []
+    freeze_states = []
+    optimizer_kinds = []
+    loaded = []
+
+    class _FakeModel(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            _ = (args, kwargs)
+            self.w = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, data, **_kwargs):
+            n = 2
+            pred = torch.zeros((n, 5), dtype=torch.float32) + self.w * 0.0
+            _ = data
+            return pred, torch.tensor(0.0)
+
+    class _FakeKernels:
+        def __init__(self, phys_cfg):
+            _ = phys_cfg
+            self.cfg = SimpleNamespace(mu_viscosity_nd_scale=0.0035)
+            self.mu_0_nd = 1.0
+
+    class _FakeLossWeighter(nn.Module):
+        def __init__(self, num_losses):
+            super().__init__()
+            _ = num_losses
+            self.p = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, losses):
+            return losses[0] + losses[1] + self.p * 0.0
+
+        def requires_grad_(self, flag=True):
+            freeze_states.append(bool(flag))
+            return super().requires_grad_(flag)
+
+    class _FakeAdam:
+        def __init__(self, *_args, **_kwargs):
+            optimizer_kinds.append("adam")
+
+        def zero_grad(self):
+            return None
+
+        def step(self):
+            return None
+
+    class _FakeLBFGS:
+        def __init__(self, *_args, **_kwargs):
+            optimizer_kinds.append("lbfgs")
+
+        def zero_grad(self):
+            return None
+
+        def step(self, closure):
+            return closure()
+
+    class _FakeScheduler:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def step(self):
+            return None
+
+    def _fake_load_dataset(phase, target_n=None):
+        loaded.append((phase, target_n))
+        return [_SimpleGraph(False), _SimpleGraph(False)]
+
+    def _fake_split(dataset, seed=42, train_ratio=0.9):
+        _ = (seed, train_ratio)
+        return {"train": dataset, "val": dataset, "n_anchors": 0, "n_physics": len(dataset)}
+
+    def _fake_compute_step_loss(
+        _model,
+        _data,
+        _kernels,
+        _loss_weighter,
+        _solver,
+        _device,
+        stage,
+        current_n,
+        current_mu_0,
+    ):
+        stage_calls.append((stage, current_n, current_mu_0))
+        return torch.tensor(1.0, requires_grad=True), {"L_mom": 0.0, "L_data": 0.0}
+
+    monkeypatch.setattr(kin_mod, "GINO_DEQ", _FakeModel)
+    monkeypatch.setattr(kin_mod, "PhysicsKernels", _FakeKernels)
+    monkeypatch.setattr(kin_mod, "DynamicLossWeighter", _FakeLossWeighter)
+    monkeypatch.setattr(kin_mod, "load_dataset", _fake_load_dataset)
+    monkeypatch.setattr(kin_mod, "split_anchor_physics", _fake_split)
+    monkeypatch.setattr(kin_mod, "compute_step_loss", _fake_compute_step_loss)
+    monkeypatch.setattr(
+        kin_mod,
+        "quantify_performance",
+        lambda *_args, **_kwargs: {"rel_l2": 0.1, "continuity": 0.001},
+    )
+    monkeypatch.setattr(kin_mod, "DataLoader", lambda data, **_kwargs: list(data))
+    monkeypatch.setattr(kin_mod.optim, "AdamW", _FakeAdam)
+    monkeypatch.setattr(kin_mod.optim, "LBFGS", _FakeLBFGS)
+    monkeypatch.setattr(kin_mod, "LinearLR", _FakeScheduler)
+    monkeypatch.setattr(kin_mod, "CosineAnnealingLR", _FakeScheduler)
+    monkeypatch.setattr(kin_mod, "SequentialLR", _FakeScheduler)
+    monkeypatch.setattr(kin_mod.os, "makedirs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(kin_mod.torch, "save", lambda *_args, **_kwargs: None)
+
+    kin_mod.train_kinematics(
+        epochs=3,
+        adam_epochs=2,
+        stage1_end_epoch=1,
+        stage2_end_epoch=2,
     )
 
-    assert abs(float(loss.item()) - 107.39) < 1e-6
-    assert metrics["L_pgrad"] == 0.0
-    assert metrics["A_nodes"] == 0
-
-
-def test_load_tier1_bootstrap_adapts_encoder_width(tmp_path):
-    class _TinyModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.encoder = nn.Sequential(nn.Linear(5, 4, bias=False))
-
-    ckpt_path = tmp_path / "tier1_best_physics.pth"
-    state = {"encoder.0.weight": torch.ones((4, 3), dtype=torch.float32)}
-    torch.save(state, ckpt_path)
-
-    model = _TinyModel()
-    ok = t2_mod._load_tier1_bootstrap(model, ckpt_path, device="cpu")
-    assert ok is True
-    w = model.encoder[0].weight.detach()
-    assert torch.allclose(w[:, :3], torch.ones((4, 3), dtype=torch.float32), atol=1e-6)
-    assert torch.allclose(w[:, 3:], torch.zeros((4, 2), dtype=torch.float32), atol=1e-6)
+    assert [s for s, _, _ in stage_calls] == [1, 1, 2, 2, 3, 3]
+    assert loaded == [("kinematics", "newtonian"), ("kinematics", "carreau")]
+    assert False in freeze_states  # Stage 2 freezes Kendall weighter
+    assert True in freeze_states   # Stage 1/3 unfreezes it
+    assert "lbfgs" in optimizer_kinds

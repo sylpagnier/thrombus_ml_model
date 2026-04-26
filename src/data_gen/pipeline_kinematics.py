@@ -1,8 +1,8 @@
 """
-Interactive Tier 1/2 data pipeline: vessel meshes, optional COMSOL anchors, PyG graphs.
+Interactive Kinematics/2 data pipeline: vessel meshes, optional COMSOL anchors, PyG graphs.
 
 Runs the same logical steps as ``vessel_generator``, ``anchor_generator``, and ``mesh_to_graph``.
-**Interactive mode asks every question first** (per tier), then runs Gmsh / COMSOL / mesh-to-graph
+**Interactive mode asks every question first** (per phase), then runs Gmsh / COMSOL / mesh-to-graph
 with **no further prompts** so you can leave the machine unattended after the planning phase.
 """
 
@@ -49,21 +49,21 @@ def _prompt_nonnegative_int(label: str, default: int) -> int:
             print("Invalid input. Enter an integer value.")
 
 
-def _tier_str_from_n(tier_n: int) -> str:
-    return f"tier{tier_n}"
+def _rheology_from_n(choice_n: int) -> str:
+    if choice_n == 1:
+        return "newtonian"
+    if choice_n == 2:
+        return "carreau"
+    raise ValueError(f"Unsupported rheology choice: {choice_n}")
 
 
-def _final_n_subdir_for_tier(tier: str) -> str | None:
-    if tier != "tier2":
-        return None
-    from src.config import PhysicsConfig
-
-    return f"n_{float(PhysicsConfig(tier='tier2').n):.3f}"
+def _final_subdir_for_rheology(rheology: str) -> str:
+    return str(rheology).strip().lower()
 
 
 @dataclass
-class TierInteractivePlan:
-    """All interactive choices for one tier (collected before any long-running step)."""
+class PhaseInteractivePlan:
+    """All interactive choices for one rheology pass (collected before any long-running step)."""
 
     anchor_target: int
     run_vessel: bool
@@ -81,35 +81,34 @@ class TierInteractivePlan:
     # When anchor_target == 0 and run_anchors: how many new CFD samples to aim for.
     anchor_manual_max_new: Optional[int]
     run_mesh: bool
-    continuation_steps: Optional[list[float]] = None
 
 
 def run_interactive_pipeline() -> None:
-    print("\n=== Tier 1/2 data generation pipeline (vessel, anchors, graphs) ===\n")
+    print("\n=== Kinematics/2 data generation pipeline (vessel, anchors, graphs) ===\n")
 
-    tier_scope = _vg_prompt_int_choice(
-        "Run datagen for (1 = Tier 1 only, 2 = Tier 2 only, 3 = Tier 1 and Tier 2 sequentially)",
+    rheology_scope = _vg_prompt_int_choice(
+        "Run Kinematics datagen for (1 = Newtonian Primer, 2 = Carreau Target, 3 = Both sequentially)",
         (1, 2, 3),
     )
-    tier_sequence = (1, 2) if tier_scope == 3 else (tier_scope,)
+    rheology_sequence = (1, 2) if rheology_scope == 3 else (rheology_scope,)
 
-    if len(tier_sequence) == 2:
+    if len(rheology_sequence) == 2:
         print(
-            "\nBoth tiers run one after the other (separate `data/raw/tier*`, CFD dirs, and graphs). "
-            "Each tier uses a random vessel cohort (interactive pipeline does not prompt for RNG seed).\n"
+            "\nBoth rheology passes run one after the other (newtonian then carreau), "
+            "writing to separate CFD and graph subfolders.\n"
         )
 
     print(
-        "\nEach tier plan asks vessel generation -> COMSOL anchors (optional) first; "
+        "\nEach rheology plan asks vessel generation -> COMSOL anchors (optional) first; "
         "mesh-to-graph runs automatically after. No prompts during execution.\n"
     )
 
     print(
         "\n--- Planning: answer all questions now; the run after this has **no further prompts** ---\n"
     )
-    plans: dict[int, TierInteractivePlan] = {}
-    for tier_n in tier_sequence:
-        plans[tier_n] = _prompt_tier_interactive_plan(tier_n)
+    plans: dict[int, PhaseInteractivePlan] = {}
+    for rheology_n in rheology_sequence:
+        plans[rheology_n] = _prompt_phase_interactive_plan(rheology_n)
 
     print(
         f"\n{'=' * 60}\n"
@@ -117,20 +116,20 @@ def run_interactive_pipeline() -> None:
         f"{'=' * 60}\n"
     )
 
-    for tier_n in tier_sequence:
-        _execute_tier_interactive_plan(tier_n, plans[tier_n].anchor_target, plans[tier_n])
+    for rheology_n in rheology_sequence:
+        _execute_phase_interactive_plan(rheology_n, plans[rheology_n].anchor_target, plans[rheology_n])
 
     print("\n=== Pipeline finished ===\n")
 
 
-def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
-    tier = _tier_str_from_n(tier_n)
-    print(f"\n{'=' * 60}\n  PLAN — {tier.upper()} (independent cohort)\n{'=' * 60}\n")
+def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
+    rheology = _rheology_from_n(rheology_n)
+    print(f"\n{'=' * 60}\n  PLAN — {rheology.upper()} (independent cohort)\n{'=' * 60}\n")
 
     # ==========================================================
     # 1. VESSELS
     # ==========================================================
-    vg = VesselGenerator(tier=tier)
+    vg = VesselGenerator(phase="kinematics")
     inv = summarize_vessel_mesh_inventory(vg.output_dir)
     n_on_disk = int(inv["count"])
 
@@ -163,7 +162,7 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
         summarize_anchor_inventory,
     )
 
-    print(f"\n--- {tier.upper()} COMSOL anchors ---")
+    print(f"\n--- {rheology.upper()} COMSOL anchors ---")
 
     # Match anchor write mode to vessel overwrite (new cohort replaces old meshes + anchors).
     if run_vessel and overwrite is True:
@@ -174,7 +173,8 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
     else:
         allow_overwrite_anchor = _prompt_anchor_write_mode()
 
-    gen = AnchorGenerator(tier=tier)
+    anchor_output_dir = vg.vessel_cfg.output_dir / _final_subdir_for_rheology(rheology)
+    gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
     anchor_inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
     have_npz = int(anchor_inv["existing_npz"])
     ready_add = int(anchor_inv["candidate_pool_ready"])
@@ -193,24 +193,16 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
     )
     run_anchors = anchor_manual_max_new > 0
 
-    # No JSON scan cap; shuffle candidates with a random seed (interactive tier12 defaults).
+    # No JSON scan cap; shuffle candidates with a random seed (interactive kinematics defaults).
     anchor_max_json_scan: Optional[int] = None
     anchor_shuffle = True
     anchor_shuffle_seed: Optional[int] = None
-    continuation_steps: Optional[list[float]] = None
-    if tier_n == 2:  # Always ask for Tier 2 so mesh-to-graph knows about continuation steps.
-        raw_steps = input(
-            "Enter continuation 'n' steps separated by commas (e.g. 0.8, 0.6) or leave blank: "
-        ).strip()
-        if raw_steps:
-            continuation_steps = [float(x.strip()) for x in raw_steps.split(",") if x.strip()]
-
     # ==========================================================
     # 3. MESH TO GRAPH (Automatic)
     # ==========================================================
     run_mesh = True
 
-    return TierInteractivePlan(
+    return PhaseInteractivePlan(
         anchor_target=0,  # Hardcoded to 0 to trigger the manual count in execution
         run_vessel=run_vessel,
         level=level,
@@ -226,19 +218,18 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
         anchor_shuffle_seed=anchor_shuffle_seed,
         anchor_manual_max_new=anchor_manual_max_new,
         run_mesh=run_mesh,
-        continuation_steps=continuation_steps,
     )
 
 
-def _execute_tier_interactive_plan(
-    tier_n: int, anchor_target: int, plan: TierInteractivePlan
+def _execute_phase_interactive_plan(
+    rheology_n: int, anchor_target: int, plan: PhaseInteractivePlan
 ) -> None:
-    tier = _tier_str_from_n(tier_n)
-    print(f"\n{'=' * 60}\n  RUN — {tier.upper()}\n{'=' * 60}\n")
+    rheology = _rheology_from_n(rheology_n)
+    print(f"\n{'=' * 60}\n  RUN — {rheology.upper()}\n{'=' * 60}\n")
 
     if plan.run_vessel:
         assert plan.level is not None and plan.overwrite is not None and plan.n_vessels is not None
-        vg = VesselGenerator(tier=tier)
+        vg = VesselGenerator(phase="kinematics")
         start_idx = 0 if plan.overwrite else None
         print("\n--- Running vessel generator ---\n")
         vg.run_pipeline(
@@ -256,7 +247,10 @@ def _execute_tier_interactive_plan(
             summarize_anchor_inventory,
         )
 
-        gen = AnchorGenerator(tier=tier)
+        anchor_output_dir = VesselGenerator(phase="kinematics").vessel_cfg.output_dir / _final_subdir_for_rheology(
+            rheology
+        )
+        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
         inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
         ready_add = int(inv["candidate_pool_ready"])
         ready_all = int(inv["candidate_pool_including_npz"])
@@ -310,86 +304,78 @@ def _execute_tier_interactive_plan(
                     shuffle_candidates=plan.anchor_shuffle,
                     shuffle_seed=plan.anchor_shuffle_seed,
                     allow_overwrite=plan.allow_overwrite_anchor,
-                    continuation_steps=plan.continuation_steps,
+                    continuation_steps=None,
                 )
 
     if plan.run_mesh:
         print("\n--- Mesh to graph ---")
         from src.data_gen.lib.mesh_to_graph import MeshToGraph
 
-        # 1. Process Continuation Steps (if any)
-        if plan.continuation_steps and tier_n == 2:
-            for step_val in plan.continuation_steps:
-                subdir = f"n_{step_val:.3f}"
-                print(f"\n⚙️ Converting Meshes -> Graphs for {subdir}...")
-                processor = MeshToGraph(tier=tier, n_subdir=subdir)
-                processor.run()
-
-        # 2. Process Final Target Graphs
-        final_subdir = _final_n_subdir_for_tier(tier)
-        target_label = final_subdir if final_subdir else "tier default directory"
+        # Process target graphs only; no intermediate continuation sweeps.
+        final_subdir = _final_subdir_for_rheology(rheology)
+        target_label = final_subdir
         print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(tier=tier, n_subdir=final_subdir)
+        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir)
         processor.run()
 
 
 def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p = argparse.ArgumentParser(
-        description="Tier 1/2 data pipeline: vessel meshes, optional COMSOL anchors, PyG graphs.",
+        description="Kinematics/2 data pipeline: vessel meshes, optional COMSOL anchors, PyG graphs.",
     )
     p.add_argument(
         "--batch",
         action="store_true",
-        help="Non-interactive mode (requires --tier or --both-tiers; optional anchor flags).",
+        help="Non-interactive mode (requires --rheology or --both-rheologies; optional anchor flags).",
     )
     p.add_argument(
-        "--both-tiers",
+        "--both-rheologies",
         action="store_true",
-        help="Run tier 1 then tier 2 sequentially (independent cohorts; use --seed-tier1/--seed-tier2).",
+        help="Run newtonian then carreau sequentially (independent cohorts; use --seed-newtonian/--seed-carreau).",
     )
-    p.add_argument("--tier", type=int, choices=(1, 2), help="Tier (1 or 2); omit when using --both-tiers")
+    p.add_argument("--rheology", choices=("newtonian", "carreau"), help="Rheology target; omit when using --both-rheologies")
     p.add_argument("--level", type=int, choices=(0, 1), help="Geometry complexity")
     p.add_argument(
         "-n",
         "--num-vessels",
         type=int,
         metavar="N",
-        help="Number of vessels to generate (both tiers use this if --num-vessels-tier* omitted)",
+        help="Number of vessels to generate (both passes use this if per-rheology flags are omitted)",
     )
     p.add_argument(
-        "--num-vessels-tier1",
+        "--num-vessels-newtonian",
         type=int,
         default=None,
         metavar="N",
-        help="With --both-tiers: vessel count for tier 1 (falls back to -n).",
+        help="With --both-rheologies: vessel count for newtonian pass (falls back to -n).",
     )
     p.add_argument(
-        "--num-vessels-tier2",
+        "--num-vessels-carreau",
         type=int,
         default=None,
         metavar="N",
-        help="With --both-tiers: vessel count for tier 2 (falls back to -n).",
+        help="With --both-rheologies: vessel count for carreau pass (falls back to -n).",
     )
     p.add_argument("--overwrite", action="store_true", help="Start vessel indices at 0")
     p.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Gmsh RNG seed for vessel generation (single-tier batch only; empty default = random).",
+        help="Gmsh RNG seed for vessel generation (single-rheology batch only; empty default = random).",
     )
     p.add_argument(
-        "--seed-tier1",
+        "--seed-newtonian",
         type=int,
         default=None,
         metavar="INT",
-        help="With --both-tiers: Gmsh seed for tier 1 (omit for random).",
+        help="With --both-rheologies: Gmsh seed for newtonian pass (omit for random).",
     )
     p.add_argument(
-        "--seed-tier2",
+        "--seed-carreau",
         type=int,
         default=None,
         metavar="INT",
-        help="With --both-tiers: Gmsh seed for tier 2 (omit for random).",
+        help="With --both-rheologies: Gmsh seed for carreau pass (omit for random).",
     )
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--chunk-size", type=int, default=None)
@@ -411,21 +397,21 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
         type=int,
         default=None,
         metavar="K",
-        help="COMSOL: target new .npz per tier if tier-specific flags omitted (omit with --skip-anchor)",
+        help="COMSOL: target new .npz per phase if phase-specific flags omitted (omit with --skip-anchor)",
     )
     p.add_argument(
-        "--anchor-max-new-tier1",
+        "--anchor-max-new-newtonian",
         type=int,
         default=None,
         metavar="K",
-        help="With --both-tiers: anchor target for tier 1 (falls back to --anchor-max-new).",
+        help="With --both-rheologies: anchor target for newtonian pass (falls back to --anchor-max-new).",
     )
     p.add_argument(
-        "--anchor-max-new-tier2",
+        "--anchor-max-new-carreau",
         type=int,
         default=None,
         metavar="K",
-        help="With --both-tiers: anchor target for tier 2 (falls back to --anchor-max-new).",
+        help="With --both-rheologies: anchor target for carreau pass (falls back to --anchor-max-new).",
     )
     p.add_argument(
         "--anchor-overwrite",
@@ -435,99 +421,88 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p.add_argument("--anchor-max-json-scan", type=int, default=None)
     p.add_argument("--anchor-shuffle", action="store_true")
     p.add_argument("--anchor-shuffle-seed", type=int, default=None)
-    p.add_argument(
-        "--continuation-steps",
-        type=str,
-        default=None,
-        help="Comma separated list of intermediate n values (e.g. '0.8,0.6') for Tier 2.",
-    )
 
     args = p.parse_args(argv)
     if not args.batch:
         return None
-    if args.both_tiers and args.tier is not None:
-        p.error("Do not pass --tier with --both-tiers")
-    if args.both_tiers and args.seed is not None:
-        p.error("With --both-tiers use --seed-tier1 and --seed-tier2 (not --seed)")
+    if args.both_rheologies and args.rheology is not None:
+        p.error("Do not pass --rheology with --both-rheologies")
+    if args.both_rheologies and args.seed is not None:
+        p.error("With --both-rheologies use --seed-newtonian and --seed-carreau (not --seed)")
     missing = []
     if not args.skip_vessel:
-        if not args.both_tiers and args.tier is None:
-            missing.append("--tier or --both-tiers")
+        if not args.both_rheologies and args.rheology is None:
+            missing.append("--rheology or --both-rheologies")
         if args.level is None:
             missing.append("--level")
-        if args.both_tiers:
+        if args.both_rheologies:
             ok_nv = args.num_vessels is not None or (
-                args.num_vessels_tier1 is not None and args.num_vessels_tier2 is not None
+                args.num_vessels_newtonian is not None and args.num_vessels_carreau is not None
             )
             if not ok_nv:
                 missing.append(
-                    "-n / --num-vessels, or both --num-vessels-tier1 and --num-vessels-tier2"
+                    "-n / --num-vessels, or both --num-vessels-newtonian and --num-vessels-carreau"
                 )
         elif args.num_vessels is None:
             missing.append("-n / --num-vessels")
     else:
-        if not args.both_tiers and args.tier is None:
-            missing.append("--tier or --both-tiers (needed for mesh step paths)")
+        if not args.both_rheologies and args.rheology is None:
+            missing.append("--rheology or --both-rheologies (needed for mesh step paths)")
     if missing:
         p.error(f"--batch mode missing: {', '.join(missing)}")
     if not args.skip_anchor:
-        if not getattr(args, "both_tiers", False):
+        if not getattr(args, "both_rheologies", False):
             if args.anchor_max_new is None:
                 p.error("--batch: specify --anchor-max-new or --skip-anchor")
         else:
-            for tn in (1, 2):
-                av = getattr(args, f"anchor_max_new_tier{tn}", None)
+            for key in ("newtonian", "carreau"):
+                av = getattr(args, f"anchor_max_new_{key}", None)
                 if av is None and args.anchor_max_new is None:
                     p.error(
-                        "--both-tiers: set --anchor-max-new, or both "
-                        "--anchor-max-new-tier1 and --anchor-max-new-tier2"
+                        "--both-rheologies: set --anchor-max-new, or both "
+                        "--anchor-max-new-newtonian and --anchor-max-new-carreau"
                     )
-    if getattr(args, "both_tiers", False) and not args.skip_vessel:
-        for tn in (1, 2):
-            nv = getattr(args, f"num_vessels_tier{tn}", None)
+    if getattr(args, "both_rheologies", False) and not args.skip_vessel:
+        for key in ("newtonian", "carreau"):
+            nv = getattr(args, f"num_vessels_{key}", None)
             if nv is None and args.num_vessels is None:
                 p.error(
-                    "--both-tiers: set -n / --num-vessels, or both "
-                    "--num-vessels-tier1 and --num-vessels-tier2"
+                    "--both-rheologies: set -n / --num-vessels, or both "
+                    "--num-vessels-newtonian and --num-vessels-carreau"
                 )
     return args
 
 
-def _batch_num_vessels_for_tier(tier_num: int, args: argparse.Namespace) -> int:
-    v = getattr(args, f"num_vessels_tier{tier_num}", None)
+def _batch_num_vessels_for_rheology(rheology: str, args: argparse.Namespace) -> int:
+    v = getattr(args, f"num_vessels_{rheology}", None)
     if v is not None:
         return int(v)
     assert args.num_vessels is not None
     return int(args.num_vessels)
 
 
-def _batch_anchor_max_for_tier(tier_num: int, args: argparse.Namespace) -> int:
-    v = getattr(args, f"anchor_max_new_tier{tier_num}", None)
+def _batch_anchor_max_for_rheology(rheology: str, args: argparse.Namespace) -> int:
+    v = getattr(args, f"anchor_max_new_{rheology}", None)
     if v is not None:
         return int(v)
     assert args.anchor_max_new is not None
     return int(args.anchor_max_new)
 
 
-def _run_batch_for_tier(
-    tier_num: int,
+def _run_batch_for_phase(
+    rheology: str,
     args: argparse.Namespace,
     *,
     vessel_seed: Optional[int],
     num_vessels: Optional[int] = None,
     anchor_max_new: Optional[int] = None,
 ) -> None:
-    tier = _tier_str_from_n(tier_num)
-    continuation_steps = None
-    if getattr(args, "continuation_steps", None) and tier_num == 2:
-        continuation_steps = [float(x.strip()) for x in args.continuation_steps.split(",")]
-
     if not args.skip_vessel:
         assert num_vessels is not None
-        vg = VesselGenerator(tier=tier)
+        vg = VesselGenerator(phase="kinematics")
         start_idx = 0 if args.overwrite else None
         print(
-            f"--- Vessel generation: tier={tier} level={args.level} n={num_vessels} "
+            f"--- Vessel generation: rheology={rheology} level={args.level} n={num_vessels} "
             f"seed={vessel_seed!r} ---\n"
         )
         vg.run_pipeline(
@@ -550,8 +525,11 @@ def _run_batch_for_tier(
         assert anchor_max_new is not None
         from src.data_gen.lib.anchor_generator import AnchorGenerator
 
-        gen = AnchorGenerator(tier=tier)
-        print(f"--- Anchor CFD: tier={tier} max_new={anchor_max_new} ---\n")
+        anchor_output_dir = VesselGenerator(phase="kinematics").vessel_cfg.output_dir / _final_subdir_for_rheology(
+            rheology
+        )
+        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
+        print(f"--- Anchor CFD: rheology={rheology} max_new={anchor_max_new} ---\n")
         with gen:
             gen.run_batch(
                 max_new=anchor_max_new,
@@ -559,44 +537,36 @@ def _run_batch_for_tier(
                 shuffle_candidates=bool(args.anchor_shuffle),
                 shuffle_seed=args.anchor_shuffle_seed,
                 allow_overwrite=bool(args.anchor_overwrite),
-                continuation_steps=continuation_steps,
+                continuation_steps=None,
             )
 
     if not args.skip_mesh:
-        print(f"--- Mesh to graph (tier={tier}) ---")
+        print(f"--- Mesh to graph (rheology={rheology}) ---")
         from src.data_gen.lib.mesh_to_graph import MeshToGraph
 
-        # 1. Process Continuation Steps (if any)
-        if continuation_steps and tier_num == 2:
-            for step_val in continuation_steps:
-                subdir = f"n_{step_val:.3f}"
-                print(f"\n⚙️ Converting Meshes -> Graphs for {subdir}...")
-                processor = MeshToGraph(tier=tier, n_subdir=subdir)
-                processor.run()
-
-        # 2. Process Final Target Graphs
-        final_subdir = _final_n_subdir_for_tier(tier)
-        target_label = final_subdir if final_subdir else "tier default directory"
+        # Process target graphs only; no intermediate continuation sweeps.
+        final_subdir = _final_subdir_for_rheology(rheology)
+        target_label = final_subdir
         print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(tier=tier, n_subdir=final_subdir)
+        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir)
         processor.run()
 
 
 def run_batch_pipeline(args: argparse.Namespace) -> None:
-    if getattr(args, "both_tiers", False):
-        tiers = (1, 2)
-        seeds = (args.seed_tier1, args.seed_tier2)
+    if getattr(args, "both_rheologies", False):
+        rheologies = ("newtonian", "carreau")
+        seeds = (args.seed_newtonian, args.seed_carreau)
     else:
-        tiers = (int(args.tier),)
+        rheologies = (str(args.rheology),)
         seeds = (args.seed,)
 
-    for i, tier_num in enumerate(tiers):
-        if len(tiers) > 1:
-            print(f"\n========== Batch tier {tier_num} ==========\n")
-        nv = _batch_num_vessels_for_tier(tier_num, args) if not args.skip_vessel else None
-        am = _batch_anchor_max_for_tier(tier_num, args) if not args.skip_anchor else None
-        _run_batch_for_tier(
-            tier_num,
+    for i, rheology in enumerate(rheologies):
+        if len(rheologies) > 1:
+            print(f"\n========== Batch rheology {rheology} ==========\n")
+        nv = _batch_num_vessels_for_rheology(rheology, args) if not args.skip_vessel else None
+        am = _batch_anchor_max_for_rheology(rheology, args) if not args.skip_anchor else None
+        _run_batch_for_phase(
+            rheology,
             args,
             vessel_seed=seeds[i],
             num_vessels=nv,

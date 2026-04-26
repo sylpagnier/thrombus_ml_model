@@ -5,11 +5,11 @@ from __future__ import annotations
 import torch
 
 from src.config import BiochemConfig
-from src.data_gen.lib.mesh_to_graph import assemble_tier12_graph_data
-from src.data_gen.lib.mesh_to_graph_tier3 import (
-    assemble_tier3_steady_graph_data,
-    assemble_tier3_transient_graph_data,
-    default_tier3_bio_inlet_bc,
+from src.data_gen.lib.mesh_to_graph import assemble_kinematics_graph_data
+from src.data_gen.lib.mesh_to_graph_biochem import (
+    assemble_biochem_steady_graph_data,
+    assemble_biochem_transient_graph_data,
+    default_biochem_bio_inlet_bc,
 )
 
 
@@ -38,8 +38,8 @@ def _diag_sparse_grad(n: int) -> torch.Tensor:
     return torch.sparse_coo_tensor(ii, torch.ones(n, dtype=torch.float32), (n, n)).coalesce()
 
 
-def test_tier12_saved_graph_includes_wls_and_sparse_gradients_without_laplacian(tmp_path):
-    """Tier 1/2 ``*.pt`` graphs carry WLS blocks + ``G_x``/``G_y``; Laplacian is not serialized."""
+def test_kinematics_saved_graph_includes_wls_and_sparse_gradients_without_laplacian(tmp_path):
+    """Kinematics/2 ``*.pt`` graphs carry WLS blocks + ``G_x``/``G_y``; Laplacian is not serialized."""
     ctx = _base_context(num_nodes=3)
     priors = {
         "u_prior": torch.zeros(3, dtype=torch.float32),
@@ -50,7 +50,7 @@ def test_tier12_saved_graph_includes_wls_and_sparse_gradients_without_laplacian(
     gx = _diag_sparse_grad(3)
     gy = _diag_sparse_grad(3)
 
-    data = assemble_tier12_graph_data(
+    data = assemble_kinematics_graph_data(
         x_tensor=x_tensor,
         edge_index=ctx["edge_index"],
         edge_attr=ctx["edge_attr"],
@@ -78,10 +78,10 @@ def test_tier12_saved_graph_includes_wls_and_sparse_gradients_without_laplacian(
     assert not hasattr(data, "Laplacian")
 
 
-def test_tier3_non_anchor_transient_graph_matches_process_file_shape(tmp_path):
-    """Tier 3 non-anchor: transient ``y``, time axis, biochem BCs, sparse operators (same as pipeline)."""
+def test_biochem_non_anchor_transient_graph_matches_process_file_shape(tmp_path):
+    """Biochem non-anchor: transient ``y``, time axis, biochem BCs, sparse operators (same as pipeline)."""
     ctx = _base_context(num_nodes=3)
-    bio_cfg = BiochemConfig(tier="tier3")
+    bio_cfg = BiochemConfig(phase="biochem")
     num_times = bio_cfg.num_time_steps
     tvec = torch.linspace(0.0, bio_cfg.t_final, num_times, dtype=torch.float32)
     y_series = torch.zeros((num_times, 3, 16), dtype=torch.float32)
@@ -93,9 +93,9 @@ def test_tier3_non_anchor_transient_graph_matches_process_file_shape(tmp_path):
     mu_prior = torch.ones(3, dtype=torch.float32)
     uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
     x_tensor = torch.zeros((3, 15), dtype=torch.float32)
-    bio_inlet_bc = default_tier3_bio_inlet_bc(3)
+    bio_inlet_bc = default_biochem_bio_inlet_bc(3)
 
-    data = assemble_tier3_transient_graph_data(
+    data = assemble_biochem_transient_graph_data(
         x_tensor=x_tensor,
         y_tensor_series=y_series,
         eval_times_tensor=tvec,
@@ -130,8 +130,8 @@ def test_tier3_non_anchor_transient_graph_matches_process_file_shape(tmp_path):
     assert int(data.is_anchor.sum().item()) == 0
 
 
-def test_tier3_anchor_steady_graph_matches_steady_label_layout(tmp_path):
-    """Tier 3 anchor (COMSOL-labeled): steady ``[N,5]`` kinematics + scalar anchor flag."""
+def test_biochem_anchor_steady_graph_matches_steady_label_layout(tmp_path):
+    """Biochem anchor (COMSOL-labeled): steady ``[N,5]`` kinematics + scalar anchor flag."""
     ctx = _base_context(num_nodes=3)
     gx = _diag_sparse_grad(3)
     gy = _diag_sparse_grad(3)
@@ -141,7 +141,7 @@ def test_tier3_anchor_steady_graph_matches_steady_label_layout(tmp_path):
     x_tensor = torch.zeros((3, 15), dtype=torch.float32)
     y_labels = torch.zeros((3, 5), dtype=torch.float32)
 
-    data = assemble_tier3_steady_graph_data(
+    data = assemble_biochem_steady_graph_data(
         x_tensor=x_tensor,
         y_labels=y_labels,
         edge_index=ctx["edge_index"],

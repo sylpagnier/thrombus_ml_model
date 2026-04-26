@@ -267,7 +267,7 @@ class GINO_DEQ(nn.Module):
         )
         self.mu_encoder = nn.Linear(1, latent_dim)
 
-    def prepare_for_tier3_lora(self, rank: int = 4, alpha: float = 1.0):
+    def prepare_for_biochem_lora(self, rank: int = 4, alpha: float = 1.0):
         """
         Iterates through the model's architecture and dynamically injects LoRA
         into all SpectralLinear modules while rigorously maintaining Lipschitz bounds.
@@ -277,7 +277,7 @@ class GINO_DEQ(nn.Module):
                 module.inject_lora(rank=rank, alpha=alpha)
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
-        # Canonical Tier-1 layout is 15 channels; optional width priors append three more (see NodeFeat).
+        # Canonical Phase-1 layout is 15 channels; optional width priors append three more (see NodeFeat).
         xb = x[:, :15] if x.size(1) >= 15 else x
         nodes_nd = pos_nd if pos_nd is not None else xb[:, NodeFeat.XY]
         sdf_nd = xb[:, NodeFeat.SDF]
@@ -343,10 +343,10 @@ class GINO_DEQ(nn.Module):
             mu_raw = self.mu_decoder(curr_z_flat)
             mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
             if getattr(self, "decouple_rheology", False):
-                # During warmup, preserve Tier 1 latent feedback via frozen decoder clone.
-                if hasattr(self, "tier1_mu_decoder"):
+                # During warmup, preserve Kinematics latent feedback via frozen decoder clone.
+                if hasattr(self, "kinematics_mu_decoder"):
                     with torch.no_grad():
-                        t1_mu_raw = self.tier1_mu_decoder(curr_z_flat)
+                        t1_mu_raw = self.kinematics_mu_decoder(curr_z_flat)
                         mu_feedback = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(t1_mu_raw)
                 else:
                     mu_feedback = mu

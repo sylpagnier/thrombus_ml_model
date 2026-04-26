@@ -19,7 +19,7 @@ def anchor_node_mask(data):
 
     ``mesh_to_graph`` uses graph-level ``is_anchor`` of shape ``[1]``.
     Batched graphs use ``is_anchor[batch]`` (one flag per graph).
-    Tier-3 style graphs may use per-node ``is_anchor`` of shape ``[N]``.
+    Phase-3 style graphs may use per-node ``is_anchor`` of shape ``[N]``.
     """
     if not hasattr(data, "is_anchor"):
         return None

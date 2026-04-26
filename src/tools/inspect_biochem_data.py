@@ -1,20 +1,20 @@
 """
-Tier 3 export / graph inspector: boundary checks, unit audits, summaries, and matplotlib views.
+Biochem export / graph inspector: boundary checks, unit audits, summaries, and matplotlib views.
 
 **Default:** one patient at a time — **brief** availability line, qualitative text (boundaries, unit audit, graph
 summary) for **that** stem only, then **one** matplotlib window (domain time-slider if multi-``@ t=``, else a
 single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). **Regenerate Random Patient** /
-``r`` cycles stems like ``inspect_phase1_data``. For the **full** stems/times table use ``--summary``.
+``r`` cycles stems like ``inspect_kinematics_data``. For the **full** stems/times table use ``--summary``.
 
 Examples:
-    python -m src.tools.inspect_tier3_data --tier tier3_patients
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --summary
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem patient001
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --unit-audit
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --graph-summary
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --plot-domain
-    python -m src.tools.inspect_tier3_data --tier tier3_mix --plot-domain-interactive
-    python -m src.tools.inspect_tier3_data --tier tier3_patients --stem vessel_001 --plot-graph
+    python -m src.tools.inspect_biochem_data --phase biochem_patients
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --summary
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem patient001
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --unit-audit
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --graph-summary
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --plot-domain
+    python -m src.tools.inspect_biochem_data --phase biochem_mix --plot-domain-interactive
+    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --plot-graph
 """
 
 from __future__ import annotations
@@ -55,17 +55,17 @@ FIELD_COLUMNS = [
     "Mat",
 ]
 
-_TIER_CHOICES = ("tier3", "tier3_patients", "tier3_mix")
+_PHASE_CHOICES = ("biochem", "biochem_patients", "biochem_mix")
 U_CMAP = "jet"
 
 
-def _resolve_export_dir(tier: str) -> Path:
-    cfg = VesselConfig(tier=tier)
+def _resolve_export_dir(phase: str) -> Path:
+    cfg = VesselConfig(phase=phase)
     return Path(cfg.output_dir)
 
 
-def _resolve_graph_dir(tier: str) -> Path:
-    cfg = VesselConfig(tier=tier)
+def _resolve_graph_dir(phase: str) -> Path:
+    cfg = VesselConfig(phase=phase)
     return Path(cfg.graph_output_dir)
 
 
@@ -104,7 +104,7 @@ def _load_first_block(domain_file: Path, sample_rows: int = 100000) -> pd.DataFr
 
 
 def _load_comsol_trajectory(domain_file: Path) -> tuple[list[float], dict[float, pd.DataFrame]]:
-    """Parse wide-format Tier3 COMSOL domain ``.txt`` (same layout as ``extract_tier3_comsol_data``)."""
+    """Parse wide-format Phase3 COMSOL domain ``.txt`` (same layout as ``extract_biochem_comsol_data``)."""
     with open(domain_file, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
     header_line = ""
@@ -173,7 +173,7 @@ def _attach_regenerate_patient_button(
     next_holder: dict[str, str | None],
     enable: bool,
 ) -> None:
-    """Bottom-right button + ``r`` hotkey to switch to another patient (same stem list as phase1 anchor)."""
+    """Bottom-right button + ``r`` hotkey to switch to another patient (same stem list as kinematics anchor)."""
     if not enable:
         return
 
@@ -239,7 +239,7 @@ def plot_domain_trajectory_slider(
     bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
     plt.subplots_adjust(bottom=bottom, hspace=0.25)
     ti0 = 0
-    fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[ti0]:.6g})", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Phase3 domain export — {stem}  (t={t_axis[ti0]:.6g})", fontsize=14, fontweight="bold")
 
     sc0 = axs[0, 0].scatter(x_s, y_s, c=vel[ti0], cmap=U_CMAP, s=2, vmin=vel_vmin, vmax=vel_vmax, rasterized=True)
     fig.colorbar(sc0, ax=axs[0, 0], label="|U|")
@@ -277,7 +277,7 @@ def plot_domain_trajectory_slider(
             sc1.set_array(p_all[k])
             sc2.set_array(th_all[k])
             sc3.set_array(mu_all[k])
-            fig.suptitle(f"Tier3 domain export — {stem}  (t={t_axis[k]:.6g})", fontsize=14, fontweight="bold")
+            fig.suptitle(f"Phase3 domain export — {stem}  (t={t_axis[k]:.6g})", fontsize=14, fontweight="bold")
             fig.canvas.draw_idle()
 
         slider.on_changed(_upd)
@@ -304,7 +304,7 @@ def plot_graph_trajectory_slider(
     current_stem_for_regen: str | None = None,
     enable_regenerate: bool = True,
 ) -> None:
-    """Time slider for transient graph labels ``y`` shaped ``[T, N, C]`` (Tier3 trajectories)."""
+    """Time slider for transient graph labels ``y`` shaped ``[T, N, C]`` (Phase3 trajectories)."""
     y = data.y
     if not torch.is_tensor(y):
         y = torch.as_tensor(y)
@@ -341,7 +341,7 @@ def plot_graph_trajectory_slider(
     plt.subplots_adjust(bottom=bottom, hspace=0.25)
     ti0 = 0
     fig.suptitle(
-        f"Tier3 graph labels — {stem}  (t={float(t_axis[ti0]):.6g})",
+        f"Phase3 graph labels — {stem}  (t={float(t_axis[ti0]):.6g})",
         fontsize=14,
         fontweight="bold",
     )
@@ -382,7 +382,7 @@ def plot_graph_trajectory_slider(
         sc2.set_array(th_all[k])
         sc3.set_array(mu_ch[k])
         tt = float(t_axis[k]) if k < len(t_axis) else float(k)
-        fig.suptitle(f"Tier3 graph labels — {stem}  (t={tt:.6g})", fontsize=14, fontweight="bold")
+        fig.suptitle(f"Phase3 graph labels — {stem}  (t={tt:.6g})", fontsize=14, fontweight="bold")
         fig.canvas.draw_idle()
 
     slider.on_changed(_upd)
@@ -420,7 +420,7 @@ def _plot_domain_single_time_dashboard(
     vel = np.sqrt(u**2 + v**2)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     plt.subplots_adjust(bottom=0.18, hspace=0.25)
-    fig.suptitle(f"Tier3 domain (single time) — {stem}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Phase3 domain (single time) — {stem}", fontsize=14, fontweight="bold")
     ax = axes.flatten()
     s0 = ax[0].scatter(x, y, c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U|")
@@ -468,7 +468,7 @@ def _plot_graph_steady_dashboard_with_regen(
     vel = np.sqrt(u**2 + v**2)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     plt.subplots_adjust(bottom=0.18, hspace=0.25)
-    fig.suptitle(f"Tier3 graph (steady) — {stem}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Phase3 graph (steady) — {stem}", fontsize=14, fontweight="bold")
     ax = axes.flatten()
     s0 = ax[0].scatter(pos[:, 0], pos[:, 1], c=vel, cmap=U_CMAP, s=2, rasterized=True)
     fig.colorbar(s0, ax=ax[0], label="|U|")
@@ -497,7 +497,7 @@ def _plot_graph_steady_dashboard_with_regen(
     plt.show()
 
 
-def run_tier3_default_inspector(
+def run_biochem_default_inspector(
     export_dir: Path,
     graph_dir: Path,
     *,
@@ -505,7 +505,7 @@ def run_tier3_default_inspector(
     sample_rows: int,
     enable_regenerate: bool = True,
 ) -> None:
-    """One patient per figure; qualitative lines + matplotlib; Regenerate picks another stem (phase1-style)."""
+    """One patient per figure; qualitative lines + matplotlib; Regenerate picks another stem (kinematics-style)."""
     all_stems = _stem_candidates_union(export_dir, graph_dir)
     if not all_stems:
         print("No domain *.txt or graph *.pt found.")
@@ -641,7 +641,7 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
         raise FileNotFoundError(f"Missing domain export: {domain_file}")
 
     df = _load_first_block(domain_file, sample_rows=sample_rows)
-    bio = BiochemConfig(tier="tier3")
+    bio = BiochemConfig(phase="biochem")
 
     expected_cgs = {
         "rp": bio.c_RP0 / 1e6,
@@ -660,7 +660,7 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
 
     species_cols = ["rp", "ap", "apr", "aps", "PT", "th", "at", "fg", "fi", "M", "Mas", "Mat"]
 
-    print(f"\n=== Tier3 unit audit: {stem} ===")
+    print(f"\n=== Phase3 unit audit: {stem} ===")
     print(f"{'col':<5} {'p95+':>12} {'ref(CGS)':>12} {'ratio':>10}  likely family")
     for col in species_cols:
         vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
@@ -677,7 +677,7 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
             family = "uM-ish" if 0.1 <= ratio <= 10 else "check"
         print(f"{col:<5} {p95:12.4g} {ref:12.4g} {ratio:10.3g}  {family}")
 
-    print("Hint: for tier-3 solutes in uM, conversion to SI is uM * 1e-3 -> mol/m^3.")
+    print("Hint: for phase-3 solutes in uM, conversion to SI is uM * 1e-3 -> mol/m^3.")
 
 
 def summarize_graph(stem: str, graph_dir: Path) -> None:
@@ -700,13 +700,13 @@ def summarize_graph(stem: str, graph_dir: Path) -> None:
         print(f"re_actual            : {re_val:.4g}")
 
 
-def print_summary_table(tier: str, export_dir: Path, graph_dir: Path) -> None:
+def print_summary_table(phase: str, export_dir: Path, graph_dir: Path) -> None:
     stems = _domain_txt_stems(export_dir)
     if not stems:
-        print(f"No tier3 export stems found in {export_dir}")
+        print(f"No biochem export stems found in {export_dir}")
         return
 
-    print(f"\n=== Tier3 summary ({tier}) ===")
+    print(f"\n=== Phase3 summary ({phase}) ===")
     print(f"{'stem':<24} {'times':>6} {'graph?':>8}")
     for stem in stems:
         times = _parse_times_from_header(export_dir / f"{stem}.txt")
@@ -756,7 +756,7 @@ def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    fig.suptitle(f"Tier3 domain export — {stem} (first block, up to {sample_rows} rows)")
+    fig.suptitle(f"Phase3 domain export — {stem} (first block, up to {sample_rows} rows)")
     plt.tight_layout()
     plt.show()
 
@@ -806,7 +806,7 @@ def plot_graph_static(stem: str, graph_dir: Path) -> None:
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    fig.suptitle(f"Tier3 graph — {stem}")
+    fig.suptitle(f"Phase3 graph — {stem}")
     plt.tight_layout()
     plt.show()
 
@@ -922,8 +922,8 @@ def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> Non
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect tier3 exports and processed graphs.")
-    parser.add_argument("--tier", type=str, default="tier3_patients", choices=list(_TIER_CHOICES))
+    parser = argparse.ArgumentParser(description="Inspect biochem exports and processed graphs.")
+    parser.add_argument("--phase", type=str, default="biochem_patients", choices=list(_PHASE_CHOICES))
     parser.add_argument("--stem", type=str, default=None, help="Stem name without extension (e.g. vessel_001).")
     parser.add_argument(
         "--summary",
@@ -961,8 +961,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    export_dir = _resolve_export_dir(args.tier)
-    graph_dir = _resolve_graph_dir(args.tier)
+    export_dir = _resolve_export_dir(args.phase)
+    graph_dir = _resolve_graph_dir(args.phase)
     if not export_dir.exists():
         raise FileNotFoundError(f"Export dir does not exist: {export_dir}")
 
@@ -978,11 +978,11 @@ def main() -> None:
     any_explicit = any(plot_flags)
 
     if args.summary:
-        print_summary_table(args.tier, export_dir, graph_dir)
+        print_summary_table(args.phase, export_dir, graph_dir)
         return
 
     if not any_explicit:
-        run_tier3_default_inspector(
+        run_biochem_default_inspector(
             export_dir,
             graph_dir,
             start_stem=args.stem,
