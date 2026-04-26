@@ -245,6 +245,9 @@ def _check_bc() -> bool:
 def _iter_anchor_graph_files(tier: str) -> Iterator[Path]:
     cfg = VesselConfig(tier=tier)
     d = cfg.graph_output_dir
+    if tier == "tier2":
+        final_n = float(PhysicsConfig(tier="tier2").n)
+        d = d / f"n_{final_n:.3f}"
     if not d.is_dir():
         return
     for p in sorted(d.glob("vessel_*.pt")):
@@ -352,10 +355,18 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         mom_ratio_max = _env_float("PHASE1_T1_MOM_RATIO_MAX", 0.2)
         # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
         wss_ratio_max = _env_float("PHASE1_T1_WSS_RATIO_MAX", 0.60)
+        # Absolute closeness gates for Tier 1 COMSOL anchors (not only relative-vs-shuffle).
+        mom_abs_max = _env_float("PHASE1_T1_MOM_ABS_MAX", 1.0e-3)
+        wss_abs_max = _env_float("PHASE1_T1_WSS_ABS_MAX", 1.0e-4)
+        train_cont_scale = _env_float("PHASE1_T1_TRAIN_CONT_SCALE", 100.0)
+        train_conflict_budget_max = _env_float("PHASE1_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.3)
         abs_tail_pct = _env_float("PHASE1_T1_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("PHASE1_T1_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
         wss_ok_values: List[float] = []
+        cont_ok_values: List[float] = []
+        io_ok_values: List[float] = []
+        conflict_budget_values: List[float] = []
         mom_ok_by_stem: Dict[str, float] = {}
         wss_ok_by_stem: Dict[str, float] = {}
 
@@ -369,6 +380,8 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             t_ok = _evaluate_terms(pred, data, kernels, tier="tier1")
             mom_ok_values.append(t_ok["l_mom"])
             wss_ok_values.append(t_ok["l_wss"])
+            cont_ok_values.append(t_ok["l_cont"])
+            io_ok_values.append(t_ok["l_io"])
             mom_ok_by_stem[stem] = t_ok["l_mom"]
             wss_ok_by_stem[stem] = t_ok["l_wss"]
 
@@ -379,6 +392,26 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             if _check_bc() and t_ok["l_bc"] >= EPS_BC:
                 failures.append(
                     f"{stem}: l_bc={t_ok['l_bc']:.3e} (expect <{EPS_BC} for no-slip labels)"
+                )
+            if t_ok["l_mom"] > mom_abs_max:
+                failures.append(
+                    f"{stem}: l_mom={t_ok['l_mom']:.6g} > abs cap {mom_abs_max:.6g}"
+                )
+            if t_ok["l_wss"] > wss_abs_max:
+                failures.append(
+                    f"{stem}: l_wss={t_ok['l_wss']:.6g} > abs cap {wss_abs_max:.6g}"
+                )
+            train_conflict_budget = (
+                t_ok["l_mom"]
+                + (train_cont_scale * t_ok["l_cont"])
+                + (10.0 * t_ok["l_wss"])
+            )
+            conflict_budget_values.append(train_conflict_budget)
+            if train_conflict_budget > train_conflict_budget_max:
+                failures.append(
+                    f"{stem}: train_conflict_budget={train_conflict_budget:.6g} > "
+                    f"{train_conflict_budget_max:.6g} "
+                    f"(mom + {train_cont_scale:g}*cont + 10*wss)"
                 )
 
             if relax:
@@ -409,6 +442,22 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             for stem, v in wss_ok_by_stem.items():
                 if v > wss_cap:
                     failures.append(f"{stem}: l_wss={v:.6g} > tail cap {wss_cap:.6g}")
+        # Always print closeness diagnostics so CI and local runs show absolute agreement levels.
+        if mom_ok_values:
+            mom_arr = np.asarray(mom_ok_values, dtype=np.float64)
+            wss_arr = np.asarray(wss_ok_values, dtype=np.float64)
+            cont_arr = np.asarray(cont_ok_values, dtype=np.float64)
+            io_arr = np.asarray(io_ok_values, dtype=np.float64)
+            cb_arr = np.asarray(conflict_budget_values, dtype=np.float64)
+            print(
+                "\n[Tier1 COMSOL Closeness] "
+                f"anchors={len(mom_ok_values)} "
+                f"mom(mean/p95/max)={mom_arr.mean():.3e}/{np.percentile(mom_arr, 95):.3e}/{mom_arr.max():.3e} "
+                f"cont(mean/p95/max)={cont_arr.mean():.3e}/{np.percentile(cont_arr, 95):.3e}/{cont_arr.max():.3e} "
+                f"wss(mean/p95/max)={wss_arr.mean():.3e}/{np.percentile(wss_arr, 95):.3e}/{wss_arr.max():.3e} "
+                f"io(mean/p95/max)={io_arr.mean():.3e}/{np.percentile(io_arr, 95):.3e}/{io_arr.max():.3e} "
+                f"budget(mean/p95/max)={cb_arr.mean():.3e}/{np.percentile(cb_arr, 95):.3e}/{cb_arr.max():.3e}"
+            )
 
         self.assertEqual(
             failures,
@@ -436,11 +485,22 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
         wss_ratio_max = _env_float("PHASE1_T2_WSS_RATIO_MAX", 0.60)
         rheo_ratio_max = _env_float("PHASE1_T2_RHEO_RATIO_MAX", 0.5)
+        # Absolute closeness gates (not just better-than-shuffle), tuned to stay consistent with
+        # Tier 2 coupled training scales so physics terms do not conflict in optimization.
+        mom_abs_max = _env_float("PHASE1_T2_MOM_ABS_MAX", 1.0e-3)
+        cont_abs_max = _env_float("PHASE1_T2_CONT_ABS_MAX", 2.5e-3)
+        rheo_abs_max = _env_float("PHASE1_T2_RHEO_ABS_MAX", 0.55)
+        train_cont_scale = _env_float("PHASE1_T2_TRAIN_CONT_SCALE", 100.0)
+        train_rheo_scale = _env_float("PHASE1_T2_TRAIN_RHEO_SCALE", 1.0)
+        train_conflict_budget_max = _env_float("PHASE1_T2_TRAIN_CONFLICT_BUDGET_MAX", 0.9)
         abs_tail_pct = _env_float("PHASE1_T2_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("PHASE1_T2_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
+        cont_ok_values: List[float] = []
         wss_ok_values: List[float] = []
         rheo_ok_values: List[float] = []
+        io_ok_values: List[float] = []
+        conflict_budget_values: List[float] = []
         mom_ok_by_stem: Dict[str, float] = {}
         wss_ok_by_stem: Dict[str, float] = {}
         rheo_ok_by_stem: Dict[str, float] = {}
@@ -457,8 +517,10 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
                 pred, data, kernels, tier="tier2", tier2_distillation=False, carreau_n=carreau_n
             )
             mom_ok_values.append(t_ok["l_mom"])
+            cont_ok_values.append(t_ok["l_cont"])
             wss_ok_values.append(t_ok["l_wss"])
             rheo_ok_values.append(t_ok["l_rheo"])
+            io_ok_values.append(t_ok["l_io"])
             mom_ok_by_stem[stem] = t_ok["l_mom"]
             wss_ok_by_stem[stem] = t_ok["l_wss"]
             rheo_ok_by_stem[stem] = t_ok["l_rheo"]
@@ -469,6 +531,31 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
                 failures.append(f"{stem}: l_data_mu={t_ok['l_data_mu']:.3e}")
             if _check_bc() and t_ok["l_bc"] >= EPS_BC:
                 failures.append(f"{stem}: l_bc={t_ok['l_bc']:.3e}")
+            if t_ok["l_mom"] > mom_abs_max:
+                failures.append(
+                    f"{stem}: l_mom={t_ok['l_mom']:.6g} > abs cap {mom_abs_max:.6g}"
+                )
+            if t_ok["l_cont"] > cont_abs_max:
+                failures.append(
+                    f"{stem}: l_cont={t_ok['l_cont']:.6g} > abs cap {cont_abs_max:.6g}"
+                )
+            if t_ok["l_rheo"] > rheo_abs_max:
+                failures.append(
+                    f"{stem}: l_rheo={t_ok['l_rheo']:.6g} > abs cap {rheo_abs_max:.6g}"
+                )
+            train_conflict_budget = (
+                t_ok["l_mom"]
+                + (train_cont_scale * t_ok["l_cont"])
+                + (train_rheo_scale * t_ok["l_rheo"])
+                + (10.0 * t_ok["l_wss"])
+            )
+            conflict_budget_values.append(train_conflict_budget)
+            if train_conflict_budget > train_conflict_budget_max:
+                failures.append(
+                    f"{stem}: train_conflict_budget={train_conflict_budget:.6g} > "
+                    f"{train_conflict_budget_max:.6g} "
+                    f"(mom + {train_cont_scale:g}*cont + {train_rheo_scale:g}*rheo + 10*wss)"
+                )
 
             if relax:
                 continue
@@ -514,6 +601,24 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             for stem, v in rheo_ok_by_stem.items():
                 if v > rheo_cap:
                     failures.append(f"{stem}: l_rheo={v:.6g} > tail cap {rheo_cap:.6g}")
+        # Always print closeness diagnostics so CI and local runs show absolute agreement levels.
+        if mom_ok_values:
+            mom_arr = np.asarray(mom_ok_values, dtype=np.float64)
+            cont_arr = np.asarray(cont_ok_values, dtype=np.float64)
+            wss_arr = np.asarray(wss_ok_values, dtype=np.float64)
+            rheo_arr = np.asarray(rheo_ok_values, dtype=np.float64)
+            io_arr = np.asarray(io_ok_values, dtype=np.float64)
+            cb_arr = np.asarray(conflict_budget_values, dtype=np.float64)
+            print(
+                "\n[Tier2 COMSOL Closeness] "
+                f"anchors={len(mom_ok_values)} "
+                f"mom(mean/p95/max)={mom_arr.mean():.3e}/{np.percentile(mom_arr, 95):.3e}/{mom_arr.max():.3e} "
+                f"cont(mean/p95/max)={cont_arr.mean():.3e}/{np.percentile(cont_arr, 95):.3e}/{cont_arr.max():.3e} "
+                f"wss(mean/p95/max)={wss_arr.mean():.3e}/{np.percentile(wss_arr, 95):.3e}/{wss_arr.max():.3e} "
+                f"rheo(mean/p95/max)={rheo_arr.mean():.3e}/{np.percentile(rheo_arr, 95):.3e}/{rheo_arr.max():.3e} "
+                f"io(mean/p95/max)={io_arr.mean():.3e}/{np.percentile(io_arr, 95):.3e}/{io_arr.max():.3e} "
+                f"budget(mean/p95/max)={cb_arr.mean():.3e}/{np.percentile(cb_arr, 95):.3e}/{cb_arr.max():.3e}"
+            )
 
         self.assertEqual(
             failures,

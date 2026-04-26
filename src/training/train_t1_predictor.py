@@ -31,7 +31,7 @@ import csv
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.optim as optim

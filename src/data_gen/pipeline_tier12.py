@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
-from src.data_gen.lib.mesh_to_graph import MeshToGraphComplete
+from src.data_gen.lib.mesh_to_graph import MeshToGraph
 from src.data_gen.lib.vessel_generator import (
     VesselGenerator,
     summarize_vessel_mesh_inventory,
@@ -53,6 +53,14 @@ def _tier_str_from_n(tier_n: int) -> str:
     return f"tier{tier_n}"
 
 
+def _final_n_subdir_for_tier(tier: str) -> str | None:
+    if tier != "tier2":
+        return None
+    from src.config import PhysicsConfig
+
+    return f"n_{float(PhysicsConfig(tier='tier2').n):.3f}"
+
+
 @dataclass
 class TierInteractivePlan:
     """All interactive choices for one tier (collected before any long-running step)."""
@@ -73,6 +81,7 @@ class TierInteractivePlan:
     # When anchor_target == 0 and run_anchors: how many new CFD samples to aim for.
     anchor_manual_max_new: Optional[int]
     run_mesh: bool
+    continuation_steps: Optional[list[float]] = None
 
 
 def run_interactive_pipeline() -> None:
@@ -166,7 +175,7 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
         allow_overwrite_anchor = _prompt_anchor_write_mode()
 
     gen = AnchorGenerator(tier=tier)
-    anchor_inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
+    anchor_inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
     have_npz = int(anchor_inv["existing_npz"])
     ready_add = int(anchor_inv["candidate_pool_ready"])
     ready_all = int(anchor_inv["candidate_pool_including_npz"])
@@ -188,6 +197,13 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
     anchor_max_json_scan: Optional[int] = None
     anchor_shuffle = True
     anchor_shuffle_seed: Optional[int] = None
+    continuation_steps: Optional[list[float]] = None
+    if tier_n == 2:  # Always ask for Tier 2 so mesh-to-graph knows about continuation steps.
+        raw_steps = input(
+            "Enter continuation 'n' steps separated by commas (e.g. 0.8, 0.6) or leave blank: "
+        ).strip()
+        if raw_steps:
+            continuation_steps = [float(x.strip()) for x in raw_steps.split(",") if x.strip()]
 
     # ==========================================================
     # 3. MESH TO GRAPH (Automatic)
@@ -210,6 +226,7 @@ def _prompt_tier_interactive_plan(tier_n: int) -> TierInteractivePlan:
         anchor_shuffle_seed=anchor_shuffle_seed,
         anchor_manual_max_new=anchor_manual_max_new,
         run_mesh=run_mesh,
+        continuation_steps=continuation_steps,
     )
 
 
@@ -240,7 +257,7 @@ def _execute_tier_interactive_plan(
         )
 
         gen = AnchorGenerator(tier=tier)
-        inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
+        inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
         ready_add = int(inv["candidate_pool_ready"])
         ready_all = int(inv["candidate_pool_including_npz"])
         remaining = int(inv["pending_missing_npz"])
@@ -293,11 +310,27 @@ def _execute_tier_interactive_plan(
                     shuffle_candidates=plan.anchor_shuffle,
                     shuffle_seed=plan.anchor_shuffle_seed,
                     allow_overwrite=plan.allow_overwrite_anchor,
+                    continuation_steps=plan.continuation_steps,
                 )
 
     if plan.run_mesh:
-        print("\n--- Mesh to graph ---\n")
-        MeshToGraphComplete(tier=tier).run()
+        print("\n--- Mesh to graph ---")
+        from src.data_gen.lib.mesh_to_graph import MeshToGraph
+
+        # 1. Process Continuation Steps (if any)
+        if plan.continuation_steps and tier_n == 2:
+            for step_val in plan.continuation_steps:
+                subdir = f"n_{step_val:.3f}"
+                print(f"\n⚙️ Converting Meshes -> Graphs for {subdir}...")
+                processor = MeshToGraph(tier=tier, n_subdir=subdir)
+                processor.run()
+
+        # 2. Process Final Target Graphs
+        final_subdir = _final_n_subdir_for_tier(tier)
+        target_label = final_subdir if final_subdir else "tier default directory"
+        print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
+        processor = MeshToGraph(tier=tier, n_subdir=final_subdir)
+        processor.run()
 
 
 def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
@@ -402,6 +435,12 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p.add_argument("--anchor-max-json-scan", type=int, default=None)
     p.add_argument("--anchor-shuffle", action="store_true")
     p.add_argument("--anchor-shuffle-seed", type=int, default=None)
+    p.add_argument(
+        "--continuation-steps",
+        type=str,
+        default=None,
+        help="Comma separated list of intermediate n values (e.g. '0.8,0.6') for Tier 2.",
+    )
 
     args = p.parse_args(argv)
     if not args.batch:
@@ -479,6 +518,9 @@ def _run_batch_for_tier(
     anchor_max_new: Optional[int] = None,
 ) -> None:
     tier = _tier_str_from_n(tier_num)
+    continuation_steps = None
+    if getattr(args, "continuation_steps", None) and tier_num == 2:
+        continuation_steps = [float(x.strip()) for x in args.continuation_steps.split(",")]
 
     if not args.skip_vessel:
         assert num_vessels is not None
@@ -517,11 +559,27 @@ def _run_batch_for_tier(
                 shuffle_candidates=bool(args.anchor_shuffle),
                 shuffle_seed=args.anchor_shuffle_seed,
                 allow_overwrite=bool(args.anchor_overwrite),
+                continuation_steps=continuation_steps,
             )
 
     if not args.skip_mesh:
-        print(f"--- Mesh to graph (tier={tier}) ---\n")
-        MeshToGraphComplete(tier=tier).run()
+        print(f"--- Mesh to graph (tier={tier}) ---")
+        from src.data_gen.lib.mesh_to_graph import MeshToGraph
+
+        # 1. Process Continuation Steps (if any)
+        if continuation_steps and tier_num == 2:
+            for step_val in continuation_steps:
+                subdir = f"n_{step_val:.3f}"
+                print(f"\n⚙️ Converting Meshes -> Graphs for {subdir}...")
+                processor = MeshToGraph(tier=tier, n_subdir=subdir)
+                processor.run()
+
+        # 2. Process Final Target Graphs
+        final_subdir = _final_n_subdir_for_tier(tier)
+        target_label = final_subdir if final_subdir else "tier default directory"
+        print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
+        processor = MeshToGraph(tier=tier, n_subdir=final_subdir)
+        processor.run()
 
 
 def run_batch_pipeline(args: argparse.Namespace) -> None:

@@ -95,7 +95,7 @@ def assemble_tier12_graph_data(
 
 
 class MeshToGraphComplete:
-    def __init__(self, tier="tier1", raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, tier="tier1", n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
         self.vessel_cfg = VesselConfig(tier=tier)
         self.phys_cfg = PhysicsConfig(tier=tier)
@@ -111,14 +111,43 @@ class MeshToGraphComplete:
             self.label_dir = Path(label_dir)
         else:
             self.label_dir = self.root / self.vessel_cfg.output_dir
+        if n_subdir:
+            self.label_dir = self.label_dir / n_subdir
 
         # Resolve Processed Dir
         if proc_dir:
             self.proc_dir = Path(proc_dir)
         else:
             self.proc_dir = self.root / self.vessel_cfg.graph_output_dir
+        if n_subdir:
+            self.proc_dir = self.proc_dir / n_subdir
 
         self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+
+class MeshToGraph(MeshToGraphComplete):
+    """
+    Tier 1 & Tier 2 specific graph conversion logic.
+    Computes kinematics and packages variables.
+    """
+
+    def __init__(
+        self,
+        tier: str,
+        n_subdir: str = None,
+        raw_dir=None,
+        label_dir=None,
+        proc_dir=None,
+    ):
+        # Keep explicit path overrides for callers (benchmark/pipeline/tests) that
+        # build temporary datasets outside default tier directories.
+        super().__init__(
+            tier=tier,
+            n_subdir=n_subdir,
+            raw_dir=raw_dir,
+            label_dir=label_dir,
+            proc_dir=proc_dir,
+        )
 
     def _precompute_wls(self, edge_index, num_nodes, pos_tensor):
         """Modified to accept pos_tensor directly so it can run before x_tensor assembly."""
@@ -498,6 +527,10 @@ class MeshToGraphComplete:
             self.process_file(f)
 
 
+class MeshToGraphComplete(MeshToGraph):
+    """Backward-compatible alias for callers still importing MeshToGraphComplete."""
+
+
 def build_mesh_converter(
     tier: str = "tier1",
     *,
@@ -516,12 +549,12 @@ def build_mesh_converter(
 
         return MeshToGraphTier3(**kwargs)
     if is_non_newtonian is False:
-        return MeshToGraphComplete(tier=tier, **kwargs)
+        return MeshToGraph(tier=tier, **kwargs)
     if t in ("tier3", "tier3_patients", "tier3_mix"):
         from src.data_gen.lib.mesh_to_graph_tier3 import MeshToGraphTier3
 
         return MeshToGraphTier3(**kwargs)
-    return MeshToGraphComplete(tier=tier, **kwargs)
+    return MeshToGraph(tier=tier, **kwargs)
 
 
 def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
@@ -542,5 +575,5 @@ def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
 if __name__ == "__main__":
     tier_n = _prompt_int_choice("Tier", (1, 2))
     tier = f"tier{tier_n}"
-    processor = MeshToGraphComplete(tier=tier)
+    processor = MeshToGraph(tier=tier)
     processor.run()

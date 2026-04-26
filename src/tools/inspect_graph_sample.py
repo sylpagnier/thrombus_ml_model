@@ -22,6 +22,24 @@ from src.config import PhysicsConfig, VesselConfig
 from src.core_physics.physics_kernels import scatter_add
 
 
+def _tier2_final_n_subdir() -> str:
+    return f"n_{float(PhysicsConfig(tier='tier2').n):.3f}"
+
+
+def _default_graph_dir_for_tier(tier: str) -> Path:
+    d = Path(VesselConfig(tier=tier).graph_output_dir)
+    if tier == "tier2":
+        d = d / _tier2_final_n_subdir()
+    return d
+
+
+def _default_cfd_dir_for_tier(tier: str) -> Path:
+    d = Path(VesselConfig(tier=tier).output_dir)
+    if tier == "tier2":
+        d = d / _tier2_final_n_subdir()
+    return d
+
+
 def analyze_geometric_quality(data):
     """Analyzes mesh quality via WLS condition numbers (2nd-order 5x5 matrix)."""
     row, col = data.edge_index
@@ -81,7 +99,7 @@ def inspect_sample(filename=None, tier="tier1", proc_dir=None, cfd_dir=None, tie
     def _graph_dir_for_current_tier():
         if proc_dir is not None:
             return Path(proc_dir)
-        return VesselConfig(tier=state["tier"]).graph_output_dir
+        return _default_graph_dir_for_tier(state["tier"])
 
     def _sync_overlap_for_current_tier():
         if restrict_to_overlap:
@@ -347,9 +365,8 @@ def list_indices_with_valid_comsol_results(
     print_indices=False,
     emit=True,
 ):
-    vessel_cfg = VesselConfig(tier=tier)
-    graph_dir = Path(proc_dir) if proc_dir is not None else vessel_cfg.graph_output_dir
-    comsol_dir = Path(cfd_dir) if cfd_dir is not None else vessel_cfg.output_dir
+    graph_dir = Path(proc_dir) if proc_dir is not None else _default_graph_dir_for_tier(tier)
+    comsol_dir = Path(cfd_dir) if cfd_dir is not None else _default_cfd_dir_for_tier(tier)
 
     if not graph_dir.exists():
         if emit:
@@ -444,7 +461,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if inspect_mode and args.filename is None:
-        default_dir = Path(args.proc_dir) if args.proc_dir is not None else VesselConfig(tier=selected_tier).graph_output_dir
+        default_dir = Path(args.proc_dir) if args.proc_dir is not None else _default_graph_dir_for_tier(selected_tier)
         selected_filename = _pick_filename_interactively(default_dir)
         if selected_filename is None:
             print("Exiting without action.")

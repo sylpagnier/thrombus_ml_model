@@ -232,6 +232,7 @@ class GINO_DEQ(nn.Module):
         self.use_hard_bcs = bool(use_hard_bcs)
         self.use_siren_decoder = bool(use_siren_decoder)
         self.use_width_priors = bool(use_width_priors)
+        self.decouple_rheology = False
 
         freqs = (self.fourier_base ** torch.arange(num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
@@ -341,7 +342,17 @@ class GINO_DEQ(nn.Module):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
             mu_raw = self.mu_decoder(curr_z_flat)
             mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
-            mu_enc = self.mu_encoder(mu)
+            if getattr(self, "decouple_rheology", False):
+                # During warmup, preserve Tier 1 latent feedback via frozen decoder clone.
+                if hasattr(self, "tier1_mu_decoder"):
+                    with torch.no_grad():
+                        t1_mu_raw = self.tier1_mu_decoder(curr_z_flat)
+                        mu_feedback = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(t1_mu_raw)
+                else:
+                    mu_feedback = mu
+            else:
+                mu_feedback = mu
+            mu_enc = self.mu_encoder(mu_feedback)
             z_in = curr_z_flat + x_enc + mu_enc
             out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
             return out.unsqueeze(0) if curr_z.ndim == 3 else out

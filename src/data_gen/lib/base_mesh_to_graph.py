@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -15,19 +16,47 @@ from src.utils.paths import get_project_root
 
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 
+logger = logging.getLogger(__name__)
+
 
 class BaseMeshToGraph(ABC):
     """Shared mesh -> graph conversion pipeline used by Tier 1/2 and Tier 3."""
 
-    def __init__(self, tier: str, raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, tier: str, n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
+        """
+        Base class for converting .npz + .msh into PyG graphs.
+        :param tier: "tier1" or "tier2"
+        :param n_subdir: Optional n-subdirectory (e.g., "n_0.800") used for
+                         continuation/final Tier 2 datasets; redirects label/proc paths.
+        """
         self.root = get_project_root()
-        self.vessel_cfg = VesselConfig(tier=tier)
+        self.cfg = VesselConfig(tier=tier)
+        self.vessel_cfg = self.cfg
         self.phys_cfg = PhysicsConfig(tier=tier)
+        self.tier = tier
+
+        # Apply continuation subdir logic if provided.
+        label_base = Path(label_dir) if label_dir else (self.root / self.vessel_cfg.output_dir)
+        proc_base = Path(proc_dir) if proc_dir else (self.root / self.vessel_cfg.graph_output_dir)
+        if n_subdir:
+            label_base = label_base / n_subdir
+            proc_base = proc_base / n_subdir
 
         self.raw_dir = Path(raw_dir) if raw_dir else (self.root / self.vessel_cfg.mesh_input_dir)
-        self.label_dir = Path(label_dir) if label_dir else (self.root / self.vessel_cfg.output_dir)
-        self.proc_dir = Path(proc_dir) if proc_dir else (self.root / self.vessel_cfg.graph_output_dir)
+        self.label_dir = label_base
+        self.proc_dir = proc_base
         self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        # We need a reference geometry to define continuous boundary nodes.
+        mesh_root = getattr(self.cfg, "vessel_mesh_dir", self.vessel_cfg.mesh_input_dir)
+        mesh_root = Path(mesh_root)
+        if not mesh_root.is_absolute():
+            mesh_root = self.root / mesh_root
+        try:
+            self.ref_mesh = meshio.read(mesh_root / "vessel_0000.msh")
+        except FileNotFoundError:
+            self.ref_mesh = None
+            logger.warning("vessel_0000.msh not found. Ensure it exists for node tagging.")
 
     def _precompute_wls(self, edge_index, num_nodes, pos_tensor):
         return precompute_wls_operators(edge_index, num_nodes, pos_tensor)

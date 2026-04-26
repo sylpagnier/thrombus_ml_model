@@ -1,5 +1,4 @@
 import argparse
-import atexit
 import math
 import os
 import sys
@@ -7,27 +6,23 @@ if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import random
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from src.config import VesselConfig, PhysicsConfig, CurriculumConfig
+from src.config import VesselConfig, PhysicsConfig
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.samplers import StratifiedAnchorSampler
-from src.utils.training_diary import TrainingDiary, env_snapshot
-from src.utils.paths import get_project_root, stage_a_dir, resolve_checkpoint
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR, ReduceLROnPlateau
+from src.utils.paths import stage_a_dir, resolve_checkpoint
+from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau
 
-# Default physics-composite scales (overridable via environment variables in ``train_t2_predictor``).
 TIER2_VAL_COMPOSITE_CONTINUITY_SCALE_DEFAULT = 100.0
 TIER2_VAL_COMPOSITE_RHEOLOGY_SCALE_DEFAULT = 1.0
-TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT = 100.0
 TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT = 1.0
 
 
@@ -36,904 +31,343 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _load_tier1_bootstrap(model: GINO_DEQ, tier1_path: Path, device: str) -> bool:
-    """Load Tier 1 ``GINO_DEQ`` weights into this Tier 2 model (encoder input-width surgery if needed)."""
     if not tier1_path.is_file():
-        print(
-            f"⚠️ Tier 1 weights not found at {tier1_path}. "
-            "Train Tier 1 first or place tier1_best_physics.pth under outputs/stage_a/; Tier 2 will use random init."
-        )
+        print(f"⚠️ Tier 1 weights not found at {tier1_path}. Random init will be used.")
         return False
     state_dict = torch.load(tier1_path, map_location=device, weights_only=True)
-    if "encoder.0.weight" in state_dict:
-        w_t1 = state_dict["encoder.0.weight"]
-        w_t2 = model.encoder[0].weight
-        if w_t1.shape[1] != w_t2.shape[1]:
-            print(f"🔧 Adapting Tier 1 encoder width ({w_t1.shape[1]} -> {w_t2.shape[1]}) for Tier 2 node features.")
-            new_w = torch.zeros_like(w_t2)
-            n = min(w_t1.shape[1], w_t2.shape[1])
-            new_w[:, :n] = w_t1[:, :n]
-            state_dict["encoder.0.weight"] = new_w
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        print(
-            f"ℹ️ load_state_dict(strict=False): {len(missing)} missing keys, {len(unexpected)} unexpected keys."
-        )
+    encoder_key = next(
+        (k for k in state_dict.keys() if k.startswith("encoder.") and k.endswith(".weight")),
+        None,
+    )
+    if encoder_key:
+        model_params = dict(model.named_parameters())
+        if encoder_key in model_params:
+            w_t1 = state_dict[encoder_key]
+            w_t2 = model_params[encoder_key]
+            if w_t1.shape != w_t2.shape:
+                new_w = torch.zeros_like(w_t2)
+                n_out = min(w_t1.shape[0], w_t2.shape[0])
+                n_in = min(w_t1.shape[1], w_t2.shape[1])
+                new_w[:n_out, :n_in] = w_t1[:n_out, :n_in]
+                state_dict[encoder_key] = new_w
+    model.load_state_dict(state_dict, strict=False)
     print(f"✅ Loaded Tier 1 bootstrap weights from {tier1_path.name}")
     return True
 
 
 def _assert_tier2_train_split(train_data: list, val_data: list) -> None:
-    """Fail fast on splits that break the sampler or coupled phase."""
-    if not train_data:
-        raise ValueError("train_data is empty after split.")
-    if not val_data:
-        raise ValueError("val_data is empty after split; need at least one validation graph.")
-    n_anchor_tr = sum(1 for d in train_data if d.is_anchor.any().item())
-    n_phys_tr = len(train_data) - n_anchor_tr
-    if n_anchor_tr == 0:
-        raise ValueError(
-            "Training split has no anchor (COMSOL-labeled) graphs; StratifiedAnchorSampler requires them."
-        )
-    if n_phys_tr == 0:
-        raise ValueError(
-            "Training split has no physics-only graphs. After distillation the sampler uses a "
-            "50/50 anchor/physics mix — add unlabeled meshes or change the split."
-        )
+    if not train_data or not val_data:
+        raise ValueError("Train or val data is empty after split.")
+    if sum(1 for d in train_data if d.is_anchor.any().item()) == 0:
+        raise ValueError("Training split has no anchor (COMSOL-labeled) graphs.")
 
-def load_dataset():
+
+def load_dataset_for_n(current_n: float):
     cfg = VesselConfig(tier="tier2")
-    data_dir = cfg.graph_output_dir
+    n_subdir = f"n_{current_n:.3f}"
+    data_dir = cfg.graph_output_dir / n_subdir
+
     if not data_dir.exists():
-        print(f"Directory not found: {data_dir}. Please generate Tier 2 data first.")
         return []
     file_list = sorted(list(data_dir.glob("vessel_*.pt")))
-    max_load_raw = os.environ.get("TIER2_MAX_LOAD_VESSELS", "").strip()
-    if max_load_raw:
-        try:
-            max_load = max(1, int(max_load_raw))
-        except ValueError:
-            max_load = 0
-        if max_load > 0 and len(file_list) > max_load:
-            shuffle_before_cap = os.environ.get("TIER2_MAX_LOAD_SHUFFLE", "1").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-            if shuffle_before_cap:
-                rng = random.Random(42)
-                rng.shuffle(file_list)
-            file_list = file_list[:max_load]
-            print(
-                f"✂️ Pre-load cap active (TIER2_MAX_LOAD_VESSELS={max_load}): "
-                f"loading {len(file_list)} graph files before split."
-            )
+
     dataset = []
-    print(f"📂 Loading {len(file_list)} Tier 2 graphs from {data_dir}...")
-    for f in tqdm(file_list):
-        data = torch.load(f, weights_only=False)
-        dataset.append(data)
+    print(f"📂 Loading {len(file_list)} Tier 2 graphs for n={current_n:.3f} from {data_dir.name}...")
+    for f in tqdm(file_list, leave=False):
+        dataset.append(torch.load(f, weights_only=False))
     return dataset
 
 
-def setup_rheology_warmup(model, loss_weighter, lr=1e-4):
-    print("❄️ Freezing Tier 1 Core. Warming up Rheology Decoder only.")
-    # Freeze everything first
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Unfreeze only the viscosity components
-    for param in model.mu_decoder.parameters():
-        param.requires_grad = True
-    for param in model.mu_encoder.parameters():
-        param.requires_grad = True
-
-    return optim.AdamW([
-        {'params': model.mu_decoder.parameters(), 'lr': lr},
-        {'params': model.mu_encoder.parameters(), 'lr': lr},
-        {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
-    ], weight_decay=1e-5)
-
-
 def setup_coupled_phase(model, loss_weighter, base_lr=1e-4):
-    print("🔥 Unfreezing All Layers. Activating Differential Coupled Optimization.")
+    # Ensure all parameters are unfrozen
     for param in model.parameters():
         param.requires_grad = True
 
-    # Protect Tier 1 kinematics with 10x smaller LR, let Rheology learn faster
-    core_lr = base_lr * 0.1
-    rheo_lr = base_lr
+    # Pass all model parameters uniformly, just like Tier 1
+    opt_params = list(model.parameters()) + list(loss_weighter.parameters())
 
-    kinematics_params = model.siren_decoder.parameters() if model.use_siren_decoder else model.kinematics_decoder.parameters()
-
-    return optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': core_lr},
-        {'params': model.core.parameters(), 'lr': core_lr},
-        {'params': kinematics_params, 'lr': core_lr},
-        {'params': model.wss_decoder.parameters(), 'lr': core_lr},
-        {'params': model.mu_decoder.parameters(), 'lr': rheo_lr},
-        {'params': model.mu_encoder.parameters(), 'lr': rheo_lr},
-        {'params': loss_weighter.parameters(), 'lr': 1e-3, 'weight_decay': 0.0}
-    ], weight_decay=1e-5)
+    return optim.AdamW(opt_params, lr=base_lr, weight_decay=1e-5)
 
 
-def _tier2_dynamic_loss_weighter(device: str, mom_precision_floor: float) -> DynamicLossWeighter:
-    """Kendall weights for [momentum]; floor momentum precision (default >= 0.8)."""
+def _tier2_dynamic_loss_weighter(device: str, mom_precision_floor: float, mom_weight_cap: float) -> DynamicLossWeighter:
     floor = max(float(mom_precision_floor), 1e-6)
-    max_lv_mom = float(-math.log(floor))
+    cap = max(float(mom_weight_cap), 1.0)
     return DynamicLossWeighter(
-        num_losses=1,
-        max_log_var=[max_lv_mom],
+        num_losses=2,
+        min_log_var=[-math.log(cap), -math.log(50.0)],
+        max_log_var=[-math.log(floor), 10.0],
     ).to(device)
 
 
-def _build_warmup_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    total_epochs: int,
-    warmup_epochs: int,
-    eta_min: float,
-    warmup_start_factor: float = 0.1,
-):
-    """Linear warm-up, then cosine decay (Tier 1 parity)."""
-    total_epochs = max(1, int(total_epochs))
-    warmup_epochs = max(0, min(int(warmup_epochs), total_epochs - 1))
-    decay_epochs = max(1, total_epochs - warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=decay_epochs, eta_min=float(eta_min))
-    if warmup_epochs == 0:
-        return cosine_scheduler
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=float(warmup_start_factor),
-        end_factor=1.0,
-        total_iters=warmup_epochs,
-    )
-    return SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_epochs],
-    )
-
-
 def compute_step_loss(
-    model,
-    data,
-    kernels,
-    loss_weighter,
-    current_solver,
-    device,
-    carreau_n=None,
-    *,
-    tier2_kine_p_weight: float = 1.0,
-    coupled_io_scale: float = 6.0,
-    train_continuity_scale: float = TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT,
-    train_rheology_scale: float = TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT,
+    model, data, kernels, loss_weighter, current_solver, device, carreau_n,
+    lambda_phys: float, tier2_kine_p_weight: float = 1.0, coupled_io_scale: float = 6.0,
+    train_rheology_scale: float = TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT
 ):
-    # Always use Anderson with beta=0.8 to maintain a consistent DEQ fixed-point
-    out = model(data, solver=current_solver, anderson_beta=0.8, anderson_warmup_iters=5)
-    if isinstance(out, tuple):
-        pred, jac_loss = out
-    else:
-        pred = out
-        jac_loss = torch.tensor(0.0, device=device)
+    out = model(data, solver=current_solver, anderson_beta=0.8, anderson_warmup_iters=12)
+    pred, jac_loss = out if isinstance(out, tuple) else (out, torch.tensor(0.0, device=device))
 
     terms = compute_kinematics_physics_terms(
-        pred,
-        data,
-        kernels,
-        tier="tier2",
-        tier2_distillation=False,  # Physics are ALWAYS active
-        carreau_n=carreau_n,
-        tier2_kine_p_weight=tier2_kine_p_weight,
+        pred, data, kernels, tier="tier2",
+        tier2_distillation=False, carreau_n=carreau_n, tier2_kine_p_weight=tier2_kine_p_weight,
     )
-    l_wss = terms["l_wss"]
-    l_data_kine = terms["l_data_kine"]
-    l_data_mu = terms["l_data_mu"]
-    l_mom = terms["l_mom"]
-    l_cont = terms["l_cont"]
-    l_bc = terms["l_bc"]
-    l_io = terms["l_io"]
-    l_rheo = terms["l_rheo"]
 
-    # FIX: Pass raw loss to Kendall weighter. Do not manually scale it.
-    weighted_pdes = loss_weighter([l_mom])
+    # Pass raw PDE losses to Kendall weighting, then scale by curriculum lambda_phys.
+    raw_pde_losses = [terms["l_mom"], terms["l_cont"]]
+    weighted_pdes = loss_weighter(raw_pde_losses)
 
     loss = (
-        weighted_pdes
-        + (float(train_rheology_scale) * l_rheo)
-        + (float(train_continuity_scale) * l_cont)
-        + (500.0 * l_data_kine)
-        + (50.0 * l_data_mu)
-        + (5.0 * l_bc)
-        + (float(coupled_io_scale) * l_io)
-        + (10.0 * l_wss)
+        (lambda_phys * weighted_pdes)
+        + (lambda_phys * float(train_rheology_scale) * terms["l_rheo"])
+        + (500.0 * terms["l_data_kine"])
+        + (500.0 * terms["l_data_mu"])
+        + (5.0 * terms["l_bc"])
+        + (float(coupled_io_scale) * terms["l_io"])
+        + (10.0 * terms["l_wss"])
         + (0.1 * jac_loss)
     )
 
-    metrics = {
-        "L_mom": l_mom.item(),
-        "L_cont": l_cont.item(),
-        "L_rh": l_rheo.item(),
-        "L_jac": jac_loss.item(),
-        "L_wss": l_wss.item()
+    return loss, {
+        "L_mom": terms["l_mom"].item(), "L_cont": terms["l_cont"].item(),
+        "L_rh": terms["l_rheo"].item(), "L_jac": jac_loss.item(), "L_wss": terms["l_wss"].item()
     }
-    return loss, metrics
 
 
-def train_t2_predictor(epochs=80, distillation_epochs=12, adam_epochs=50, lr=1e-4):
-    """Train Tier 2 (Carreau) GINO-DEQ.
-
-    **Weights**
-        Tier 1 ``tier1_best_physics.pth`` under ``outputs/stage_a/`` is always loaded when **not** restoring from
-        ``tier2_latest_checkpoint.pth`` in the same stage directory (bootstrap from Newtonian pretraining).
-
-    **Environment**
-        ``TIER2_RESUME=1`` — restore optimizer/scheduler/epoch from ``tier2_latest_checkpoint.pth``
-        only. Tier 1 bootstrap is skipped in that case (checkpoint already contains trained weights).
-        Default ``TIER2_RESUME=0`` — new run: Tier 1 bootstrap + fresh optimizer (ignores stale
-        checkpoint file on disk unless resume is enabled).
-        ``TIER2_USE_LBFGS=1`` — after ``adam_epochs``, switch to L-BFGS (same pattern as Tier 1:
-        ``epoch >= adam_epochs``, ``strong_wolfe`` line search, joint ``model`` + ``loss_weighter``
-        parameters). Checkpoints saved in the L-BFGS phase do not restore the L-BFGS optimizer
-        state on resume (fresh AdamW for the current phase, then L-BFGS activates again when due).
-        **Early stopping (coupled phase only; validation every 2 epochs):**
-        ``TIER2_EARLY_STOP_PATIENCE`` (default ``8``) and ``TIER2_EARLY_STOP_MIN_DELTA`` (default
-        ``0.002``) — stop if the validation composite
-        ``rel_l2 + TIER2_VAL_CONTINUITY_SCALE*continuity + TIER2_VAL_RHEOLOGY_SCALE*rheology``
-        fails to beat the prior *material* best by more than ``min_delta`` for ``patience``
-        validation checks.
-        ``TIER2_EARLY_STOP_FLAT_EPS`` (default ``3e-4``) and ``TIER2_EARLY_STOP_FLAT_PATIENCE``
-        (default ``6``) — additionally stop if that same validation composite changes by less than
-        ``flat_eps`` versus the *previous* validation for ``flat_patience`` checks in a row.
-
-        **Coupled-phase stability / pressure emphasis (defaults tuned for Carreau DEQ):**
-        ``TIER2_MOM_PRECISION_FLOOR`` (default ``0.8``) — Kendall momentum precision cannot drop
-        below this (caps ``log_var`` for the momentum task).
-        ``TIER2_KINE_P_WEIGHT`` (default ``1.35``) — extra weight on the pressure channel in anchor
-        kinematic MSE vs ``u,v``.
-        ``TIER2_GRAD_CLIP_COUPLED`` (default ``0.5``) — global grad norm clip in the coupled phase
-        (distillation still uses ``1.0``).
-        ``TIER2_WARMUP_EPOCHS`` (default ``5``) — linear LR warm-up epochs before cosine decay
-        (SequentialLR: LinearLR -> CosineAnnealingLR; Tier 1 parity).
-        ``TIER2_COSINE_ETA_MIN`` / ``TIER2_PLATEAU_MIN_LR`` (default ``5e-6``) — LR floor for
-        cosine annealing and ``ReduceLROnPlateau`` in the coupled phase.
-        ``TIER2_COUPLED_IO_SCALE`` (default ``6.0``) — multiplier on ``l_io`` (inlet velocity + outlet
-        ``p=0`` soft penalty) after distillation.
-        ``TIER2_TRAIN_CONTINUITY_SCALE`` / ``TIER2_TRAIN_RHEOLOGY_SCALE`` (defaults ``100`` / ``1``) —
-        coupled-phase training weights for continuity and rheology in total loss.
-        ``TIER2_VAL_CONTINUITY_SCALE`` / ``TIER2_VAL_RHEOLOGY_SCALE`` (defaults ``100`` / ``1``) —
-        validation/checkpoint composite weights.
-    """
+def train_t2_predictor(epochs=80, lr=1e-4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device being used:", device)
 
     phys_cfg = PhysicsConfig(tier="tier2")
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
     model = GINO_DEQ(
-        in_channels=15,
-        out_channels=5,
-        latent_dim=256,
-        max_iters=25,
-        num_fourier_freqs=16,
-        phys_cfg=phys_cfg,
-        activation_fn="silu",
-        fourier_base=1.5,
-        use_hard_bcs=True,
-        num_global_tokens=16,
-        use_siren_decoder=True,
-        use_width_priors=True,
+        in_channels=15, out_channels=5, latent_dim=256, max_iters=25,
+        num_fourier_freqs=16, phys_cfg=phys_cfg, activation_fn="silu",
+        fourier_base=1.5, use_hard_bcs=True, num_global_tokens=16,
+        use_siren_decoder=True, use_width_priors=True,
     ).to(device)
 
-    root = get_project_root()
     model_dir = stage_a_dir()
     tier1_path = resolve_checkpoint("a", "tier1_best_physics.pth")
-    latest_ckpt_path = resolve_checkpoint("a", "tier2_latest_checkpoint.pth")
     latest_ckpt_save = model_dir / "tier2_latest_checkpoint.pth"
     resume_training = _env_truthy("TIER2_RESUME")
 
-    mom_precision_floor = float(os.environ.get("TIER2_MOM_PRECISION_FLOOR", "0.8"))
-    loss_weighter = _tier2_dynamic_loss_weighter(device, mom_precision_floor)
+    loss_weighter = _tier2_dynamic_loss_weighter(device, 0.8, 20.0)
 
-    dataset = load_dataset()
-    if not dataset:
-        return
+    target_n = phys_cfg.n
+    raw_steps = os.environ.get("TIER2_CONTINUATION_STEPS", "0.8,0.6")
+    continuation_steps = [float(x.strip()) for x in raw_steps.split(",") if x.strip()]
+    n_sequence = []
+    for n_val in continuation_steps + [target_n]:
+        if not any(abs(n_val - seen) < 1e-8 for seen in n_sequence):
+            n_sequence.append(float(n_val))
 
-    anchors = [d for d in dataset if d.is_anchor.any().item()]
-    physics = [d for d in dataset if not d.is_anchor.any().item()]
+    # Epoch allocation: ~20% for intermediate stages, rest for final target_n stage
+    stage_epochs_alloc = []
+    for i in range(len(n_sequence) - 1):
+        stage_epochs_alloc.append(max(5, int(epochs * 0.2)))
+    stage_epochs_alloc.append(epochs - sum(stage_epochs_alloc))
 
-    random.seed(42)
-    random.shuffle(anchors)
-    random.shuffle(physics)
+    def get_stage_info(epoch: int):
+        cum_epochs = 0
+        for idx, (n_val, alloc) in enumerate(zip(n_sequence, stage_epochs_alloc)):
+            if epoch < cum_epochs + alloc:
+                return idx, n_val, cum_epochs, alloc
+            cum_epochs += alloc
+        return len(n_sequence)-1, n_sequence[-1], sum(stage_epochs_alloc[:-1]), stage_epochs_alloc[-1]
 
-    split_idx_a = int(0.9 * len(anchors))
-    split_idx_p = int(0.9 * len(physics))
+    best_val_composite_loss, best_loss = float("inf"), float("inf")
+    start_epoch = 0
+    resume_optimizer_state = None
+    resume_scheduler_state = None
+    resume_plateau_scheduler_state = None
+    resume_loss_weighter_state = None
 
-    train_data = anchors[:split_idx_a] + physics[:split_idx_p]
-    val_data = anchors[split_idx_a:] + physics[split_idx_p:]
+    if resume_training and latest_ckpt_save.is_file():
+        ckpt = torch.load(latest_ckpt_save, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        best_loss = float(ckpt.get("best_loss", best_loss))
+        best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
+        resume_optimizer_state = ckpt.get("optimizer_state_dict")
+        resume_scheduler_state = ckpt.get("scheduler_state_dict")
+        resume_plateau_scheduler_state = ckpt.get("plateau_scheduler_state_dict")
+        resume_loss_weighter_state = ckpt.get("loss_weighter_state_dict")
+        if resume_loss_weighter_state is not None:
+            try:
+                loss_weighter.load_state_dict(resume_loss_weighter_state)
+            except RuntimeError as err:
+                print(f"⚠️ Could not restore loss weighter state: {err}. Continuing with fresh weights.")
+        print(f"✅ Tier 2 training resume complete at epoch {start_epoch}")
+    else:
+        _load_tier1_bootstrap(model, tier1_path, device)
 
-    if distillation_epochs < 1:
-        raise ValueError("distillation_epochs must be >= 1.")
-    if adam_epochs > epochs:
-        raise ValueError(f"adam_epochs ({adam_epochs}) must be <= epochs ({epochs}).")
-    if adam_epochs < distillation_epochs:
-        print(
-            f"⚠️ adam_epochs ({adam_epochs}) < distillation_epochs ({distillation_epochs}): "
-            "L-BFGS activates when epoch >= adam_epochs and may overlap distillation. "
-            "Prefer adam_epochs >= distillation_epochs."
-        )
-    _assert_tier2_train_split(train_data, val_data)
-
-    micro_batch_size = 1
-    accumulation_steps = 8
-
-    sampler = StratifiedAnchorSampler(train_data, batch_size=micro_batch_size)
-    loader = DataLoader(train_data, batch_size=micro_batch_size, sampler=sampler)
-    val_loader = DataLoader(val_data, batch_size=micro_batch_size, shuffle=False)
-
-    best_val_composite_loss = float("inf")
-    best_loss = float("inf")
+    # State tracking variables
+    current_stage_idx = -1
     optimizer = None
     scheduler = None
-    lbfgs_initialized = False
-    use_lbfgs = _env_truthy("TIER2_USE_LBFGS")
-    stop_after_adam = _env_truthy("TIER2_STOP_AFTER_ADAM")
-    start_epoch = 0
-    ckpt_every = max(1, int(os.environ.get("TIER2_CKPT_EVERY", "1")))
-
-    curriculum = CurriculumConfig()
-    target_n = phys_cfg.n
-    start_n = curriculum.tier2_carreau_n_distill_start
-
-    tier2_kine_p_weight = float(os.environ.get("TIER2_KINE_P_WEIGHT", "1.35"))
-    tier2_cosine_eta_min = float(os.environ.get("TIER2_COSINE_ETA_MIN", "5e-6"))
-    tier2_plateau_min_lr = float(os.environ.get("TIER2_PLATEAU_MIN_LR", "5e-6"))
-    tier2_grad_clip_coupled = float(os.environ.get("TIER2_GRAD_CLIP_COUPLED", "0.5"))
-    tier2_coupled_io_scale = float(os.environ.get("TIER2_COUPLED_IO_SCALE", "6.0"))
-    tier2_warmup_epochs = max(0, int(os.environ.get("TIER2_WARMUP_EPOCHS", "5")))
-    train_continuity_scale = float(
-        os.environ.get("TIER2_TRAIN_CONTINUITY_SCALE", str(TIER2_TRAIN_COUPLED_CONTINUITY_SCALE_DEFAULT))
-    )
-    train_rheology_scale = float(
-        os.environ.get("TIER2_TRAIN_RHEOLOGY_SCALE", str(TIER2_TRAIN_COUPLED_RHEOLOGY_SCALE_DEFAULT))
-    )
-    val_continuity_scale = float(
-        os.environ.get("TIER2_VAL_CONTINUITY_SCALE", str(TIER2_VAL_COMPOSITE_CONTINUITY_SCALE_DEFAULT))
-    )
-    val_rheology_scale = float(
-        os.environ.get("TIER2_VAL_RHEOLOGY_SCALE", str(TIER2_VAL_COMPOSITE_RHEOLOGY_SCALE_DEFAULT))
-    )
-
-    resumed_full_checkpoint = False
-    tier1_bootstrap_loaded = False
     plateau_scheduler = None
-
-    if resume_training and latest_ckpt_path.is_file():
-        print(f"🔄 TIER2_RESUME: restoring full training state from {latest_ckpt_path.name}")
-        ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        try:
-            loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
-        except RuntimeError:
-            # Backward compatibility: old checkpoints may store two PDE log_vars (cont, mom).
-            print("ℹ️ Reinitializing Tier 2 PDE loss weighter for momentum-only setup.")
-        best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
-        best_loss = float(ckpt.get("best_loss", best_loss))
-        start_epoch = int(ckpt.get("epoch", -1)) + 1
-        ckpt_optimizer_type = ckpt.get("optimizer_type", "AdamW")
-
-        optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-        coupled_total_epochs = max(1, epochs - distillation_epochs)
-        scheduler = _build_warmup_cosine_scheduler(
-            optimizer,
-            total_epochs=coupled_total_epochs,
-            warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
-            eta_min=tier2_cosine_eta_min,
-        )
-        plateau_scheduler = ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
-        )
-        sampler.set_warmup_mode(False)
-
-        if ckpt_optimizer_type == "LBFGS":
-            print("ℹ️ Ignoring stored LBFGS optimizer state in checkpoint; continuing with AdamW for this phase.")
-            lbfgs_initialized = False
-        elif ckpt_optimizer_type == "AdamW" and start_epoch < adam_epochs:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            if ckpt.get("scheduler_state_dict") is not None:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-
-        resumed_full_checkpoint = True
-        print(f"✅ Tier 2 training resume complete at epoch {start_epoch} (Tier 1 bootstrap skipped).")
-    else:
-        if resume_training:
-            print(
-                f"ℹ️ TIER2_RESUME is set but no checkpoint file at {latest_ckpt_path}. "
-                "Starting a new run with Tier 1 bootstrap."
-            )
-        tier1_bootstrap_loaded = _load_tier1_bootstrap(model, tier1_path, device)
-
-    cfg_t2 = VesselConfig(tier="tier2")
-    n_anchor_train_t2 = len([d for d in train_data if d.is_anchor.any().item()])
-    n_phys_train_t2 = max(0, len(train_data) - n_anchor_train_t2)
-    plateau_patience = max(1, int(os.environ.get("TIER2_EARLY_STOP_PATIENCE", "8")))
-    plateau_min_delta = float(os.environ.get("TIER2_EARLY_STOP_MIN_DELTA", "0.002"))
-    flat_eps = float(os.environ.get("TIER2_EARLY_STOP_FLAT_EPS", "3e-4"))
-    flat_patience = max(1, int(os.environ.get("TIER2_EARLY_STOP_FLAT_PATIENCE", "6")))
-    best_early_stop_metric = float("inf")
-    val_no_improve = 0
-    prev_val_metric: Optional[float] = None
-    flat_streak = 0
-    early_stopped = False
-
-    diary = TrainingDiary("tier2")
-    diary.log_run_start(
-        device=device,
-        re_target=float(phys_cfg.re_target),
-        graph_dir=str(cfg_t2.graph_output_dir),
-        n_graphs_total=len(dataset),
-        n_train=len(train_data),
-        n_val=len(val_data),
-        n_anchor_train=n_anchor_train_t2,
-        n_phys_train=n_phys_train_t2,
-        n_val_anchors=sum(1 for d in val_data if d.is_anchor.any().item()),
-        micro_batch_size=micro_batch_size,
-        accumulation_steps=accumulation_steps,
-        distillation_epochs=distillation_epochs,
-        adam_epochs=adam_epochs,
-        epochs=epochs,
-        lr=lr,
-        carreau_n_curriculum_start=float(start_n),
-        carreau_n_target=float(target_n),
-        start_epoch=start_epoch,
-        resume_training=bool(resume_training),
-        resumed_full_checkpoint=bool(resumed_full_checkpoint),
-        tier1_bootstrap_loaded=bool(tier1_bootstrap_loaded),
-        best_val_composite_loss_checkpoint=float(best_val_composite_loss),
-        best_loss_checkpoint=float(best_loss),
-        use_lbfgs=use_lbfgs,
-        ckpt_every=ckpt_every,
-        plateau_patience=plateau_patience,
-        plateau_min_delta=plateau_min_delta,
-        early_stop_flat_eps=flat_eps,
-        early_stop_flat_patience=flat_patience,
-        env_tier2_phase1=env_snapshot("TIER2_", "PHASE1_"),
-        mom_precision_floor=float(mom_precision_floor),
-        tier2_kine_p_weight=float(tier2_kine_p_weight),
-        tier2_kine_weight_mode="uniform" if abs(float(tier2_kine_p_weight) - 1.0) < 1e-9 else "uvp_nonuniform",
-        tier2_ns_residual_mode="wls",
-        tier2_warmup_epochs=int(tier2_warmup_epochs),
-        tier2_cosine_eta_min=float(tier2_cosine_eta_min),
-        tier2_plateau_min_lr=float(tier2_plateau_min_lr),
-        tier2_grad_clip_coupled=float(tier2_grad_clip_coupled),
-        tier2_coupled_io_scale=float(tier2_coupled_io_scale),
-        train_continuity_scale=float(train_continuity_scale),
-        train_rheology_scale=float(train_rheology_scale),
-        val_continuity_scale=float(val_continuity_scale),
-        val_rheology_scale=float(val_rheology_scale),
-        run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
-        diary_main_path=str(diary.path) if diary.path is not None else None,
-    )
-
-    tier2_final_path = model_dir / "tier2_final.pth"
-    run_end_emitted = False
-    saved_final_weights = False
-    last_epoch_completed: Optional[int] = None
-
-    def _emit_tier2_run_end(interrupted: bool = False) -> None:
-        nonlocal run_end_emitted
-        if run_end_emitted or not diary.enabled:
-            return
-        run_end_emitted = True
-        if interrupted:
-            print("\n⚠️ Training interrupted; appending training diary run_end (JSONL report).")
-        diary.log_run_end(
-            best_val_composite_loss=float(best_val_composite_loss),
-            best_loss=float(best_loss),
-            best_rel_l2=float(best_early_stop_metric),
-            early_stopped=bool(early_stopped),
-            interrupted=bool(interrupted),
-            last_epoch_completed=last_epoch_completed,
-            diary_path=str(diary.path) if diary.path else None,
-            final_weights_path=str(tier2_final_path) if saved_final_weights else None,
-        )
-
-    atexit.register(lambda: _emit_tier2_run_end(True))
+    current_loader = None
+    current_val_loader = None
+    model.decouple_rheology = False
 
     for epoch in range(start_epoch, epochs):
-        last_epoch_completed = epoch
-        rheology_warmup_epochs = distillation_epochs  # Repurposing the variable
-        is_rheology_warmup = epoch < rheology_warmup_epochs
-        lambda_phys = 1.0
-        if use_lbfgs and stop_after_adam and epoch >= adam_epochs:
-            checkpoint = {
-                "epoch": epoch - 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": (scheduler.state_dict() if scheduler is not None else None),
-                "loss_weighter_state_dict": loss_weighter.state_dict(),
-                "best_val_composite_loss": best_val_composite_loss,
-                "best_loss": best_loss,
-                "optimizer_type": "AdamW",
-                "handoff_for_lbfgs": True,
-            }
-            torch.save(checkpoint, latest_ckpt_save)
-            print(
-                f"🧳 Saved Tier 2 Adam handoff checkpoint at epoch {epoch - 1} -> {latest_ckpt_save.name}. "
-                "Resume with TIER2_STOP_AFTER_ADAM=0 (or unset) to continue L-BFGS."
-            )
-            break
-        physics_active = True  # Physics are always strictly enforced now
-        current_solver = "anderson"  # Always use Anderson
+        stage_idx, current_n, stage_start_epoch, alloc = get_stage_info(epoch)
+        epochs_in_stage = epoch - stage_start_epoch
 
-        # The true fluid properties must exactly match the COMSOL ground truth data
-        carreau_n = target_n
+        # Ramp lambda_phys from 0 to 1 over the first 5 epochs of the current stage
+        lambda_phys = min(1.0, max(0.0, epochs_in_stage / 5.0))
 
-        if epoch == 0 and not resumed_full_checkpoint:
-            print(
-                f"\n🚀 --- Starting Phase 1: Frozen Core Rheology Warmup "
-                f"(Epochs 0-{rheology_warmup_epochs - 1}) ---"
-            )
-            optimizer = setup_rheology_warmup(model, loss_weighter, lr=lr)
-            scheduler = _build_warmup_cosine_scheduler(
-                optimizer,
-                total_epochs=epochs,
-                warmup_epochs=tier2_warmup_epochs,
-                eta_min=tier2_cosine_eta_min,
-            )
-            plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
-            )
-            sampler.set_warmup_mode(False)
-        elif epoch == rheology_warmup_epochs:
-            print(
-                f"\n🚀 --- Starting Phase 2: Differential Coupled DEQ "
-                f"(Epochs {rheology_warmup_epochs}-{adam_epochs - 1}) ---"
-            )
+        # Re-initialize Optimizer and Schedulers upon entering a new n-stage
+        if stage_idx != current_stage_idx:
+            print(f"\n🌊 NEW TIER 2 STAGE: n={current_n:.3f} | Epochs {stage_start_epoch} to {stage_start_epoch+alloc-1}")
+            current_stage_idx = stage_idx
+
+            # Reset stage-local bests, except when resuming inside the same stage.
+            if not (resume_training and epoch == start_epoch):
+                best_loss = float("inf")
+                best_val_composite_loss = float("inf")
+
             optimizer = setup_coupled_phase(model, loss_weighter, base_lr=lr)
-            coupled_total_epochs = max(1, epochs - rheology_warmup_epochs)
-            scheduler = _build_warmup_cosine_scheduler(
-                optimizer,
-                total_epochs=coupled_total_epochs,
-                warmup_epochs=min(tier2_warmup_epochs, coupled_total_epochs - 1),
-                eta_min=tier2_cosine_eta_min,
-            )
-            plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=tier2_plateau_min_lr
-            )
-            # Reset optimizer state for the Kendall weighter which carries over
-            loss_weighter.reset_parameters() if hasattr(loss_weighter, "reset_parameters") else None
-            sampler.set_warmup_mode(False)
-        elif use_lbfgs and epoch >= adam_epochs and not lbfgs_initialized:
-            print(f"\n⚡ Switching to L-BFGS Optimizer for the final {max(0, epochs - adam_epochs)} epoch(s)...")
-            torch.cuda.empty_cache()
+            if hasattr(loss_weighter, "log_vars"):
+                loss_weighter.log_vars.data.zero_()  # Reset PDE precisions
 
-            optimizer = optim.LBFGS(
-                list(model.parameters()) + list(loss_weighter.parameters()),
-                lr=0.01,
-                max_iter=20,
-                history_size=30,
-                line_search_fn="strong_wolfe",
-                tolerance_grad=1e-6,
-                tolerance_change=1e-8,
-            )
-            lbfgs_initialized = True
+            scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=max(1, 5))
+            plateau_scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, threshold=5e-4, min_lr=5e-6)
+
+            # Load only current stage data to avoid holding all n-datasets in RAM.
+            ds = load_dataset_for_n(current_n)
+            anchors = [d for d in ds if d.is_anchor.any().item()]
+            physics = [d for d in ds if not d.is_anchor.any().item()]
+            split_rng = random.Random(42)
+            split_rng.shuffle(anchors)
+            split_rng.shuffle(physics)
+            split_idx_a, split_idx_p = int(0.9 * len(anchors)), int(0.9 * len(physics))
+            train_data_n = anchors[:split_idx_a] + physics[:split_idx_p]
+            val_data_n = anchors[split_idx_a:] + physics[split_idx_p:]
+            _assert_tier2_train_split(train_data_n, val_data_n)
+
+            sampler_n = StratifiedAnchorSampler(train_data_n, batch_size=1)
+            sampler_n.set_warmup_mode(False)
+            current_loader = DataLoader(train_data_n, batch_size=1, sampler=sampler_n)
+            current_val_loader = DataLoader(val_data_n, batch_size=1, shuffle=False)
+
+            if epoch == start_epoch and resume_optimizer_state is not None:
+                try:
+                    optimizer.load_state_dict(resume_optimizer_state)
+                    if resume_scheduler_state is not None:
+                        scheduler.load_state_dict(resume_scheduler_state)
+                    if resume_plateau_scheduler_state is not None:
+                        plateau_scheduler.load_state_dict(resume_plateau_scheduler_state)
+                    print("🔁 Restored optimizer/scheduler states from checkpoint.")
+                except Exception as err:
+                    print(f"⚠️ Failed to restore optimizer/scheduler states ({err}). Continuing with fresh states.")
+                finally:
+                    resume_optimizer_state = None
+                    resume_scheduler_state = None
+                    resume_plateau_scheduler_state = None
 
         model.train()
-
         total_loss_epoch = 0.0
-        grad_norm = 0.0
+        accumulation_steps = 8
+        # Freeze loss-weighter updates while lambda_phys is still ramping.
+        loss_weighter.requires_grad_(lambda_phys >= 1.0)
+        optimizer.zero_grad()
 
-        if not lbfgs_initialized:
-            phase_tag = "Warmup" if is_rheology_warmup else "AdamW"
-            pbar = tqdm(loader, desc=f"Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] ({phase_tag})")
+        pbar = tqdm(current_loader, desc=f"Tier 2 Ep {epoch:02d} [n={current_n:.3f}] (λ={lambda_phys:.2f})")
+        for batch_idx, data in enumerate(pbar):
+            data = data.to(device)
 
-            # Zero gradients AT THE START of the epoch
-            optimizer.zero_grad()
+            loss, metrics = compute_step_loss(
+                model, data, kernels, loss_weighter, "anderson", device, current_n, lambda_phys=lambda_phys
+            )
+            loss = loss / accumulation_steps
 
-            for batch_idx, data in enumerate(pbar):
-                data = data.to(device)
-
-                # Compute loss (scaled by accumulation steps)
-                loss, metrics = compute_step_loss(
-                    model,
-                    data,
-                    kernels,
-                    loss_weighter,
-                    current_solver,
-                    device,
-                    carreau_n=carreau_n,
-                    tier2_kine_p_weight=tier2_kine_p_weight,
-                    coupled_io_scale=tier2_coupled_io_scale,
-                    train_continuity_scale=train_continuity_scale,
-                    train_rheology_scale=train_rheology_scale,
-                )
-                loss = loss / accumulation_steps
-
-                if torch.isnan(loss):
-                    print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping micro-batch.")
-                    continue
-
-                loss.backward()
-
-                # Step optimizer ONLY when we've accumulated enough micro-batches
-                if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(loader)):
-                    clip_params = [p for g in optimizer.param_groups for p in g["params"]]
-                    clip_max = 1.0 if is_rheology_warmup else tier2_grad_clip_coupled
-                    grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=clip_max)
-                    optimizer.step()
-                    optimizer.zero_grad()  # Reset for the next effective batch
-
-                # Multiply back for display purposes
-                total_loss_epoch += (loss.item() * accumulation_steps)
-
-                pbar.set_postfix({
-                    "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
-                    "L_mom": f"{metrics['L_mom']:.3f}",
-                    "L_cont": f"{metrics['L_cont']:.3f}",
-                    "L_rh": f"{metrics['L_rh']:.3f}",
-                    "|g|": f"{grad_norm:.2f}",
-                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
-                })
-            if scheduler is not None:
-                scheduler.step()
-
-        else:
-            print(f"⏳ Tier 2 Epoch {epoch:02d} [Re={phys_cfg.re_target}] (L-BFGS Line Search...)")
-            # L-BFGS may reevaluate closure many times; keep batch set fixed per epoch.
-            # Snapshot batches on CPU and transfer one-by-one in closure to avoid VRAM spikes.
-            epoch_batches_cpu = list(loader)
-            epoch_batches_device = [b.to(device) for b in epoch_batches_cpu]
-            n_batches = max(len(epoch_batches_device), 1)
-
-            def closure():
+            if torch.isnan(loss):
                 optimizer.zero_grad()
-                accumulated_loss = torch.tensor(0.0, device=device)
+                continue
 
-                for closure_data in epoch_batches_device:
-                    loss, _ = compute_step_loss(
-                        model,
-                        closure_data,
-                        kernels,
-                        loss_weighter,
-                        current_solver,
-                        device,
-                        carreau_n=carreau_n,
-                        tier2_kine_p_weight=tier2_kine_p_weight,
-                        coupled_io_scale=tier2_coupled_io_scale,
-                        train_continuity_scale=train_continuity_scale,
-                        train_rheology_scale=train_rheology_scale,
-                    )
-                    loss = loss / n_batches
-                    loss.backward()
-                    accumulated_loss += loss.detach()
-                return accumulated_loss
+            loss.backward()
 
-            loss_tensor = optimizer.step(closure)
-            total_loss_epoch = loss_tensor.item() * n_batches
-            print(f"✅ L-BFGS Step Complete. Accumulated Full-Batch Loss: {loss_tensor.item():.4f}")
+            if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(current_loader)):
+                clip_params = [p for g in optimizer.param_groups for p in g["params"]]
+                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=0.5)
+                optimizer.step()
+                optimizer.zero_grad()
 
-        avg_loss = total_loss_epoch / max(1, len(loader))
-        if avg_loss < best_loss and physics_active:
+            total_loss_epoch += (loss.item() * accumulation_steps)
+
+            pbar.set_postfix({
+                "L_tot": f"{(loss.item() * accumulation_steps):.3f}",
+                "L_mom": f"{metrics['L_mom']:.3f}",
+                "L_cont": f"{metrics['L_cont']:.3f}",
+                "L_rh": f"{metrics['L_rh']:.3f}"
+            })
+
+        if scheduler.last_epoch < scheduler.total_iters:
+            scheduler.step()
+
+        avg_loss = total_loss_epoch / max(1, len(current_loader))
+        if avg_loss < best_loss and lambda_phys >= 1.0:
             best_loss = avg_loss
-            save_bl = model_dir / "tier2_best_loss.pth"
-            torch.save(model.state_dict(), save_bl)
-            print(f"⭐ Saved Best Loss Model to {save_bl}")
+            torch.save(model.state_dict(), model_dir / "tier2_best_loss.pth")
 
-        should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
-        if should_save_ckpt:
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": (scheduler.state_dict() if not lbfgs_initialized and scheduler is not None else None),
-                "loss_weighter_state_dict": loss_weighter.state_dict(),
-                "best_val_composite_loss": best_val_composite_loss,
-                "best_loss": best_loss,
-                "optimizer_type": ("LBFGS" if lbfgs_initialized else "AdamW"),
-            }
-            torch.save(checkpoint, latest_ckpt_save)
-            print(f"💾 Saved Tier 2 checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "plateau_scheduler_state_dict": plateau_scheduler.state_dict(),
+            "loss_weighter_state_dict": loss_weighter.state_dict(),
+            "best_loss": best_loss,
+            "best_val_composite_loss": best_val_composite_loss,
+        }, latest_ckpt_save)
 
-        diary.log_epoch_end(
-            epoch,
-            avg_epoch_loss=float(avg_loss),
-            lr=float(optimizer.param_groups[0]["lr"]),
-            lambda_phys=float(lambda_phys),
-            carreau_n=float(carreau_n),
-            phase=("rheology_warmup" if is_rheology_warmup else ("lbfgs" if lbfgs_initialized else "coupled")),
-            solver=current_solver,
-            physics_active=bool(physics_active),
-            lbfgs=bool(lbfgs_initialized),
-            best_loss_so_far=float(best_loss),
-            best_val_composite_loss_so_far=float(best_val_composite_loss),
-            best_rel_l2_so_far=float(best_early_stop_metric),
-            val_no_improve=int(val_no_improve),
-        )
-
+        # Validation every 2 epochs
         if epoch % 2 == 0:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            scores = quantify_performance(
-                model,
-                val_loader,
-                kernels,
-                device,
-                tier="tier2",
-                solver=current_solver,
-                anderson_beta=0.8,
-            )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(
-                f"\n📊 [Validation] Rel L2 (anchor): {scores.get('rel_l2', float('nan')):.4f} "
-                f"(σ {scores.get('rel_l2_std', float('nan')):.4f}, p90 {scores.get('rel_l2_p90', float('nan')):.4f})"
-            )
-            print(
-                f"   Components u / v / p: {scores.get('rel_l2_u', float('nan')):.4f} / "
-                f"{scores.get('rel_l2_v', float('nan')):.4f} / {scores.get('rel_l2_p', float('nan')):.4f}"
-            )
-            print(
-                f"   |∇·u| mean (fluid interior): {scores.get('continuity', float('nan')):.3e} "
-                f"(p90 {scores.get('continuity_p90', float('nan')):.3e}) | "
-                f"Rheo residual mean: {scores.get('rheology', float('nan')):.3e} "
-                f"(p90 {scores.get('rheology_p90', float('nan')):.3e})"
-            )
-            print(
-                f"   μ MAE: {scores.get('mu_mae', float('nan')):.4e} | "
-                f"log-μ MSE: {scores.get('mu_log_mse', float('nan')):.4e} | "
-                f"Wall |u| mean: {scores.get('wall_slip', float('nan')):.4f} "
-                f"(p90 {scores.get('wall_slip_p90', float('nan')):.4f})"
-            )
-            print(
-                f"   γ̇ MSE (anchor): {scores.get('shear_mse', float('nan')):.4e} "
-                f"(p90 {scores.get('shear_mse_p90', float('nan')):.4e}) | "
-                f"Batches w/ anchors: {int(scores.get('val_anchor_batches', 0))}/"
-                f"{int(scores.get('val_total_batches', 0))}"
-            )
-
-            w_cont = None
-            w_mom = None
-            n_val_anchor = sum(1 for d in val_data if d.is_anchor.any().item())
-            n_val_physics = max(0, len(val_data) - n_val_anchor)
-
-            with torch.no_grad():
-                safe_vars = loss_weighter.clamped_log_vars()
-                weights = torch.exp(-safe_vars)
-                w_cont = 0.0
-                w_mom = float(weights[0].item())
-                print(f"⚖️ Learned PDE Weights -> Cont: {w_cont:.2f} | Mom: {w_mom:.2f}")
-            print(f"📌 Val split: anchors={n_val_anchor} | physics={n_val_physics}")
-
-            val_composite_loss = float(
+            scores = quantify_performance(model, current_val_loader, kernels, device, tier="tier2", solver="anderson")
+            val_comp = float(
                 scores.get("rel_l2", 0)
-                + (float(val_continuity_scale) * scores.get("continuity", 0))
-                + (float(val_rheology_scale) * scores.get("rheology", 0))
-            )
-            print(
-                f"   Val composite: {val_composite_loss:.4f} = rel_l2 + "
-                f"{val_continuity_scale:g}*continuity + {val_rheology_scale:g}*rheology"
+                + TIER2_VAL_COMPOSITE_CONTINUITY_SCALE_DEFAULT * scores.get("continuity", 0)
+                + TIER2_VAL_COMPOSITE_RHEOLOGY_SCALE_DEFAULT * scores.get("rheology", 0)
             )
 
-            diary.log_validation(
-                epoch,
-                scores,
-                weight_cont=w_cont,
-                weight_mom=w_mom,
-                val_composite_loss=val_composite_loss,
-                carreau_n=float(carreau_n),
-                phase_distillation=bool(is_rheology_warmup),
-                best_rel_l2=float(best_early_stop_metric),
-                val_no_improve=int(val_no_improve),
-                n_val_anchors=int(n_val_anchor),
-                n_val_physics=int(n_val_physics),
-            )
+            print(f"\n📊 [Validation n={current_n:.3f}] Rel L2: {scores.get('rel_l2', float('nan')):.4f}")
+            print(f"   |∇·u| mean: {scores.get('continuity', float('nan')):.3e} | Rheo res: {scores.get('rheology', float('nan')):.3e}")
+            print(f"   Val composite: {val_comp:.4f}")
 
-            if plateau_scheduler is not None and not lbfgs_initialized:
-                plateau_metric = val_composite_loss if physics_active else float(scores.get("rel_l2", 0.0))
-                plateau_scheduler.step(plateau_metric)
+            if lambda_phys >= 1.0:
+                plateau_scheduler.step(val_comp)
+                if val_comp < best_val_composite_loss:
+                    best_val_composite_loss = val_comp
+                    torch.save(model.state_dict(), model_dir / "tier2_best_physics.pth")
+                    print(f"⭐ Saved Best Physics Model")
 
-            rel_l2 = float(scores.get("rel_l2", float("inf")))
-            stop_metric = val_composite_loss if physics_active else rel_l2
-            if not physics_active:
-                if stop_metric < best_early_stop_metric:
-                    best_early_stop_metric = stop_metric
-            else:
-                if (best_early_stop_metric - stop_metric) > plateau_min_delta:
-                    best_early_stop_metric = stop_metric
-                    val_no_improve = 0
-                    flat_streak = 0
-                else:
-                    val_no_improve += 1
-
-                if prev_val_metric is not None and abs(stop_metric - prev_val_metric) < flat_eps:
-                    flat_streak += 1
-                else:
-                    flat_streak = 0
-                prev_val_metric = stop_metric
-
-                stop_material = val_no_improve >= plateau_patience
-                stop_flat = flat_streak >= flat_patience
-                if stop_material or stop_flat:
-                    if stop_material and stop_flat:
-                        reason = "val_composite_plateau_and_flat"
-                    elif stop_flat:
-                        reason = "val_composite_flatline"
-                    else:
-                        reason = "val_composite_plateau"
-                    print(
-                        f"🛑 Early stopping ({reason}) on val composite loss: "
-                        f"material plateau min_delta={plateau_min_delta:.4f} "
-                        f"patience={plateau_patience} | flat_eps={flat_eps:.2e} flat_patience={flat_patience} "
-                        f"(last val composite={stop_metric:.4f})."
-                    )
-                    early_stopped = True
-                    diary.log_event(
-                        "early_stop",
-                        epoch=epoch,
-                        reason=reason,
-                        plateau_min_delta=plateau_min_delta,
-                        plateau_patience=plateau_patience,
-                        flat_eps=flat_eps,
-                        flat_patience=flat_patience,
-                        last_val_composite=stop_metric,
-                    )
-                    break
-
-            if physics_active and val_composite_loss < best_val_composite_loss:
-                best_val_composite_loss = val_composite_loss
-                save_bp = model_dir / "tier2_best_physics.pth"
-                torch.save(model.state_dict(), save_bp)
-                print(f"⭐ Saved Best Physics Model to {save_bp}")
-
-    torch.save(model.state_dict(), tier2_final_path)
-    saved_final_weights = True
-    _emit_tier2_run_end(interrupted=False)
-    print(
-        f"Tier 2 Training Complete. Best val composite loss: {best_val_composite_loss:.4f} "
-        f"(rel_l2 + {val_continuity_scale:g}×continuity + "
-        f"{val_rheology_scale:g}×rheology; lower is better) | Best Loss: {best_loss:.4f}"
-    )
-
-
-def _parse_args():
-    p = argparse.ArgumentParser(description="Tier 2 GINO-DEQ predictor training.")
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from tier2_latest_checkpoint.pth (sets TIER2_RESUME=1).",
-    )
-    mode.add_argument(
-        "--new",
-        action="store_true",
-        help="Start a new run (sets TIER2_RESUME=0).",
-    )
-    return p.parse_args()
-
-
-def _prompt_resume_or_new_t2() -> bool:
-    """Ask user whether to resume checkpointed training."""
-    while True:
-        raw = input("Training mode [1=resume / 2=start new] [1]: ").strip()
-        if raw in ("", "1"):
-            return True
-        if raw == "2":
-            return False
-        print("  Enter 1 or 2.")
+    torch.save(model.state_dict(), model_dir / "tier2_final.pth")
+    print(f"Tier 2 Training Complete. Best val composite: {best_val_composite_loss:.4f} | Best Loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":
-    args = _parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--new", action="store_true")
+    args = p.parse_args()
+    if args.resume and args.new:
+        raise ValueError("Use only one of --resume or --new.")
     if args.resume:
         resume_enabled = True
     elif args.new:
         resume_enabled = False
     else:
-        resume_enabled = _prompt_resume_or_new_t2()
+        while True:
+            raw = input("Training mode [1=resume / 2=start new] [1]: ").strip()
+            if raw in ("", "1"):
+                resume_enabled = True
+                break
+            if raw == "2":
+                resume_enabled = False
+                break
+            print("  Enter 1 or 2.")
+
     os.environ["TIER2_RESUME"] = "1" if resume_enabled else "0"
-    print(
-        "🔄 Resuming Tier 2 from latest checkpoint."
-        if resume_enabled
-        else "🆕 Starting a new Tier 2 run."
-    )
+    print("🔄 Resuming Tier 2 from latest checkpoint." if resume_enabled else "🆕 Starting a new Tier 2 run.")
     train_t2_predictor()

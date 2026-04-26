@@ -22,6 +22,8 @@ from src.data_gen import AnchorGenerator, MeshToGraphComplete, VesselGenerator
 from src.evaluation.lib.validate_model import ModelValidator
 from src.config import PredChannels
 
+TIER2_FINAL_ANNEALED_N = 0.358
+
 
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     triang = mtri.Triangulation(pos[:, 0], pos[:, 1])
@@ -124,7 +126,7 @@ def _show_benchmark_visualization(validator, graph_dir, tier, level_idx, level_n
         current_idx = next_idx
 
 
-def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualize=False):
+def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualize=False, carreau_n=None):
     print(f"\n{'=' * 60}")
     print(f"🚀 STARTING BENCHMARK: [{tier.upper()}] {level_name} (Level {level_idx})")
     print(f"{'=' * 60}")
@@ -158,6 +160,17 @@ def run_pipeline_for_level(tier, level_idx, level_name, num_samples=10, visualiz
                 mesh_dir=str(raw_mesh_dir),
                 output_dir=str(label_dir)
         ) as a_gen:
+            if tier == "tier2":
+                # Tier 2 benchmark should default to the final continuation target.
+                target_n = TIER2_FINAL_ANNEALED_N if carreau_n is None else float(carreau_n)
+                a_gen.phys_cfg.n = target_n
+                a_gen.model.parameter("n_index", str(target_n))
+                print(f"   ↳ Using Tier 2 Carreau n_index = {target_n:.3f}")
+            elif carreau_n is not None and tier != "tier1":
+                target_n = float(carreau_n)
+                a_gen.phys_cfg.n = target_n
+                a_gen.model.parameter("n_index", str(target_n))
+                print(f"   ↳ Using Carreau n_index override = {target_n:.3f}")
             a_gen.run_batch(max_new=num_samples)
 
         print(f"\n[3/4] 🕸️ Converting to Graphs...")
@@ -221,6 +234,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", type=int, default=None, help="Number of vessels per benchmark level")
     parser.add_argument("--levels", type=str, default=None, help='Comma-separated benchmark levels (for example: "0,1")')
     parser.add_argument(
+        "--carreau-n",
+        type=float,
+        default=None,
+        help=f'Override Carreau n_index for non-tier1 runs (default for tier2: {TIER2_FINAL_ANNEALED_N:.3f})',
+    )
+    parser.add_argument(
         "--visualize",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -265,6 +284,7 @@ if __name__ == "__main__":
                 name,
                 num_samples=num_samples,
                 visualize=bool(args.visualize),
+                carreau_n=args.carreau_n,
             )
             if metrics is not None:
                 all_results[name] = metrics

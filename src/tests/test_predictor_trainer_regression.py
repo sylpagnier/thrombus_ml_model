@@ -69,22 +69,34 @@ def test_assert_tier2_train_split_validation():
 
 def test_tier2_dynamic_loss_weighter_precision_floor():
     floor = 0.8
-    lw = t2_mod._tier2_dynamic_loss_weighter(device="cpu", mom_precision_floor=floor)
+    cap = 20.0
+    lw = t2_mod._tier2_dynamic_loss_weighter(device="cpu", mom_precision_floor=floor, mom_weight_cap=cap)
     expected_max_lv = -torch.log(torch.tensor(floor))
-    assert torch.allclose(lw.per_task_max_log_var, expected_max_lv.view(1), atol=1e-6)
+    expected_min_lv = -torch.log(torch.tensor(cap))
+    assert torch.allclose(
+        lw.per_task_max_log_var,
+        torch.tensor([expected_max_lv.item(), 10.0], dtype=torch.float32),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        lw.per_task_min_log_var,
+        torch.tensor([expected_min_lv.item(), -8.0], dtype=torch.float32),
+        atol=1e-6,
+    )
 
 
 def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
     def _fake_terms(*_args, **_kwargs):
+        is_distillation = bool(_kwargs.get("tier2_distillation", False))
         return {
             "l_wss": torch.tensor(0.6),
             "l_data_kine": torch.tensor(0.1),
             "l_data_mu": torch.tensor(0.2),
-            "l_mom": torch.tensor(0.5),
-            "l_cont": torch.tensor(0.25),
+            "l_mom": torch.tensor(0.0 if is_distillation else 0.5),
+            "l_cont": torch.tensor(0.0 if is_distillation else 0.25),
             "l_bc": torch.tensor(0.3),
             "l_io": torch.tensor(0.4),
-            "l_rheo": torch.tensor(0.7),
+            "l_rheo": torch.tensor(0.0 if is_distillation else 0.7),
         }
 
     monkeypatch.setattr(t2_mod, "compute_kinematics_physics_terms", _fake_terms)
@@ -98,13 +110,12 @@ def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
         data=data,
         kernels=_DummyKernels(),
         loss_weighter=_SimpleWeighter(),
-        current_solver="picard",
-        lambda_phys=0.25,
+        current_solver="anderson",
         device="cpu",
-        is_distillation=True,
         carreau_n=0.7,
+        physics_active=False,
     )
-    assert abs(float(loss_d.item()) - 17.55) < 1e-6
+    assert abs(float(loss_d.item()) - 609.95) < 1e-6
     assert metrics_d["L_mom"] == 0.0
 
     loss_c, metrics_c = t2_mod.compute_step_loss(
@@ -113,14 +124,14 @@ def test_compute_step_loss_t2_distillation_and_coupled(monkeypatch):
         kernels=_DummyKernels(),
         loss_weighter=_SimpleWeighter(),
         current_solver="anderson",
-        lambda_phys=0.25,
         device="cpu",
-        is_distillation=False,
         carreau_n=0.7,
         tier2_kine_p_weight=1.35,
         coupled_io_scale=6.0,
+        train_continuity_scale=100.0,
+        physics_active=True,
     )
-    assert abs(float(loss_c.item()) - 70.775) < 1e-5
+    assert abs(float(loss_c.item()) - 636.15) < 1e-5
     assert abs(metrics_c["L_mom"] - 0.5) < 1e-6
 
 

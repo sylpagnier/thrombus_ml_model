@@ -29,7 +29,7 @@ class ModelValidator:
         mu_0_nd = self.kernels.mu_0_nd
 
         # Mirror training-time model recipes so checkpoint loading is shape-compatible.
-        if self.tier == "tier1":
+        if self.tier in {"tier1", "tier2"}:
             self.model = GINO_DEQ(
                 in_channels=15,
                 out_channels=5,

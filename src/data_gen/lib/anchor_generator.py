@@ -140,6 +140,20 @@ class AnchorGenerator:
         if not self.mesh_dir.exists():
             logger.warning(f"Mesh input directory does not exist: {self.mesh_dir}")
 
+    def _final_target_output_dir(self) -> Path:
+        """Directory for the final target n outputs.
+
+        Tier 2 now always writes final anchors to ``n_<target>`` for consistency with
+        continuation layouts. Tier 1 keeps the base output directory.
+        """
+        if self.vessel_config.tier == "tier2":
+            return self.output_dir / f"n_{float(self.phys_cfg.n):.3f}"
+        return self.output_dir
+
+    def target_output_dir(self) -> Path:
+        """Public accessor for current final-target output directory."""
+        return self._final_target_output_dir()
+
     def __enter__(self):
         logger.info(f"Connecting to COMSOL... Loading: {self.template_path.name}")
         self.client = mph.start()
@@ -147,6 +161,7 @@ class AnchorGenerator:
         self._set_global_physics_parameters()
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._final_target_output_dir().mkdir(parents=True, exist_ok=True)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -218,7 +233,7 @@ class AnchorGenerator:
                 pass
 
     def _process_single_anchor(
-        self, json_file: Path, mesh_j, import_tag, *, allow_overwrite: bool = False
+        self, json_file: Path, mesh_j, import_tag, *, allow_overwrite: bool = False, continuation_steps: Optional[List[float]] = None
     ) -> bool:
         """Run COMSOL for one vessel; write ``.npz`` if field checks pass. Returns True if saved."""
         file_stem = json_file.stem
@@ -229,11 +244,13 @@ class AnchorGenerator:
 
         nas_file = self.mesh_dir / f"{file_stem}.nas"
         msh_file = self.mesh_dir / f"{file_stem}.msh"
-        out_file = self.output_dir / f"{file_stem}.npz"
+
+        # Build sequence of n_values to solve (continuation steps + target)
+        n_sequence = continuation_steps.copy() if continuation_steps else []
+        if self.phys_cfg.n not in n_sequence:
+            n_sequence.append(self.phys_cfg.n)
 
         if not nas_file.exists() or nas_file.stat().st_size == 0:
-            return False
-        if out_file.exists() and not allow_overwrite:
             return False
 
         try:
@@ -262,91 +279,98 @@ class AnchorGenerator:
             except Exception as e:
                 logger.warning(f"Could not verify mesh stats for {i}: {e}")
 
-            self.model.solve()
-
             mesh = meshio.read(msh_file)
             target_nodes = mesh.points[:, :2]
 
-            u, v, p, mu = self._evaluate_at_coords(target_nodes)
-            u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
+            # --- THE CONTINUATION LOOP ---
+            for step_idx, n_val in enumerate(n_sequence):
+                is_target = (n_val == self.phys_cfg.n and step_idx == len(n_sequence) - 1)
 
-            def fix_boundary_nans(field, coords):
-                mask = np.isnan(field)
-                if mask.any() and not mask.all():
-                    interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
-                    field[mask] = interpolator(coords[mask])
-                return field
-
-            u = fix_boundary_nans(u, target_nodes)
-            v = fix_boundary_nans(v, target_nodes)
-            p = fix_boundary_nans(p, target_nodes)
-            mu = fix_boundary_nans(mu, target_nodes)
-
-            try:
-                line_cells = mesh.get_cells_type("line")
-                line_tags = mesh.get_cell_data("gmsh:physical", "line")
-                has_lines = len(line_cells) > 0
-            except Exception:
-                has_lines = False
-
-            if has_lines:
-                outlet_node_indices = []
-                outlet_tags = [
-                    tag_id for name, tag_id in self.vessel_config.TAGS.items()
-                    if "Outlet" in name
-                ]
-                for j, tag in enumerate(line_tags):
-                    if tag in outlet_tags:
-                        outlet_node_indices.extend(line_cells[j])
-                if outlet_node_indices:
-                    unique_indices = np.unique(outlet_node_indices)
-                    valid_indices = unique_indices[unique_indices < len(p)]
-                    if len(valid_indices) > 0:
-                        p_offset = np.mean(p[valid_indices])
-                        p = p - p_offset
-
-            nan_u = np.isnan(u).sum()
-            nan_v = np.isnan(v).sum()
-            nan_p = np.isnan(p).sum()
-            nan_mu = np.isnan(mu).sum()
-            total_nodes = len(u)
-
-            if nan_u > 0 or nan_v > 0 or nan_p > 0 or nan_mu > 0:
-                logger.warning(
-                    f"NaNs detected in {nas_file.name} | Total Nodes: {total_nodes} | "
-                    f"NaN counts -> u: {nan_u}, v: {nan_v}, p: {nan_p}, mu: {nan_mu}"
-                )
-                if nan_u == total_nodes:
-                    logger.error(
-                        f"[{i}] FATAL: 100% of nodes are NaN. (Solver diverged or coordinate shape mismatch)"
-                    )
+                # Setup output paths
+                if is_target:
+                    out_file = self._final_target_output_dir() / f"{file_stem}.npz"
                 else:
-                    pct_failed = (nan_u / total_nodes) * 100
+                    step_dir = self.output_dir / f"n_{n_val:.3f}"
+                    step_dir.mkdir(parents=True, exist_ok=True)
+                    out_file = step_dir / f"{file_stem}.npz"
+
+                if out_file.exists() and not allow_overwrite:
+                    logger.debug(f"[{i}] Skipping step n={n_val}, already exists.")
+                    continue
+
+                logger.info(f"[{i}] Solving for n_index = {n_val}...")
+                self.model.parameter('n_index', str(n_val))
+                self.model.solve()
+
+                u, v, p, mu = self._evaluate_at_coords(target_nodes)
+                u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
+
+                def fix_boundary_nans(field, coords):
+                    mask = np.isnan(field)
+                    if mask.any() and not mask.all():
+                        interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
+                        field[mask] = interpolator(coords[mask])
+                    return field
+
+                u = fix_boundary_nans(u, target_nodes)
+                v = fix_boundary_nans(v, target_nodes)
+                p = fix_boundary_nans(p, target_nodes)
+                mu = fix_boundary_nans(mu, target_nodes)
+
+                try:
+                    line_cells = mesh.get_cells_type("line")
+                    line_tags = mesh.get_cell_data("gmsh:physical", "line")
+                    has_lines = len(line_cells) > 0
+                except Exception:
+                    has_lines = False
+
+                if has_lines:
+                    outlet_node_indices = []
+                    outlet_tags = [
+                        tag_id for name, tag_id in self.vessel_config.TAGS.items()
+                        if "Outlet" in name
+                    ]
+                    for j, tag in enumerate(line_tags):
+                        if tag in outlet_tags:
+                            outlet_node_indices.extend(line_cells[j])
+                    if outlet_node_indices:
+                        unique_indices = np.unique(outlet_node_indices)
+                        valid_indices = unique_indices[unique_indices < len(p)]
+                        if len(valid_indices) > 0:
+                            p_offset = np.mean(p[valid_indices])
+                            p = p - p_offset
+
+                nan_u = np.isnan(u).sum()
+                nan_v = np.isnan(v).sum()
+                nan_p = np.isnan(p).sum()
+                nan_mu = np.isnan(mu).sum()
+                total_nodes = len(u)
+
+                if nan_u > 0 or nan_v > 0 or nan_p > 0 or nan_mu > 0:
                     logger.warning(
-                        f"[{i}] BOUNDARY ISSUE: {pct_failed:.2f}% of nodes are NaN. "
-                        "COMSOL thinks these nodes are outside the mesh."
+                        f"NaNs detected in {nas_file.name} at n={n_val} | Total Nodes: {total_nodes} | "
+                        f"NaN counts -> u: {nan_u}, v: {nan_v}, p: {nan_p}, mu: {nan_mu}"
                     )
-                return False
+                    return False
 
-            p_std = np.std(p)
-            u_max = np.max(np.abs(u))
-            if p_std < 1e-9 or u_max < 1e-7:
-                logger.warning(
-                    f"[{i}] Skipping: Trivial solution detected (P_std: {p_std:.2e}, U_max: {u_max:.2e})"
+                p_std = np.std(p)
+                u_max = np.max(np.abs(u))
+                if p_std < 1e-9 or u_max < 1e-7:
+                    logger.warning(f"[{i}] Skipping: Trivial solution detected at n={n_val}")
+                    return False
+
+                np.savez(
+                    out_file,
+                    x=target_nodes[:, 0],
+                    y=target_nodes[:, 1],
+                    u=u,
+                    v=v,
+                    p=p,
+                    mu=mu,
+                    d_bar=d_bar,
+                    config_id=i,
+                    carreau_n=n_val  # Crucial for your dataloader later
                 )
-                return False
-
-            np.savez(
-                out_file,
-                x=target_nodes[:, 0],
-                y=target_nodes[:, 1],
-                u=u,
-                v=v,
-                p=p,
-                mu=mu,
-                d_bar=d_bar,
-                config_id=i,
-            )
             return True
 
         except Exception as e:
@@ -363,6 +387,7 @@ class AnchorGenerator:
         shuffle_candidates: bool = False,
         shuffle_seed: Optional[int] = None,
         allow_overwrite: bool = False,
+        continuation_steps: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         """Write up to ``max_new`` new healthy ``vessel_*.npz`` files.
 
@@ -393,9 +418,11 @@ class AnchorGenerator:
             raise RuntimeError("Model not loaded.")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        existing_npz = len(list(self.output_dir.glob("vessel_*.npz")))
+        target_output_dir = self._final_target_output_dir()
+        target_output_dir.mkdir(parents=True, exist_ok=True)
+        existing_npz = len(list(target_output_dir.glob("vessel_*.npz")))
         candidates = list_anchor_candidate_json_paths(
-            self.mesh_dir, self.output_dir, include_existing_npz=allow_overwrite
+            self.mesh_dir, target_output_dir, include_existing_npz=allow_overwrite
         )
         pool_full = len(candidates)
 
@@ -442,7 +469,11 @@ class AnchorGenerator:
                 break
             attempted += 1
             if self._process_single_anchor(
-                json_file, mesh_j, import_tag, allow_overwrite=allow_overwrite
+                json_file,
+                mesh_j,
+                import_tag,
+                allow_overwrite=allow_overwrite,
+                continuation_steps=continuation_steps,
             ):
                 new_written += 1
             else:
@@ -521,14 +552,15 @@ if __name__ == "__main__":
         tier_n = _prompt_int_choice("Tier", (1, 2))
         tier = f"tier{tier_n}"
         gen = AnchorGenerator(tier=tier)
-        inv = summarize_anchor_inventory(gen.mesh_dir, gen.output_dir)
+        target_dir = gen.target_output_dir()
+        inv = summarize_anchor_inventory(gen.mesh_dir, target_dir)
         total_v = int(inv["mesh_json_with_valid_nas"])
         have_npz = int(inv["existing_npz"])
         remaining = int(inv["pending_missing_npz"])
         ready_add = int(inv["candidate_pool_ready"])
         ready_all = int(inv["candidate_pool_including_npz"])
         print("\n--- Anchor CFD inventory ---")
-        print(f"  Output: {gen.output_dir}")
+        print(f"  Output: {target_dir}")
         print(f"  Mesh:   {gen.mesh_dir}")
         print(f"  Total number of tier vessels: {total_v}")
         print(f"  Number of anchors already generated: {have_npz}")
