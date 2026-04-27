@@ -8,7 +8,11 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Tuple, Optional, Dict, Any, List
 from src.config import VesselConfig, PhysicsConfig
-from src.utils.paths import get_project_root
+from src.utils.paths import (
+    get_project_root,
+    migrate_legacy_final_n_subdir,
+    migrate_legacy_vessel_meshes,
+)
 from scipy.interpolate import NearestNDInterpolator
 
 # Configure logging
@@ -107,9 +111,26 @@ class AnchorGenerator:
     Automates COMSOL CFD simulations based on synthetic vessel meshes.
     """
 
-    def __init__(self, phase="kinematics", mesh_dir=None, output_dir=None, template_path=None):
+    def __init__(
+        self,
+        phase="kinematics",
+        mesh_dir=None,
+        output_dir=None,
+        template_path=None,
+        rheology: Optional[str] = None,
+    ):
         self.vessel_config = VesselConfig(phase=phase)
-        self.phys_cfg = PhysicsConfig(phase=phase)
+        inferred_rheology = None
+        if rheology is None and output_dir is not None:
+            leaf = Path(output_dir).name.strip().lower()
+            if leaf in {"newtonian", "carreau"}:
+                inferred_rheology = leaf
+        self.rheology = (
+            rheology.strip().lower()
+            if isinstance(rheology, str)
+            else inferred_rheology
+        )
+        self.phys_cfg = PhysicsConfig(phase=phase, rheology=self.rheology)
 
         self.root_dir = get_project_root()
 
@@ -131,6 +152,7 @@ class AnchorGenerator:
             self.mesh_dir = Path(mesh_dir)
         else:
             self.mesh_dir = self.vessel_config.mesh_input_dir
+            migrate_legacy_vessel_meshes(self.mesh_dir)
 
         self.client: Optional[mph.Client] = None
         self.model: Optional[mph.Model] = None
@@ -139,15 +161,18 @@ class AnchorGenerator:
             raise FileNotFoundError(f"COMSOL template not found at: {self.template_path}")
         if not self.mesh_dir.exists():
             logger.warning(f"Mesh input directory does not exist: {self.mesh_dir}")
+        if self.vessel_config.phase == "kinematics":
+            migrate_legacy_final_n_subdir(self.output_dir, n_value=self.phys_cfg.n, ext="npz")
 
     def _final_target_output_dir(self) -> Path:
         """Directory for the final target n outputs.
 
-        Kinematics now always writes final anchors to ``n_<target>`` for consistency with
-        continuation layouts. Kinematics keeps the base output directory.
+        Kinematics final anchors live directly in regime folders
+        (``.../<newtonian|carreau>``). Continuation sweeps still write intermediate
+        ``n_*`` folders during solving.
         """
         if self.vessel_config.phase == "kinematics":
-            return self.output_dir / f"n_{float(self.phys_cfg.n):.3f}"
+            return self.output_dir
         return self.output_dir
 
     def target_output_dir(self) -> Path:
@@ -175,7 +200,7 @@ class AnchorGenerator:
         # Update Parameters (Global)
         self.model.parameter('rho_fluid', f'{self.phys_cfg.rho} [kg/m^3]')
         self.model.parameter('Re_target', str(self.phys_cfg.re_target))
-        self.model.parameter('mu_ref', f'{self.phys_cfg.mu_newtonian} [Pa*s]')
+        self.model.parameter('mu_ref', f'{self.phys_cfg.mu_ref} [Pa*s]')
         self.model.parameter('mu_inf', f'{self.phys_cfg.mu_inf} [Pa*s]')
         self.model.parameter('mu_0', f'{self.phys_cfg.mu_0} [Pa*s]')
         self.model.parameter('lambda_cy', f'{self.phys_cfg.lam} [s]')
@@ -281,6 +306,39 @@ class AnchorGenerator:
 
             mesh = meshio.read(msh_file)
             target_nodes = mesh.points[:, :2]
+            n_nodes = target_nodes.shape[0]
+
+            # Build boundary masks once per mesh so NaN repair can preserve boundary classes.
+            wall_tags = {self.vessel_config.TAGS["Walls"]}
+            outlet_tags = {
+                tag_id for name, tag_id in self.vessel_config.TAGS.items() if "Outlet" in name
+            }
+            boundary_node_mask = np.zeros(n_nodes, dtype=bool)
+            wall_node_mask = np.zeros(n_nodes, dtype=bool)
+            outlet_node_indices = []
+            try:
+                line_cells = mesh.get_cells_type("line")
+                line_tags = mesh.get_cell_data("gmsh:physical", "line")
+                has_lines = len(line_cells) > 0
+            except Exception:
+                line_cells = []
+                line_tags = []
+                has_lines = False
+
+            if has_lines:
+                for j, tag in enumerate(line_tags):
+                    if j >= len(line_cells):
+                        continue
+                    nodes_j = np.asarray(line_cells[j], dtype=np.int64)
+                    nodes_j = nodes_j[(nodes_j >= 0) & (nodes_j < n_nodes)]
+                    if nodes_j.size == 0:
+                        continue
+                    boundary_node_mask[nodes_j] = True
+                    if int(tag) in wall_tags:
+                        wall_node_mask[nodes_j] = True
+                    if int(tag) in outlet_tags:
+                        outlet_node_indices.extend(nodes_j.tolist())
+            interior_node_mask = ~boundary_node_mask
 
             # --- THE CONTINUATION LOOP ---
             for step_idx, n_val in enumerate(n_sequence):
@@ -306,39 +364,50 @@ class AnchorGenerator:
                 u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
 
                 def fix_boundary_nans(field, coords):
-                    mask = np.isnan(field)
-                    if mask.any() and not mask.all():
-                        interpolator = NearestNDInterpolator(coords[~mask], field[~mask])
-                        field[mask] = interpolator(coords[mask])
-                    return field
+                    """Fill NaNs without leaking interior values onto wall nodes."""
+                    out = np.asarray(field, dtype=np.float64).copy()
+                    nan_mask = np.isnan(out)
+                    if not nan_mask.any():
+                        return out
+                    if nan_mask.all():
+                        return out
+
+                    def _fill_group(target_mask, source_mask):
+                        missing = nan_mask & target_mask
+                        if not missing.any():
+                            return
+                        available = source_mask & (~np.isnan(out))
+                        if not available.any():
+                            return
+                        interpolator = NearestNDInterpolator(coords[available], out[available])
+                        out[missing] = interpolator(coords[missing])
+
+                    # Prefer class-consistent fills first.
+                    _fill_group(interior_node_mask, interior_node_mask)
+                    _fill_group(wall_node_mask, wall_node_mask)
+                    boundary_nonwall = boundary_node_mask & (~wall_node_mask)
+                    _fill_group(boundary_nonwall, boundary_nonwall)
+
+                    # Fallback for any residual NaNs.
+                    residual = np.isnan(out)
+                    if residual.any():
+                        available = ~residual
+                        if available.any():
+                            interpolator = NearestNDInterpolator(coords[available], out[available])
+                            out[residual] = interpolator(coords[residual])
+                    return out
 
                 u = fix_boundary_nans(u, target_nodes)
                 v = fix_boundary_nans(v, target_nodes)
                 p = fix_boundary_nans(p, target_nodes)
                 mu = fix_boundary_nans(mu, target_nodes)
 
-                try:
-                    line_cells = mesh.get_cells_type("line")
-                    line_tags = mesh.get_cell_data("gmsh:physical", "line")
-                    has_lines = len(line_cells) > 0
-                except Exception:
-                    has_lines = False
-
-                if has_lines:
-                    outlet_node_indices = []
-                    outlet_tags = [
-                        tag_id for name, tag_id in self.vessel_config.TAGS.items()
-                        if "Outlet" in name
-                    ]
-                    for j, tag in enumerate(line_tags):
-                        if tag in outlet_tags:
-                            outlet_node_indices.extend(line_cells[j])
-                    if outlet_node_indices:
-                        unique_indices = np.unique(outlet_node_indices)
-                        valid_indices = unique_indices[unique_indices < len(p)]
-                        if len(valid_indices) > 0:
-                            p_offset = np.mean(p[valid_indices])
-                            p = p - p_offset
+                if has_lines and outlet_node_indices:
+                    unique_indices = np.unique(np.asarray(outlet_node_indices, dtype=np.int64))
+                    valid_indices = unique_indices[(unique_indices >= 0) & (unique_indices < len(p))]
+                    if len(valid_indices) > 0:
+                        p_offset = np.mean(p[valid_indices])
+                        p = p - p_offset
 
                 nan_u = np.isnan(u).sum()
                 nan_v = np.isnan(v).sum()

@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
 import pytest
 import torch
 from torch_geometric.data import Data
@@ -120,6 +121,22 @@ def _iter_graph_paths(graph_dir: Path, limit: int) -> List[Path]:
     return files[:limit]
 
 
+def _rheology_dirs(base_dir: Path) -> Dict[str, Path]:
+    out: Dict[str, Path] = {}
+    for name in ("newtonian", "carreau"):
+        d = base_dir / name
+        if d.is_dir():
+            out[name] = d
+    return out
+
+
+def _extract_idx(path: Path) -> int | None:
+    try:
+        return int(path.stem.split("_")[-1])
+    except Exception:
+        return None
+
+
 def _assert_graph_invariants(data: Data, path: Path) -> None:
     assert isinstance(data, Data)
     n = int(data.num_nodes)
@@ -202,3 +219,76 @@ def test_kinematics_anchor_flag_prevalence(kinematics_layout: Dict[str, Any]) ->
         f"Found {inv_npz} npz under {paths['cfd_npz']} but no graph with is_anchor in sampled .pt "
         f"(check mesh_to_graph / label paths)."
     )
+
+
+def test_kinematics_rheology_applied_in_anchor_groups(kinematics_layout: Dict[str, Any]) -> None:
+    """Validate that generated anchor ``mu`` behavior matches selected rheology folders."""
+    cfd_base = kinematics_layout["paths"]["cfd_npz"]
+    rheo_dirs = _rheology_dirs(cfd_base)
+    if not rheo_dirs:
+        pytest.skip(f"No rheology subdirectories under {cfd_base}")
+
+    max_npz = _env_int("KINEMATICS_INSPECT_MAX_NPZ", 200)
+    for rheology, d in rheo_dirs.items():
+        files = sorted(d.glob("vessel_*.npz"))[:max_npz]
+        if not files:
+            pytest.skip(f"No vessel_*.npz files under {d}")
+        mu_ranges: list[float] = []
+        for p in files:
+            with np.load(p) as npz:
+                if "mu" not in npz:
+                    continue
+                mu = np.asarray(npz["mu"]).reshape(-1)
+                if mu.size == 0:
+                    continue
+                mu_ranges.append(float(np.nanmax(mu) - np.nanmin(mu)))
+        if not mu_ranges:
+            pytest.skip(f"No usable mu arrays found in {d}")
+
+        q50 = float(np.quantile(np.asarray(mu_ranges), 0.5))
+        q90 = float(np.quantile(np.asarray(mu_ranges), 0.9))
+        if rheology == "newtonian":
+            assert q90 < 1e-5, (
+                f"Newtonian anchors should be near-constant viscosity in {d}; "
+                f"observed mu range quantiles: q50={q50:.3e}, q90={q90:.3e}"
+            )
+        elif rheology == "carreau":
+            assert q50 > 1e-4, (
+                f"Carreau anchors should show variable viscosity in {d}; "
+                f"observed mu range quantiles: q50={q50:.3e}, q90={q90:.3e}"
+            )
+
+
+def test_kinematics_anchor_graph_node_count_compatibility(kinematics_layout: Dict[str, Any]) -> None:
+    """For labeled anchor graphs, per-index node counts must match anchor ``.npz`` nodes."""
+    cfd_base = kinematics_layout["paths"]["cfd_npz"]
+    graph_base = kinematics_layout["paths"]["graphs"]
+    cfd_rheos = _rheology_dirs(cfd_base)
+    graph_rheos = _rheology_dirs(graph_base)
+    common = sorted(set(cfd_rheos).intersection(graph_rheos))
+    if not common:
+        pytest.skip(f"No common rheology subdirs between {cfd_base} and {graph_base}")
+
+    max_pairs = _env_int("KINEMATICS_INSPECT_MAX_MATCHED", 300)
+    for rheology in common:
+        npz_files = sorted(cfd_rheos[rheology].glob("vessel_*.npz"))
+        pt_files = {p.stem: p for p in sorted(graph_rheos[rheology].glob("vessel_*.pt"))}
+        pairs = [(p, pt_files[p.stem]) for p in npz_files if p.stem in pt_files][:max_pairs]
+        if not pairs:
+            pytest.skip(f"No paired vessel_*.npz / vessel_*.pt files for {rheology}")
+
+        checked = 0
+        for npz_path, pt_path in pairs:
+            data = torch.load(pt_path, map_location="cpu", weights_only=False)
+            if not graph_has_anchor(data):
+                continue
+            with np.load(npz_path) as npz:
+                n_npz = int(np.asarray(npz["x"]).reshape(-1).shape[0])
+            n_pt = int(data.num_nodes)
+            checked += 1
+            assert n_npz == n_pt, (
+                f"{rheology}:{npz_path.stem} node-count mismatch "
+                f"(npz={n_npz}, graph={n_pt})"
+            )
+        if checked == 0:
+            pytest.skip(f"No labeled anchor graphs found in sampled pairs for {rheology}")

@@ -132,7 +132,7 @@ class VesselConfig:
         self.mesh_size_factor = PHASE_DEFAULT_MESH_SIZE_FACTOR.get(self.phase, self.mesh_size_factor)
         dr = data_root()
         if self.phase == "kinematics":
-            self.mesh_input_dir = dr / "raw/kinematics"
+            self.mesh_input_dir = dr / "raw/kinematics/meshes"
             self.output_dir = dr / "processed/cfd_results_kinematics"
             self.graph_output_dir = dr / "processed/graphs_kinematics"
         else:
@@ -184,6 +184,8 @@ class PhysicsConfig:
     relabeling graphs.
     """
     phase: str = "kinematics"
+    # Optional rheology override for kinematics phase ("newtonian" or "carreau").
+    rheology: str | None = None
 
     # --- Unit Conversion Scales (COMSOL CGS to SI) ---
     cm_to_m: float = 0.01
@@ -219,7 +221,18 @@ class PhysicsConfig:
     def __post_init__(self):
         """Automatically set the correct physics based on the project phase."""
         self.phase = _map_phase_to_phase(self.phase)
-        if self.phase in ("kinematics", "biochem"):
+        if self.phase == "kinematics":
+            mode_raw = (self.rheology or "carreau").strip().lower()
+            if mode_raw not in {"newtonian", "carreau"}:
+                raise ValueError(f"Unknown kinematics rheology: {self.rheology}")
+            if mode_raw == "newtonian":
+                self.viscosity_model = "newtonian"
+                self.mu_ref = self.mu_newtonian
+                self.n = 1.0
+            else:
+                self.viscosity_model = "carreau"
+                self.mu_ref = self.mu_inf
+        elif self.phase == "biochem":
             self.viscosity_model = "carreau"
             self.mu_ref = self.mu_inf
         else:

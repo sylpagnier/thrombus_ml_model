@@ -266,6 +266,8 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, 1)
         )
         self.mu_encoder = nn.Linear(1, latent_dim)
+        # Prior injector: maps [u_prior, v_prior, p_prior, mu_prior] into latent warm start.
+        self.z_prior_proj = SpectralLinear(4, latent_dim)
 
     def prepare_for_biochem_lora(self, rank: int = 4, alpha: float = 1.0):
         """
@@ -307,7 +309,7 @@ class GINO_DEQ(nn.Module):
         return encoded_x, uv_prior
 
     @torch.enable_grad()
-    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5):
+    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5, current_n=None):
         x_encoded, _ = self._apply_fourier_encoding(data.x)
         x_enc = self.encoder(x_encoded)
         z = x_enc.clone()
@@ -338,10 +340,13 @@ class GINO_DEQ(nn.Module):
         mod_rheo = torch.log(torch.clamp(dot_prod, min=self.rheo_log_clamp_min, max=1.0)) * decay_factor
         mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=self.adv_log_clamp_min, max=1.0)) * decay_factor
 
+        def decode_mu(latent_state):
+            mu_raw_state = self.mu_decoder(latent_state)
+            return self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw_state)
+
         def f_coupled(curr_z):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
-            mu_raw = self.mu_decoder(curr_z_flat)
-            mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
+            mu = decode_mu(curr_z_flat)
             if getattr(self, "decouple_rheology", False):
                 # During warmup, preserve Kinematics latent feedback via frozen decoder clone.
                 if hasattr(self, "kinematics_mu_decoder"):
@@ -357,7 +362,13 @@ class GINO_DEQ(nn.Module):
             out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
             return out.unsqueeze(0) if curr_z.ndim == 3 else out
 
-        z_init = z.unsqueeze(0) if z.ndim == 2 else z
+        # Warm-start DEQ state with explicit physical priors: [u_prior, v_prior, p_prior, mu_prior].
+        uv_prior = data.x[:, NodeFeat.UV_PRIOR]
+        p_prior = data.x[:, NodeFeat.SHEAR_POT]
+        mu_prior = data.x[:, NodeFeat.MU_PRIOR]
+        priors = torch.cat([uv_prior, p_prior, mu_prior], dim=1)
+        z_warm_start = z + self.z_prior_proj(priors)
+        z_init = z_warm_start.unsqueeze(0) if z_warm_start.ndim == 2 else z_warm_start
 
         # Solve for equilibrium without unrolling autograd through all fixed-point steps.
         with torch.no_grad():
@@ -384,8 +395,7 @@ class GINO_DEQ(nn.Module):
             z = z_out.squeeze(0)
             jac_loss = torch.tensor(0.0, device=z.device)
 
-        mu_raw = self.mu_decoder(z)
-        mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
+        mu = decode_mu(z)
 
         if self.siren_decoder is not None:
             pos_nd = getattr(data, "pos_nd", None)

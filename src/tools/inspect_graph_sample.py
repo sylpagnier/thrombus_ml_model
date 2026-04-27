@@ -1,5 +1,5 @@
 """
-Interactive inspection of processed graph ``.pt`` samples (Kinematics / Kinematics / Kine phase).
+Interactive inspection of processed graph ``.pt`` samples (Kinematics / Kine phase).
 
 Run as a script (not via pytest)::
 
@@ -18,25 +18,42 @@ import torch
 from matplotlib.widgets import Button, RadioButtons, TextBox
 from torch_geometric.utils import degree
 
-from src.config import PhysicsConfig, VesselConfig
+from src.config import NodeFeat, PhysicsConfig, VesselConfig
 from src.core_physics.physics_kernels import scatter_add
 
 
-def _kinematics_final_n_subdir() -> str:
-    return f"n_{float(PhysicsConfig(phase='kinematics').n):.3f}"
+def _resolve_kinematics_subdir(base_dir: Path, requested: str | None) -> Path:
+    """Resolve kinematics rheology folder consistently with inspect_kinematics_data."""
+    if requested:
+        chosen = requested.strip().lower()
+        if chosen not in {"carreau", "newtonian"}:
+            raise ValueError(f"Invalid rheology '{requested}'. Use 'carreau' or 'newtonian'.")
+        out = base_dir / chosen
+        if not out.is_dir():
+            raise FileNotFoundError(f"Requested rheology folder not found: {out}")
+        return out
+
+    # Flat legacy layout
+    if list(base_dir.glob("vessel_*.*")):
+        return base_dir
+
+    available = []
+    for name in ("carreau", "newtonian"):
+        d = base_dir / name
+        if d.is_dir() and list(d.glob("vessel_*.*")):
+            available.append(d)
+    if not available:
+        return base_dir
+    return next((d for d in available if d.name == "carreau"), available[0])
 
 
 def _default_graph_dir_for_phase(phase: str) -> Path:
     d = Path(VesselConfig(phase=phase).graph_output_dir)
-    if phase == "kinematics":
-        d = d / _kinematics_final_n_subdir()
     return d
 
 
 def _default_cfd_dir_for_phase(phase: str) -> Path:
     d = Path(VesselConfig(phase=phase).output_dir)
-    if phase == "kinematics":
-        d = d / _kinematics_final_n_subdir()
     return d
 
 
@@ -82,9 +99,32 @@ def plot_field(ax, pos, values, title, cmap="viridis", colorbar=True, **kwargs):
     return sc
 
 
-def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=None, phase_options=None, restrict_to_overlap=True):
+def _collect_vessel_files(base_dir, suffix):
+    """Collect vessel files keyed by vessel index (stable direct-dir first)."""
+    base = Path(base_dir)
+    by_idx = {}
+    direct = sorted(base.glob(f"vessel_*{suffix}"))
+    source = direct if direct else sorted(base.rglob(f"vessel_*{suffix}"))
+    for path in source:
+        idx = _extract_vessel_idx(path)
+        if idx is None or idx in by_idx:
+            continue
+        by_idx[idx] = path
+    return by_idx
+
+
+def inspect_sample(
+    filename=None,
+    phase="kinematics",
+    proc_dir=None,
+    cfd_dir=None,
+    phase_options=None,
+    restrict_to_overlap=True,
+    rheology=None,
+    allow_stale_pairs=False,
+):
     if phase_options is None:
-        phase_options = ["kinematics", "kinematics"]
+        phase_options = ["kinematics"]
 
     requested_vessel_idx = _extract_vessel_idx(Path(filename)) if filename is not None else None
     state = {
@@ -98,22 +138,47 @@ def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=Non
 
     def _graph_dir_for_current_phase():
         if proc_dir is not None:
-            return Path(proc_dir)
-        return _default_graph_dir_for_phase(state["phase"])
+            base = Path(proc_dir)
+        else:
+            base = _default_graph_dir_for_phase(state["phase"])
+        if state["phase"] == "kinematics":
+            return _resolve_kinematics_subdir(base, rheology)
+        return base
+
+    def _cfd_dir_for_current_phase():
+        if cfd_dir is not None:
+            base = Path(cfd_dir)
+        else:
+            base = _default_cfd_dir_for_phase(state["phase"])
+        if state["phase"] == "kinematics":
+            return _resolve_kinematics_subdir(base, rheology)
+        return base
 
     def _sync_overlap_for_current_phase():
+        graph_dir = _graph_dir_for_current_phase()
+        cfd_dir_local = _cfd_dir_for_current_phase()
+        graph_files_by_idx = _collect_vessel_files(graph_dir, ".pt")
+        if not allow_stale_pairs and restrict_to_overlap:
+            bad = _find_incompatible_graph_cfd_pairs(graph_dir, cfd_dir_local)
+            if bad:
+                preview = ", ".join(str(v) for v in bad[:20])
+                if len(bad) > 20:
+                    preview = f"{preview}, ..."
+                raise RuntimeError(
+                    "Refusing to inspect with stale graph/CFD pairings. "
+                    f"Found {len(bad)} incompatible same-ID pairs in current view: [{preview}]. "
+                    "Regenerate anchors/graphs, or rerun with --allow-stale-pairs."
+                )
         if restrict_to_overlap:
             state["overlap_indices"] = list_indices_with_valid_comsol_results(
                 phase=state["phase"],
-                proc_dir=proc_dir,
-                cfd_dir=cfd_dir,
+                proc_dir=graph_dir,
+                cfd_dir=cfd_dir_local,
                 emit=False,
             )
         else:
-            graph_dir = _graph_dir_for_current_phase()
-            state["overlap_indices"] = sorted(
-                idx for idx in (_extract_vessel_idx(p) for p in graph_dir.glob("vessel_*.pt")) if idx is not None
-            )
+            state["overlap_indices"] = sorted(graph_files_by_idx)
+        state["graph_files_by_idx"] = graph_files_by_idx
         if len(state["overlap_indices"]) == 0:
             state["vessel_idx"] = None
         elif state["vessel_idx"] not in set(state["overlap_indices"]):
@@ -172,7 +237,10 @@ def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=Non
             return
 
         filename_local = f"vessel_{state['vessel_idx']}.pt"
-        data_path = _graph_dir_for_current_phase() / filename_local
+        data_path = state.get("graph_files_by_idx", {}).get(state["vessel_idx"])
+        if data_path is None:
+            graph_dir = _graph_dir_for_current_phase()
+            data_path = graph_dir / filename_local
         if not data_path.exists():
             print(f"File {filename_local} not found in {_graph_dir_for_current_phase()}")
             fig.canvas.draw_idle()
@@ -183,7 +251,7 @@ def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=Non
         data = torch.load(data_path, weights_only=False)
 
         print("\n Architecture & Invariants")
-        expected_channels = 15
+        expected_channels = NodeFeat.WIDTH_D2.stop
         if data.x.shape[1] != expected_channels:
             print(f" ❌ FAIL: Feature mismatch! Expected {expected_channels}, got {data.x.shape}.")
         else:
@@ -254,7 +322,7 @@ def inspect_sample(filename=None, phase="kinematics", proc_dir=None, cfd_dir=Non
         meta_ax.text(
             0,
             0.5,
-            f"Phase: {state['phase']}\nFile: {filename_local}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}\n"
+            f"Phase: {state['phase']}\nFile: {data_path}\nRe: {phys_cfg.re_target}\nModel: {phys_cfg.viscosity_model}\n"
             f"{'Overlap' if restrict_to_overlap else 'Available'} count: {len(overlap_sorted)}",
             fontsize=10,
         )
@@ -357,6 +425,31 @@ def _is_valid_comsol_result(npz_path):
     return True
 
 
+def _is_graph_cfd_node_compatible(pt_path, npz_path):
+    """Basic compatibility gate: graph node count must match same-ID CFD node count."""
+    try:
+        data = torch.load(pt_path, map_location="cpu", weights_only=False)
+        graph_nodes = int(data.num_nodes)
+        with np.load(npz_path) as data_npz:
+            cfd_nodes = int(np.asarray(data_npz["x"]).size)
+    except Exception:
+        return False
+    return graph_nodes == cfd_nodes
+
+
+def _find_incompatible_graph_cfd_pairs(graph_dir, comsol_dir):
+    """Return vessel IDs whose graph/CFD pair exists but fails compatibility."""
+    graph_files = _collect_vessel_files(graph_dir, ".pt")
+    cfd_files = _collect_vessel_files(comsol_dir, ".npz")
+    out = []
+    for idx in sorted(set(graph_files) & set(cfd_files)):
+        if not _is_valid_comsol_result(cfd_files[idx]):
+            continue
+        if not _is_graph_cfd_node_compatible(graph_files[idx], cfd_files[idx]):
+            out.append(idx)
+    return out
+
+
 def list_indices_with_valid_comsol_results(
     phase="kinematics",
     proc_dir=None,
@@ -364,6 +457,8 @@ def list_indices_with_valid_comsol_results(
     verbose=False,
     print_indices=False,
     emit=True,
+    require_graph_cfd_compat=True,
+    fail_on_incompat=False,
 ):
     graph_dir = Path(proc_dir) if proc_dir is not None else _default_graph_dir_for_phase(phase)
     comsol_dir = Path(cfd_dir) if cfd_dir is not None else _default_cfd_dir_for_phase(phase)
@@ -377,20 +472,33 @@ def list_indices_with_valid_comsol_results(
             print(f"COMSOL results directory not found: {comsol_dir}")
         return []
 
-    graph_indices = {idx for idx in (_extract_vessel_idx(p) for p in graph_dir.glob("vessel_*.pt")) if idx is not None}
+    graph_indices = set(_collect_vessel_files(graph_dir, ".pt").keys())
 
     valid_cfd_indices = set()
     invalid_cfd_indices = set()
-    for npz_path in comsol_dir.glob("vessel_*.npz"):
-        idx = _extract_vessel_idx(npz_path)
-        if idx is None:
-            continue
+    incompatible_pairs = set()
+    graph_files = _collect_vessel_files(graph_dir, ".pt")
+    for idx, npz_path in _collect_vessel_files(comsol_dir, ".npz").items():
         if _is_valid_comsol_result(npz_path):
+            if require_graph_cfd_compat and idx in graph_files:
+                if not _is_graph_cfd_node_compatible(graph_files[idx], npz_path):
+                    incompatible_pairs.add(idx)
+                    continue
             valid_cfd_indices.add(idx)
         else:
             invalid_cfd_indices.add(idx)
 
     overlap_indices = sorted(graph_indices & valid_cfd_indices)
+
+    if fail_on_incompat and incompatible_pairs:
+        preview = ", ".join(str(v) for v in sorted(incompatible_pairs)[:20])
+        if len(incompatible_pairs) > 20:
+            preview = f"{preview}, ..."
+        raise RuntimeError(
+            "Detected stale graph/CFD pairings (same vessel ID but incompatible nodes). "
+            f"Count={len(incompatible_pairs)}; sample IDs: [{preview}]. "
+            "Regenerate anchor CFD + graphs, or rerun with --allow-stale-pairs."
+        )
 
     if verbose and emit:
         print(f"\n{'=' * 60}")
@@ -402,6 +510,8 @@ def list_indices_with_valid_comsol_results(
         print(f"Valid COMSOL samples found: {len(valid_cfd_indices)}")
         if invalid_cfd_indices:
             print(f"Invalid COMSOL samples skipped: {len(invalid_cfd_indices)}")
+        if incompatible_pairs:
+            print(f"Graph/CFD node-mismatch pairs skipped: {len(incompatible_pairs)}")
         print(f"Overlap samples: {len(overlap_indices)}")
         print(f"Overlap indices: {overlap_indices}")
     elif emit:
@@ -419,8 +529,6 @@ def _normalize_phase_value(raw_phase):
     aliases = {
         "1": "kinematics",
         "kinematics": "kinematics",
-        "2": "kinematics",
-        "kinematics": "kinematics",
     }
     return aliases.get(normalized)
 
@@ -432,12 +540,24 @@ if __name__ == "__main__":
     parser.add_argument("--proc-dir", type=str, default=None, help="Directory with graph .pt files")
     parser.add_argument("--cfd-dir", type=str, default=None, help="Directory with COMSOL .npz CFD files")
     parser.add_argument(
+        "--rheology",
+        type=str,
+        default=None,
+        choices=("newtonian", "carreau"),
+        help="Kinematics rheology folder to inspect (default: auto, prefers carreau).",
+    )
+    parser.add_argument(
         "--list-cfd-overlap",
         action="store_true",
         help="Print overlap count for graphs with valid COMSOL CFD outputs",
     )
     parser.add_argument("--inspect-sample", action="store_true", help="Interactive inspection / picker")
     parser.add_argument("--verbose-overlap", action="store_true", help="Full overlap diagnostics")
+    parser.add_argument(
+        "--allow-stale-pairs",
+        action="store_true",
+        help="Allow graph/CFD same-ID node mismatches (default: fail loudly).",
+    )
     args = parser.parse_args()
 
     if args.phase is not None:
@@ -452,11 +572,17 @@ if __name__ == "__main__":
     overlap_mode = args.list_cfd_overlap
 
     if overlap_mode:
+        overlap_proc_dir = Path(args.proc_dir) if args.proc_dir is not None else _default_graph_dir_for_phase(selected_phase)
+        overlap_cfd_dir = Path(args.cfd_dir) if args.cfd_dir is not None else _default_cfd_dir_for_phase(selected_phase)
+        if selected_phase == "kinematics":
+            overlap_proc_dir = _resolve_kinematics_subdir(overlap_proc_dir, args.rheology)
+            overlap_cfd_dir = _resolve_kinematics_subdir(overlap_cfd_dir, args.rheology)
         list_indices_with_valid_comsol_results(
             phase=selected_phase,
-            proc_dir=args.proc_dir,
-            cfd_dir=args.cfd_dir,
+            proc_dir=overlap_proc_dir,
+            cfd_dir=overlap_cfd_dir,
             verbose=args.verbose_overlap,
+            fail_on_incompat=not args.allow_stale_pairs,
         )
         raise SystemExit(0)
 
@@ -475,4 +601,6 @@ if __name__ == "__main__":
         proc_dir=args.proc_dir,
         cfd_dir=args.cfd_dir,
         restrict_to_overlap=not inspect_mode,
+        rheology=args.rheology,
+        allow_stale_pairs=args.allow_stale_pairs,
     )

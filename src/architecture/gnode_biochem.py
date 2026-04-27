@@ -6,7 +6,7 @@ from torch import Tensor
 from torchdiffeq import odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig
-from src.core_physics.physics_kernels import scatter_add
+from src.utils.math_operators import wls_derivatives
 from src.utils.batching import get_batch_tensor
 
 # Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
@@ -179,19 +179,40 @@ class GNODE_Phase3(nn.Module):
         row, col = batch.edge_index
         num_nodes = batch.num_nodes
         V, W, M_inv = batch.V, batch.W, batch.M_inv
+        edge_index = torch.stack([row, col], dim=0)
 
-        u = field if field.dim() == 2 else field.unsqueeze(-1)
-        du = u[col] - u[row]
+        boundary_mask = None
+        boundary_normals = None
+        if hasattr(batch, "mask_wall") or hasattr(batch, "mask_inlet") or hasattr(batch, "mask_outlet"):
+            boundary_mask = torch.zeros(num_nodes, dtype=torch.bool, device=V.device)
+            if hasattr(batch, "mask_wall"):
+                boundary_mask |= batch.mask_wall.view(-1).to(device=V.device).bool()
+            if hasattr(batch, "mask_inlet"):
+                boundary_mask |= batch.mask_inlet.view(-1).to(device=V.device).bool()
+            if hasattr(batch, "mask_outlet"):
+                boundary_mask |= batch.mask_outlet.view(-1).to(device=V.device).bool()
 
-        w = W.view(-1, 1, 1)
-        v = V.unsqueeze(2)
-        du_unsq = du.unsqueeze(1)
-        b_e = w * torch.bmm(v, du_unsq)
+            boundary_normals = torch.zeros((num_nodes, 2), dtype=V.dtype, device=V.device)
+            if hasattr(batch, "x") and torch.is_tensor(batch.x) and batch.x.dim() == 2 and batch.x.shape[1] >= 5:
+                boundary_normals = batch.x[:, 3:5].to(device=V.device, dtype=V.dtype).clone()
+            if hasattr(batch, "outlet_normal") and batch.outlet_normal is not None and hasattr(batch, "mask_outlet"):
+                om = batch.mask_outlet.view(-1).to(device=V.device).bool()
+                on = batch.outlet_normal.to(device=V.device, dtype=V.dtype)
+                if on.dim() == 2 and on.shape[1] >= 2 and on.shape[0] == num_nodes:
+                    boundary_normals[om] = on[om, :2]
+            nrm = torch.linalg.norm(boundary_normals, dim=1, keepdim=True)
+            boundary_normals = boundary_normals / (nrm + 1e-12)
 
-        c = u.shape[1]
-        b_flat = scatter_add(b_e.view(-1, 5 * c), row, dim=0, dim_size=num_nodes)
-        b = b_flat.view(num_nodes, 5, c)
-        return torch.bmm(M_inv, b)
+        return wls_derivatives(
+            field,
+            edge_index,
+            num_nodes,
+            V,
+            W,
+            M_inv,
+            boundary_mask=boundary_mask,
+            boundary_normals=boundary_normals,
+        )
 
     def _stream_to_velocity(
         self,

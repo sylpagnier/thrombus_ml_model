@@ -36,7 +36,7 @@ import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
-from src.config import PhysicsConfig, VesselConfig
+from src.config import PhysicsConfig, PredChannels, VesselConfig
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.utils.anchor_mask import anchor_node_mask, graph_has_anchor
 from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
@@ -501,11 +501,9 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
                 f"under {VesselConfig(phase='kinematics').graph_output_dir}."
             )
 
-        phys_cfg = PhysicsConfig(phase="kinematics")
-        if phys_cfg.viscosity_model != "carreau":
-            self.skipTest("Kinematics config is not Carreau.")
-        kernels = PhysicsKernels(phys_cfg)
-        carreau_n = phys_cfg.n
+        kernels_carreau = PhysicsKernels(PhysicsConfig(phase="kinematics", rheology="carreau"))
+        kernels_newtonian = PhysicsKernels(PhysicsConfig(phase="kinematics", rheology="newtonian"))
+        carreau_n = kernels_carreau.cfg.n
         relax = _relax_shuffle()
         failures: List[str] = []
         mom_ratio_max = _env_float("KINEMATICS_T2_MOM_RATIO_MAX", 0.2)
@@ -520,6 +518,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         train_cont_scale = _env_float("KINEMATICS_T2_TRAIN_CONT_SCALE", 100.0)
         train_rheo_scale = _env_float("KINEMATICS_T2_TRAIN_RHEO_SCALE", 1.0)
         train_conflict_budget_max = _env_float("KINEMATICS_T2_TRAIN_CONFLICT_BUDGET_MAX", 0.9)
+        newtonian_mu_spread_max = _env_float("KINEMATICS_T2_NEWTONIAN_MU_SPREAD_MAX", 1.0e-3)
         abs_tail_pct = _env_float("KINEMATICS_T2_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("KINEMATICS_T2_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
@@ -536,50 +535,76 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
             data = _load_anchor_graph(path)
             assert data is not None
             stem = path.stem
+            rheology = path.parent.name.strip().lower()
             pred = _state_from_labels(data)
             seed_row = hash((stem, "row")) % (2**31)
             seed_mu = hash((stem, "mu")) % (2**31)
+            stem_key = f"{rheology}/{stem}"
 
-            t_ok = _evaluate_terms(pred, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n)
+            if rheology == "newtonian":
+                kernels = kernels_newtonian
+                sample_carreau_n = None
+                sample_train_rheo_scale = 0.0
+                mu_spread = float((pred[:, PredChannels.MU_EFF_ND].max() - pred[:, PredChannels.MU_EFF_ND].min()).item())
+                if mu_spread > newtonian_mu_spread_max:
+                    failures.append(
+                        f"{stem_key}: mu spread={mu_spread:.6g} > {newtonian_mu_spread_max:.6g} for newtonian anchor"
+                    )
+            elif rheology == "carreau":
+                kernels = kernels_carreau
+                sample_carreau_n = carreau_n
+                sample_train_rheo_scale = train_rheo_scale
+            else:
+                continue
+
+            t_ok = _evaluate_terms(
+                pred,
+                data,
+                kernels,
+                phase="kinematics",
+                distillation=False,
+                carreau_n=sample_carreau_n,
+            )
             mom_ok_values.append(t_ok["l_mom"])
             cont_ok_values.append(t_ok["l_cont"])
             wss_ok_values.append(t_ok["l_wss"])
-            rheo_ok_values.append(t_ok["l_rheo"])
             io_ok_values.append(t_ok["l_io"])
-            mom_ok_by_stem[stem] = t_ok["l_mom"]
-            wss_ok_by_stem[stem] = t_ok["l_wss"]
-            rheo_ok_by_stem[stem] = t_ok["l_rheo"]
+            mom_ok_by_stem[stem_key] = t_ok["l_mom"]
+            wss_ok_by_stem[stem_key] = t_ok["l_wss"]
+            if rheology == "carreau":
+                rheo_ok_values.append(t_ok["l_rheo"])
+                rheo_ok_by_stem[stem_key] = t_ok["l_rheo"]
 
             if t_ok["l_data_kine"] >= EPS_DATA:
-                failures.append(f"{stem}: l_data_kine={t_ok['l_data_kine']:.3e}")
+                failures.append(f"{stem_key}: l_data_kine={t_ok['l_data_kine']:.3e}")
             if t_ok["l_data_mu"] >= EPS_DATA:
-                failures.append(f"{stem}: l_data_mu={t_ok['l_data_mu']:.3e}")
+                failures.append(f"{stem_key}: l_data_mu={t_ok['l_data_mu']:.3e}")
             if _check_bc() and t_ok["l_bc"] >= EPS_BC:
-                failures.append(f"{stem}: l_bc={t_ok['l_bc']:.3e}")
+                failures.append(f"{stem_key}: l_bc={t_ok['l_bc']:.3e}")
             if t_ok["l_mom"] > mom_abs_max:
                 failures.append(
-                    f"{stem}: l_mom={t_ok['l_mom']:.6g} > abs cap {mom_abs_max:.6g}"
+                    f"{stem_key}: l_mom={t_ok['l_mom']:.6g} > abs cap {mom_abs_max:.6g}"
                 )
             if t_ok["l_cont"] > cont_abs_max:
                 failures.append(
-                    f"{stem}: l_cont={t_ok['l_cont']:.6g} > abs cap {cont_abs_max:.6g}"
+                    f"{stem_key}: l_cont={t_ok['l_cont']:.6g} > abs cap {cont_abs_max:.6g}"
                 )
-            if t_ok["l_rheo"] > rheo_abs_max:
+            if rheology == "carreau" and t_ok["l_rheo"] > rheo_abs_max:
                 failures.append(
-                    f"{stem}: l_rheo={t_ok['l_rheo']:.6g} > abs cap {rheo_abs_max:.6g}"
+                    f"{stem_key}: l_rheo={t_ok['l_rheo']:.6g} > abs cap {rheo_abs_max:.6g}"
                 )
             train_conflict_budget = (
                 t_ok["l_mom"]
                 + (train_cont_scale * t_ok["l_cont"])
-                + (train_rheo_scale * t_ok["l_rheo"])
+                + (sample_train_rheo_scale * t_ok["l_rheo"])
                 + (10.0 * t_ok["l_wss"])
             )
             conflict_budget_values.append(train_conflict_budget)
             if train_conflict_budget > train_conflict_budget_max:
                 failures.append(
-                    f"{stem}: train_conflict_budget={train_conflict_budget:.6g} > "
+                    f"{stem_key}: train_conflict_budget={train_conflict_budget:.6g} > "
                     f"{train_conflict_budget_max:.6g} "
-                    f"(mom + {train_cont_scale:g}*cont + {train_rheo_scale:g}*rheo + 10*wss)"
+                    f"(mom + {train_cont_scale:g}*cont + {sample_train_rheo_scale:g}*rheo + 10*wss)"
                 )
 
             if relax:
@@ -587,51 +612,57 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
 
             pred_bad = _permute_rows(pred, seed_row)
             t_bad = _evaluate_terms(
-                pred_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n
+                pred_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=sample_carreau_n
             )
             mom_ratio = _safe_ratio(t_ok["l_mom"], t_bad["l_mom"])
             if mom_ratio > mom_ratio_max:
                 failures.append(
-                    f"{stem}: l_mom ratio={mom_ratio:.3f} > {mom_ratio_max:.3f} "
+                    f"{stem_key}: l_mom ratio={mom_ratio:.3f} > {mom_ratio_max:.3f} "
                     f"(gt={t_ok['l_mom']:.6g}, row_shuf={t_bad['l_mom']:.6g})"
                 )
             wss_ratio = _safe_ratio(t_ok["l_wss"], t_bad["l_wss"])
             if wss_ratio > wss_ratio_max:
                 failures.append(
-                    f"{stem}: l_wss ratio={wss_ratio:.3f} > {wss_ratio_max:.3f} "
+                    f"{stem_key}: l_wss ratio={wss_ratio:.3f} > {wss_ratio_max:.3f} "
                     f"(gt={t_ok['l_wss']:.6g}, row_shuf={t_bad['l_wss']:.6g})"
                 )
 
-            pred_mu_bad = _permute_mu_column(pred, seed_mu)
-            t_mu = _evaluate_terms(
-                pred_mu_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=carreau_n
-            )
-            rheo_ratio = _safe_ratio(t_ok["l_rheo"], t_mu["l_rheo"])
-            if rheo_ratio > rheo_ratio_max:
-                failures.append(
-                    f"{stem}: l_rheo ratio={rheo_ratio:.3f} > {rheo_ratio_max:.3f} "
-                    f"(gt={t_ok['l_rheo']:.6g}, mu_shuf={t_mu['l_rheo']:.6g})"
+            if rheology == "carreau":
+                pred_mu_bad = _permute_mu_column(pred, seed_mu)
+                t_mu = _evaluate_terms(
+                    pred_mu_bad, data, kernels, phase="kinematics", distillation=False, carreau_n=sample_carreau_n
                 )
+                rheo_ratio = _safe_ratio(t_ok["l_rheo"], t_mu["l_rheo"])
+                if rheo_ratio > rheo_ratio_max:
+                    failures.append(
+                        f"{stem_key}: l_rheo ratio={rheo_ratio:.3f} > {rheo_ratio_max:.3f} "
+                        f"(gt={t_ok['l_rheo']:.6g}, mu_shuf={t_mu['l_rheo']:.6g})"
+                    )
 
         if mom_ok_values:
             mom_cap = float(np.percentile(np.asarray(mom_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
             wss_cap = float(np.percentile(np.asarray(wss_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
-            rheo_cap = float(np.percentile(np.asarray(rheo_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+            rheo_cap = (
+                float(np.percentile(np.asarray(rheo_ok_values, dtype=np.float64), abs_tail_pct)) * abs_tail_mult
+                if rheo_ok_values
+                else None
+            )
             for stem, v in mom_ok_by_stem.items():
                 if v > mom_cap:
                     failures.append(f"{stem}: l_mom={v:.6g} > tail cap {mom_cap:.6g}")
             for stem, v in wss_ok_by_stem.items():
                 if v > wss_cap:
                     failures.append(f"{stem}: l_wss={v:.6g} > tail cap {wss_cap:.6g}")
-            for stem, v in rheo_ok_by_stem.items():
-                if v > rheo_cap:
-                    failures.append(f"{stem}: l_rheo={v:.6g} > tail cap {rheo_cap:.6g}")
+            if rheo_cap is not None:
+                for stem, v in rheo_ok_by_stem.items():
+                    if v > rheo_cap:
+                        failures.append(f"{stem}: l_rheo={v:.6g} > tail cap {rheo_cap:.6g}")
         # Always print closeness diagnostics so CI and local runs show absolute agreement levels.
         if mom_ok_values:
             mom_arr = np.asarray(mom_ok_values, dtype=np.float64)
             cont_arr = np.asarray(cont_ok_values, dtype=np.float64)
             wss_arr = np.asarray(wss_ok_values, dtype=np.float64)
-            rheo_arr = np.asarray(rheo_ok_values, dtype=np.float64)
+            rheo_arr = np.asarray(rheo_ok_values, dtype=np.float64) if rheo_ok_values else np.asarray([0.0], dtype=np.float64)
             io_arr = np.asarray(io_ok_values, dtype=np.float64)
             cb_arr = np.asarray(conflict_budget_values, dtype=np.float64)
             print(

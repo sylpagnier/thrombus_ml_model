@@ -244,12 +244,34 @@ class MeshToGraphPhase3:
         tri_nodes = np.vstack(all_tris)
 
         d_bar = None
+        meta = None
         if json_path.exists():
             with open(json_path, 'r') as f:
                 meta = json.load(f)
                 d_bar = meta.get('d_bar')
         if d_bar is None or (isinstance(d_bar, (int, float)) and float(d_bar) <= 0):
             d_bar = float(np.max(np.ptp(nodes, axis=0)) + 1e-6)
+        if meta is None:
+            raise ValueError(
+                f"{stem}: missing sidecar JSON {json_path}; wall normal orientation requires centerline metadata."
+            )
+        spine_pts_nd = meta.get("centerline_pts")
+        if spine_pts_nd is None:
+            raise ValueError(
+                f"{stem}: JSON must define centerline_pts "
+                "(regenerate meshes with the current vessel_generator)."
+            )
+        spine_pts_nd = np.asarray(spine_pts_nd, dtype=np.float64)
+        if not (
+            spine_pts_nd.ndim == 2
+            and spine_pts_nd.shape[1] == 2
+            and spine_pts_nd.shape[0] > 0
+        ):
+            raise ValueError(
+                f"{stem}: invalid centerline_pts shape {getattr(spine_pts_nd, 'shape', None)}."
+            )
+        spine_pts = spine_pts_nd * float(d_bar)
+        spine_tree_wall = cKDTree(spine_pts)
 
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
         outlet_normal = self._compute_outlet_normals(mesh, nodes, mask_outlet)
@@ -292,16 +314,6 @@ class MeshToGraphPhase3:
         if len(wall_lines) > 0:
             node_normals = np.zeros((len(nodes), 2))
 
-            interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
-            interior_nodes = nodes[interior_mask]
-
-            if len(interior_nodes) > 0:
-                interior_tree = cKDTree(interior_nodes)
-            else:
-                interior_tree = None
-                # Fallback if no interior nodes exist (highly unlikely)
-                center_pt = np.mean(nodes, axis=0)
-
             for line in wall_lines:
                 idx_a, idx_b = line[0], line[1]
                 pt_a, pt_b = nodes[idx_a], nodes[idx_b]
@@ -312,19 +324,11 @@ class MeshToGraphPhase3:
                 # Orthogonal normal vector (-dy, dx)
                 n = np.array([-dy, dx])
 
-                # Ensure the normal points towards the vessel interior
+                # Ensure the normal points towards the local lumen center (nearest centerline sample).
                 midpoint = (pt_a + pt_b) / 2.0
-
-                if interior_tree is not None:
-                    # Find the strictly closest fluid node to this wall segment
-                    _, nearest_idx = interior_tree.query(midpoint)
-                    nearest_interior_pt = interior_nodes[nearest_idx]
-                    inward_vec = nearest_interior_pt - midpoint
-                else:
-                    inward_vec = center_pt - midpoint
-
-                # If the normal points away from the local inward vector, flip it
-                if np.dot(n, inward_vec) < 0:
+                _, nearest_spine_idx = spine_tree_wall.query(midpoint)
+                local_center = spine_pts[nearest_spine_idx]
+                if np.dot(n, local_center - midpoint) < 0:
                     n = -n
 
                 # Accumulate the normalized segment normal to the vertices

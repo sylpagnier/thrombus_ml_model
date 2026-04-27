@@ -51,6 +51,8 @@ class PhysicsKernels:
 
         Do not pass ``[1, N, C]`` or other ranks; edge indices address nodes along dim 0.
         """
+        boundary_mask = None
+        boundary_normals = None
         if isinstance(data_or_props, dict):
             row, col = data_or_props['row'], data_or_props['col']
             num_nodes = data_or_props['num_nodes']
@@ -59,9 +61,52 @@ class PhysicsKernels:
             row, col = data_or_props.edge_index
             num_nodes = data_or_props.num_nodes
             V, W, M_inv = data_or_props.V, data_or_props.W, data_or_props.M_inv
+            boundary_mask, boundary_normals = self._get_boundary_wls_context(data_or_props, num_nodes, V.dtype, V.device)
 
         edge_index = torch.stack([row, col], dim=0)
-        return wls_derivatives(u, edge_index, num_nodes, V, W, M_inv)
+        return wls_derivatives(
+            u,
+            edge_index,
+            num_nodes,
+            V,
+            W,
+            M_inv,
+            boundary_mask=boundary_mask,
+            boundary_normals=boundary_normals,
+        )
+
+    def _get_boundary_wls_context(self, data, num_nodes, dtype, device):
+        """Assemble boundary mask + outward normals for one-sided boundary WLS rows."""
+        mask_wall = getattr(data, "mask_wall", None)
+        mask_inlet = getattr(data, "mask_inlet", None)
+        mask_outlet = getattr(data, "mask_outlet", None)
+        if mask_wall is None and mask_inlet is None and mask_outlet is None:
+            return None, None
+
+        boundary_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        if mask_wall is not None:
+            boundary_mask |= mask_wall.view(-1).to(device=device).bool()
+        if mask_inlet is not None:
+            boundary_mask |= mask_inlet.view(-1).to(device=device).bool()
+        if mask_outlet is not None:
+            boundary_mask |= mask_outlet.view(-1).to(device=device).bool()
+        if not boundary_mask.any():
+            return None, None
+
+        normals = torch.zeros((num_nodes, 2), dtype=dtype, device=device)
+        # Feature slots [3:5] are wall-normal in this project.
+        if hasattr(data, "x") and torch.is_tensor(data.x) and data.x.dim() == 2 and data.x.shape[1] >= 5:
+            normals = data.x[:, 3:5].to(device=device, dtype=dtype).clone()
+        # Outlet face normals are geometrically computed; prefer them on outlet nodes.
+        if hasattr(data, "outlet_normal") and data.outlet_normal is not None and mask_outlet is not None:
+            outlet_mask = mask_outlet.view(-1).to(device=device).bool()
+            on = data.outlet_normal.to(device=device, dtype=dtype)
+            if on.dim() == 2 and on.shape[1] >= 2 and on.shape[0] == num_nodes:
+                normals[outlet_mask] = on[outlet_mask, :2]
+
+        nrm = torch.linalg.norm(normals, dim=1, keepdim=True)
+        normals = normals / (nrm + 1e-12)
+        return boundary_mask, normals
 
     def _compute_gradients(self, u, props):
         """Legacy wrapper to maintain compatibility with existing tests."""
@@ -225,7 +270,8 @@ class PhysicsKernels:
         du_dx, du_dy = du_ij[:, 0], du_ij[:, 1]
         dv_dx, dv_dy = du_ij[:, 2], du_ij[:, 3]
 
-        gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
+        # Raw WLS velocity gradients are dimensional when geometry is in meters.
+        gamma_dot_dim = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
 
         # --- BATCH-AWARE BROADCASTING ---
         batch_idx = get_batch_tensor(data, data.num_nodes, du_ij.device)
@@ -236,7 +282,10 @@ class PhysicsKernels:
             u_ref_b = data.u_ref[batch_idx].squeeze() if isinstance(data.u_ref, torch.Tensor) else data.u_ref
             d_bar_b = data.d_bar[batch_idx].squeeze() if isinstance(data.d_bar, torch.Tensor) else data.d_bar
 
-        # Scale the relaxation time (lambda) into the non-dimensional domain dynamically
+        # Convert shear rate to non-dimensional form: gamma_nd = gamma_dim * (d_bar / u_ref).
+        gamma_dot_nd = gamma_dot_dim * (d_bar_b / torch.clamp(u_ref_b, min=1e-8))
+
+        # Scale the relaxation time (lambda) into the non-dimensional domain dynamically.
         lambda_nd = self.cfg.lam * (u_ref_b / d_bar_b)
 
         a = self.cfg.a

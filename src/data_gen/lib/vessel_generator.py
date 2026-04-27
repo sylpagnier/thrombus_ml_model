@@ -39,7 +39,7 @@ from matplotlib.collections import PolyCollection
 from tqdm import tqdm
 
 from src.config import VesselConfig
-from src.utils.paths import get_project_root
+from src.utils.paths import get_project_root, migrate_legacy_vessel_meshes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -315,6 +315,15 @@ def _build_and_mesh(
         # 4. Generate Final Coordinates
         top_coords = pts + normals * top_dist[:, np.newaxis]
         bot_coords = pts - normals * bot_dist[:, np.newaxis]
+        # True wall tangents/normals must be computed from the final displaced wall curves.
+        top_tangents = np.gradient(top_coords, axis=0)
+        top_tangents = top_tangents / np.maximum(np.linalg.norm(top_tangents, axis=1, keepdims=True), 1e-9)
+        bot_tangents = np.gradient(bot_coords, axis=0)
+        bot_tangents = bot_tangents / np.maximum(np.linalg.norm(bot_tangents, axis=1, keepdims=True), 1e-9)
+        # Top wall order is inlet->outlet; CCW rotation gives outward normal.
+        top_normals = np.column_stack([-top_tangents[:, 1], top_tangents[:, 0]])
+        # Bottom wall uses opposite orientation for outward normal.
+        bot_normals = np.column_stack([bot_tangents[:, 1], -bot_tangents[:, 0]])
 
         # Safety Check for Self-Intersection
         for coords in (top_coords, bot_coords):
@@ -370,6 +379,13 @@ def _build_and_mesh(
             # Nondimensional centerline (same scaling as mesh graphs: nodes / d_bar) + unit tangents
             "centerline_pts": (pts / d_bar).tolist(),
             "centerline_tangents": tangents.tolist(),
+            # Nondimensional wall coordinates + true displaced-wall tangents/normals.
+            "top_wall_pts": (top_coords / d_bar).tolist(),
+            "bot_wall_pts": (bot_coords / d_bar).tolist(),
+            "top_wall_tangents": top_tangents.tolist(),
+            "bot_wall_tangents": bot_tangents.tolist(),
+            "top_wall_normals": top_normals.tolist(),
+            "bot_wall_normals": bot_normals.tolist(),
         }
         with open(out / f"vessel_{idx}.json", "w") as f:
             json.dump(meta, f, indent=4)
@@ -420,6 +436,8 @@ class VesselGenerator:
         self.project_root = get_project_root()
         self.output_dir   = Path(output_dir) if output_dir else self.project_root / self.cfg.mesh_input_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir is None:
+            migrate_legacy_vessel_meshes(self.output_dir)
 
     def _cfg_dict(self) -> Dict[str, Any]:
         return {

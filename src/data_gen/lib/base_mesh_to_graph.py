@@ -85,21 +85,36 @@ class BaseMeshToGraph(ABC):
             return []
         return line_segments
 
-    def _build_wall_orientation_context(self, nodes, mask_inlet, mask_outlet, mask_wall):
+    def _build_wall_orientation_context(self, nodes, mask_inlet, mask_outlet, mask_wall, meta=None, d_bar=None):
+        centerline_pts_nd = None
+        if isinstance(meta, dict):
+            centerline_pts_nd = meta.get("centerline_pts")
+
+        if centerline_pts_nd is not None and d_bar is not None:
+            centerline_pts_nd = np.asarray(centerline_pts_nd, dtype=np.float64)
+            if centerline_pts_nd.ndim == 2 and centerline_pts_nd.shape[1] == 2 and centerline_pts_nd.shape[0] > 0:
+                centerline_pts = centerline_pts_nd * float(d_bar)
+                return {"spine_tree": cKDTree(centerline_pts), "spine_pts": centerline_pts}
+
         interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
         center_pt = np.mean(nodes[interior_mask], axis=0) if interior_mask.any() else np.mean(nodes, axis=0)
         return {"center_pt": center_pt}
 
     def _orient_wall_normal(self, normal, midpoint, orientation_context):
-        center_pt = orientation_context["center_pt"]
-        if np.dot(normal, center_pt - midpoint) < 0:
+        spine_tree = orientation_context.get("spine_tree")
+        if spine_tree is not None:
+            _, nearest_idx = spine_tree.query(midpoint)
+            target_pt = orientation_context["spine_pts"][nearest_idx]
+        else:
+            target_pt = orientation_context["center_pt"]
+        if np.dot(normal, target_pt - midpoint) < 0:
             normal = -normal
         return normal
 
     def _compute_outlet_normals(self, mesh, nodes, mask_outlet):
         return torch.zeros((len(nodes), 2), dtype=torch.float32)
 
-    def _compute_wall_normals_and_sdf(self, mesh, nodes, mask_inlet, mask_outlet, mask_wall):
+    def _compute_wall_normals_and_sdf(self, mesh, nodes, mask_inlet, mask_outlet, mask_wall, meta=None, d_bar=None):
         wall_node_indices = np.where(mask_wall.numpy())[0]
         if len(wall_node_indices) == 0:
             return None, None
@@ -114,7 +129,9 @@ class BaseMeshToGraph(ABC):
         wall_lines = self._extract_line_segments(mesh, wall_tag)
         if wall_lines:
             node_normals = np.zeros((len(nodes), 2), dtype=np.float32)
-            orient_ctx = self._build_wall_orientation_context(nodes, mask_inlet, mask_outlet, mask_wall)
+            orient_ctx = self._build_wall_orientation_context(
+                nodes, mask_inlet, mask_outlet, mask_wall, meta=meta, d_bar=d_bar
+            )
             for line in wall_lines:
                 idx_a, idx_b = line[0], line[1]
                 pt_a, pt_b = nodes[idx_a], nodes[idx_b]
@@ -224,9 +241,11 @@ class BaseMeshToGraph(ABC):
         tri_nodes = np.vstack(all_tris)
 
         d_bar = None
+        meta = None
         if json_path.exists():
             with open(json_path, "r", encoding="utf-8") as f:
-                d_bar = json.load(f).get("d_bar")
+                meta = json.load(f)
+                d_bar = meta.get("d_bar")
         if d_bar is None or float(d_bar) <= 0.0:
             print(f"Skipping {filename}: missing/invalid d_bar in metadata.")
             return
@@ -234,7 +253,9 @@ class BaseMeshToGraph(ABC):
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
         outlet_normal = self._compute_outlet_normals(mesh, nodes, mask_outlet)
 
-        dist_raw, wall_normal_vec = self._compute_wall_normals_and_sdf(mesh, nodes, mask_inlet, mask_outlet, mask_wall)
+        dist_raw, wall_normal_vec = self._compute_wall_normals_and_sdf(
+            mesh, nodes, mask_inlet, mask_outlet, mask_wall, meta=meta, d_bar=d_bar
+        )
         if dist_raw is None:
             return
 

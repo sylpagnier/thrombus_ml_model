@@ -1,9 +1,7 @@
 """
-Kinematics anchor inspector: COMSOL `vessel_*.npz` (kinematics/kinematics).
+Kinematics anchor inspector: COMSOL `vessel_*.npz` (newtonian/carreau).
 
-**Default behavior** (no extra flags): same style as ``vessel_generator`` — if ``--phase`` is omitted, **Phase** is
-chosen interactively (``1`` or ``2``). Non-interactive scripts should pass ``--phase 1`` or ``--phase 2``. Then
-full-directory **health scan**
+**Default behavior** (no extra flags): runs on unified ``kinematics`` data. Then full-directory **health scan**
 (quality flags printed to console) and **interactive** matplotlib (random ``vessel_*.npz`` or ``--sample-idx``;
 Regenerate button / ``r`` key).
 
@@ -13,12 +11,13 @@ and **mesh-based priors (x)** in non-dimensional form; otherwise it falls back t
 Examples:
     python -m src.tools.inspect_kinematics_data
     python src/tools/inspect_kinematics_data.py
-    python -m src.tools.inspect_kinematics_data --phase 1
-    python -m src.tools.inspect_kinematics_data --phase 1 --sample-idx 10
-    python -m src.tools.inspect_kinematics_data --phase 1 --summary
-    python -m src.tools.inspect_kinematics_data --phase 1 --scan-only
-    python -m src.tools.inspect_kinematics_data --phase 1 --skip-health-scan
-    python -m src.tools.inspect_kinematics_data --phase 1 --plot-static --sample-idx 0
+    python -m src.tools.inspect_kinematics_data --phase kinematics
+    python -m src.tools.inspect_kinematics_data --phase kinematics --rheology newtonian
+    python -m src.tools.inspect_kinematics_data --phase kinematics --rheology carreau --sample-idx 10
+    python -m src.tools.inspect_kinematics_data --phase kinematics --summary
+    python -m src.tools.inspect_kinematics_data --phase kinematics --scan-only
+    python -m src.tools.inspect_kinematics_data --phase kinematics --skip-health-scan
+    python -m src.tools.inspect_kinematics_data --phase kinematics --plot-static --sample-idx 0
     python -m src.tools.inspect_kinematics_data --inspect-template-tags
 """
 
@@ -26,7 +25,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Tuple
 
 # Allow running as ``python src/tools/inspect_kinematics_data.py`` (IDE / full path): put repo root on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -50,18 +48,41 @@ def _format_n_subdir(n_value: float) -> str:
 
 
 def _resolve_kinematics_n_subdir(base_dir: Path, requested: str | None, *, kind: str) -> str:
-    """Resolve Phase-2 n-subdir. Legacy support only, defaults to root."""
+    """Resolve kinematics subdir (newtonian/carreau, legacy n_*, or auto)."""
+    legacy_aliases = {"newtonian": "newtonian", "carreau": "carreau"}
     if requested:
         raw = requested.strip()
+        low = raw.lower()
+        if low in legacy_aliases:
+            chosen = legacy_aliases[low]
+            chosen_dir = base_dir / chosen
+            if not chosen_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Requested --rheology '{requested}' not found under {base_dir} for {kind}."
+                )
+            return chosen
         chosen = raw if raw.startswith("n_") else _format_n_subdir(float(raw))
         chosen_dir = base_dir / chosen
         if not chosen_dir.is_dir():
             raise FileNotFoundError(
-                f"Requested --n-subdir '{requested}' not found under {base_dir} for {kind}."
+                f"Requested subdir '{requested}' not found under {base_dir} for {kind}."
             )
         return chosen
 
-    # Under the new unified setup, Kinematics data sits directly in the root directory.
+    # First, support flat layouts where vessel_*.npz / vessel_*.pt are in the root.
+    if list(base_dir.glob("vessel_*.*")):
+        return ""
+
+    # Current layout keeps per-rheology folders under kinematics.
+    available = []
+    for name in ("carreau", "newtonian"):
+        d = base_dir / name
+        if d.is_dir() and list(d.glob("vessel_*.*")):
+            available.append(name)
+    if available:
+        chosen = "carreau" if "carreau" in available else available[0]
+        return chosen
+
     return ""
 
 
@@ -87,11 +108,46 @@ def _extract_idx(path: Path) -> int | None:
         return None
 
 
-def _list_sample_indices(phase: str, n_subdir: str | None = None) -> list[int]:
+_GRAPH_ANCHOR_CACHE: dict[tuple[str, str | None, int], bool] = {}
+
+
+def _has_labeled_anchor_graph(phase: str, sample_idx: int, n_subdir: str | None = None) -> bool:
+    """True when ``vessel_<idx>.pt`` exists and marks ``is_anchor=True``."""
+    cache_key = (phase, n_subdir, int(sample_idx))
+    if cache_key in _GRAPH_ANCHOR_CACHE:
+        return _GRAPH_ANCHOR_CACHE[cache_key]
+
+    pt_path = _resolve_graph_pt_path(phase, int(sample_idx), n_subdir=n_subdir) / f"vessel_{sample_idx}.pt"
+    if not pt_path.exists():
+        _GRAPH_ANCHOR_CACHE[cache_key] = False
+        return False
+    try:
+        data = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except Exception:
+        _GRAPH_ANCHOR_CACHE[cache_key] = False
+        return False
+    is_anchor_attr = getattr(data, "is_anchor", None)
+    if is_anchor_attr is None:
+        _GRAPH_ANCHOR_CACHE[cache_key] = False
+        return False
+    try:
+        result = bool(np.asarray(is_anchor_attr).reshape(-1)[0])
+    except Exception:
+        result = False
+    _GRAPH_ANCHOR_CACHE[cache_key] = result
+    return result
+
+
+def _list_sample_indices(
+    phase: str,
+    n_subdir: str | None = None,
+    *,
+    require_labeled_graph: bool = False,
+) -> list[int]:
     out: list[int] = []
     for f in _iter_anchor_files(_resolve_anchor_dir(phase, n_subdir=n_subdir)):
         idx = _extract_idx(f)
-        if idx is not None:
+        if idx is not None and (not require_labeled_graph or _has_labeled_anchor_graph(phase, idx, n_subdir=n_subdir)):
             out.append(idx)
     return out
 
@@ -170,7 +226,7 @@ def summary(phase: str, n_subdir: str | None = None) -> None:
         rows.append(m)
 
     valid = [r for r in rows if r.get("ok")]
-    print(f"\n=== Phase1 anchor summary ({phase}) ===")
+    print(f"\n=== Kinematics anchor summary ({phase}) ===")
     print(f"anchor dir      : {anchor_dir}")
     print(f"files total     : {len(rows)}")
     print(f"files valid     : {len(valid)}")
@@ -237,27 +293,19 @@ def health_scan_anchors(phase: str, n_subdir: str | None = None) -> list[dict]:
     return rows
 
 
-def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
-    """Read an integer from stdin until it is one of ``allowed`` (same pattern as ``vessel_generator``)."""
-    allowed_str = "/".join(str(x) for x in allowed)
-    while True:
-        raw = input(f"{label} ({allowed_str}): ").strip()
-        try:
-            v = int(raw)
-        except ValueError:
-            print(f"  Enter an integer: {allowed_str}")
-            continue
-        if v in allowed:
-            return v
-        print(f"  Must be one of: {allowed_str}")
+def _resolve_phase_from_cli(cli_phase: str | None) -> str:
+    """Resolve CLI phase; keep legacy phase aliases for compatibility."""
+    raw = (cli_phase or "kinematics").strip().lower()
+    legacy_aliases = {"1", "2", "phase1", "phase2"}
+    if raw in legacy_aliases:
+        print("Note: legacy phase selector is deprecated; using unified 'kinematics' dataset.")
+        phase = "kinematics"
+    else:
+        phase = raw
 
+    if phase != "kinematics":
+        raise ValueError(f"Unsupported phase '{cli_phase}'. Use --phase kinematics.")
 
-def _resolve_phase_from_cli(cli_phase: int | None) -> str:
-    """Use ``--phase`` (1 or 2) when set; else prompt like ``vessel_generator`` (no isatty shortcut)."""
-    if cli_phase is not None:
-        return f"phase{cli_phase}"
-    phase_n = _prompt_int_choice("Phase", (1, 2))
-    phase = f"phase{phase_n}"
     anchor_dir = _resolve_anchor_dir(phase)
     n_npz = len(list(_iter_anchor_files(anchor_dir)))
     print("\n--- Kinematics anchor inspection ---")
@@ -278,14 +326,29 @@ def _resolve_graph_pt_path(phase: str, sample_idx: int, n_subdir: str | None = N
     return base
 
 
-def _try_load_graph_data(phase: str, sample_idx: int, n_subdir: str | None = None) -> dict | None:
-    """Load both mesh-based priors (x) and scaled training labels (y) from ``vessel_<idx>.pt``."""
+def _try_load_graph_data(
+    phase: str,
+    sample_idx: int,
+    n_subdir: str | None = None,
+    *,
+    expected_nodes: int | None = None,
+) -> dict | None:
+    """Load mesh priors/labels from ``vessel_<idx>.pt`` when graph is a labeled anchor."""
     pt_path = _resolve_graph_pt_path(phase, sample_idx, n_subdir=n_subdir) / f"vessel_{sample_idx}.pt"
     if not pt_path.exists():
         return None
     try:
         data = torch.load(pt_path, map_location="cpu", weights_only=False)
     except Exception:
+        return None
+    is_anchor_attr = getattr(data, "is_anchor", None)
+    if is_anchor_attr is None:
+        return None
+    try:
+        is_anchor = bool(np.asarray(is_anchor_attr).reshape(-1)[0])
+    except Exception:
+        return None
+    if not is_anchor:
         return None
     if (
         not hasattr(data, "x")
@@ -321,6 +384,9 @@ def _try_load_graph_data(phase: str, sample_idx: int, n_subdir: str | None = Non
 
     has_mu = y_tensor.shape[1] > PredChannels.MU_EFF_ND
     mu_label = y_tensor[:, PredChannels.MU_EFF_ND] if has_mu else None
+
+    if expected_nodes is not None and int(y_tensor.shape[0]) != int(expected_nodes):
+        return None
 
     return {
         "x": x,
@@ -381,7 +447,11 @@ def plot_sample_static(phase: str, sample_idx: int, n_subdir: str | None = None)
     file_path = anchor_dir / f"vessel_{sample_idx}.npz"
     if not file_path.exists():
         raise FileNotFoundError(f"Sample not found: {file_path}")
-    gd = _try_load_graph_data(phase, sample_idx, n_subdir=n_subdir)
+    if not _has_labeled_anchor_graph(phase, sample_idx, n_subdir=n_subdir):
+        raise FileNotFoundError(
+            f"Sample vessel_{sample_idx} is not available as a labeled anchor graph "
+            f"under {_resolve_graph_pt_path(phase, sample_idx, n_subdir=n_subdir)}."
+        )
     with np.load(file_path) as npz:
         x = np.asarray(npz["x"]).reshape(-1)
         y = np.asarray(npz["y"]).reshape(-1)
@@ -391,6 +461,7 @@ def plot_sample_static(phase: str, sample_idx: int, n_subdir: str | None = None)
         vel = np.sqrt(u**2 + v**2)
         mu = np.asarray(npz["mu"]).reshape(-1) if "mu" in npz else None
         d_bar_npz = float(np.asarray(npz["d_bar"]).reshape(-1)[0]) if "d_bar" in npz.files else None
+    gd = _try_load_graph_data(phase, sample_idx, n_subdir=n_subdir, expected_nodes=len(x))
 
     if gd is not None:
         fig, axes = plt.subplots(3, 3, figsize=(14, 12))
@@ -412,15 +483,16 @@ def plot_sample_static(phase: str, sample_idx: int, n_subdir: str | None = None)
         u_label = "|U|/u_ref (COMSOL, ND)" if u_ref else "|U| (COMSOL)"
         fig.colorbar(s0, ax=axes[0, 0], label=u_label)
         axes[0, 0].set_title("COMSOL |U|")
-        s1 = axes[0, 1].scatter(x, y, c=p, cmap="coolwarm", s=2)
-        fig.colorbar(s1, ax=axes[0, 1], label="p")
-        axes[0, 1].set_title("COMSOL pressure")
         if mu is not None:
-            s2 = axes[0, 2].scatter(x, y, c=mu, cmap="magma", s=2)
-            fig.colorbar(s2, ax=axes[0, 2], label="mu")
-            axes[0, 2].set_title("COMSOL viscosity")
+            s2 = axes[0, 1].scatter(x, y, c=mu, cmap="magma", s=2)
+            fig.colorbar(s2, ax=axes[0, 1], label="mu")
+            axes[0, 1].set_title("COMSOL viscosity")
         else:
-            axes[0, 2].axis("off")
+            axes[0, 1].axis("off")
+
+        s1 = axes[0, 2].scatter(x, y, c=p, cmap="coolwarm", s=2)
+        fig.colorbar(s1, ax=axes[0, 2], label="p")
+        axes[0, 2].set_title("COMSOL pressure")
 
         px, py = gd["x"], gd["y"]
         kw_p = {"cmap": "jet", "s": 2}
@@ -488,16 +560,35 @@ def inspect_anchor_interactive(
 ) -> None:
     """Interactive 2x2 view with optional random-resample button and ``r`` hotkey."""
     current_idx = int(sample_idx)
-    all_indices = _list_sample_indices(phase, n_subdir=n_subdir) if enable_regenerate else []
+    current_subdir = n_subdir
+    toggle_options: list[str] = []
+    if phase == "kinematics":
+        for candidate in ("newtonian", "carreau"):
+            if _list_sample_indices(phase, n_subdir=candidate, require_labeled_graph=True):
+                toggle_options.append(candidate)
 
     while True:
-        data, file_path = _load_anchor_npz(sample_idx=current_idx, phase=phase, n_subdir=n_subdir)
+        all_indices = _list_sample_indices(phase, n_subdir=current_subdir, require_labeled_graph=True)
+        if not all_indices:
+            print(
+                f"No labeled anchor samples found in {_resolve_anchor_dir(phase, n_subdir=current_subdir)} "
+                f"with matching anchor graphs."
+            )
+            return
+        if all_indices and current_idx not in all_indices:
+            current_idx = int(random.choice(all_indices))
+
+        data, file_path = _load_anchor_npz(sample_idx=current_idx, phase=phase, n_subdir=current_subdir)
         if data is None:
             return
 
         next_idx_holder: dict[str, int | None] = {"value": None}
+        next_subdir_holder: dict[str, str | None] = {"value": None}
+        active_dir_name = _resolve_anchor_dir(phase, n_subdir=current_subdir).name
 
         print(f"\nLoading: {file_path.name}")
+        if active_dir_name in ("newtonian", "carreau"):
+            print(f"Rheology: {active_dir_name}")
         try:
             keys = list(data.keys())
             print(f"Available Keys: {keys}")
@@ -515,7 +606,12 @@ def inspect_anchor_interactive(
             has_mu = "mu" in keys
             mu = data["mu"].flatten() if has_mu else None
 
-            graph_data = _try_load_graph_data(phase, current_idx, n_subdir=n_subdir)
+            graph_data = _try_load_graph_data(
+                phase,
+                current_idx,
+                n_subdir=current_subdir,
+                expected_nodes=len(x),
+            )
 
             print(f"--- Data Summary (Sample {current_idx}) ---")
             if "d_bar" in keys:
@@ -553,18 +649,18 @@ def inspect_anchor_interactive(
                 axes[0, 0].set_title(f"Target |U| (Sample {current_idx})")
                 axes[0, 0].set_aspect("equal")
 
-                sc1 = axes[0, 1].scatter(px, py, c=graph_data["p_label"], cmap="plasma", s=2)
-                fig.colorbar(sc1, ax=axes[0, 1], label="Pressure (ND Label)")
-                axes[0, 1].set_title("Target Pressure")
-                axes[0, 1].set_aspect("equal")
-
                 if graph_data["mu_label"] is not None:
-                    sc2 = axes[0, 2].scatter(px, py, c=graph_data["mu_label"], cmap="magma", s=2)
-                    fig.colorbar(sc2, ax=axes[0, 2], label=r"Viscosity $\mu$ (ND Label)")
-                    axes[0, 2].set_title("Target Viscosity")
-                    axes[0, 2].set_aspect("equal")
+                    sc2 = axes[0, 1].scatter(px, py, c=graph_data["mu_label"], cmap="magma", s=2)
+                    fig.colorbar(sc2, ax=axes[0, 1], label=r"Viscosity $\mu$ (ND Label)")
+                    axes[0, 1].set_title("Target Viscosity")
+                    axes[0, 1].set_aspect("equal")
                 else:
-                    axes[0, 2].axis("off")
+                    axes[0, 1].axis("off")
+
+                sc1 = axes[0, 2].scatter(px, py, c=graph_data["p_label"], cmap="plasma", s=2)
+                fig.colorbar(sc1, ax=axes[0, 2], label="Pressure (ND Label)")
+                axes[0, 2].set_title("Target Pressure")
+                axes[0, 2].set_aspect("equal")
 
                 # ROW 2: Network priors (x)
                 sp0 = axes[1, 0].scatter(px, py, c=vp, **u_kw)
@@ -614,7 +710,8 @@ def inspect_anchor_interactive(
                 axes[2, 2].axis("off")
             else:
                 print(
-                    f"No graph plotted (missing {_resolve_graph_pt_path(phase, current_idx, n_subdir=n_subdir) / f'vessel_{current_idx}.pt'}). "
+                    f"No compatible labeled anchor graph plotted (missing/unlabeled/node-count mismatch in "
+                    f"{_resolve_graph_pt_path(phase, current_idx, n_subdir=current_subdir) / f'vessel_{current_idx}.pt'}). "
                     "Displaying raw unscaled SI COMSOL data."
                 )
                 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -645,6 +742,10 @@ def inspect_anchor_interactive(
                 ax[3].set_title("Velocity Vector Field (press 'r' or click Regenerate)")
                 ax[3].set_aspect("equal")
 
+            figure_title = f"{phase} sample vessel_{current_idx}"
+            if active_dir_name in ("newtonian", "carreau"):
+                figure_title = f"{figure_title} [{active_dir_name}]"
+            fig.suptitle(figure_title)
             plt.tight_layout()
             if enable_regenerate and len(all_indices) > 1:
 
@@ -672,6 +773,33 @@ def inspect_anchor_interactive(
                 regen_btn.on_clicked(lambda _event: _regenerate())
                 fig.canvas.mpl_connect("key_press_event", _on_key)
 
+            if len(toggle_options) > 1 and active_dir_name in toggle_options:
+                target_subdir = toggle_options[1] if active_dir_name == toggle_options[0] else toggle_options[0]
+
+                def _toggle_rheology() -> None:
+                    target_indices = _list_sample_indices(
+                        phase,
+                        n_subdir=target_subdir,
+                        require_labeled_graph=True,
+                    )
+                    if not target_indices:
+                        print(f"No samples found in rheology '{target_subdir}'.")
+                        return
+                    next_subdir_holder["value"] = target_subdir
+                    if current_idx in target_indices:
+                        next_idx_holder["value"] = int(current_idx)
+                    else:
+                        next_idx_holder["value"] = int(random.choice(target_indices))
+                    print(
+                        f"\nSwitching rheology to {target_subdir}: "
+                        f"vessel_{next_idx_holder['value']}.npz"
+                    )
+                    plt.close(fig)
+
+                toggle_ax = fig.add_axes([0.50, 0.02, 0.22, 0.05])
+                toggle_btn = Button(toggle_ax, f"Switch to {target_subdir}")
+                toggle_btn.on_clicked(lambda _event: _toggle_rheology())
+
             plt.show()
         except Exception as e:
             print(f"Error inspecting data: {e}")
@@ -679,6 +807,8 @@ def inspect_anchor_interactive(
         finally:
             data.close()
 
+        if next_subdir_holder["value"] is not None:
+            current_subdir = next_subdir_holder["value"]
         if next_idx_holder["value"] is None:
             break
         current_idx = int(next_idx_holder["value"])
@@ -722,14 +852,25 @@ def inspect_template_tags() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect Phase1 anchor data, health scan, plots, and template tags.")
+    parser = argparse.ArgumentParser(description="Inspect kinematics anchor data, health scan, plots, and template tags.")
     parser.add_argument(
         "--phase",
-        type=int,
-        choices=(1, 2),
+        type=str,
+        default="kinematics",
+        metavar="NAME",
+        help=(
+            "Dataset phase (default: kinematics). "
+            "Legacy aliases 1/2/phase1/phase2 are accepted and mapped to kinematics."
+        ),
+    )
+    parser.add_argument(
+        "--rheology",
+        type=str,
         default=None,
-        metavar="N",
-        help="Phase-1 anchor phase: 1=kinematics, 2=kinematics. Omit for an interactive prompt (see vessel_generator).",
+        choices=("newtonian", "carreau"),
+        help=(
+            "Kinematics rheology folder to inspect. Default: auto-select (prefers carreau when both exist)."
+        ),
     )
     parser.add_argument(
         "--summary",
@@ -772,8 +913,8 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Kinematics only: choose continuation folder (e.g. 'n_0.800' or '0.8'). "
-            "Default: final n folder when present."
+            "Deprecated alias for kinematics subdir selection (legacy n_* folders). "
+            "Prefer --rheology newtonian|carreau."
         ),
     )
     args = parser.parse_args()
@@ -783,39 +924,45 @@ def main() -> None:
         return
 
     phase = _resolve_phase_from_cli(args.phase)
+    selected_subdir = args.rheology if args.rheology is not None else args.n_subdir
 
     if args.scan_only:
-        health_scan_anchors(phase, n_subdir=args.n_subdir)
+        health_scan_anchors(phase, n_subdir=selected_subdir)
         return
 
     if args.summary:
-        summary(phase, n_subdir=args.n_subdir)
+        summary(phase, n_subdir=selected_subdir)
         return
 
     if not args.skip_health_scan:
-        health_scan_anchors(phase, n_subdir=args.n_subdir)
+        health_scan_anchors(phase, n_subdir=selected_subdir)
 
     if args.plot_static:
         if args.sample_idx is None:
             raise ValueError("--plot-static requires --sample-idx")
-        plot_sample_static(phase, args.sample_idx, n_subdir=args.n_subdir)
+        plot_sample_static(phase, args.sample_idx, n_subdir=selected_subdir)
         return
 
-    data_dir = _resolve_anchor_dir(phase, n_subdir=args.n_subdir)
+    data_dir = _resolve_anchor_dir(phase, n_subdir=selected_subdir)
     if args.sample_idx is not None:
+        if not _has_labeled_anchor_graph(phase, args.sample_idx, n_subdir=selected_subdir):
+            raise FileNotFoundError(
+                f"Sample vessel_{args.sample_idx} is not available as a labeled anchor graph "
+                f"in {_resolve_graph_pt_path(phase, args.sample_idx, n_subdir=selected_subdir)}."
+            )
         sample_idx = args.sample_idx
     else:
-        files = sorted(data_dir.glob("vessel_*.npz"))
-        if not files:
-            print(f"No vessel_*.npz files found in {data_dir}")
+        indices = _list_sample_indices(phase, n_subdir=selected_subdir, require_labeled_graph=True)
+        if not indices:
+            print(f"No labeled anchor samples found in {data_dir}")
             return
-        sample_idx = int(random.choice(files).stem.split("_")[-1])
+        sample_idx = int(random.choice(indices))
         print(f"\nRandom sample selected for plotting: vessel_{sample_idx}.npz")
 
     inspect_anchor_interactive(
         sample_idx=sample_idx,
         phase=phase,
-        n_subdir=args.n_subdir,
+        n_subdir=selected_subdir,
         enable_regenerate=not args.no_regenerate,
     )
 

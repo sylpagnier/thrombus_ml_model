@@ -143,6 +143,9 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
     class _FakeAdam:
         def __init__(self, *_args, **_kwargs):
             optimizer_kinds.append("adam")
+            # Mirror real torch optimizers that expose a mutable state dict.
+            # This keeps the regression test focused on real stage/curriculum behavior.
+            self.state = {}
 
         def zero_grad(self):
             return None

@@ -1,8 +1,8 @@
 """Unified CLI for runnable scripts across the repository.
 
 Examples:
-    python -m src.bin.main train t1
-    python -m src.bin.main train t3 -- --epochs 10
+    python -m src.bin.main train kinematics
+    python -m src.bin.main train biochem -- --epochs 10
     python -m src.bin.main data kinematics
     python -m src.bin.main eval benchmark
     python -m src.bin.main inspect graph
@@ -19,6 +19,7 @@ import sys
 
 MODULE_MAP: dict[tuple[str, str], str] = {
     ("train", "kinematics"): "src.training.train_kinematics_predictor",
+    ("train", "biochem"): "src.training.train_biochem_corrector",
     # Backward-compatible aliases; all map to unified kinematics trainer.
     ("train", "t1"): "src.training.train_kinematics_predictor",
     ("train", "t2"): "src.training.train_kinematics_predictor",

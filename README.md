@@ -28,7 +28,14 @@ Artifacts: checkpoints under `outputs/stage_a/` and `outputs/stage_b/`; reports 
 ## Tests
 
 ```text
+# Full suite
 pytest src/tests/
+
+# Kinematics-only suite (skips biochem/phase-3 coverage)
+pytest src/tests/ --suite=kinematics
+
+# Biochem suite (includes all kinematics tests)
+pytest src/tests/ --suite=biochem
 ```
 
 See `PROJECT_CONTEXT.md` for which regression modules track CLI routing and graph builders.

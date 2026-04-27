@@ -7,7 +7,9 @@ import argparse
 import json
 import os
 import random
+import re
 import time
+import warnings
 from pathlib import Path
 
 import torch
@@ -24,6 +26,9 @@ from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.paths import stage_a_dir
 from src.utils.training_diary import TrainingDiary
+
+# Ignore known PyTorch scheduler deprecation noise in training logs.
+warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
 
 # -------------------------------------------------------------------------
 # Curriculum Definitions
@@ -150,7 +155,18 @@ def evaluate_mass_flow_health(model, dataset, device, max_graphs=12):
 # Forward & Loss Computation
 # -------------------------------------------------------------------------
 def compute_step_loss(
-    model, data, kernels, loss_weighter, solver, device, stage, current_n, current_mu_0
+    model,
+    data,
+    kernels,
+    loss_weighter,
+    solver,
+    device,
+    stage,
+    current_n,
+    current_mu_0,
+    weight_data_base: float,
+    weight_mu_base: float,
+    weight_wss_base: float,
 ):
     # 1. Inject dynamic physics parameters into the kernels
     # mu_viscosity_nd_scale is typically mu_inf (0.0035)
@@ -158,7 +174,13 @@ def compute_step_loss(
     kernels.mu_0_nd = current_mu_0 / mu_nd_scale
 
     # 2. Forward pass
-    out = model(data, solver=solver, anderson_beta=0.8, anderson_warmup_iters=5)
+    out = model(
+        data,
+        solver=solver,
+        anderson_beta=0.8,
+        anderson_warmup_iters=5,
+        current_n=current_n,
+    )
     pred, jac_loss = out if isinstance(out, tuple) else (out, torch.tensor(0.0, device=device))
 
     # 3. Get generic terms
@@ -188,32 +210,50 @@ def compute_step_loss(
         p_true_grad = c_p_true[:, 0:2, 0]
         node_is_anchor = anchor_node_mask(data)
         if node_is_anchor is not None and int(node_is_anchor.sum().item()) > 0:
+            # Non-dimensionalize physical gradients prior to squaring in MSE.
+            if hasattr(data, "d_bar"):
+                d_bar = data.d_bar
+                if torch.is_tensor(d_bar):
+                    d_bar_flat = d_bar.view(-1)
+                    if d_bar_flat.numel() == data.num_nodes:
+                        length_scale = d_bar_flat[node_is_anchor].view(-1, 1)
+                    else:
+                        length_scale = d_bar_flat[:1].reshape(1, 1)
+                else:
+                    length_scale = torch.tensor([[float(d_bar)]], device=device, dtype=p_pred_grad.dtype)
+            else:
+                length_scale = torch.tensor([[1e-4]], device=device, dtype=p_pred_grad.dtype)
+            p_pred_grad_nd = p_pred_grad[node_is_anchor] * length_scale
+            p_true_grad_nd = p_true_grad[node_is_anchor] * length_scale
             p_grad_loss = torch.nn.functional.mse_loss(
-                p_pred_grad[node_is_anchor],
-                p_true_grad[node_is_anchor],
+                p_pred_grad_nd,
+                p_true_grad_nd,
             )
 
     # Stage-specific loss manipulation
-    if stage == 1:
-        # Newtonian: Force mu decoder to output constant mu_inf (which non-dims to 1.0)
-        target_mu_nd = torch.full_like(pred[:, PredChannels.MU_EFF_ND], 0.0035 / mu_nd_scale)
+    if stage in (1, 2):
+        # Constant-field preconditioning: supervise mu decoder toward the curriculum viscosity target.
+        target_mu_nd = torch.full_like(pred[:, PredChannels.MU_EFF_ND], current_mu_0 / mu_nd_scale)
         l_data_mu = torch.nn.functional.mse_loss(
             pred[:, PredChannels.MU_EFF_ND], target_mu_nd
         )
-        weight_data = 500.0
-        weight_wss = 10.0
-    elif stage == 2:
-        # Ramp Phase: Labels are invalidated by changing physics. Trust the PDEs.
-        l_data_kine = l_data_kine * 0.0
-        l_wss = l_wss * 0.0
-        l_data_mu = torch.tensor(0.0, device=device)
-        weight_data = 0.0
-        weight_wss = 0.0
+        if stage == 1:
+            weight_data = weight_data_base
+            weight_mu = weight_mu_base
+            weight_wss = weight_wss_base
+        else:
+            # Stage 2 keeps PDE-only kinematics but preserves rheology supervision while ramping.
+            l_data_kine = l_data_kine * 0.0
+            l_wss = l_wss * 0.0
+            weight_data = 0.0
+            weight_mu = weight_mu_base
+            weight_wss = 0.0
     else:
         # Stage 3: Target phase. Both data (now matching physics) and PDEs.
         l_data_mu = terms.get("l_data_mu", torch.tensor(0.0, device=device))
-        weight_data = 500.0
-        weight_wss = 10.0
+        weight_data = weight_data_base
+        weight_mu = weight_mu_base
+        weight_wss = weight_wss_base
 
     # 5. Kendall Loss Weighting for PDEs
     raw_pdes = [l_mom, l_cont]
@@ -223,7 +263,7 @@ def compute_step_loss(
     loss = (
         weighted_pdes
         + (weight_data * l_data_kine)
-        + (weight_data * l_data_mu)
+        + (weight_mu * l_data_mu)
         + (5.0 * l_bc)
         + (5.0 * l_io)
         + (1.0 * p_grad_loss)
@@ -231,12 +271,32 @@ def compute_step_loss(
         + (0.1 * jac_loss)
     )
 
+    weighted_data_kine = weight_data * l_data_kine
+    weighted_data_mu = weight_mu * l_data_mu
+    weighted_bc = 5.0 * l_bc
+    weighted_io = 5.0 * l_io
+    weighted_pgrad = 1.0 * p_grad_loss
+    weighted_wss = weight_wss * l_wss
+    weighted_jac = 0.1 * jac_loss
     metrics = {
         "L_mom": l_mom.item(),
         "L_cont": l_cont.item(),
         "L_data": l_data_kine.item(),
         "L_mu": l_data_mu.item(),
+        "L_bc": l_bc.item(),
+        "L_io": l_io.item(),
+        "L_wss": l_wss.item(),
+        "L_jac": jac_loss.item(),
         "L_pgrad": p_grad_loss.item(),
+        "L_total": loss.item(),
+        "C_weighted_pde": weighted_pdes.item(),
+        "C_data_kine": weighted_data_kine.item(),
+        "C_data_mu": weighted_data_mu.item(),
+        "C_bc": weighted_bc.item(),
+        "C_io": weighted_io.item(),
+        "C_pgrad": weighted_pgrad.item(),
+        "C_wss": weighted_wss.item(),
+        "C_jac": weighted_jac.item(),
     }
     return loss, metrics
 
@@ -250,6 +310,12 @@ def train_kinematics(
     adam_epochs: int = 85,
     stage1_end_epoch: int = STAGE1_END_EPOCH,
     stage2_end_epoch: int = STAGE2_END_EPOCH,
+    resume_from: str | None = None,
+    accum_steps: int = 2,
+    weight_data: float = 500.0,
+    weight_mu: float = 10.0,
+    weight_wss: float = 10.0,
+    max_lbfgs_graphs: int = 4,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Handoff to L-BFGS in late Stage 3 by default.
@@ -288,9 +354,42 @@ def train_kinematics(
     train_data, val_data = [], []
     hard_anchor_multiplier = {}
     lbfgs_initialized = False
+    static_batches = []
     n_anchors, n_physics = 0, 0
     best_val_composite_loss = float("inf")
-    accum_steps = 8
+    accum_steps = max(1, int(accum_steps))
+    max_lbfgs_graphs = max(1, int(max_lbfgs_graphs))
+    start_epoch = 0
+
+    if resume_from:
+        print(f"🔁 Resuming training from: {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "loss_weighter_state_dict" in ckpt:
+                loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
+            if "optimizer_state_dict" in ckpt and ckpt.get("optimizer_name", "AdamW") == "AdamW":
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except (ValueError, RuntimeError):
+                    print("⚠️ Could not restore AdamW optimizer state; continuing with fresh optimizer.")
+            if "scheduler_state_dict" in ckpt:
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                except (ValueError, RuntimeError):
+                    print("⚠️ Could not restore scheduler state; continuing with fresh scheduler.")
+            start_epoch = int(ckpt.get("epoch", -1)) + 1
+            best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
+            # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
+            lbfgs_initialized = False
+            print(f"✅ Loaded full training state (next epoch: {start_epoch})")
+        else:
+            model.load_state_dict(ckpt)
+            m = re.search(r"kinematics_ckpt_(\d+)\.pth$", str(resume_from))
+            if m:
+                start_epoch = int(m.group(1))
+            print(f"✅ Loaded model-only checkpoint (next epoch: {start_epoch})")
+
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
         epochs=int(epochs),
@@ -343,7 +442,7 @@ def train_kinematics(
 
     print("🚀 Starting Unified Kinematics Training...")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         stage, current_n, current_mu_0, target_rheology = get_stage_physics(
             epoch, int(stage1_end_epoch), int(stage2_end_epoch)
         )
@@ -402,10 +501,25 @@ def train_kinematics(
             optimizer = optim.LBFGS(
                 lbfgs_params, lr=0.01, max_iter=20, history_size=30, line_search_fn="strong_wolfe"
             )
+            static_batches = []
+            for d in list(loader)[:max_lbfgs_graphs]:
+                static_batches.append(d.clone().to(device))
+            if not static_batches:
+                raise RuntimeError("L-BFGS initialization failed: no batches available to cache.")
             lbfgs_initialized = True
 
         model.train()
         total_loss = 0.0
+        component_sums = {
+            "C_weighted_pde": 0.0,
+            "C_data_kine": 0.0,
+            "C_data_mu": 0.0,
+            "C_bc": 0.0,
+            "C_io": 0.0,
+            "C_pgrad": 0.0,
+            "C_wss": 0.0,
+            "C_jac": 0.0,
+        }
 
         if not lbfgs_initialized:
             pbar = tqdm(loader, desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, μ0={current_mu_0:.4f}]")
@@ -422,31 +536,53 @@ def train_kinematics(
                     stage,
                     current_n,
                     current_mu_0,
+                    weight_data,
+                    weight_mu,
+                    weight_wss,
                 )
                 if torch.isnan(loss):
                     continue
-                loss.backward()
+                scaled_loss = loss / accum_steps
+                scaled_loss.backward()
                 accum_counter += 1
+                grad_norm = 0.0
 
                 if (idx + 1) % accum_steps == 0 or (idx + 1) == len(loader):
                     if accum_counter == 0:
                         continue
-                    if accum_counter < accum_steps:
-                        scale = accum_steps / float(accum_counter)
-                        for p in opt_params:
-                            if p.grad is not None:
-                                p.grad.mul_(scale)
-                    torch.nn.utils.clip_grad_norm_(opt_params, 1.0)
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(opt_params, 1.0))
                     optimizer.step()
                     optimizer.zero_grad()
                     accum_counter = 0
 
                 total_loss += loss.item()
-                pbar.set_postfix({"L_mom": f"{metrics['L_mom']:.3f}", "L_data": f"{metrics['L_data']:.3f}"})
+                for k in component_sums:
+                    component_sums[k] += metrics.get(k, 0.0)
+                lr_val = (
+                    optimizer.param_groups[0]["lr"]
+                    if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0
+                    else float("nan")
+                )
+                pbar.set_postfix(
+                    {
+                        "L_tot": f"{metrics['L_total']:.3f}",
+                        "L_data": f"{metrics['L_data']:.3f}",
+                        "L_mu": f"{metrics['L_mu']:.3f}",
+                        "L_mom": f"{metrics['L_mom']:.3f}",
+                        "L_cont": f"{metrics['L_cont']:.3f}",
+                        "L_bc": f"{metrics['L_bc']:.3f}",
+                        "L_io": f"{metrics['L_io']:.3f}",
+                        "L_wss": f"{metrics['L_wss']:.3f}",
+                        "L_pgrad": f"{metrics['L_pgrad']:.3f}",
+                        "L_jac": f"{metrics['L_jac']:.3f}",
+                        "|g|": f"{grad_norm:.2f}",
+                        "LR": f"{lr_val:.2e}",
+                    }
+                )
             scheduler.step()
         else:
             print(f"⏳ L-BFGS Step (Ep {epoch:02d}) [S{stage}: n={current_n:.3f}]")
-            static_batches = list(loader)[:10]  # Subset for LBFGS closure
+            # static_batches is frozen during LBFGS initialization and already on device.
 
             def closure():
                 optimizer.zero_grad()
@@ -454,7 +590,7 @@ def train_kinematics(
                 for c_data in static_batches:
                     loss, _ = compute_step_loss(
                         model,
-                        c_data.to(device),
+                        c_data,
                         kernels,
                         loss_weighter,
                         "anderson",
@@ -462,6 +598,9 @@ def train_kinematics(
                         stage,
                         current_n,
                         current_mu_0,
+                        weight_data,
+                        weight_mu,
+                        weight_wss,
                     )
                     loss.backward()
                     accumulated_loss += loss.detach() / len(static_batches)
@@ -476,6 +615,26 @@ def train_kinematics(
             ckpt_path = stage_a_dir() / f"kinematics_ckpt_{epoch + 1}.pth"
             torch.save(model.state_dict(), ckpt_path)
             torch.save(model.state_dict(), stage_a_dir() / "kinematics_ckpt_latest.pth")
+            state_path = stage_a_dir() / f"kinematics_state_{epoch + 1}.pth"
+            state_payload = {
+                "epoch": int(epoch),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": (
+                    optimizer.state_dict()
+                    if hasattr(optimizer, "state_dict")
+                    else None
+                ),
+                "scheduler_state_dict": (
+                    scheduler.state_dict()
+                    if hasattr(scheduler, "state_dict")
+                    else None
+                ),
+                "loss_weighter_state_dict": loss_weighter.state_dict(),
+                "best_val_composite_loss": float(best_val_composite_loss),
+                "optimizer_name": optimizer.__class__.__name__,
+            }
+            torch.save(state_payload, state_path)
+            torch.save(state_payload, stage_a_dir() / "kinematics_state_latest.pth")
 
         if epoch % 2 == 0 and len(val_data) > 0:
             val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
@@ -532,11 +691,29 @@ def train_kinematics(
                 best_so_far=float(best_val_composite_loss),
             )
 
-        print(f"Epoch {epoch:03d} complete | stage={stage} | loss={total_loss:.6f}")
+        num_steps = max(1, len(loader))
+        avg_epoch_loss = total_loss / num_steps
+        print(f"Epoch {epoch:03d} complete | stage={stage} | loss={avg_epoch_loss:.6f}")
+        avg_components = {k: v / num_steps for k, v in component_sums.items()}
+        component_total = sum(avg_components.values())
+        if component_total > 0.0:
+            print(
+                "   ↳ Loss breakdown (avg/step): "
+                f"PDE={avg_components['C_weighted_pde']:.3f} ({100.0 * avg_components['C_weighted_pde'] / component_total:5.1f}%), "
+                f"data_u={avg_components['C_data_kine']:.3f} ({100.0 * avg_components['C_data_kine'] / component_total:5.1f}%), "
+                f"data_mu={avg_components['C_data_mu']:.3f} ({100.0 * avg_components['C_data_mu'] / component_total:5.1f}%), "
+                f"bc={avg_components['C_bc']:.3f} ({100.0 * avg_components['C_bc'] / component_total:5.1f}%), "
+                f"io={avg_components['C_io']:.3f} ({100.0 * avg_components['C_io'] / component_total:5.1f}%), "
+                f"pgrad={avg_components['C_pgrad']:.3f} ({100.0 * avg_components['C_pgrad'] / component_total:5.1f}%), "
+                f"wss={avg_components['C_wss']:.3f} ({100.0 * avg_components['C_wss'] / component_total:5.1f}%), "
+                f"jac={avg_components['C_jac']:.3f} ({100.0 * avg_components['C_jac'] / component_total:5.1f}%)"
+            )
+        else:
+            print("   ↳ Loss breakdown skipped (non-positive total weighted contribution).")
         diary.log_epoch_end(
             epoch,
             stage=int(stage),
-            train_loss=float(total_loss),
+            train_loss=float(avg_epoch_loss),
             lr=float(
                 optimizer.param_groups[0]["lr"]
                 if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0
@@ -547,5 +724,81 @@ def train_kinematics(
 
 
 if __name__ == "__main__":
-    _ = (argparse, time, Path, quantify_performance)  # kept for API parity/future hooks
-    train_kinematics()
+    _ = (time, Path, quantify_performance)  # kept for API parity/future hooks
+    parser = argparse.ArgumentParser(description="Train kinematics predictor with optional resume UX.")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--adam-epochs", type=int, default=85)
+    parser.add_argument("--stage1-end-epoch", type=int, default=STAGE1_END_EPOCH)
+    parser.add_argument("--stage2-end-epoch", type=int, default=STAGE2_END_EPOCH)
+    parser.add_argument("--accum-steps", type=int, default=2, help="Gradient accumulation steps")
+    parser.add_argument("--weight-data", type=float, default=500.0, help="Supervised data weight")
+    parser.add_argument("--weight-mu", type=float, default=10.0, help="Viscosity supervision weight")
+    parser.add_argument("--weight-wss", type=float, default=10.0, help="Wall shear stress weight")
+    parser.add_argument(
+        "--max-lbfgs-graphs",
+        type=int,
+        default=4,
+        help="Number of cached graphs for L-BFGS closure.",
+    )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        help="Resume from checkpoint path or use 'latest' (default when flag provided without value).",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start a fresh run and disable interactive resume prompt.",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Disable interactive prompt; starts fresh unless --resume is explicitly set.",
+    )
+    args = parser.parse_args()
+
+    if args.fresh and args.resume is not None:
+        raise ValueError("Cannot use --fresh together with --resume.")
+
+    ckpt_dir = stage_a_dir()
+    latest_state = ckpt_dir / "kinematics_state_latest.pth"
+    latest_model = ckpt_dir / "kinematics_ckpt_latest.pth"
+
+    resume_from = None
+    if args.resume is not None:
+        if args.resume == "latest":
+            if latest_state.exists():
+                resume_from = str(latest_state)
+            elif latest_model.exists():
+                resume_from = str(latest_model)
+            else:
+                print("ℹ️ No latest checkpoint found; starting fresh.")
+        else:
+            resume_path = Path(args.resume)
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            resume_from = str(resume_path)
+    elif not args.fresh and not args.no_prompt:
+        latest = latest_state if latest_state.exists() else (latest_model if latest_model.exists() else None)
+        if latest is not None:
+            try:
+                choice = input(f"Found checkpoint '{latest}'. Resume? [Y/n]: ").strip().lower()
+            except EOFError:
+                choice = "n"
+            if choice in ("", "y", "yes"):
+                resume_from = str(latest)
+
+    train_kinematics(
+        epochs=int(args.epochs),
+        adam_epochs=int(args.adam_epochs),
+        stage1_end_epoch=int(args.stage1_end_epoch),
+        stage2_end_epoch=int(args.stage2_end_epoch),
+        resume_from=resume_from,
+        accum_steps=int(args.accum_steps),
+        weight_data=float(args.weight_data),
+        weight_mu=float(args.weight_mu),
+        weight_wss=float(args.weight_wss),
+        max_lbfgs_graphs=int(args.max_lbfgs_graphs),
+    )

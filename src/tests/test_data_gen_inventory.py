@@ -1,9 +1,13 @@
 """Inventory helpers for ``anchor_generator`` and ``vessel_generator`` (mesh/NPZ paths, next index)."""
 
+from src.config import PhysicsConfig
+from src.data_gen.pipeline_kinematics import _purge_anchor_npz_outputs
+from src.data_gen.lib.anchor_generator import AnchorGenerator
 from src.data_gen.lib.anchor_generator import (
     list_anchor_candidate_json_paths,
     summarize_anchor_inventory,
 )
+from src.data_gen.lib.mesh_to_graph import MeshToGraph
 from src.data_gen.lib.vessel_generator import summarize_vessel_mesh_inventory
 
 
@@ -57,3 +61,59 @@ def test_summarize_vessel_mesh_inventory_next_idx(tmp_path):
     assert inv["count"] == 1
     assert inv["max_idx"] == 10
     assert inv["next_idx"] == 11
+
+
+def test_kinematics_physicsconfig_rheology_mode_switches():
+    newt = PhysicsConfig(phase="kinematics", rheology="newtonian")
+    carr = PhysicsConfig(phase="kinematics", rheology="carreau")
+    assert newt.viscosity_model == "newtonian"
+    assert newt.n == 1.0
+    assert carr.viscosity_model == "carreau"
+    assert carr.n < 1.0
+
+
+def test_anchor_generator_infers_rheology_from_output_dir(tmp_path):
+    out_newt = tmp_path / "cfd_results_kinematics" / "newtonian"
+    out_carr = tmp_path / "cfd_results_kinematics" / "carreau"
+    mesh_dir = tmp_path / "meshes"
+    mesh_dir.mkdir(parents=True)
+    out_newt.mkdir(parents=True)
+    out_carr.mkdir(parents=True)
+    (tmp_path / "template.mph").write_text("dummy")
+
+    a_newt = AnchorGenerator(
+        phase="kinematics",
+        output_dir=out_newt,
+        mesh_dir=mesh_dir,
+        template_path=tmp_path / "template.mph",
+    )
+    a_carr = AnchorGenerator(
+        phase="kinematics",
+        output_dir=out_carr,
+        mesh_dir=mesh_dir,
+        template_path=tmp_path / "template.mph",
+    )
+    assert a_newt.phys_cfg.viscosity_model == "newtonian"
+    assert a_carr.phys_cfg.viscosity_model == "carreau"
+
+
+def test_mesh_to_graph_infers_rheology_from_subdir():
+    g_newt = MeshToGraph(phase="kinematics", n_subdir="newtonian")
+    g_carr = MeshToGraph(phase="kinematics", n_subdir="carreau")
+    assert g_newt.phys_cfg.viscosity_model == "newtonian"
+    assert g_carr.phys_cfg.viscosity_model == "carreau"
+
+
+def test_purge_anchor_npz_outputs_removes_only_vessel_npz(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "vessel_1.npz").write_bytes(b"x")
+    (out / "vessel_2.npz").write_bytes(b"x")
+    (out / "keep.txt").write_text("keep")
+
+    removed = _purge_anchor_npz_outputs(out)
+
+    assert removed == 2
+    assert not (out / "vessel_1.npz").exists()
+    assert not (out / "vessel_2.npz").exists()
+    assert (out / "keep.txt").exists()

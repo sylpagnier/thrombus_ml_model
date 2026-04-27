@@ -20,6 +20,66 @@ def data_root() -> Path:
     return get_project_root() / "data"
 
 
+def migrate_legacy_vessel_meshes(mesh_dir: Path) -> int:
+    """Move legacy ``vessel_*`` mesh sidecars into ``mesh_dir``.
+
+    Older layouts stored ``vessel_*.json/.msh/.nas`` directly under
+    ``data/raw/kinematics``. New layout stores them under
+    ``data/raw/kinematics/meshes``. This migration is idempotent:
+    existing target files are preserved and only missing files are moved.
+    Returns number of files moved.
+    """
+    mesh_dir = Path(mesh_dir)
+    parent = mesh_dir.parent
+    if mesh_dir.name != "meshes" or not parent.exists():
+        return 0
+
+    moved = 0
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    for ext in ("json", "msh", "nas"):
+        for legacy_file in parent.glob(f"vessel_*.{ext}"):
+            target = mesh_dir / legacy_file.name
+            if target.exists():
+                continue
+            legacy_file.replace(target)
+            moved += 1
+    return moved
+
+
+def migrate_legacy_final_n_subdir(regime_dir: Path, *, n_value: float, ext: str) -> int:
+    """Flatten legacy ``<regime>/n_<value>/vessel_*.{ext}`` into ``<regime>``.
+
+    This supports the regime-first layout used by current kinematics pipelines while
+    keeping one-way compatibility with older runs that wrote target artifacts to an
+    ``n_*.`` subfolder.
+    """
+    regime_dir = Path(regime_dir)
+    if not regime_dir.exists():
+        return 0
+
+    legacy = regime_dir / f"n_{float(n_value):.3f}"
+    if not legacy.exists() or not legacy.is_dir():
+        return 0
+
+    moved = 0
+    regime_dir.mkdir(parents=True, exist_ok=True)
+    for old_file in legacy.glob(f"vessel_*.{ext}"):
+        target = regime_dir / old_file.name
+        if target.exists():
+            continue
+        old_file.replace(target)
+        moved += 1
+
+    try:
+        next(legacy.iterdir())
+    except StopIteration:
+        legacy.rmdir()
+    except OSError:
+        pass
+
+    return moved
+
+
 def comsol_models_dir() -> Path:
     """Reference COMSOL projects and templates (versioned assets, not training checkpoints)."""
     return get_project_root() / "comsol_models"
@@ -55,7 +115,7 @@ def reports_inspection_dir(*parts: str) -> Path:
 
 
 def stage_a_dir() -> Path:
-    """Predictor warm-up & Newtonian / Phase-1–2 checkpoints."""
+    """Predictor warm-up and kinematics checkpoints (newtonian/carreau)."""
     p = outputs_root() / "stage_a"
     p.mkdir(parents=True, exist_ok=True)
     return p

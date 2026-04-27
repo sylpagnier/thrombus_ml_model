@@ -5,10 +5,11 @@ Velocity priors follow 2D plane Poiseuille and mass scaling; 3D pipe flow is not
 
 import os
 import sys
+import argparse
 import torch
 import json
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional
 import meshio
 from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
@@ -29,7 +30,11 @@ from src.data_gen.lib.graph_velocity_priors import (
     smooth_width_nd_on_edges,
     width_nd_to_radius_nd,
 )
-from src.utils.paths import get_project_root
+from src.utils.paths import (
+    get_project_root,
+    migrate_legacy_final_n_subdir,
+    migrate_legacy_vessel_meshes,
+)
 
 
 def _clip_wss_magnitude_quantile(
@@ -95,16 +100,30 @@ def assemble_kinematics_graph_data(
 
 
 class MeshToGraphComplete:
-    def __init__(self, phase="kinematics", n_subdir: str = None, raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(
+        self,
+        phase="kinematics",
+        n_subdir: str = None,
+        raw_dir=None,
+        label_dir=None,
+        proc_dir=None,
+        rheology: Optional[str] = None,
+    ):
         self.root = get_project_root()
         self.vessel_cfg = VesselConfig(phase=phase)
-        self.phys_cfg = PhysicsConfig(phase=phase)
+        inferred_rheology = rheology
+        if inferred_rheology is None:
+            leaf = (n_subdir or "").strip().lower()
+            if leaf in {"newtonian", "carreau"}:
+                inferred_rheology = leaf
+        self.phys_cfg = PhysicsConfig(phase=phase, rheology=inferred_rheology)
 
         # Resolve Raw Dir
         if raw_dir:
             self.raw_dir = Path(raw_dir)
         else:
             self.raw_dir = self.root / self.vessel_cfg.mesh_input_dir
+            migrate_legacy_vessel_meshes(self.raw_dir)
 
         # Resolve Label Dir
         if label_dir:
@@ -122,6 +141,10 @@ class MeshToGraphComplete:
         if n_subdir:
             self.proc_dir = self.proc_dir / n_subdir
 
+        if phase == "kinematics":
+            migrate_legacy_final_n_subdir(self.label_dir, n_value=self.phys_cfg.n, ext="npz")
+            migrate_legacy_final_n_subdir(self.proc_dir, n_value=self.phys_cfg.n, ext="pt")
+
         self.proc_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -138,6 +161,7 @@ class MeshToGraph(MeshToGraphComplete):
         raw_dir=None,
         label_dir=None,
         proc_dir=None,
+        rheology: Optional[str] = None,
     ):
         # Keep explicit path overrides for callers (benchmark/pipeline/tests) that
         # build temporary datasets outside default phase directories.
@@ -147,6 +171,7 @@ class MeshToGraph(MeshToGraphComplete):
             raw_dir=raw_dir,
             label_dir=label_dir,
             proc_dir=proc_dir,
+            rheology=rheology,
         )
 
     def _precompute_wls(self, edge_index, num_nodes, pos_tensor):
@@ -191,6 +216,32 @@ class MeshToGraph(MeshToGraphComplete):
         if d_bar is None or (isinstance(d_bar, (int, float)) and float(d_bar) <= 0):
             d_bar = float(np.max(np.ptp(nodes, axis=0)) + 1e-6)
 
+        if meta is None:
+            raise ValueError(
+                f"{stem}: missing sidecar JSON {json_path}; flow priors and wall normal orientation require centerline metadata."
+            )
+        spine_pts_nd = meta.get("centerline_pts")
+        spine_tangents = meta.get("centerline_tangents")
+        if spine_pts_nd is None or spine_tangents is None:
+            raise ValueError(
+                f"{stem}: JSON must define centerline_pts and centerline_tangents "
+                "(regenerate meshes with the current vessel_generator)."
+            )
+        spine_pts_nd = np.asarray(spine_pts_nd, dtype=np.float64)
+        spine_tangents = np.asarray(spine_tangents, dtype=np.float64)
+        if not (
+            spine_pts_nd.ndim == 2
+            and spine_pts_nd.shape[1] == 2
+            and spine_tangents.shape == spine_pts_nd.shape
+            and spine_pts_nd.shape[0] > 0
+        ):
+            raise ValueError(
+                f"{stem}: invalid centerline_pts / centerline_tangents "
+                f"(got pts {getattr(spine_pts_nd, 'shape', None)}, tangents {getattr(spine_tangents, 'shape', None)})."
+            )
+        spine_pts = spine_pts_nd * float(d_bar)
+        spine_tree_wall = cKDTree(spine_pts)
+
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
 
         # Scaling Factors
@@ -231,10 +282,6 @@ class MeshToGraph(MeshToGraphComplete):
         if len(wall_lines) > 0:
             node_normals = np.zeros((len(nodes), 2))
 
-            # Calculate vessel center to ensure normals point inward (into the fluid)
-            interior_mask = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
-            center_pt = np.mean(nodes[interior_mask], axis=0) if interior_mask.any() else np.mean(nodes, axis=0)
-
             for line in wall_lines:
                 idx_a, idx_b = line[0], line[1]
                 pt_a, pt_b = nodes[idx_a], nodes[idx_b]
@@ -245,9 +292,11 @@ class MeshToGraph(MeshToGraphComplete):
                 # Orthogonal normal vector (-dy, dx)
                 n = np.array([-dy, dx])
 
-                # Ensure the normal points towards the vessel interior
+                # Ensure the normal points towards the local lumen center (nearest centerline sample).
                 midpoint = (pt_a + pt_b) / 2.0
-                if np.dot(n, center_pt - midpoint) < 0:
+                _, nearest_spine_idx = spine_tree_wall.query(midpoint)
+                local_center = spine_pts[nearest_spine_idx]
+                if np.dot(n, local_center - midpoint) < 0:
                     n = -n
 
                 # Accumulate the normalized segment normal to the vertices
@@ -402,30 +451,7 @@ class MeshToGraph(MeshToGraphComplete):
         t_x_unoriented = -n_y
         t_y_unoriented = n_x
 
-        if meta is None:
-            raise ValueError(
-                f"{stem}: missing sidecar JSON {json_path}; flow priors require centerline metadata."
-            )
-        spine_pts = meta.get("centerline_pts")
-        spine_tangents = meta.get("centerline_tangents")
-        if spine_pts is None or spine_tangents is None:
-            raise ValueError(
-                f"{stem}: JSON must define centerline_pts and centerline_tangents "
-                "(regenerate meshes with the current vessel_generator)."
-            )
-        spine_pts = np.asarray(spine_pts, dtype=np.float64)
-        spine_tangents = np.asarray(spine_tangents, dtype=np.float64)
-        if not (
-            spine_pts.ndim == 2
-            and spine_pts.shape[1] == 2
-            and spine_tangents.shape == spine_pts.shape
-            and spine_pts.shape[0] > 0
-        ):
-            raise ValueError(
-                f"{stem}: invalid centerline_pts / centerline_tangents "
-                f"(got pts {getattr(spine_pts, 'shape', None)}, tangents {getattr(spine_tangents, 'shape', None)})."
-            )
-        spine_tree = cKDTree(spine_pts)
+        spine_tree = cKDTree(spine_pts_nd)
         _, nearest_spine_idx = spine_tree.query(pos_nd_tensor.detach().cpu().numpy())
         local_flow_vec = torch.tensor(
             spine_tangents[nearest_spine_idx], dtype=torch.float32, device=pos_nd_tensor.device
@@ -557,23 +583,29 @@ def build_mesh_converter(
     return MeshToGraph(phase=phase, **kwargs)
 
 
-def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:
-    """Read an integer from stdin until it is one of ``allowed``."""
-    allowed_str = "/".join(str(x) for x in allowed)
-    while True:
-        raw = input(f"{label} ({allowed_str}): ").strip()
-        try:
-            v = int(raw)
-        except ValueError:
-            print(f"  Enter an integer: {allowed_str}")
-            continue
-        if v in allowed:
-            return v
-        print(f"  Must be one of: {allowed_str}")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert vessel meshes into graph tensors for kinematics/biochem pipelines."
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("kinematics", "biochem"),
+        default="kinematics",
+        help="Pipeline target. Uses modern names (no numeric phase selection).",
+    )
+    parser.add_argument(
+        "--rheology",
+        choices=("newtonian", "carreau"),
+        default=None,
+        help="Kinematics-only viscosity model override (defaults to config behavior).",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    phase_n = _prompt_int_choice("Phase", (1, 2))
-    phase = f"phase{phase_n}"
-    processor = MeshToGraph(phase=phase)
+    args = _parse_args()
+    build_kwargs = {}
+    if args.phase == "kinematics" and args.rheology is not None:
+        build_kwargs["rheology"] = args.rheology
+    processor = build_mesh_converter(phase=args.phase, **build_kwargs)
     processor.run()

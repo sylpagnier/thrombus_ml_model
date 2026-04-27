@@ -12,6 +12,7 @@ import argparse
 import multiprocessing as mp
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from src.data_gen.lib.mesh_to_graph import MeshToGraph
@@ -21,6 +22,20 @@ from src.data_gen.lib.vessel_generator import (
     _prompt_int_choice as _vg_prompt_int_choice,
     _prompt_write_mode_vessel as _vg_prompt_write_mode_vessel,
 )
+
+
+def _purge_anchor_npz_outputs(target_output_dir: Path) -> int:
+    """Delete existing anchor ``vessel_*.npz`` files before a full cohort refresh."""
+    removed = 0
+    if not target_output_dir.exists():
+        return removed
+    for npz_path in target_output_dir.glob("vessel_*.npz"):
+        try:
+            npz_path.unlink()
+            removed += 1
+        except OSError as exc:
+            print(f"Warning: could not remove stale anchor file {npz_path}: {exc}")
+    return removed
 
 
 def _prompt_anchor_write_mode() -> bool:
@@ -173,8 +188,8 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
     else:
         allow_overwrite_anchor = _prompt_anchor_write_mode()
 
-    anchor_output_dir = vg.vessel_cfg.output_dir / _final_subdir_for_rheology(rheology)
-    gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
+    anchor_output_dir = vg.cfg.output_dir / _final_subdir_for_rheology(rheology)
+    gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir, rheology=rheology)
     anchor_inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
     have_npz = int(anchor_inv["existing_npz"])
     ready_add = int(anchor_inv["candidate_pool_ready"])
@@ -187,7 +202,9 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
         print("  Overwriting existing anchors.\n")
         pool = ready_all
 
-    default_anchors = min(pool, 50) if pool > 0 else 0
+    if run_vessel and overwrite is True:
+        print("  Mesh overwrite selected -> anchor overwrite is locked ON.\n")
+    default_anchors = (pool // 2) if pool > 0 else 0
     anchor_manual_max_new = _prompt_nonnegative_int(
         "How many anchors to generate? (0 = skip)", default=default_anchors
     )
@@ -247,17 +264,24 @@ def _execute_phase_interactive_plan(
             summarize_anchor_inventory,
         )
 
-        anchor_output_dir = VesselGenerator(phase="kinematics").vessel_cfg.output_dir / _final_subdir_for_rheology(
+        anchor_output_dir = VesselGenerator(phase="kinematics").cfg.output_dir / _final_subdir_for_rheology(
             rheology
         )
-        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
+        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir, rheology=rheology)
+        force_full_anchor_refresh = bool(plan.run_vessel and (plan.overwrite is True))
+        if force_full_anchor_refresh:
+            removed = _purge_anchor_npz_outputs(gen.target_output_dir())
+            print(
+                f"  Mesh overwrite detected: removed {removed} existing anchor .npz "
+                f"from {gen.target_output_dir()} before regeneration.\n"
+            )
         inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
         ready_add = int(inv["candidate_pool_ready"])
         ready_all = int(inv["candidate_pool_including_npz"])
         remaining = int(inv["pending_missing_npz"])
         total_v = int(inv["mesh_json_with_valid_nas"])
 
-        pool = ready_all if plan.allow_overwrite_anchor else ready_add
+        pool = ready_all if (plan.allow_overwrite_anchor and not force_full_anchor_refresh) else ready_add
         print("\n--- Anchor CFD inventory (at run time) ---")
         print(f"  CFD-ready pool: {pool} (add-only pool: {ready_add})\n")
 
@@ -315,7 +339,7 @@ def _execute_phase_interactive_plan(
         final_subdir = _final_subdir_for_rheology(rheology)
         target_label = final_subdir
         print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir)
+        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
         processor.run()
 
 
@@ -497,6 +521,8 @@ def _run_batch_for_phase(
     num_vessels: Optional[int] = None,
     anchor_max_new: Optional[int] = None,
 ) -> None:
+    force_full_anchor_refresh = bool(not args.skip_vessel and bool(args.overwrite))
+
     if not args.skip_vessel:
         assert num_vessels is not None
         vg = VesselGenerator(phase="kinematics")
@@ -523,20 +549,33 @@ def _run_batch_for_phase(
 
     if not args.skip_anchor:
         assert anchor_max_new is not None
-        from src.data_gen.lib.anchor_generator import AnchorGenerator
+        from src.data_gen.lib.anchor_generator import AnchorGenerator, summarize_anchor_inventory
 
-        anchor_output_dir = VesselGenerator(phase="kinematics").vessel_cfg.output_dir / _final_subdir_for_rheology(
+        anchor_output_dir = VesselGenerator(phase="kinematics").cfg.output_dir / _final_subdir_for_rheology(
             rheology
         )
-        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir)
-        print(f"--- Anchor CFD: rheology={rheology} max_new={anchor_max_new} ---\n")
+        gen = AnchorGenerator(phase="kinematics", output_dir=anchor_output_dir, rheology=rheology)
+        if force_full_anchor_refresh:
+            removed = _purge_anchor_npz_outputs(gen.target_output_dir())
+            inv = summarize_anchor_inventory(gen.mesh_dir, gen.target_output_dir())
+            forced_pool = int(inv["candidate_pool_including_npz"])
+            print(
+                f"--- Anchor CFD: rheology={rheology} FORCE full overwrite after mesh overwrite "
+                f"(removed={removed}, max_new={forced_pool}) ---\n"
+            )
+            effective_anchor_max_new = forced_pool
+            effective_allow_overwrite = True
+        else:
+            print(f"--- Anchor CFD: rheology={rheology} max_new={anchor_max_new} ---\n")
+            effective_anchor_max_new = anchor_max_new
+            effective_allow_overwrite = bool(args.anchor_overwrite)
         with gen:
             gen.run_batch(
-                max_new=anchor_max_new,
+                max_new=effective_anchor_max_new,
                 max_json_to_scan=args.anchor_max_json_scan,
                 shuffle_candidates=bool(args.anchor_shuffle),
                 shuffle_seed=args.anchor_shuffle_seed,
-                allow_overwrite=bool(args.anchor_overwrite),
+                allow_overwrite=effective_allow_overwrite,
                 continuation_steps=None,
             )
 
@@ -548,7 +587,7 @@ def _run_batch_for_phase(
         final_subdir = _final_subdir_for_rheology(rheology)
         target_label = final_subdir
         print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir)
+        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
         processor.run()
 
 
