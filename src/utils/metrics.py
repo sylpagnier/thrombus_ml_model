@@ -104,6 +104,12 @@ class DynamicLossWeighter(nn.Module):
 
         self.register_buffer("per_task_min_log_var", _bound_vec(min_log_var, -8.0))
         self.register_buffer("per_task_max_log_var", _bound_vec(max_log_var, float("inf")))
+        # Keep the Kendall regularizer interpretable: avoid overly negative log-var terms
+        # that can dominate and drive reported total loss far below zero.
+        self.register_buffer(
+            "interpretability_min_log_var",
+            torch.full((num_losses,), -4.0, dtype=torch.float32),
+        )
 
         self.min_log_var = (
             float(min_log_var)
@@ -112,9 +118,10 @@ class DynamicLossWeighter(nn.Module):
         )
 
     def clamped_log_vars(self) -> torch.Tensor:
+        effective_min = torch.maximum(self.per_task_min_log_var, self.interpretability_min_log_var)
         return torch.clamp(
             self.log_vars,
-            min=self.per_task_min_log_var,
+            min=effective_min,
             max=self.per_task_max_log_var,
         )
 
@@ -136,7 +143,7 @@ class DynamicLossWeighter(nn.Module):
             total_loss = first.sum() * 0.0
         else:
             total_loss = self.log_vars.sum() * 0.0
-        min_lv = self.per_task_min_log_var
+        min_lv = torch.maximum(self.per_task_min_log_var, self.interpretability_min_log_var)
         max_lv = self.per_task_max_log_var
         for i, loss in enumerate(losses):
             if task_active is not None:

@@ -186,8 +186,10 @@ class PhysicsKernels:
             mu_eff = pred[:, PredChannels.MU_EFF_ND]
 
             mu_for_grad = mu_eff.detach() if self.cfg.detach_mu_for_ns_gradient else mu_eff
+            # Prevent NaN if the network predicts negative viscosity.
+            mu_for_grad = torch.clamp(mu_for_grad, min=1e-6)
             # Compute viscosity gradients in log-space to reduce ringing across sharp clot interfaces.
-            log_mu = torch.log(mu_for_grad + 1e-8)
+            log_mu = torch.log(mu_for_grad)
             c_log_mu = self._compute_derivatives(log_mu.unsqueeze(1), props)
             log_mu_x, log_mu_y = c_log_mu[:, 0, 0], c_log_mu[:, 1, 0]
             mu_x = mu_for_grad * log_mu_x

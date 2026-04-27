@@ -259,13 +259,17 @@ def compute_step_loss(
     raw_pdes = [l_mom, l_cont]
     weighted_pdes = loss_weighter(raw_pdes)
 
+    # Scale up IO/BC weight severely ONLY in Stage 2 when interior data supervision is removed.
+    io_weight = 100.0 if stage == 2 else 5.0
+    bc_weight = 50.0 if stage == 2 else 5.0
+
     # 6. Final Composite Loss
     loss = (
         weighted_pdes
         + (weight_data * l_data_kine)
         + (weight_mu * l_data_mu)
-        + (5.0 * l_bc)
-        + (5.0 * l_io)
+        + (bc_weight * l_bc)
+        + (io_weight * l_io)
         + (1.0 * p_grad_loss)
         + (weight_wss * l_wss)
         + (0.1 * jac_loss)
@@ -273,8 +277,8 @@ def compute_step_loss(
 
     weighted_data_kine = weight_data * l_data_kine
     weighted_data_mu = weight_mu * l_data_mu
-    weighted_bc = 5.0 * l_bc
-    weighted_io = 5.0 * l_io
+    weighted_bc = bc_weight * l_bc
+    weighted_io = io_weight * l_io
     weighted_pgrad = 1.0 * p_grad_loss
     weighted_wss = weight_wss * l_wss
     weighted_jac = 0.1 * jac_loss
