@@ -49,11 +49,17 @@ def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_
         print(f"⚠️ No graph files found for visualization in {graph_path}")
         return
     current_idx = random.randrange(len(files))
+    use_itpc = False
     while True:
         next_idx = None
+        toggle_mode = False
         data = torch.load(files[current_idx], weights_only=False).to(validator.device)
         with torch.no_grad():
-            pred = validator.model(data, solver="anderson")
+            pred_base = validator.model(data, solver="anderson")
+        if phase == "kinematics" and use_itpc:
+            _, pred = validator._predict_with_physics_correction(data, correction_steps=20)
+        else:
+            pred = pred_base
         pred_np = pred.detach().cpu().numpy()
         pos = data.x[:, :2].detach().cpu().numpy()
 
@@ -63,9 +69,8 @@ def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_
         fields = [
             ("Velocity Magnitude", "jet", lambda arr: np.linalg.norm(arr[:, PredChannels.UV], axis=1)),
             ("Pressure", "coolwarm", lambda arr: arr[:, PredChannels.P]),
+            ("Viscosity", "viridis", lambda arr: arr[:, PredChannels.MU_EFF_ND]),
         ]
-        if phase != "kinematics":
-            fields.append(("Viscosity", "viridis", lambda arr: arr[:, PredChannels.MU_EFF_ND]))
 
         ncols = 3 if has_labels else 1
         fig, axes = plt.subplots(len(fields), ncols, figsize=(7 * ncols, 4 * len(fields)))
@@ -81,7 +86,8 @@ def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_
             vmax = max(pred_val.max(), gt_val.max()) if gt_val is not None else pred_val.max()
             if gt_val is not None:
                 _plot_field(fig, axes[row_idx, 0], pos, gt_val, f"GT {name}", cmap, vmin=vmin, vmax=vmax)
-                _plot_field(fig, axes[row_idx, 1], pos, pred_val, f"Pred {name}", cmap, vmin=vmin, vmax=vmax)
+                pred_label = "Pred ITPC" if (phase == "kinematics" and use_itpc) else "Pred Base"
+                _plot_field(fig, axes[row_idx, 1], pos, pred_val, f"{pred_label} {name}", cmap, vmin=vmin, vmax=vmax)
                 abs_err = np.abs(pred_val - gt_val)
                 _plot_field(
                     fig,
@@ -94,21 +100,34 @@ def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_
                     vmax=float(abs_err.max()) if abs_err.size else 1.0,
                 )
             else:
-                _plot_field(fig, axes[row_idx, 0], pos, pred_val, f"Pred {name}", cmap, vmin=vmin, vmax=vmax)
+                pred_label = "Pred ITPC" if (phase == "kinematics" and use_itpc) else "Pred Base"
+                _plot_field(fig, axes[row_idx, 0], pos, pred_val, f"{pred_label} {name}", cmap, vmin=vmin, vmax=vmax)
 
         fig.suptitle(
-            f"{phase.upper()} Benchmark Visualization - {level_name} ({files[current_idx].name})",
+            f"{phase.upper()} Benchmark Visualization ({'ITPC' if (phase == 'kinematics' and use_itpc) else 'Base'}) - {level_name} ({files[current_idx].name})",
             fontsize=14,
         )
         fig.tight_layout(rect=(0, 0.06, 1, 0.97))
 
-        if len(files) > 1:
-            btn_ax = fig.add_axes([0.77, 0.01, 0.2, 0.045])
-            regen_btn = Button(btn_ax, "Regenerate Vessel", color="lightgray", hovercolor="gainsboro")
+        if len(files) > 1 or phase == "kinematics":
+            btn_x = 0.57
+            if phase == "kinematics":
+                toggle_ax = fig.add_axes([btn_x, 0.01, 0.18, 0.045])
+                toggle_label = "Show Base" if use_itpc else "Show ITPC"
+                toggle_btn = Button(toggle_ax, toggle_label, color="lightgray", hovercolor="gainsboro")
 
             def _pick_next_index():
                 candidates = [i for i in range(len(files)) if i != current_idx]
                 return random.choice(candidates) if candidates else None
+
+            def _toggle_view():
+                nonlocal toggle_mode, use_itpc
+                if phase != "kinematics":
+                    return
+                use_itpc = not use_itpc
+                toggle_mode = True
+                print(f"🔁 Visualization mode: {'ITPC' if use_itpc else 'Base'}")
+                plt.close(fig)
 
             def _request_regen():
                 nonlocal next_idx
@@ -117,10 +136,25 @@ def _show_benchmark_visualization(validator, graph_dir, phase, level_idx, level_
                     print(f"🔁 Switching to vessel sample: {files[next_idx].name}")
                     plt.close(fig)
 
-            regen_btn.on_clicked(lambda _event: _request_regen())
-            fig.canvas.mpl_connect("key_press_event", lambda event: _request_regen() if event.key == "r" else None)
+            if phase == "kinematics":
+                toggle_btn.on_clicked(lambda _event: _toggle_view())
+
+            if len(files) > 1:
+                regen_ax = fig.add_axes([0.77, 0.01, 0.2, 0.045])
+                regen_btn = Button(regen_ax, "Regenerate Vessel", color="lightgray", hovercolor="gainsboro")
+                regen_btn.on_clicked(lambda _event: _request_regen())
+
+            def _on_key(event):
+                if event.key == "r" and len(files) > 1:
+                    _request_regen()
+                elif event.key == "t" and phase == "kinematics":
+                    _toggle_view()
+
+            fig.canvas.mpl_connect("key_press_event", _on_key)
 
         plt.show()
+        if toggle_mode:
+            continue
         if next_idx is None:
             break
         current_idx = next_idx
@@ -153,25 +187,31 @@ def run_pipeline_for_level(phase, level_idx, level_name, num_samples=10, visuali
 
         print(f"\n[2/4] 🌪️ Solving Navier-Stokes in COMSOL...")
         template_absolute = comsol_models_dir() / "kinematics_template.mph"
+        comsol_available = True
 
-        with AnchorGenerator(
-                phase=phase,
-                template_path=str(template_absolute),
-                mesh_dir=str(raw_mesh_dir),
-                output_dir=str(label_dir)
-        ) as a_gen:
-            if phase == "kinematics":
-                # Kinematics benchmark should default to the final continuation target.
-                target_n = KINEMATICS_FINAL_ANNEALED_N if carreau_n is None else float(carreau_n)
-                a_gen.phys_cfg.n = target_n
-                a_gen.model.parameter("n_index", str(target_n))
-                print(f"   ↳ Using Kinematics Carreau n_index = {target_n:.3f}")
-            elif carreau_n is not None and phase != "kinematics":
-                target_n = float(carreau_n)
-                a_gen.phys_cfg.n = target_n
-                a_gen.model.parameter("n_index", str(target_n))
-                print(f"   ↳ Using Carreau n_index override = {target_n:.3f}")
-            a_gen.run_batch(max_new=num_samples)
+        try:
+            with AnchorGenerator(
+                    phase=phase,
+                    template_path=str(template_absolute),
+                    mesh_dir=str(raw_mesh_dir),
+                    output_dir=str(label_dir)
+            ) as a_gen:
+                if phase == "kinematics":
+                    # Kinematics benchmark should default to the final continuation target.
+                    target_n = KINEMATICS_FINAL_ANNEALED_N if carreau_n is None else float(carreau_n)
+                    a_gen.phys_cfg.n = target_n
+                    a_gen.model.parameter("n_index", str(target_n))
+                    print(f"   ↳ Using Kinematics Carreau n_index = {target_n:.3f}")
+                elif carreau_n is not None and phase != "kinematics":
+                    target_n = float(carreau_n)
+                    a_gen.phys_cfg.n = target_n
+                    a_gen.model.parameter("n_index", str(target_n))
+                    print(f"   ↳ Using Carreau n_index override = {target_n:.3f}")
+                a_gen.run_batch(max_new=num_samples)
+        except Exception as comsol_exc:
+            comsol_available = False
+            print(f"⚠️ COMSOL step skipped: {comsol_exc}")
+            print("   ↳ Falling back to AI-only benchmark mode (no COMSOL labels).")
 
         print(f"\n[3/4] 🕸️ Converting to Graphs...")
         m_gen = MeshToGraphComplete(
@@ -183,12 +223,28 @@ def run_pipeline_for_level(phase, level_idx, level_name, num_samples=10, visuali
         m_gen.run()
 
         print(f"\n[4/4] 🧠 Running Model Inference & Metrics...")
-        ckpt_name = "kinematics_ckpt_100.pth"
-        model_path = resolve_checkpoint("a", ckpt_name)
+        ckpt_candidates = [
+            "kinematics_best.pth",
+            "kinematics_ckpt_latest.pth",
+            "kinematics_ckpt_100.pth",  # legacy fallback
+        ]
+        model_path = None
+        for ckpt_name in ckpt_candidates:
+            candidate = resolve_checkpoint("a", ckpt_name)
+            if candidate.exists():
+                model_path = candidate
+                break
 
-        if not model_path.exists():
-            print(f"❌ Model not found at {model_path} (expected under outputs/stage_a/). Skipping validation.")
+        if model_path is None:
+            expected_dir = resolve_checkpoint("a", "kinematics_best.pth").parent
+            print(
+                "❌ Model not found. Tried: "
+                + ", ".join(str(expected_dir / name) for name in ckpt_candidates)
+                + ". Skipping validation."
+            )
             return None
+
+        print(f"   ↳ Using model checkpoint: {model_path.name}")
 
         validator = ModelValidator(model_path=model_path, phase=phase)
         metrics = validator.validate_dataset(
@@ -196,6 +252,8 @@ def run_pipeline_for_level(phase, level_idx, level_name, num_samples=10, visuali
             level_name=level_name,
             save_comparison_images=False,
         )
+        if not comsol_available and metrics is not None:
+            print("ℹ️ Running in AI-only mode: supervised GT metrics (for example rel_l2 / wss_corr) are expected to be NaN.")
         if visualize:
             _show_benchmark_visualization(
                 validator=validator,

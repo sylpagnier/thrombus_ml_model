@@ -122,6 +122,22 @@ class ModelValidator:
             "base_div_res": [],
             "base_wall_slip": [],
             "base_wss_corr": [],
+            "base_pred_u_mag_mean": [],
+            "base_pred_u_mag_std": [],
+            "base_pred_u_mag_min": [],
+            "base_pred_u_mag_max": [],
+            "base_pred_p_mean": [],
+            "base_pred_p_std": [],
+            "base_pred_p_min": [],
+            "base_pred_p_max": [],
+            "base_pred_mu_mean": [],
+            "base_pred_mu_std": [],
+            "base_pred_mu_min": [],
+            "base_pred_mu_max": [],
+            "base_pred_wss_mean": [],
+            "base_pred_wss_std": [],
+            "base_pred_wss_min": [],
+            "base_pred_wss_max": [],
         }
         if use_itpc:
             metrics.update(
@@ -130,6 +146,22 @@ class ModelValidator:
                     "itpc_div_res": [],
                     "itpc_wall_slip": [],
                     "itpc_wss_corr": [],
+                    "itpc_pred_u_mag_mean": [],
+                    "itpc_pred_u_mag_std": [],
+                    "itpc_pred_u_mag_min": [],
+                    "itpc_pred_u_mag_max": [],
+                    "itpc_pred_p_mean": [],
+                    "itpc_pred_p_std": [],
+                    "itpc_pred_p_min": [],
+                    "itpc_pred_p_max": [],
+                    "itpc_pred_mu_mean": [],
+                    "itpc_pred_mu_std": [],
+                    "itpc_pred_mu_min": [],
+                    "itpc_pred_mu_max": [],
+                    "itpc_pred_wss_mean": [],
+                    "itpc_pred_wss_std": [],
+                    "itpc_pred_wss_min": [],
+                    "itpc_pred_wss_max": [],
                 }
             )
 
@@ -161,6 +193,23 @@ class ModelValidator:
                     metrics[f"{prefix}_wall_slip"].append(slip.item())
                 else:
                     metrics[f"{prefix}_wall_slip"].append(0.0)
+
+                # 1.5 Prediction distribution summaries (useful in AI-only / no-label runs).
+                vel_mag = torch.norm(pred[:, PredChannels.UV], dim=1)
+                p_pred = pred[:, PredChannels.P]
+                mu_pred = pred[:, PredChannels.MU_EFF_ND]
+                wss_pred = pred[:, PredChannels.WSS]
+
+                def _append_stats(tensor, metric_stem):
+                    metrics[f"{prefix}_{metric_stem}_mean"].append(float(tensor.mean().item()))
+                    metrics[f"{prefix}_{metric_stem}_std"].append(float(tensor.std(unbiased=False).item()))
+                    metrics[f"{prefix}_{metric_stem}_min"].append(float(tensor.min().item()))
+                    metrics[f"{prefix}_{metric_stem}_max"].append(float(tensor.max().item()))
+
+                _append_stats(vel_mag, "pred_u_mag")
+                _append_stats(p_pred, "pred_p")
+                _append_stats(mu_pred, "pred_mu")
+                _append_stats(wss_pred, "pred_wss")
 
                 # 2. Supervised Metrics
                 if has_labels:
@@ -202,10 +251,48 @@ class ModelValidator:
 
         print(df.describe().loc[['mean']].T)
         if use_itpc:
-            mean_base = df["base_rel_l2_u"].mean()
-            mean_itpc = df["itpc_rel_l2_u"].mean()
-            improvement = ((mean_base - mean_itpc) / mean_base) * 100
-            print(f"\n💡 ITPC reduced L2 Velocity Error by {improvement:.2f}%")
+            print("\n📈 ITPC vs Base aggregate improvement:")
+
+            def _safe_pct_change(base_mean, itpc_mean, lower_is_better=True):
+                denom = abs(base_mean)
+                if denom < 1e-12:
+                    return np.nan
+                signed = (base_mean - itpc_mean) if lower_is_better else (itpc_mean - base_mean)
+                return (signed / denom) * 100.0
+
+            def _report_pair(label, base_col, itpc_col, lower_is_better=True):
+                if base_col not in df.columns or itpc_col not in df.columns:
+                    return
+                valid = df[[base_col, itpc_col]].dropna()
+                if valid.empty:
+                    print(f" - {label}: n/a (no valid paired samples)")
+                    return
+
+                base_vals = valid[base_col].to_numpy()
+                itpc_vals = valid[itpc_col].to_numpy()
+                base_mean = float(np.mean(base_vals))
+                itpc_mean = float(np.mean(itpc_vals))
+                delta = itpc_mean - base_mean
+
+                if lower_is_better:
+                    improved_mask = itpc_vals < base_vals
+                else:
+                    improved_mask = itpc_vals > base_vals
+                win_rate = float(np.mean(improved_mask) * 100.0)
+                pct_change = _safe_pct_change(base_mean, itpc_mean, lower_is_better=lower_is_better)
+
+                direction = "decrease" if lower_is_better else "increase"
+                pct_str = f"{pct_change:.2f}%" if np.isfinite(pct_change) else "n/a"
+                print(
+                    f" - {label}: base={base_mean:.6g}, itpc={itpc_mean:.6g}, "
+                    f"delta={delta:+.6g}, {direction}={pct_str}, "
+                    f"sample-win-rate={win_rate:.1f}% ({len(valid)} paired)"
+                )
+
+            _report_pair("Velocity Rel L2", "base_rel_l2_u", "itpc_rel_l2_u", lower_is_better=True)
+            _report_pair("Divergence Residual", "base_div_res", "itpc_div_res", lower_is_better=True)
+            _report_pair("Wall Slip", "base_wall_slip", "itpc_wall_slip", lower_is_better=True)
+            _report_pair("WSS Correlation", "base_wss_corr", "itpc_wss_corr", lower_is_better=False)
 
         return df.mean()
 
