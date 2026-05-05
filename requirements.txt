@@ -1,18 +1,14 @@
-#         - (+).     
-#   ..
-#   ( --- //..// —       +)
-#  -   ..().  
+numpy
+scipy
+pandas
+matplotlib
+tqdm
+pytest
 
-..
-..
-..
-..,
-..
-..
--..
-..
-..
-..
-..
-..
-..
+torch
+torch-geometric
+torchdiffeq
+
+meshio
+gmsh
+mph
