@@ -24,7 +24,7 @@ from src.core_physics.physics_kernels import PhysicsKernels
 from src.utils.anchor_mask import graph_has_anchor, anchor_node_mask
 from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.metrics import DynamicLossWeighter, quantify_performance
-from src.utils.paths import stage_a_dir
+from src.utils.paths import kinematics_dir
 from src.utils.training_diary import TrainingDiary
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
@@ -35,6 +35,32 @@ warnings.filterwarnings("ignore", category=UserWarning, message="The epoch param
 # -------------------------------------------------------------------------
 STAGE1_END_EPOCH = 40
 STAGE2_END_EPOCH = 60
+
+
+def _prune_kine_training_artifacts(target_dir: Path, *, keep: int = 3) -> int:
+    """Keep only the newest numbered kinematics checkpoint/state files."""
+    if keep < 1:
+        return 0
+    target = Path(target_dir)
+    groups = {
+        "kinematics_ckpt": re.compile(r"^kinematics_ckpt_(\d+)\.pth$"),
+        "kinematics_state": re.compile(r"^kinematics_state_(\d+)\.pth$"),
+    }
+    removed = 0
+    for pattern in groups.values():
+        matches = []
+        for path in target.glob("*.pth"):
+            found = pattern.match(path.name)
+            if found:
+                matches.append((int(found.group(1)), path))
+        matches.sort(key=lambda item: item[0], reverse=True)
+        for _, old_path in matches[keep:]:
+            try:
+                old_path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def get_stage_physics(epoch: int, s1_end: int, s2_end: int):
@@ -615,11 +641,11 @@ def train_kinematics(
 
         # Simple save
         if epoch % 5 == 0 or epoch == epochs - 1:
-            os.makedirs(stage_a_dir(), exist_ok=True)
-            ckpt_path = stage_a_dir() / f"kinematics_ckpt_{epoch + 1}.pth"
+            os.makedirs(kinematics_dir(), exist_ok=True)
+            ckpt_path = kinematics_dir() / f"kinematics_ckpt_{epoch + 1}.pth"
             torch.save(model.state_dict(), ckpt_path)
-            torch.save(model.state_dict(), stage_a_dir() / "kinematics_ckpt_latest.pth")
-            state_path = stage_a_dir() / f"kinematics_state_{epoch + 1}.pth"
+            torch.save(model.state_dict(), kinematics_dir() / "kinematics_ckpt_latest.pth")
+            state_path = kinematics_dir() / f"kinematics_state_{epoch + 1}.pth"
             state_payload = {
                 "epoch": int(epoch),
                 "model_state_dict": model.state_dict(),
@@ -638,7 +664,8 @@ def train_kinematics(
                 "optimizer_name": optimizer.__class__.__name__,
             }
             torch.save(state_payload, state_path)
-            torch.save(state_payload, stage_a_dir() / "kinematics_state_latest.pth")
+            torch.save(state_payload, kinematics_dir() / "kinematics_state_latest.pth")
+            _prune_kine_training_artifacts(kinematics_dir(), keep=3)
 
         if epoch % 2 == 0 and len(val_data) > 0:
             val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
@@ -652,11 +679,11 @@ def train_kinematics(
             )
             if stage == 3 and val_comp < best_val_composite_loss:
                 best_val_composite_loss = val_comp
-                torch.save(model.state_dict(), stage_a_dir() / "kinematics_best.pth")
+                torch.save(model.state_dict(), kinematics_dir() / "kinematics_best.pth")
                 print("⭐ Saved New Best Kinematics Model")
             try:
-                os.makedirs(stage_a_dir(), exist_ok=True)
-                with open(stage_a_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:
+                os.makedirs(kinematics_dir(), exist_ok=True)
+                with open(kinematics_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:
                     f.write(
                         json.dumps(
                             {
@@ -766,7 +793,7 @@ if __name__ == "__main__":
     if args.fresh and args.resume is not None:
         raise ValueError("Cannot use --fresh together with --resume.")
 
-    ckpt_dir = stage_a_dir()
+    ckpt_dir = kinematics_dir()
     latest_state = ckpt_dir / "kinematics_state_latest.pth"
     latest_model = ckpt_dir / "kinematics_ckpt_latest.pth"
 

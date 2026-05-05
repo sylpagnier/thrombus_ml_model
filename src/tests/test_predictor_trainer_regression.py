@@ -82,6 +82,9 @@ def test_compute_step_loss_respects_curriculum_stage_logic(monkeypatch):
         stage=1,
         current_n=1.0,
         current_mu_0=0.0035,
+        weight_data_base=500.0,
+        weight_mu_base=10.0,
+        weight_wss_base=10.0,
     )
     assert m1["L_data"] > 0.0
     assert m1["L_mu"] > 0.0
@@ -97,9 +100,12 @@ def test_compute_step_loss_respects_curriculum_stage_logic(monkeypatch):
         stage=2,
         current_n=0.8,
         current_mu_0=0.02,
+        weight_data_base=500.0,
+        weight_mu_base=10.0,
+        weight_wss_base=10.0,
     )
     assert m2["L_data"] == 0.0
-    assert m2["L_mu"] == 0.0
+    assert m2["L_mu"] > 0.0
     assert abs(kernels.mu_0_nd - (0.02 / 0.0035)) < 1e-6
 
 
@@ -188,9 +194,32 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
         stage,
         current_n,
         current_mu_0,
+        weight_data_base,
+        weight_mu_base,
+        weight_wss_base,
     ):
+        _ = (weight_data_base, weight_mu_base, weight_wss_base)
         stage_calls.append((stage, current_n, current_mu_0))
-        return torch.tensor(1.0, requires_grad=True), {"L_mom": 0.0, "L_data": 0.0}
+        return torch.tensor(1.0, requires_grad=True), {
+            "L_total": 1.0,
+            "L_data": 0.0,
+            "L_mu": 0.0,
+            "L_mom": 0.0,
+            "L_cont": 0.0,
+            "L_bc": 0.0,
+            "L_io": 0.0,
+            "L_wss": 0.0,
+            "L_pgrad": 0.0,
+            "L_jac": 0.0,
+            "C_weighted_pde": 0.0,
+            "C_data_kine": 0.0,
+            "C_data_mu": 0.0,
+            "C_bc": 0.0,
+            "C_io": 0.0,
+            "C_pgrad": 0.0,
+            "C_wss": 0.0,
+            "C_jac": 0.0,
+        }
 
     monkeypatch.setattr(kin_mod, "GINO_DEQ", _FakeModel)
     monkeypatch.setattr(kin_mod, "PhysicsKernels", _FakeKernels)
@@ -224,3 +253,31 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
     assert False in freeze_states  # Stage 2 freezes Kendall weighter
     assert True in freeze_states   # Stage 1/3 unfreezes it
     assert "lbfgs" in optimizer_kinds
+
+
+def test_prune_kine_training_artifacts_keeps_only_latest_three(tmp_path):
+    out = tmp_path / "outputs" / "kinematics"
+    out.mkdir(parents=True)
+    for epoch in range(1, 6):
+        (out / f"kinematics_ckpt_{epoch}.pth").write_text("ckpt", encoding="utf-8")
+        (out / f"kinematics_state_{epoch}.pth").write_text("state", encoding="utf-8")
+    (out / "kinematics_ckpt_latest.pth").write_text("latest", encoding="utf-8")
+    (out / "kinematics_state_latest.pth").write_text("latest", encoding="utf-8")
+    (out / "kinematics_best.pth").write_text("best", encoding="utf-8")
+
+    removed = kin_mod._prune_kine_training_artifacts(out, keep=3)
+
+    assert removed == 4
+    assert sorted(p.name for p in out.glob("kinematics_ckpt_*.pth")) == [
+        "kinematics_ckpt_3.pth",
+        "kinematics_ckpt_4.pth",
+        "kinematics_ckpt_5.pth",
+        "kinematics_ckpt_latest.pth",
+    ]
+    assert sorted(p.name for p in out.glob("kinematics_state_*.pth")) == [
+        "kinematics_state_3.pth",
+        "kinematics_state_4.pth",
+        "kinematics_state_5.pth",
+        "kinematics_state_latest.pth",
+    ]
+    assert (out / "kinematics_best.pth").exists()

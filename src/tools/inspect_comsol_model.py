@@ -111,18 +111,16 @@ def _print_parameters(model) -> None:
 
 def _print_variables(model) -> None:
     print("\n=== VARIABLES (global + component) ===")
-    
+
     # 1. Global Variables
     g_root = _safe_call(lambda: model.java.variable(), None)
     g_ids = _to_list(_safe_call(lambda: g_root.tags(), [])) if g_root is not None else []
     print(f"Global variable groups: {len(g_ids)}")
     for group_id in g_ids:
-        # FIX: Use .get(group_id) instead of (group_id) for the Java API
         group = _safe_call(lambda: g_root.get(group_id), None)
         names = _to_list(_safe_call(lambda: group.varnames(), [])) if group is not None else []
-        print(f"  - {group_id}: {len(names)} vars")
-        
-        # FIX: Loop through and print the actual variable names and expressions
+        print(f"  - {group_id}: {len(names)} vars (Scope: Global)")
+
         for name in names:
             expr = _safe_call(lambda: str(group.get(name)), "<unavailable>")
             desc = _safe_call(lambda: str(group.descr(name)), "")
@@ -139,17 +137,58 @@ def _print_variables(model) -> None:
         v_ids = _to_list(_safe_call(lambda: v_root.tags(), [])) if v_root is not None else []
         print(f"Component {comp_id} variable groups: {len(v_ids)}")
         for group_id in v_ids:
-            # FIX: Use .get(group_id) here too
             group = _safe_call(lambda: v_root.get(group_id), None)
             names = _to_list(_safe_call(lambda: group.varnames(), [])) if group is not None else []
-            print(f"  - {group_id}: {len(names)} vars")
-            
-            # FIX: Loop through and print
+
+            # Extract geometric scope for component variable groups.
+            sel = _safe_call(lambda: group.selection(), None)
+            scope_str = "Global/Entire Geometry"
+            if sel is not None:
+                is_all = _safe_call(lambda: bool(sel.all()), False)
+                if not is_all:
+                    entities = _selection_entities(sel)
+                    if entities:
+                        scope_str = "Scope: " + "; ".join(entities)
+                    else:
+                        scope_str = "Scope: empty selection"
+
+            print(f"  - {group_id}: {len(names)} vars ({scope_str})")
+
             for name in names:
                 expr = _safe_call(lambda: str(group.get(name)), "<unavailable>")
                 desc = _safe_call(lambda: str(group.descr(name)), "")
                 desc_s = f" :: {desc}" if desc else ""
                 print(f"    * {name} = {expr}{desc_s}")
+
+
+def _print_named_selections(model) -> None:
+    print("\n=== NAMED/EXPLICIT SELECTIONS ===")
+    s_root = _safe_call(lambda: model.java.selection(), None)
+    s_ids = _to_list(_safe_call(lambda: s_root.tags(), [])) if s_root is not None else []
+    print(f"Count: {len(s_ids)}")
+    for sid in s_ids:
+        sel = _safe_call(lambda: s_root.get(sid), None)
+        if sel is None:
+            print(f"- {sid}: <unavailable>")
+            continue
+
+        s_type = _safe_call(lambda: str(sel.getType()), "<unknown>")
+        s_name = _safe_call(lambda: str(sel.name()), sid)
+        geom_name = _safe_call(lambda: str(sel.geom()), "")
+        geom_dim = _safe_call(lambda: str(sel.geomdim()), "")
+        entities = _selection_entities(sel)
+        is_all = _safe_call(lambda: bool(sel.all()), False)
+
+        geom_s = ""
+        if geom_name or geom_dim:
+            geom_s = f" ({geom_name}, dim={geom_dim})" if geom_name else f" (dim={geom_dim})"
+        print(f"- {sid}: {s_name} [{s_type}]{geom_s}")
+        if entities:
+            print(f"  entities -> {'; '.join(entities)}")
+        elif is_all:
+            print("  entities -> all entities in selection scope")
+        else:
+            print("  entities -> no explicit entities reported")
 
 
 def _print_functions(func_root, scope_name: str) -> None:
@@ -287,7 +326,7 @@ def _print_applied_boundary_conditions(model) -> None:
 
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
-            if phys is None:
+            if phys is None or not _safe_call(lambda: phys.isActive(), True):
                 continue
             phys_type = _safe_call(lambda: str(phys.getType()), "<unknown>")
             print(f"  Physics: {phys_id} ({phys_type})")
@@ -300,6 +339,8 @@ def _print_applied_boundary_conditions(model) -> None:
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
                 if feat is None:
+                    continue
+                if not _safe_call(lambda: feat.isActive(), True):
                     continue
                 feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 feat_name = _safe_call(lambda: str(feat.name()), feat_id)
@@ -331,7 +372,7 @@ def _print_equation_forms(model) -> None:
 
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
-            if phys is None:
+            if phys is None or not _safe_call(lambda: phys.isActive(), True):
                 continue
 
             phys_type = _safe_call(lambda: str(phys.getType()), "<unknown>")
@@ -353,6 +394,8 @@ def _print_equation_forms(model) -> None:
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
                 if feat is None:
+                    continue
+                if not _safe_call(lambda: feat.isActive(), True):
                     continue
                 feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 equation_pairs = list(_iter_equation_like_properties(feat))
@@ -450,12 +493,16 @@ def _print_model_structure(model, show_properties: bool = False) -> None:
         print(f"  Physics interfaces: {len(phys_ids)}")
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
+            if phys is not None and not _safe_call(lambda: phys.isActive(), True):
+                continue
             phys_type = _safe_call(lambda: str(phys.getType()), "<unknown>") if phys is not None else "<unknown>"
             print(f"    - {phys_id} ({phys_type})")
             feat_ids = _to_list(_safe_call(lambda: phys.feature().tags(), []))
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
                 if feat is None:
+                    continue
+                if not _safe_call(lambda: feat.isActive(), True):
                     continue
                 feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 print(f"      * {feat_id} ({feat_type})")
@@ -505,6 +552,7 @@ def inspect_model(model_path: Path, show_properties: bool = False) -> None:
         _print_materials_content(model)
         _print_parameters(model)
         _print_variables(model)
+        _print_named_selections(model)
         _print_functions(_safe_call(lambda: model.java.func(), None), "Global")
         _print_studies(model)
     finally:

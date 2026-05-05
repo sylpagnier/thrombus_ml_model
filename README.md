@@ -13,7 +13,7 @@ Mesh-agnostic graph neural surrogate for vessel hemodynamics and coupled biochem
 ## Quick start
 
 ```text
-# Stage A (unified kinematics pretraining) then Stage B (Tier 3 corrector)
+# Kinematics then Biochem (phase B)
 python -m src.bin.orchestrate all
 
 # Unified kinematics pretraining only
@@ -23,7 +23,7 @@ python -m src.training.train_kinematics_predictor
 python -m src.bin.main train kinematics
 ```
 
-Artifacts: checkpoints under `outputs/stage_a/` and `outputs/stage_b/`; reports under `outputs/reports/`; datasets under `data/` via `data_root()`.
+Artifacts: checkpoints under `outputs/kinematics/` and `outputs/biochem/`; reports under `outputs/reports/`; datasets under `data/` via `data_root()`.
 
 ## Tests
 

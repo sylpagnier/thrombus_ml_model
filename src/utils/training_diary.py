@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -96,6 +97,32 @@ def env_snapshot(*prefixes: str) -> Dict[str, str]:
     return dict(sorted(out.items()))
 
 
+def prune_training_diary_runs(base_dir: Path, *, keep: int = 5, current_run_id: str | None = None) -> int:
+    """Keep only the newest ``keep`` run folders that contain ``training_diary_main.jsonl``."""
+    base = Path(base_dir)
+    if keep < 1 or not base.exists():
+        return 0
+    candidates = []
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if current_run_id and child.name == current_run_id:
+            continue
+        diary_path = child / "training_diary_main.jsonl"
+        if diary_path.exists():
+            candidates.append(child)
+    candidates.sort(key=lambda p: p.name, reverse=True)
+    keep_old = max(0, keep - 1) if current_run_id else keep
+    removed = 0
+    for old_run in candidates[keep_old:]:
+        try:
+            shutil.rmtree(old_run)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 class TrainingDiary:
     """Writes one main JSONL diary per run under a run-specific folder."""
 
@@ -120,6 +147,7 @@ class TrainingDiary:
             self.run_dir = self.path.parent
         else:
             self.path = self.run_dir / "training_diary_main.jsonl"
+            prune_training_diary_runs(reports, keep=5, current_run_id=self.run_id)
         os.environ["KINEMATICS_TRAINING_RUN_DIR"] = str(self.run_dir)
         print(f"📝 Training diary (main JSONL): {self.path}")
         print(f"📂 Training run folder: {self.run_dir}")

@@ -114,21 +114,39 @@ def reports_inspection_dir(*parts: str) -> Path:
     return reports_subdir("inspection", *parts)
 
 
-def stage_a_dir() -> Path:
-    """Predictor warm-up and kinematics checkpoints (newtonian/carreau)."""
-    p = outputs_root() / "stage_a"
+def kinematics_dir() -> Path:
+    """Kinematics checkpoints and validation artifacts under ``outputs/kinematics``."""
+    p = outputs_root() / "kinematics"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def biochem_dir() -> Path:
+    """Biochem / phase-B checkpoints under ``outputs/biochem``."""
+    p = outputs_root() / "biochem"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def stage_a_dir() -> Path:
+    """Backward-compatible alias for ``kinematics_dir()``."""
+    return kinematics_dir()
 
 
 def stage_b_dir() -> Path:
-    """Corrector (coupled biochem + non-Newtonian) checkpoints."""
-    p = outputs_root() / "stage_b"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    """Backward-compatible alias for ``biochem_dir()``."""
+    return biochem_dir()
 
 
 def resolve_checkpoint(stage: str, filename: str) -> Path:
-    """Canonical checkpoint path: ``outputs/stage_a/<filename>`` or ``outputs/stage_b/<filename>``."""
-    base = stage_a_dir() if stage == "a" else stage_b_dir()
-    return base / filename
+    """Return the canonical checkpoint path, falling back to legacy stage dirs when reading old runs."""
+    key = str(stage).strip().lower()
+    if key in {"a", "kinematics", "t1", "t2"}:
+        canonical = kinematics_dir() / filename
+        legacy = outputs_root() / "stage_a" / filename
+    elif key in {"b", "biochem", "phase_b", "t3"}:
+        canonical = biochem_dir() / filename
+        legacy = outputs_root() / "stage_b" / filename
+    else:
+        raise ValueError(f"Unknown checkpoint stage: {stage!r}")
+    return canonical if canonical.exists() or not legacy.exists() else legacy

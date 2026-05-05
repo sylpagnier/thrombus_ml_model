@@ -65,9 +65,9 @@ There is **no** separate `src.main` package for training; use **`src.bin.orchest
 | Kinematics/2 datagen | `python -m src.data_gen.pipeline_kinematics` |
 | Biochem datagen | `python -m src.data_gen.pipeline_biochem` |
 
-Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint` returns the canonical path under those dirs).
+Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` keeps backward-compatible reads from legacy `stage_a` / `stage_b` runs).
 
-**Path helpers**: `data_root()`, `outputs_root()`, `stage_a_dir()`, `stage_b_dir()`, `reports_dir()`, `comsol_models_dir()`, `resolve_checkpoint()`.
+**Path helpers**: `data_root()`, `outputs_root()`, `kinematics_dir()`, `biochem_dir()`, `stage_a_dir()`, `stage_b_dir()`, `reports_dir()`, `comsol_models_dir()`, `resolve_checkpoint()`.
 
 ## Simulation boundary assumptions (current)
 
@@ -98,7 +98,7 @@ Checkpoints: `outputs/stage_a/` and `outputs/stage_b/` only (`resolve_checkpoint
 ## Data & artifacts (not in `src/`)
 
 - **`data/`** — Canonical tree via `data_root()`: `raw/<phase>`, `processed/cfd_results_*`, `processed/graphs_*`, and **`data/benchmark/`** for temporary benchmark pipeline outputs (cleaned up by `run_benchmark` when finished).
-- **`outputs/stage_a`**, **`outputs/stage_b`** — Preferred checkpoint roots (`stage_a_dir()`, `stage_b_dir()`).
+- **`outputs/kinematics`**, **`outputs/biochem`** — Preferred checkpoint roots (`kinematics_dir()`, `biochem_dir()`). Legacy `stage_a` / `stage_b` reads remain supported.
 - **`outputs/reports/`** — All generated reports (`reports_dir()`): CSVs, `figures/<phase>/`, `validation_<phase>/`, training diaries, biochem metrics/debug logs, kinematics experiment JSON under `experiments/`.
 - **`comsol_models/`** — Reference COMSOL projects (`comsol_models_dir()`); large binary assets.
 

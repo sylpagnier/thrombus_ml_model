@@ -157,34 +157,59 @@ def _sample_params(
 ) -> Dict[str, Any]:
     """
     Draw ALL random numbers for one vessel and return a plain picklable dict.
-    Adds high-frequency biological roughness and global tortuosity.
+    Level 2 triggers pro-thrombotic geometry (extreme expansions/stagnation zones).
     """
-    weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
-    active = {k: v for k, v in weights_map.items() if v > 0}
+    # Level-driven mode: 2 => pro-thrombotic cohort shaping.
+    pro_thrombotic = (level == 2)
+
+    if pro_thrombotic:
+        # Eliminate straight vessels; favor sharp turns and hooks
+        active = {"straight": 0.0, "arc": 0.20, "s_curve": 0.40, "hook": 0.40}
+    else:
+        weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
+        active = {k: v for k, v in weights_map.items() if v > 0}
+
     keys = list(active.keys())
     probs = np.array(list(active.values()), dtype=float)
     probs /= probs.sum()
     curve_type = str(rng.choice(keys, p=probs))
 
-    v_type = str(rng.choice(["straight", "stenosis", "aneurysm"]))
+    if pro_thrombotic:
+        # Guarantee a pathology. Aneurysms (stagnation) and Stenosis (downstream deceleration)
+        v_type = str(rng.choice(["stenosis", "aneurysm"], p=[0.3, 0.7]))
+    else:
+        v_type = str(rng.choice(["straight", "stenosis", "aneurysm"]))
+
     width = float(rng.uniform(cfg.width_min, cfg.width_max))
     n = cfg.num_ctrl_pts
     L = cfg.base_length
     t = np.linspace(0, 1, n)
 
-    # 1. Main Clinical Pathology (Gaussian Aneurysm/Stenosis)
+    # 1. Main Clinical Pathology
     offsets = np.zeros(n)
     if v_type != "straight":
         if v_type in ("stenosis", "occlusion"):
-            mag = -float(rng.uniform(cfg.stenosis_factor_min * width, cfg.stenosis_factor_max * width))
+            mult = 1.2 if pro_thrombotic else 1.0  # Tighter stenosis
+            mag = -float(
+                rng.uniform(
+                    cfg.stenosis_factor_min * width,
+                    min(0.9, cfg.stenosis_factor_max * mult) * width,
+                )
+            )
         else:
-            mag = float(rng.uniform(cfg.aneurysm_factor_min * width, cfg.aneurysm_factor_max * width))
+            mult = 1.5 if pro_thrombotic else 1.0  # Deeper aneurysms
+            mag = float(rng.uniform(cfg.aneurysm_factor_min * width, cfg.aneurysm_factor_max * mult * width))
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
         peak = int(rng.integers(min_idx, max_idx))
-        std_dev = float(rng.uniform(0.04 * n, 0.10 * n))
-        x_idx = np.arange(n)
 
+        if pro_thrombotic:
+            # Sharper geometric transition to trigger sr_grad_flow < -750 (sgt)
+            std_dev = float(rng.uniform(0.02 * n, 0.05 * n))
+        else:
+            std_dev = float(rng.uniform(0.04 * n, 0.10 * n))
+
+        x_idx = np.arange(n)
         gauss = np.exp(-0.5 * ((x_idx - peak) / std_dev) ** 2)
         skew_factor = float(rng.uniform(-0.3, 0.3))
         skew = 1.0 + skew_factor * ((x_idx - peak) / n)
@@ -192,33 +217,39 @@ def _sample_params(
 
     path_loc = int(rng.choice([0, 1, 2])) if v_type != "straight" else 2
 
-    # 2. Universal Centerline Tortuosity (Organic Meander)
-    # Lowered frequencies: Prevents B-spline loops between control points
+    # 2. Universal Centerline Tortuosity
     f1, f2 = rng.uniform(0.5, 1.5), rng.uniform(1.5, 2.5)
     meander = np.sin(2 * np.pi * f1 * t + rng.uniform(0, 2 * np.pi)) + \
               0.5 * np.sin(2 * np.pi * f2 * t + rng.uniform(0, 2 * np.pi))
-    max_meander = 0.10 * width  # Reduced to 10% of width to prevent acute angles
+
+    # Higher tortuosity triggers separation on inner radii
+    max_meander = (0.15 if pro_thrombotic else 0.10) * width
     meander = (meander / max(1e-9, float(np.max(np.abs(meander))))) * max_meander
-    meander *= np.sin(np.pi * t)  # Taper exactly to 0 at inlet/outlet
+    meander *= np.sin(np.pi * t)
     tortuosity = meander[2:n - 2].tolist()
 
-    # 3. Independent Wall Roughness (Plaque/Irregularity)
+    # 3. Independent Wall Roughness
     def get_wall_noise():
-        # Lowered frequencies so the 50-point spline can smoothly resolve the waves
-        f_h1, f_h2 = rng.uniform(1.0, 2.5), rng.uniform(2.5, 4.0)
+        if pro_thrombotic:
+            # Higher frequency and amplitude to create local micro-cavities (sr < 25)
+            f_h1, f_h2 = rng.uniform(2.0, 4.0), rng.uniform(4.0, 6.0)
+            max_noise = 0.08 * width
+        else:
+            f_h1, f_h2 = rng.uniform(1.0, 2.5), rng.uniform(2.5, 4.0)
+            max_noise = 0.05 * width
+
         noise = np.sin(2 * np.pi * f_h1 * t + rng.uniform(0, 2 * np.pi)) + \
                 0.5 * np.sin(2 * np.pi * f_h2 * t + rng.uniform(0, 2 * np.pi))
-        max_noise = 0.05 * width  # Reduced to 5% of width to prevent pinching
         noise = (noise / max(1e-9, float(np.max(np.abs(noise))))) * max_noise
-        noise *= np.sin(np.pi * t) ** 0.5  # Taper smoothly to ends
+        noise *= np.sin(np.pi * t) ** 0.5
         return noise.tolist()
 
     noise_top = get_wall_noise()
     noise_bot = get_wall_noise()
 
-    # 4. Safely Bound Parameters to prevent self-intersection
+    # 4. Safely Bound Parameters (Unchanged)
     max_half_width = (width / 2.0) + max(0, float(np.max(offsets))) + (0.08 * width)
-    min_safe_radius = 1.6 * max_half_width  # Increased margin for high-frequency noise
+    min_safe_radius = 1.6 * max_half_width
     max_safe_angle_span = L / min_safe_radius
 
     if curve_type == "straight":
@@ -227,7 +258,6 @@ def _sample_params(
         if curve_type == "arc":
             target_angle = float(rng.uniform(np.deg2rad(45), np.deg2rad(100)))
         else:
-            # Cap hook angle at 125 degrees to prevent the outlet from curling back past L/3
             target_angle = float(rng.uniform(np.deg2rad(100), np.deg2rad(125)))
 
         angle_span = min(target_angle, max_safe_angle_span)
@@ -244,7 +274,7 @@ def _sample_params(
         "width": width,
         "angle_span": angle_span,
         "amplitude": amplitude,
-        "jitter": [],  # Deprecated, handled by tortuosity now
+        "jitter": [],
         "tortuosity": tortuosity,
         "noise_top": noise_top,
         "noise_bot": noise_bot,
@@ -325,6 +355,17 @@ def _build_and_mesh(
         # Bottom wall uses opposite orientation for outward normal.
         bot_normals = np.column_stack([bot_tangents[:, 1], -bot_tangents[:, 0]])
 
+        unit = cfg_dict.get("unit", "m")
+        unit_scale = 100.0 if unit == "cm" else 1.0
+
+        if unit_scale != 1.0:
+            top_coords *= unit_scale
+            bot_coords *= unit_scale
+            pts *= unit_scale
+            d_bar *= unit_scale
+            L *= unit_scale
+            lc *= unit_scale
+
         # Safety Check for Self-Intersection
         for coords in (top_coords, bot_coords):
             step_vectors = np.diff(coords, axis=0)
@@ -374,7 +415,9 @@ def _build_and_mesh(
             "type": f"{v_type}_{curve_type}",
             "curve": curve_type,
             "level": params["level"],
+            "unit": unit,
             "d_bar": d_bar,
+            "d_inlet": float(np.linalg.norm(top_coords[0] - bot_coords[0])),
             "num_outlets": 1,
             # Nondimensional centerline (same scaling as mesh graphs: nodes / d_bar) + unit tangents
             "centerline_pts": (pts / d_bar).tolist(),
@@ -410,6 +453,10 @@ def _worker_run_chunk(
     then finalise.  Gmsh init/finalize is the heaviest fixed cost, so
     processing multiple samples per worker amortises it.
     """
+    unit = cfg_dict.get("unit", "m")
+    unit_scale = 100.0 if unit == "cm" else 1.0
+    mesh_lc = cfg_dict["mesh_lc"] * unit_scale
+
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal",          0)
     gmsh.option.setNumber("Mesh.Algorithm",            6)   # Frontal-Delaunay
@@ -419,8 +466,8 @@ def _worker_run_chunk(
     gmsh.option.setNumber("Mesh.SaveGroupsOfNodes",    1)
     gmsh.option.setNumber("Mesh.SaveAll",              0)
     gmsh.option.setNumber("Mesh.MeshSizeFactor",       cfg_dict["mesh_size_factor"])
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", cfg_dict["mesh_lc"])
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", cfg_dict["mesh_lc"])
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_lc)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_lc)
 
     results = [_build_and_mesh(p, cfg_dict, output_dir) for p in chunk]
 
@@ -471,6 +518,7 @@ class VesselGenerator:
 
         for ax, idx in zip(axes, indices):
             path = self.output_dir / f"vessel_{idx}.msh"
+            meta_path = self.output_dir / f"vessel_{idx}.json"
             if not path.exists():
                 ax.set_visible(False)
                 continue
@@ -487,7 +535,21 @@ class VesselGenerator:
                 ax.add_collection(poly)
                 ax.autoscale_view()
                 ax.set_aspect("equal")
-                ax.set_title(f"vessel_{idx}", fontsize=8)
+                title = f"vessel_{idx}"
+                if meta_path.exists():
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        if "d_inlet" in meta:
+                            inlet_diameter = float(meta["d_inlet"])
+                            if str(meta.get("unit", "m")).lower() == "m":
+                                inlet_diameter_cm = inlet_diameter * 100.0
+                            else:
+                                inlet_diameter_cm = inlet_diameter
+                            title = f"{title} | d_inlet={inlet_diameter_cm:.2f} cm"
+                    except Exception:
+                        pass
+                ax.set_title(title, fontsize=8)
             except Exception:
                 ax.set_title(f"vessel_{idx} ERROR", fontsize=8)
 
@@ -510,6 +572,7 @@ class VesselGenerator:
         chunk_size: Optional[int] = None,
         seed: Optional[int] = None,
         start_idx: Optional[int] = None,
+        unit: str = "m",
     ) -> None:
         """
         Parallel batch vessel generation.
@@ -540,6 +603,7 @@ class VesselGenerator:
         )
 
         cfg_d   = self._cfg_dict()
+        cfg_d["unit"] = unit
         out_str = str(self.output_dir)
         rng     = np.random.default_rng(seed)
 
@@ -679,6 +743,7 @@ class VesselGeneratorPhase3(VesselGenerator):
         chunk_size: Optional[int] = None,
         seed: Optional[int] = None,
         start_idx: Optional[int] = None,
+        unit: str = "m",
     ) -> None:
         if start_idx is None:
             start_idx = 0
@@ -690,6 +755,7 @@ class VesselGeneratorPhase3(VesselGenerator):
             chunk_size=chunk_size,
             seed=seed,
             start_idx=start_idx,
+            unit=unit,
         )
 
 
@@ -749,10 +815,36 @@ def _prompt_yes_no(label: str, default: bool = False) -> bool:
         print("  Enter y/yes or n/no.")
 
 
+def _prompt_unit_choice(default: str = "m") -> str:
+    """Read output unit from stdin; valid values are 'm' and 'cm'."""
+    default = default.lower().strip()
+    if default not in ("m", "cm"):
+        default = "m"
+    while True:
+        raw = input(f"Mesh unit system [m/cm] [{default}]: ").strip().lower()
+        if raw == "":
+            return default
+        if raw in ("m", "cm"):
+            return raw
+        print("  Enter m or cm.")
+
+
 def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Generate 2D vessel meshes (Gmsh) for Kinematics phases.")
-    p.add_argument("--phase", type=int, choices=(1, 2), default=None, help="Phase (use with --level and -n)")
-    p.add_argument("--level", type=int, choices=(0, 1), default=None, help="Geometry complexity (use with --phase and -n)")
+    p.add_argument(
+        "--phase",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help="Dataset (1=kinematics, 2=biochem; use with --level and -n)",
+    )
+    p.add_argument(
+        "--level",
+        type=int,
+        choices=(0, 1, 2),
+        default=None,
+        help="Geometry complexity (0=straight, 1=curved, 2=pro-clot)",
+    )
     p.add_argument(
         "-n",
         "--num-vessels",
@@ -769,6 +861,13 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--num-workers", type=int, default=None, help="Worker processes (default: auto)")
     p.add_argument("--chunk-size", type=int, default=None, help="Samples per worker chunk (default: auto)")
+    p.add_argument(
+        "--unit",
+        type=str,
+        choices=("m", "cm"),
+        default="m",
+        help="Mesh unit system (default: m).",
+    )
     p.add_argument(
         "--overwrite",
         action="store_true",
@@ -795,16 +894,25 @@ if __name__ == "__main__":
     if any(trio) and not all(trio):
         parser.error("Provide --phase, --level, and -n/--num-vessels together for non-interactive mode.")
 
+    phase_map = {1: "kinematics", 2: "biochem"}
+
     if all(trio):
-        phase = f"phase{args.phase}"
+        phase = phase_map[int(args.phase)]
         level = args.level
         n_vessels = args.num_vessels
         start_idx = 0 if args.overwrite else None
         show_vessel_plot = bool(args.show_vessel_plot)
+        unit_choice = str(args.unit).lower()
     else:
-        phase_n = _prompt_int_choice("Phase", (1, 2))
-        level = _prompt_int_choice("Level", (0, 1))
-        phase = f"phase{phase_n}"
+        phase_n = _prompt_int_choice("Dataset (1=kinematics, 2=biochem)", (1, 2))
+        level = _prompt_int_choice("Level (0=straight, 1=curved, 2=pro-clot)", (0, 1, 2))
+        phase = phase_map[phase_n]
+
+        unit_choice = "m"
+        if phase == "biochem" and level == 2:
+            print("High-thrombus biochem generation detected.")
+            print("Use 'cm' for thrombus CFD-compatible meshes, or keep 'm' for SI-scale meshes.")
+            unit_choice = _prompt_unit_choice(default="cm")
 
         vg = VesselGenerator(phase=phase)
         inv = summarize_vessel_mesh_inventory(vg.output_dir)
@@ -846,6 +954,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
         start_idx=start_idx,
+        unit=unit_choice,
     )
 
     if show_vessel_plot:
