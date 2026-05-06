@@ -1,5 +1,5 @@
 """
-Live COMSOL model inspector (restored + modernized).
+Live COMSOL model inspector (Optimized for PINN/AI Context).
 
 Examples:
     python -m src.tools.inspect_comsol_model --list-models
@@ -58,7 +58,6 @@ def _resolve_model_path(model_arg: str | None) -> Path:
 
 
 def _prompt_int_choice(label: str, min_value: int, max_value: int) -> int:
-    """Read an integer from stdin until it falls in [min_value, max_value]."""
     while True:
         raw = input(f"{label} [{min_value}-{max_value}]: ").strip()
         try:
@@ -72,7 +71,6 @@ def _prompt_int_choice(label: str, min_value: int, max_value: int) -> int:
 
 
 def _prompt_yes_no(label: str, default: bool = False) -> bool:
-    """Read a yes/no answer; empty input returns default."""
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
         raw = input(f"{label} {suffix}: ").strip().lower()
@@ -112,7 +110,6 @@ def _print_parameters(model) -> None:
 def _print_variables(model) -> None:
     print("\n=== VARIABLES (global + component) ===")
 
-    # 1. Global Variables
     g_root = _safe_call(lambda: model.java.variable(), None)
     g_ids = _to_list(_safe_call(lambda: g_root.tags(), [])) if g_root is not None else []
     print(f"Global variable groups: {len(g_ids)}")
@@ -127,7 +124,6 @@ def _print_variables(model) -> None:
             desc_s = f" :: {desc}" if desc else ""
             print(f"    * {name} = {expr}{desc_s}")
 
-    # 2. Component Variables
     comp_ids = _to_list(_safe_call(lambda: model.java.component().tags(), []))
     for comp_id in comp_ids:
         comp = _safe_call(lambda: model.java.component(comp_id), None)
@@ -140,7 +136,6 @@ def _print_variables(model) -> None:
             group = _safe_call(lambda: v_root.get(group_id), None)
             names = _to_list(_safe_call(lambda: group.varnames(), [])) if group is not None else []
 
-            # Extract geometric scope for component variable groups.
             sel = _safe_call(lambda: group.selection(), None)
             scope_str = "Global/Entire Geometry"
             if sel is not None:
@@ -165,24 +160,21 @@ def _print_named_selections(model) -> None:
     print("\n=== NAMED/EXPLICIT SELECTIONS ===")
     s_root = _safe_call(lambda: model.java.selection(), None)
     s_ids = _to_list(_safe_call(lambda: s_root.tags(), [])) if s_root is not None else []
-    print(f"Count: {len(s_ids)}")
-    for sid in s_ids:
+
+    filtered_sids = [sid for sid in s_ids if "nastran" not in sid.lower() and "imp" not in sid.lower()]
+    print(f"Count: {len(filtered_sids)} (Ignored {len(s_ids) - len(filtered_sids)} auto-imports)")
+
+    for sid in filtered_sids:
         sel = _safe_call(lambda: s_root.get(sid), None)
         if sel is None:
-            print(f"- {sid}: <unavailable>")
             continue
 
         s_type = _safe_call(lambda: str(sel.getType()), "<unknown>")
         s_name = _safe_call(lambda: str(sel.name()), sid)
-        geom_name = _safe_call(lambda: str(sel.geom()), "")
-        geom_dim = _safe_call(lambda: str(sel.geomdim()), "")
         entities = _selection_entities(sel)
         is_all = _safe_call(lambda: bool(sel.all()), False)
 
-        geom_s = ""
-        if geom_name or geom_dim:
-            geom_s = f" ({geom_name}, dim={geom_dim})" if geom_name else f" (dim={geom_dim})"
-        print(f"- {sid}: {s_name} [{s_type}]{geom_s}")
+        print(f"- {sid}: {s_name} [{s_type}]")
         if entities:
             print(f"  entities -> {'; '.join(entities)}")
         elif is_all:
@@ -199,27 +191,74 @@ def _print_functions(func_root, scope_name: str) -> None:
         f_node = _safe_call(lambda: func_root.get(fid), None)
         if f_node is None:
             continue
+
         f_name = _safe_call(lambda: str(f_node.name()), fid)
         f_type = _safe_call(lambda: str(f_node.getType()), "<unknown>")
-        expr = _safe_call(lambda: str(f_node.getString("expr")), "")
-        if expr:
-            print(f"- {f_name} [{f_type}] :: {expr}")
+
+        # Explicitly extract the callable name and arguments used in the equations
+        func_call = _safe_call(lambda: str(f_node.getString("funcname")), "")
+        args_arr = _safe_call(lambda: f_node.getStringArray("args"), [])
+        args_str = ", ".join([str(a) for a in args_arr]) if args_arr else ""
+
+        call_sig = f"{func_call}({args_str})" if func_call else f_name
+
+        if f_type == "Analytic":
+            expr = _safe_call(lambda: str(f_node.getString("expr")), "")
+            print(f"- {f_name} [{f_type}] :: {call_sig} = {expr}")
+
+        elif f_type == "Step":
+            loc = _safe_call(lambda: str(f_node.getString("location")), "")
+            f_val = _safe_call(lambda: str(f_node.getString("from")), "")
+            t_val = _safe_call(lambda: str(f_node.getString("to")), "")
+            print(f"- {f_name} [{f_type}] :: {call_sig} -> Step at {loc} (from {f_val} to {t_val})")
+
+        elif f_type == "Piecewise":
+            print(f"- {f_name} [{f_type}] :: {call_sig}")
+            funcs_mat = _safe_call(lambda: f_node.getStringMatrix("funcs"), [])
+            if funcs_mat:
+                for row in funcs_mat:
+                    row_strs = [str(x) for x in row]
+                    print(f"    * interval/expr: {row_strs}")
+        elif f_type == "Interpolation":
+            print(f"- {f_name} [{f_type}] :: {call_sig}")
+            table_data = _safe_call(lambda: f_node.getStringMatrix("table"), [])
+            if table_data:
+                # Limit output to avoid context bloat if table is very large.
+                if len(table_data) > 20:
+                    print(f"    * [Table contains {len(table_data)} rows - showing first 5]")
+                    for row in table_data[:5]:
+                        print(f"    * {row}")
+                    print("    * ...")
+                else:
+                    for row in table_data:
+                        print(f"    * {row}")
         else:
-            print(f"- {f_name} [{f_type}]")
+            expr = _safe_call(lambda: str(f_node.getString("expr")), "")
+            if expr:
+                print(f"- {f_name} [{f_type}] :: {call_sig} = {expr}")
+            else:
+                print(f"- {f_name} [{f_type}] :: {call_sig}")
 
 
 def _iter_feature_properties(feat) -> Iterable[tuple[str, str]]:
     props = _to_list(_safe_call(lambda: feat.properties(), []))
+
+    # Aggressively filter out GUI noise and unrelated properties
+    ignore_substrings = [
+        "minput_", "showPhysicsSymbols", "StudyStep", "constraint",
+        "pairContrib", "CompensateFor", "editModelInputs", "coordinateSystem"
+    ]
+
     for key in props:
-        # Use robust extraction so array-valued fields are not truncated.
+        if any(sub in key for sub in ignore_substrings):
+            continue
+
         val = _get_feature_property_value(feat, key)
         if val and val != "[]":
             yield key, val
 
 
 def _get_feature_property_value(node, key: str) -> str:
-    """Best-effort property extraction across common COMSOL value types."""
-    # Prioritize array extraction to avoid truncating multi-element fields.
     arr_val = _safe_call(lambda: node.getStringArray(key), None)
     if arr_val is not None:
         val_list = [str(x) for x in arr_val]
@@ -246,21 +285,13 @@ def _get_feature_property_value(node, key: str) -> str:
 
 
 def _iter_equation_like_properties(feat) -> Iterable[tuple[str, str]]:
-    """Extract properties likely to contain governing-equation content."""
     eq_tokens = (
-        "equ",
-        "pde",
-        "weak",
-        "rhs",
-        "source",
-        "flux",
-        "constraint",
-        "reaction",
+        "equ", "pde", "weak", "rhs", "source", "flux", "reaction",
+        "init", "diff", "u0", "p0", "c0"
     )
     props = _to_list(_safe_call(lambda: feat.properties(), []))
     for key in props:
-        key_lower = key.lower()
-        if not any(token in key_lower for token in eq_tokens):
+        if not any(token in key.lower() for token in eq_tokens):
             continue
         value = _get_feature_property_value(feat, key)
         if value:
@@ -268,7 +299,6 @@ def _iter_equation_like_properties(feat) -> Iterable[tuple[str, str]]:
 
 
 def _selection_entities(selection) -> list[str]:
-    """Return best-effort entity id lists for common geometric dimensions."""
     out: list[str] = []
     for dim in (0, 1, 2, 3):
         ids = _safe_call(lambda d=dim: selection.entities(d), None)
@@ -279,7 +309,6 @@ def _selection_entities(selection) -> list[str]:
 
 
 def _format_feature_selection(feat) -> str:
-    """Human-readable selection summary for a physics feature."""
     sel = _safe_call(lambda: feat.selection(), None)
     if sel is None:
         return "selection unavailable"
@@ -298,7 +327,6 @@ def _format_feature_selection(feat) -> str:
             prefix += suffix
         return f"{prefix}: " + "; ".join(entities)
 
-    # Fallback for "all" style selections.
     is_all = _safe_call(lambda: bool(sel.all()), False)
     if is_all:
         return "applies to all entities in selection scope"
@@ -310,20 +338,14 @@ def _print_applied_boundary_conditions(model) -> None:
     print("\n=== APPLIED BOUNDARY CONDITIONS / TARGET SELECTIONS ===")
     comp_ids = _to_list(_safe_call(lambda: model.java.component().tags(), []))
     if not comp_ids:
-        print("No components found.")
         return
 
-    total_conditions = 0
     for comp_id in comp_ids:
         comp = _safe_call(lambda: model.java.component(comp_id), None)
         if comp is None:
             continue
         print(f"\nComponent: {comp_id}")
         phys_ids = _to_list(_safe_call(lambda: comp.physics().tags(), []))
-        if not phys_ids:
-            print("  No physics interfaces.")
-            continue
-
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
             if phys is None or not _safe_call(lambda: phys.isActive(), True):
@@ -332,149 +354,84 @@ def _print_applied_boundary_conditions(model) -> None:
             print(f"  Physics: {phys_id} ({phys_type})")
 
             feat_ids = _to_list(_safe_call(lambda: phys.feature().tags(), []))
-            if not feat_ids:
-                print("    No physics features.")
-                continue
-
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
-                if feat is None:
-                    continue
-                if not _safe_call(lambda: feat.isActive(), True):
+                if feat is None or not _safe_call(lambda: feat.isActive(), True):
                     continue
                 feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 feat_name = _safe_call(lambda: str(feat.name()), feat_id)
                 sel_summary = _format_feature_selection(feat)
-                total_conditions += 1
                 print(f"    - {feat_id} ({feat_type}) :: {feat_name}")
                 print(f"      applies on -> {sel_summary}")
 
-    print(f"\nTotal physics conditions/features reported: {total_conditions}")
-
 
 def _print_equation_forms(model) -> None:
-    print("\n=== FULL EQUATION FORMS (best effort) ===")
+    print("\n=== FULL EQUATION FORMS ===")
     comp_ids = _to_list(_safe_call(lambda: model.java.component().tags(), []))
-    if not comp_ids:
-        print("No components found.")
-        return
-
-    total_equation_fields = 0
     for comp_id in comp_ids:
         comp = _safe_call(lambda: model.java.component(comp_id), None)
         if comp is None:
             continue
-        print(f"\nComponent: {comp_id}")
         phys_ids = _to_list(_safe_call(lambda: comp.physics().tags(), []))
-        if not phys_ids:
-            print("  No physics interfaces.")
-            continue
-
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
             if phys is None or not _safe_call(lambda: phys.isActive(), True):
                 continue
 
             phys_type = _safe_call(lambda: str(phys.getType()), "<unknown>")
-            print(f"  Physics: {phys_id} ({phys_type})")
-
-            # Interface-level equation-like properties.
-            interface_pairs = list(_iter_equation_like_properties(phys))
-            if interface_pairs:
-                print("    Interface equation properties:")
-                for key, value in interface_pairs:
-                    total_equation_fields += 1
-                    print(f"      - {key}: {value}")
+            print(f"\n  Physics: {phys_id} ({phys_type})")
 
             feat_ids = _to_list(_safe_call(lambda: phys.feature().tags(), []))
-            if not feat_ids:
-                print("    No physics features.")
-                continue
-
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
-                if feat is None:
+                if feat is None or not _safe_call(lambda: feat.isActive(), True):
                     continue
-                if not _safe_call(lambda: feat.isActive(), True):
-                    continue
-                feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
+
                 equation_pairs = list(_iter_equation_like_properties(feat))
                 if not equation_pairs:
                     continue
+
+                feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 print(f"    Feature: {feat_id} ({feat_type})")
                 for key, value in equation_pairs:
-                    total_equation_fields += 1
                     print(f"      - {key}: {value}")
-
-    print(f"\nExtracted equation-related fields: {total_equation_fields}")
-    if total_equation_fields == 0:
-        print("No equation-like properties were discovered with current API calls.")
 
 
 def _print_materials_content(model) -> None:
-    print("\n=== MATERIALS CONTENT (detailed) ===")
+    print("\n=== MATERIALS CONTENT ===")
     comp_ids = _to_list(_safe_call(lambda: model.java.component().tags(), []))
-    if not comp_ids:
-        print("No components found.")
-        return
-
-    total_material_fields = 0
     for comp_id in comp_ids:
         comp = _safe_call(lambda: model.java.component(comp_id), None)
         if comp is None:
             continue
 
-        print(f"\nComponent: {comp_id}")
         mat_ids = _to_list(_safe_call(lambda: comp.material().tags(), []))
-        print(f"  Materials: {len(mat_ids)}")
-        if not mat_ids:
-            continue
-
         for mat_id in mat_ids:
             mat = _safe_call(lambda: comp.material(mat_id), None)
             if mat is None:
-                print(f"  - {mat_id} (unavailable)")
                 continue
             mat_name = _safe_call(lambda: str(mat.name()), mat_id)
             mat_type = _safe_call(lambda: str(mat.getType()), "<unknown>")
-            print(f"  - {mat_id}: {mat_name} ({mat_type})")
+            print(f"\n  - {mat_id}: {mat_name} ({mat_type})")
 
-            # COMSOL materials commonly store properties under property groups.
             pg_root = _safe_call(lambda: mat.propertyGroup(), None)
             pg_ids = _to_list(_safe_call(lambda: pg_root.tags(), [])) if pg_root is not None else []
-            if not pg_ids:
-                print("      (no material property groups found)")
-                continue
-
             for pg_id in pg_ids:
                 pg = _safe_call(lambda: mat.propertyGroup(pg_id), None)
                 if pg is None:
                     continue
                 pg_name = _safe_call(lambda: str(pg.name()), pg_id)
                 print(f"      * Property group: {pg_id} ({pg_name})")
-                prop_keys = _to_list(_safe_call(lambda: pg.properties(), []))
-                if not prop_keys:
-                    print("          - (no properties listed)")
-                    continue
 
-                for key in prop_keys:
+                for key in _to_list(_safe_call(lambda: pg.properties(), [])):
                     value = _get_feature_property_value(pg, key)
-                    if not value:
-                        continue
-                    total_material_fields += 1
-                    print(f"          - {key}: {value}")
-
-    print(f"\nExtracted material fields: {total_material_fields}")
-    if total_material_fields == 0:
-        print("No material properties were discovered with current API calls.")
+                    if value:
+                        print(f"          - {key}: {value}")
 
 
 def _print_model_structure(model, show_properties: bool = False) -> None:
     print("\n=== MODEL STRUCTURE ===")
     comp_ids = _to_list(_safe_call(lambda: model.java.component().tags(), []))
-    if not comp_ids:
-        print("No components found.")
-        return
 
     for comp_id in comp_ids:
         comp = _safe_call(lambda: model.java.component(comp_id), None)
@@ -482,56 +439,29 @@ def _print_model_structure(model, show_properties: bool = False) -> None:
             continue
 
         print(f"\nComponent: {comp_id}")
-        mesh_ids = _to_list(_safe_call(lambda: comp.mesh().tags(), []))
-        print(f"  Meshes: {len(mesh_ids)}")
-        for mesh_id in mesh_ids:
-            mesh = _safe_call(lambda: comp.mesh(mesh_id), None)
-            feat_ids = _to_list(_safe_call(lambda: mesh.feature().tags(), [])) if mesh is not None else []
-            print(f"    - {mesh_id}: {len(feat_ids)} features")
-
         phys_ids = _to_list(_safe_call(lambda: comp.physics().tags(), []))
         print(f"  Physics interfaces: {len(phys_ids)}")
+
         for phys_id in phys_ids:
             phys = _safe_call(lambda: comp.physics(phys_id), None)
             if phys is not None and not _safe_call(lambda: phys.isActive(), True):
                 continue
             phys_type = _safe_call(lambda: str(phys.getType()), "<unknown>") if phys is not None else "<unknown>"
             print(f"    - {phys_id} ({phys_type})")
+
             feat_ids = _to_list(_safe_call(lambda: phys.feature().tags(), []))
             for feat_id in feat_ids:
                 feat = _safe_call(lambda: phys.feature(feat_id), None)
-                if feat is None:
-                    continue
-                if not _safe_call(lambda: feat.isActive(), True):
+                if feat is None or not _safe_call(lambda: feat.isActive(), True):
                     continue
                 feat_type = _safe_call(lambda: str(feat.getType()), "<unknown>")
                 print(f"      * {feat_id} ({feat_type})")
+
                 if show_properties:
                     for k, v in _iter_feature_properties(feat):
                         print(f"        -> {k}: {v}")
 
-        mat_ids = _to_list(_safe_call(lambda: comp.material().tags(), []))
-        print(f"  Materials: {len(mat_ids)}")
-        for mat_id in mat_ids:
-            print(f"    - {mat_id}")
-
         _print_functions(_safe_call(lambda: comp.func(), None), f"Component {comp_id}")
-
-
-def _print_studies(model) -> None:
-    print("\n=== STUDIES ===")
-    s_root = _safe_call(lambda: model.java.study(), None)
-    s_ids = _to_list(_safe_call(lambda: s_root.tags(), [])) if s_root is not None else []
-    for sid in s_ids:
-        study = _safe_call(lambda: s_root.get(sid), None)
-        if study is None:
-            continue
-        print(f"- {sid}")
-        feat_ids = _to_list(_safe_call(lambda: study.feature().tags(), []))
-        for fid in feat_ids:
-            feat = _safe_call(lambda: study.feature(fid), None)
-            ftype = _safe_call(lambda: str(feat.getType()), "<unknown>") if feat is not None else "<unknown>"
-            print(f"  * {fid} ({ftype})")
 
 
 def inspect_model(model_path: Path, show_properties: bool = False) -> None:
@@ -554,7 +484,7 @@ def inspect_model(model_path: Path, show_properties: bool = False) -> None:
         _print_variables(model)
         _print_named_selections(model)
         _print_functions(_safe_call(lambda: model.java.func(), None), "Global")
-        _print_studies(model)
+        # _print_studies(model)  # Removed: Not relevant for PINN context mapping
     finally:
         _safe_call(lambda: model.remove())
         _safe_call(lambda: client.clear())
@@ -563,47 +493,30 @@ def inspect_model(model_path: Path, show_properties: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect COMSOL .mph internals via mph/LiveLink.")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Path to .mph model (if omitted, interactive model picker is used).",
-    )
-    parser.add_argument("--all-models", action="store_true", help="Inspect all .mph files under comsol_models/.")
-    parser.add_argument("--list-models", action="store_true", help="List discoverable .mph models and exit.")
-    parser.add_argument(
-        "--show-properties",
-        action="store_true",
-        help="Print physics feature property key/value pairs (verbose).",
-    )
+    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--all-models", action="store_true")
+    parser.add_argument("--list-models", action="store_true")
+    parser.add_argument("--show-properties", action="store_true")
     args = parser.parse_args()
 
     models = _discover_models()
     if args.list_models:
-        if not models:
-            print(f"No .mph files found in {comsol_models_dir()}")
-            return
-        print("Discovered models:")
         for m in models:
             print(f"- {m}")
         return
 
     if args.all_models:
-        if not models:
-            raise FileNotFoundError(f"No .mph files found in {comsol_models_dir()}")
         for m in models:
             inspect_model(m, show_properties=args.show_properties)
         return
 
     if args.model:
-        selected = _resolve_model_path(args.model)
-        inspect_model(selected, show_properties=args.show_properties)
+        inspect_model(_resolve_model_path(args.model), show_properties=args.show_properties)
         return
 
     selected = _prompt_model_choice(models)
     show_properties = args.show_properties or _prompt_yes_no(
-        "Also print verbose physics feature properties?",
-        default=False,
+        "Also print verbose physics feature properties?", default=False
     )
     inspect_model(selected, show_properties=show_properties)
 

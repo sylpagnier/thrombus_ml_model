@@ -300,7 +300,7 @@ class BiochemConfig:
     # --- Temporal simulation (per-graph truth is authoritative) ---
     # Prefer storing COMSOL sample times on each graph as ``data.t`` [s]; lengths can differ
     # between patients/runs. These fields are fallbacks when ``data.t`` is missing.
-    t_final: float = 6000  # Default horizon [s] if graph has no ``data.t``
+    t_final: float = 30000  # Default horizon [s] if graph has no ``data.t``
     num_time_steps: int = 60  # Default count for synthetic linspace if not set by export
 
     # --- Initial Concentrations ---
@@ -438,11 +438,28 @@ class BiochemConfig:
         import torch
         import warnings
 
+        def _is_anchor_graph(batch_data) -> bool:
+            if not hasattr(batch_data, "is_anchor"):
+                return False
+            ia = batch_data.is_anchor
+            if not torch.is_tensor(ia):
+                return bool(ia)
+            if ia.numel() == 0:
+                return False
+            return bool(ia.reshape(-1).any().item())
+
         t_steps = int(data.y.shape[0])
+        is_anchor_graph = _is_anchor_graph(data)
         if hasattr(data, "t") and data.t is not None and data.t.numel() > 0:
             t = data.t.to(device=device, dtype=torch.float32).reshape(-1)
             if t.numel() == t_steps:
                 return self._ensure_strictly_increasing_times(t)
+            if is_anchor_graph:
+                raise ValueError(
+                    "Anchor biochem graph has invalid time vector: "
+                    f"data.t length {t.numel()} != y time dim {t_steps}. "
+                    "Anchor/patient COMSOL exports must provide aligned time stamps."
+                )
             t_last = float(t[-1].item()) if t.numel() else float(self.t_final)
             warnings.warn(
                 f"data.t length {t.numel()} != y time dim {t_steps}; "
@@ -451,6 +468,11 @@ class BiochemConfig:
             )
             return self._ensure_strictly_increasing_times(
                 torch.linspace(0.0, t_last, steps=t_steps, device=device, dtype=torch.float32)
+            )
+        if is_anchor_graph:
+            raise ValueError(
+                "Anchor biochem graph is missing `data.t`. "
+                "Anchor/patient COMSOL exports must include time stamps."
             )
         return self._ensure_strictly_increasing_times(
             torch.linspace(0.0, float(self.t_final), steps=t_steps, device=device, dtype=torch.float32)
