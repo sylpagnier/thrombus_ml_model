@@ -1087,5 +1087,76 @@ class TestPhase3Physics(unittest.TestCase):
             ),
         )
 
+    def test_adr_transport_and_normalization(self):
+        """
+        Verifies L_ADR assembly in biochem_adr_residual with mocked sparse operators.
+        Checks that fast/slow losses are computed and ADR norm scales remain consistent.
+        """
+        num_nodes = 5
+
+        class MockData:
+            def __init__(self):
+                idx = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+                vals = torch.tensor([1.0, 1.0], dtype=torch.float32)
+                self.G_x = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
+                self.G_y = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
+                self.Laplacian = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
+                self.mask_wall = torch.zeros(num_nodes, dtype=torch.bool)
+
+        data = MockData()
+        species_preds = torch.zeros((num_nodes, 9), dtype=torch.float32, requires_grad=True)
+        velocity_field = torch.ones((num_nodes, 2), dtype=torch.float32) * 0.5
+        spatial_props = {
+            "u_ref": torch.ones(num_nodes, dtype=torch.float32),
+            "d_bar": torch.full((num_nodes,), 0.01, dtype=torch.float32),
+        }
+
+        adr_fast, adr_slow = self.biochem_kernels.biochem_adr_residual(
+            species_preds, velocity_field, spatial_props, data, d_pred_dt=None
+        )
+
+        self.assertTrue(adr_fast.requires_grad or float(adr_fast.item()) == 0.0)
+        self.assertTrue(adr_slow.requires_grad or float(adr_slow.item()) == 0.0)
+
+        scales = self.biochem_kernels._get_species_scales(species_preds.device, species_preds.dtype)
+        adr_norm = self.biochem_kernels._get_adr_norm_scales(species_preds.device, species_preds.dtype)
+        expected_pt_norm = scales[4]
+        self.assertTrue(torch.isclose(adr_norm[4], expected_pt_norm))
+
+    def test_neumann_boundary_flux_coupling(self):
+        """
+        Verifies Neumann wall flux coupling is active and differentiable.
+        Uses mocked PyG-like data and wall normals to exercise flux residual path.
+        """
+        num_nodes = 3
+
+        class MockDataFlux:
+            def __init__(self):
+                idx = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+                vals = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+                self.G_x = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
+                self.G_y = torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes)).coalesce()
+                self.mask_wall = torch.ones(num_nodes, dtype=torch.bool)
+                self.x = torch.zeros((num_nodes, 10), dtype=torch.float32)
+                self.x[:, 3] = 1.0
+                self.x[:, 4] = 0.0
+
+        data = MockDataFlux()
+        biochem_preds = torch.ones((num_nodes, 9), dtype=torch.float32, requires_grad=True)
+        wall_preds = torch.zeros((num_nodes, 3), dtype=torch.float32, requires_grad=True)
+        velocity_field = torch.zeros((num_nodes, 2), dtype=torch.float32)
+        spatial_props = {
+            "u_ref": torch.ones(num_nodes, dtype=torch.float32),
+            "d_bar": torch.full((num_nodes,), 0.01, dtype=torch.float32),
+        }
+
+        loss_surface, loss_flux = self.biochem_kernels.biochem_wall_residual(
+            biochem_preds, wall_preds, velocity_field, spatial_props, data
+        )
+
+        self.assertTrue(loss_surface.requires_grad)
+        self.assertTrue(loss_flux.requires_grad)
+        self.assertGreaterEqual(float(loss_flux.item()), 0.0)
+
 if __name__ == "__main__":
     unittest.main()

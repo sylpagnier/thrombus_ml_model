@@ -22,7 +22,7 @@ from src.data_gen import AnchorGenerator, MeshToGraphComplete, VesselGenerator
 from src.evaluation.lib.validate_model import ModelValidator
 from src.config import PredChannels
 
-KINEMATICS_FINAL_ANNEALED_N = 0.358
+KINEMATICS_FINAL_ANNEALED_N = 0.3568
 
 
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):

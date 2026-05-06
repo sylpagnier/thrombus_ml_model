@@ -159,7 +159,7 @@ def test_dynamic_curriculum_parameters_change_physics_response():
 
     residuals = []
     mu_means = []
-    for n_val, mu0_si in ((1.0, 0.0035), (0.8, 0.02), (0.6, 0.035), (0.358, 0.056)):
+    for n_val, mu0_si in ((1.0, 0.0035), (0.8, 0.02), (0.6, 0.035), (0.3568, 0.056)):
         kernels.mu_0_nd = float(mu0_si / kernels.cfg.mu_viscosity_nd_scale)
         mu = kernels._compute_carreau_viscosity(du_ij, data, carreau_n=n_val).unsqueeze(1)
         pred = torch.cat([u, v, p, mu], dim=1)

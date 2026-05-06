@@ -421,16 +421,26 @@ class BiochemPhysicsKernels:
         Minf = self.cfg.Minf * self.cfg.surface_scale
 
         # 4. Compute Local Surface Activation & Spatial Gradients
-        global_shear = self._compute_shear_rate(velocity_field[..., 0], velocity_field[..., 1], spatial_props, data)
+        u = velocity_field[..., 0]
+        v = velocity_field[..., 1]
+
+        global_shear = self._compute_shear_rate(u, v, spatial_props, data)
         shear_wall = global_shear[mask_wall]
 
         d_bar = spatial_props['d_bar'].to(biochem_preds.device)
         d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
-        # Sparse Matrix Gradient Calculation for Shear Rate
+        # Streamwise Directional Derivative (d/ds)
         dshear_dx = torch.sparse.mm(data.G_x, global_shear.unsqueeze(1)).squeeze(1)
-        dshear_dx_wall = (dshear_dx / d_bar_safe)[mask_wall]
-        dshear_abs = torch.abs(dshear_dx_wall) + 1e-6
+        dshear_dy = torch.sparse.mm(data.G_y, global_shear.unsqueeze(1)).squeeze(1)
+
+        vel_mag = torch.sqrt(u ** 2 + v ** 2) + 1e-8
+        u_dir = u / vel_mag
+        v_dir = v / vel_mag
+
+        dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
+        dshear_ds_wall = (dshear_ds / d_bar_safe)[mask_wall]
+        dshear_abs = torch.abs(dshear_ds_wall) + 1e-6
 
         raw_availability = 1.0 - (M_tot / Minf)
         if self._availability_negative_slope > 0.0:
@@ -444,7 +454,7 @@ class BiochemPhysicsKernels:
             availability = torch.clamp(raw_availability, min=1e-8, max=1.0)
 
         # COMSOL Pathological Conditionals (Soft-Logic)
-        is_separation = self.kinetics._soft_step(dshear_dx_wall, self.cfg.sgt, self.kinetics.T_grad, reverse=True)
+        is_separation = self.kinetics._soft_step(dshear_ds_wall, self.cfg.sgt, self.kinetics.T_grad, reverse=True)
         is_low_shear = self.kinetics._soft_step(shear_wall, self.cfg.lss, self.kinetics.T_low_shear, reverse=True)
 
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)

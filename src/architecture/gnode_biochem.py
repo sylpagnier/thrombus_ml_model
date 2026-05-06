@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import math
+import torch.nn.functional as F
 from torch import Tensor
 # ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
 from torchdiffeq import odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
-from src.config import BiochemConfig
-from src.utils.math_operators import wls_derivatives
+from src.config import BiochemConfig, NodeFeat
 from src.utils.batching import get_batch_tensor
 
 # Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
@@ -64,11 +64,13 @@ class BioODEFunc(nn.Module):
         self.derivative_energy_sum = 0.0
         self.derivative_eval_count = 0
 
-    def forward(self, t, z, edge_index, edge_attr, batch_idx):
+    def forward(self, t, z, edge_index, edge_attr, batch_idx, mod_biochem=None):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
         z = torch.clamp(z, min=-20.0, max=20.0)
         mod_dummy = torch.zeros(int(edge_index.shape[ 1 ]), 1, dtype=torch.float32, device=z.device)
-        dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
+        if mod_biochem is None:
+            mod_biochem = mod_dummy
+        dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_biochem, mod_dummy, mod_dummy)
         dz_dt = self.derivative_scale * dz_raw
         dz_dt = torch.clamp(dz_dt, min=-10.0, max=10.0)
         if self.training:
@@ -107,28 +109,38 @@ class GNODE_Phase3(nn.Module):
         # ==========================================
         # 1. KINEMATICS BACKBONE (FROZEN)
         # ==========================================
+        self.edge_decay_k = float(self.phys_cfg.gino_edge_decay_k)
+        self.curve_log_clamp_min = float(self.phys_cfg.gino_curve_log_clamp_min)
+        self.rheo_log_clamp_min = float(self.phys_cfg.gino_rheo_log_clamp_min)
+        self.adv_log_clamp_min = float(self.phys_cfg.gino_adv_log_clamp_min)
+
         self.num_fourier_freqs = 8
         freqs = (2.0 ** torch.arange(self.num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
 
-        fourier_channels = 3 * self.num_fourier_freqs * 2
-        encoded_channels = (15 - 3) + 1 + 3 + fourier_channels
+        fourier_channels = 5 * self.num_fourier_freqs * 2
+        encoded_channels = (15 - 5) + 5 + fourier_channels
 
         self.kin_encoder = nn.Sequential(
             nn.Linear(encoded_channels, latent_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(latent_dim, latent_dim)
         )
-        self.kin_processor = GINOBlock(latent_dim)
-        # Stream-function formulation for kinematics: decoder predicts (psi, p).
-        self.kinematics_decoder = nn.Linear(latent_dim, 2)
+        self.kin_processor = GINOBlock(latent_dim, edge_dim=3, num_global_tokens=16)
+        self.kinematics_decoder = nn.Linear(latent_dim, 3)
         self.mu_encoder = nn.Linear(1, latent_dim)
+        self.z_prior_proj = SpectralLinear(4, latent_dim)
 
         # ==========================================
         # 2. BIOCHEMISTRY NEURAL ODE
         # ==========================================
         # Initial Condition Encoder (Maps spatial config to z0)
         self.bio_encoder = SpectralLinear(in_features=in_channels + 3 + spatial_channels, out_features=latent_dim)
+        _bio = BiochemConfig(phase="biochem")
+        self.sgt = _bio.sgt
+        self.T_grad = _bio.soft_step_T_grad
+        # 5x attention multiplier for edges in decelerating zones (log-space bias)
+        self.biochem_attention_boost = math.log(5.0)
 
         # The ODE Function
         self.ode_func = BioODEFunc(latent_dim)
@@ -136,7 +148,6 @@ class GNODE_Phase3(nn.Module):
         # Physical Decoder
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
-        _bio = BiochemConfig(phase="biochem")
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
 
     def train(self, mode=True):
@@ -151,17 +162,16 @@ class GNODE_Phase3(nn.Module):
         self.mu_encoder.eval()
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
-        nodes_nd = pos_nd if pos_nd is not None else x[:, 0:2]
-        sdf_nd = x[:, 2:3]
-        shear_pot = torch.zeros_like(sdf_nd)
-        wall_normal = x[:, 3:5]
+        nodes_nd = pos_nd if pos_nd is not None else x[:, NodeFeat.XY]
+        sdf_nd = x[:, NodeFeat.SDF]
+        shear_pot = x[:, NodeFeat.SHEAR_POT]
+        wall_normal = x[:, NodeFeat.WALL_NORMAL]
+        rest = x[:, NodeFeat.REST]
+        uv_prior = x[:, NodeFeat.UV_PRIOR]
+        mu_prior = x[:, NodeFeat.MU_PRIOR]
+        wss_prior = x[:, NodeFeat.WSS_PRIOR]
 
-        rest = x[:, 5:11]
-        uv_prior = x[:, 11:13]
-        mu_prior = x[:, 13:14]
-        wss_prior = x[:, 14:15]
-
-        features_to_encode = torch.cat([sdf_nd, wall_normal], dim=1)
+        features_to_encode = torch.cat([nodes_nd, sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
 
         x_proj = (features_to_encode.unsqueeze(-1) * self.fourier_freqs).contiguous()
@@ -169,79 +179,45 @@ class GNODE_Phase3(nn.Module):
         fourier_feats = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
         encoded_x = torch.cat([
-            nodes_nd, shear_pot, features_to_encode, fourier_feats,
+            shear_pot, features_to_encode, fourier_feats,
             rest, uv_prior, mu_prior, wss_prior
         ], dim=1)
         return encoded_x
 
-    def _compute_wls_derivatives(self, field: Tensor, batch) -> Tensor:
-        """Compute WLS derivatives [d/dx, d/dy, d2/dx2, d2/dxdy, d2/dy2] for a nodal scalar."""
+    def _compute_kinematics_modulators(self, batch):
+        """Computes physical edge modulators (advection, rheology, curvature) for GINO."""
         row, col = batch.edge_index
-        num_nodes = batch.num_nodes
-        V, W, M_inv = batch.V, batch.W, batch.M_inv
-        edge_index = torch.stack([row, col], dim=0)
+        edge_vec = batch.edge_attr[:, :2]
+        wall_normals = batch.x[:, NodeFeat.WALL_NORMAL]
 
-        boundary_mask = None
-        boundary_normals = None
-        if hasattr(batch, "mask_wall") or hasattr(batch, "mask_inlet") or hasattr(batch, "mask_outlet"):
-            boundary_mask = torch.zeros(num_nodes, dtype=torch.bool, device=V.device)
-            if hasattr(batch, "mask_wall"):
-                boundary_mask |= batch.mask_wall.view(-1).to(device=V.device).bool()
-            if hasattr(batch, "mask_inlet"):
-                boundary_mask |= batch.mask_inlet.view(-1).to(device=V.device).bool()
-            if hasattr(batch, "mask_outlet"):
-                boundary_mask |= batch.mask_outlet.view(-1).to(device=V.device).bool()
+        e_dir = F.normalize(edge_vec, p=2, dim=-1, eps=1e-8)
+        n_dir_row = F.normalize(wall_normals[row], p=2, dim=-1, eps=1e-8)
+        n_dir_col = F.normalize(wall_normals[col], p=2, dim=-1, eps=1e-8)
 
-            boundary_normals = torch.zeros((num_nodes, 2), dtype=V.dtype, device=V.device)
-            if hasattr(batch, "x") and torch.is_tensor(batch.x) and batch.x.dim() == 2 and batch.x.shape[1] >= 5:
-                boundary_normals = batch.x[:, 3:5].to(device=V.device, dtype=V.dtype).clone()
-            if hasattr(batch, "outlet_normal") and batch.outlet_normal is not None and hasattr(batch, "mask_outlet"):
-                om = batch.mask_outlet.view(-1).to(device=V.device).bool()
-                on = batch.outlet_normal.to(device=V.device, dtype=V.dtype)
-                if on.dim() == 2 and on.shape[1] >= 2 and on.shape[0] == num_nodes:
-                    boundary_normals[om] = on[om, :2]
-            nrm = torch.linalg.norm(boundary_normals, dim=1, keepdim=True)
-            boundary_normals = boundary_normals / (nrm + 1e-12)
+        dot_prod = torch.abs((e_dir * n_dir_row).sum(dim=-1, keepdim=True))
+        dot_prod = torch.clamp(dot_prod, max=1.0)
 
-        return wls_derivatives(
-            field,
-            edge_index,
-            num_nodes,
-            V,
-            W,
-            M_inv,
-            boundary_mask=boundary_mask,
-            boundary_normals=boundary_normals,
-        )
+        sdf_nd = batch.x[:, NodeFeat.SDF]
+        sdf_edge = sdf_nd[row]
+        decay_factor = torch.exp(-self.edge_decay_k * sdf_edge)
 
-    def _stream_to_velocity(
-        self,
-        psi_raw: Tensor,
-        p: Tensor,
-        batch,
-        sdf: Tensor,
-        wall_normal: Tensor,
-    ) -> torch.Tensor:
-        """Convert (psi, p) -> (u, v, p) using WLS derivatives + manual product rule."""
-        c_psi = self._compute_wls_derivatives(psi_raw, batch)
-        psi_x = c_psi[:, 0:1, 0]
-        psi_y = c_psi[:, 1:2, 0]
-        n_x = wall_normal[:, 0:1]
-        n_y = wall_normal[:, 1:2]
-        u = (sdf ** 2) * psi_y + psi_raw * 2.0 * sdf * n_y
-        v = -((sdf ** 2) * psi_x + psi_raw * 2.0 * sdf * n_x)
-        return torch.cat([u, v, p], dim=1)
+        curve_dot = (n_dir_row * n_dir_col).sum(dim=-1, keepdim=True)
+        mod_curve = torch.log(torch.clamp(1.0 - curve_dot, min=self.curve_log_clamp_min, max=1.0)) * decay_factor
+        mod_rheo = torch.log(torch.clamp(dot_prod, min=self.rheo_log_clamp_min, max=1.0)) * decay_factor
+        mod_adv = torch.log(torch.clamp((1.0 - dot_prod), min=self.adv_log_clamp_min, max=1.0)) * decay_factor
+
+        return mod_adv, mod_rheo, mod_curve
 
     def _decode_constrained_uvp(self, z_kin: torch.Tensor, kin_in: torch.Tensor, batch) -> torch.Tensor:
         """
-        Decode latent kinematics and recover velocity analytically via product rule.
+        Decode latent kinematics directly to (u, v, p) using SDF hard constraints,
+        matching the updated GINO_DEQ model.
         """
-        psi_p = self.kinematics_decoder(z_kin)
-        psi_raw = psi_p[:, 0:1]
-        p = psi_p[:, 1:2]
-        sdf = kin_in[:, 2:3]
-        wall_normal = kin_in[:, 3:5]
-        return self._stream_to_velocity(psi_raw, p, batch, sdf, wall_normal)
+        u_v_p = self.kinematics_decoder(z_kin)
+        sdf = kin_in[:, NodeFeat.SDF]
+        uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
+        u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
+        return torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
 
     def _decode_species_log1p(self, raw_species: torch.Tensor) -> torch.Tensor:
         """Decoder predicts log1p(species_nd) directly; clamp to a safe training range."""
@@ -279,13 +255,17 @@ class GNODE_Phase3(nn.Module):
         kin_in[:, 13:14] = current_mu_eff / mu_nd_scale
         kin_encoded = self._apply_fourier_encoding(kin_in)
         mu_enc = self.mu_encoder(current_mu_eff / mu_nd_scale)
+        uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
+        p_prior = kin_in[:, NodeFeat.SHEAR_POT]
+        mu_prior = kin_in[:, NodeFeat.MU_PRIOR]
+        priors = torch.cat([uv_prior, p_prior, mu_prior], dim=1)
+        z_kin = self.z_prior_proj(priors)
 
-        z_kin = torch.zeros(num_nodes, self.latent_dim, device=device)
+        mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
         def apply_kin_processor(x):
             batch_idx = get_batch_tensor(batch, num_nodes, device)
-            mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
+            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
 
         with torch.no_grad():
             for _ in range(self.max_inner_iters):
@@ -365,17 +345,18 @@ class GNODE_Phase3(nn.Module):
 
         # Warm-start for the kinematic DEQ: carried detached between macro time steps so TBPTT
         # does not retain a cross-time graph through the fixed-point iteration.
-        z_kin_ws = torch.zeros(num_nodes, self.latent_dim, device=device)
+        kin_in_ws = batch.x[:, :15]
+        uv_prior_ws = kin_in_ws[:, NodeFeat.UV_PRIOR]
+        p_prior_ws = kin_in_ws[:, NodeFeat.SHEAR_POT]
+        mu_prior_ws = kin_in_ws[:, NodeFeat.MU_PRIOR]
+        priors_ws = torch.cat([uv_prior_ws, p_prior_ws, mu_prior_ws], dim=1)
+        z_kin_ws = self.z_prior_proj(priors_ws)
+
+        mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
         def apply_kin_processor(x):
             batch_idx = get_batch_tensor(batch, num_nodes, device)
-            mod_dummy = torch.zeros(int(batch.edge_index.shape[1]), 1, dtype=torch.float32, device=device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_dummy, mod_dummy, mod_dummy)
-
-        def odefunc_wrapper(t, z):
-            batch_idx = get_batch_tensor(batch, num_nodes, device)
-            dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx)
-            return torch.clamp(dz, min=-10.0, max=10.0)
+            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
 
         pred_trajectory = []
 
@@ -441,6 +422,27 @@ class GNODE_Phase3(nn.Module):
             total_multiplier = 1.0 + self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
             current_mu_eff = mu_base * total_multiplier
 
+            # ==========================================
+            # BIOCHEM ATTENTION MODULATOR (Streamwise + detached)
+            # ==========================================
+            dshear_dx = torch.sparse.mm(batch.G_x, gamma_dot)
+            dshear_dy = torch.sparse.mm(batch.G_y, gamma_dot)
+
+            vel_mag = torch.sqrt(u_nd ** 2 + v_nd ** 2) + 1e-8
+            u_dir = u_nd / vel_mag
+            v_dir = v_nd / vel_mag
+
+            dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
+            dshear_ds_phys = dshear_ds / torch.clamp(d_bar, min=1e-8)
+
+            row, _ = batch.edge_index
+            dshear_edge = dshear_ds_phys[row]
+
+            scaled_temp = max(self.T_grad * self.T_scale, 1e-5)
+            separation_logits = -(dshear_edge - self.sgt) / scaled_temp
+            is_separation_edge = torch.sigmoid(torch.clamp(separation_logits, min=-50.0, max=50.0))
+            mod_separation = (is_separation_edge * self.biochem_attention_boost).detach()
+
             # --- C. RECORD COUPLED STATE ---
             current_mu_eff_nd = current_mu_eff / mu_nd_scale
             # Use the ND version for the recorded trajectory
@@ -465,6 +467,11 @@ class GNODE_Phase3(nn.Module):
                     # Duplicate/near-duplicate timestamps → no evolution.
                     z_next = z_current
                 else:
+                    def odefunc_wrapper(t, z):
+                        batch_idx = get_batch_tensor(batch, num_nodes, device)
+                        dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx, mod_separation)
+                        return torch.clamp(dz, min=-10.0, max=10.0)
+
                     z_out = odeint_adjoint(
                         odefunc_wrapper,
                         z_current,

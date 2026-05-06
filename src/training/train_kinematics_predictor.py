@@ -79,7 +79,7 @@ def get_stage_physics(epoch: int, s1_end: int, s2_end: int):
         # Stage-2 keeps Newtonian labels while physics ramps internally.
         return 2, n, mu_0, "newtonian"
     else:
-        return 3, 0.358, 0.056, "carreau"
+        return 3, 0.3568, 0.056, "carreau"
 
 
 # -------------------------------------------------------------------------

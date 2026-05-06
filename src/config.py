@@ -207,7 +207,7 @@ class PhysicsConfig:
     mu_inf: float = 0.0035  # [Pa*s]
     mu_0: float = 0.056  # [Pa*s]
     lam: float = 3.313  # Relaxation time [s]
-    n: float = 0.358  # Power law index
+    n: float = 0.3568  # Power law index
     a: float = 2.0  # Yasuda parameter
 
     # Carreau momentum residual: if True, ∂μ/∂x does not backprop into predicted μ (PINN-style stability).
