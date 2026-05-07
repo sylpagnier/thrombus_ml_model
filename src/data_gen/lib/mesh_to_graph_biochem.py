@@ -1,11 +1,11 @@
-﻿"""
+"""
 Biochem synthetic mesh-to-graph conversion.
 
 **2D planar vessels only** (in-plane lumen); velocity priors match 2D plane Poiseuille,
 not 3D pipe flow.
 
 Scope: non-anchor Biochem samples (synthetic meshes / priors-only trajectory setup).
-Anchor/patient samples with COMSOL trajectories are produced by:
+Anchor samples with COMSOL trajectories are produced by:
 ``src.data_gen.lib.extract_biochem_comsol_data.PatientDataExtractor``.
 """
 
@@ -34,6 +34,7 @@ from src.utils.channel_schema import (
     KINE_Y_SCHEMA,
     attach_channel_metadata,
 )
+from src.utils.units import MESH_UNIT_M, assert_mesh_unit
 
 
 def default_biochem_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
@@ -273,6 +274,7 @@ class MeshToGraphPhase3:
             raise ValueError(
                 f"{stem}: missing sidecar JSON {json_path}; wall normal orientation requires centerline metadata."
             )
+        assert_mesh_unit(meta, MESH_UNIT_M, stem=stem, builder="MeshToGraphPhase3")
         spine_pts_nd = meta.get("centerline_pts")
         if spine_pts_nd is None:
             raise ValueError(

@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from src.config import PhysicsConfig, VesselConfig
 from src.utils.paths import get_project_root
+from src.utils.units import MESH_UNIT_M, assert_mesh_unit
 
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 
@@ -249,6 +250,7 @@ class BaseMeshToGraph(ABC):
         if d_bar is None or float(d_bar) <= 0.0:
             print(f"Skipping {filename}: missing/invalid d_bar in metadata.")
             return
+        assert_mesh_unit(meta, MESH_UNIT_M, stem=Path(filename).stem, builder=type(self).__name__)
 
         mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
         outlet_normal = self._compute_outlet_normals(mesh, nodes, mask_outlet)

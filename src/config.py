@@ -110,7 +110,17 @@ def _map_phase_to_phase(value: str) -> str:
     # Accept common aliases to keep call sites/tests robust.
     if v in ("kinematics", "phase1", "phase_1", "kine", "kine_phase"):
         return "kinematics"
-    if v in ("biochem", "phase2", "phase_2", "phase3", "phase_3", "biochem_patients", "biochem_patient"):
+    if v in (
+        "biochem",
+        "phase2",
+        "phase_2",
+        "phase3",
+        "phase_3",
+        "biochem_anchors",
+        "biochem_anchor",
+        "biochem_patients",
+        "biochem_patient",
+    ):
         return "biochem"
     raise ValueError(f"Unknown phase: {value}")
 
@@ -127,6 +137,7 @@ class VesselConfig:
 
     def __post_init__(self):
         self.template_path = comsol_models_dir() / "phase1_template.mph"
+        raw_phase = (self.phase or "").strip().lower()
         self.phase = _map_phase_to_phase(self.phase)
         self.mesh_size_factor = PHASE_DEFAULT_MESH_SIZE_FACTOR.get(self.phase, self.mesh_size_factor)
         dr = data_root()
@@ -134,6 +145,15 @@ class VesselConfig:
             self.mesh_input_dir = dr / "raw/kinematics/meshes"
             self.output_dir = dr / "processed/cfd_results_kinematics"
             self.graph_output_dir = dr / "processed/graphs_kinematics"
+        elif raw_phase in (
+            "biochem_anchors",
+            "biochem_anchor",
+            "biochem_patients",
+            "biochem_patient",
+        ):
+            self.mesh_input_dir = dr / "raw/biochem_anchors"
+            self.output_dir = dr / "processed/cfd_results_biochem"
+            self.graph_output_dir = dr / "processed/graphs_biochem_anchors"
         else:
             self.mesh_input_dir = dr / "raw/biochem"
             self.output_dir = dr / "processed/cfd_results_biochem"
@@ -191,7 +211,7 @@ class PhysicsConfig:
     cgs_p_to_pa: float = 0.1
     cgs_mu_to_pa_s: float = 0.1
 
-    # Mesh nodes farther than this from a COMSOL export coordinate are not treated as labeled (Biochem patients).
+    # Mesh nodes farther than this from a COMSOL export coordinate are not treated as labeled (Biochem anchors).
     comsol_spatial_match_tol_m: float = 1e-4
 
     # Fluid Properties
@@ -298,7 +318,7 @@ class BiochemConfig:
 
     # --- Temporal simulation (per-graph truth is authoritative) ---
     # Prefer storing COMSOL sample times on each graph as ``data.t`` [s]; lengths can differ
-    # between patients/runs. These fields are fallbacks when ``data.t`` is missing.
+    # between anchors/runs. These fields are fallbacks when ``data.t`` is missing.
     t_final: float = 30000  # Default horizon [s] if graph has no ``data.t``
     num_time_steps: int = 60  # Default count for synthetic linspace if not set by export
 
@@ -461,7 +481,7 @@ class BiochemConfig:
                 raise ValueError(
                     "Anchor biochem graph has invalid time vector: "
                     f"data.t length {t.numel()} != y time dim {t_steps}. "
-                    "Anchor/patient COMSOL exports must provide aligned time stamps."
+                    "Anchor COMSOL exports must provide aligned time stamps."
                 )
             t_last = float(t[-1].item()) if t.numel() else float(self.t_final)
             warnings.warn(
@@ -475,7 +495,7 @@ class BiochemConfig:
         if is_anchor_graph:
             raise ValueError(
                 "Anchor biochem graph is missing `data.t`. "
-                "Anchor/patient COMSOL exports must include time stamps."
+                "Anchor COMSOL exports must include time stamps."
             )
         return self._ensure_strictly_increasing_times(
             torch.linspace(0.0, float(self.t_final), steps=t_steps, device=device, dtype=torch.float32)

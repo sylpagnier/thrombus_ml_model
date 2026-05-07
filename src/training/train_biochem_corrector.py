@@ -367,23 +367,23 @@ def remap_stage_a_encoder_to_corrector(
 
 
 def load_dataset():
-    cfg_patients = VesselConfig(phase="biochem_patients")
+    cfg_anchors = VesselConfig(phase="biochem_anchors")
     cfg_synthetic = VesselConfig(phase="biochem")
 
-    patient_dir = cfg_patients.graph_output_dir
+    anchor_dir = cfg_anchors.graph_output_dir
     synthetic_dir = cfg_synthetic.graph_output_dir
 
-    patient_files = sorted(list(patient_dir.glob("*.pt"))) if patient_dir.exists() else []
+    anchor_files = sorted(list(anchor_dir.glob("*.pt"))) if anchor_dir.exists() else []
     synthetic_files = sorted(list(synthetic_dir.glob("*.pt"))) if synthetic_dir.exists() else []
 
-    if not patient_files and not synthetic_files:
+    if not anchor_files and not synthetic_files:
         print(
-            f"No Biochem graphs found in {patient_dir} or {synthetic_dir}. "
+            f"No Biochem graphs found in {anchor_dir} or {synthetic_dir}. "
             f"Please generate/extract Biochem data first."
         )
         return []
 
-    file_list = patient_files + synthetic_files
+    file_list = anchor_files + synthetic_files
     max_load_raw = os.environ.get("BIOCHEM_MAX_LOAD_VESSELS", "").strip()
     if max_load_raw:
         try:
@@ -406,7 +406,7 @@ def load_dataset():
                 f"using {len(file_list)} graph files before split."
             )
     print(
-        f"📂 Found {len(patient_files)} Biochem anchor/patient graphs + "
+        f"📂 Found {len(anchor_files)} Biochem anchor graphs + "
         f"{len(synthetic_files)} Biochem synthetic graphs for lazy loading..."
     )
 
@@ -961,15 +961,28 @@ def compute_biochem_loss(
     num_steps = len(evaluation_times) - 1
     # Keep fallback zero losses attached to the current forward graph.
     # Some sparse/synthetic batches can yield no valid residual nodes; if every
-    # active loss is a detached constant, backward() will fail.
-    z = pred_final.sum() * 0.0
+    # active loss is a detached constant, backward() will fail. We initialise each
+    # accumulator from a *fresh* ``pred_final.sum() * 0.0`` so the five tensors are
+    # independent storage. A chained ``a = b = c = z`` would alias them; subsequent
+    # in-place updates anywhere downstream would silently couple distinct losses.
+    def _zero_loss():
+        return pred_final.sum() * 0.0
+
     if num_steps <= 0:
-        l_adr_fast = l_adr_slow = l_wall_bio = l_wall_phys = l_bio_io = z
+        l_adr_fast = _zero_loss()
+        l_adr_slow = _zero_loss()
+        l_wall_bio = _zero_loss()
+        l_wall_phys = _zero_loss()
+        l_bio_io = _zero_loss()
     else:
         dt_intervals = (evaluation_times[1:] - evaluation_times[:-1]).view(-1, 1, 1)
         dt_intervals = torch.clamp(dt_intervals, min=1e-9)
         d_pred_dt = (pred_series[1:] - pred_series[:-1]) / dt_intervals
-        l_adr_fast = l_adr_slow = l_wall_bio = l_wall_phys = l_bio_io = z
+        l_adr_fast = _zero_loss()
+        l_adr_slow = _zero_loss()
+        l_wall_bio = _zero_loss()
+        l_wall_phys = _zero_loss()
+        l_bio_io = _zero_loss()
 
         for t_idx in range(num_steps):
             # Evaluate physics at step t+1 using finite difference gradient

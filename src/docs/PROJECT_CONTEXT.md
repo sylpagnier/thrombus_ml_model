@@ -10,7 +10,7 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 
 ## Terminology: Tier vs Stage
 
-- **Tier** (`kinematics` | `kinematics` | `biochem` / `biochem_patients` / `biochem_mix` in `PhysicsConfig` / `VesselConfig`): **which physics terms and data modes are enabled** (Newtonian → non-Newtonian → coupled biochem + transient graphs as configured).
+- **Tier** (`kinematics` | `kinematics` | `biochem` / `biochem_anchors` / `biochem_patients` (legacy alias) / `biochem_mix` in `PhysicsConfig` / `VesselConfig`): **which physics terms and data modes are enabled** (Newtonian → non-Newtonian → coupled biochem + transient graphs as configured).
 - **Stage** (training pipeline): **Kine phase** = unified kinematics pretraining (curriculum spans kinematics behavior to kinematics target behavior); **Biochem phase** = biochem corrector. This is about **checkpoint buckets and orchestration order**, not a different physical meaning of “phase.”
 
 ## Architecture (current)
@@ -109,7 +109,7 @@ Primary modules (also routed through `python -m src.bin.main inspect <target> --
 | Module | Purpose |
 |--------|---------|
 | `python -m src.tools.inspect_kinematics_data` | **Kinematics / 2 COMSOL anchors** (`vessel_*.npz`): **default** = full-directory health scan (flags + CSV) **then** interactive plot (random sample or `--sample-idx`; Regenerate / `r`). Also: `--summary` (compact text only), `--scan-only` (health/CSV, no GUI), `--skip-health-scan` (plot only), `--plot-static`, `--inspect-template-tags`. |
-| `python -m src.tools.inspect_biochem_data` | **Biochem** domain `.txt` + graphs: **default** = one patient at a time (brief availability line + qualitative text for that stem), one figure (domain time-slider or single-time 2×2; graph-only stems use graph views). **Regenerate Random Patient** / `r` like kinematics. `--summary` = full table only. `--no-regenerate` fixes the current stem (`biochem` / `biochem_patients` / `biochem_mix`). |
+| `python -m src.tools.inspect_biochem_data` | **Biochem** domain `.txt` + graphs: **default** = one anchor stem at a time (brief availability line + qualitative text for that stem), one figure (domain time-slider or single-time 2×2; graph-only stems use graph views). **Regenerate Random Anchor** / `r` like kinematics. `--summary` = full table only. `--no-regenerate` fixes the current stem (`biochem` / `biochem_anchors` / `biochem_mix`; legacy `biochem_patients` still accepted). |
 | `python -m src.tools.inspect_comsol_model` | Live **COMSOL** model browser (`mph`): `--list-models`, `--model`, `--all-models`. |
 | `python -m src.tools.inspect_graph_sample` | **Processed** `.pt` graphs (kinematics/stage A style): COMSOL overlap, WLS condition numbers, BC masks, widgets. |
 | `python -m src.tools.verify_deq_convergence` | Manual Picard vs Anderson residual curves (not pytest). |

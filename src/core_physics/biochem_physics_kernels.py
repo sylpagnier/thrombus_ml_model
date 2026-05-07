@@ -226,21 +226,18 @@ class BiochemPhysicsKernels:
         fast_species = SPECIES_GROUPS["fast"]
         slow_species = SPECIES_GROUPS["slow"]
 
-        z = species_preds.sum() * 0.0
-        adr_losses_fast = z
-        adr_losses_slow = z
+        # Independent accumulators: keep both tied to ``species_preds`` for autograd, but
+        # ensure ``adr_losses_fast`` and ``adr_losses_slow`` are *separate* tensors. A
+        # shared reference combined with the in-place ``+=`` below would silently make
+        # both losses equal to the sum across all species (each accumulator mutates the
+        # same storage), which neutralises the fast/slow Kendall weighting downstream.
+        adr_losses_fast = species_preds.sum() * 0.0
+        adr_losses_slow = species_preds.sum() * 0.0
 
         u_ref = spatial_props['u_ref'].to(device=species_preds.device, dtype=species_preds.dtype)
         d_bar = spatial_props['d_bar'].to(device=species_preds.device, dtype=species_preds.dtype)
         u_ref_safe = torch.clamp(u_ref, min=1e-8)
         d_bar_safe = torch.clamp(d_bar, min=1e-8)
-
-        # Dynamic graph-level dimensionless groups from geometry + flow.
-        u_ref_scalar = torch.clamp(u_ref_safe.reshape(-1).mean(), min=1e-8)
-        d_bar_scalar = torch.clamp(d_bar_safe.reshape(-1).mean(), min=1e-8)
-        Pe_RP = (u_ref_scalar * d_bar_scalar) / max(self.cfg.D_RP * self.D_scale, 1e-18)
-        Pe_FG = (u_ref_scalar * d_bar_scalar) / max(self.cfg.D_FG * self.D_scale, 1e-18)
-        Da_adhesion = (self.cfg.k_rs * d_bar_scalar) / u_ref_scalar
 
         keys = BULK_SPECIES_ORDER
         bulk_n = len(keys)
@@ -283,32 +280,16 @@ class BiochemPhysicsKernels:
             advection_nd = u * dC_dx_nd + v * dC_dy_nd
 
             # Diffusion in dimensionless form: div((1/Pe) grad(C_nd)).
+            # Even with constant base D, 1/Pe is spatially varying because u_ref and d_bar vary.
             laplacian_C_nd = torch.sparse.mm(data.Laplacian, C_col_nd).squeeze(1)
             inv_pe = as_tensor_like(D, like=u_ref_safe) / (u_ref_safe * d_bar_safe)
-            if sp in keller_species:
-                inv_pe_col = inv_pe.unsqueeze(1)
-                dinvpe_dx = torch.sparse.mm(data.G_x, inv_pe_col).squeeze(1)
-                dinvpe_dy = torch.sparse.mm(data.G_y, inv_pe_col).squeeze(1)
-                diffusion_nd = (inv_pe * laplacian_C_nd) + (dinvpe_dx * dC_dx_nd + dinvpe_dy * dC_dy_nd)
-            else:
-                D_char = D if torch.is_tensor(D) else torch.tensor(D, device=C_nd.device, dtype=C_nd.dtype)
-                Pe_char = (u_ref_scalar * d_bar_scalar) / torch.clamp(
-                    D_char if D_char.dim() == 0 else D_char.reshape(-1).mean(),
-                    min=1e-18,
-                )
-                if key == "RP":
-                    Pe_char = torch.clamp(Pe_RP, min=1e-8)
-                elif key == "FG":
-                    Pe_char = torch.clamp(Pe_FG, min=1e-8)
-                inv_pe_char = 1.0 / torch.clamp(Pe_char, min=1e-8)
-                diffusion_nd = inv_pe_char * laplacian_C_nd
+            inv_pe_col = inv_pe.unsqueeze(1)
+            dinvpe_dx = torch.sparse.mm(data.G_x, inv_pe_col).squeeze(1)
+            dinvpe_dy = torch.sparse.mm(data.G_y, inv_pe_col).squeeze(1)
+            diffusion_nd = (inv_pe * laplacian_C_nd) + (dinvpe_dx * dC_dx_nd + dinvpe_dy * dC_dy_nd)
 
-            # Dimensionless reaction scale: (d_bar/u_ref) * (R/C_ref) = Da * R_nd
-            if sp in (BulkSpecies.RP, BulkSpecies.AP):
-                reaction_rate_nd = R / torch.clamp(self.cfg.k_rs * scale_c, min=1e-12)
-                reaction_nd = Da_adhesion * reaction_rate_nd
-            else:
-                reaction_nd = (d_bar_safe / u_ref_safe) * (R / torch.clamp(scale_c, min=1e-12))
+            # Local convective-time reaction scale for all species.
+            reaction_nd = (d_bar_safe / u_ref_safe) * (R / torch.clamp(scale_c, min=1e-12))
 
             if sp in SPECIES_GROUPS["solid"]:
                 # Polymerized fibrin is a solid matrix; it does not advect or diffuse.
@@ -322,8 +303,13 @@ class BiochemPhysicsKernels:
                 u_ref=u_ref_safe,
             )
 
-            # Fully non-dimensional ADR residual with balanced O(1) terms.
-            residual_nd = dC_dt_nd + time_ratio * (advection_nd - diffusion_nd - reaction_nd)
+            # Fully non-dimensional ADR residual scaled to Convective Time (O(1)).
+            # Dividing the temporal term by ``time_ratio`` (instead of multiplying the
+            # spatial terms by it) collapses advection / diffusion / reaction onto the
+            # same magnitude scale as the chemistry, so the optimizer can "see" the
+            # reaction equations alongside transport instead of being dominated by
+            # O(1e6) convective gradients.
+            residual_nd = (dC_dt_nd / time_ratio) + advection_nd - diffusion_nd - reaction_nd
             loss_c = torch.mean(residual_nd ** 2)
 
             if sp in fast_species:
@@ -464,6 +450,13 @@ class BiochemPhysicsKernels:
         d_bar = spatial_props['d_bar'].to(biochem_preds.device)
         d_bar_safe = torch.clamp(d_bar, min=1e-8)
 
+        # Local convective time at the wall (used by both the surface ODE residuals
+        # below and the Neumann flux normalization further down).
+        d_bar_wall = d_bar_safe[mask_wall]
+        u_ref_wall = spatial_props['u_ref'].to(biochem_preds.device)[mask_wall]
+        u_ref_wall_safe = torch.clamp(u_ref_wall, min=1e-8)
+        conv_time = d_bar_wall / u_ref_wall_safe
+
         # Streamwise Directional Derivative (d/ds)
         dshear_dx = torch.sparse.mm(data.G_x, global_shear.unsqueeze(1)).squeeze(1)
         dshear_dy = torch.sparse.mm(data.G_y, global_shear.unsqueeze(1)).squeeze(1)
@@ -520,10 +513,13 @@ class BiochemPhysicsKernels:
         R_Mat = k_pa_wall * M
 
         # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
-        # Apply chain rule: res = (dM/dt_nd - t_ref_global * R_M) / Minf
-        res_M = (dM_dt_nd - t_ref_global * R_M) / Minf
-        res_Mas = (dMas_dt_nd - t_ref_global * R_Mas) / Minf
-        res_Mat = (dMat_dt_nd - t_ref_global * R_Mat) / Minf
+        # Apply chain rule and rescale to local Convective Time (O(1)) so the surface
+        # ODE landscape matches the bulk ADR loss landscape.
+        # Equivalent to (dM/dt_global - R_M) but expressed via dM/dt_nd:
+        #   res = conv_time * (dM/dt_nd / t_ref_global - R_M) / Minf
+        res_M = conv_time * ((dM_dt_nd / t_ref_global) - R_M) / Minf
+        res_Mas = conv_time * ((dMas_dt_nd / t_ref_global) - R_Mas) / Minf
+        res_Mat = conv_time * ((dMat_dt_nd / t_ref_global) - R_Mat) / Minf
 
         loss_surface = (
                                F.huber_loss(res_M, torch.zeros_like(res_M), delta=self._biochem_huber_delta) +
@@ -552,7 +548,8 @@ class BiochemPhysicsKernels:
         wall_normals = data.x[mask_wall, BiochemNodeFeat.WALL_NORMAL]
         nx = wall_normals[:, 0]
         ny = wall_normals[:, 1]
-        u_ref_wall = spatial_props['u_ref'].to(biochem_preds.device)[mask_wall]
+        # ``u_ref_wall`` is hoisted above near ``conv_time`` so it can be shared by
+        # the surface ODE residuals and this Neumann flux normalization.
 
         a_RBC_m_wall = self.cfg.d_RBC / 2.0
         D_s_wall = 0.18 * (a_RBC_m_wall ** 2) * shear_wall

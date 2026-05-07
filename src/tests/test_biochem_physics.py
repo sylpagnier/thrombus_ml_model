@@ -30,7 +30,7 @@ class TestPhase3Physics(unittest.TestCase):
     def setUpClass(cls):
         """Create output directory for visualizations relative to project root."""
         root = get_project_root()
-        cls.vis_dir = root / "data/processed/graphs_biochem_patients/sanity_checks"
+        cls.vis_dir = root / "data/processed/graphs_biochem_anchors/sanity_checks"
         cls.vis_dir.mkdir(parents=True, exist_ok=True)
 
     def setUp(self):
@@ -59,7 +59,7 @@ class TestPhase3Physics(unittest.TestCase):
         """Return one extracted Phase-3 graph path if present."""
         root = get_project_root()
         candidate_dirs = [
-            root / "data/processed/graphs_biochem_patients",
+            root / "data/processed/graphs_biochem_anchors",
             root / "data/processed/graphs_biochem",
         ]
         for directory in candidate_dirs:
@@ -128,6 +128,25 @@ class TestPhase3Physics(unittest.TestCase):
         if not raw:
             return float(default)
         return float(raw)
+
+    def _mean_rel_err(self, pred: np.ndarray, target: np.ndarray, eps: float = 1e-12) -> float:
+        pred = np.asarray(pred, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        denom = np.maximum(np.abs(target), eps)
+        return float(np.mean(np.abs(pred - target) / denom))
+
+    def _p95_rel_err(self, pred: np.ndarray, target: np.ndarray, eps: float = 1e-12) -> float:
+        pred = np.asarray(pred, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        denom = np.maximum(np.abs(target), eps)
+        return float(np.percentile(np.abs(pred - target) / denom, 95))
+
+    def _nrmse(self, pred: np.ndarray, target: np.ndarray, eps: float = 1e-12) -> float:
+        pred = np.asarray(pred, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        rmse = np.sqrt(np.mean((pred - target) ** 2))
+        scale = max(float(np.max(target) - np.min(target)), eps)
+        return float(rmse / scale)
 
     def test_comsol_constants_mapping(self):
         """Verify fundamental COMSOL parameters are correctly inherited and scaled."""
@@ -214,31 +233,38 @@ class TestPhase3Physics(unittest.TestCase):
         """
         Data-driven oracle test:
         reads COMSOL export rows and verifies PyTorch kinetics per row.
-        """
-        import os
-        import pandas as pd
-        from src.utils.oracle_csv import oracle_enabled, read_comsol_oracle_table
 
-        if not oracle_enabled(os.environ.get("RUN_COMSOL_ORACLES")):
-            self.skipTest("Set RUN_COMSOL_ORACLES=1 to run COMSOL oracle tests.")
+        This test is required in CI: the fixture must be present under
+        ``src/tests/fixtures/oracle_kinetics.csv`` (or ``.txt``).
+        """
+        from src.utils.oracle_csv import read_comsol_oracle_table
 
         root = get_project_root()
         oracle_csv = root / "src/tests/fixtures/oracle_kinetics.csv"
         oracle_txt = root / "src/tests/fixtures/oracle_kinetics.txt"
         oracle_path = oracle_csv if oracle_csv.exists() else oracle_txt
-        if not oracle_path.exists():
-            self.skipTest(
-                f"Oracle file not found at {oracle_csv} or {oracle_txt}. "
-                "Export from COMSOL to run this test."
-            )
+        self.assertTrue(
+            oracle_path.exists(),
+            (
+                f"COMSOL kinetics oracle fixture is required but missing: "
+                f"expected {oracle_csv} or {oracle_txt}. "
+                "Commit the COMSOL export under src/tests/fixtures/."
+            ),
+        )
 
         df = read_comsol_oracle_table(oracle_path, expected_cols=11)
-        if len(df) == 0:
-            self.skipTest(f"Oracle file has no numeric rows after parsing: {oracle_path}")
+        self.assertGreater(
+            len(df),
+            0,
+            f"COMSOL oracle file must contain numeric rows after parsing: {oracle_path}",
+        )
         df.columns = [
             "time", "th", "at", "fg", "apr", "aps", "gamma", "omega", "k_pa_chem", "r_fi", "fi"
         ]
 
+        gamma_rel = []
+        omega_rel = []
+        rfi_rel = []
         for _, row in df.iterrows():
             with self.subTest(time=float(row["time"])):
                 # CSV species are in uM. Kinetics run in C_scale space.
@@ -260,24 +286,30 @@ class TestPhase3Physics(unittest.TestCase):
                 omega_pt = self.kinetics.compute_omega(APR, APS, T)
                 _, r_fi_pt = self.kinetics.compute_fibrin_kinetics(T, FG, FI)
 
-                self.assertAlmostEqual(
-                    float(gamma_pt.item()),
-                    expected_gamma,
-                    places=2,
-                    msg=f"Gamma mismatch at t={row['time']}",
+                gamma_pred = float(gamma_pt.item())
+                omega_pred = float(omega_pt.item())
+                rfi_pred = float(r_fi_pt.item())
+
+                gamma_rel.append(abs(gamma_pred - expected_gamma) / max(abs(expected_gamma), 1e-12))
+                omega_rel.append(abs(omega_pred - expected_omega) / max(abs(expected_omega), 1e-12))
+                rfi_rel.append(abs(rfi_pred - expected_r_fi) / max(abs(expected_r_fi), 1e-12))
+
+                self.assertTrue(
+                    np.isclose(gamma_pred, expected_gamma, rtol=2e-2, atol=1e-3),
+                    msg=f"Gamma mismatch at t={row['time']}: pred={gamma_pred:.6e}, exp={expected_gamma:.6e}",
                 )
-                self.assertAlmostEqual(
-                    float(omega_pt.item()),
-                    expected_omega,
-                    places=4,
-                    msg=f"Omega mismatch at t={row['time']}",
+                self.assertTrue(
+                    np.isclose(omega_pred, expected_omega, rtol=1e-2, atol=1e-4),
+                    msg=f"Omega mismatch at t={row['time']}: pred={omega_pred:.6e}, exp={expected_omega:.6e}",
                 )
-                self.assertAlmostEqual(
-                    float(r_fi_pt.item()),
-                    expected_r_fi,
-                    places=1,
-                    msg=f"Fibrin rate mismatch at t={row['time']}",
+                self.assertTrue(
+                    np.isclose(rfi_pred, expected_r_fi, rtol=2e-2, atol=2e-2),
+                    msg=f"Fibrin rate mismatch at t={row['time']}: pred={rfi_pred:.6e}, exp={expected_r_fi:.6e}",
                 )
+
+        self.assertLessEqual(float(np.mean(np.asarray(gamma_rel))), 0.01, "Gamma mean relative error exceeds 1%.")
+        self.assertLessEqual(float(np.mean(np.asarray(omega_rel))), 0.005, "Omega mean relative error exceeds 0.5%.")
+        self.assertLessEqual(float(np.mean(np.asarray(rfi_rel))), 0.01, "r_fi mean relative error exceeds 1%.")
 
     def test_wls_sparse_operators_match_analytic_polynomial(self):
         """G_x/G_y must recover analytic derivatives on a simple structured mesh interior."""
@@ -522,8 +554,30 @@ class TestPhase3Physics(unittest.TestCase):
 
     def test_biochem_comsol_gt_residuals_are_close_vs_permuted_baseline(self):
         """
-        Ground-truth trajectory should remain substantially closer to Phase-3 physics/biochem kernels
-        than a geometry-breaking node permutation baseline.
+        Ground-truth trajectory should remain substantially closer to Phase-3
+        physics/biochem kernels than a *physics-breaking* baseline.
+
+        Now that the ADR + wall residuals are scaled to local **Convective Time**
+        (terms collapsed to O(1) in
+        ``BiochemPhysicsKernels.biochem_adr_residual`` / ``biochem_wall_residual``),
+        a single composite baseline is too coarse: the slow, reaction-dominated
+        species (AT, FG, FI) are essentially invariant to a node permutation,
+        while the fast, transport-dominated species only mildly respond to a
+        per-node concentration shift. We therefore evaluate two *independent*
+        breakers and route each ratio to its physically appropriate one:
+
+        1. **Transport Breaker (node permutation).** Permutes ``y[t+1]`` so that
+           each node's sparse-WLS spatial gradients use the wrong neighbour
+           values. This inflates advection / diffusion-dominated residuals
+           (NS, ADR_fast).
+        2. **Reaction Breaker (concentration shift in log1p space).** Adds
+           ``species_shift`` (default 0.5) to every biochem channel, which is
+           roughly a 65% increase in linear concentration for ``C >> scale``
+           and exposes the non-linear mass-action / Michaelis-Menten kinetics.
+           This inflates reaction-dominated residuals (ADR_slow).
+
+        Override knobs:
+            PHASE3_BASELINE_SPECIES_SHIFT  log1p-space additive shift (default 0.5)
         """
         graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
@@ -533,14 +587,21 @@ class TestPhase3Physics(unittest.TestCase):
         if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
             self.skipTest(f"{graph_path.name} does not contain a usable Phase-3 trajectory.")
 
+        # NOTE: Now that ADR + wall residuals are scaled to local Convective Time
+        # (O(1)), the absolute P95 bounds collapse from O(1e6) to O(1). The
+        # default P95 bounds below assume the *new* normalized scale; CI/CD can
+        # still override via env vars (PHASE3_ADR_*_P95_MAX, etc.).
         ratio_ns_max = self._env_float("PHASE3_NS_RATIO_MAX", 0.5)
         ratio_adr_fast_max = self._env_float("PHASE3_ADR_FAST_RATIO_MAX", 0.95)
-        ratio_adr_slow_max = self._env_float("PHASE3_ADR_SLOW_RATIO_MAX", 0.95)
+        # Reaction-dominated slow species should be drastically inflated by the
+        # reaction breaker; tighten the ratio gate accordingly.
+        ratio_adr_slow_max = self._env_float("PHASE3_ADR_SLOW_RATIO_MAX", 0.85)
         abs_ns_p95_max = self._env_float("PHASE3_NS_P95_MAX", 80.0)
-        abs_adr_fast_p95_max = self._env_float("PHASE3_ADR_FAST_P95_MAX", 12.0)
-        abs_adr_slow_p95_max = self._env_float("PHASE3_ADR_SLOW_P95_MAX", 12.0)
+        abs_adr_fast_p95_max = self._env_float("PHASE3_ADR_FAST_P95_MAX", 2.0)
+        abs_adr_slow_p95_max = self._env_float("PHASE3_ADR_SLOW_P95_MAX", 2.0)
         abs_wall_bio_p95_max = self._env_float("PHASE3_WALL_BIO_P95_MAX", 6.0)
         abs_wall_flux_p95_max = self._env_float("PHASE3_WALL_FLUX_P95_MAX", 6.0)
+        species_shift = self._env_float("PHASE3_BASELINE_SPECIES_SHIFT", 0.5)
 
         core = PhysicsKernels(phys_cfg=self.phys_cfg)
         kernels = BiochemPhysicsKernels(self.bio_cfg, core)
@@ -577,8 +638,11 @@ class TestPhase3Physics(unittest.TestCase):
                 "Wall_flux": float(l_w_phy.item()),
             }
 
+        # Independent accumulators so each ratio is compared against the
+        # physically appropriate breaker (see docstring).
         good_terms = []
-        bad_terms = []
+        bad_transport_terms = []
+        bad_rxn_terms = []
         n_intervals = int(data.y.shape[0] - 1)
         for i in range(n_intervals):
             y0 = data.y[i].detach()
@@ -591,9 +655,22 @@ class TestPhase3Physics(unittest.TestCase):
             g = torch.Generator(device=y1.device)
             g.manual_seed(hash((graph_path.stem, i, "biochem_perm")) % (2**31))
             perm = torch.randperm(y1.shape[0], generator=g, device=y1.device)
-            y1_bad = y1[perm]
-            d_dt_bad = d_dt[perm]
-            bad_terms.append(_eval_terms(y1_bad, d_dt_bad))
+
+            # 1. Transport Breaker: permute nodes spatially. This corrupts every
+            #    sparse spatial-gradient stencil so advection / diffusion (and NS)
+            #    spike, while per-node reaction values are merely relabelled.
+            y1_bad_transport = y1[perm].clone()
+            d_dt_bad_transport = d_dt[perm].clone()
+            bad_transport_terms.append(_eval_terms(y1_bad_transport, d_dt_bad_transport))
+
+            # 2. Reaction Breaker: shift bulk biochem + wall concentrations in
+            #    log1p space without permuting nodes. Spatial gradients survive
+            #    but the stiff non-linear chemistry sees a real perturbation.
+            #    Slow species (AT/FG/FI) are reaction-invariant under pure
+            #    permutation; this gives them a baseline they actually move on.
+            y1_bad_rxn = y1.clone()
+            y1_bad_rxn[:, 4:16] = y1_bad_rxn[:, 4:16] + species_shift
+            bad_rxn_terms.append(_eval_terms(y1_bad_rxn, d_dt))
 
         def _mean(name: str, terms: list[dict]) -> float:
             return float(np.mean(np.asarray([d[name] for d in terms], dtype=np.float64)))
@@ -601,12 +678,16 @@ class TestPhase3Physics(unittest.TestCase):
         def _p95(name: str, terms: list[dict]) -> float:
             return float(np.percentile(np.asarray([d[name] for d in terms], dtype=np.float64), 95))
 
-        def _ratio(name: str) -> float:
-            return _mean(name, good_terms) / max(_mean(name, bad_terms), 1e-12)
-
-        ratio_ns = _ratio("NS")
-        ratio_adr_f = _ratio("ADR_fast")
-        ratio_adr_s = _ratio("ADR_slow")
+        # NS and ADR_fast are transport-dominated -> compare against the
+        # transport breaker. ADR_slow is reaction-dominated -> compare against
+        # the reaction breaker.
+        ratio_ns = _mean("NS", good_terms) / max(_mean("NS", bad_transport_terms), 1e-12)
+        ratio_adr_f = _mean("ADR_fast", good_terms) / max(
+            _mean("ADR_fast", bad_transport_terms), 1e-12
+        )
+        ratio_adr_s = _mean("ADR_slow", good_terms) / max(
+            _mean("ADR_slow", bad_rxn_terms), 1e-12
+        )
 
         self.assertLessEqual(
             ratio_ns,
@@ -673,8 +754,12 @@ class TestPhase3Physics(unittest.TestCase):
         kpa_comsol = kpa_chem_np + kpa_mech_np
 
         correlation = float(np.corrcoef(kpa_pt.numpy(), kpa_comsol)[ 0, 1 ])
-        self.assertGreater(correlation, 0.98,
+        self.assertGreater(correlation, 0.995,
                            "PyTorch soft-logic for k_pa deviates too far from COMSOL rigid logic.")
+        mre = self._mean_rel_err(kpa_pt.numpy(), kpa_comsol, eps=1e-8)
+        p95 = self._p95_rel_err(kpa_pt.numpy(), kpa_comsol, eps=1e-8)
+        self.assertLessEqual(mre, 0.02, f"k_pa mean relative error too high: {mre:.4f}")
+        self.assertLessEqual(p95, 0.05, f"k_pa p95 relative error too high: {p95:.4f}")
 
     def test_platelet_viscosity_mu1(self):
         """
@@ -696,9 +781,18 @@ class TestPhase3Physics(unittest.TestCase):
             val_to=self.bio_cfg.mu_ratio_max - 1.0
         )
 
-        correlation = float(np.corrcoef(mu1_pt_strict, mu1_comsol)[ 0, 1 ])
-        self.assertGreater(correlation, 0.98,
+        correlation = float(np.corrcoef(mu1_pt_strict, mu1_comsol)[0, 1])
+        self.assertGreater(correlation, 0.995,
                            "PyTorch soft-logic for mu1 deviates too far from COMSOL smooth step.")
+        nrmse = self._nrmse(mu1_pt_strict, mu1_comsol)
+        self.assertLessEqual(nrmse, 0.03, f"mu1 NRMSE too high: {nrmse:.4f}")
+        transition = np.abs(mat_np - 2e7) <= (7e6 / 2.0)
+        transition_mae = float(np.mean(np.abs(mu1_pt_strict[transition] - mu1_comsol[transition])))
+        self.assertLessEqual(
+            transition_mae,
+            0.05 * max(self.bio_cfg.mu_ratio_max - 1.0, 1e-6),
+            f"mu1 transition-band MAE too high: {transition_mae:.4f}",
+        )
 
         # Ensure mathematical bounds are respected (0.0 to Max-1)
         self.assertLessEqual(np.max(mu1_pt_strict), self.model.mu_ratio_max)
@@ -715,7 +809,6 @@ class TestPhase3Physics(unittest.TestCase):
 
         self.model.T_scale = 1.0
         mu2_pt_strict = self.model.mu2_sigmoid(fi_tensor).numpy()
-
         self.model.T_scale = 5.0
         mu2_pt_relaxed = self.model.mu2_sigmoid(fi_tensor).numpy()
 
@@ -726,6 +819,11 @@ class TestPhase3Physics(unittest.TestCase):
             val_from=0.0,
             val_to=self.bio_cfg.mu_ratio_max
         )
+        corr_strict = float(np.corrcoef(mu2_pt_strict, mu2_comsol)[0, 1])
+        self.assertGreater(corr_strict, 0.96, "mu2 strict-shape correlation too low vs COMSOL.")
+        # Relaxed curve (higher temperature) is visualized for diagnostics only; strict curve is the parity target.
+        nrmse = self._nrmse(mu2_pt_strict, mu2_comsol)
+        self.assertLessEqual(nrmse, 0.13, f"mu2 NRMSE too high: {nrmse:.4f}")
 
         plt.figure(figsize=(10, 6))
         plt.plot(fi_range, mu2_comsol, 'r-', linewidth=3, label='COMSOL Exact Smoothed Step (Ground Truth)')
@@ -889,7 +987,7 @@ class TestPhase3Physics(unittest.TestCase):
         min_accuracy_pct_first = 90.0
         # Relaxed from 40.0 to 20.0 to account for WLS Gibbs phenomena at the clot
         # boundary, smooth Soft-STE relaxations, and QSSA assumptions.
-        min_accuracy_pct_trajectory = 20.0
+        min_accuracy_pct_trajectory = self._env_float("PHASE3_MIN_TRAJECTORY_ACCURACY_PCT", 75.0)
         # Late-time NS drift guard: max momentum residual allowed over final 20% of intervals.
         max_late_ns_residual = 70.0
         graph_path = self._find_extracted_biochem_graph()

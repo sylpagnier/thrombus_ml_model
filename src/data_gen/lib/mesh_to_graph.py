@@ -40,6 +40,7 @@ from src.utils.channel_schema import (
     KINE_Y_SCHEMA,
     attach_channel_metadata,
 )
+from src.utils.units import MESH_UNIT_M, assert_mesh_unit
 
 
 def _clip_wss_magnitude_quantile(
@@ -231,6 +232,7 @@ class MeshToGraph(MeshToGraphComplete):
             raise ValueError(
                 f"{stem}: missing sidecar JSON {json_path}; flow priors and wall normal orientation require centerline metadata."
             )
+        assert_mesh_unit(meta, MESH_UNIT_M, stem=stem, builder="MeshToGraph")
         spine_pts_nd = meta.get("centerline_pts")
         spine_tangents = meta.get("centerline_tangents")
         if spine_pts_nd is None or spine_tangents is None:
@@ -578,7 +580,7 @@ def build_mesh_converter(
 
     If ``is_non_newtonian`` is True, the Phase-3 pipeline is selected regardless of ``phase``.
     If False, Kinematics/2-style graphs are built. If None (default), ``phase`` alone decides
-    (``biochem`` / ``biochem_patients`` / ``biochem_mix`` → Biochem).
+    (``biochem`` / ``biochem_anchors`` / ``biochem_patients`` / ``biochem_mix`` → Biochem).
     """
     t = (phase or "kinematics").lower()
     if is_non_newtonian is True:
@@ -587,7 +589,7 @@ def build_mesh_converter(
         return MeshToGraphPhase3(**kwargs)
     if is_non_newtonian is False:
         return MeshToGraph(phase=phase, **kwargs)
-    if t in ("biochem", "biochem_patients", "biochem_mix"):
+    if t in ("biochem", "biochem_anchors", "biochem_patients", "biochem_mix"):
         from src.data_gen.lib.mesh_to_graph_biochem import MeshToGraphPhase3
 
         return MeshToGraphPhase3(**kwargs)

@@ -13,6 +13,7 @@ import re
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from src.utils.paths import get_project_root
 from src.utils.channel_schema import BIO_X_SCHEMA, BIO_Y_SCHEMA, attach_channel_metadata
+from src.utils.units import MESH_UNIT_CM, assert_mesh_unit
 
 
 class PatientDataExtractor:
@@ -27,7 +28,7 @@ class PatientDataExtractor:
     To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
 
     1. In COMSOL: Go to Results > Export > Data.
-    2. Main Domain: Export domain nodes to `data/processed/cfd_results_biochem_patients/<stem>.txt`
+    2. Main Domain: Export domain nodes to `data/processed/cfd_results_biochem/<stem>.txt`
        Headers must map exactly to:
        x, y, u, v, p, mu_effective, rp, ap, apr, aps, PT, th, at, fg, fi, M, Mas, Mat
     3. Boundaries: Export Edge 2D coordinates (x, y) with "Time Selection: Last" to:
@@ -37,7 +38,7 @@ class PatientDataExtractor:
     ----------------------------------
     """
 
-    def __init__(self, phase="biochem_patients", raw_dir=None, label_dir=None, proc_dir=None):
+    def __init__(self, phase="biochem_anchors", raw_dir=None, label_dir=None, proc_dir=None):
         self.root = get_project_root()
         self.vessel_cfg = VesselConfig(phase=phase)
         self.phys_cfg = PhysicsConfig(phase=phase)
@@ -154,36 +155,153 @@ class PatientDataExtractor:
 
         return normals_unit
 
-    def _load_spatial_mask(self, file_path, tree, num_nodes, tolerance=1e-5):
+    @staticmethod
+    def _empty_boundary_diagnostics(*, missing: bool = False) -> dict:
+        """Diagnostic dict returned when a boundary file is missing or empty."""
+        return {
+            "n_csv_unique": 0,
+            "n_vertex_hits": 0,
+            "vertex_hit_rate": 0.0,
+            "unmapped_ratio": 1.0 if missing else 0.0,
+            "d_median_m": float("nan"),
+            "d_p90_m": float("nan"),
+            "d_max_m": float("nan"),
+            "p2_inferred": False,
+            "status": "missing" if missing else "empty",
+        }
+
+    def _load_spatial_mask(
+        self,
+        file_path,
+        tree,
+        num_nodes,
+        *,
+        mesh_edge_scale_m: float | None = None,
+        vertex_tol_m: float = 1e-5,
+        unit_floor_m: float = 1.0e-3,
+    ):
+        """Map COMSOL boundary coords to mesh-vertex indices, with health diagnostics.
+
+        Returns ``(mask, diagnostics)``. ``diagnostics`` is a small ``dict`` recording
+        the nearest-vertex distance distribution, the vertex-hit rate, and a
+        ``p2_inferred`` flag set when the unmapped half of the export sits at
+        ~½ ``mesh_edge_scale_m`` (textbook signature of COMSOL exporting P2
+        Lagrange mid-edge nodes against a P1 mesh).
+
+        Three-tier policy:
+
+        1. **Hard error** if ``d_median > unit_floor_m`` (median residual that
+           large can only be a unit/coordinate-frame bug, *not* a P2 expansion).
+        2. **Hard error** if zero vertex matches were found at ``vertex_tol_m``
+           and the file had unique COMSOL coords (the original guard, kept).
+        3. **Loud warning** if ``vertex_hit_rate < 0.30`` (the mesh genuinely
+           doesn't cover the wall vertices that COMSOL exported).
+        4. **Info note** if a P2 export is inferred -- this is the common,
+           benign case and should not look like an alarm.
+        5. **Plain warning** otherwise when ``unmapped_ratio > 0.10``.
+        """
         mask = torch.zeros(num_nodes, dtype=torch.bool)
-        unmapped_ratio = 0.0
 
         if not file_path.exists():
-            return mask, 1.0
+            return mask, self._empty_boundary_diagnostics(missing=True)
 
         bnd_df = pd.read_csv(file_path, comment='%', sep=r'\s+', header=None)
 
         # USE CENTRALIZED SCALE
-        bnd_coords = np.unique(bnd_df.iloc[ :, -2: ].values, axis=0) * self.phys_cfg.cm_to_m
+        bnd_coords = np.unique(bnd_df.iloc[:, -2:].values, axis=0) * self.phys_cfg.cm_to_m
+        n_unique = int(len(bnd_coords))
+        if n_unique == 0:
+            return mask, self._empty_boundary_diagnostics(missing=False)
 
         distances, indices = tree.query(bnd_coords)
-        valid_matches = indices[ distances < tolerance ]
+        d_median = float(np.median(distances))
+        d_p90 = float(np.percentile(distances, 90))
+        d_max = float(distances.max())
 
-        if len(valid_matches) == 0 and len(bnd_coords) > 0:
+        # 1) Unit / coordinate-frame sanity floor: a real bug, not a P2 expansion.
+        if d_median > unit_floor_m:
             raise ValueError(
-                f"\nCRITICAL ERROR: Zero boundary nodes mapped for {file_path.name}!\n"
-                f"Attempted to map {len(bnd_coords)} nodes but none fell within the {tolerance} tolerance.\n"
-                f"Please verify that your COMSOL boundary exports are in the same spatial units (cm) as your domain export."
+                f"\nCRITICAL ERROR: median nearest-vertex distance for {file_path.name} "
+                f"is {d_median * 1e3:.3f} mm (> {unit_floor_m * 1e3:.3f} mm).\n"
+                f"This usually means the COMSOL export is in a different unit / "
+                f"coordinate frame than the mesh.\n"
+                f"Verify: boundary export is in cm, same origin/axes as the .nas mesh."
             )
 
-        mask[ valid_matches ] = True
-        unmapped_ratio = 1.0 - (len(np.unique(valid_matches)) / len(bnd_coords))
+        valid_matches = indices[distances < vertex_tol_m]
+        n_vertex_hits = int(len(np.unique(valid_matches)))
+        vertex_hit_rate = n_vertex_hits / n_unique
 
-        # Optional: Print a warning if the mask only partially maps
-        if unmapped_ratio > 0.10:
-            print(f"⚠️ Warning: {unmapped_ratio:.1%} of boundary nodes in {file_path.name} failed to map.")
+        # 2) No vertex matches at all -- existing hard error, sharper diagnostic.
+        if n_vertex_hits == 0:
+            raise ValueError(
+                f"\nCRITICAL ERROR: zero boundary nodes mapped for {file_path.name}!\n"
+                f"Attempted to map {n_unique} unique COMSOL coords; nearest "
+                f"distances span [{distances.min() * 1e6:.1f}, {d_max * 1e6:.1f}] um, "
+                f"none within the {vertex_tol_m * 1e6:.1f} um vertex tolerance.\n"
+                f"Verify that boundary exports use the same units (cm) as the domain export."
+            )
 
-        return mask, unmapped_ratio
+        mask[valid_matches] = True
+        unmapped_ratio = 1.0 - vertex_hit_rate
+
+        # P2 (quadratic-element) inference: the unmapped cluster sits at ~edge/2.
+        p2_inferred = False
+        if (
+            mesh_edge_scale_m is not None
+            and unmapped_ratio > 0.10
+            and vertex_hit_rate >= 0.30
+        ):
+            far = distances[distances >= 5 * vertex_tol_m]
+            if far.size > 0:
+                far_median = float(np.median(far))
+                lo = 0.30 * mesh_edge_scale_m
+                hi = 0.70 * mesh_edge_scale_m
+                p2_inferred = lo <= far_median <= hi
+
+        # 3) Loud warning: mesh genuinely lacks the wall vertices.
+        if vertex_hit_rate < 0.30:
+            print(
+                f"⚠️ {file_path.name}: only {vertex_hit_rate:.1%} of {n_unique} "
+                f"COMSOL boundary coords matched a mesh vertex within "
+                f"{vertex_tol_m * 1e6:.0f} um (median residual {d_median * 1e6:.1f} um, "
+                f"max {d_max * 1e6:.1f} um). The mesh may not contain the wall "
+                f"vertices COMSOL is exporting; check that the .nas mesh and the "
+                f"COMSOL geometry share the same vertex set."
+            )
+        elif p2_inferred:
+            # 4) Benign P2 export -- one informational line, no alarm bell.
+            far_median_um = float(
+                np.median(distances[distances >= 5 * vertex_tol_m])
+            ) * 1e6
+            print(
+                f"[note] {file_path.name}: P2 export inferred -- "
+                f"{n_vertex_hits}/{n_unique} vertex hits, residual cluster at "
+                f"~{far_median_um:.0f} um (~1/2 mesh edge "
+                f"{mesh_edge_scale_m * 1e6:.0f} um). Mid-edge nodes have no P1 "
+                f"counterpart and are correctly ignored."
+            )
+        elif unmapped_ratio > 0.10:
+            # 5) Unexplained partial: still worth a heads-up.
+            print(
+                f"⚠️ {file_path.name}: {unmapped_ratio:.1%} of boundary nodes "
+                f"unmapped (median {d_median * 1e6:.1f} um, p90 "
+                f"{d_p90 * 1e6:.1f} um, max {d_max * 1e6:.1f} um); not a clean "
+                f"P2 pattern -- inspect the export."
+            )
+
+        diagnostics = {
+            "n_csv_unique": n_unique,
+            "n_vertex_hits": n_vertex_hits,
+            "vertex_hit_rate": vertex_hit_rate,
+            "unmapped_ratio": unmapped_ratio,
+            "d_median_m": d_median,
+            "d_p90_m": d_p90,
+            "d_max_m": d_max,
+            "p2_inferred": p2_inferred,
+            "status": "ok",
+        }
+        return mask, diagnostics
 
     def _compute_analytic_inlet_mu_nd(self, mask_inlet, mesh_nodes, u_raw_si, v_raw_si):
         """Compute analytical Carreau inlet viscosity from a Poiseuille-style profile."""
@@ -273,6 +391,13 @@ class PatientDataExtractor:
             print(f"❌ Skipping {stem}: Mesh file (.nas/.msh) not found.")
             return
 
+        sidecar_path = self.raw_dir / f"{stem}.json"
+        sidecar_meta = None
+        if sidecar_path.exists():
+            with open(sidecar_path, "r", encoding="utf-8") as _f:
+                sidecar_meta = json.load(_f)
+        assert_mesh_unit(sidecar_meta, MESH_UNIT_CM, stem=stem, builder="PatientDataExtractor")
+
         txt_path = self.label_dir / f"{stem}.txt"
         inlet_path = self.label_dir / f"{stem}_inlet.txt"
         outlet_path = self.label_dir / f"{stem}_outlet.txt"
@@ -288,9 +413,24 @@ class PatientDataExtractor:
         num_nodes = len(mesh_nodes)
         mesh_tree = cKDTree(mesh_nodes)
 
-        mask_inlet, inlet_fail = self._load_spatial_mask(inlet_path, mesh_tree, num_nodes)
-        mask_outlet, outlet_fail = self._load_spatial_mask(outlet_path, mesh_tree, num_nodes)
-        mask_wall, wall_fail = self._load_spatial_mask(wall_path, mesh_tree, num_nodes)
+        # Mean nearest-neighbour spacing -- used to recognise the COMSOL P2 mid-edge
+        # signature (unmatched cluster sits at ~½ this value) without misclassifying
+        # genuine alignment failures.
+        if num_nodes >= 2:
+            nn_d, _ = mesh_tree.query(mesh_nodes, k=2)
+            mesh_edge_scale_m = float(np.mean(nn_d[:, 1]))
+        else:
+            mesh_edge_scale_m = None
+
+        mask_inlet, diag_inlet = self._load_spatial_mask(
+            inlet_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
+        )
+        mask_outlet, diag_outlet = self._load_spatial_mask(
+            outlet_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
+        )
+        mask_wall, diag_wall = self._load_spatial_mask(
+            wall_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
+        )
 
         # 3. AUTO-DETECT SCALE (d_bar) FROM INLET BOUNDARY
         inlet_coords = mesh_nodes[ mask_inlet.numpy() ]
@@ -522,12 +662,24 @@ class PatientDataExtractor:
         bio_inlet_bc = inlet_species_transformed.unsqueeze(0).expand(num_nodes, -1)
 
         # 10. Metadata Export
+        boundary_diagnostics = {
+            "inlet": diag_inlet,
+            "outlet": diag_outlet,
+            "wall": diag_wall,
+        }
         metadata = {
             "stem": stem,
             "quality": {
                 "max_wls_condition_number": max_cond,
                 "mass_flux_imbalance": avg_flux_imbalance,
-                "boundary_unmapped_ratio": max(inlet_fail, outlet_fail, wall_fail)
+                # Legacy field, kept for back-compat. Per-boundary diagnostics live in `boundaries`.
+                "boundary_unmapped_ratio": max(
+                    diag_inlet["unmapped_ratio"],
+                    diag_outlet["unmapped_ratio"],
+                    diag_wall["unmapped_ratio"],
+                ),
+                "mesh_edge_scale_m": mesh_edge_scale_m,
+                "boundaries": boundary_diagnostics,
             },
             "field_stats": {
                 "u_max": u_raw.max().item(),
@@ -583,9 +735,9 @@ class PatientDataExtractor:
 
         stems = sorted(list(set([ Path(f).stem for f in files ])))
 
-        for stem in tqdm(stems, desc="Extracting Biochem Patient Data"):
+        for stem in tqdm(stems, desc="Extracting Biochem anchor data"):
             self.process_patient(stem)
 
 if __name__ == "__main__":
-    extractor = PatientDataExtractor(phase="biochem_patients")
+    extractor = PatientDataExtractor(phase="biochem_anchors")
     extractor.run()

@@ -1,20 +1,20 @@
 """
 Biochem export / graph inspector: boundary checks, unit audits, summaries, and matplotlib views.
 
-**Default:** one patient at a time — **brief** availability line, qualitative text (boundaries, unit audit, graph
+**Default:** one anchor stem at a time — **brief** availability line, qualitative text (boundaries, unit audit, graph
 summary) for **that** stem only, then **one** matplotlib window (domain time-slider if multi-``@ t=``, else a
-single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). **Regenerate Random Patient** /
+single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). **Regenerate Random Anchor** /
 ``r`` cycles stems like ``inspect_kinematics_data``. For the **full** stems/times table use ``--summary``.
 
 Examples:
-    python -m src.tools.inspect_biochem_data --phase biochem_patients
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --summary
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem patient001
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --unit-audit
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --graph-summary
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --plot-domain
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --summary
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --stem patient001
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --stem vessel_001 --unit-audit
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --stem vessel_001 --graph-summary
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --stem vessel_001 --plot-domain
     python -m src.tools.inspect_biochem_data --phase biochem_mix --plot-domain-interactive
-    python -m src.tools.inspect_biochem_data --phase biochem_patients --stem vessel_001 --plot-graph
+    python -m src.tools.inspect_biochem_data --phase biochem_anchors --stem vessel_001 --plot-graph
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ FIELD_COLUMNS = [
     "Mat",
 ]
 
-_PHASE_CHOICES = ("biochem", "biochem_patients", "biochem_mix")
+_PHASE_CHOICES = ("biochem", "biochem_anchors", "biochem_mix", "biochem_patients")
 U_CMAP = "jet"
 
 
@@ -165,7 +165,7 @@ def _stem_candidates_union(export_dir: Path, graph_dir: Path) -> list[str]:
     return sorted(set(_domain_txt_stems(export_dir)) | set(_list_graph_stems(graph_dir)))
 
 
-def _attach_regenerate_patient_button(
+def _attach_regenerate_anchor_button(
     fig: plt.Figure,
     *,
     current_stem: str,
@@ -173,22 +173,22 @@ def _attach_regenerate_patient_button(
     next_holder: dict[str, str | None],
     enable: bool,
 ) -> None:
-    """Bottom-right button + ``r`` hotkey to switch to another patient (same stem list as kinematics anchor)."""
+    """Bottom-right button + ``r`` hotkey to switch to another stem (same stem list as kinematics anchor)."""
     if not enable:
         return
 
     def _go(_event=None) -> None:
         candidates = [s for s in all_stems if s != current_stem]
         if not candidates:
-            print("Only one patient available; cannot regenerate.")
+            print("Only one stem available; cannot regenerate.")
             return
         nxt = random.choice(candidates)
-        print(f"\nRegenerating to patient: {nxt}")
+        print(f"\nRegenerating to stem: {nxt}")
         next_holder["value"] = nxt
         plt.close(fig)
 
     btn_ax = fig.add_axes([0.74, 0.02, 0.23, 0.05])
-    Button(btn_ax, "Regenerate Random Patient").on_clicked(_go)
+    Button(btn_ax, "Regenerate Random Anchor").on_clicked(_go)
     fig.canvas.mpl_connect(
         "key_press_event",
         lambda e: _go() if getattr(e, "key", None) == "r" else None,
@@ -283,7 +283,7 @@ def plot_domain_trajectory_slider(
         slider.on_changed(_upd)
 
     if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
-        _attach_regenerate_patient_button(
+        _attach_regenerate_anchor_button(
             fig,
             current_stem=current_stem_for_regen,
             all_stems=regen_stems,
@@ -388,7 +388,7 @@ def plot_graph_trajectory_slider(
     slider.on_changed(_upd)
 
     if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
-        _attach_regenerate_patient_button(
+        _attach_regenerate_anchor_button(
             fig,
             current_stem=current_stem_for_regen,
             all_stems=regen_stems,
@@ -409,7 +409,7 @@ def _plot_domain_single_time_dashboard(
     current_stem_for_regen: str,
     enable_regenerate: bool,
 ) -> None:
-    """One COMSOL time slice (narrow / first block), 2×2 + optional patient Regenerate."""
+    """One COMSOL time slice (narrow / first block), 2×2 + optional anchor Regenerate."""
     domain_file = export_dir / f"{stem}.txt"
     df = _load_first_block(domain_file, sample_rows=sample_rows)
     x = df["x"].to_numpy(dtype=np.float64)
@@ -437,7 +437,7 @@ def _plot_domain_single_time_dashboard(
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    _attach_regenerate_patient_button(
+    _attach_regenerate_anchor_button(
         fig,
         current_stem=current_stem_for_regen,
         all_stems=regen_stems,
@@ -487,7 +487,7 @@ def _plot_graph_steady_dashboard_with_regen(
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    _attach_regenerate_patient_button(
+    _attach_regenerate_anchor_button(
         fig,
         current_stem=current_stem_for_regen,
         all_stems=regen_stems,
@@ -505,7 +505,7 @@ def run_biochem_default_inspector(
     sample_rows: int,
     enable_regenerate: bool = True,
 ) -> None:
-    """One patient per figure; qualitative lines + matplotlib; Regenerate picks another stem (kinematics-style)."""
+    """One anchor stem per figure; qualitative lines + matplotlib; Regenerate picks another stem (kinematics-style)."""
     all_stems = _stem_candidates_union(export_dir, graph_dir)
     if not all_stems:
         print("No domain *.txt or graph *.pt found.")
@@ -513,14 +513,14 @@ def run_biochem_default_inspector(
 
     n_show = min(5, len(all_stems))
     preview = ", ".join(all_stems[:n_show]) + (" …" if len(all_stems) > n_show else "")
-    print(f"\n{len(all_stems)} patient(s) available [{preview}]. One window at a time.\n")
+    print(f"\n{len(all_stems)} stem(s) available [{preview}]. One window at a time.\n")
 
     current = start_stem if (start_stem in all_stems) else random.choice(all_stems)
     enable_btn = enable_regenerate
 
     while True:
         next_holder: dict[str, str | None] = {"value": None}
-        print(f"--- Patient: {current} ---")
+        print(f"--- Stem: {current} ---")
         domain_path = export_dir / f"{current}.txt"
         graph_path = graph_dir / f"{current}.pt"
 
@@ -923,7 +923,7 @@ def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect biochem exports and processed graphs.")
-    parser.add_argument("--phase", type=str, default="biochem_patients", choices=list(_PHASE_CHOICES))
+    parser.add_argument("--phase", type=str, default="biochem_anchors", choices=list(_PHASE_CHOICES))
     parser.add_argument("--stem", type=str, default=None, help="Stem name without extension (e.g. vessel_001).")
     parser.add_argument(
         "--summary",
@@ -957,7 +957,7 @@ def main() -> None:
     parser.add_argument(
         "--no-regenerate",
         action="store_true",
-        help="Default mode: disable the Regenerate Random Patient button and 'r' hotkey (default is on).",
+        help="Default mode: disable the Regenerate Random Anchor button and 'r' hotkey (default is on).",
     )
     args = parser.parse_args()
 
