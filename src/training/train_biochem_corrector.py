@@ -115,6 +115,8 @@ from src.utils.batching import get_batch_tensor
 from src.utils.metrics import DynamicLossWeighter
 from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.training.physics_curriculum import ease01 as _ease01
+from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
+from src.utils.nondim import to_t_nd
 
 
 def _biochem_metrics_jsonl_path():
@@ -313,6 +315,8 @@ class PatientDataset(Dataset):
     def get(self, idx):
         path = self.file_list[idx]
         data = torch.load(path, weights_only=False)
+        data = infer_missing_schema(data, phase_hint="biochem")
+        assert_graph_schema(data, expected_y_schema=(BIO_Y_SCHEMA,))
         # Provenance for BIOCHEM_DEBUG=1 (PyG allows extra attributes on Data).
         data._biochem_path = str(path)
         # Also keep a public attribute name; some code paths / collate behavior are
@@ -474,7 +478,7 @@ def initialize_biochem_priors(model):
 def make_biochem_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> DynamicLossWeighter:
     """Per-task Kendall bounds: cap physics weights, floor supervised data weights."""
     # Hard cap the physics precision so PDE terms cannot be effectively muted.
-    phys_ceiling = 10.0
+    phys_ceiling = max(float(curriculum.biochem_physics_precision_ceiling), 1e-6)
     data_floor = max(float(curriculum.biochem_data_precision_floor), 1e-12)
     adr_s_floor = max(float(curriculum.biochem_adr_s_precision_floor), 1e-12)
     w_phys_floor = max(float(curriculum.biochem_w_phys_precision_floor), 1e-12)
@@ -502,6 +506,40 @@ def make_biochem_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> 
         f"freeze_in_warmup={curriculum.biochem_weighter_freeze_during_warmup}"
     )
     return DynamicLossWeighter(num_losses=8, min_log_var=min_lv, max_log_var=max_lv).to(device)
+
+
+def _scheduled_biochem_huber_delta(bio_cfg: BiochemConfig, epoch: int) -> float:
+    start = max(float(bio_cfg.biochem_huber_delta), 1e-8)
+    end = max(float(getattr(bio_cfg, "biochem_huber_delta_final", start)), 1e-8)
+    warmup = max(0, int(getattr(bio_cfg, "biochem_huber_delta_warmup_epochs", 0)))
+    anneal = max(1, int(getattr(bio_cfg, "biochem_huber_delta_anneal_epochs", 1)))
+    if epoch <= warmup:
+        return start
+    p = min(1.0, max(0.0, (epoch - warmup) / float(anneal)))
+    p = _ease01(p, "smoothstep")
+    return start + (end - start) * p
+
+
+def _apply_dynamic_physics_precision_ceiling(
+    loss_weighter: DynamicLossWeighter,
+    curriculum: CurriculumConfig,
+    epoch: int,
+) -> float:
+    """Ramp Kendall physics precision ceiling after data-head warmup."""
+    lo = max(float(curriculum.biochem_physics_precision_ceiling_warmup), 1e-6)
+    hi = max(float(curriculum.biochem_physics_precision_ceiling), lo)
+    warmup_end = max(0, int(curriculum.biochem_warmup_epochs))
+    ramp_epochs = max(1, int(curriculum.biochem_physics_precision_ramp_epochs))
+    if epoch <= warmup_end:
+        ceiling = lo
+    else:
+        p = min(1.0, max(0.0, (epoch - warmup_end) / float(ramp_epochs)))
+        p = _ease01(p, curriculum.biochem_curriculum_easing)
+        ceiling = lo + (hi - lo) * p
+    min_lv = -math.log(ceiling)
+    with torch.no_grad():
+        loss_weighter.per_task_min_log_var[:6].fill_(min_lv)
+    return ceiling
 
 
 def inject_biochem_kinematic_lora(model: GNODE_Phase3, rank: int = 4, alpha: float = 1.0) -> None:
@@ -683,9 +721,10 @@ def pretrain_autoencoder(model, loader, optimizer, device, kernels, epochs=5, od
                 props['d_bar'] = data.d_bar[batch_idx_nodes]
             shear_rate = kernels._compute_shear_rate(u_det, v_det, props, data)
             reaction_terms = kernels.kinetics.compute_species_reactions(species_dict, shear_rate)
+            t_ref = kernels.cfg.t_final
             target_dlog_dt = torch.stack(
                 [
-                    reaction_terms[k]
+                    (reaction_terms[k] * t_ref)
                     / (scales[:, i] * torch.clamp(torch.exp(species_now[:, i]), min=1e-8))
                     for i, k in enumerate(rxn_keys)
                 ],
@@ -737,6 +776,7 @@ def compute_biochem_loss(
     pseudo_loss_weight: float = 0.0,
 ):
     curriculum = curriculum or CurriculumConfig()
+    kernels.set_biochem_huber_delta(_scheduled_biochem_huber_delta(bio_cfg, epoch))
 
     num_nodes_d = int(data.x.shape[0])
     truth_mask = biochem_truth_node_mask(data, num_nodes_d, device)
@@ -767,7 +807,9 @@ def compute_biochem_loss(
             f"u_ref={data.u_ref!r}, d_bar={data.d_bar!r}, re_actual={getattr(data, 're_actual', None)!r}"
         )
 
-    full_times = bio_cfg.resolve_biochem_times(data, device)
+    # Pass non-dimensional time into the ODE integration window.
+    t_ref = bio_cfg.t_final
+    full_times = to_t_nd(bio_cfg.resolve_biochem_times(data, device), t_ref)
 
     actual_num_steps = int(data.y.shape[0])
     start_idx = 0
@@ -854,6 +896,7 @@ def compute_biochem_loss(
         teacher_forcing_ratio=teacher_forcing_ratio,
         start_idx=start_idx,
         initial_species=initial_species_for_window,
+        detach_macro_state=bool(model.training),
     )
 
     props = kernels.core._get_geometric_props(data)
@@ -958,6 +1001,11 @@ def compute_biochem_loss(
         l_wall_phys = l_wall_phys * inv
         l_bio_io = l_bio_io * inv
 
+    wall_surface_mult = max(float(curriculum.biochem_wall_surface_loss_multiplier), 1e-6)
+    wall_flux_mult = max(float(curriculum.biochem_wall_flux_loss_multiplier), 1e-6)
+    l_wall_bio = l_wall_bio * wall_surface_mult
+    l_wall_phys = l_wall_phys * wall_flux_mult
+
     # Fluid Mechanics (pseudo-steady snapshot at final time in the window)
     l_mom = kernels.core.navier_stokes_residual(
         pred_final[:, 0:4], data, props=props, re_ref=re_ref
@@ -968,16 +1016,6 @@ def compute_biochem_loss(
         props,
         data,
     )
-
-    # Scale volume-heavy residuals by ~1/sqrt(N) so different mesh sizes are comparable in Kendall weighting.
-    if curriculum.biochem_physics_geom_normalization:
-        geom_inv = 1.0 / math.sqrt(max(1.0, float(num_nodes_d)))
-        l_adr_fast = l_adr_fast * geom_inv
-        l_adr_slow = l_adr_slow * geom_inv
-        l_wall_bio = l_wall_bio * geom_inv
-        l_wall_phys = l_wall_phys * geom_inv
-        l_bio_io = l_bio_io * geom_inv
-        l_mom = l_mom * geom_inv
 
     # --- Auxiliary segmentation (soft clot Dice) + COMSOL temporal derivative match (physics-informed) ---
     l_seg = torch.tensor(0.0, device=device)
@@ -1029,11 +1067,12 @@ def compute_biochem_loss(
         model.ode_func.derivative_energy_sum = 0.0
         model.ode_func.derivative_eval_count = 0
 
+    visc_reg_w = max(float(curriculum.biochem_viscosity_regularization_weight), 0.0)
     loss = (
         loss_weighter(all_losses, task_active=task_active)
         + (float(pseudo_loss_weight) * l_pseudo)
         + (latent_scale * l_latent_reg)
-        + (1e-3 * l_visc_reg)
+        + (visc_reg_w * l_visc_reg)
         + (w_seg * l_seg)
         + (w_pt * l_phys_temp)
     )
@@ -1063,6 +1102,10 @@ def compute_biochem_loss(
         "L_Pseudo": l_pseudo.item(),
         "L_Latent_Reg": l_latent_reg.item(),
         "L_Visc_Reg": l_visc_reg.item(),
+        "W_Wall_Bio": wall_surface_mult,
+        "W_Wall_Phy": wall_flux_mult,
+        "W_Visc_Reg": visc_reg_w,
+        "Huber_Delta_Bio": float(kernels._biochem_huber_delta),
         "TF_eff": float(teacher_forcing_ratio),
         "ODE_Evals": ode_eval_count,
         "Has_Anchor_Supervision": float(has_anchor_supervision),
@@ -1283,7 +1326,7 @@ def _compute_anchor_dice(model, loader, kernels, bio_cfg, device) -> float:
     with torch.no_grad():
         for v_data in loader:
             v_data = v_data.to(device)
-            val_eval_times = bio_cfg.resolve_biochem_times(v_data, device)
+            val_eval_times = to_t_nd(bio_cfg.resolve_biochem_times(v_data, device), bio_cfg.t_final)
             v_pred = model(v_data, val_eval_times)
             if isinstance(v_pred, tuple):
                 v_pred = v_pred[0]
@@ -1402,7 +1445,7 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
             if src is None:
                 continue
             data = data.to(device)
-            eval_times = bio_cfg.resolve_biochem_times(data, device)
+            eval_times = to_t_nd(bio_cfg.resolve_biochem_times(data, device), bio_cfg.t_final)
             pred = teacher(data, eval_times)
             if isinstance(pred, tuple):
                 pred = pred[0]
@@ -1533,6 +1576,8 @@ def train_biochem_corrector(epochs=25, lr=1e-3):
     print("🔎 Indexing Biochem files by anchor flag (lazy split)...")
     for graph_path in all_files:
         graph = torch.load(graph_path, map_location="cpu", weights_only=False)
+        graph = infer_missing_schema(graph, phase_hint="biochem")
+        assert_graph_schema(graph, expected_y_schema=(BIO_Y_SCHEMA,))
         ia = getattr(graph, "is_anchor", None)
         if ia is None:
             is_anchor = False
@@ -1857,7 +1902,11 @@ def train_biochem_corrector(epochs=25, lr=1e-3):
         kernels.kinetics.T_scale = current_T_scale
 
         # FIX: Capitalized 'T' here as well
-        print(f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | T_scale: {current_T_scale:.2f}")
+        huber_delta_epoch = _scheduled_biochem_huber_delta(bio_cfg, epoch)
+        print(
+            f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | "
+            f"T_scale: {current_T_scale:.2f} | huber_delta: {huber_delta_epoch:.4f}"
+        )
 
         if curriculum.biochem_weighter_freeze_during_warmup:
             phys_start = wu + int(curriculum.biochem_weighter_physics_grace_epochs)
@@ -1878,6 +1927,7 @@ def train_biochem_corrector(epochs=25, lr=1e-3):
         else:
             loss_weighter.log_vars.requires_grad_(True)
 
+        current_phys_ceiling = _apply_dynamic_physics_precision_ceiling(loss_weighter, curriculum, epoch)
         model.train()
         total_loss_epoch = 0.0
         optimizer.zero_grad()
@@ -2002,6 +2052,7 @@ def train_biochem_corrector(epochs=25, lr=1e-3):
                 "L_W_Phy": f"{ema_metrics['L_W_Phy']:.2e}",
                 "TF_eff": f"{metrics['TF_eff']:.2f}",
                 "ODE": f"{int(metrics.get('ODE_Evals', 0))}",
+                "Pceil": f"{current_phys_ceiling:.0f}",
                 "t_batch": f"{batch_dt:.2f}s",
                 "A_sup": f"{anchor_supervised_batches}/{total_batches}",
                 "P_sup": f"{pseudo_supervised_batches}/{total_batches}",
@@ -2068,7 +2119,7 @@ def train_biochem_corrector(epochs=25, lr=1e-3):
 
                 for v_data in val_loader:
                     v_data = v_data.to(device)
-                    val_eval_times = bio_cfg.resolve_biochem_times(v_data, device)
+                    val_eval_times = to_t_nd(bio_cfg.resolve_biochem_times(v_data, device), bio_cfg.t_final)
                     v_pred = model(v_data, val_eval_times)
                     if isinstance(v_pred, tuple):
                         v_pred = v_pred[0]

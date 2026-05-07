@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import os
 import torch.nn.functional as F
 from torch import Tensor
 # ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
@@ -95,6 +96,12 @@ class GNODE_Phase3(nn.Module):
         self.rtol = rtol
         self.atol = atol
         self.phys_cfg = phys_cfg  # Store physics config internally
+        # Micro-step ODE restart behavior:
+        # - "rk4" is restart-friendly for short segments.
+        # - set BIOCHEM_ODE_METHOD=implicit_adams to preserve legacy behavior.
+        self.micro_ode_method = str(os.environ.get("BIOCHEM_ODE_METHOD", "rk4")).strip().lower()
+        # Optional TBPTT-style truncation at macro boundaries.
+        self.detach_macro_state_default = bool(int(os.environ.get("BIOCHEM_DETACH_MACRO_STATE", "0")))
 
         # COMSOL Step Function Approximations (Dual-Trigger)
         self.mu_ratio_max = mu_ratio_max
@@ -296,10 +303,23 @@ class GNODE_Phase3(nn.Module):
         teacher_forcing_ratio=0.0,
         start_idx=0,
         initial_species=None,
+        detach_macro_state=None,
     ):
         """
         Forward pass for the Neural ODE with Two-Way Macro-Micro Coupling.
-        evaluation_times: A 1D tensor of times [ 0.0, t1, t2, ..., t_n ] to evaluate the clot state.
+
+        Designed for long clinical time horizons (e.g., 10,000 - 30,000 seconds with ~150s
+        macro-steps, yielding 66-200 steps per trajectory).
+
+        Args:
+            batch: PyG graph batch containing spatial features.
+            evaluation_times: A 1D tensor of times [ 0.0, t1, t2, ..., t_n ] to evaluate the clot state.
+            y_true_trajectory: Ground truth log-space species trajectory for scheduled sampling.
+            teacher_forcing_ratio: Probability (0.0 to 1.0) of injecting the ground truth state at each step.
+            start_idx: Starting index for Truncated BPTT (TBPTT) offset.
+            initial_species: Optional detached state from a previous chunk for warm-starting TBPTT.
+            detach_macro_state: If True, detaches the computational graph at each macro-step
+                to prevent OOM on long 200-step rollouts.
         """
         num_nodes = int(batch.x.shape[0])
         device = batch.x.device
@@ -359,19 +379,23 @@ class GNODE_Phase3(nn.Module):
             return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
 
         pred_trajectory = []
+        detach_macro_state = self.detach_macro_state_default if detach_macro_state is None else bool(detach_macro_state)
 
         # ==========================================
         # 2. MACRO-MICRO STEPPING (Two-Way Coupling)
         # ==========================================
         for i in range(num_times):
             if self.training and y_true_trajectory is not None and i > 0:
-                # Smooth teacher forcing: blend predicted and target anchor states.
+                # Scheduled sampling in log1p-space states for long trajectories (66-200 steps):
+                # We DO NOT blend values linearly in log-space, as this physically skews concentrations.
+                # Instead, choose 100% GT or 100% model state for anchor nodes via a probabilistic coin flip.
                 tf = float(max(0.0, min(1.0, teacher_forcing_ratio)))
                 if tf > 0.0:
-                    gt_species = y_true_trajectory[i, :, 4:16].to(device)
-                    blended_species = (1.0 - tf) * current_species + tf * gt_species
-                    current_species = torch.where(truth_mask.unsqueeze(-1), blended_species, current_species)
-                    current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+                    use_ground_truth = bool((torch.rand((), device=device) < tf).item())
+                    if use_ground_truth:
+                        gt_species = y_true_trajectory[i, :, 4:16].to(device)
+                        current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, current_species)
+                        current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = batch.x[:, :15].clone()
@@ -472,18 +496,28 @@ class GNODE_Phase3(nn.Module):
                         dz = self.ode_func(t, z, batch.edge_index, batch.edge_attr, batch_idx, mod_separation)
                         return torch.clamp(dz, min=-10.0, max=10.0)
 
-                    z_out = odeint_adjoint(
-                        odefunc_wrapper,
-                        z_current,
-                        t_span,
-                        method="implicit_adams",
-                        adjoint_method="implicit_adams",
+                    # Use an explicit method (like "rk4") by default for large 150s jumps to avoid
+                    # implicit solver history-drop penalties on restarted biochemical segment solves.
+                    solver_method = self.micro_ode_method
+                    ode_kwargs = dict(
+                        method=solver_method,
+                        adjoint_method=solver_method,
                         adjoint_params=tuple(self.ode_func.parameters()),
                         # Keep forward/backward solver tolerances aligned with model config.
                         rtol=self.rtol,
                         atol=self.atol,
                         adjoint_rtol=self.rtol,
                         adjoint_atol=self.atol,
+                    )
+                    if solver_method == "rk4":
+                        # Force one fixed RK4 step over the current [t_i, t_{i+1}] segment.
+                        ode_kwargs["options"] = {"step_size": dt_seg}
+                        ode_kwargs["adjoint_options"] = {"step_size": dt_seg}
+                    z_out = odeint_adjoint(
+                        odefunc_wrapper,
+                        z_current,
+                        t_span,
+                        **ode_kwargs,
                     )
                     z_next = z_out[1]
                 raw_species = self.biochem_decoder(z_next)
@@ -497,6 +531,11 @@ class GNODE_Phase3(nn.Module):
                 # Update species state for the next macro-step
                 current_species = torch.cat([next_species_flat[:, 0:9], surface_species], dim=1)
                 current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+                if detach_macro_state:
+                    # Prevent OOM during BPTT across long 66-200 step macro trajectories on
+                    # finite-memory GPUs by severing the carried-state graph each macro step.
+                    current_species = current_species.detach()
+                    current_mu_eff = current_mu_eff.detach()
 
         # Stack into shape: [ Time, Nodes, 16 ]
         pred_series = torch.stack(pred_trajectory, dim=0)

@@ -11,6 +11,7 @@ from src.utils.paths import get_project_root, reports_evaluation_dir
 from src.architecture.ginodeq import GINO_DEQ
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.config import PhysicsConfig, PredChannels
+from src.utils.channel_schema import BIO_Y_SCHEMA, KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 
 project_root = get_project_root()
 
@@ -113,7 +114,13 @@ class ModelValidator:
             print(f"⚠️ No files found in {path}")
             return None
 
-        dataset = [torch.load(f, weights_only=False) for f in files]
+        expected_schema = KINE_Y_SCHEMA if self.phase == "kinematics" else BIO_Y_SCHEMA
+        dataset = []
+        for f in files:
+            data = torch.load(f, weights_only=False)
+            data = infer_missing_schema(data, phase_hint=self.phase)
+            assert_graph_schema(data, expected_y_schema=(expected_schema,))
+            dataset.append(data)
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
         use_itpc = (self.phase == "kinematics")

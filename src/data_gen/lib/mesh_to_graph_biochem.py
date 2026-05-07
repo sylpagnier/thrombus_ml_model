@@ -28,6 +28,12 @@ from .graph_velocity_priors import (
 from src.utils.paths import get_project_root
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
+from src.utils.channel_schema import (
+    BIO_X_SCHEMA,
+    BIO_Y_SCHEMA,
+    KINE_Y_SCHEMA,
+    attach_channel_metadata,
+)
 
 
 def default_biochem_bio_inlet_bc(num_nodes: int) -> torch.Tensor:
@@ -71,7 +77,7 @@ def assemble_biochem_transient_graph_data(
 ) -> Data:
     """Biochem non-anchor graphs: transient ``y`` + biochemistry + serialized sparse operators."""
     num_nodes = x_tensor.shape[0]
-    return Data(
+    data = Data(
         x=x_tensor,
         y=y_tensor_series,
         t=eval_times_tensor,
@@ -94,6 +100,12 @@ def assemble_biochem_transient_graph_data(
         mu_inlet_bc=mu_prior.view(-1, 1),
         bio_inlet_bc=bio_inlet_bc,
         outlet_normal=outlet_normal,
+    )
+    return attach_channel_metadata(
+        data,
+        x_schema=BIO_X_SCHEMA,
+        y_schema=BIO_Y_SCHEMA,
+        mask_wall=mask_wall,
     )
 
 
@@ -120,7 +132,7 @@ def assemble_biochem_steady_graph_data(
     Laplacian: torch.Tensor,
 ) -> Data:
     """Biochem anchor graphs (steady labels) — same kinematic payload as Kinematics/2 plus ``Laplacian``."""
-    return Data(
+    data = Data(
         x=x_tensor,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -140,6 +152,12 @@ def assemble_biochem_steady_graph_data(
         G_x=G_x,
         G_y=G_y,
         Laplacian=Laplacian,
+    )
+    return attach_channel_metadata(
+        data,
+        x_schema=BIO_X_SCHEMA,
+        y_schema=KINE_Y_SCHEMA,
+        mask_wall=mask_wall,
     )
 
 

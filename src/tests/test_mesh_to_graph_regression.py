@@ -45,7 +45,7 @@ def test_kinematics_saved_graph_includes_wls_and_sparse_gradients_without_laplac
         "u_prior": torch.zeros(3, dtype=torch.float32),
         "mu_prior": torch.ones(3, dtype=torch.float32),
     }
-    x_tensor = torch.zeros((3, 15), dtype=torch.float32)
+    x_tensor = torch.zeros((3, 18), dtype=torch.float32)
     y_labels = torch.zeros((3, 5), dtype=torch.float32)
     gx = _diag_sparse_grad(3)
     gy = _diag_sparse_grad(3)

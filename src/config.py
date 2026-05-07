@@ -107,11 +107,10 @@ PHASE_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
 
 def _map_phase_to_phase(value: str) -> str:
     v = (value or "").strip().lower()
-    if v in ("kinematics", "biochem"):
-        return v
-    if v == "kinematics":
+    # Accept common aliases to keep call sites/tests robust.
+    if v in ("kinematics", "phase1", "phase_1", "kine", "kine_phase"):
         return "kinematics"
-    if v == "biochem":
+    if v in ("biochem", "phase2", "phase_2", "phase3", "phase_3", "biochem_patients", "biochem_patient"):
         return "biochem"
     raise ValueError(f"Unknown phase: {value}")
 
@@ -385,7 +384,11 @@ class BiochemConfig:
     soft_step_T_low_shear: float = 5.0
     soft_step_T_scale: float = 1.0
     # Shared Huber delta for Biochem biochemical residuals.
+    # Long-rollout stability benefits from a tighter delta once data-fit warmup passes.
     biochem_huber_delta: float = 1.0
+    biochem_huber_delta_final: float = 0.01
+    biochem_huber_delta_warmup_epochs: int = 10
+    biochem_huber_delta_anneal_epochs: int = 40
     # Optional non-zero slope keeps adhesion gradients alive when M_tot exceeds Minf.
     availability_negative_slope: float = 0.0
 
@@ -497,11 +500,13 @@ class CurriculumConfig:
     # Biochem: Kendall loss weighter — freeze during warmup; bound effective precisions
     biochem_weighter_freeze_during_warmup: bool = True
     # Cap exp(-log_var) for physics tasks (indices 0–5: ADR_F, ADR_S, W_Bio, W_Phy, Bio_IO, NS_mom).
-    biochem_physics_precision_ceiling: float = 100.0
+    biochem_physics_precision_ceiling: float = 500.0
+    biochem_physics_precision_ceiling_warmup: float = 100.0
+    biochem_physics_precision_ramp_epochs: int = 20
     # Floors for specific physics terms that must not be down-weighted too aggressively.
     # These apply to ADR_S (index 1) and W_Phy (index 3) only.
-    biochem_adr_s_precision_floor: float = 1.0
-    biochem_w_phys_precision_floor: float = 1.0
+    biochem_adr_s_precision_floor: float = 3.0
+    biochem_w_phys_precision_floor: float = 3.0
     # Floor exp(-log_var) for supervised tasks (indices 6–7: Data_Kine, Data_Bio).
     biochem_data_precision_floor: float = 0.12
 
@@ -513,4 +518,12 @@ class CurriculumConfig:
     # After main warmup, keep physics-task log_vars frozen for extra epochs (data heads tune first).
     biochem_weighter_physics_grace_epochs: int = 3
     # Divide ADR/wall/IO/NS residuals by sqrt(num_nodes) so graphs of different sizes are comparable.
-    biochem_physics_geom_normalization: bool = True
+    # For extrapolation to finer meshes, prefer physical normalization below.
+    biochem_physics_geom_normalization: bool = False
+    # ``sqrt_nodes`` | ``num_nodes`` | ``none`` (used when ``biochem_physics_geom_normalization`` is True).
+    biochem_physics_geom_norm_mode: str = "sqrt_nodes"
+    # Static multipliers to prevent wall/surface physics from being drowned by bulk ADR.
+    biochem_wall_surface_loss_multiplier: float = 30.0
+    biochem_wall_flux_loss_multiplier: float = 30.0
+    # Dual-viscosity regularizer weight (replaces hard-coded scalar in trainer).
+    biochem_viscosity_regularization_weight: float = 0.005

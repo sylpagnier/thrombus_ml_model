@@ -238,6 +238,6 @@ class TestBiochemKineticsParity:
         assert torch.isclose(actual_d_eff_rp, expected_d_eff_rp, rtol=1e-5)
 
         # FG is not in SPECIES_GROUPS["keller"], so no D_s term.
-        expected_d_eff_fg = kernels.D_coeff["FG"]
-        actual_d_eff_fg = kernels.D_coeff["FG"]
+        expected_d_eff_fg = torch.tensor(kernels.D_coeff["FG"], dtype=torch.float32)
+        actual_d_eff_fg = torch.tensor(kernels.D_coeff["FG"], dtype=torch.float32)
         assert torch.isclose(actual_d_eff_fg, expected_d_eff_fg, rtol=1e-5)

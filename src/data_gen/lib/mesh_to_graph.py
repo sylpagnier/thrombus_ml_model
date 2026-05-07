@@ -35,6 +35,11 @@ from src.utils.paths import (
     migrate_legacy_final_n_subdir,
     migrate_legacy_vessel_meshes,
 )
+from src.utils.channel_schema import (
+    KINE_X_SCHEMA,
+    KINE_Y_SCHEMA,
+    attach_channel_metadata,
+)
 
 
 def _clip_wss_magnitude_quantile(
@@ -77,7 +82,7 @@ def assemble_kinematics_graph_data(
 
     Kinematics/2 graphs store sparse WLS gradient operators ``G_x`` / ``G_y`` for physics kernels.
     """
-    return Data(
+    data = Data(
         x=x_tensor,
         edge_index=edge_index,
         edge_attr=edge_attr,
@@ -96,6 +101,12 @@ def assemble_kinematics_graph_data(
         M_inv=M_inv,
         G_x=G_x,
         G_y=G_y,
+    )
+    return attach_channel_metadata(
+        data,
+        x_schema=KINE_X_SCHEMA,
+        y_schema=KINE_Y_SCHEMA,
+        mask_wall=mask_wall,
     )
 
 

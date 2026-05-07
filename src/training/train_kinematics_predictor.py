@@ -26,6 +26,7 @@ from src.utils.kinematics_physics_terms import compute_kinematics_physics_terms
 from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.paths import kinematics_dir
 from src.utils.training_diary import TrainingDiary
+from src.utils.channel_schema import KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
@@ -106,7 +107,10 @@ def load_dataset(phase: str, rheology: str | None = None):
     dataset = []
     print(f"📂 Loading {len(paths)} graphs from {data_dir}...")
     for f in tqdm(paths, leave=False):
-        dataset.append(torch.load(f, weights_only=False))
+        data = torch.load(f, weights_only=False)
+        data = infer_missing_schema(data, phase_hint=phase)
+        assert_graph_schema(data, expected_y_schema=(KINE_Y_SCHEMA,))
+        dataset.append(data)
     return dataset
 
 

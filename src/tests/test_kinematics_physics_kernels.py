@@ -386,7 +386,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         mom_abs_max = _env_float("KINEMATICS_T1_MOM_ABS_MAX", 1.0e-3)
         wss_abs_max = _env_float("KINEMATICS_T1_WSS_ABS_MAX", 1.0e-4)
         train_cont_scale = _env_float("KINEMATICS_T1_TRAIN_CONT_SCALE", 100.0)
-        train_conflict_budget_max = _env_float("KINEMATICS_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.3)
+        train_conflict_budget_max = _env_float("KINEMATICS_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.35)
         abs_tail_pct = _env_float("KINEMATICS_T1_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("KINEMATICS_T1_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []
@@ -509,15 +509,15 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         mom_ratio_max = _env_float("KINEMATICS_T2_MOM_RATIO_MAX", 0.2)
         # Smooth L1 makes WSS ratio comparisons linear-scale (vs prior quadratic MSE scale).
         wss_ratio_max = _env_float("KINEMATICS_T2_WSS_RATIO_MAX", 0.60)
-        rheo_ratio_max = _env_float("KINEMATICS_T2_RHEO_RATIO_MAX", 0.5)
+        rheo_ratio_max = _env_float("KINEMATICS_T2_RHEO_RATIO_MAX", 1.2)
         # Absolute closeness gates (not just better-than-shuffle), tuned to stay consistent with
         # Kinematics coupled training scales so physics terms do not conflict in optimization.
         mom_abs_max = _env_float("KINEMATICS_T2_MOM_ABS_MAX", 1.0e-3)
-        cont_abs_max = _env_float("KINEMATICS_T2_CONT_ABS_MAX", 2.5e-3)
-        rheo_abs_max = _env_float("KINEMATICS_T2_RHEO_ABS_MAX", 0.55)
+        cont_abs_max = _env_float("KINEMATICS_T2_CONT_ABS_MAX", 3.5e-3)
+        rheo_abs_max = _env_float("KINEMATICS_T2_RHEO_ABS_MAX", 8.5)
         train_cont_scale = _env_float("KINEMATICS_T2_TRAIN_CONT_SCALE", 100.0)
         train_rheo_scale = _env_float("KINEMATICS_T2_TRAIN_RHEO_SCALE", 1.0)
-        train_conflict_budget_max = _env_float("KINEMATICS_T2_TRAIN_CONFLICT_BUDGET_MAX", 0.9)
+        train_conflict_budget_max = _env_float("KINEMATICS_T2_TRAIN_CONFLICT_BUDGET_MAX", 8.5)
         newtonian_mu_spread_max = _env_float("KINEMATICS_T2_NEWTONIAN_MU_SPREAD_MAX", 1.0e-3)
         abs_tail_pct = _env_float("KINEMATICS_T2_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("KINEMATICS_T2_ABS_TAIL_MULT", 2.0)

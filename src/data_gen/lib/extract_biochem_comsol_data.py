@@ -12,6 +12,7 @@ import glob
 import re
 from src.config import VesselConfig, PhysicsConfig, BiochemConfig
 from src.utils.paths import get_project_root
+from src.utils.channel_schema import BIO_X_SCHEMA, BIO_Y_SCHEMA, attach_channel_metadata
 
 
 class PatientDataExtractor:
@@ -561,6 +562,12 @@ class PatientDataExtractor:
             mu_inlet_bc=mu_inlet_bc,
             bio_inlet_bc=bio_inlet_bc,
             outlet_normal=outlet_normals,
+        )
+        data = attach_channel_metadata(
+            data,
+            x_schema=BIO_X_SCHEMA,
+            y_schema=BIO_Y_SCHEMA,
+            mask_wall=mask_wall,
         )
 
         torch.save(data, self.proc_dir / f"{stem}.pt")

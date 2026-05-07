@@ -378,6 +378,12 @@ class PhysicsKernels:
         if (not hasattr(data, "y")) or (data.y is None) or (data.y.shape[1] <= 4):
             return pred.sum() * 0.0
 
+        if hasattr(data, "y_valid_mask") and data.y_valid_mask is not None:
+            valid_mask = data.y_valid_mask[:, PredChannels.WSS].view(-1).bool()
+            mask = mask & valid_mask
+            if not mask.any():
+                return pred.sum() * 0.0
+
         wss_mag_phys = data.y[:, PredChannels.WSS]
         return torch.nn.functional.smooth_l1_loss(
             wss_pred[mask], wss_mag_phys[mask], beta=0.01
