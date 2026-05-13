@@ -3,8 +3,9 @@ Biochem export / graph inspector: boundary checks, unit audits, summaries, and m
 
 **Default:** one anchor stem at a time — **brief** availability line, qualitative text (boundaries, unit audit, graph
 summary) for **that** stem only, then **one** matplotlib window (domain time-slider if multi-``@ t=``, else a
-single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). **Regenerate Random Anchor** /
-``r`` cycles stems like ``inspect_kinematics_data``. For the **full** stems/times table use ``--summary``.
+single domain 2×2; **graph-only** stems use graph time-slider or steady 2×2). Use Prev/Next controls (or
+left/right keys) to cycle stems manually; ``r`` still jumps to random. For the **full** stems/times table use
+``--summary``.
 
 Examples:
     python -m src.tools.inspect_biochem_data --phase biochem_anchors
@@ -57,6 +58,23 @@ FIELD_COLUMNS = [
 
 _PHASE_CHOICES = ("biochem", "biochem_anchors", "biochem_mix", "biochem_patients")
 U_CMAP = "jet"
+MU_CMAP = "viridis"
+
+
+def _robust_vmin_vmax(values: np.ndarray, *, lo: float = 1.0, hi: float = 99.0) -> tuple[float, float]:
+    """Percentile-based color limits to keep fields readable under outliers."""
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 1.0
+    vmin = float(np.percentile(arr, lo))
+    vmax = float(np.percentile(arr, hi))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin = float(np.nanmin(arr))
+        vmax = float(np.nanmax(arr))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return 0.0, 1.0
+    return vmin, vmax
 
 
 def _resolve_export_dir(phase: str) -> Path:
@@ -165,7 +183,7 @@ def _stem_candidates_union(export_dir: Path, graph_dir: Path) -> list[str]:
     return sorted(set(_domain_txt_stems(export_dir)) | set(_list_graph_stems(graph_dir)))
 
 
-def _attach_regenerate_anchor_button(
+def _attach_stem_navigation_controls(
     fig: plt.Figure,
     *,
     current_stem: str,
@@ -173,26 +191,59 @@ def _attach_regenerate_anchor_button(
     next_holder: dict[str, str | None],
     enable: bool,
 ) -> None:
-    """Bottom-right button + ``r`` hotkey to switch to another stem (same stem list as kinematics anchor)."""
+    """Attach deterministic Prev/Next + optional random stem controls."""
     if not enable:
         return
 
-    def _go(_event=None) -> None:
-        candidates = [s for s in all_stems if s != current_stem]
-        if not candidates:
-            print("Only one stem available; cannot regenerate.")
-            return
-        nxt = random.choice(candidates)
-        print(f"\nRegenerating to stem: {nxt}")
-        next_holder["value"] = nxt
+    if len(all_stems) == 0:
+        return
+
+    try:
+        i_cur = all_stems.index(current_stem)
+    except ValueError:
+        i_cur = 0
+
+    def _set_stem(target: str) -> None:
+        print(f"\nSwitching to stem: {target}")
+        next_holder["value"] = target
         plt.close(fig)
 
-    btn_ax = fig.add_axes([0.74, 0.02, 0.23, 0.05])
-    Button(btn_ax, "Regenerate Random Anchor").on_clicked(_go)
-    fig.canvas.mpl_connect(
-        "key_press_event",
-        lambda e: _go() if getattr(e, "key", None) == "r" else None,
-    )
+    def _prev(_event=None) -> None:
+        if len(all_stems) <= 1:
+            print("Only one stem available; cannot move.")
+            return
+        _set_stem(all_stems[(i_cur - 1) % len(all_stems)])
+
+    def _next(_event=None) -> None:
+        if len(all_stems) <= 1:
+            print("Only one stem available; cannot move.")
+            return
+        _set_stem(all_stems[(i_cur + 1) % len(all_stems)])
+
+    def _random(_event=None) -> None:
+        candidates = [s for s in all_stems if s != current_stem]
+        if not candidates:
+            print("Only one stem available; cannot pick random.")
+            return
+        _set_stem(random.choice(candidates))
+
+    prev_ax = fig.add_axes([0.58, 0.02, 0.12, 0.05])
+    next_ax = fig.add_axes([0.71, 0.02, 0.12, 0.05])
+    rand_ax = fig.add_axes([0.84, 0.02, 0.14, 0.05])
+    Button(prev_ax, "Prev stem").on_clicked(_prev)
+    Button(next_ax, "Next stem").on_clicked(_next)
+    Button(rand_ax, "Random").on_clicked(_random)
+
+    def _on_key(event) -> None:
+        k = getattr(event, "key", None)
+        if k in ("left", "p"):
+            _prev()
+        elif k in ("right", "n"):
+            _next()
+        elif k == "r":
+            _random()
+
+    fig.canvas.mpl_connect("key_press_event", _on_key)
 
 
 def plot_domain_trajectory_slider(
@@ -233,7 +284,7 @@ def plot_domain_trajectory_slider(
     vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
     p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
     th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
-    mu_vmin, mu_vmax = float(mu_all.min()), float(mu_all.max())
+    mu_vmin, mu_vmax = _robust_vmin_vmax(mu_all)
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
     bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
@@ -250,7 +301,7 @@ def plot_domain_trajectory_slider(
     sc2 = axs[1, 0].scatter(x_s, y_s, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
     fig.colorbar(sc2, ax=axs[1, 0], label="th")
     axs[1, 0].set_title("th")
-    sc3 = axs[1, 1].scatter(x_s, y_s, c=mu_all[ti0], cmap="magma", s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
+    sc3 = axs[1, 1].scatter(x_s, y_s, c=mu_all[ti0], cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(sc3, ax=axs[1, 1], label="mu_eff")
     axs[1, 1].set_title("mu_eff")
 
@@ -283,7 +334,7 @@ def plot_domain_trajectory_slider(
         slider.on_changed(_upd)
 
     if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
-        _attach_regenerate_anchor_button(
+        _attach_stem_navigation_controls(
             fig,
             current_stem=current_stem_for_regen,
             all_stems=regen_stems,
@@ -334,7 +385,7 @@ def plot_graph_trajectory_slider(
     vel_vmin, vel_vmax = float(vel.min()), float(vel.max())
     p_vmin, p_vmax = float(p_all.min()), float(p_all.max())
     th_vmin, th_vmax = float(th_all.min()), float(th_all.max())
-    mu_vmin, mu_vmax = float(mu_ch.min()), float(mu_ch.max())
+    mu_vmin, mu_vmax = _robust_vmin_vmax(mu_ch)
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
     bottom = 0.22 if (regen_stems and next_holder is not None and enable_regenerate) else 0.12
@@ -355,7 +406,7 @@ def plot_graph_trajectory_slider(
     sc2 = axs[1, 0].scatter(x_s, y_coord, c=th_all[ti0], cmap="inferno", s=2, vmin=th_vmin, vmax=th_vmax, rasterized=True)
     fig.colorbar(sc2, ax=axs[1, 0], label=f"ch{th_ch}")
     axs[1, 0].set_title("th / channel")
-    sc3 = axs[1, 1].scatter(x_s, y_coord, c=mu_ch[ti0], cmap="magma", s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
+    sc3 = axs[1, 1].scatter(x_s, y_coord, c=mu_ch[ti0], cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(sc3, ax=axs[1, 1], label="ch3")
     axs[1, 1].set_title("mu / channel 3")
 
@@ -388,7 +439,7 @@ def plot_graph_trajectory_slider(
     slider.on_changed(_upd)
 
     if regen_stems is not None and next_holder is not None and current_stem_for_regen is not None:
-        _attach_regenerate_anchor_button(
+        _attach_stem_navigation_controls(
             fig,
             current_stem=current_stem_for_regen,
             all_stems=regen_stems,
@@ -409,7 +460,7 @@ def _plot_domain_single_time_dashboard(
     current_stem_for_regen: str,
     enable_regenerate: bool,
 ) -> None:
-    """One COMSOL time slice (narrow / first block), 2×2 + optional anchor Regenerate."""
+    """One COMSOL time slice (narrow / first block), 2×2 + optional stem navigation."""
     domain_file = export_dir / f"{stem}.txt"
     df = _load_first_block(domain_file, sample_rows=sample_rows)
     x = df["x"].to_numpy(dtype=np.float64)
@@ -431,13 +482,15 @@ def _plot_domain_single_time_dashboard(
     s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
     fig.colorbar(s2, ax=ax[2], label="th")
     ax[2].set_title("th")
-    s3 = ax[3].scatter(x, y, c=df["mu_eff"].to_numpy(dtype=np.float64), cmap="magma", s=2, rasterized=True)
+    mu_vals = df["mu_eff"].to_numpy(dtype=np.float64)
+    mu_vmin, mu_vmax = _robust_vmin_vmax(mu_vals)
+    s3 = ax[3].scatter(x, y, c=mu_vals, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(s3, ax=ax[3], label="mu_eff")
-    ax[3].set_title("mu_eff ('r' / Regenerate)")
+    ax[3].set_title("mu_eff (left/right: stem, r: random)")
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    _attach_regenerate_anchor_button(
+    _attach_stem_navigation_controls(
         fig,
         current_stem=current_stem_for_regen,
         all_stems=regen_stems,
@@ -481,13 +534,14 @@ def _plot_graph_steady_dashboard_with_regen(
     fig.colorbar(s2, ax=ax[2], label=f"ch{th_ch}")
     ax[2].set_title("th / channel")
     mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
-    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+    mu_vmin, mu_vmax = _robust_vmin_vmax(mu_ch)
+    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(s3, ax=ax[3])
     ax[3].set_title("μ / ch3")
     for a in ax:
         a.set_aspect("equal")
         a.axis("off")
-    _attach_regenerate_anchor_button(
+    _attach_stem_navigation_controls(
         fig,
         current_stem=current_stem_for_regen,
         all_stems=regen_stems,
@@ -505,7 +559,7 @@ def run_biochem_default_inspector(
     sample_rows: int,
     enable_regenerate: bool = True,
 ) -> None:
-    """One anchor stem per figure; qualitative lines + matplotlib; Regenerate picks another stem (kinematics-style)."""
+    """One anchor stem per figure; qualitative lines + matplotlib with stem navigation controls."""
     all_stems = _stem_candidates_union(export_dir, graph_dir)
     if not all_stems:
         print("No domain *.txt or graph *.pt found.")
@@ -640,7 +694,15 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
     if not domain_file.exists():
         raise FileNotFoundError(f"Missing domain export: {domain_file}")
 
-    df = _load_first_block(domain_file, sample_rows=sample_rows)
+    # FIX 1: Load the full trajectory and extract the FINAL timestep, not t=0
+    times, blocks = _load_comsol_trajectory(domain_file)
+    if not times:
+        print(f"Failed to load time trajectories for {stem}.")
+        return
+
+    final_t = sorted(blocks.keys())[-1]
+    df = blocks[final_t]
+
     bio = BiochemConfig(phase="biochem")
 
     expected_cgs = {
@@ -660,24 +722,29 @@ def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
 
     species_cols = ["rp", "ap", "apr", "aps", "PT", "th", "at", "fg", "fi", "M", "Mas", "Mat"]
 
-    print(f"\n=== Phase3 unit audit: {stem} ===")
-    print(f"{'col':<5} {'p95+':>12} {'ref(CGS)':>12} {'ratio':>10}  likely family")
+    print(f"\n=== Phase3 unit audit: {stem} (Evaluated at final t={final_t}) ===")
+
+    # FIX 2: Swap p95+ for Max Val to capture highly localized boundary physics
+    print(f"{'col':<5} {'Max Val':>12} {'ref(CGS)':>12} {'ratio':>10}  likely family")
     for col in species_cols:
         vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
         vals = vals[np.isfinite(vals)]
-        pos = vals[vals > 0.0]
-        p95 = float(np.nanpercentile(pos, 95)) if pos.size else 0.0
+
+        # Track the absolute maximum concentration in the domain
+        max_val = float(np.nanmax(vals)) if vals.size > 0 else 0.0
+
         ref = max(float(expected_cgs[col]), 1e-18)
-        ratio = p95 / ref if p95 > 0 else 0.0
+        ratio = max_val / ref if max_val > 0 else 0.0
+
         if col in ("rp", "ap"):
             family = "plt/ml-ish" if 0.1 <= ratio <= 10 else "check"
         elif col in ("M", "Mas", "Mat"):
             family = "plt/cm^2-ish" if 0.1 <= ratio <= 10 else "check"
         else:
             family = "uM-ish" if 0.1 <= ratio <= 10 else "check"
-        print(f"{col:<5} {p95:12.4g} {ref:12.4g} {ratio:10.3g}  {family}")
+        print(f"{col:<5} {max_val:12.4g} {ref:12.4g} {ratio:10.3g}  {family}")
 
-    print("Hint: for phase-3 solutes in uM, conversion to SI is uM * 1e-3 -> mol/m^3.")
+    print("Hint: for phase-3 solutes in uM, conversion to SI is uM * 1e-3 -> mol/m³.")
 
 
 def summarize_graph(stem: str, graph_dir: Path) -> None:
@@ -737,7 +804,8 @@ def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000
     s1 = ax[1].scatter(x, y, c=p, cmap="coolwarm", s=2, rasterized=True)
     fig.colorbar(s1, ax=ax[1], label="p")
     ax[1].set_title("Pressure")
-    s2 = ax[2].scatter(x, y, c=mu, cmap="magma", s=2, rasterized=True)
+    mu_vmin, mu_vmax = _robust_vmin_vmax(mu)
+    s2 = ax[2].scatter(x, y, c=mu, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(s2, ax=ax[2], label="mu_eff")
     ax[2].set_title("mu_eff")
 
@@ -749,7 +817,7 @@ def plot_domain_static(stem: str, export_dir: Path, *, sample_rows: int = 80_000
     fig.colorbar(s4, ax=ax[4], label="rp")
     ax[4].set_title("rp (sample)")
 
-    scat_mu = ax[5].scatter(x, y, c=mu, cmap="magma", s=2, rasterized=True)
+    scat_mu = ax[5].scatter(x, y, c=mu, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
     fig.colorbar(scat_mu, ax=ax[5], label="mu_eff")
     ax[5].set_title("mu_eff")
 
@@ -800,7 +868,7 @@ def plot_graph_static(stem: str, graph_dir: Path) -> None:
     fig.colorbar(s2, ax=ax[2], label=f"ch{th_ch}")
     ax[2].set_title("th / channel")
     mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
-    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+    s3 = ax[3].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap=MU_CMAP, s=2, rasterized=True)
     fig.colorbar(s3, ax=ax[3], label="mu / extra")
     ax[3].set_title("Channel 3+ (mu_nd or extra)")
     for a in ax:
@@ -840,30 +908,56 @@ def inspect_domain_interactive(*, export_dir: Path, start_stem: str | None, samp
         s2 = ax[2].scatter(x, y, c=df["th"].to_numpy(dtype=np.float64), cmap="inferno", s=2, rasterized=True)
         fig.colorbar(s2, ax=ax[2], label="th")
         ax[2].set_title("th")
-        s3 = ax[3].scatter(x, y, c=df["mu_eff"].to_numpy(dtype=np.float64), cmap="magma", s=2, rasterized=True)
+        mu_vals = df["mu_eff"].to_numpy(dtype=np.float64)
+        mu_vmin, mu_vmax = _robust_vmin_vmax(mu_vals)
+        s3 = ax[3].scatter(x, y, c=mu_vals, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
         fig.colorbar(s3, ax=ax[3], label="mu_eff")
-        ax[3].set_title("mu_eff (press 'r' or Regenerate)")
+        ax[3].set_title("mu_eff (left/right: stem, r: random)")
         for a in ax:
             a.set_aspect("equal")
             a.axis("off")
         plt.tight_layout()
 
-        candidates = [s for s in stems if s != current]
-
-        def _regen() -> None:
-            if len(candidates) == 0:
-                print("Only one stem; cannot pick another.")
-                return
-            nxt = random.choice(candidates)
-            print(f"\nRegenerating domain view: {nxt}")
-            next_holder["value"] = nxt
+        def _set_stem(target: str) -> None:
+            print(f"\nSwitching domain view: {target}")
+            next_holder["value"] = target
             plt.close(fig)
 
-        btn_ax = fig.add_axes([0.72, 0.02, 0.25, 0.06])
-        Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+        def _prev() -> None:
+            if len(stems) <= 1:
+                print("Only one stem; cannot move.")
+                return
+            i_cur = stems.index(current)
+            _set_stem(stems[(i_cur - 1) % len(stems)])
+
+        def _next() -> None:
+            if len(stems) <= 1:
+                print("Only one stem; cannot move.")
+                return
+            i_cur = stems.index(current)
+            _set_stem(stems[(i_cur + 1) % len(stems)])
+
+        def _regen() -> None:
+            candidates = [s for s in stems if s != current]
+            if len(candidates) == 0:
+                print("Only one stem; cannot pick random.")
+                return
+            _set_stem(random.choice(candidates))
+
+        prev_ax = fig.add_axes([0.60, 0.02, 0.12, 0.06])
+        next_ax = fig.add_axes([0.73, 0.02, 0.12, 0.06])
+        rand_ax = fig.add_axes([0.86, 0.02, 0.12, 0.06])
+        Button(prev_ax, "Prev").on_clicked(lambda _e: _prev())
+        Button(next_ax, "Next").on_clicked(lambda _e: _next())
+        Button(rand_ax, "Random").on_clicked(lambda _e: _regen())
         fig.canvas.mpl_connect(
             "key_press_event",
-            lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+            lambda e: (
+                _prev() if getattr(e, "key", None) in ("left", "p")
+                else _next() if getattr(e, "key", None) in ("right", "n")
+                else _regen() if getattr(e, "key", None) == "r"
+                else None
+            ),
         )
         plt.show()
         if next_holder["value"] is None:
@@ -891,29 +985,54 @@ def inspect_graph_interactive(*, graph_dir: Path, start_stem: str | None) -> Non
         fig.colorbar(s0, ax=axes[0], label="|U|")
         axes[0].set_title(f"|U| — {current}")
         mu_ch = y_s[:, 3] if y_s.shape[1] > 3 else np.zeros_like(u)
-        s1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap="magma", s=2, rasterized=True)
+        mu_vmin, mu_vmax = _robust_vmin_vmax(mu_ch)
+        s1 = axes[1].scatter(pos[:, 0], pos[:, 1], c=mu_ch, cmap=MU_CMAP, s=2, vmin=mu_vmin, vmax=mu_vmax, rasterized=True)
         fig.colorbar(s1, ax=axes[1], label="ch3")
-        axes[1].set_title("mu / channel 3 (press 'r' or Regenerate)")
+        axes[1].set_title("mu / channel 3 (left/right: stem, r: random)")
         for a in axes:
             a.set_aspect("equal")
             a.axis("off")
         plt.tight_layout()
-        candidates = [s for s in stems if s != current]
-
-        def _regen() -> None:
-            if len(candidates) == 0:
-                print("Only one graph; cannot pick another.")
-                return
-            nxt = random.choice(candidates)
-            print(f"\nRegenerating graph view: {nxt}")
-            next_holder["value"] = nxt
+        def _set_stem(target: str) -> None:
+            print(f"\nSwitching graph view: {target}")
+            next_holder["value"] = target
             plt.close(fig)
 
-        btn_ax = fig.add_axes([0.76, 0.02, 0.2, 0.08])
-        Button(btn_ax, "Regenerate stem").on_clicked(lambda _e: _regen())
+        def _prev() -> None:
+            if len(stems) <= 1:
+                print("Only one graph; cannot move.")
+                return
+            i_cur = stems.index(current)
+            _set_stem(stems[(i_cur - 1) % len(stems)])
+
+        def _next() -> None:
+            if len(stems) <= 1:
+                print("Only one graph; cannot move.")
+                return
+            i_cur = stems.index(current)
+            _set_stem(stems[(i_cur + 1) % len(stems)])
+
+        def _regen() -> None:
+            candidates = [s for s in stems if s != current]
+            if len(candidates) == 0:
+                print("Only one graph; cannot pick random.")
+                return
+            _set_stem(random.choice(candidates))
+
+        prev_ax = fig.add_axes([0.60, 0.02, 0.12, 0.08])
+        next_ax = fig.add_axes([0.73, 0.02, 0.12, 0.08])
+        rand_ax = fig.add_axes([0.86, 0.02, 0.12, 0.08])
+        Button(prev_ax, "Prev").on_clicked(lambda _e: _prev())
+        Button(next_ax, "Next").on_clicked(lambda _e: _next())
+        Button(rand_ax, "Random").on_clicked(lambda _e: _regen())
         fig.canvas.mpl_connect(
             "key_press_event",
-            lambda e: _regen() if getattr(e, "key", None) == "r" else None,
+            lambda e: (
+                _prev() if getattr(e, "key", None) in ("left", "p")
+                else _next() if getattr(e, "key", None) in ("right", "n")
+                else _regen() if getattr(e, "key", None) == "r"
+                else None
+            ),
         )
         plt.show()
         if next_holder["value"] is None:
@@ -942,7 +1061,7 @@ def main() -> None:
     parser.add_argument(
         "--plot-domain-interactive",
         action="store_true",
-        help="Interactive domain view with random stem regenerate (button / 'r').",
+        help="Interactive domain view with Prev/Next stem controls (left/right keys); 'r' for random.",
     )
     parser.add_argument(
         "--plot-graph",
@@ -952,12 +1071,12 @@ def main() -> None:
     parser.add_argument(
         "--plot-graph-interactive",
         action="store_true",
-        help="Interactive graph view with random stem regenerate (button / 'r').",
+        help="Interactive graph view with Prev/Next stem controls (left/right keys); 'r' for random.",
     )
     parser.add_argument(
         "--no-regenerate",
         action="store_true",
-        help="Default mode: disable the Regenerate Random Anchor button and 'r' hotkey (default is on).",
+        help="Default mode: disable stem navigation controls/hotkeys (default is on).",
     )
     args = parser.parse_args()
 

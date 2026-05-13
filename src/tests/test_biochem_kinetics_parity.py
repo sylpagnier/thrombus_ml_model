@@ -130,11 +130,11 @@ class TestBiochemKineticsParity:
         expected_at = -(gamma * state["T"])
 
         eps = 1e-8
+        # COMSOL truth: ``reac1`` exports the unbounded Michaelis-Menten rate
+        # ``(kfi * th * fg) / (kmfi + fg)`` (see oracle_kinetics.csv column header
+        # emitted by phase2_nowound_001.mph). There is no FI saturation taper.
         reaction_rate = (bio_cfg.kfi * state["T"] * state["FG"]) / (kinetics.kmfi + state["FG"] + eps)
-        c_max = bio_cfg.fi_reaction_saturation_si * kinetics.C_scale + eps
-        raw_sat = 1.0 - state["FI"] / c_max
-        saturation = 0.5 * (torch.tanh(10.0 * (raw_sat - 0.5)) + 1.0)
-        expected_fi = reaction_rate * saturation
+        expected_fi = reaction_rate
         expected_fg = -expected_fi
 
         assert torch.isclose(out["RP"], expected_rp, rtol=1e-4)

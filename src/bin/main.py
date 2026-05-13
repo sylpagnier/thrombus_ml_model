@@ -88,6 +88,13 @@ def main(argv: list[str] | None = None) -> None:
         valid_targets = sorted(k[1] for k in MODULE_MAP if k[0] == ns.group)
         parser.error(f"unknown target '{ns.target}' for group '{ns.group}'. valid: {valid_targets}")
 
+    if ns.group == "train" and ns.target in {"t1", "t2", "t3", "explore"}:
+        canonical = "biochem" if ns.target == "t3" else "kinematics"
+        print(
+            f"⚠️ Deprecated train target '{ns.target}'. "
+            f"Use 'train {canonical}' instead."
+        )
+
     if ns.group == "orchestrate":
         _run_module(module, [ns.target, *forwarded_args])
     else:

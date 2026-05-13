@@ -190,6 +190,11 @@ class TestPhase3Physics(unittest.TestCase):
         """
         Verify fibrin kinetics on extracted anchor data using hardcoded COMSOL constants/expression.
         This avoids separate oracle exports while still checking implementation against COMSOL math.
+
+        COMSOL truth: ``reac1`` in ``phase2_nowound_001.mph`` exports the unbounded
+        Michaelis-Menten rate ``(kfi * th * fg) / (kmfi + fg)`` (see the column header
+        emitted to ``src/tests/fixtures/oracle_kinetics.csv``). There is no
+        ``(1 - FI/C_max)`` taper or tanh saturation in the COMSOL reaction node.
         """
         T_si, _, FG_si, FI_si = self._sample_anchor_species_si()
         T = T_si * self.kinetics.C_scale
@@ -197,15 +202,10 @@ class TestPhase3Physics(unittest.TestCase):
         FI = FI_si * self.kinetics.C_scale
         r_fg_pt, r_fi_pt = self.kinetics.compute_fibrin_kinetics(T, FG, FI)
 
-        # Hardcoded COMSOL constants from model summary mapped to C_scale working space.
         kfi = 59.0
         kmfi_c = 3.16e-3 * self.kinetics.C_scale
-        fi_sat_c = 7.0e-3 * self.kinetics.C_scale
         eps = 1e-8
-        base_reaction = (kfi * T * FG) / (kmfi_c + FG + eps)
-        raw_sat = 1.0 - FI / (fi_sat_c + eps)
-        sat = 0.5 * (torch.tanh(10.0 * (raw_sat - 0.5)) + 1.0)
-        expected_r_fi = base_reaction * sat
+        expected_r_fi = (kfi * T * FG) / (kmfi_c + FG + eps)
         expected_r_fg = -expected_r_fi
 
         self.assertTrue(torch.allclose(r_fi_pt, expected_r_fi, atol=1e-8, rtol=1e-6))
@@ -275,7 +275,8 @@ class TestPhase3Physics(unittest.TestCase):
                 FG = torch.tensor([float(row["fg"])], dtype=torch.float32) * to_c
                 APR = torch.tensor([float(row["apr"])], dtype=torch.float32) * to_c
                 APS = torch.tensor([float(row["aps"])], dtype=torch.float32) * to_c
-                # Isolated base-reaction check (no saturation taper from FI).
+                # COMSOL reac1 is unbounded Michaelis-Menten; FI does not enter the rate
+                # (see oracle_kinetics.csv column header). Value here is irrelevant.
                 FI = torch.tensor([0.0], dtype=torch.float32)
 
                 expected_gamma = float(row["gamma"])
@@ -904,10 +905,11 @@ class TestPhase3Physics(unittest.TestCase):
         self.assertTrue(torch.allclose(encoded[:, -2:-1], x[:, 13:14]))
         self.assertTrue(torch.allclose(encoded[:, -1:], x[:, 14:15]))
 
-    def test_comsol_trajectory_kernel_matches_log_derivative_finite_difference(self):
+    def test_comsol_trajectory_kernel_matches_linear_rate_finite_difference(self):
         """
-        COMSOL parity: along an extracted anchor trajectory, kinetics-implied d(log1p C)/dt
-        should match finite differences of COMSOL labels (same construction as ODE-RXN pretraining).
+        COMSOL parity: along an extracted anchor trajectory, kinetics-implied linear
+        reaction rates should match linear rates derived from finite differences of
+        COMSOL log1p labels (same stabilized construction as ODE-RXN pretraining).
         """
         graph_path = self._find_extracted_biochem_graph()
         if graph_path is None:
@@ -934,11 +936,14 @@ class TestPhase3Physics(unittest.TestCase):
             dt = max(dt, 1e-9)
 
             species_now = y0[:, 4:13].to(torch.float32)
-            dlog_fd = (y1[:, 4:13] - y0[:, 4:13]) / dt
+            species_next = y1[:, 4:13].to(torch.float32)
 
             u_det = y0[:, 0]
             v_det = y0[:, 1]
-            species_now_si = torch.clamp(torch.expm1(species_now), min=0.0) * scales
+            species_now_nd = torch.clamp(torch.expm1(species_now), min=0.0)
+            species_next_nd = torch.clamp(torch.expm1(species_next), min=0.0)
+            dnd_fd = (species_next_nd - species_now_nd) / dt
+            species_now_si = species_now_nd * scales
             species_dict = {k: species_now_si[:, j] for j, k in enumerate(rxn_keys)}
             props = kernels.core._get_geometric_props(data)
             num_nodes = int(data.num_nodes)
@@ -952,17 +957,12 @@ class TestPhase3Physics(unittest.TestCase):
             props["d_bar"] = d_bar
             shear_rate = kernels._compute_shear_rate(u_det, v_det, props, data)
             reaction_terms = kernels.kinetics.compute_species_reactions(species_dict, shear_rate)
-            target_dlog_dt = torch.stack(
-                [
-                    reaction_terms[k]
-                    / (scales[:, j] * torch.clamp(torch.exp(species_now[:, j]), min=1e-8))
-                    for j, k in enumerate(rxn_keys)
-                ],
+            target_nd_rate = torch.stack(
+                [reaction_terms[k] / scales[:, j] for j, k in enumerate(rxn_keys)],
                 dim=1,
             )
-            target_dlog_dt = torch.clamp(target_dlog_dt, min=-20.0, max=20.0)
 
-            mse = F.mse_loss(dlog_fd, target_dlog_dt).item()
+            mse = F.huber_loss(dnd_fd, target_nd_rate, delta=1.0).item()
             max_mse = max(max_mse, mse)
             num_iv += 1
 
@@ -971,7 +971,7 @@ class TestPhase3Physics(unittest.TestCase):
         self.assertLess(
             max_mse,
             25.0,
-            f"Kernel vs FD log-derivative MSE too high (max over intervals={max_mse:.4f}).",
+            f"Kernel vs FD linear-rate Huber too high (max over intervals={max_mse:.4f}).",
         )
 
     def test_comsol_extracted_graph_physics_regression(self):

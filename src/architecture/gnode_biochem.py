@@ -4,10 +4,12 @@ import math
 import os
 import torch.nn.functional as F
 from torch import Tensor
+from torch_geometric.utils import degree
 # ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
 from torchdiffeq import odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig, NodeFeat
+from src.core_physics.kinematics_clot_prior import clot_prior_features
 from src.utils.batching import get_batch_tensor
 
 # Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
@@ -37,10 +39,12 @@ def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torc
 
 def _default_resting_species(num_nodes: int, device: torch.device, batch) -> torch.Tensor:
     current_species = torch.zeros(num_nodes, 12, dtype=torch.float32, device=device)
-    resting_indices = [0, 4, 6, 7]
-    resting_value = math.log(2.0)
-    for idx in resting_indices:
-        current_species[:, idx] = resting_value
+    # COMSOL-consistent resting blood chemistry in ND/log1p space.
+    current_species[:, 0] = math.log1p(1.0)   # RP
+    current_species[:, 1] = math.log1p(0.05)  # AP
+    current_species[:, 4] = math.log1p(1.0)   # PT
+    current_species[:, 6] = math.log1p(1.0)   # AT
+    current_species[:, 7] = math.log1p(1.0)   # FG
     if hasattr(batch, "bio_inlet_bc"):
         mask_inlet = batch.mask_inlet.view(-1).bool()
         current_species[mask_inlet, 0:9] = batch.bio_inlet_bc[mask_inlet]
@@ -72,6 +76,20 @@ class BioODEFunc(nn.Module):
         if mod_biochem is None:
             mod_biochem = mod_dummy
         dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_biochem, mod_dummy, mod_dummy)
+
+        # Explicitly smooth latent states to suppress high-frequency spatial jitter during integration.
+        row, col = edge_index
+        deg = degree(row, z.size(0), dtype=z.dtype).clamp_(min=1.0)
+        laplacian_smooth = torch.zeros_like(z)
+        z_j = z[col]
+        laplacian_smooth.scatter_add_(
+            0,
+            row.unsqueeze(-1).expand(-1, z.size(-1)),
+            z_j / deg[col].unsqueeze(-1),
+        )
+        laplacian_smooth = laplacian_smooth - z
+        dz_raw = dz_raw + 0.05 * laplacian_smooth
+
         dz_dt = self.derivative_scale * dz_raw
         dz_dt = torch.clamp(dz_dt, min=-10.0, max=10.0)
         if self.training:
@@ -86,9 +104,22 @@ class GNODE_Phase3(nn.Module):
     Replaces the steady-state DEQ with a continuous-time latent ODE solver.
     """
 
-    def __init__(self, phys_cfg, in_channels=12, spatial_channels=15, latent_dim=64, max_inner_iters=25,
-                 mu_ratio_max=80.0, mat_crit=2e7, fi_crit=0.6,
-                 temp_mat=1e6, temp_fi=0.05, rtol=1e-3, atol=1e-4):
+    def __init__(
+        self,
+        phys_cfg,
+        in_channels=12,
+        spatial_channels=15,
+        latent_dim=64,
+        max_inner_iters=25,
+        bio_encoder_prior_dim: int = 0,
+        mu_ratio_max=80.0,
+        mat_crit=2e7,
+        fi_crit=0.6,
+        temp_mat=1e6,
+        temp_fi=0.05,
+        rtol=1e-3,
+        atol=1e-4,
+    ):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -142,8 +173,13 @@ class GNODE_Phase3(nn.Module):
         # 2. BIOCHEMISTRY NEURAL ODE
         # ==========================================
         # Initial Condition Encoder (Maps spatial config to z0)
-        self.bio_encoder = SpectralLinear(in_features=in_channels + 3 + spatial_channels, out_features=latent_dim)
-        _bio = BiochemConfig(phase="biochem")
+        self.bio_encoder_prior_dim = max(0, int(bio_encoder_prior_dim))
+        self._bio_cfg = BiochemConfig(phase="biochem")
+        self.bio_encoder = SpectralLinear(
+            in_features=in_channels + 3 + spatial_channels + self.bio_encoder_prior_dim,
+            out_features=latent_dim,
+        )
+        _bio = self._bio_cfg
         self.sgt = _bio.sgt
         self.T_grad = _bio.soft_step_T_grad
         # 5x attention multiplier for edges in decelerating zones (log-space bias)
@@ -155,7 +191,34 @@ class GNODE_Phase3(nn.Module):
         # Physical Decoder
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
 
+        # Kinematic baseline + biochem-only corrector: μ_eff = μ_kin * (1 + explicit_gel + learned_gel).
+        # ``learned_clot_penalty`` sees only log1p species (12); Softplus ⇒ nonnegative learned gelation.
+        self.learned_clot_penalty = nn.Sequential(
+            nn.Linear(12, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Softplus(),
+        )
+        self._init_learned_clot_penalty_near_zero()
+
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
+
+    def _kinematics_prior_tail(self, batch, u_nd: torch.Tensor, v_nd: torch.Tensor) -> torch.Tensor | None:
+        """Extra ``bio_encoder`` channels from kinematics clot prior (COMSOL-aligned cues)."""
+        if self.bio_encoder_prior_dim <= 0:
+            return None
+        props = {
+            "u_ref": batch.u_ref.view(-1, 1).to(dtype=torch.float32),
+            "d_bar": batch.d_bar.view(-1, 1).to(dtype=torch.float32),
+        }
+        return clot_prior_features(
+            batch,
+            u_nd.reshape(-1),
+            v_nd.reshape(-1),
+            self._bio_cfg,
+            props,
+            n_features=self.bio_encoder_prior_dim,
+        )
 
     def train(self, mode=True):
         """
@@ -230,6 +293,24 @@ class GNODE_Phase3(nn.Module):
         """Decoder predicts log1p(species_nd) directly; clamp to a safe training range."""
         return torch.clamp(raw_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
+    def species_log_nd_to_si(self, species_log: Tensor) -> Tensor:
+        """Map stored ``log1p(c / c_scale)`` bulk+wall channels (12) to SI concentrations."""
+        sc = self.species_si_scales.to(device=species_log.device, dtype=species_log.dtype)
+        sp = torch.clamp(species_log, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
+        return torch.expm1(sp) * sc
+
+    def _init_learned_clot_penalty_near_zero(self) -> None:
+        """Small random weights, zero biases, then shift last linear bias so Softplus output starts ~0."""
+        with torch.no_grad():
+            for m in self.learned_clot_penalty.modules():
+                if isinstance(m, nn.Linear):
+                    m.weight.uniform_(-1e-4, 1e-4)
+                    if m.bias is not None:
+                        m.bias.zero_()
+            last_lin = self.learned_clot_penalty[2]
+            if isinstance(last_lin, nn.Linear):
+                last_lin.bias.fill_(-6.0)
+
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
         safe_t_scale = max(self.T_scale, 1e-5)
@@ -285,7 +366,11 @@ class GNODE_Phase3(nn.Module):
         with torch.enable_grad():
             u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
 
-        bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15]], dim=-1)
+        prior_tail = self._kinematics_prior_tail(batch, u_v_p[:, 0], u_v_p[:, 1])
+        if prior_tail is None:
+            bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15]], dim=-1)
+        else:
+            bio_in = torch.cat([current_species, u_v_p, batch.x[:, :15], prior_tail], dim=-1)
 
         z = self.bio_encoder(bio_in)
         raw_species = self.biochem_decoder(z)
@@ -385,18 +470,6 @@ class GNODE_Phase3(nn.Module):
         # 2. MACRO-MICRO STEPPING (Two-Way Coupling)
         # ==========================================
         for i in range(num_times):
-            if self.training and y_true_trajectory is not None and i > 0:
-                # Scheduled sampling in log1p-space states for long trajectories (66-200 steps):
-                # We DO NOT blend values linearly in log-space, as this physically skews concentrations.
-                # Instead, choose 100% GT or 100% model state for anchor nodes via a probabilistic coin flip.
-                tf = float(max(0.0, min(1.0, teacher_forcing_ratio)))
-                if tf > 0.0:
-                    use_ground_truth = bool((torch.rand((), device=device) < tf).item())
-                    if use_ground_truth:
-                        gt_species = y_true_trajectory[i, :, 4:16].to(device)
-                        current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, current_species)
-                        current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
-
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = batch.x[:, :15].clone()
 
@@ -435,16 +508,22 @@ class GNODE_Phase3(nn.Module):
             gamma_dot = torch.sqrt(2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2) +
                                    ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2 + 1e-8)
 
-            mu_base = mu_inf + (mu_0 - mu_inf) * torch.pow(1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0)
+            # 1) Pure shear-thinning kinematic baseline (no species coupling).
+            mu_kin_baseline = mu_inf + (mu_0 - mu_inf) * torch.pow(
+                1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0
+            )
 
-            # mu1/mu2 thresholds (mat_crit, fi_crit) are in SI units; convert log1p state to linear SI.
-            sc = self.species_si_scales.to(device=device, dtype=current_species.dtype)
+            # 2) Biochem gelation: explicit FI/Mat gates + species-only learned nonnegative penalty.
             sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
-            FI_si = torch.expm1(sp_safe[:, 8:9]) * sc[8:9]
-            Mat_si = torch.expm1(sp_safe[:, 11:12]) * sc[11:12]
+            species_si = self.species_log_nd_to_si(sp_safe)
+            FI_si = species_si[:, 8:9]
+            # STRICT COMSOL PARITY: viscosity depends on Mat (channel 11) only.
+            Mat_si = species_si[:, 11:12]
 
-            total_multiplier = 1.0 + self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
-            current_mu_eff = mu_base * total_multiplier
+            explicit_gelation = self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
+            learned_gelation = self.learned_clot_penalty(sp_safe)
+            total_multiplier = 1.0 + explicit_gelation + learned_gelation
+            current_mu_eff = mu_kin_baseline * total_multiplier
 
             # ==========================================
             # BIOCHEM ATTENTION MODULATOR (Streamwise + detached)
@@ -467,12 +546,27 @@ class GNODE_Phase3(nn.Module):
             is_separation_edge = torch.sigmoid(torch.clamp(separation_logits, min=-50.0, max=50.0))
             mod_separation = (is_separation_edge * self.biochem_attention_boost).detach()
 
-            # --- C. RECORD COUPLED STATE ---
+            # --- C. RECORD COUPLED STATE (Record prediction first) ---
             current_mu_eff_nd = current_mu_eff / mu_nd_scale
-            # Use the ND version for the recorded trajectory
-            safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
-            pred_step = torch.cat([u_v_p, current_mu_eff_nd, safe_species], dim=-1)
+            # Use the ND version for the recorded trajectory (species at this macro time, pre-TF).
+            pred_step = torch.cat([u_v_p, current_mu_eff_nd, sp_safe], dim=-1)
             pred_trajectory.append(pred_step)
+
+            # --- C.5 TEACHER FORCING INJECTION (For next ODE step only) ---
+            if self.training and y_true_trajectory is not None and i > 0:
+                # Scheduled sampling in log1p-space states for long trajectories (66-200 steps):
+                # We DO NOT blend values linearly in log-space, as this physically skews concentrations.
+                # Instead, choose 100% GT or 100% model state for anchor nodes via a probabilistic coin flip.
+                tf = float(max(0.0, min(1.0, teacher_forcing_ratio)))
+                if tf > 0.0:
+                    if tf >= 1.0 - 1e-6:
+                        use_ground_truth = True
+                    else:
+                        use_ground_truth = bool((torch.rand((), device=device) < tf).item())
+                    if use_ground_truth:
+                        gt_species = y_true_trajectory[i, :, 4:16].to(device)
+                        current_species = torch.where(truth_mask.unsqueeze(-1), gt_species, current_species)
+                        current_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
 
             # --- D. MICRO STEP: INTEGRATE BIOCHEMISTRY (Frozen Kinematics) ---
             if i < num_times - 1:
@@ -481,7 +575,11 @@ class GNODE_Phase3(nn.Module):
 
                 # Encode current physical state into latent representation
                 safe_species = torch.clamp(current_species, min=_SPECIES_LOG1P_MIN, max=_SPECIES_LOG1P_MAX)
-                bio_in = torch.cat([safe_species, u_v_p, batch.x[:, :15]], dim=-1)
+                prior_tail = self._kinematics_prior_tail(batch, u_v_p[:, 0], u_v_p[:, 1])
+                if prior_tail is None:
+                    bio_in = torch.cat([safe_species, u_v_p, batch.x[:, :15]], dim=-1)
+                else:
+                    bio_in = torch.cat([safe_species, u_v_p, batch.x[:, :15], prior_tail], dim=-1)
                 z_current = self.bio_encoder(bio_in)
 
                 # Integrate ODE over the Delta t interval (adjoint: memory-safe backward).
@@ -499,27 +597,55 @@ class GNODE_Phase3(nn.Module):
                     # Use an explicit method (like "rk4") by default for large 150s jumps to avoid
                     # implicit solver history-drop penalties on restarted biochemical segment solves.
                     solver_method = self.micro_ode_method
-                    ode_kwargs = dict(
+                    ode_kwargs_base = dict(
                         method=solver_method,
                         adjoint_method=solver_method,
                         adjoint_params=tuple(self.ode_func.parameters()),
-                        # Keep forward/backward solver tolerances aligned with model config.
                         rtol=self.rtol,
                         atol=self.atol,
                         adjoint_rtol=self.rtol,
                         adjoint_atol=self.atol,
                     )
-                    if solver_method == "rk4":
-                        # Force one fixed RK4 step over the current [t_i, t_{i+1}] segment.
-                        ode_kwargs["options"] = {"step_size": dt_seg}
-                        ode_kwargs["adjoint_options"] = {"step_size": dt_seg}
-                    z_out = odeint_adjoint(
-                        odefunc_wrapper,
-                        z_current,
-                        t_span,
-                        **ode_kwargs,
-                    )
-                    z_next = z_out[1]
+                    # ``evaluation_times`` are nondimensional (see ``to_t_nd(..., t_final)``); env cap is SI seconds.
+                    max_step_env = (os.environ.get("BIOCHEM_ODE_MAX_STEP_S") or "").strip()
+                    max_step_phys_s = max(float(max_step_env), 1e-9) if max_step_env else 10.0
+                    t_int_ref = float(getattr(self._bio_cfg, "t_final", 30000.0))
+                    max_step_nd = max_step_phys_s / max(t_int_ref, 1e-12)
+                    rk_sub_env = (os.environ.get("BIOCHEM_ADJOINT_RK4_SUBSTEPS") or "").strip()
+                    n_rk_sub = max(1, int(rk_sub_env) if rk_sub_env else 32)
+
+                    def _one_odeint(z0, span: torch.Tensor, step_hint: float) -> torch.Tensor:
+                        ode_kwargs = dict(ode_kwargs_base)
+                        if solver_method == "rk4":
+                            # ``step_hint`` is the macro subsegment length; torchdiffeq's fixed ``rk4``
+                            # would otherwise take a single step over the whole segment (unstable).
+                            seg_len = abs(float(span[-1] - span[0]))
+                            sh = max(seg_len / float(n_rk_sub), 1e-12)
+                            ode_kwargs["options"] = {"step_size": sh}
+                            ode_kwargs["adjoint_options"] = {"step_size": sh}
+                        z_out = odeint_adjoint(
+                            odefunc_wrapper,
+                            z0,
+                            span,
+                            **ode_kwargs,
+                        )
+                        return z_out[1]
+
+                    if dt_seg > max_step_nd:
+                        t0 = float(t_span[0].detach().item())
+                        t1 = float(t_span[-1].detach().item())
+                        duration = t1 - t0
+                        n_sub = max(1, int(math.ceil(abs(duration) / max_step_nd)))
+                        sub_dt = duration / float(n_sub)
+                        z_run = z_current
+                        for j in range(n_sub):
+                            ts0 = t0 + j * sub_dt
+                            ts1 = t0 + (j + 1) * sub_dt
+                            t_sub = torch.tensor([ts0, ts1], device=device, dtype=t_span.dtype)
+                            z_run = _one_odeint(z_run, t_sub, step_hint=sub_dt)
+                        z_next = z_run
+                    else:
+                        z_next = _one_odeint(z_current, t_span, step_hint=dt_seg)
                 raw_species = self.biochem_decoder(z_next)
 
                 next_species_flat = self._decode_species_log1p(raw_species)

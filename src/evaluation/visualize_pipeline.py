@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,10 +9,61 @@ from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
 from src.architecture.gnode_biochem import GNODE_Phase3
+from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND
 
 # Standard channel indices across all models for kinematics
 _CHANNEL = dict(u=0, v=1, p=2, mu_eff=STATE_CHANNEL_MU_EFF_ND)
+_KIN_CKPT_CANDIDATES = ("kinematics_best.pth", "kinematics_ckpt_latest.pth", "kinematics_ckpt_100.pth")
+
+
+def _infer_bio_encoder_prior_dim_from_state_dict(state_dict):
+    """Infer extra bio-encoder prior channels from checkpoint tensor shape."""
+    key = "bio_encoder.linear.parametrizations.weight.original"
+    weight = state_dict.get(key)
+    if weight is None or not hasattr(weight, "shape") or len(weight.shape) != 2:
+        return None
+    # GNODE bio_encoder input = 12 species + 3 kinematics + 15 spatial + prior_dim.
+    base_in_features = 30
+    inferred = int(weight.shape[1]) - base_in_features
+    if inferred < 0:
+        return None
+    return inferred
+
+
+def _inject_biochem_kinematic_lora(model, rank=4, alpha=1.0):
+    """Match Biochem training: LoRA on kinematic SpectralLinear layers."""
+    n_enc = inject_lora_to_spectral_linears(model.kin_encoder, rank=rank, alpha=alpha)
+    n_proc = inject_lora_to_spectral_linears(model.kin_processor, rank=rank, alpha=alpha)
+    n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
+    print(
+        f"   ↳ LoRA injected: kin_encoder={n_enc}, kin_processor={n_proc}, "
+        f"kinematics_decoder={n_dec} (rank={rank}, alpha={alpha})"
+    )
+
+
+def _resolve_kinematics_checkpoint():
+    for ckpt_name in _KIN_CKPT_CANDIDATES:
+        candidate = resolve_checkpoint("a", ckpt_name)
+        if candidate.exists():
+            return candidate
+    expected_dir = resolve_checkpoint("a", _KIN_CKPT_CANDIDATES[0]).parent
+    raise FileNotFoundError(
+        "No kinematics checkpoint found for visualization. Tried: "
+        + ", ".join(str(expected_dir / name) for name in _KIN_CKPT_CANDIDATES)
+    )
+
+
+def _load_single_graph(proc_dir, device, label):
+    files = sorted(proc_dir.glob("*.pt"))
+    if not files:
+        raise FileNotFoundError(f"No graph files found in {proc_dir} for {label}")
+    return torch.load(files[0], weights_only=False).to(device)
+
+
+def _run_model_once(model, data):
+    pred = model(data)
+    return pred[0] if isinstance(pred, tuple) else pred
 
 
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
@@ -38,16 +90,16 @@ def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
 
 
-def _show_biochem_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=None):
-    u_all = pred_t3_series_np[:, :, _CHANNEL["u"]]
-    v_all = pred_t3_series_np[:, :, _CHANNEL["v"]]
+def _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_refresh=None):
+    u_all = pred_biochem_series_np[:, :, _CHANNEL["u"]]
+    v_all = pred_biochem_series_np[:, :, _CHANNEL["v"]]
     vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
-    p_all = pred_t3_series_np[:, :, _CHANNEL["p"]]
-    # Phase-3 species channels are stored as log1p(species_nd); convert FI and Mat_s to SI for plotting.
+    p_all = pred_biochem_series_np[:, :, _CHANNEL["p"]]
+    # Biochem species channels are stored as log1p(species_nd); convert FI and Mat_s to SI for plotting.
     bio_cfg = BiochemConfig(phase="biochem")
     scales = bio_cfg.get_species_scales(device="cpu").cpu().numpy()
-    fib_all = np.expm1(np.clip(pred_t3_series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
-    mat_all = np.expm1(np.clip(pred_t3_series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
+    fib_all = np.expm1(np.clip(pred_biochem_series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
+    mat_all = np.expm1(np.clip(pred_biochem_series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
 
     # Keep color scales fixed across time to avoid frame-wise contrast artifacts.
     vel_vmin, vel_vmax = float(vel_all.min()), float(vel_all.max())
@@ -124,27 +176,25 @@ def run_phase_comparison(regenerate=True, seed=42):
     # ------------------------------------------------------------------
     test_dir = root / "data" / "phase_comparison_test"
     raw_dir = test_dir / "raw_meshes"
-    graph_t1_dir = test_dir / "graphs_t1"
-    graph_t2_dir = test_dir / "graphs_t2"
-    graph_t3_dir = test_dir / "graphs_t3"
+    graph_kine_base_dir = test_dir / "graphs_kine_base"
+    graph_biochem_dir = test_dir / "graphs_biochem"
 
-    for d in [raw_dir, graph_t1_dir, graph_t2_dir, graph_t3_dir]:
+    for d in [raw_dir, graph_kine_base_dir, graph_biochem_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     need_regen = regenerate
     if not regenerate:
         has_ready_data = (
             any(raw_dir.glob("*.msh")) and
-            any(graph_t1_dir.glob("*.pt")) and
-            any(graph_t2_dir.glob("*.pt")) and
-            any(graph_t3_dir.glob("*.pt"))
+            any(graph_kine_base_dir.glob("*.pt")) and
+            any(graph_biochem_dir.glob("*.pt"))
         )
         if not has_ready_data:
             print("⚠️ No existing cached synthetic data found. Regenerating now...")
             need_regen = True
 
     if need_regen:
-        for d in [raw_dir, graph_t1_dir, graph_t2_dir, graph_t3_dir]:
+        for d in [raw_dir, graph_kine_base_dir, graph_biochem_dir]:
             for f in d.glob("*"):
                 if f.is_file():
                     f.unlink()
@@ -154,87 +204,99 @@ def run_phase_comparison(regenerate=True, seed=42):
         vg.run_pipeline(n=1, level=1, num_workers=1, seed=seed)
 
         print("\n🕸️ Converting mesh to graphs for each phase's specific channel requirements...")
-        mg1 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t1_dir)
+        mg1 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_kine_base_dir)
         mg1.run()
-        mg2 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t2_dir)
-        mg2.run()
-        mg3 = MeshToGraphPhase3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_t3_dir)
+        mg3 = MeshToGraphPhase3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_biochem_dir)
         mg3.run()
     else:
         print("\n♻️ Reusing existing single-case synthetic data.")
 
     # Load the specific graphs
     try:
-        data_t1 = torch.load(list(graph_t1_dir.glob("*.pt"))[0], weights_only=False).to(device)
-        data_t2 = torch.load(list(graph_t2_dir.glob("*.pt"))[0], weights_only=False).to(device)
-        data_t3 = torch.load(list(graph_t3_dir.glob("*.pt"))[0], weights_only=False).to(device)
-        pos = data_t3.x[:, :2].cpu().numpy()  # Position is the same across all
-    except IndexError:
-        print("⚠️ Failed to generate or load graph files.")
-        return
+        data_kine_base = _load_single_graph(graph_kine_base_dir, device, "kinematics")
+        data_biochem = _load_single_graph(graph_biochem_dir, device, "biochem")
+        pos = data_biochem.x[:, :2].cpu().numpy()  # Position is the same across all
+    except FileNotFoundError as exc:
+        print(f"⚠️ Failed to generate or load graph files: {exc}")
+        return False
 
     # ------------------------------------------------------------------
     # 4. Load Models
     # ------------------------------------------------------------------
     print("\n🧠 Loading trained models...")
-    kin_ckpt = resolve_checkpoint("a", "kinematics_ckpt_100.pth")
-    t3_ckpt = resolve_checkpoint("b", "biochem_best_bio.pth")
+    kin_ckpt = _resolve_kinematics_checkpoint()
+    print(f"   ↳ Using kinematics checkpoint: {kin_ckpt.name}")
+    biochem_ckpt = resolve_checkpoint("b", "biochem_best_bio.pth")
+    if not biochem_ckpt.exists():
+        raise FileNotFoundError(f"Biochem checkpoint not found: {biochem_ckpt}")
+    biochem_state = torch.load(biochem_ckpt, map_location=device, weights_only=True)
 
-    # Kinematics Setup
-    model_t1 = GINO_DEQ(in_channels=15, out_channels=5, latent_dim=64, max_iters=15).to(device)
-    model_t1.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
-    model_t1.eval()
-
-    # Kinematics Setup (needs proper Non-Newtonian boundaries from config)
-    phys_cfg_t2 = PhysicsConfig(phase="kinematics")
-    model_t2 = GINO_DEQ(
-        in_channels=15, out_channels=5, latent_dim=64, max_iters=15,
-        mu_inf_nd=(phys_cfg_t2.mu_inf / phys_cfg_t2.mu_viscosity_nd_scale),
-        mu_0_nd=(phys_cfg_t2.mu_0 / phys_cfg_t2.mu_viscosity_nd_scale)
+    # Kinematics setup
+    phys_cfg_kine = PhysicsConfig(phase="kinematics")
+    model_kine_base = GINO_DEQ(
+        in_channels=15,
+        out_channels=5,
+        latent_dim=256,
+        max_iters=25,
+        num_fourier_freqs=16,
+        phys_cfg=phys_cfg_kine,
+        activation_fn="silu",
+        use_hard_bcs=True,
+        use_siren_decoder=True,
+        use_width_priors=True,
     ).to(device)
-    model_t2.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
-    model_t2.eval()
+    model_kine_base.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
+    model_kine_base.eval()
 
     # Biochem Setup (same PhysicsConfig defaults as train_biochem_corrector.py / config.py)
-    phys_cfg_t3 = PhysicsConfig(phase="biochem")
+    phys_cfg_biochem = PhysicsConfig(phase="biochem")
     bio_cfg = BiochemConfig(phase="biochem")
-    model_t3 = GNODE_Phase3(
-        phys_cfg=phys_cfg_t3,
+    env_prior = int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2"))
+    inferred_prior = _infer_bio_encoder_prior_dim_from_state_dict(biochem_state)
+    bio_enc_prior = inferred_prior if inferred_prior is not None else env_prior
+    print(f"   ↳ Using biochem checkpoint: {biochem_ckpt.name}")
+    print(f"   ↳ bio_encoder prior dim: {bio_enc_prior}")
+    model_biochem = GNODE_Phase3(
+        phys_cfg=phys_cfg_biochem,
         in_channels=12,
         spatial_channels=15,
         latent_dim=64,
         max_inner_iters=10,
+        bio_encoder_prior_dim=bio_enc_prior,
         mu_ratio_max=bio_cfg.mu_ratio_max,
         mat_crit=bio_cfg.viscosity_mat_crit,
         fi_crit=bio_cfg.viscosity_fi_crit,
         temp_mat=bio_cfg.viscosity_gnode_temp_mat,
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
     ).to(device)
-    model_t3.load_state_dict(torch.load(t3_ckpt, map_location=device, weights_only=True))
-    model_t3.eval()
+    _inject_biochem_kinematic_lora(model_biochem)
+    model_biochem.load_state_dict(biochem_state)
+    model_biochem.eval()
 
     # ------------------------------------------------------------------
     # 5. Inference
     # ------------------------------------------------------------------
-    print("\n🔮 Running Inference across all Phases...")
+    print("\n🔮 Running inference across kinematics + biochem...")
     with torch.no_grad():
-        pred_t1 = model_t1(data_t1) if isinstance(model_t1(data_t1), tuple) else model_t1(data_t1)
-        pred_t2 = model_t2(data_t2) if isinstance(model_t2(data_t2), tuple) else model_t2(data_t2)
-
+        pred_kine_base = _run_model_once(model_kine_base, data_kine_base)
         # Setup evaluation times for Biochem Neural ODE.
-        dense_times = bio_cfg.resolve_biochem_times(data_t3, device)
+        dense_times = bio_cfg.resolve_biochem_times(data_biochem, device)
+        if dense_times.numel() < 2:
+            raise ValueError("Biochem timeline must contain at least two timestamps for rollout visualization.")
         t_final = float(dense_times[-1].item())
         dt = float((dense_times[1] - dense_times[0]).item())
+        if dt <= 0.0:
+            raise ValueError(f"Invalid biochem timeline step dt={dt}. Expected strictly positive spacing.")
 
         # Extrapolate to 1.5x t_final by extending the dense timeline.
-        num_extra = int((t_final * 0.5) / dt)
+        num_extra = max(1, int((t_final * 0.5) / dt))
         extended_times = torch.cat([
             dense_times,
             dense_times[-1] + dt * torch.arange(1, num_extra + 1, device=device),
         ])
 
         # Forward pass over the dense timeline (safer ODE stepping).
-        pred_t3_series_dense = model_t3(data_t3, extended_times)
+        pred_biochem_series_dense = model_biochem(data_biochem, extended_times)
 
         # Extract the keyframes used by the temporal slider.
         custom_times = [0.0, t_final * 0.33, t_final * 0.66, t_final, t_final * 1.5]
@@ -242,16 +304,15 @@ def run_phase_comparison(regenerate=True, seed=42):
             torch.argmin(torch.abs(extended_times - t)).item()
             for t in custom_times
         ]
-        pred_t3_series = pred_t3_series_dense[frame_indices]
+        pred_biochem_series = pred_biochem_series_dense[frame_indices]
 
         # Extract the final *trained* time step for static Fig 1 comparison.
         idx_t_final = torch.argmin(torch.abs(extended_times - t_final)).item()
-        pred_t3 = pred_t3_series_dense[idx_t_final]
+        pred_biochem = pred_biochem_series_dense[idx_t_final]
 
-    pred_t1_np = pred_t1.cpu().numpy()
-    pred_t2_np = pred_t2.cpu().numpy()
-    pred_t3_np = pred_t3.cpu().numpy()
-    pred_t3_series_np = pred_t3_series.cpu().numpy()
+    pred_kine_base_np = pred_kine_base.detach().cpu().numpy()
+    pred_biochem_np = pred_biochem.detach().cpu().numpy()
+    pred_biochem_series_np = pred_biochem_series.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
     # 5.5 Extract Fields & Calculate Bounds
@@ -264,17 +325,16 @@ def run_phase_comparison(regenerate=True, seed=42):
         viscosity = pred_np[:, _CHANNEL['mu_eff']]
         return vel_mag, pressure, viscosity
 
-    vel_1, p_1, mu_1 = get_kinematics(pred_t1_np)
-    vel_2, p_2, mu_2 = get_kinematics(pred_t2_np)
-    vel_3, p_3, mu_3 = get_kinematics(pred_t3_np)
+    vel_kine_base, p_kine_base, mu_kine_base = get_kinematics(pred_kine_base_np)
+    vel_biochem, p_biochem, mu_biochem = get_kinematics(pred_biochem_np)
 
     # Determine global min/max for fair colorbar comparisons across columns
-    vel_min = min(vel_1.min(), vel_2.min(), vel_3.min())
-    vel_max = max(vel_1.max(), vel_2.max(), vel_3.max())
-    p_min = min(p_1.min(), p_2.min(), p_3.min())
-    p_max = max(p_1.max(), p_2.max(), p_3.max())
-    mu_min = min(mu_1.min(), mu_2.min(), mu_3.min())
-    mu_max = max(mu_1.max(), mu_2.max(), mu_3.max())
+    vel_min = min(vel_kine_base.min(), vel_biochem.min())
+    vel_max = max(vel_kine_base.max(), vel_biochem.max())
+    p_min = min(p_kine_base.min(), p_biochem.min())
+    p_max = max(p_kine_base.max(), p_biochem.max())
+    mu_min = min(mu_kine_base.min(), mu_biochem.min())
+    mu_max = max(mu_kine_base.max(), mu_biochem.max())
 
     # ------------------------------------------------------------------
     # 6. Plotting
@@ -282,28 +342,25 @@ def run_phase_comparison(regenerate=True, seed=42):
     print("🎨 Generating Comparison Plots...")
 
     # --- FIGURE 1: Kinematic Comparison ---
-    fig1, axes1 = plt.subplots(3, 3, figsize=(20, 14))
-    fig1.suptitle("Kinematic Evolution: Kinematics (Newtonian) vs Kinematics (Non-Newtonian) vs Biochem (Bio-Coupled)",
+    fig1, axes1 = plt.subplots(3, 2, figsize=(15, 14))
+    fig1.suptitle("Kinematic Evolution: Kine vs Biochem (Coupled)",
                   fontsize=18, y=0.98)
 
-    columns = ["Kinematics (Newtonian)", "Kinematics (Carreau Rheology)", "Biochem (Coupled Biochemistry)"]
+    columns = ["Kine", "Biochem (Coupled)"]
     for ax, col in zip(axes1[0], columns):
         ax.set_title(col, fontsize=14, fontweight='bold', pad=20)
 
     # Row 1: Velocity (non-dimensional)
-    _plot_field(fig1, axes1[0, 0], pos, vel_1, "Velocity Mag (ND)", 'jet', vmin=vel_min, vmax=vel_max)
-    _plot_field(fig1, axes1[0, 1], pos, vel_2, "Velocity Mag (ND)", 'jet', vmin=vel_min, vmax=vel_max)
-    _plot_field(fig1, axes1[0, 2], pos, vel_3, "Velocity Mag (ND)", 'jet', vmin=vel_min, vmax=vel_max)
+    _plot_field(fig1, axes1[0, 0], pos, vel_kine_base, "Velocity Mag (ND)", 'jet', vmin=vel_min, vmax=vel_max)
+    _plot_field(fig1, axes1[0, 1], pos, vel_biochem, "Velocity Mag (ND)", 'jet', vmin=vel_min, vmax=vel_max)
 
     # Row 2: Pressure (non-dimensional)
-    _plot_field(fig1, axes1[1, 0], pos, p_1, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
-    _plot_field(fig1, axes1[1, 1], pos, p_2, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
-    _plot_field(fig1, axes1[1, 2], pos, p_3, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
+    _plot_field(fig1, axes1[1, 0], pos, p_kine_base, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
+    _plot_field(fig1, axes1[1, 1], pos, p_biochem, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
 
     # Row 3: Viscosity
-    _plot_field(fig1, axes1[2, 0], pos, mu_1, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
-    _plot_field(fig1, axes1[2, 1], pos, mu_2, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
-    _plot_field(fig1, axes1[2, 2], pos, mu_3, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
+    _plot_field(fig1, axes1[2, 0], pos, mu_kine_base, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
+    _plot_field(fig1, axes1[2, 1], pos, mu_biochem, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
 
     fig1.tight_layout(rect=(0, 0.03, 1, 0.95))
 
@@ -317,7 +374,7 @@ def run_phase_comparison(regenerate=True, seed=42):
     refresh_btn_main.on_clicked(lambda _: _request_refresh())
 
     print("⏳ Opening interactive Biochem temporal slider...")
-    _show_biochem_temporal_slider(pos, pred_t3_series_np, custom_times, on_refresh=_request_refresh)
+    _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_refresh=_request_refresh)
     return refresh_state["requested"]
 
 

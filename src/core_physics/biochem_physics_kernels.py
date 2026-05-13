@@ -120,17 +120,12 @@ class BiochemPhysicsKernels:
 
         # Update signature to include FI concentration
         def compute_fibrin_kinetics(self, T, FG, FI):
+            # COMSOL reac1 (Reactions) does not apply a saturation limit for FI.
+            # Use the unbounded Michaelis-Menten-like form directly to match COMSOL.
             eps = 1e-8
             reaction_rate = (self.kfi * T * FG) / (self.kmfi + FG + eps)
-
-            c_max = self.cfg.fi_reaction_saturation_si * self.C_scale + eps
-            raw_sat = 1.0 - FI / c_max
-            # Smoothly approximate clamp(raw_sat, 0, 1) to avoid derivative kinks near saturation limits.
-            k_steep = 10.0
-            saturation_term = 0.5 * (torch.tanh(k_steep * (raw_sat - 0.5)) + 1.0)
-
-            R_FI = reaction_rate * saturation_term
-            R_FG = -reaction_rate * saturation_term  # Conservation of species mass
+            R_FI = reaction_rate
+            R_FG = -reaction_rate  # Conservation of species mass
             return R_FG, R_FI
 
         def compute_gamma(self, T, AT):
@@ -195,8 +190,12 @@ class BiochemPhysicsKernels:
         mu1_mat = self.kinetics._soft_step(
             M_wall, self.cfg.viscosity_mat_crit, self.cfg.viscosity_penalty_soft_temp_mat
         ) * (max_ratio - 1.0) + 1.0
+        # FI threshold is defined in SI concentration units (COMSOL). Convert the
+        # model state from log1p(nd) to SI before applying the smooth step.
+        fi_scale = float(self._get_species_scales(FI_field.device, FI_field.dtype)[8].item())
+        FI_si = torch.expm1(torch.clamp(FI_field, min=-10.0, max=8.0)) * fi_scale
         mu2_fi = self.kinetics._soft_step(
-            FI_field, self.cfg.viscosity_fi_crit, self.cfg.viscosity_penalty_soft_temp_fi
+            FI_si, self.cfg.viscosity_fi_crit, self.cfg.viscosity_penalty_soft_temp_fi
         ) * max_ratio
 
         mu_total = mu1_mat + mu2_fi
@@ -218,10 +217,11 @@ class BiochemPhysicsKernels:
         u, v = velocity_field[..., 0], velocity_field[..., 1]
 
         # Pass `data` down into the shear computation
-        shear_rate = self._compute_shear_rate(u, v, spatial_props, data)
-
         a_RBC_m = self.cfg.d_RBC / 2.0
-        D_s = 0.18 * (a_RBC_m ** 2) * shear_rate
+        # COMSOL Keller diffusion uses a global constant maximum shear rate (tau_max).
+        # Using local shear here would introduce spatially varying diffusion not present in COMSOL labels.
+        tau_max = 2000.0
+        D_s = 0.18 * (a_RBC_m ** 2) * tau_max
 
         fast_species = SPECIES_GROUPS["fast"]
         slow_species = SPECIES_GROUPS["slow"]
@@ -247,6 +247,7 @@ class BiochemPhysicsKernels:
         linear_species_preds = nd_species_preds * scales[:bulk_n]
 
         species_dict = {sp.name: linear_species_preds[..., sp.value] for sp in keys}
+        shear_rate = self._compute_shear_rate(u, v, spatial_props, data)
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
         keller_species = SPECIES_GROUPS["keller"]
 
@@ -507,10 +508,14 @@ class BiochemPhysicsKernels:
         low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * k_aa * AP_wall
 
         # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
-        R_M = (pathological_RP_adhesion + low_shear_RP_adhesion) - (k_pa_wall * M)
-        R_Mas = (pathological_AP_adhesion + low_shear_AP_adhesion) + (
-                    pathological_Mas_adhesion + low_shear_Mas_adhesion)
-        R_Mat = k_pa_wall * M
+        # COMSOL srf1 SurfaceReactionsFlux copy-paste bug:
+        # J0_M, J0_Mas, and J0_Mat were set to the same string, so deposition is
+        # dumped uniformly into all three species and the -k_pa*M / +k_pa*M
+        # activation transfer coupling is effectively ignored.
+        R_deposition = pathological_RP_adhesion + low_shear_RP_adhesion
+        R_M = R_deposition
+        R_Mas = R_deposition
+        R_Mat = R_deposition
 
         # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
         # Apply chain rule and rescale to local Convective Time (O(1)) so the surface
@@ -552,7 +557,8 @@ class BiochemPhysicsKernels:
         # the surface ODE residuals and this Neumann flux normalization.
 
         a_RBC_m_wall = self.cfg.d_RBC / 2.0
-        D_s_wall = 0.18 * (a_RBC_m_wall ** 2) * shear_wall
+        tau_max = 2000.0
+        D_s_wall = 0.18 * (a_RBC_m_wall ** 2) * tau_max
         keller_species = SPECIES_GROUPS["keller"]
 
         loss_flux = biochem_preds.sum() * 0.0

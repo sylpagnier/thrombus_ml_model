@@ -21,16 +21,26 @@ from torch.nn.utils.parametrizations import spectral_norm
 class LoRAParametrization(nn.Module):
     """Computes the low-rank additive weight delta applied to a frozen base weight."""
 
-    def __init__(self, in_features: int, out_features: int, rank: int = 4, alpha: float = 1.0):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 4,
+        alpha: float = 1.0,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features, device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device, dtype=dtype))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
         self.scaling = alpha / rank
 
     def forward(self, original_weight: torch.Tensor) -> torch.Tensor:
-        return original_weight + (self.lora_B @ self.lora_A) * self.scaling
+        delta = (self.lora_B @ self.lora_A).to(device=original_weight.device, dtype=original_weight.dtype)
+        return original_weight + delta * self.scaling
 
 
 class SpectralLinear(nn.Module):
@@ -47,11 +57,32 @@ class SpectralLinear(nn.Module):
     def inject_lora(self, rank: int = 4, alpha: float = 1.0) -> None:
         in_features = self.linear.in_features
         out_features = self.linear.out_features
-        torch.nn.utils.remove_spectral_norm(self.linear)
+        # Idempotency: if LoRA already exists, do not stack parametrizations.
+        if hasattr(self.linear, "parametrizations") and "weight" in self.linear.parametrizations:
+            for p in self.linear.parametrizations.weight:
+                if isinstance(p, LoRAParametrization):
+                    return
+
+        # PyTorch exposes spectral norm in two flavors:
+        # 1) legacy hook-based (remove_spectral_norm)
+        # 2) parametrization-based (ParametrizedLinear with _SpectralNorm)
+        # Handle both so LoRA injection works across torch versions.
+        try:
+            torch.nn.utils.remove_spectral_norm(self.linear)
+        except (ValueError, AttributeError):
+            if hasattr(self.linear, "parametrizations") and "weight" in self.linear.parametrizations:
+                parametrize.remove_parametrizations(self.linear, "weight", leave_parametrized=True)
         parametrize.register_parametrization(
             self.linear,
             "weight",
-            LoRAParametrization(in_features, out_features, rank, alpha),
+            LoRAParametrization(
+                in_features,
+                out_features,
+                rank,
+                alpha,
+                device=self.linear.weight.device,
+                dtype=self.linear.weight.dtype,
+            ),
         )
         spectral_norm(self.linear)
         self.linear.parametrizations.weight.original.requires_grad = False

@@ -22,10 +22,12 @@ class PatientDataExtractor:
 
     State ``y`` layout: indices 0–2 are u, v, p (non-dimensional); channel index 3
     (``STATE_CHANNEL_MU_EFF_ND`` in ``src.config``) is ``mu_effective`` via
-    ``PhysicsConfig.viscosity_si_to_nd`` (Carreau: scale ``mu_inf``).
+    ``PhysicsConfig.viscosity_si_to_nd`` (canonical cross-phase ND viscosity reference).
 
     --- COMSOL Export Instructions ---
     To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
+    IMPORTANT: export from ``Component 1 -> Mesh 1`` geometry coordinates (the solved component mesh),
+    not directly from the raw Mesh Import object, otherwise node coordinates/order can drift and mapping fails.
 
     1. In COMSOL: Go to Results > Export > Data.
     2. Main Domain: Export domain nodes to `data/processed/cfd_results_biochem/<stem>.txt`
@@ -649,10 +651,11 @@ class PatientDataExtractor:
         # --- Use index assignment for the tensor ---
         inlet_species_si = torch.zeros(9, dtype=torch.float32)
         inlet_species_si[0] = bio_cfg.c_RP0 * bio_cfg.bulk_scale  # RP
+        inlet_species_si[1] = bio_cfg.c_AP0 * bio_cfg.bulk_scale  # AP
         inlet_species_si[4] = bio_cfg.c_pT0 * bio_cfg.bulk_scale  # PT
         inlet_species_si[6] = bio_cfg.cAT0 * bio_cfg.bulk_scale  # AT
         inlet_species_si[7] = bio_cfg.c_Fg0 * bio_cfg.bulk_scale  # FG
-        # Note: AP, APR, APS, T, FI remain 0.0 at the inlet
+        # Note: APR, APS, T, FI remain 0.0 at the inlet
 
         # Scale and transform
         inlet_species_nd = inlet_species_si / scales[ :9 ]

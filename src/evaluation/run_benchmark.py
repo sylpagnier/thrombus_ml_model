@@ -288,7 +288,7 @@ def _prompt_int(label, default):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run multi-fidelity benchmark pipeline")
-    parser.add_argument("--phases", type=str, default=None, help='Comma-separated phases (for example: "kinematics,kinematics")')
+    parser.add_argument("--phases", type=str, default=None, help='Comma-separated phases (for example: "kinematics").')
     parser.add_argument("--num-samples", type=int, default=None, help="Number of vessels per benchmark level")
     parser.add_argument("--levels", type=str, default=None, help='Comma-separated benchmark levels (for example: "0,1")')
     parser.add_argument(
@@ -310,6 +310,8 @@ if __name__ == "__main__":
     else:
         phases_raw = args.phases
     target_phases = [t.strip() for t in phases_raw.split(",") if t.strip()]
+    if not target_phases:
+        target_phases = ["kinematics"]
 
     if args.num_samples is None:
         num_samples = _prompt_int("Number of vessels per level", 10)

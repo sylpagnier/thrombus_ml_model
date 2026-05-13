@@ -199,7 +199,7 @@ def compute_step_loss(
     weight_wss_base: float,
 ):
     # 1. Inject dynamic physics parameters into the kernels
-    # mu_viscosity_nd_scale is typically mu_inf (0.0035)
+    # Canonical ND viscosity scale (shared with biochem channel encoding).
     mu_nd_scale = kernels.cfg.mu_viscosity_nd_scale
     kernels.mu_0_nd = current_mu_0 / mu_nd_scale
 

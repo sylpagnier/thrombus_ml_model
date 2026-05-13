@@ -29,6 +29,23 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 - **Node features (Kinematics/2)** — `NodeFeat` slices: positions, SDF, wall normals, priors, optional hydraulic width `D(x)` and derivatives for geometric priors.
 - **Biochem node features** — `BiochemNodeFeat` for clot/chemistry graphs.
 
+### Biochem "Clot" Semantics
+
+In this repository, a "clot" is not a discrete model class. It is an interpretive
+label for a spatial region where the continuous effective-viscosity field
+`mu_eff_si` has been triggered upward by the coupled platelet/fibrin rheology.
+Training therefore treats `mu_eff_si` as a regression target on COMSOL anchor
+nodes. Thresholded views such as `mu_eff_si > 20 * mu_inf` may be logged as
+`HighMuDice@thr` diagnostics for quick sanity checks, but they should not be
+used as classifier metrics (for example AUPRC) or primary checkpoint objectives.
+
+Preferred validation quantities for Biochem high-viscosity behavior are:
+
+- `mu_MAE_si` / `mu_RMSE_si`: absolute effective-viscosity error in physical SI units.
+- `mu_log_MAE`: scale-aware error for the heavy-tailed viscosity field.
+- `mu_Pearson` and `mu_R2`: spatial pattern and explained-variance diagnostics.
+- `HighMuDice@thr`: optional threshold-overlap diagnostic only.
+
 ### Training runtime (no monolithic “trainer” class)
 
 Training is driven by **self-contained scripts** that own dataloading loops, schedulers, and checkpointing:

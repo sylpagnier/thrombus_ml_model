@@ -198,9 +198,9 @@ class PhysicsConfig:
     """Configuration for physical properties and fluid dynamics.
 
     Reynolds / velocity reference uses ``mu_ref`` (``get_u_ref``, ``get_re``). Stored labels and
-    predictions use ``mu_viscosity_nd_scale`` for channel ``STATE_CHANNEL_MU_EFF_ND``: non-dimensional
-    viscosity is always ``mu_eff_si / mu_viscosity_nd_scale`` so Re scaling can change without
-    relabeling graphs.
+    predictions use one canonical ``mu_viscosity_nd_scale`` for channel ``STATE_CHANNEL_MU_EFF_ND``:
+    non-dimensional viscosity is always ``mu_eff_si / mu_viscosity_nd_scale`` so Re/rheology choices
+    can change without relabeling graphs across phases.
     """
     phase: str = "kinematics"
     # Optional rheology override for kinematics phase ("newtonian" or "carreau").
@@ -218,7 +218,7 @@ class PhysicsConfig:
     rho: float = 1106.0  # [kg/m^3]
     re_target: float = 450  # Reynolds number [-]
     viscosity_model: str = field(init=False)
-    # Viscosity [Pa*s] used in Re / u_ref; may differ from mu_viscosity_nd_scale if extended.
+    # Viscosity [Pa*s] used in Re / u_ref; intentionally independent from ND label scaling.
     mu_ref: float = field(init=False)
     mu_newtonian: float = 0.0035  # [Pa*s]
 
@@ -228,6 +228,8 @@ class PhysicsConfig:
     lam: float = 3.313  # Relaxation time [s]
     n: float = 0.3568  # Power law index
     a: float = 2.0  # Yasuda parameter
+    # Canonical viscosity scale [Pa*s] used for ND label channel across all phases/models.
+    mu_viscosity_nd_reference: float = 0.0035
 
     # Carreau momentum residual: if True, ∂μ/∂x does not backprop into predicted μ (PINN-style stability).
     detach_mu_for_ns_gradient: bool = True
@@ -256,16 +258,17 @@ class PhysicsConfig:
             self.mu_ref = self.mu_inf
         else:
             raise ValueError(f"Unknown phase: {self.phase}")
+        if self.mu_viscosity_nd_reference <= 0.0:
+            raise ValueError("mu_viscosity_nd_reference must be strictly positive")
 
     @property
     def mu_viscosity_nd_scale(self) -> float:
         """SI viscosity [Pa*s] that non-dimensionalizes ``mu_eff`` in labels (channel STATE_CHANNEL_MU_EFF_ND).
 
-        Carreau: ``mu_inf``. Newtonian (phase 1): ``mu_newtonian``.
+        This is a canonical cross-phase reference (``mu_viscosity_nd_reference``), so
+        kinematics and biochemistry always share the same ``mu_eff`` channel encoding.
         """
-        if self.viscosity_model == "carreau":
-            return self.mu_inf
-        return self.mu_newtonian
+        return self.mu_viscosity_nd_reference
 
     def viscosity_si_to_nd(self, mu_si: Union[float, "torch.Tensor"]):
         """Effective viscosity SI [Pa*s] → non-dimensional label scale (same as stored in graphs)."""
@@ -324,6 +327,7 @@ class BiochemConfig:
 
     # --- Initial Concentrations ---
     c_RP0: float = 2.5e14  # Initial resting platelets [plt/m^3]
+    c_AP0: float = 1.25e13  # Inlet activated platelets baseline [plt/m^3] (0.05 * c_RP0)
     c_pT0: float = 1.2e-3  # Initial prothrombin concentration [mol/m^3]
     c_Fg0: float = 7.0e-3  # Initial fibrinogen concentration [mol/m^3]
     cAT0: float = 2.84e-3  # Initial/Static background antithrombin concentration [mol/m^3]
@@ -356,8 +360,12 @@ class BiochemConfig:
     # --- Fibrin Kinetics ---
     kfi: float = 59.0  # Reaction rate fibrinogen [1/s]
     kmfi: float = 3.16e-3  # Rate constant fibrin reaction [mol/m^3]
-    # SI scale for (1 - FI/C_max) taper; COMSOL "Sat" is often a 0–1 proxy — here use ~ fibrinogen scale.
-    fi_reaction_saturation_si: float = 7.0e-3  # [mol/m^3], default matches c_Fg0
+    # DEPRECATED (kept for state-dict / checkpoint compatibility): legacy SI scale for
+    # a ``(1 - FI/C_max)`` tanh taper that was removed when ``compute_fibrin_kinetics``
+    # was aligned with COMSOL ``reac1`` (unbounded Michaelis-Menten — see
+    # ``src/tests/fixtures/oracle_kinetics.csv`` header). No code path reads this field
+    # any more; safe to delete in a future cleanup pass.
+    fi_reaction_saturation_si: float = 7.0e-3  # [mol/m^3], default matches c_Fg0 (unused)
 
     # --- Surface Parameters & Diffusion ---
     Minf: float = 7.0e10  # Total deposition capacity / max surface saturation [plt/m^2]
@@ -392,10 +400,10 @@ class BiochemConfig:
     viscosity_mat_crit: float = 2e7
     viscosity_fi_crit: float = 0.6
     viscosity_gnode_temp_mat: float = 1e6
-    viscosity_gnode_temp_fi: float = 0.05
+    viscosity_gnode_temp_fi: float = 0.02
     # Soft-step temperatures in BiochemPhysicsKernels.compute_dual_viscosity_penalty
     viscosity_penalty_soft_temp_mat: float = 7e6
-    viscosity_penalty_soft_temp_fi: float = 0.01
+    viscosity_penalty_soft_temp_fi: float = 0.02
 
     # Soft-step temperatures for BiochemKinetics (STE forward / sigmoid backward). T_scale multiplies all.
     soft_step_T_omega: float = 0.05
@@ -510,7 +518,7 @@ class CurriculumConfig:
     kinematics_carreau_n_distill_start: float = 0.8
 
     # Biochem: warmup / teacher forcing / T_scale schedule
-    biochem_warmup_epochs: int = 10
+    biochem_warmup_epochs: int = 20
     biochem_teacher_force_decay_epochs: int = 20
     biochem_t_scale_warmup_initial: float = 10.0
     biochem_t_scale_warmup_final: float = 8.0
@@ -522,7 +530,7 @@ class CurriculumConfig:
     # Cap exp(-log_var) for physics tasks (indices 0–5: ADR_F, ADR_S, W_Bio, W_Phy, Bio_IO, NS_mom).
     biochem_physics_precision_ceiling: float = 500.0
     biochem_physics_precision_ceiling_warmup: float = 100.0
-    biochem_physics_precision_ramp_epochs: int = 20
+    biochem_physics_precision_ramp_epochs: int = 15
     # Floors for specific physics terms that must not be down-weighted too aggressively.
     # These apply to ADR_S (index 1) and W_Phy (index 3) only.
     biochem_adr_s_precision_floor: float = 3.0
