@@ -50,6 +50,11 @@ Env knobs (all optional, sensible physical defaults):
 - ``BIOCHEM_PRIOR_MIN_FLOOR`` (default ``1e-4``) — small additive floor inside
   the SDF gate so every output channel inherits the wall localisation gate
   even when local kinematics give zero physics signal.
+- ``BIOCHEM_PRIOR_THROMBUS_CORONA_HOPS`` (default ``0``) — after wall-local
+  gating, dilate each prior channel by repeated **per-node max over graph
+  neighbors** (one iteration per hop). Use ``2``–``3`` so thrombus-shaped
+  high-risk regions extend a short graph distance from the wall into the
+  lumen without smearing into the full bulk. Set ``0`` to disable.
 
 Deprecated env vars (silently ignored — kept for backward compat with old run
 configurations and tests that still set them):
@@ -73,6 +78,42 @@ from src.utils.rheology import compute_shear_rate
 
 if TYPE_CHECKING:
     from src.config import BiochemConfig
+
+
+def _max_neighbor_dilate_1d(v: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    """Per-node max over self and neighbors (one undirected graph hop when edges are bidirectional)."""
+    flat = v.reshape(-1).contiguous()
+    row = edge_index[0]
+    col = edge_index[1]
+    msg = torch.full_like(flat, float("-inf"))
+    msg.scatter_reduce_(0, row, flat[col], reduce="amax", include_self=False)
+    return torch.maximum(flat, msg).view(v.shape)
+
+
+def _thrombus_corona_hop_count() -> int:
+    """Graph hops to dilate wall-adjacent clot risk (thrombus a few elements into the lumen)."""
+    try:
+        return max(0, min(12, int(os.environ.get("BIOCHEM_PRIOR_THROMBUS_CORONA_HOPS", "0"))))
+    except ValueError:
+        return 0
+
+
+def _apply_thrombus_corona_dilation(
+    cols: list[torch.Tensor],
+    edge_index: torch.Tensor,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    hops = _thrombus_corona_hop_count()
+    if hops <= 0 or edge_index.numel() == 0:
+        return cols
+    ei = edge_index.to(device=device)
+    out_cols: list[torch.Tensor] = []
+    for c in cols:
+        flat = c.reshape(-1).contiguous()
+        for _ in range(hops):
+            flat = _max_neighbor_dilate_1d(flat, ei)
+        out_cols.append(flat.reshape(c.shape).clamp(0.0, 1.0))
+    return out_cols
 
 
 def shear_rate_si(data, u_nd: torch.Tensor, v_nd: torch.Tensor, props: dict) -> torch.Tensor:
@@ -216,6 +257,15 @@ def clot_prior_features(
         cols.append(col_path)
     while len(cols) < n_features:
         cols.append(pad_template)
+
+    if (
+        hasattr(data, "edge_index")
+        and torch.is_tensor(data.edge_index)
+        and data.edge_index.dim() == 2
+        and data.edge_index.shape[1] > 0
+    ):
+        cols = _apply_thrombus_corona_dilation(cols, data.edge_index, device=u.device)
+
     return torch.stack(cols[:n_features], dim=1)
 
 

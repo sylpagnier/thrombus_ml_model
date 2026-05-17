@@ -100,6 +100,12 @@ SPECIES_GROUPS = {
     "solid": (BulkSpecies.FI,),
 }
 
+# --- TEMP DEBUG (biochemistry / COMSOL pipeline) ---
+# Upper bound [s] on physical time kept when exporting graphs and when synthesizing
+# fallback timelines. **Not for production:** raise or remove this cap (or set it
+# well above your COMSOL ``t_end``) before full-horizon training and evaluation.
+BIOCHEM_T_MAX: float = 8000.0
+
 PHASE_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
     "kinematics": 0.75,
 }
@@ -492,6 +498,7 @@ class BiochemConfig:
                     "Anchor COMSOL exports must provide aligned time stamps."
                 )
             t_last = float(t[-1].item()) if t.numel() else float(self.t_final)
+            t_last = min(t_last, float(BIOCHEM_T_MAX))
             warnings.warn(
                 f"data.t length {t.numel()} != y time dim {t_steps}; "
                 f"using linspace(0, {t_last:g}, {t_steps}). Re-export graphs with aligned t.",
@@ -505,14 +512,21 @@ class BiochemConfig:
                 "Anchor biochem graph is missing `data.t`. "
                 "Anchor COMSOL exports must include time stamps."
             )
+        t_end = min(float(self.t_final), float(BIOCHEM_T_MAX))
         return self._ensure_strictly_increasing_times(
-            torch.linspace(0.0, float(self.t_final), steps=t_steps, device=device, dtype=torch.float32)
+            torch.linspace(0.0, t_end, steps=t_steps, device=device, dtype=torch.float32)
         )
 
 
 @dataclass
 class CurriculumConfig:
-    """Training curriculum schedules (keeps magic numbers out of training loops)."""
+    """Training curriculum schedules (keeps magic numbers out of training loops).
+
+    Biochem temporal rollouts are bounded by the timestamps on each graph (COMSOL
+    anchors after extraction use ``t <= BIOCHEM_T_MAX`` while the TEMP DEBUG cap
+    is enabled — see ``src.config.BIOCHEM_T_MAX`` and
+    ``src.training.physics_curriculum.biochem_physical_time_horizon_s``).
+    """
 
     # Kinematics: Carreau index n during viscosity distillation (anneals toward PhysicsConfig.n)
     kinematics_carreau_n_distill_start: float = 0.8

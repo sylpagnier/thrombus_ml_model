@@ -14,6 +14,8 @@ Start here, then open the linked files for depth.
 
 2. **[KINEMATICS_TRAINING_HISTORY.md](KINEMATICS_TRAINING_HISTORY.md)** — Kinematics sweep history, mesh-resolution decision, V2/V3 strategy.
 
+3. **[BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md)** — Biochem corrector training log: complexity ladder, μ diagnostics, env pitfalls, run table (update after experiments).
+
 ## Common commands
 
 ```text

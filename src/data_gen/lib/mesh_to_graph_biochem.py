@@ -18,7 +18,7 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
-from src.config import VesselConfig, PhysicsConfig, BiochemConfig
+from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from .graph_velocity_priors import (
     mass_conserving_umax_nd,
@@ -580,9 +580,11 @@ class MeshToGraphPhase3:
         if self.vessel_cfg.phase in ("biochem", "biochem_mix") and not is_anchor:
             bio_cfg = BiochemConfig(phase="biochem")
 
-            # 1) Dummy time trajectory [T, N, 16] + time tensor
+            # 1) Dummy time trajectory [T, N, 16] + time tensor (length ``num_time_steps``, not COMSOL export width)
             num_times = bio_cfg.num_time_steps
-            eval_times_tensor = torch.linspace(0.0, bio_cfg.t_final, num_times, dtype=torch.float32)
+            # TEMP DEBUG: match truncated anchor horizon (``BIOCHEM_T_MAX``); do not assume full ``t_final``.
+            t_horizon_s = min(float(bio_cfg.t_final), float(BIOCHEM_T_MAX))
+            eval_times_tensor = torch.linspace(0.0, t_horizon_s, num_times, dtype=torch.float32)
             y_tensor_series = torch.zeros((num_times, len(nodes), 16), dtype=torch.float32)
 
             bio_inlet_bc = default_biochem_bio_inlet_bc(len(nodes))

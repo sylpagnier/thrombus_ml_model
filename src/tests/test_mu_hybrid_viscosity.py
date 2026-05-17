@@ -82,3 +82,12 @@ def test_forward_one_step_with_gelation_head():
     assert traj.shape == (1, n, 16)
     mu_nd = traj[0, :, 3:4]
     assert torch.isfinite(mu_nd).all()
+
+
+def test_gelation_prior_gate_env(monkeypatch):
+    from src.architecture import gnode_biochem as gb
+
+    monkeypatch.delenv("BIOCHEM_GELATION_PRIOR_GATE", raising=False)
+    assert gb._biochem_gelation_prior_gate_enabled()
+    monkeypatch.setenv("BIOCHEM_GELATION_PRIOR_GATE", "0")
+    assert not gb._biochem_gelation_prior_gate_enabled()

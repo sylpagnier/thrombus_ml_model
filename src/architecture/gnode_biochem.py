@@ -3,18 +3,39 @@ import torch.nn as nn
 import math
 import os
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch import Tensor
 from torch_geometric.utils import degree
-# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that.
-from torchdiffeq import odeint_adjoint
+# ``odeint`` OOMs on large graphs; ``odeint_adjoint`` fixes that. For short TBPTT teacher
+# windows, ``BIOCHEM_ODEINT_USE_ADJOINT=0`` uses dense ``odeint`` backward (more VRAM,
+# often stabler than adjoint on stiff segments / low RK substep counts).
+from torchdiffeq import odeint, odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.config import BiochemConfig, NodeFeat
-from src.core_physics.kinematics_clot_prior import clot_prior_features
+from src.core_physics.kinematics_clot_prior import clot_prior_features, clot_prior_score_flat
 from src.utils.batching import get_batch_tensor
 
 # Matches BiochemPhysicsKernels: species channels are log1p(species_nd).
 _SPECIES_LOG1P_MIN = -10.0
 _SPECIES_LOG1P_MAX = 8.0
+
+
+def _biochem_ode_grad_checkpoint_enabled() -> bool:
+    """Recompute GINO derivative block during backward to lower peak VRAM (more compute).
+
+    Set ``BIOCHEM_ODE_GRADIENT_CHECKPOINT=1`` during biochem / teacher training on tight GPUs.
+    """
+    v = (os.environ.get("BIOCHEM_ODE_GRADIENT_CHECKPOINT", "0") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _biochem_gelation_prior_gate_enabled() -> bool:
+    """When true (default), scale FI/Mat + learned gelation by wall-local kinematic clot-risk prior.
+
+    Set ``BIOCHEM_GELATION_PRIOR_GATE=0`` to restore legacy behaviour (gelation can lift μ everywhere).
+    """
+    raw = (os.environ.get("BIOCHEM_GELATION_PRIOR_GATE", "1") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
@@ -69,13 +90,36 @@ class BioODEFunc(nn.Module):
         self.derivative_energy_sum = 0.0
         self.derivative_eval_count = 0
 
+    def _derivative_gino_block(
+        self,
+        z: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor,
+        batch_idx: Tensor,
+        mb: Tensor,
+    ) -> Tensor:
+        n_e = int(edge_index.shape[1])
+        mod_dummy = torch.zeros(n_e, 1, dtype=torch.float32, device=z.device)
+        return self.derivative_processor(z, edge_index, edge_attr, batch_idx, mb, mod_dummy, mod_dummy)
+
     def forward(self, t, z, edge_index, edge_attr, batch_idx, mod_biochem=None):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
         z = torch.clamp(z, min=-20.0, max=20.0)
-        mod_dummy = torch.zeros(int(edge_index.shape[ 1 ]), 1, dtype=torch.float32, device=z.device)
-        if mod_biochem is None:
-            mod_biochem = mod_dummy
-        dz_raw = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mod_biochem, mod_dummy, mod_dummy)
+        n_e = int(edge_index.shape[1])
+        mod_dummy = torch.zeros(n_e, 1, dtype=torch.float32, device=z.device)
+        mod_in = mod_biochem if mod_biochem is not None else mod_dummy
+        if self.training and _biochem_ode_grad_checkpoint_enabled():
+            dz_raw = checkpoint(
+                self._derivative_gino_block,
+                z,
+                edge_index,
+                edge_attr,
+                batch_idx,
+                mod_in,
+                use_reentrant=False,
+            )
+        else:
+            dz_raw = self._derivative_gino_block(z, edge_index, edge_attr, batch_idx, mod_in)
 
         # Explicitly smooth latent states to suppress high-frequency spatial jitter during integration.
         row, col = edge_index
@@ -522,7 +566,21 @@ class GNODE_Phase3(nn.Module):
 
             explicit_gelation = self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
             learned_gelation = self.learned_clot_penalty(sp_safe)
-            total_multiplier = 1.0 + explicit_gelation + learned_gelation
+            gel_extra = explicit_gelation + learned_gelation
+            if _biochem_gelation_prior_gate_enabled():
+                # Wall-localised [0,1] map: keeps bulk lumen near pure Carreau (μ_kin_baseline) unless
+                # kinematics indicate clot-risk (separation / low-shear × wall proximity).
+                props_g = {"u_ref": u_ref.to(dtype=torch.float32), "d_bar": d_bar.to(dtype=torch.float32)}
+                p_gate = clot_prior_score_flat(
+                    batch,
+                    u_nd.reshape(-1),
+                    v_nd.reshape(-1),
+                    self._bio_cfg,
+                    props_g,
+                )
+                p_gate = p_gate.detach().clamp(0.0, 1.0).reshape(-1, 1).to(dtype=gel_extra.dtype)
+                gel_extra = gel_extra * p_gate
+            total_multiplier = 1.0 + gel_extra
             current_mu_eff = mu_kin_baseline * total_multiplier
 
             # ==========================================
@@ -613,6 +671,12 @@ class GNODE_Phase3(nn.Module):
                     max_step_nd = max_step_phys_s / max(t_int_ref, 1e-12)
                     rk_sub_env = (os.environ.get("BIOCHEM_ADJOINT_RK4_SUBSTEPS") or "").strip()
                     n_rk_sub = max(1, int(rk_sub_env) if rk_sub_env else 32)
+                    use_adjoint = (os.environ.get("BIOCHEM_ODEINT_USE_ADJOINT", "1") or "").strip().lower() not in (
+                        "0",
+                        "false",
+                        "no",
+                        "off",
+                    )
 
                     def _one_odeint(z0, span: torch.Tensor, step_hint: float) -> torch.Tensor:
                         ode_kwargs = dict(ode_kwargs_base)
@@ -623,12 +687,22 @@ class GNODE_Phase3(nn.Module):
                             sh = max(seg_len / float(n_rk_sub), 1e-12)
                             ode_kwargs["options"] = {"step_size": sh}
                             ode_kwargs["adjoint_options"] = {"step_size": sh}
-                        z_out = odeint_adjoint(
-                            odefunc_wrapper,
-                            z0,
-                            span,
-                            **ode_kwargs,
-                        )
+                        if use_adjoint:
+                            z_out = odeint_adjoint(
+                                odefunc_wrapper,
+                                z0,
+                                span,
+                                **ode_kwargs,
+                            )
+                        else:
+                            plain = dict(
+                                method=solver_method,
+                                rtol=self.rtol,
+                                atol=self.atol,
+                            )
+                            if solver_method == "rk4" and "options" in ode_kwargs:
+                                plain["options"] = ode_kwargs["options"]
+                            z_out = odeint(odefunc_wrapper, z0, span, **plain)
                         return z_out[1]
 
                     if dt_seg > max_step_nd:

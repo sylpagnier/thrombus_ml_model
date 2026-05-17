@@ -187,3 +187,35 @@ def test_smooth_width_nd_on_edges_damps_spike():
     out = smooth_width_nd_on_edges(w, edge_index, num_nodes=3, alpha=0.5, iters=5)
     assert out[1, 0] < w[1, 0]
     assert out[0, 0] > w[0, 0]
+
+
+def test_gmsh_line_boundary_masks_raises_without_inlet():
+    import numpy as np
+    import pytest
+
+    from src.data_gen.lib.mesh_wls import gmsh_line_boundary_masks
+
+    class M:
+        cells_dict = {"line": np.array([[0, 1], [1, 2]], dtype=np.int64)}
+        cell_data_dict = {"gmsh:physical": {"line": np.array([2, 3], dtype=np.int32)}}
+
+    m = M()
+    tags = {"Inlet": 1, "Outlet_1": 2, "Walls": 3}
+    with pytest.raises(ValueError, match="no inlet nodes"):
+        gmsh_line_boundary_masks(m, num_nodes=3, tags=tags)
+
+
+def test_gmsh_line_boundary_masks_raises_without_wall():
+    import numpy as np
+    import pytest
+
+    from src.data_gen.lib.mesh_wls import gmsh_line_boundary_masks
+
+    class M:
+        cells_dict = {"line": np.array([[0, 1], [1, 2]], dtype=np.int64)}
+        cell_data_dict = {"gmsh:physical": {"line": np.array([1, 2], dtype=np.int32)}}
+
+    m = M()
+    tags = {"Inlet": 1, "Outlet_1": 2, "Walls": 99}
+    with pytest.raises(ValueError, match="no wall nodes"):
+        gmsh_line_boundary_masks(m, num_nodes=3, tags=tags)

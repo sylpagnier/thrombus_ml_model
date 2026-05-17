@@ -758,6 +758,13 @@ def summarize_graph(stem: str, graph_dir: Path) -> None:
     print(f"num_nodes            : {int(data.num_nodes)}")
     print(f"num_edges            : {int(data.edge_index.shape[1])}")
     print(f"inlet/outlet/wall    : {int(data.mask_inlet.sum())}/{int(data.mask_outlet.sum())}/{int(data.mask_wall.sum())}")
+    if int(data.mask_wall.sum()) == 0:
+        print(
+            "⚠️  mask_wall is all False in this saved graph: wall surface channels (M/Mas/Mat) are zeroed "
+            "every step; wall/ADR physics and adjoint backward are ill-posed. New graph builds fail fast "
+            "unless inlet, outlet, and wall Gmsh line tags match VesselConfig.TAGS — regenerate from a "
+            "fixed .msh export."
+        )
     if hasattr(data, "t"):
         t = data.t.detach().cpu().numpy()
         if t.size > 1:

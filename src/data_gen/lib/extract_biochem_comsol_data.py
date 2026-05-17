@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 import glob
 import re
-from src.config import VesselConfig, PhysicsConfig, BiochemConfig
+from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig
 from src.utils.paths import get_project_root
 from src.utils.channel_schema import BIO_X_SCHEMA, BIO_Y_SCHEMA, attach_channel_metadata
 from src.utils.units import MESH_UNIT_CM, assert_mesh_unit
@@ -347,13 +347,28 @@ class PatientDataExtractor:
         if not header_line:
             raise ValueError(f"Could not find time-step header in {filepath.name}")
 
-        import re
         # Find all unique time values in the header
         times = []
         for match in re.finditer(r't=([0-9.]+)', header_line):
             t_val = float(match.group(1))
             if t_val not in times:
                 times.append(t_val)
+
+        # TEMP DEBUG: drop late-time columns before building per-step blocks so disk tensors
+        # never store redundant horizons (see ``src.config.BIOCHEM_T_MAX``).
+        times_arr = np.asarray(times, dtype=np.float64)
+        valid_time_indices = times_arr <= float(BIOCHEM_T_MAX)
+        n_kept = int(valid_time_indices.sum())
+        if n_kept == 0:
+            raise ValueError(
+                f"No COMSOL export time steps <= BIOCHEM_T_MAX={BIOCHEM_T_MAX} s in {filepath.name!r}."
+            )
+        if n_kept < int(times_arr.size):
+            print(
+                f"[TEMP DEBUG] {filepath.name}: truncating COMSOL trajectory to "
+                f"t <= {BIOCHEM_T_MAX} s (kept {n_kept}/{int(times_arr.size)} steps)."
+            )
+        times = [float(x) for x in times_arr[valid_time_indices]]
 
         # 2. Load the numeric data (skipping comment lines)
         df_full = pd.read_csv(filepath, comment='%', sep=r'\s+', header=None)

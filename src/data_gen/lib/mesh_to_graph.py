@@ -549,11 +549,14 @@ class MeshToGraph(MeshToGraphComplete):
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 
-    def run(self) -> None:
-        """Convert every ``.msh`` under ``raw_dir`` to a graph ``.pt`` (with labels if CFD ``.npz`` exists).
+    def run(self, max_files=None) -> None:
+        """Convert ``.msh`` files under ``raw_dir`` to graph ``.pt`` (with labels if CFD ``.npz`` exists).
 
         Clears all existing ``*.pt`` files in ``proc_dir`` first so each run fully replaces
         graph outputs (no stale graphs if meshes were removed or indices changed).
+
+        Args:
+            max_files: If set, only the first ``max_files`` meshes (sorted by name) are converted.
         """
         self.proc_dir.mkdir(parents=True, exist_ok=True)
         for stale in self.proc_dir.glob("*.pt"):
@@ -562,6 +565,8 @@ class MeshToGraph(MeshToGraphComplete):
             except OSError as e:
                 print(f"Warning: could not remove {stale}: {e}")
         files = sorted([f for f in os.listdir(self.raw_dir) if f.endswith(".msh")])
+        if max_files is not None:
+            files = files[: int(max_files)]
         for f in tqdm(files):
             self.process_file(f)
 

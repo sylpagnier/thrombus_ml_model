@@ -66,21 +66,76 @@ def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tupl
     except Exception:
         pass
 
+    if len(line_tags) == 0 or len(line_cells) == 0:
+        raise ValueError(
+            "gmsh_line_boundary_masks: no Gmsh line cells with physical tags were found "
+            "(expected mesh.cells_dict['line'] and cell_data_dict['gmsh:physical']['line'], "
+            "or meshio equivalents). Re-export the .msh with tagged inlet, outlet, and wall curves."
+        )
+    if len(line_tags) != len(line_cells):
+        raise ValueError(
+            f"gmsh_line_boundary_masks: line_tags length ({len(line_tags)}) != line_cells length "
+            f"({len(line_cells)}); mesh file is inconsistent."
+        )
+
+    def _line_node_indices(cell) -> np.ndarray:
+        arr = np.asarray(cell, dtype=np.int64).reshape(-1)
+        if arr.size == 0:
+            return arr
+        if (arr < 0).any() or (arr >= num_nodes).any():
+            bad = arr[(arr < 0) | (arr >= num_nodes)]
+            raise ValueError(
+                "gmsh_line_boundary_masks: line references node index outside "
+                f"[0, {num_nodes - 1}] (bad values: {bad[:16]!r}{'...' if bad.size > 16 else ''}). "
+                "Re-export or repair the mesh."
+            )
+        return arr
+
     for i, tag in enumerate(line_tags):
         if isinstance(line_cells, list) and not isinstance(line_cells[0], (int, float, np.integer)):
             nodes = line_cells[i]
         else:
             nodes = line_cells[i]
+        idx = _line_node_indices(nodes)
 
         if tag == t_in:
-            mask_inlet[nodes] = True
+            mask_inlet[idx] = True
         elif tag == t_out:
-            mask_outlet[nodes] = True
+            mask_outlet[idx] = True
         elif tag == t_wall:
-            mask_wall[nodes] = True
+            mask_wall[idx] = True
 
     mask_inlet = mask_inlet & (~mask_wall)
     mask_outlet = mask_outlet & (~mask_wall)
+
+    unique_tags = sorted({int(t) for t in line_tags})
+    tag_msg = f"Unique gmsh:physical line tags present in mesh: {unique_tags}. " f"Expected Inlet={t_in}, Outlet_1={t_out}, Walls={t_wall}."
+
+    if not bool(mask_inlet.any()):
+        raise ValueError(
+            "gmsh_line_boundary_masks: **no inlet nodes** matched VesselConfig.TAGS['Inlet']. "
+            + tag_msg
+            + " Fix Gmsh physical names/IDs or update TAGS, then re-export."
+        )
+    if not bool(mask_outlet.any()):
+        raise ValueError(
+            "gmsh_line_boundary_masks: **no outlet nodes** matched VesselConfig.TAGS['Outlet_1']. "
+            + tag_msg
+            + " Fix Gmsh physical names/IDs or update TAGS, then re-export."
+        )
+    if not bool(mask_wall.any()):
+        raise ValueError(
+            "gmsh_line_boundary_masks: **no wall nodes** matched VesselConfig.TAGS['Walls']. "
+            + tag_msg
+            + " Without wall tags, surface species and wall residuals are undefined. "
+            "Re-export the mesh with wall boundary curves under the expected physical group."
+        )
+    if bool((mask_inlet & mask_outlet).any()):
+        overlap = int((mask_inlet & mask_outlet).sum().item())
+        raise ValueError(
+            f"gmsh_line_boundary_masks: {overlap} node(s) are both inlet and outlet after wall "
+            "carving (tags overlap on shared vertices). Fix boundary curve tagging in Gmsh."
+        )
 
     return mask_inlet, mask_outlet, mask_wall
 

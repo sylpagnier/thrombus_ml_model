@@ -1,4 +1,10 @@
-"""Curriculum easing for Predictor (Kine phase) → Corrector (Biochem phase) training."""
+"""Curriculum easing for Predictor (Kine phase) → Corrector (Biochem phase) training.
+
+Biochem **physical** rollout length is determined by the time axis on each graph
+(``data.t`` / ``data.y.shape[0]``). While the TEMP DEBUG cap ``BIOCHEM_T_MAX`` is
+enabled in ``src.config``, COMSOL anchor extraction and synthetic graph timelines
+stay within that bound so TBPTT / ODE windows never target absent ground truth.
+"""
 
 from __future__ import annotations
 
@@ -80,4 +86,20 @@ def update_physics_curriculum(
     return True
 
 
-__all__ = ["ease01", "update_physics_curriculum"]
+def biochem_physical_time_horizon_s() -> float:
+    """Physical time ceiling [s] for biochem pipelines (``src.config.BIOCHEM_T_MAX``).
+
+    **TEMP DEBUG:** Used to document and share one import path for the truncated
+    COMSOL / synthetic horizon. Full-horizon runs: remove or raise the cap in config
+    before relying on this value for production curricula.
+    """
+    from src.config import BIOCHEM_T_MAX as _tmax
+
+    return float(_tmax)
+
+
+__all__ = [
+    "biochem_physical_time_horizon_s",
+    "ease01",
+    "update_physics_curriculum",
+]

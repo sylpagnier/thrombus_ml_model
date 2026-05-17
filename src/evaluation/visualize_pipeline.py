@@ -1,4 +1,8 @@
+import contextlib
 import os
+import time
+from typing import Dict, Iterator, List, Tuple
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,9 +12,10 @@ from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
-from src.architecture.gnode_biochem import GNODE_Phase3
+from src.architecture.gnode_biochem import GNODE_Phase3, _SPECIES_LOG1P_MAX, _SPECIES_LOG1P_MIN
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND
+from src.utils.nondim import to_t_nd
 
 # Standard channel indices across all models for kinematics
 _CHANNEL = dict(u=0, v=1, p=2, mu_eff=STATE_CHANNEL_MU_EFF_ND)
@@ -29,6 +34,55 @@ def _infer_bio_encoder_prior_dim_from_state_dict(state_dict):
     if inferred < 0:
         return None
     return inferred
+
+
+def _infer_latent_dim_from_state_dict(state_dict) -> int | None:
+    """Match ``train_biochem_corrector``: infer GNODE width from saved tensors."""
+    w = state_dict.get("kin_encoder.0.weight")
+    if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+        return int(w.shape[0])
+    w = state_dict.get("bio_encoder.linear.parametrizations.weight.original")
+    if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+        return int(w.shape[0])
+    return None
+
+
+@contextlib.contextmanager
+def _viz_biochem_ode_speedups() -> Iterator[None]:
+    """Plain ``odeint`` + coarser RK for visualization unless the user already set these env vars."""
+    keys = ("BIOCHEM_ODEINT_USE_ADJOINT", "BIOCHEM_ADJOINT_RK4_SUBSTEPS")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        if saved["BIOCHEM_ODEINT_USE_ADJOINT"] is None:
+            os.environ["BIOCHEM_ODEINT_USE_ADJOINT"] = "0"
+        if saved["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] is None:
+            os.environ["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] = "8"
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
+def _filter_compatible_state_dict(
+    source_state_dict: Dict[str, torch.Tensor],
+    target_state_dict: Dict[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    """Keep only checkpoint tensors whose key exists and shape matches the live model."""
+    compatible: Dict[str, torch.Tensor] = {}
+    skipped: List[str] = []
+    for key, value in source_state_dict.items():
+        target_value = target_state_dict.get(key, None)
+        if target_value is None:
+            skipped.append(key)
+            continue
+        if tuple(value.shape) != tuple(target_value.shape):
+            skipped.append(key)
+            continue
+        compatible[key] = value
+    return compatible, skipped
 
 
 def _inject_biochem_kinematic_lora(model, rank=4, alpha=1.0):
@@ -66,6 +120,77 @@ def _run_model_once(model, data):
     return pred[0] if isinstance(pred, tuple) else pred
 
 
+def _biochem_rheology_fields(
+    model: GNODE_Phase3,
+    data,
+    pred_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """COMSOL-style gelation: Carreau ``μ_blood`` + triggers ``μ1(Mat)``, ``μ2(FI)`` (same as ``GNODE_Phase3``)."""
+    device = pred_t.device
+    dtype = pred_t.dtype
+    u_nd = pred_t[:, 0:1]
+    v_nd = pred_t[:, 1:2]
+    mu_inf = model.phys_cfg.mu_inf
+    mu_0 = model.phys_cfg.mu_0
+    lam = model.phys_cfg.lam
+    n_idx = model.phys_cfg.n
+    u_ref = data.u_ref.view(-1, 1).to(device=device, dtype=dtype)
+    d_bar = data.d_bar.view(-1, 1).to(device=device, dtype=dtype)
+
+    du_dx_nd = torch.sparse.mm(data.G_x, u_nd)
+    du_dy_nd = torch.sparse.mm(data.G_y, u_nd)
+    dv_dx_nd = torch.sparse.mm(data.G_x, v_nd)
+    dv_dy_nd = torch.sparse.mm(data.G_y, v_nd)
+
+    scale_grad = u_ref / d_bar
+    gamma_dot = torch.sqrt(
+        2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2)
+        + ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2
+        + 1e-8
+    )
+
+    mu_blood = mu_inf + (mu_0 - mu_inf) * torch.pow(1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0)
+
+    sp_safe = torch.clamp(
+        pred_t[:, 4:16],
+        min=torch.tensor(_SPECIES_LOG1P_MIN, device=device, dtype=dtype),
+        max=torch.tensor(_SPECIES_LOG1P_MAX, device=device, dtype=dtype),
+    )
+    species_si = model.species_log_nd_to_si(sp_safe)
+    fi_si = species_si[:, 8:9]
+    mat_si = species_si[:, 11:12]
+    mu1 = model.mu1_sigmoid(mat_si)
+    mu2 = model.mu2_sigmoid(fi_si)
+    mu_blood_mu1 = mu_blood * mu1
+    return (
+        mu_blood.squeeze(-1),
+        mu1.squeeze(-1),
+        mu2.squeeze(-1),
+        mu_blood_mu1.squeeze(-1),
+    )
+
+
+def _rheology_series_numpy(
+    model: GNODE_Phase3,
+    data,
+    pred_series_np: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``pred_series_np`` shaped ``[T, N, C]`` → ``(mu_blood*mu1 [T,N], mu2 [T,N])`` in SI / dimensionless."""
+    device = data.x.device
+    dtype = torch.float32
+    t_steps = int(pred_series_np.shape[0])
+    n = int(pred_series_np.shape[1])
+    out_m1 = np.zeros((t_steps, n), dtype=np.float64)
+    out_m2 = np.zeros((t_steps, n), dtype=np.float64)
+    with torch.no_grad():
+        for ti in range(t_steps):
+            pred_t = torch.from_numpy(pred_series_np[ti]).to(device=device, dtype=dtype)
+            _, _, mu2, mb_m1 = _biochem_rheology_fields(model, data, pred_t)
+            out_m1[ti] = mb_m1.detach().cpu().numpy()
+            out_m2[ti] = mu2.detach().cpu().numpy()
+    return out_m1, out_m2
+
+
 def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     """
     Plot a scalar field on an unstructured mesh using tripcolor.
@@ -90,7 +215,14 @@ def _plot_field(fig, ax, pos, val, title, cmap, vmin=None, vmax=None):
     fig.colorbar(tc, ax=ax, fraction=0.046, pad=0.04)
 
 
-def _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_refresh=None):
+def _show_biochem_temporal_slider(
+    pos,
+    pred_biochem_series_np,
+    custom_times,
+    model_biochem: GNODE_Phase3,
+    data_biochem,
+    on_refresh=None,
+):
     u_all = pred_biochem_series_np[:, :, _CHANNEL["u"]]
     v_all = pred_biochem_series_np[:, :, _CHANNEL["v"]]
     vel_all = np.sqrt(u_all ** 2 + v_all ** 2)
@@ -107,8 +239,14 @@ def _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_
     fib_vmin, fib_vmax = float(fib_all.min()), float(fib_all.max())
     mat_vmin, mat_vmax = float(mat_all.min()), float(mat_all.max())
 
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-    plt.subplots_adjust(bottom=0.10, hspace=0.2)
+    mb_mu1_all, mu2_all = _rheology_series_numpy(model_biochem, data_biochem, pred_biochem_series_np)
+    m1_vmin, m1_vmax = float(mb_mu1_all.min()), float(mb_mu1_all.max())
+    if m1_vmax <= m1_vmin + 1e-18:
+        m1_vmax = m1_vmin + 1e-12
+    mu2_cap = float(model_biochem.mu_ratio_max)
+
+    fig, axs = plt.subplots(3, 2, figsize=(14, 14))
+    plt.subplots_adjust(bottom=0.10, hspace=0.22)
     fig.suptitle(f"Biochem Temporal Inspector (t={custom_times[0]:.1f}s)", fontsize=16, fontweight="bold")
 
     sc1 = axs[0, 0].scatter(pos[:, 0], pos[:, 1], c=vel_all[0], cmap="jet", s=3, vmin=vel_vmin, vmax=vel_vmax)
@@ -126,6 +264,16 @@ def _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_
     sc4 = axs[1, 1].scatter(pos[:, 0], pos[:, 1], c=mat_all[0], cmap="Oranges", s=3, vmin=mat_vmin, vmax=mat_vmax)
     axs[1, 1].set_title("Surface Platelets (Mat_s, SI)")
     fig.colorbar(sc4, ax=axs[1, 1], label="plt/m^2")
+
+    sc5 = axs[2, 0].scatter(
+        pos[:, 0], pos[:, 1], c=mb_mu1_all[0], cmap="magma", s=3, vmin=m1_vmin, vmax=m1_vmax
+    )
+    axs[2, 0].set_title(r"$\mu_{blood}\times\mu_1$(Mat) [Pa·s]")
+    fig.colorbar(sc5, ax=axs[2, 0], label="Pa·s")
+
+    sc6 = axs[2, 1].scatter(pos[:, 0], pos[:, 1], c=mu2_all[0], cmap="Reds", s=3, vmin=0.0, vmax=mu2_cap)
+    axs[2, 1].set_title(r"$\mu_2$ trigger (FI) [−]")
+    fig.colorbar(sc6, ax=axs[2, 1], label="−")
 
     for ax in axs.flat:
         ax.set_aspect("equal")
@@ -156,6 +304,8 @@ def _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_
         sc2.set_array(p_all[idx])
         sc3.set_array(fib_all[idx])
         sc4.set_array(mat_all[idx])
+        sc5.set_array(mb_mu1_all[idx])
+        sc6.set_array(mu2_all[idx])
 
         fig.suptitle(f"Biochem Temporal Inspector (t={custom_times[idx]:.1f}s)", fontsize=16, fontweight="bold")
         fig.canvas.draw_idle()
@@ -205,9 +355,9 @@ def run_phase_comparison(regenerate=True, seed=42):
 
         print("\n🕸️ Converting mesh to graphs for each phase's specific channel requirements...")
         mg1 = MeshToGraphComplete(phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_kine_base_dir)
-        mg1.run()
+        mg1.run(max_files=1)
         mg3 = MeshToGraphPhase3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_biochem_dir)
-        mg3.run()
+        mg3.run(max_files=1)
     else:
         print("\n♻️ Reusing existing single-case synthetic data.")
 
@@ -216,6 +366,9 @@ def run_phase_comparison(regenerate=True, seed=42):
         data_kine_base = _load_single_graph(graph_kine_base_dir, device, "kinematics")
         data_biochem = _load_single_graph(graph_biochem_dir, device, "biochem")
         pos = data_biochem.x[:, :2].cpu().numpy()  # Position is the same across all
+        n_nodes = int(data_biochem.x.shape[0])
+        n_edges = int(data_biochem.edge_index.shape[1])
+        print(f"   ↳ Graph: {n_nodes} nodes, {n_edges} edges", flush=True)
     except FileNotFoundError as exc:
         print(f"⚠️ Failed to generate or load graph files: {exc}")
         return False
@@ -231,13 +384,15 @@ def run_phase_comparison(regenerate=True, seed=42):
         raise FileNotFoundError(f"Biochem checkpoint not found: {biochem_ckpt}")
     biochem_state = torch.load(biochem_ckpt, map_location=device, weights_only=True)
 
-    # Kinematics setup
+    # Kinematics setup (optional faster DEQ for visualization — default matches training)
+    kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", "25"))
+    kin_max_iters = max(5, min(80, kin_max_iters))
     phys_cfg_kine = PhysicsConfig(phase="kinematics")
     model_kine_base = GINO_DEQ(
         in_channels=15,
         out_channels=5,
         latent_dim=256,
-        max_iters=25,
+        max_iters=kin_max_iters,
         num_fourier_freqs=16,
         phys_cfg=phys_cfg_kine,
         activation_fn="silu",
@@ -254,14 +409,23 @@ def run_phase_comparison(regenerate=True, seed=42):
     env_prior = int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2"))
     inferred_prior = _infer_bio_encoder_prior_dim_from_state_dict(biochem_state)
     bio_enc_prior = inferred_prior if inferred_prior is not None else env_prior
+    latent_env = os.environ.get("BIOCHEM_LATENT_DIM", "").strip()
+    if latent_env:
+        latent_dim = max(8, int(latent_env))
+    else:
+        latent_dim = _infer_latent_dim_from_state_dict(biochem_state) or 256
     print(f"   ↳ Using biochem checkpoint: {biochem_ckpt.name}")
     print(f"   ↳ bio_encoder prior dim: {bio_enc_prior}")
+    print(f"   ↳ latent_dim: {latent_dim}")
+    _viz_inner = os.environ.get("VIZ_BIOCHEM_MAX_INNER_ITERS", "").strip()
+    biochem_inner_iters = int(_viz_inner) if _viz_inner else 10
+    biochem_inner_iters = max(3, min(25, biochem_inner_iters))
     model_biochem = GNODE_Phase3(
         phys_cfg=phys_cfg_biochem,
         in_channels=12,
         spatial_channels=15,
-        latent_dim=64,
-        max_inner_iters=10,
+        latent_dim=latent_dim,
+        max_inner_iters=biochem_inner_iters,
         bio_encoder_prior_dim=bio_enc_prior,
         mu_ratio_max=bio_cfg.mu_ratio_max,
         mat_crit=bio_cfg.viscosity_mat_crit,
@@ -270,44 +434,84 @@ def run_phase_comparison(regenerate=True, seed=42):
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
     ).to(device)
     _inject_biochem_kinematic_lora(model_biochem)
-    model_biochem.load_state_dict(biochem_state)
+    compatible_bio, skipped_bio = _filter_compatible_state_dict(biochem_state, model_biochem.state_dict())
+    model_biochem.load_state_dict(compatible_bio, strict=False)
+    if skipped_bio:
+        print(f"   ↳ Skipped {len(skipped_bio)} checkpoint key(s) (no target or shape mismatch).")
     model_biochem.eval()
 
     # ------------------------------------------------------------------
     # 5. Inference
     # ------------------------------------------------------------------
-    print("\n🔮 Running inference across kinematics + biochem...")
+    print("\n🔮 Running inference across kinematics + biochem...", flush=True)
+
+    def _cuda_sync() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
     with torch.no_grad():
+        t_k0 = time.perf_counter()
+        print("   ↳ Kinematics (GINO-DEQ)…", flush=True)
         pred_kine_base = _run_model_once(model_kine_base, data_kine_base)
-        # Setup evaluation times for Biochem Neural ODE.
-        dense_times = bio_cfg.resolve_biochem_times(data_biochem, device)
-        if dense_times.numel() < 2:
+        _cuda_sync()
+        print(f"   ↳ Kinematics done in {time.perf_counter() - t_k0:.1f}s", flush=True)
+
+        # ``GNODE_Phase3`` expects non-dimensional times (same as training: ``to_t_nd(..., bio_cfg.t_final)``).
+        dense_times_si_full = bio_cfg.resolve_biochem_times(data_biochem, device)
+        if dense_times_si_full.numel() < 2:
             raise ValueError("Biochem timeline must contain at least two timestamps for rollout visualization.")
-        t_final = float(dense_times[-1].item())
-        dt = float((dense_times[1] - dense_times[0]).item())
-        if dt <= 0.0:
-            raise ValueError(f"Invalid biochem timeline step dt={dt}. Expected strictly positive spacing.")
+        t_ref = float(bio_cfg.t_final)
+        t_final_si = float(dense_times_si_full[-1].item())
+        n_full = int(dense_times_si_full.numel())
+        # Each macro step runs a full DEQ-style kinematics solve + an ODE segment — interactive viz
+        # must subsample the COMSOL-sized grid (often ~60+ steps) or a single run can take many minutes.
+        n_cap_raw = (os.environ.get("VIZ_BIOCHEM_MACRO_STEPS") or "16").strip()
+        if n_cap_raw == "0" or (n_cap_raw.lower() in ("full", "all")):
+            n_macro_use = n_full
+        else:
+            try:
+                n_cap = max(4, min(512, int(n_cap_raw)))
+            except ValueError:
+                n_cap = 16
+            n_macro_use = min(n_full, n_cap)
+        dense_times_si = torch.linspace(
+            0.0, t_final_si, steps=n_macro_use, device=device, dtype=torch.float32
+        )
+        dense_times = to_t_nd(dense_times_si, t_ref)
+        dt_si = float((dense_times_si[1] - dense_times_si[0]).item())
+        if dt_si <= 0.0:
+            raise ValueError(f"Invalid biochem timeline step dt_si={dt_si}. Expected strictly positive spacing.")
+        dt_nd = float((dense_times[1] - dense_times[0]).item())
+        if dt_nd <= 0.0:
+            raise ValueError(f"Invalid ND timeline step dt_nd={dt_nd}. Expected strictly positive spacing.")
 
-        # Extrapolate to 1.5x t_final by extending the dense timeline.
-        num_extra = max(1, int((t_final * 0.5) / dt))
-        extended_times = torch.cat([
-            dense_times,
-            dense_times[-1] + dt * torch.arange(1, num_extra + 1, device=device),
+        num_extra = max(1, int((t_final_si * 0.5) / dt_si))
+        extended_times = torch.cat([            dense_times,
+            dense_times[-1] + dt_nd * torch.arange(1, num_extra + 1, device=device, dtype=dense_times.dtype),
         ])
+        print(
+            f"   ↳ Biochem rollout: {extended_times.numel()} macro knots "
+            f"(using {n_macro_use}/{n_full} time samples; set VIZ_BIOCHEM_MACRO_STEPS=0 for full density)",
+            flush=True,
+        )
 
-        # Forward pass over the dense timeline (safer ODE stepping).
-        pred_biochem_series_dense = model_biochem(data_biochem, extended_times)
+        t_b0 = time.perf_counter()
+        with _viz_biochem_ode_speedups():
+            pred_biochem_series_dense = model_biochem(data_biochem, extended_times)
+        _cuda_sync()
+        print(f"   ↳ Biochem trajectory done in {time.perf_counter() - t_b0:.1f}s", flush=True)
 
-        # Extract the keyframes used by the temporal slider.
-        custom_times = [0.0, t_final * 0.33, t_final * 0.66, t_final, t_final * 1.5]
+        # Extract the keyframes used by the temporal slider (labels stay in SI seconds for the UI).
+        custom_times = [0.0, t_final_si * 0.33, t_final_si * 0.66, t_final_si, t_final_si * 1.5]
+        custom_times_nd = [t / t_ref for t in custom_times]
         frame_indices = [
-            torch.argmin(torch.abs(extended_times - t)).item()
-            for t in custom_times
+            torch.argmin(torch.abs(extended_times - t_nd)).item()
+            for t_nd in custom_times_nd
         ]
         pred_biochem_series = pred_biochem_series_dense[frame_indices]
 
         # Extract the final *trained* time step for static Fig 1 comparison.
-        idx_t_final = torch.argmin(torch.abs(extended_times - t_final)).item()
+        idx_t_final = torch.argmin(torch.abs(extended_times - (t_final_si / t_ref))).item()
         pred_biochem = pred_biochem_series_dense[idx_t_final]
 
     pred_kine_base_np = pred_kine_base.detach().cpu().numpy()
@@ -333,8 +537,16 @@ def run_phase_comparison(regenerate=True, seed=42):
     vel_max = max(vel_kine_base.max(), vel_biochem.max())
     p_min = min(p_kine_base.min(), p_biochem.min())
     p_max = max(p_kine_base.max(), p_biochem.max())
-    mu_min = min(mu_kine_base.min(), mu_biochem.min())
-    mu_max = max(mu_kine_base.max(), mu_biochem.max())
+    # Do not share μ_eff color limits across columns: biochem adds large gelation spikes on the same
+    # ND channel scale as kine, so a joint max (often set by biochem) washes out Carreau structure
+    # in the kinematics panel and makes it look falsely Newtonian/uniform.
+    mu_k_min, mu_k_max = float(mu_kine_base.min()), float(mu_kine_base.max())
+    mu_b_min, mu_b_max = float(mu_biochem.min()), float(mu_biochem.max())
+    _eps = 1e-9
+    if mu_k_max <= mu_k_min + _eps:
+        mu_k_max = mu_k_min + max(abs(mu_k_min), 1.0) * 1e-6
+    if mu_b_max <= mu_b_min + _eps:
+        mu_b_max = mu_b_min + max(abs(mu_b_min), 1.0) * 1e-6
 
     # ------------------------------------------------------------------
     # 6. Plotting
@@ -358,11 +570,50 @@ def run_phase_comparison(regenerate=True, seed=42):
     _plot_field(fig1, axes1[1, 0], pos, p_kine_base, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
     _plot_field(fig1, axes1[1, 1], pos, p_biochem, "Pressure (ND)", 'coolwarm', vmin=p_min, vmax=p_max)
 
-    # Row 3: Viscosity
-    _plot_field(fig1, axes1[2, 0], pos, mu_kine_base, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
-    _plot_field(fig1, axes1[2, 1], pos, mu_biochem, r"Eff. Viscosity ($\mu_{eff}$)", 'viridis', vmin=mu_min, vmax=mu_max)
+    # Row 3: Viscosity (independent scales — see ``mu_*`` mins/maxes above)
+    _plot_field(fig1, axes1[2, 0], pos, mu_kine_base, r"Eff. Viscosity ($\mu_{eff,nd}$) kine", 'viridis', vmin=mu_k_min, vmax=mu_k_max)
+    _plot_field(fig1, axes1[2, 1], pos, mu_biochem, r"Eff. Viscosity ($\mu_{eff,nd}$) biochem", 'viridis', vmin=mu_b_min, vmax=mu_b_max)
 
     fig1.tight_layout(rect=(0, 0.03, 1, 0.95))
+
+    # --- FIGURE 2: Biochem COMSOL-style viscosity triggers (final rollout time) ---
+    with torch.no_grad():
+        pred_bt = torch.from_numpy(pred_biochem_np).to(
+            device=data_biochem.x.device, dtype=torch.float32
+        )
+        _, _, mu2_t, mb_m1 = _biochem_rheology_fields(model_biochem, data_biochem, pred_bt)
+    mb_m1_np = mb_m1.detach().cpu().numpy()
+    mu2_np = mu2_t.detach().cpu().numpy()
+    m1s_vmin, m1s_vmax = float(mb_m1_np.min()), float(mb_m1_np.max())
+    if m1s_vmax <= m1s_vmin + 1e-18:
+        m1s_vmax = m1s_vmin + 1e-12
+    fig2, axs2 = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig2.suptitle(
+        "Biochem: COMSOL-style gelation (final rollout time; same μ1/μ2 as GNODE_Phase3)",
+        fontsize=14,
+        fontweight="bold",
+    )
+    _plot_field(
+        fig2,
+        axs2[0],
+        pos,
+        mb_m1_np,
+        r"$\mu_{blood}\times\mu_1$(Mat) [Pa·s]",
+        "magma",
+        vmin=m1s_vmin,
+        vmax=m1s_vmax,
+    )
+    _plot_field(
+        fig2,
+        axs2[1],
+        pos,
+        mu2_np,
+        r"$\mu_2$ trigger (FI) [−]",
+        "Reds",
+        vmin=0.0,
+        vmax=float(model_biochem.mu_ratio_max),
+    )
+    fig2.tight_layout(rect=(0, 0.03, 1, 0.92))
 
     ax_refresh_main = fig1.add_axes([0.83, 0.01, 0.15, 0.04])
     refresh_btn_main = Button(ax_refresh_main, "Refresh Geometry", color="lightgray", hovercolor="gainsboro")
@@ -374,7 +625,14 @@ def run_phase_comparison(regenerate=True, seed=42):
     refresh_btn_main.on_clicked(lambda _: _request_refresh())
 
     print("⏳ Opening interactive Biochem temporal slider...")
-    _show_biochem_temporal_slider(pos, pred_biochem_series_np, custom_times, on_refresh=_request_refresh)
+    _show_biochem_temporal_slider(
+        pos,
+        pred_biochem_series_np,
+        custom_times,
+        model_biochem,
+        data_biochem,
+        on_refresh=_request_refresh,
+    )
     return refresh_state["requested"]
 
 

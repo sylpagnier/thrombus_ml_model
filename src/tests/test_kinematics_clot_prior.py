@@ -66,3 +66,14 @@ def test_prior_feature_channels_are_bounded_and_interpretable(monkeypatch):
     assert torch.all(feats[:, 0] >= feats[:, 1])
     # All physics channels should inherit the wall/near-wall localization gate.
     assert torch.all(feats[0] > feats[-1])
+
+
+def test_max_neighbor_dilate_propagates_along_chain():
+    from src.core_physics.kinematics_clot_prior import _max_neighbor_dilate_1d
+
+    ei = torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]], dtype=torch.long)
+    v = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    x = v
+    for _ in range(3):
+        x = _max_neighbor_dilate_1d(x, ei)
+    assert float(x[3]) >= 0.99
