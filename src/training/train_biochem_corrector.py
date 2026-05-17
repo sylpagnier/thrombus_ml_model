@@ -142,6 +142,11 @@ def _biochem_env_truthy(key: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _biochem_stop_after_teacher() -> bool:
+    """True when teacher-only runs should exit before corrector / pseudo-label distillation."""
+    return _biochem_env_truthy("BIOCHEM_STOP_AFTER_TEACHER", default=False)
+
+
 def _biochem_teacher_mu_ratio_max(bio_cfg) -> float:
     """Rheology saturation scale for teacher / preflight (COMSOL high-μ), not Newtonian-only."""
     raw = (os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX") or "").strip()
@@ -4421,6 +4426,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         val_every = 4
     ckpt_every = max(1, int(os.environ.get("BIOCHEM_CKPT_EVERY", "4")))
     resume_ema_state = None
+    stop_after_teacher = _biochem_stop_after_teacher()
 
     if resume_enabled and latest_ckpt_path.exists():
         print(f"🔄 Resuming Biochem from checkpoint: {latest_ckpt_path}")
@@ -4452,24 +4458,31 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         teacher_best_mu_score = float(ckpt.get("teacher_best_mu_score", 0.0))
         pseudo_w = float(ckpt.get("pseudo_w", 0.0))
         resume_ema_state = ckpt.get("ema_model_state_dict")
-        print("🧾 Rebuilding pseudo-label bank from resumed Biochem weights...")
-        temp_teacher = copy.deepcopy(model).to(device)
-        temp_teacher.eval()
-        for p in temp_teacher.parameters():
-            p.requires_grad = False
-        pseudo_bank = build_synthetic_pseudo_labels(
-            teacher=temp_teacher,
-            synthetic_dataset=train_synth_dataset,
-            bio_cfg=bio_cfg,
-            device=device,
-        )
-        del temp_teacher
-        pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
-        if len(train_physics) > 0:
+        if stop_after_teacher:
+            pseudo_bank = {}
             print(
-                f"🧾 Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
-                f"({pseudo_cov:.1%}) synthetic graphs."
+                "ℹ️ Skipping pseudo-label bank rebuild "
+                "(BIOCHEM_STOP_AFTER_TEACHER=1; corrector not run)."
             )
+        else:
+            print("🧾 Rebuilding pseudo-label bank from resumed Biochem weights...")
+            temp_teacher = copy.deepcopy(model).to(device)
+            temp_teacher.eval()
+            for p in temp_teacher.parameters():
+                p.requires_grad = False
+            pseudo_bank = build_synthetic_pseudo_labels(
+                teacher=temp_teacher,
+                synthetic_dataset=train_synth_dataset,
+                bio_cfg=bio_cfg,
+                device=device,
+            )
+            del temp_teacher
+            pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
+            if len(train_physics) > 0:
+                print(
+                    f"🧾 Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
+                    f"({pseudo_cov:.1%}) synthetic graphs."
+                )
         print(f"✅ Biochem resume complete at epoch {start_epoch}.")
     elif resume_enabled:
         print(f"ℹ️ BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
@@ -4527,36 +4540,44 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             base_lr=lr,
             low_anchor_mode=low_anchor_mode,
         )
-        pseudo_bank = build_synthetic_pseudo_labels(
-            teacher=teacher,
-            synthetic_dataset=train_synth_dataset,
-            bio_cfg=bio_cfg,
-            device=device,
-        )
-        pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
-        if len(train_physics) > 0:
-            print(
-                f"🧾 Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
-                f"({pseudo_cov:.1%}) synthetic graphs."
-            )
-        pseudo_w_base = float(os.environ.get("BIOCHEM_SYNTH_PSEUDO_WEIGHT", "0.5"))
-        min_teacher_score = float(os.environ.get("BIOCHEM_PSEUDO_MIN_TEACHER_MU_SCORE", "-1.0"))
-        if teacher_best_mu_score < min_teacher_score:
+        if stop_after_teacher:
+            pseudo_bank = {}
             pseudo_w = 0.0
             print(
-                f"🧷 Synthetic pseudo-label weight set to 0 "
-                f"(teacher mu_score {teacher_best_mu_score:.4f} < "
-                f"BIOCHEM_PSEUDO_MIN_TEACHER_MU_SCORE={min_teacher_score})."
+                "ℹ️ Skipping synthetic pseudo-label bank "
+                "(BIOCHEM_STOP_AFTER_TEACHER=1; corrector not run)."
             )
         else:
-            ref_score = float(os.environ.get("BIOCHEM_PSEUDO_TEACHER_REF_MU_SCORE", "-0.25"))
-            denom = max(ref_score - min_teacher_score, 1e-6)
-            ramp = min(1.0, max(0.0, (teacher_best_mu_score - min_teacher_score) / denom))
-            pseudo_w = pseudo_w_base * ramp
-            print(
-                f"🧷 Synthetic pseudo-label loss weight: {pseudo_w:.3f} "
-                f"(base={pseudo_w_base:.3f}, teacher_mu_score={teacher_best_mu_score:.4f}, ramp={ramp:.3f})"
+            pseudo_bank = build_synthetic_pseudo_labels(
+                teacher=teacher,
+                synthetic_dataset=train_synth_dataset,
+                bio_cfg=bio_cfg,
+                device=device,
             )
+            pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
+            if len(train_physics) > 0:
+                print(
+                    f"🧾 Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
+                    f"({pseudo_cov:.1%}) synthetic graphs."
+                )
+            pseudo_w_base = float(os.environ.get("BIOCHEM_SYNTH_PSEUDO_WEIGHT", "0.5"))
+            min_teacher_score = float(os.environ.get("BIOCHEM_PSEUDO_MIN_TEACHER_MU_SCORE", "-1.0"))
+            if teacher_best_mu_score < min_teacher_score:
+                pseudo_w = 0.0
+                print(
+                    f"🧷 Synthetic pseudo-label weight set to 0 "
+                    f"(teacher mu_score {teacher_best_mu_score:.4f} < "
+                    f"BIOCHEM_PSEUDO_MIN_TEACHER_MU_SCORE={min_teacher_score})."
+                )
+            else:
+                ref_score = float(os.environ.get("BIOCHEM_PSEUDO_TEACHER_REF_MU_SCORE", "-0.25"))
+                denom = max(ref_score - min_teacher_score, 1e-6)
+                ramp = min(1.0, max(0.0, (teacher_best_mu_score - min_teacher_score) / denom))
+                pseudo_w = pseudo_w_base * ramp
+                print(
+                    f"🧷 Synthetic pseudo-label loss weight: {pseudo_w:.3f} "
+                    f"(base={pseudo_w_base:.3f}, teacher_mu_score={teacher_best_mu_score:.4f}, ramp={ramp:.3f})"
+                )
 
         # Teacher optimizes a deep copy; merge back so Phase 3 trains the same weights that produced
         # pseudo trajectories (teacher LoRA stayed frozen — student LoRA tensors load from teacher where keys match).
@@ -4567,17 +4588,18 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             if compatible_tm:
                 model.load_state_dict(compatible_tm, strict=False)
             n_tm = len(skipped_tm) if skipped_tm else 0
+            merge_note = (
+                " for Phase 3 corrector."
+                if not stop_after_teacher
+                else " (teacher-only run; corrector skipped)."
+            )
             print(
-                "🔁 Merged teacher weights into student for Phase 3 corrector."
+                "🔁 Merged teacher weights into student" + merge_note
                 + (f" Skipped {n_tm} incompatible/missing key(s)." if n_tm else "")
             )
 
-    stop_after_teacher = (
-        os.environ.get("BIOCHEM_STOP_AFTER_TEACHER", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-    )
     if stop_after_teacher:
-        print("🛑 BIOCHEM_STOP_AFTER_TEACHER enabled: stopping after teacher stage + pseudo-label build.")
+        print("🛑 BIOCHEM_STOP_AFTER_TEACHER enabled: stopping after teacher stage.")
         return
 
     train_cfg = BiochemTrainingConfig.from_env()

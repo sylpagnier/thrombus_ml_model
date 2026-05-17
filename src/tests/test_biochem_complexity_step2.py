@@ -56,3 +56,16 @@ def test_complexity_step2_skipped_when_stock_defaults(monkeypatch: pytest.Monkey
     _apply_biochem_complexity_step2_env()
 
     assert "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT" not in os.environ
+
+
+def test_stop_after_teacher_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.training.train_biochem_corrector import _biochem_stop_after_teacher
+
+    monkeypatch.delenv("BIOCHEM_STOP_AFTER_TEACHER", raising=False)
+    assert _biochem_stop_after_teacher() is False
+
+    monkeypatch.setenv("BIOCHEM_STOP_AFTER_TEACHER", "1")
+    assert _biochem_stop_after_teacher() is True
+
+    monkeypatch.setenv("BIOCHEM_STOP_AFTER_TEACHER", "yes")
+    assert _biochem_stop_after_teacher() is True
