@@ -326,6 +326,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import WeightedRandomSampler
 from src.utils.batching import get_batch_tensor
 from src.utils.metrics import DynamicLossWeighter
+from src.utils.boundary_flux import flux_debug_from_graph_data, flux_debug_to_training_metrics
 from src.utils.training_diary import TrainingDiary, env_snapshot
 from src.training.physics_curriculum import ease01 as _ease01
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
@@ -1001,40 +1002,24 @@ def _compute_mu_flow_debug_metrics(
         out["DBG_mu_gt_si_mean_truth"] = float("nan")
         out["DBG_mu_gt_si_p90_truth"] = float("nan")
 
-    # Fast flow-collapse sanity: compare mean |velocity| on inlet/outlet masks.
+    # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref × width).
     u = pred_final[:, 0].float()
     v = pred_final[:, 1].float()
     speed = torch.sqrt(u * u + v * v + 1e-20)
     out["DBG_speed_mean"] = float(speed.mean().item())
-    if (
-        hasattr(data, "mask_inlet")
-        and hasattr(data, "mask_outlet")
-        and data.mask_inlet is not None
-        and data.mask_outlet is not None
-    ):
-        m_in = data.mask_inlet.view(-1).bool().to(speed.device)
-        m_out = data.mask_outlet.view(-1).bool().to(speed.device)
-        if bool(m_in.any().item()) and bool(m_out.any().item()):
-            inlet_flux = float(speed[m_in].mean().item())
-            outlet_flux = float(speed[m_out].mean().item())
-            eps = 1e-8
-            imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + outlet_flux + eps)
-            flow_ref = max(inlet_flux, outlet_flux, eps)
-            collapse = 1.0 - ((inlet_flux + outlet_flux) / (2.0 * flow_ref + eps))
-            out["DBG_flux_inlet"] = inlet_flux
-            out["DBG_flux_outlet"] = outlet_flux
-            out["DBG_flux_imbalance"] = float(imbalance)
-            out["DBG_flow_collapse"] = float(collapse)
-        else:
-            out["DBG_flux_inlet"] = float("nan")
-            out["DBG_flux_outlet"] = float("nan")
-            out["DBG_flux_imbalance"] = float("nan")
-            out["DBG_flow_collapse"] = float("nan")
-    else:
-        out["DBG_flux_inlet"] = float("nan")
-        out["DBG_flux_outlet"] = float("nan")
+    vel_xy = torch.stack([u, v], dim=1)
+    try:
+        flux_dbg = flux_debug_from_graph_data(data, vel_xy, phys_cfg=phys_cfg)
+        out.update(flux_debug_to_training_metrics(flux_dbg))
+    except Exception as exc:
         out["DBG_flux_imbalance"] = float("nan")
-        out["DBG_flow_collapse"] = float("nan")
+        out["DBG_flux_debug_error"] = 1.0
+        if _biochem_env_truthy("BIOCHEM_ZERO_LOSS_WARN", default=False):
+            print(
+                f"⚠️ flux_debug_from_graph_data failed ({type(exc).__name__}: {exc}); "
+                "μ training continues.",
+                flush=True,
+            )
     return out
 
 
@@ -4082,6 +4067,9 @@ def train_teacher_on_anchors(
             epoch_dbg_mu2_sum = 0.0
             epoch_dbg_mu_learned_sum = 0.0
             epoch_dbg_flow_imb_sum = 0.0
+            epoch_dbg_q_rel_err_sum = 0.0
+            epoch_dbg_flow_trivial_sum = 0.0
+            epoch_dbg_flux_n = 0
             epoch_dbg_mu_log_anchor_sum = 0.0
             epoch_dbg_n = 0
             n_batches = 0
@@ -4132,7 +4120,9 @@ def train_teacher_on_anchors(
                 dbg_mu1 = float(metrics.get("DBG_mu1_mean", float("nan")))
                 dbg_mu2 = float(metrics.get("DBG_mu2_mean", float("nan")))
                 dbg_ml = float(metrics.get("DBG_mu_learned_mean", float("nan")))
-                dbg_fi = float(metrics.get("DBG_flux_imbalance", float("nan")))
+                dbg_fi = float(metrics.get("DBG_Q_inlet_outlet_imbalance", float("nan")))
+                dbg_qre = float(metrics.get("DBG_Q_inlet_rel_err", float("nan")))
+                dbg_triv = float(metrics.get("DBG_flow_trivial_score", float("nan")))
                 dbg_lm = float(metrics.get("DBG_mu_log_mae_final_anchor", float("nan")))
                 if (
                     math.isfinite(dbg_mu1)
@@ -4147,6 +4137,10 @@ def train_teacher_on_anchors(
                     epoch_dbg_flow_imb_sum += dbg_fi
                     epoch_dbg_mu_log_anchor_sum += dbg_lm
                     epoch_dbg_n += 1
+                if math.isfinite(dbg_qre) and math.isfinite(dbg_triv):
+                    epoch_dbg_q_rel_err_sum += dbg_qre
+                    epoch_dbg_flow_trivial_sum += dbg_triv
+                    epoch_dbg_flux_n += 1
                 n_batches += 1
                 if ema_l_bio is None:
                     ema_l_bio = current_l_bio
@@ -4220,6 +4214,8 @@ def train_teacher_on_anchors(
                 dbg_mu2_e = (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n)))
                 dbg_mlearn_e = (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n)))
                 dbg_flow_imb_e = (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n)))
+                dbg_q_rel_e = (epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_n)))
+                dbg_triv_e = (epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_n)))
                 dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
                 val_stats = _log_mu_validation_report(
                     stage="teacher",
@@ -4236,7 +4232,8 @@ def train_teacher_on_anchors(
                         (
                             f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
                             f"learned={dbg_mlearn_e:.3e} "
-                            f"final_anchor_logMAE={dbg_mu_log_e:.3e} flow_imb={dbg_flow_imb_e:.3e}"
+                            f"final_anchor_logMAE={dbg_mu_log_e:.3e} Q_imb={dbg_flow_imb_e:.3e} "
+                            f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial={dbg_triv_e:.3f}"
                         ),
                     ],
                 )
@@ -4265,13 +4262,16 @@ def train_teacher_on_anchors(
                 dbg_mu2_e = (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n)))
                 dbg_mlearn_e = (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n)))
                 dbg_flow_imb_e = (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n)))
+                dbg_q_rel_e = (epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_flux_n)))
+                dbg_triv_e = (epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_flux_n)))
                 dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
                 print(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
                     f"L_Bio (Avg): {avg_bio:.3e}] | "
                     f"μdbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
-                    f"logMAE_f={dbg_mu_log_e:.2e},flowImb={dbg_flow_imb_e:.2e}] | "
+                    f"logMAE_f={dbg_mu_log_e:.2e},Q_imb={dbg_flow_imb_e:.2e},"
+                    f"Q_rel={dbg_q_rel_e:.2e},trivial={dbg_triv_e:.3f}] | "
                     f"Val skipped (BIOCHEM_TEACHER_VAL_EVERY={teacher_val_every})"
                 )
 
@@ -4290,6 +4290,16 @@ def train_teacher_on_anchors(
                 "dbg_mu2_mean": (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n))),
                 "dbg_mu_learned_mean": (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n))),
                 "dbg_flux_imbalance_mean": (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n))),
+                "dbg_Q_inlet_rel_err_mean": (
+                    epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_flux_n))
+                    if epoch_dbg_flux_n > 0
+                    else None
+                ),
+                "dbg_flow_trivial_score_mean": (
+                    epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_flux_n))
+                    if epoch_dbg_flux_n > 0
+                    else None
+                ),
                 "dbg_final_anchor_mu_log_mae_mean": (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n))),
                 "val_mu_mae_si": float(val_stats["mu_mae_si"]) if val_stats is not None else None,
                 "val_mu_rmse_si": float(val_stats["mu_rmse_si"]) if val_stats is not None else None,

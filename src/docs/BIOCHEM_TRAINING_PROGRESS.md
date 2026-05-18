@@ -50,21 +50,21 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Study A0**: patient007 **1.28→0.44** best ep8; **&lt;1.2** at ep6–8; late drift ep10–11 (~0.54–0.64); use best-epoch checkpoint |
-| Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | A0 ep8 **r≈0.37** (best); ep11 **~0.15**; bulk **r** often negative |
-| Wall μ logMAE | ≲ 1.5 | **Fail** | A0 wall **~1.80–2.13** flat; bulk logMAE **~0.33** ep8 |
-| `L_bio` on anchors | Decrease without μ stall | **Pass** | Species fit is easy |
-| Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59; train `L_MuSI` only |
-| Phase B: `MU_SI` + low TF | Val logMAE drops | **Partial / stalled** | Early one-run dip observed, but repeats are mostly flat (~1.48–1.49) after ep0 |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Marathon T2** (TBPTT=6, MU_LOG): best **0.40** ep6; **I1/I2/I4** ~0.44–0.49 ep3; A0 ep8 **0.44**; wall still **~1.8** |
+| Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
+| Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
+| `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
+| Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
+| Phase B: `MU_SI` + low TF + μ-path | Val logMAE drops | **Pass** | Marathon **I2** best **0.44** ep3 (same recipe as MU_LOG) |
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: **Interim pass on patient007** — study **A0** best val logMAE **0.44** (ep8), two val points **&lt;1.2** (ep6, ep8); wall/high-μ still weak; stop early or save ep8 checkpoint before late drift. Corrector / joint losses still **not** started.
+- **Step-2 teacher “done”**: **Interim pass on patient007** — marathon **T2** best **0.40** (MU_LOG, TBPTT=6); **A0**/**I1** ~0.44–0.49; wall/high-μ still weak; **J2** joint (+`W_MuSI`) blocked by flux-debug crash (fixed locally). Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
 
-**We are roughly at: μ formulation validated on patient007** (A0 MU_LOG + μ-path, full anchors) **with subset caveats** (wall ~1.8, high-μ tail, late-epoch val drift) — ready for **Phase B ablations** and **A1/A2**; not at corona-full or step 3.
+**We are roughly at: μ formulation validated on patient007** (MU_LOG / MU_SI / DATA_KINE isolates + TBPTT=6 all reach **~0.40–0.49** val logMAE) **with subset caveats** (wall ~1.8, high-μ tail often worsens when bulk improves, bulk **r** weak). Next: finish **J2**, confirm **J3** (laptop B), then step-2 joint without isolate; not at corona / step 3.
 
 ---
 
@@ -221,6 +221,28 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Cause**: Easier val split + full μ-path stack; bulk log loss improved while **high-μ tail regressed** ep5 (0.66→0.95); **`r` stayed ~0.14** (magnitude not pattern).
 - **Fix**: Acceptance = **patient007**, **no `MAX_LOAD_VESSELS` cap**, log **wall / high-μ / bulk** every epoch. Treat patient003 0.51 as a signal, not SOTA.
 - **Status**: **Gate for next runs** — study script Phase A.
+
+### 20. Dual-laptop complexity marathon (2026-05-18) — isolate then combine
+
+- **Setup**: `run_biochem_teacher_complexity_laptop_a.ps1` / `_b.ps1`; patient007 val, stride=10, val every 3 ep, `DETACH=1`, TBPTT=4 default, μ-path on, `TEACHER_FORCE_MIN=0`, warm-start pretrain.
+- **μ isolates (laptop A, RTX 500 4GB)**: **I1** `MU_LOG` best **0.49** ep3; **I2** `MU_SI` best **0.44** ep3; **I4** `DATA_KINE` best **0.48** ep3; **I3** `DATA_BIO` val μ **flat ~1.47** (species-only backward does not move μ).
+- **Joint (A)**: **J1** step-2 (`L_Data_*` + `W_MuLog=2`) best **0.48** ep3 — matches isolates, not clearly better. **J2** (`+W_MuSI=4`) **crashed** ep0 in `boundary_flux.inlet_effective_width_nd` (mask vs `flow_hint` shape); wrap flux debug in try/except + shape-aware inlet width.
+- **Physics / temporal (laptop B, P2200 5GB)**: **I5** `PHYS_TEMP` isolate: val μ **1.45→1.36** (small). **I6** `ADR_F`: val μ **~1.48** flat. **T1** TBPTT=5: **0.47** ep3. **T2** TBPTT=6: **0.40** ep6 (**best marathon**). **J3** was still running at log cutoff.
+- **Runtime**: ~**11 min/val epoch** on patient007 → **~5–6 h** per laptop, not the scripted ~3 h target.
+- **Status**: Isolated μ losses **validated** on patient007; physics-only isolates **do not replace** `MU_LOG`+μ-path; longer TBPTT helps.
+
+### 21. `MU_SI` vs `MU_LOG` under μ-path (revises §17)
+
+- **Symptom**: Older runs: `MU_SI` flat ~1.48–1.59 without μ-path / high TF.
+- **Marathon**: With **μ-path + low TF + TBPTT≥4**, **I2** best **0.44** ep3 vs **I1** **0.49** ep3.
+- **Fix**: Prefer **`MU_LOG`** (matches val metric); **`MU_SI` is viable** in this stack when capacity + TF match.
+- **Status**: Revises “MU_SI always fails” — config-specific, not law.
+
+### 22. High-μ tail vs bulk tradeoff (persistent)
+
+- **Symptom**: All-truth logMAE can drop while **high-μ_gt** worsens (I1: **0.89→1.54**); wall **~1.75–2.0** across μ-winning legs.
+- **Interpretation**: Bulk scale improves; clot-tail and wall remain hard; positive high-μ **r** ≠ good spatial μ (**bulk r** often negative).
+- **Status**: Open.
 
 ---
 
@@ -441,6 +463,17 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-18 | Quadro `mu_learned_only_oomsafe`: `MU_LOG` isolate, μ-path+delta head, TF→0, `DETACH=1`, 3 vessels, val **patient003** | **1.41→0.51** (ep5 best) | **1.97→1.42** | high **0.85→0.95** | **0.11→0.14** | First strong epoch-wise μ drop; tail worsened ep5; reproduce on patient007 |
 | 2026-05-18 | Study **A0** (`mu_study_P_A_A0`): full anchors, patient007 val, MU_LOG+μ-path, 12ep, `DETACH=1`, TBPTT=4 | **1.28→0.44** (ep8 best) | **2.13→1.82** | high **0.89→1.43** | **0.28→0.37** (ep8) | **Phase A pass** (&lt;1.2 ep6+8); ep4 spike 1.04; ep10–11 drift; wall stuck |
 | 2026-05-18 | Study **A1** (`DETACH=0`, TBPTT=6, P2200 5GB) | n/a | n/a | n/a | n/a | **CUDA OOM** ep0 backward (ODE adjoint); use **A1s** or **A2** on 5GB |
+| 2026-05-18 | Marathon **I1** `MU_LOG` (RTX500, laptop A) | **0.49** ep3 (best) | 1.75 | 0.23 | high 1.54 | 8 ep; late val ~0.51; ~69 min/leg |
+| 2026-05-18 | Marathon **I2** `MU_SI` | **0.44** ep3 | 1.90 | 0.34 | high 1.46 | 5 ep; train `L_MuSI` tiny but val μ moves |
+| 2026-05-18 | Marathon **I3** `DATA_BIO` | **~1.47** flat | 2.08 | 0.18 | — | Confirms bio ⊥ val μ |
+| 2026-05-18 | Marathon **I4** `DATA_KINE` | **0.48** ep3 | 1.91 | 0.22 | high 1.40 | μ_nd in kine loss moves val μ |
+| 2026-05-18 | Marathon **J1** joint step-2 partial | **0.48** ep3 | 1.76 | 0.24 | high 1.52 | `L_Data_Bio` in backward; not beat isolate |
+| 2026-05-18 | Marathon **J2** joint + `W_MuSI=4` | n/a | n/a | n/a | n/a | **Crash** ep0 `boundary_flux` mask/`flow_hint` |
+| 2026-05-18 | Marathon **I5** `PHYS_TEMP` (P2200, laptop B) | **1.36** ep4 | 2.16 | 0.27 | — | Train `L_PhysTemp`↓; μ second-order |
+| 2026-05-18 | Marathon **I6** `ADR_F` | **~1.48** flat | 2.16 | 0.27 | — | PDE residual alone does not fit μ |
+| 2026-05-18 | Marathon **T1** `MU_LOG` TBPTT=5 | **0.47** ep3 | 1.88 | 0.36 | high 1.38 | |
+| 2026-05-18 | Marathon **T2** `MU_LOG` TBPTT=6 | **0.40** ep6 | 1.81 | 0.40 | high 1.46 | **Best marathon**; 7 ep |
+| 2026-05-18 | Marathon **J3** `MU_LOG`+phys_temp flag (B) | (in progress) | — | — | — | `LOSS_ISOLATE=MU_LOG` ⇒ PhysTemp not in backward |
 
 ---
 
