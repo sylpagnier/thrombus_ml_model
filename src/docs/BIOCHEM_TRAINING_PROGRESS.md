@@ -450,3 +450,4 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 - Project overview: [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md).
 - Corona script (experimental): `scripts/run_biochem_thrombus_corona.ps1`.
 - Comprehensive μ script (experimental): `scripts/run_biochem_comprehensive_mu.ps1`.
+- Teacher-best checkpoint (after teacher stage): `outputs/biochem/biochem_teacher_best.pth` — load in viz via `python -m src.evaluation.visualize_pipeline` (prefers this over `biochem_best_bio.pth`).

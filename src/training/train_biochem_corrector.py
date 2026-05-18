@@ -1353,6 +1353,42 @@ def _filter_compatible_state_dict(
     return compatible, skipped
 
 
+BIOCHEM_TEACHER_BEST_CKPT_NAME = "biochem_teacher_best.pth"
+
+
+def _save_biochem_teacher_best_checkpoint(
+    path: Path,
+    teacher: torch.nn.Module,
+    *,
+    teacher_best_mu_score: float,
+    best_epoch: int = -1,
+    run_note: str = "",
+) -> None:
+    """Persist best teacher weights for inference / ``visualize_pipeline.py``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    val_log_mae = (
+        float(-teacher_best_mu_score)
+        if teacher_best_mu_score > -float("inf")
+        else float("nan")
+    )
+    payload = {
+        "model_state_dict": teacher.state_dict(),
+        "teacher_best_mu_score": float(teacher_best_mu_score),
+        "val_mu_log_mae": val_log_mae,
+        "best_epoch": int(best_epoch),
+        "run_note": (run_note or "").strip(),
+        "checkpoint_role": "teacher_best",
+    }
+    torch.save(payload, path)
+    ep_note = f" epoch={best_epoch:02d}" if best_epoch >= 0 else ""
+    print(
+        f"💾 Saved teacher-best checkpoint -> {path} "
+        f"(val logMAE≈{val_log_mae:.4f}, mu_score={teacher_best_mu_score:.4f}{ep_note})",
+        flush=True,
+    )
+
+
 def _try_load_biochem_post_pretrain(model: torch.nn.Module, path: Path, device: torch.device) -> bool:
     """Load ``biochem_post_pretrain.pth`` (full ``state_dict``) for warm-start; shape-filtered."""
     if not path.is_file():
@@ -3954,6 +3990,7 @@ def train_teacher_on_anchors(
     )
     best_state = None
     best_mu_score = -float("inf")
+    best_epoch = -1
 
     _early_stop_note = (
         f"early_stop@mu_log_mae<={target_mu_log_mae:.3f}"
@@ -4212,6 +4249,7 @@ def train_teacher_on_anchors(
                 if val_mu_score > best_mu_score:
                     best_mu_score = val_mu_score
                     best_state = copy.deepcopy(teacher.state_dict())
+                    best_epoch = int(epoch)
                 if (
                     early_stop_allowed
                     and target_mu_log_mae is not None
@@ -4296,7 +4334,7 @@ def train_teacher_on_anchors(
         print("✅ Teacher frozen. Validation skipped (BIOCHEM_TEACHER_SKIP_VAL=1); using last training weights.")
     else:
         print(f"✅ Teacher frozen. Best anchor validation mu_score (-log_MAE): {best_mu_score:.4f}")
-    return teacher, float(best_mu_score)
+    return teacher, float(best_mu_score), int(best_epoch)
 
 
 def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
@@ -4778,7 +4816,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
-        teacher, teacher_best_mu_score = train_teacher_on_anchors(
+        teacher, teacher_best_mu_score, teacher_best_epoch = train_teacher_on_anchors(
             student_model=model,
             train_anchor_dataset=train_anchor_dataset,
             val_anchor_dataset=val_anchor_dataset,
@@ -4788,6 +4826,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             device=device,
             base_lr=lr,
             low_anchor_mode=low_anchor_mode,
+        )
+        _save_biochem_teacher_best_checkpoint(
+            model_dir / BIOCHEM_TEACHER_BEST_CKPT_NAME,
+            teacher,
+            teacher_best_mu_score=float(teacher_best_mu_score),
+            best_epoch=int(teacher_best_epoch),
+            run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
         )
         if stop_after_teacher:
             pseudo_bank = {}

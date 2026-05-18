@@ -1,7 +1,8 @@
 import contextlib
 import os
 import time
-from typing import Dict, Iterator, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import numpy as np
@@ -20,6 +21,11 @@ from src.utils.nondim import to_t_nd
 # Standard channel indices across all models for kinematics
 _CHANNEL = dict(u=0, v=1, p=2, mu_eff=STATE_CHANNEL_MU_EFF_ND)
 _KIN_CKPT_CANDIDATES = ("kinematics_best.pth", "kinematics_ckpt_latest.pth", "kinematics_ckpt_100.pth")
+_BIOCHEM_CKPT_CANDIDATES = (
+    "biochem_teacher_best.pth",
+    "biochem_best_bio.pth",
+    "biochem_latest_checkpoint.pth",
+)
 
 
 def _infer_bio_encoder_prior_dim_from_state_dict(state_dict):
@@ -105,6 +111,48 @@ def _resolve_kinematics_checkpoint():
     raise FileNotFoundError(
         "No kinematics checkpoint found for visualization. Tried: "
         + ", ".join(str(expected_dir / name) for name in _KIN_CKPT_CANDIDATES)
+    )
+
+
+def _load_torch_checkpoint(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _checkpoint_state_dict(raw: Any) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """Return (metadata, state_dict) from a flat or nested biochem checkpoint."""
+    if isinstance(raw, dict) and "model_state_dict" in raw:
+        meta = {k: v for k, v in raw.items() if k != "model_state_dict"}
+        state = raw["model_state_dict"]
+        if isinstance(state, dict):
+            return meta, state
+    if isinstance(raw, dict):
+        return {}, raw
+    raise TypeError(f"Unsupported checkpoint type: {type(raw)!r}")
+
+
+def _resolve_biochem_checkpoint(explicit: Optional[str] = None) -> Path:
+    """Prefer teacher-best weights; override via CLI or ``VIZ_BIOCHEM_CHECKPOINT``."""
+    name = (explicit or os.environ.get("VIZ_BIOCHEM_CHECKPOINT") or "").strip()
+    if name:
+        path = Path(name)
+        if path.is_file():
+            return path.resolve()
+        resolved = resolve_checkpoint("b", name)
+        if resolved.exists():
+            return resolved
+        raise FileNotFoundError(f"Biochem checkpoint not found: {name}")
+    for ckpt_name in _BIOCHEM_CKPT_CANDIDATES:
+        candidate = resolve_checkpoint("b", ckpt_name)
+        if candidate.exists():
+            return candidate
+    expected_dir = resolve_checkpoint("b", _BIOCHEM_CKPT_CANDIDATES[0]).parent
+    raise FileNotFoundError(
+        "No biochem checkpoint found for visualization. Tried: "
+        + ", ".join(str(expected_dir / n) for n in _BIOCHEM_CKPT_CANDIDATES)
+        + " (train with STOP_AFTER_TEACHER=1 to write biochem_teacher_best.pth)."
     )
 
 
@@ -314,7 +362,7 @@ def _show_biochem_temporal_slider(
     plt.show()
 
 
-def run_phase_comparison(regenerate=True, seed=42):
+def run_phase_comparison(regenerate=True, seed=42, biochem_checkpoint: Optional[str] = None):
     root = get_project_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ Using device: {device}")
@@ -379,10 +427,8 @@ def run_phase_comparison(regenerate=True, seed=42):
     print("\n🧠 Loading trained models...")
     kin_ckpt = _resolve_kinematics_checkpoint()
     print(f"   ↳ Using kinematics checkpoint: {kin_ckpt.name}")
-    biochem_ckpt = resolve_checkpoint("b", "biochem_best_bio.pth")
-    if not biochem_ckpt.exists():
-        raise FileNotFoundError(f"Biochem checkpoint not found: {biochem_ckpt}")
-    biochem_state = torch.load(biochem_ckpt, map_location=device, weights_only=True)
+    biochem_ckpt = _resolve_biochem_checkpoint(biochem_checkpoint)
+    biochem_meta, biochem_state = _checkpoint_state_dict(_load_torch_checkpoint(biochem_ckpt))
 
     # Kinematics setup (optional faster DEQ for visualization — default matches training)
     kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", "25"))
@@ -415,6 +461,12 @@ def run_phase_comparison(regenerate=True, seed=42):
     else:
         latent_dim = _infer_latent_dim_from_state_dict(biochem_state) or 256
     print(f"   ↳ Using biochem checkpoint: {biochem_ckpt.name}")
+    if biochem_meta.get("checkpoint_role") == "teacher_best":
+        t_ep = biochem_meta.get("best_epoch", -1)
+        t_mae = biochem_meta.get("val_mu_log_mae")
+        ep_s = f" ep={int(t_ep):02d}" if isinstance(t_ep, int) and t_ep >= 0 else ""
+        mae_s = f" val_logMAE={float(t_mae):.4f}" if t_mae is not None else ""
+        print(f"   ↳ teacher-best checkpoint{ep_s}{mae_s}")
     print(f"   ↳ bio_encoder prior dim: {bio_enc_prior}")
     print(f"   ↳ latent_dim: {latent_dim}")
     _viz_inner = os.environ.get("VIZ_BIOCHEM_MAX_INNER_ITERS", "").strip()
@@ -657,6 +709,15 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for the single synthetic case when regeneration is enabled",
     )
+    parser.add_argument(
+        "--biochem-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Biochem weights file (default: biochem_teacher_best.pth, else biochem_best_bio.pth). "
+            "Override with path or filename under outputs/biochem."
+        ),
+    )
     args = parser.parse_args()
 
     if args.regenerate and args.reuse:
@@ -669,7 +730,11 @@ if __name__ == "__main__":
 
     seed = args.seed
     while True:
-        refresh_requested = run_phase_comparison(regenerate=regenerate, seed=seed)
+        refresh_requested = run_phase_comparison(
+            regenerate=regenerate,
+            seed=seed,
+            biochem_checkpoint=args.biochem_checkpoint,
+        )
         if not refresh_requested:
             break
         regenerate = True
