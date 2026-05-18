@@ -920,6 +920,109 @@ def _emit_clot_batch_trace(
         _biochem_dbg_line(ln)
 
 
+def _compute_mu_flow_debug_metrics(
+    *,
+    model,
+    data,
+    pred_final: torch.Tensor,
+    target_final_mu_nd: Optional[torch.Tensor],
+    phys_cfg,
+    truth_mask: torch.Tensor,
+    mu_ch: int,
+) -> Dict[str, float]:
+    """Strong μ diagnostics + simple inlet/outlet flow sanity (non-destructive debug only)."""
+    out: Dict[str, float] = {}
+    species_log = torch.clamp(pred_final[:, 4:16], min=-10.0, max=8.0)
+    species_si = model.species_log_nd_to_si(species_log)
+    fi_si = species_si[:, 8:9]
+    mat_si = species_si[:, 11:12]
+
+    mu1 = model.mu1_sigmoid(mat_si) if hasattr(model, "mu1_sigmoid") else torch.zeros_like(fi_si)
+    mu2 = model.mu2_sigmoid(fi_si) if hasattr(model, "mu2_sigmoid") else torch.zeros_like(fi_si)
+    learned = (
+        model.learned_clot_penalty(species_log)
+        if hasattr(model, "learned_clot_penalty")
+        else torch.zeros_like(fi_si)
+    )
+    gel_total = mu1 + mu2 + learned
+
+    mu_pred_si = phys_cfg.viscosity_nd_to_si(pred_final[:, mu_ch]).reshape(-1).float()
+    m_all = torch.ones_like(mu_pred_si, dtype=torch.bool)
+    m_truth = truth_mask.view(-1).bool().to(mu_pred_si.device)
+    m_wall = (
+        data.mask_wall.view(-1).bool().to(mu_pred_si.device)
+        if hasattr(data, "mask_wall") and data.mask_wall is not None
+        else torch.zeros_like(m_truth)
+    )
+
+    def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> float:
+        if not bool(m.any().item()):
+            return float("nan")
+        return float(x[m].mean().item())
+
+    def _masked_q(x: torch.Tensor, m: torch.Tensor, q: float) -> float:
+        if not bool(m.any().item()):
+            return float("nan")
+        return float(torch.quantile(x[m], q).item())
+
+    out["DBG_mu1_mean"] = _masked_mean(mu1.view(-1).float(), m_all)
+    out["DBG_mu2_mean"] = _masked_mean(mu2.view(-1).float(), m_all)
+    out["DBG_mu_learned_mean"] = _masked_mean(learned.view(-1).float(), m_all)
+    out["DBG_mu_gel_total_mean"] = _masked_mean(gel_total.view(-1).float(), m_all)
+    out["DBG_mu_pred_si_mean"] = _masked_mean(mu_pred_si, m_all)
+    out["DBG_mu_pred_si_p90"] = _masked_q(mu_pred_si, m_all, 0.9)
+    out["DBG_mu_pred_si_mean_truth"] = _masked_mean(mu_pred_si, m_truth)
+    out["DBG_mu_pred_si_mean_wall"] = _masked_mean(mu_pred_si, m_truth & m_wall)
+
+    if target_final_mu_nd is not None and bool(m_truth.any().item()):
+        mu_gt_si = phys_cfg.viscosity_nd_to_si(target_final_mu_nd).reshape(-1).float().to(mu_pred_si.device)
+        mp = mu_pred_si[m_truth].clamp(min=1e-8)
+        mg = mu_gt_si[m_truth].clamp(min=1e-8)
+        out["DBG_mu_log_mae_final_anchor"] = float((torch.log(mp) - torch.log(mg)).abs().mean().item())
+        out["DBG_mu_gt_si_mean_truth"] = float(mu_gt_si[m_truth].mean().item())
+        out["DBG_mu_gt_si_p90_truth"] = float(torch.quantile(mu_gt_si[m_truth], 0.9).item())
+    else:
+        out["DBG_mu_log_mae_final_anchor"] = float("nan")
+        out["DBG_mu_gt_si_mean_truth"] = float("nan")
+        out["DBG_mu_gt_si_p90_truth"] = float("nan")
+
+    # Fast flow-collapse sanity: compare mean |velocity| on inlet/outlet masks.
+    u = pred_final[:, 0].float()
+    v = pred_final[:, 1].float()
+    speed = torch.sqrt(u * u + v * v + 1e-20)
+    out["DBG_speed_mean"] = float(speed.mean().item())
+    if (
+        hasattr(data, "mask_inlet")
+        and hasattr(data, "mask_outlet")
+        and data.mask_inlet is not None
+        and data.mask_outlet is not None
+    ):
+        m_in = data.mask_inlet.view(-1).bool().to(speed.device)
+        m_out = data.mask_outlet.view(-1).bool().to(speed.device)
+        if bool(m_in.any().item()) and bool(m_out.any().item()):
+            inlet_flux = float(speed[m_in].mean().item())
+            outlet_flux = float(speed[m_out].mean().item())
+            eps = 1e-8
+            imbalance = abs(inlet_flux - outlet_flux) / (inlet_flux + outlet_flux + eps)
+            flow_ref = max(inlet_flux, outlet_flux, eps)
+            collapse = 1.0 - ((inlet_flux + outlet_flux) / (2.0 * flow_ref + eps))
+            out["DBG_flux_inlet"] = inlet_flux
+            out["DBG_flux_outlet"] = outlet_flux
+            out["DBG_flux_imbalance"] = float(imbalance)
+            out["DBG_flow_collapse"] = float(collapse)
+        else:
+            out["DBG_flux_inlet"] = float("nan")
+            out["DBG_flux_outlet"] = float("nan")
+            out["DBG_flux_imbalance"] = float("nan")
+            out["DBG_flow_collapse"] = float("nan")
+    else:
+        out["DBG_flux_inlet"] = float("nan")
+        out["DBG_flux_outlet"] = float("nan")
+        out["DBG_flux_imbalance"] = float("nan")
+        out["DBG_flow_collapse"] = float("nan")
+    return out
+
+
 def _biochem_debug_log_path():
     run_dir = os.environ.get("KINEMATICS_TRAINING_RUN_DIR", "").strip()
     if run_dir:
@@ -2814,6 +2917,16 @@ def compute_biochem_loss(
             if w_mu_log <= 0.0:
                 l_mu_log_anchor = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
 
+    mu_dbg = _compute_mu_flow_debug_metrics(
+        model=model,
+        data=data,
+        pred_final=pred_final,
+        target_final_mu_nd=(target_series[-1, :, mu_ch] if has_anchor_supervision else None),
+        phys_cfg=phys_cfg,
+        truth_mask=truth_mask,
+        mu_ch=mu_ch,
+    )
+
     # Teacher-start FI gate suppression: prevents inherited broad FI activation from
     # immediately doubling viscosity before anchor supervision can pull states back.
     l_fi_gate_start = torch.tensor(0.0, device=device)
@@ -3014,6 +3127,7 @@ def compute_biochem_loss(
         "BIOCHEM_LOSS_ISOLATE": isolate_key or "",
         "L_Backprop": float(loss.detach().item()),
     }
+    metrics.update(mu_dbg)
     if debug_batch is not None:
         de, dbi = debug_batch
         _debug_biochem_batch(
@@ -3904,6 +4018,12 @@ def train_teacher_on_anchors(
             epoch_l_kine, epoch_l_back = 0.0, 0.0
             epoch_mu_si_w, epoch_mu_log_w = 0.0, 0.0
             epoch_mu_batches = 0
+            epoch_dbg_mu1_sum = 0.0
+            epoch_dbg_mu2_sum = 0.0
+            epoch_dbg_mu_learned_sum = 0.0
+            epoch_dbg_flow_imb_sum = 0.0
+            epoch_dbg_mu_log_anchor_sum = 0.0
+            epoch_dbg_n = 0
             n_batches = 0
             for batch_idx, data in enumerate(teacher_loader):
                 data = data.to(device, non_blocking=nb_xfer)
@@ -3949,6 +4069,24 @@ def train_teacher_on_anchors(
                     epoch_mu_si_w += float(metrics.get("W_MuSI_aux_eff", 0.0)) * float(metrics.get("L_MuSI_aux", 0.0))
                     epoch_mu_log_w += float(metrics.get("W_MuLog_aux_eff", 0.0)) * float(metrics.get("L_MuLog_aux", 0.0))
                     epoch_mu_batches += 1
+                dbg_mu1 = float(metrics.get("DBG_mu1_mean", float("nan")))
+                dbg_mu2 = float(metrics.get("DBG_mu2_mean", float("nan")))
+                dbg_ml = float(metrics.get("DBG_mu_learned_mean", float("nan")))
+                dbg_fi = float(metrics.get("DBG_flux_imbalance", float("nan")))
+                dbg_lm = float(metrics.get("DBG_mu_log_mae_final_anchor", float("nan")))
+                if (
+                    math.isfinite(dbg_mu1)
+                    and math.isfinite(dbg_mu2)
+                    and math.isfinite(dbg_ml)
+                    and math.isfinite(dbg_fi)
+                    and math.isfinite(dbg_lm)
+                ):
+                    epoch_dbg_mu1_sum += dbg_mu1
+                    epoch_dbg_mu2_sum += dbg_mu2
+                    epoch_dbg_mu_learned_sum += dbg_ml
+                    epoch_dbg_flow_imb_sum += dbg_fi
+                    epoch_dbg_mu_log_anchor_sum += dbg_lm
+                    epoch_dbg_n += 1
                 n_batches += 1
                 if ema_l_bio is None:
                     ema_l_bio = current_l_bio
@@ -4018,6 +4156,11 @@ def train_teacher_on_anchors(
                 val_bundle = _compute_anchor_mu_metrics(
                     teacher, teacher_val_loader, kernels, bio_cfg, device, non_blocking=nb_xfer
                 )
+                dbg_mu1_e = (epoch_dbg_mu1_sum / float(max(1, epoch_dbg_n)))
+                dbg_mu2_e = (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n)))
+                dbg_mlearn_e = (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n)))
+                dbg_flow_imb_e = (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n)))
+                dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
                 val_stats = _log_mu_validation_report(
                     stage="teacher",
                     epoch=epoch,
@@ -4029,6 +4172,11 @@ def train_teacher_on_anchors(
                             f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
                             f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
                             f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}"
+                        ),
+                        (
+                            f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
+                            f"learned={dbg_mlearn_e:.3e} "
+                            f"final_anchor_logMAE={dbg_mu_log_e:.3e} flow_imb={dbg_flow_imb_e:.3e}"
                         ),
                     ],
                 )
@@ -4048,10 +4196,17 @@ def train_teacher_on_anchors(
                     )
                     break
             else:
+                dbg_mu1_e = (epoch_dbg_mu1_sum / float(max(1, epoch_dbg_n)))
+                dbg_mu2_e = (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n)))
+                dbg_mlearn_e = (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n)))
+                dbg_flow_imb_e = (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n)))
+                dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
                 print(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
                     f"L_Bio (Avg): {avg_bio:.3e}] | "
+                    f"μdbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
+                    f"logMAE_f={dbg_mu_log_e:.2e},flowImb={dbg_flow_imb_e:.2e}] | "
                     f"Val skipped (BIOCHEM_TEACHER_VAL_EVERY={teacher_val_every})"
                 )
 
@@ -4066,6 +4221,11 @@ def train_teacher_on_anchors(
                 "teacher_val_ran": bool(run_teacher_val),
                 "teacher_val_every": int(teacher_val_every),
                 "teacher_best_mu_score_running": float(best_mu_score),
+                "dbg_mu1_mean": (epoch_dbg_mu1_sum / float(max(1, epoch_dbg_n))),
+                "dbg_mu2_mean": (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n))),
+                "dbg_mu_learned_mean": (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n))),
+                "dbg_flux_imbalance_mean": (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n))),
+                "dbg_final_anchor_mu_log_mae_mean": (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n))),
                 "val_mu_mae_si": float(val_stats["mu_mae_si"]) if val_stats is not None else None,
                 "val_mu_rmse_si": float(val_stats["mu_rmse_si"]) if val_stats is not None else None,
                 "val_mu_log_mae": float(val_stats["mu_log_mae"]) if val_stats is not None else None,
