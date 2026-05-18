@@ -24,7 +24,8 @@ Set-Location $RepoRoot
 
 $LegCatalog = @{
     "A0" = "Reproduce MU_LOG+mu-path on full anchors (patient007 val); 12 ep"
-    "A1" = "A0 + DETACH_MACRO=0, TBPTT=6 (needs VRAM; set -OomSafe 0 if 5GB GPU)"
+    "A1" = "A0 + DETACH_MACRO=0, TBPTT=6 — full TBPTT (>=8GB VRAM; OOM on 5GB P2200)"
+    "A1s" = "A0 + TBPTT=5, DETACH=1, RK4=10 — softer temporal probe (5GB-safe)"
     "A2" = "A0 + TEACHER_MU_RATIO_MAX=80"
     "B0" = "Ablation reference: full mu-path stack"
     "B1" = "Ablation: no delta_mu head"
@@ -110,16 +111,30 @@ if ($OomSafe -ne 0) {
     $env:BIOCHEM_DETACH_MACRO_STATE = "0"
     $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "12"
 }
+if (-not $env:PYTORCH_CUDA_ALLOC_CONF) {
+    $env:PYTORCH_CUDA_ALLOC_CONF = "max_split_size_mb:512"
+}
+
+$highVramLegs = @("A1", "C0", "C1")
+if ($Leg -in $highVramLegs -and $OomSafe -eq 0) {
+    Write-Host ""
+    Write-Host "WARNING: Leg $Leg uses DETACH_MACRO=0 and/or TBPTT>4." -ForegroundColor Red
+    Write-Host "  Quadro P2200 (5GB) typically OOMs in ODE adjoint backward (see A1 failure)." -ForegroundColor Red
+    Write-Host "  On 5GB: use A0, A1s, or A2. Retry A1 on >=8GB GPU or cloud." -ForegroundColor Yellow
+    Write-Host ""
+}
 
 switch ($Leg) {
     "A0" { }
     "A1" {
-        if ($OomSafe -ne 0) {
-            Write-Host "A1 requests DETACH=0; pass -OomSafe 0 on GPUs with headroom." -ForegroundColor Yellow
-        }
         $env:BIOCHEM_DETACH_MACRO_STATE = "0"
         $env:BIOCHEM_TBPTT_MAX_WINDOW = "6"
         $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "12"
+    }
+    "A1s" {
+        $env:BIOCHEM_DETACH_MACRO_STATE = "1"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "10"
     }
     "A2" { $env:BIOCHEM_TEACHER_MU_RATIO_MAX = "80.0" }
     "B0" { $env:BIOCHEM_TEACHER_EPOCHS = "8" }

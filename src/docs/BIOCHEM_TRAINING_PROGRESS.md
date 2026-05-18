@@ -16,13 +16,30 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | **1** | Teacher (anchors) | Supervised COMSOL on anchors only | Same script, teacher loop | `BIOCHEM_STOP_AFTER_TEACHER=1` |
 | **2** | **Step 2** (current target) | `L_Data_Kine + L_Data_Bio + W_MuSI·L_MuSI` (+ optional `L_PhysTemp`) | Teacher (+ optional early stop) | `BIOCHEM_LOSS_DATA_ONLY=1`, `BIOCHEM_COMPLEXITY_STEP=2` |
 | **2.5** | Step 2 + temporal | Step 2 + `w_pt·L_PhysTemp` on anchor trajectories | Teacher / short corrector | `BIOCHEM_PRESET=step2p5` or `DATA_ONLY_PHYS_TEMP=1` |
-| **2+** | Thrombus corona bundle | Step 2 + gelation prior gate + 3-hop corona + phys temp | **Teacher + full corrector** (mixed graphs, pseudo labels) | `BIOCHEM_PRESET=thrombus_corona`, `STOP_AFTER_TEACHER=0` |
+| **2+** | Thrombus corona bundle (**experimental / unvalidated**) | Step 2 + gelation prior gate + 3-hop corona + phys temp | **Teacher + full corrector** (mixed graphs, pseudo labels) | `BIOCHEM_PRESET=thrombus_corona`, `STOP_AFTER_TEACHER=0` — **not recommended yet** |
 | **3** | Full multitask | Kendall sum: PDE + walls + ADR + data heads (not data-only) | Full corrector, LoRA on | `BIOCHEM_COMPLEXITY_STEP=3` → forces `LOSS_DATA_ONLY=0` |
 | **Prod** | Long schedules | Step 2 or 3 + long AE/ODE/teacher/corrector | Overnight wall time | `BIOCHEM_PRESET=overnight_step2` (still step-2 loss tier) |
 
 **“All losses”** in code terms = **complexity step 3** (`BIOCHEM_LOSS_DATA_ONLY=0`): physics Kendall terms enter `backward()`, not only metrics.
 
-**“Full run”** in product terms = **`thrombus_corona` + corrector to completion** (`STOP_AFTER_TEACHER=0`), with μ and species stable on val anchors — usually **after** step-2 teacher is healthy, then step 2.5 / corona, then step 3 if VRAM allows.
+**“Full run”** (aspirational) = teacher + corrector to completion with stable μ/species on val anchors — **after** step-2 teacher is healthy, then optional step 2.5 / spatial priors / step 3. The **`thrombus_corona` preset** is one *unvalidated* bundle for that path; do not treat it as the default iteration entry point.
+
+---
+
+## Experimental presets (`thrombus_corona`, `comprehensive_mu`)
+
+**Status: unvalidated — keep in code, do not use for current μ iteration.**
+
+| Preset | What it bundles | Evidence |
+|--------|-----------------|----------|
+| `thrombus_corona` | `GELATION_PRIOR_GATE=1`, `PRIOR_THROMBUS_CORONA_HOPS=3`, `DATA_ONLY_PHYS_TEMP`, `STOP_AFTER_TEACHER=0`, step-2 data-only | **One run** (2026-05-16): teacher μ **flat ~1.484**; corrector **1.569→1.548**; confounds: `MU_RATIO_MAX` default **1.0**, TF≈1, early TBPTT windows |
+| `comprehensive_mu` | Corona + long AE/ODE/teacher/corrector + μ best-practice env | **No run** showing μ unlock vs patient007 ~1.48 plateau or A0 (~0.44) |
+
+**Why it exists:** convenience for a future “full pipeline + wall-localized gelation” experiment. **Why not now:** bundles corrector, joint losses, and spatial priors before μ formulation is understood; overwrites env (e.g. forces `PhysTemp`).
+
+**When to revisit:** after joint step-2 (Phase D) on a good teacher checkpoint — test **`GELATION_PRIOR_GATE=1`** and **`PRIOR_THROMBUS_CORONA_HOPS=3`** as **separate env flags**, not the full preset.
+
+**Preferred iteration:** `scripts/run_biochem_mu_formulation_study.ps1` (teacher-only, `MU_LOG` isolate).
 
 ---
 
@@ -33,21 +50,21 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | logMAE → **0.25** (env target) | **Partial** | **patient007** repro still ~**1.48–1.51** flat; **2026-05-18** `mu_learned_only_oomsafe` on **patient003** (3-vessel cap) reached **0.51** ep5 — not yet reproduced on full val anchor |
-| Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Low-TF patient007: **0.40 → 0.43**; MU_LOG+delta on patient003: **0.11 → 0.14** (magnitude, weak pattern) |
-| Wall μ logMAE | ≲ 1.5 | **Partial** | patient003 run: **1.97 → 1.42** ep0→5; patient007 band still ~2.24 |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Study A0**: patient007 **1.28→0.44** best ep8; **&lt;1.2** at ep6–8; late drift ep10–11 (~0.54–0.64); use best-epoch checkpoint |
+| Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | A0 ep8 **r≈0.37** (best); ep11 **~0.15**; bulk **r** often negative |
+| Wall μ logMAE | ≲ 1.5 | **Fail** | A0 wall **~1.80–2.13** flat; bulk logMAE **~0.33** ep8 |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | Species fit is easy |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59; train `L_MuSI` only |
 | Phase B: `MU_SI` + low TF | Val logMAE drops | **Partial / stalled** | Early one-run dip observed, but repeats are mostly flat (~1.48–1.49) after ep0 |
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: Not on **patient007** yet (~1.48 flat). On **3-vessel / patient003 val**, `MU_LOG` isolate + μ-path + delta head hit **0.51** logMAE ep5 — reproduce on held-out **patient007** before corrector mix; official target **0.25** still far.
-- **Step 2.5 / thrombus_corona**: **1–2 weeks of iteration** after μ moves reliably under step-2 losses (estimate; GPU-bound).
+- **Step-2 teacher “done”**: **Interim pass on patient007** — study **A0** best val logMAE **0.44** (ep8), two val points **&lt;1.2** (ep6, ep8); wall/high-μ still weak; stop early or save ep8 checkpoint before late drift. Corrector / joint losses still **not** started.
+- **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
 
-**We are roughly at: step-2 μ can move** (MU_LOG + learned μ path on tiny split) **but not yet validated on standard patient007 val** — not at corona-full or step 3.
+**We are roughly at: μ formulation validated on patient007** (A0 MU_LOG + μ-path, full anchors) **with subset caveats** (wall ~1.8, high-μ tail, late-epoch val drift) — ready for **Phase B ablations** and **A1/A2**; not at corona-full or step 3.
 
 ---
 
@@ -134,6 +151,13 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Symptom**: `thrombus_corona` sets `DATA_ONLY_PHYS_TEMP=1` even if user set `0`.
 - **Fix**: Use **`BIOCHEM_STOCK_DEFAULTS=1`** and no preset for μ probes; or re-export vars after preset (preset runs at import).
 - **Status**: Documented.
+
+### 19. `thrombus_corona` / `comprehensive_mu` presets — experimental, not validated
+
+- **Symptom**: Docs/scripts once called corona “recommended”; single corona run did not improve μ vs ~1.48 plateau; A0 (`MU_LOG` + μ-path, no corona) reached patient007 **~0.44**.
+- **Cause**: Preset bundles corrector + joint step-2 + spatial priors + `PhysTemp` — too many moving parts; not isolated as helpful.
+- **Fix**: Mark **experimental / unvalidated**; iterate with `run_biochem_mu_formulation_study.ps1`; test `GELATION_PRIOR_GATE` / `CORONA_HOPS` individually only after step-2 teacher works.
+- **Status**: Documented (see **Experimental presets** section).
 
 ### 10. `MU_SI` isolate + **TBPTT window = 2** (12 ep, stride=10 val)
 
@@ -259,7 +283,8 @@ Consolidated principles before re-introducing step-2 / corona / multitask losses
 | Leg | Purpose | Key deltas vs `mu_learned_only_oomsafe` |
 |-----|---------|----------------------------------------|
 | **A0** | Baseline transfer | Unset `MAX_LOAD_VESSELS`; same MU_LOG + μ-path; 12 ep; val every 2 ep |
-| **A1** | VRAM allowing | `DETACH_MACRO_STATE=0`, `TBPTT_MAX_WINDOW=6`, `ADJOINT_RK4_SUBSTEPS=12` |
+| **A1** | Full TBPTT (≥8GB VRAM) | `DETACH_MACRO_STATE=0`, `TBPTT_MAX_WINDOW=6` — **OOM on 5GB P2200** ep0 backward |
+| **A1s** | 5GB-safe temporal | `TBPTT=5`, `DETACH=1`, `RK4=10` — compromise before A1 |
 | **A2** | High-μ headroom | `TEACHER_MU_RATIO_MAX=80` (match preflight cap) |
 
 **Read:** If A0 snaps back to ~1.48, the 0.51 result was mostly split difficulty. If A0 drops below 1.2, mechanism is real.
@@ -318,7 +343,7 @@ Ordered by impact:
 5. **Rheology-only optimizer group** (`learned_clot_penalty`, `mu_encoder`; teacher currently `freeze_lora=True`).
 6. **`BIOCHEM_FAST_MU_PROBE=1`** preset: **`SKIP_VAL=1`** or tiny dev graph — not “stride=10 ⇒ fast val” on patient007.
 
-**Increasing complexity order (do not skip):** (A) **μ formulation study** (patient007, MU_LOG + ablations) → (B) widen TBPTT / `DETACH=0` under μ-only backward → (C) joint **step-2** one term at a time (`DATA_KINE` then `MU_SI`) → (D) **step 2.5** `L_PhysTemp` → (E) **thrombus_corona** corrector → (F) **step 3** multitask only if stable.
+**Increasing complexity order (do not skip):** (A) **μ formulation study** (patient007, MU_LOG + ablations) → (B) widen TBPTT / `DETACH=0` under μ-only backward → (C) joint **step-2** one term at a time (`DATA_KINE` then `MU_SI`) → (D) **step 2.5** `L_PhysTemp` → (E) corrector + optional corona *flags* (not full preset until validated) → (F) **step 3** multitask only if stable.
 
 ---
 
@@ -382,12 +407,12 @@ $env:BIOCHEM_TEACHER_MU_RATIO_MAX = "80.0"
 $env:BIOCHEM_VAL_TIME_STRIDE = "10"
 ```
 
-### Full corona run (not yet)
+### Corona preset (experimental — not recommended)
 
 ```powershell
+# Unvalidated bundle; see "Experimental presets" section above.
 .\scripts\run_biochem_thrombus_corona.ps1
-# STOP_AFTER_TEACHER=0 → teacher + corrector + pseudo bank
-# Only after val mu_log_mae < ~1.2 stable on stride=10
+# Only consider after joint step-2 teacher stable on patient007 (not MU_LOG isolate only).
 ```
 
 ### Step 3 multitask (not yet)
@@ -414,6 +439,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-18 | RTX500 smoke triad (`MU_LOG`, `MU_SI`, `MU_LOG+delta_head`), 1-anchor skip-val | n/a (skip val) | n/a | n/a | `L_Back` decreases (signal flow OK), but train=val same file + no held-out val ⇒ optimization sanity only |
 | 2026-05-18 | RTX500 `P_repro_lowTF_earlywin_MU_SI` repeat (5 anchors, teacher-only) | **1.4860 → ~1.4861–1.4867** | ~2.242 | ~0.92 | ~0.383 | Strong ep0 baseline but flat thereafter; no reproducible epoch-wise μ improvement yet |
 | 2026-05-18 | Quadro `mu_learned_only_oomsafe`: `MU_LOG` isolate, μ-path+delta head, TF→0, `DETACH=1`, 3 vessels, val **patient003** | **1.41→0.51** (ep5 best) | **1.97→1.42** | high **0.85→0.95** | **0.11→0.14** | First strong epoch-wise μ drop; tail worsened ep5; reproduce on patient007 |
+| 2026-05-18 | Study **A0** (`mu_study_P_A_A0`): full anchors, patient007 val, MU_LOG+μ-path, 12ep, `DETACH=1`, TBPTT=4 | **1.28→0.44** (ep8 best) | **2.13→1.82** | high **0.89→1.43** | **0.28→0.37** (ep8) | **Phase A pass** (&lt;1.2 ep6+8); ep4 spike 1.04; ep10–11 drift; wall stuck |
+| 2026-05-18 | Study **A1** (`DETACH=0`, TBPTT=6, P2200 5GB) | n/a | n/a | n/a | n/a | **CUDA OOM** ep0 backward (ODE adjoint); use **A1s** or **A2** on 5GB |
 
 ---
 
@@ -421,4 +448,5 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 
 - Module header: `src/training/train_biochem_corrector.py` (presets, complexity steps).
 - Project overview: [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md).
-- Corona script: `scripts/run_biochem_thrombus_corona.ps1`.
+- Corona script (experimental): `scripts/run_biochem_thrombus_corona.ps1`.
+- Comprehensive μ script (experimental): `scripts/run_biochem_comprehensive_mu.ps1`.

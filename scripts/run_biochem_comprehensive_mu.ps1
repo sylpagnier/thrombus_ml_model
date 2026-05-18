@@ -1,4 +1,6 @@
-# Comprehensive biochem μ diagnostic (~10h on a laptop GPU; scale down if OOM).
+# EXPERIMENTAL / UNVALIDATED — comprehensive_mu preset (corona bundle + long schedules).
+# Not shown to beat MU_LOG μ-path teacher-only runs. See BIOCHEM_TRAINING_PROGRESS.md.
+#
 # From repo root:
 #   .\scripts\run_biochem_comprehensive_mu.ps1
 #

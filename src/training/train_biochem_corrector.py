@@ -25,16 +25,17 @@ knobs (e.g. raise ``BIOCHEM_TEACHER_EPOCHS``, ``BIOCHEM_AE_EPOCHS``, ``BIOCHEM_D
   ``BIOCHEM_DATA_ONLY_PHYS_TEMP=1`` and default ``BIOCHEM_COMSOL_TEMPORAL_WEIGHT`` when unset —
   best next step when step-2 μ is flat but you are not ready for full Kendall backprop.
 
-- **Thrombus corona (recommended smoke / iteration bundle)**:
+- **Thrombus corona (experimental / unvalidated)**:
   ``BIOCHEM_PRESET=thrombus_corona`` (aliases ``corona_thrombus``, ``biochem_thrombus_corona``).
-  Enables gelation × kinematic prior, **3 graph-hop** dilation of that prior
-  (``BIOCHEM_PRIOR_THROMBUS_CORONA_HOPS``), temporal anchor loss, and runs the corrector
-  (``BIOCHEM_STOP_AFTER_TEACHER=0``). See ``scripts/run_biochem_thrombus_corona.ps1``.
+  Bundles gelation prior gate, **3-hop** prior dilation, ``L_PhysTemp``, and corrector
+  (``BIOCHEM_STOP_AFTER_TEACHER=0``). **Not recommended** for current μ work — one logged run
+  (2026-05-16) had flat teacher μ (~1.48) with confounded settings; not rerun post-A0.
+  See ``scripts/run_biochem_thrombus_corona.ps1`` and ``src/docs/BIOCHEM_TRAINING_PROGRESS.md``.
 
-- **Comprehensive μ diagnostic (~10h)**:
+- **Comprehensive μ (experimental / unvalidated)**:
   ``BIOCHEM_PRESET=comprehensive_mu`` (aliases ``mu_comprehensive``, ``step2_comprehensive``).
-  Thrombus-corona bundle + **late TBPTT** (``BIOCHEM_TBPTT_ANCHOR_END_BIAS``), ``TEACHER_MU_RATIO_MAX=80``,
-  log+SI μ losses, lower teacher TF, longer teacher/corrector. See ``scripts/run_biochem_comprehensive_mu.ps1``.
+  Corona bundle + longer schedules + μ best-practice env. Same validation status as corona.
+  See ``scripts/run_biochem_comprehensive_mu.ps1``.
 
 - **Complexity step 3** (full multitask / Kendall + PDE in ``backward``): set
   ``BIOCHEM_COMPLEXITY_STEP=3`` (aliases ``phase3``, ``full_multitask``, ``corrector_full``). Applies
@@ -485,10 +486,10 @@ _COMPREHENSIVE_MU_PRESET_ALIASES = frozenset({
 
 
 def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
-    """~10h diagnostic: thrombus corona + μ best practices + longer teacher/corrector schedules.
+    """Experimental preset: corona bundle + longer teacher/corrector + μ env defaults.
 
-    Overrides fast defaults. Still ``BIOCHEM_LOSS_DATA_ONLY=1`` (step 2). Use to compare val μ subsets,
-    wall vs high-μ tail, and whether teacher+corrector move logMAE with late TBPTT + ``MU_RATIO_MAX=80``.
+    **Unvalidated** for μ improvement (see training progress log). Still ``BIOCHEM_LOSS_DATA_ONLY=1``.
+    Prefer ``run_biochem_mu_formulation_study.ps1`` until step-2 teacher is stable on patient007.
     On 4 GiB GPUs, lower ``BIOCHEM_TBPTT_MAX_WINDOW`` / ``BIOCHEM_ADJOINT_RK4_SUBSTEPS``.
     """
     preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
@@ -533,6 +534,11 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
         os.environ[k] = v
     os.environ["BIOCHEM_ODE_REACTION_EPOCHS"] = os.environ["BIOCHEM_ODE_RXN_EPOCHS"]
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
+    print(
+        "⚠️ BIOCHEM_PRESET=comprehensive_mu is experimental/unvalidated "
+        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md).",
+        flush=True,
+    )
 
 
 _STEP2P5_PRESET_ALIASES = frozenset({"step2p5", "phys_temp_only", "compact_step2p5"})
@@ -559,11 +565,14 @@ _THROMBUS_CORONA_PRESET_ALIASES = frozenset({"thrombus_corona", "corona_thrombus
 
 
 def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
-    """``BIOCHEM_PRESET=thrombus_corona``: gelation gate + 3-hop thrombus corona + phys-temp anchors + corrector.
+    """Experimental ``BIOCHEM_PRESET=thrombus_corona`` (unvalidated — not default for iteration).
 
     Bundles: ``BIOCHEM_GELATION_PRIOR_GATE=1``, ``BIOCHEM_PRIOR_THROMBUS_CORONA_HOPS=3``,
-    data-only step 2, temporal COMSOL Huber on anchors, ``BIOCHEM_STOP_AFTER_TEACHER=0``.
-    Slightly widens ``BIOCHEM_PRIOR_WALL_DECAY_ND`` when unset (softer SDF wall layer).
+    data-only step 2, ``BIOCHEM_DATA_ONLY_PHYS_TEMP=1``, ``BIOCHEM_STOP_AFTER_TEACHER=0`` (corrector on).
+    Slightly widens ``BIOCHEM_PRIOR_WALL_DECAY_ND`` when unset.
+
+    Evidence: one 2026-05-16 run — teacher μ flat ~1.48, corrector 1.57→1.55; μ cap/TBPTT/TF confounds.
+    Not rerun after MU_LOG + μ-path A0 (patient007 ~0.44). Test corona components individually later.
 
     Skipped when ``BIOCHEM_STOCK_DEFAULTS=1``. Conflicts with ``overnight_step2`` if both set — pick one preset.
     """
@@ -586,6 +595,11 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
     if "BIOCHEM_PRIOR_WALL_DECAY_ND" not in os.environ:
         os.environ["BIOCHEM_PRIOR_WALL_DECAY_ND"] = "0.01"
     _apply_biochem_mu_best_practice_env(only_if_missing=True)
+    print(
+        "⚠️ BIOCHEM_PRESET=thrombus_corona is experimental/unvalidated "
+        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md). Prefer mu formulation study for μ work.",
+        flush=True,
+    )
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
@@ -727,7 +741,8 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     # Keep teacher-stage physics precision strongly muted so PDE residual spikes
     # cannot dominate biological regression gradients.
     _setdef("BIOCHEM_TEACHER_PHYSICS_PRECISION_CEILING", "1e-4")
-    _setdef("BIOCHEM_TEACHER_TARGET_MU_LOG_MAE", "0.25")
+    # Optional teacher early-stop threshold: set BIOCHEM_TEACHER_TARGET_MU_LOG_MAE explicitly
+    # (no default — track best val mu_score / checkpoint instead).
     # Keep gradients unscaled in tiny-debug regimes (often 1 batch/epoch).
     _setdef("BIOCHEM_TEACHER_ACCUMULATION_STEPS", "1")
     # Lift clip norm high enough to avoid suppressing biology gradients during
@@ -3913,7 +3928,10 @@ def train_teacher_on_anchors(
     else:
         # Default fallback when env is missing/blank.
         teacher_lr = 2e-3
-    target_mu_log_mae = float(os.environ.get("BIOCHEM_TEACHER_TARGET_MU_LOG_MAE", "0.25"))
+    _target_mu_raw = (os.environ.get("BIOCHEM_TEACHER_TARGET_MU_LOG_MAE") or "").strip()
+    target_mu_log_mae: Optional[float] = None
+    if _target_mu_raw:
+        target_mu_log_mae = float(_target_mu_raw)
     accumulation_steps = max(1, int(os.environ.get("BIOCHEM_TEACHER_ACCUMULATION_STEPS", "1")))
     clip_teacher = float(os.environ.get("BIOCHEM_TEACHER_CLIP_NORM", "1.0"))
     clip_teacher_phys = float(os.environ.get("BIOCHEM_TEACHER_PHYSICS_CLIP_NORM", "0.1"))
@@ -3937,9 +3955,14 @@ def train_teacher_on_anchors(
     best_state = None
     best_mu_score = -float("inf")
 
+    _early_stop_note = (
+        f"early_stop@mu_log_mae<={target_mu_log_mae:.3f}"
+        if target_mu_log_mae is not None
+        else "early_stop=off (set BIOCHEM_TEACHER_TARGET_MU_LOG_MAE to enable)"
+    )
     print(
         f"\n👩‍🏫 --- Teacher Stage (anchors only): max_epochs={max_epochs}, "
-        f"target_mu_log_mae={target_mu_log_mae:.3f}, teacher_lr={teacher_lr:.3e}, "
+        f"{_early_stop_note}, teacher_lr={teacher_lr:.3e}, "
         f"accum={accumulation_steps}, bio_clip={clip_teacher:.2f}, phys_clip={clip_teacher_phys:.2f}, "
         f"tf_warmup_epochs={teacher_curriculum.biochem_warmup_epochs} ---"
     )
@@ -4189,9 +4212,13 @@ def train_teacher_on_anchors(
                 if val_mu_score > best_mu_score:
                     best_mu_score = val_mu_score
                     best_state = copy.deepcopy(teacher.state_dict())
-                if early_stop_allowed and float(val_stats["mu_log_mae"]) <= target_mu_log_mae:
+                if (
+                    early_stop_allowed
+                    and target_mu_log_mae is not None
+                    and float(val_stats["mu_log_mae"]) <= target_mu_log_mae
+                ):
                     print(
-                        f"   ✅ Teacher reached target mu_log_MAE "
+                        f"   ✅ Teacher reached BIOCHEM_TEACHER_TARGET_MU_LOG_MAE "
                         f"({float(val_stats['mu_log_mae']):.4f} <= {target_mu_log_mae:.4f}); stopping early."
                     )
                     break
