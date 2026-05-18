@@ -1535,15 +1535,19 @@ class SplitBiochemOptimizers:
         self,
         *,
         physics_optimizer: Optional[optim.Optimizer],
+        mu_optimizer: Optional[optim.Optimizer],
         bio_optimizer: optim.Optimizer,
         weighter_optimizer: optim.Optimizer,
         physics_params: List[torch.nn.Parameter],
+        mu_params: List[torch.nn.Parameter],
         bio_params: List[torch.nn.Parameter],
     ) -> None:
         self.physics_optimizer = physics_optimizer
+        self.mu_optimizer = mu_optimizer
         self.bio_optimizer = bio_optimizer
         self.weighter_optimizer = weighter_optimizer
         self.physics_params = physics_params
+        self.mu_params = mu_params
         self.bio_params = bio_params
 
     @property
@@ -1554,12 +1558,16 @@ class SplitBiochemOptimizers:
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self.physics_optimizer is not None:
             self.physics_optimizer.zero_grad(set_to_none=set_to_none)
+        if self.mu_optimizer is not None:
+            self.mu_optimizer.zero_grad(set_to_none=set_to_none)
         self.bio_optimizer.zero_grad(set_to_none=set_to_none)
         self.weighter_optimizer.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
         if self.physics_optimizer is not None:
             self.physics_optimizer.step()
+        if self.mu_optimizer is not None:
+            self.mu_optimizer.step()
         self.bio_optimizer.step()
         self.weighter_optimizer.step()
 
@@ -1571,21 +1579,25 @@ class SplitBiochemOptimizers:
         weighter_clip: Optional[float] = None,
     ) -> Tuple[float, float]:
         physics_norm = 0.0
+        mu_norm = 0.0
         bio_norm = 0.0
         if self.physics_params and physics_clip > 0.0:
             physics_norm = float(torch.nn.utils.clip_grad_norm_(self.physics_params, max_norm=physics_clip))
+        if self.mu_params and bio_clip > 0.0:
+            mu_norm = float(torch.nn.utils.clip_grad_norm_(self.mu_params, max_norm=bio_clip))
         if self.bio_params and bio_clip > 0.0:
             bio_norm = float(torch.nn.utils.clip_grad_norm_(self.bio_params, max_norm=bio_clip))
         if weighter_clip is not None and weighter_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(self.weighter_optimizer.param_groups[0]["params"], max_norm=weighter_clip)
         self.step()
         self.zero_grad()
-        return physics_norm, bio_norm
+        return physics_norm, max(bio_norm, mu_norm)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
             "type": "SplitBiochemOptimizers",
             "physics": self.physics_optimizer.state_dict() if self.physics_optimizer is not None else None,
+            "mu": self.mu_optimizer.state_dict() if self.mu_optimizer is not None else None,
             "bio": self.bio_optimizer.state_dict(),
             "weighter": self.weighter_optimizer.state_dict(),
         }
@@ -1594,6 +1606,8 @@ class SplitBiochemOptimizers:
         if state_dict.get("type") == "SplitBiochemOptimizers":
             if self.physics_optimizer is not None and state_dict.get("physics") is not None:
                 self.physics_optimizer.load_state_dict(state_dict["physics"])
+            if self.mu_optimizer is not None and state_dict.get("mu") is not None:
+                self.mu_optimizer.load_state_dict(state_dict["mu"])
             self.bio_optimizer.load_state_dict(state_dict["bio"])
             self.weighter_optimizer.load_state_dict(state_dict["weighter"])
             return
@@ -1636,6 +1650,9 @@ def _biochem_split_opt_grads_finite(split: SplitBiochemOptimizers) -> bool:
     for p in split.physics_params:
         if p.grad is not None and not torch.isfinite(p.grad).all():
             return False
+    for p in split.mu_params:
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            return False
     for group in split.weighter_optimizer.param_groups:
         for p in group["params"]:
             if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -1676,6 +1693,11 @@ def _biochem_bio_grad_global_l2(split: SplitBiochemOptimizers) -> float:
             continue
         g = p.grad.detach().float()
         sq += float((g * g).sum().item())
+    for p in split.mu_params:
+        if p.grad is None:
+            continue
+        g = p.grad.detach().float()
+        sq += float((g * g).sum().item())
     return math.sqrt(sq) if sq > 0.0 else 0.0
 
 
@@ -1711,16 +1733,32 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         for param in model.learned_clot_penalty.parameters():
             param.requires_grad = True
 
+    if hasattr(model, "mu_delta_head"):
+        for param in model.mu_delta_head.parameters():
+            param.requires_grad = True
+
+    train_mu_encoder = _biochem_env_truthy("BIOCHEM_TRAIN_MU_ENCODER", default=False)
+    if train_mu_encoder and hasattr(model, "mu_encoder"):
+        for param in model.mu_encoder.parameters():
+            param.requires_grad = True
+
     physics_params: List[torch.nn.Parameter] = []
+    mu_params: List[torch.nn.Parameter] = []
     bio_params: List[torch.nn.Parameter] = []
     physics_names: List[str] = []
+    mu_names: List[str] = []
     bio_names: List[str] = []
+    use_mu_path_group = _biochem_env_truthy("BIOCHEM_USE_MU_PATH_GROUP", default=True)
+    mu_group_prefixes = ("mu_encoder.", "learned_clot_penalty.", "mu_delta_head.")
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if "lora" in name.lower():
             physics_params.append(param)
             physics_names.append(name)
+        elif use_mu_path_group and name.startswith(mu_group_prefixes):
+            mu_params.append(param)
+            mu_names.append(name)
         else:
             # ``ode_func`` is biochemical reaction dynamics, not fluid physics;
             # keep it with the bio stack so rare clot gradients are not starved.
@@ -1731,9 +1769,15 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         raise RuntimeError("setup_biochem_optimization found no trainable biology parameters.")
 
     physics_lr = base_lr * float(os.environ.get("BIOCHEM_PHYSICS_LR_MULT", "0.3"))
+    mu_lr = base_lr * float(os.environ.get("BIOCHEM_MU_PATH_LR_MULT", "1.0"))
     bio_lr = base_lr * float(os.environ.get("BIOCHEM_BIO_LR_MULT", "1.0"))
     print(
+        f"   μ trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
+        f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)}"
+    )
+    print(
         f"   trainable groups: physics_lora={len(physics_params)} tensors (lr={physics_lr:.3e}), "
+        f"mu_path={len(mu_params)} tensors (lr={mu_lr:.3e}), "
         f"biology={len(bio_params)} tensors (lr={bio_lr:.3e}); "
         f"loss_weighter lr=5.000e-02"
     )
@@ -1743,13 +1787,20 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         if physics_params
         else None
     )
+    opt_mu = (
+        optim.AdamW(mu_params, lr=mu_lr, weight_decay=1e-5)
+        if mu_params
+        else None
+    )
     opt_bio = optim.AdamW(bio_params, lr=bio_lr, weight_decay=1e-5)
     opt_weighter = optim.AdamW(loss_weighter.parameters(), lr=5e-2, weight_decay=0.0)
     return SplitBiochemOptimizers(
         physics_optimizer=opt_physics,
+        mu_optimizer=opt_mu,
         bio_optimizer=opt_bio,
         weighter_optimizer=opt_weighter,
         physics_params=physics_params,
+        mu_params=mu_params,
         bio_params=bio_params,
     )
 
@@ -3851,6 +3902,8 @@ def train_teacher_on_anchors(
             teacher_optimizer.zero_grad()
             epoch_l_tot, epoch_l_bio = 0.0, 0.0
             epoch_l_kine, epoch_l_back = 0.0, 0.0
+            epoch_mu_si_w, epoch_mu_log_w = 0.0, 0.0
+            epoch_mu_batches = 0
             n_batches = 0
             for batch_idx, data in enumerate(teacher_loader):
                 data = data.to(device, non_blocking=nb_xfer)
@@ -3892,6 +3945,10 @@ def train_teacher_on_anchors(
                 epoch_l_bio += current_l_bio
                 epoch_l_kine += float(metrics.get("L_Data_Kine", 0.0))
                 epoch_l_back += float(metrics.get("L_Backprop", float(loss.detach().item())))
+                if metrics.get("Has_Anchor_Supervision", 0.0) > 0.5:
+                    epoch_mu_si_w += float(metrics.get("W_MuSI_aux_eff", 0.0)) * float(metrics.get("L_MuSI_aux", 0.0))
+                    epoch_mu_log_w += float(metrics.get("W_MuLog_aux_eff", 0.0)) * float(metrics.get("L_MuLog_aux", 0.0))
+                    epoch_mu_batches += 1
                 n_batches += 1
                 if ema_l_bio is None:
                     ema_l_bio = current_l_bio
@@ -3968,6 +4025,11 @@ def train_teacher_on_anchors(
                     extra_lines=[
                         f"   Train Ep {epoch:02d}: L_tot={avg_tot:.3e} L_kine={avg_kine:.3e} "
                         f"L_bio(avg)={avg_bio:.3e} L_bio(ema)={ema_bio_str} | Pceil={teacher_phys_ceiling:.2g}",
+                        (
+                            f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
+                            f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
+                            f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}"
+                        ),
                     ],
                 )
                 val_mu_score = -float(val_stats["mu_log_mae"])

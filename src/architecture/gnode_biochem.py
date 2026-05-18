@@ -38,6 +38,15 @@ def _biochem_gelation_prior_gate_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _biochem_delta_mu_head_enabled() -> bool:
+    """Enable residual viscosity correction head on top of analytic rheology.
+
+    Set ``BIOCHEM_USE_DELTA_MU_HEAD=1`` to apply a bounded multiplicative correction.
+    """
+    raw = (os.environ.get("BIOCHEM_USE_DELTA_MU_HEAD", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
     if not hasattr(batch, "is_anchor"):
@@ -244,6 +253,14 @@ class GNODE_Phase3(nn.Module):
             nn.Softplus(),
         )
         self._init_learned_clot_penalty_near_zero()
+        # Optional residual log-space correction for μ; kept near-zero by default.
+        self.mu_delta_head = nn.Sequential(
+            nn.Linear(latent_dim + 12, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+        self.mu_delta_log_clip = max(float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP", "1.5")), 1e-6)
+        self._init_mu_delta_head_near_zero()
 
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
 
@@ -354,6 +371,15 @@ class GNODE_Phase3(nn.Module):
             last_lin = self.learned_clot_penalty[2]
             if isinstance(last_lin, nn.Linear):
                 last_lin.bias.fill_(-6.0)
+
+    def _init_mu_delta_head_near_zero(self) -> None:
+        """Keep residual μ correction neutral at startup (factor ~= 1)."""
+        with torch.no_grad():
+            for m in self.mu_delta_head.modules():
+                if isinstance(m, nn.Linear):
+                    m.weight.uniform_(-1e-4, 1e-4)
+                    if m.bias is not None:
+                        m.bias.zero_()
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
@@ -582,6 +608,12 @@ class GNODE_Phase3(nn.Module):
                 gel_extra = gel_extra * p_gate
             total_multiplier = 1.0 + gel_extra
             current_mu_eff = mu_kin_baseline * total_multiplier
+            if _biochem_delta_mu_head_enabled():
+                delta_in = torch.cat([z_kin, sp_safe], dim=1)
+                delta_log_mu = self.mu_delta_head(delta_in)
+                delta_log_mu = torch.clamp(delta_log_mu, min=-self.mu_delta_log_clip, max=self.mu_delta_log_clip)
+                current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
+            current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
 
             # ==========================================
             # BIOCHEM ATTENTION MODULATOR (Streamwise + detached)
