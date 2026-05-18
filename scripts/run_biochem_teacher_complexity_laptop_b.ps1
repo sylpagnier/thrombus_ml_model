@@ -1,5 +1,5 @@
-# Laptop B — teacher complexity marathon (~3h): aux / physics isolates, TBPTT widen, temporal.
-# Order: isolate PhysTemp & ADR → MU_LOG with longer TBPTT → combine μ + temporal.
+# Laptop B - teacher complexity marathon (~3h): aux / physics isolates, TBPTT widen, temporal.
+# Order: isolate PhysTemp & ADR -> MU_LOG with longer TBPTT -> combine mu + temporal.
 #
 # Run on LAPTOP B only (LAPTOP A runs run_biochem_teacher_complexity_laptop_a.ps1 in parallel).
 #
@@ -33,13 +33,13 @@ $LegCatalog = @{
     I6 = "ADR_F isolate (fast ADR residual; 5 ep)"
     T1 = "MU_LOG + TBPTT=5 (5GB-safe temporal; 7 ep)"
     T2 = "MU_LOG + TBPTT=6, DETACH=1 (7 ep); use -OomSafe 0 for DETACH=0 on 8GB+"
-    T3 = "MU_LOG + TBPTT=8 (6 ep) — skip if over budget"
+    T3 = "MU_LOG + TBPTT=8 (6 ep) - skip if over budget"
     J3 = "MU_LOG isolate + DATA_ONLY_PHYS_TEMP (D3 coupling; 7 ep)"
     J4 = "Full step-2 + PhysTemp (7 ep)"
 }
 
 if ($ListLegs) {
-    Write-Host "Laptop B — teacher complexity (physics / temporal track):" -ForegroundColor Cyan
+    Write-Host "Laptop B - teacher complexity (physics / temporal track):" -ForegroundColor Cyan
     foreach ($k in ($LegCatalog.Keys | Sort-Object)) { Write-Host "  $k  $($LegCatalog[$k])" }
     Write-Host ""
     Write-Host "Default: I5,I6,T1,T2,J3 (~3h). Add T3 or J4 only if finishing early."
@@ -159,7 +159,7 @@ if (-not (Test-Path $SummaryDir)) { New-Item -ItemType Directory -Path $SummaryD
 
 Write-Host "Laptop B teacher complexity (~3h target) | legs=$($Legs -join ',') | OOM-safe=$OomSafe" -ForegroundColor Cyan
 if ($UseWarmStart) { Write-Host "Warm-start: $WarmStart" -ForegroundColor Yellow }
-else { Write-Host "No warm-start — first leg runs pretrain (may exceed 3h)." -ForegroundColor Red }
+else { Write-Host "No warm-start - first leg runs pretrain (may exceed 3h)." -ForegroundColor Red }
 
 "laptop B started $(Get-Date -Format o) legs=$($Legs -join ',') oom_safe=$OomSafe" |
     Set-Content -Path $SummaryPath -Encoding utf8

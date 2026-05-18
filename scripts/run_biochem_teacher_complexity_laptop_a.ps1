@@ -1,5 +1,5 @@
-# Laptop A — teacher complexity marathon (~3h): supervised / μ losses, then combine.
-# Order: isolate each anchor loss → joint step-2 (add terms one at a time).
+# Laptop A - teacher complexity marathon (~3h): supervised / mu losses, then combine.
+# Order: isolate each anchor loss -> joint step-2 (add terms one at a time).
 #
 # Run on LAPTOP A only (LAPTOP B runs run_biochem_teacher_complexity_laptop_b.ps1 in parallel).
 #
@@ -32,15 +32,15 @@ Set-Location $RepoRoot
 
 $LegCatalog = @{
     I1 = "MU_LOG isolate + mu-path (reference; 8 ep)"
-    I2 = "MU_SI isolate (5 ep) — expect weak val μ"
-    I3 = "DATA_BIO isolate (5 ep) — species only"
-    I4 = "DATA_KINE isolate (5 ep) — u,v,p,mu_nd"
-    J1 = "Joint: L_Data_Kine + W_MuLog·L_MuLog (no isolate; 7 ep)"
-    J2 = "Joint step-2: + W_MuSI·L_MuSI (7 ep)"
+    I2 = "MU_SI isolate (5 ep) - expect weak val mu"
+    I3 = "DATA_BIO isolate (5 ep) - species only"
+    I4 = "DATA_KINE isolate (5 ep) - u,v,p,mu_nd"
+    J1 = "Joint: L_Data_Kine + W_MuLog*L_MuLog (no isolate; 7 ep)"
+    J2 = "Joint step-2: + W_MuSI*L_MuSI (7 ep)"
 }
 
 if ($ListLegs) {
-    Write-Host "Laptop A — teacher complexity (supervision track):" -ForegroundColor Cyan
+    Write-Host "Laptop A - teacher complexity (supervision track):" -ForegroundColor Cyan
     foreach ($k in ($LegCatalog.Keys | Sort-Object)) { Write-Host "  $k  $($LegCatalog[$k])" }
     Write-Host ""
     Write-Host "Default order: $(($LegCatalog.Keys | Sort-Object) -join ', ')"
@@ -141,7 +141,7 @@ if (-not (Test-Path $SummaryDir)) { New-Item -ItemType Directory -Path $SummaryD
 
 Write-Host "Laptop A teacher complexity (~3h target) | legs=$($Legs -join ',') | OOM-safe=$OomSafe" -ForegroundColor Cyan
 if ($UseWarmStart) { Write-Host "Warm-start: $WarmStart" -ForegroundColor Yellow }
-else { Write-Host "No warm-start — leg I1 will run AE+ODE pretrain (longer than 3h)." -ForegroundColor Red }
+else { Write-Host "No warm-start - leg I1 will run AE+ODE pretrain (longer than 3h)." -ForegroundColor Red }
 
 "laptop A started $(Get-Date -Format o) legs=$($Legs -join ',') oom_safe=$OomSafe" |
     Set-Content -Path $SummaryPath -Encoding utf8

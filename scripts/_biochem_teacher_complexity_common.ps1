@@ -1,5 +1,5 @@
 # Shared helpers for teacher complexity marathon scripts (laptop A / B).
-# Dot-sourced by run_biochem_teacher_complexity_laptop_*.ps1 — do not run directly.
+# Dot-sourced by run_biochem_teacher_complexity_laptop_*.ps1 - do not run directly.
 
 function Clear-BiochemCudaCache {
     python -c "import gc; gc.collect(); import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None" 2>$null
