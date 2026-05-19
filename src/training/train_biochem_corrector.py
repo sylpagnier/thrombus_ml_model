@@ -37,6 +37,14 @@ knobs (e.g. raise ``BIOCHEM_TEACHER_EPOCHS``, ``BIOCHEM_AE_EPOCHS``, ``BIOCHEM_D
   Corona bundle + longer schedules + μ best-practice env. Same validation status as corona.
   See ``scripts/run_biochem_comprehensive_mu.ps1``.
 
+- **Teacher max-complexity (recommended for robust viscosity teacher runs)**:
+  ``BIOCHEM_PRESET=teacher_max_complexity`` (aliases ``max_complexity_teacher``,
+  ``teacher_step3_robust``). Forces **complexity step 3** (full multitask backward),
+  clears single-term isolate state, keeps ``BIOCHEM_STOP_AFTER_TEACHER=1``, and
+  enables μ-focused defaults (`MU_LOG` + `MU_SI` anchors, μ-path, high μ cap).
+  Use this when your goal is robust teacher-only viscosity fitting before re-enabling
+  the corrector.
+
 - **Complexity step 3** (full multitask / Kendall + PDE in ``backward``): set
   ``BIOCHEM_COMPLEXITY_STEP=3`` (aliases ``phase3``, ``full_multitask``, ``corrector_full``). Applies
   after the step-2 helper and forces ``BIOCHEM_LOSS_DATA_ONLY=0``; use when VRAM and adjoint are stable.
@@ -542,6 +550,62 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
     )
 
 
+_TEACHER_MAX_COMPLEXITY_PRESET_ALIASES = frozenset({
+    "teacher_max_complexity",
+    "max_complexity_teacher",
+    "teacher_step3_robust",
+})
+
+
+def _apply_biochem_preset_teacher_max_complexity_if_requested() -> None:
+    """Robust teacher-only preset: full multitask (step 3) + viscosity-focused μ supervision.
+
+    Intended for the teacher stage only (keeps ``BIOCHEM_STOP_AFTER_TEACHER=1``).
+    This preset is for "all important losses active" runs where viscosity fidelity is
+    the primary objective and single-loss isolate state must be cleared.
+    """
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _TEACHER_MAX_COMPLEXITY_PRESET_ALIASES:
+        return
+    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "3",
+        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_NO_TEACHER_DEFAULTS": "0",
+        "BIOCHEM_DATA_ONLY_PHYS_TEMP": "0",
+        "BIOCHEM_TEACHER_EPOCHS": "24",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "8",
+        "BIOCHEM_TBPTT_WINDOW_CURRICULUM": "1",
+        "BIOCHEM_DETACH_MACRO_STATE": "0",
+        "BIOCHEM_TEACHER_FORCE_MIN": "0.2",
+        "BIOCHEM_TEACHER_TF_WARMUP_EPOCHS": "6",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "2.0",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "2.0",
+        "BIOCHEM_MU_SI_MULTI_STEP": "1",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_GELATION_PRIOR_GATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "24",
+        "BIOCHEM_ABORT_BAD_TEACHER_INIT": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    # Avoid accidental single-term smoke settings leaking into full-complexity runs.
+    os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
+    _apply_biochem_mu_best_practice_env(only_if_missing=False)
+    print(
+        "✅ BIOCHEM_PRESET=teacher_max_complexity: teacher-only step-3 multitask + μ-focused supervision enabled.",
+        flush=True,
+    )
+
+
 _STEP2P5_PRESET_ALIASES = frozenset({"step2p5", "phys_temp_only", "compact_step2p5"})
 
 
@@ -716,6 +780,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_step2p5_phys_temp_if_requested()
     _apply_biochem_preset_thrombus_corona_if_requested()
     _apply_biochem_preset_comprehensive_mu_if_requested()
+    _apply_biochem_preset_teacher_max_complexity_if_requested()
     _apply_biochem_complexity_step3_env()
 
 

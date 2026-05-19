@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Marathon T2** (TBPTT=6, MU_LOG): best **0.40** ep6; **I1/I2/I4** ~0.44–0.49 ep3; A0 ep8 **0.44**; wall still **~1.8** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; wall still **~1.7–1.8** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -59,7 +59,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: **Interim pass on patient007** — marathon **T2** best **0.40** (MU_LOG, TBPTT=6); **A0**/**I1** ~0.44–0.49; wall/high-μ still weak; **J2** joint (+`W_MuSI`) blocked by flux-debug crash (fixed locally). Corrector not started.
+- **Step-2 teacher “done”**: **Interim pass on patient007** — overnight A best **0.3868** (MU_LOG, TBPTT=6, 18ep); marathon **T2** **0.40**; A0/I1/I2/I4 **~0.44–0.49**. Wall/high-μ still weak; **J2** joint (+`W_MuSI`) blocked by flux-debug crash (fixed locally). Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
@@ -243,6 +243,23 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Symptom**: All-truth logMAE can drop while **high-μ_gt** worsens (I1: **0.89→1.54**); wall **~1.75–2.0** across μ-winning legs.
 - **Interpretation**: Bulk scale improves; clot-tail and wall remain hard; positive high-μ **r** ≠ good spatial μ (**bulk r** often negative).
 - **Status**: Open.
+
+### 23. Overnight A vs B (step-2 teacher): `PhysTemp=1` does not beat baseline
+
+- **Setup**: Same teacher-only step-2 recipe (`STOP_AFTER_TEACHER=1`, TBPTT=6, `DETACH=1`, `W_MuLog=2`, 18 epochs, patient007 val), comparing A (`DATA_ONLY_PHYS_TEMP=0`) vs B (`DATA_ONLY_PHYS_TEMP=1`).
+- **Result**: A best **logMAE 0.3868** (ep17) vs B best **0.4081** (ep12); wall **1.718** vs **1.762**; high-μ **1.356** vs **1.415**. B is worse by ~0.02 all-truth on the main score.
+- **Interpretation**: In this teacher-only regime, adding temporal SI anchor loss does not improve held-out μ error and slightly degrades the key subsets.
+- **Fix**: Keep overnight default at step-2 (`DATA_ONLY_PHYS_TEMP=0`) for now; treat `step2p5`/PhysTemp as a later coupling probe after joint step-2 (corrector-on) is stable.
+- **Status**: Confirmed by cross-machine overnight pair (RTX 500 Ada vs Quadro P2200).
+
+### 24. Architecture sweep (A0-A4, B0-B4): `delta_mu_head` gate dominates width/latent tweaks
+
+- **Setup**: Teacher-only (`STOP_AFTER_TEACHER=1`), `LOSS_ISOLATE=MU_LOG`, `W_MuLog=2`, `W_MuSI=0`, TBPTT=6, `DETACH=1`, 8 epochs, patient007 val, stride=10, low-TF schedule.
+- **Result (both laptops)**: All `delta1` legs converge to a tight band (**~0.47-0.51** all-truth logMAE). Bests: A3 **0.4756** (RTX 500), B1 **0.4738** (P2200).  
+- **Failure mode**: Both `delta0` legs (A4/B4) stay near **~1.45** with almost no epoch-wise movement despite identical training setup otherwise.
+- **Interpretation**: In this recipe, the residual rheology correction path (`USE_DELTA_MU_HEAD`) is a first-order requirement; latent width/prior width are second-order for all-truth logMAE.
+- **Caveat**: Best all-truth legs can still have weak/negative `r` or high wall error; e.g., A3 wins logMAE while all-truth `r` is negative, so architecture ranking must include subset metrics.
+- **Status**: Lesson locked in; keep `delta1` as default in architecture probes and avoid investing in `delta0` variants.
 
 ---
 
@@ -474,6 +491,10 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-18 | Marathon **T1** `MU_LOG` TBPTT=5 | **0.47** ep3 | 1.88 | 0.36 | high 1.38 | |
 | 2026-05-18 | Marathon **T2** `MU_LOG` TBPTT=6 | **0.40** ep6 | 1.81 | 0.40 | high 1.46 | **Best marathon**; 7 ep |
 | 2026-05-18 | Marathon **J3** `MU_LOG`+phys_temp flag (B) | (in progress) | — | — | — | `LOSS_ISOLATE=MU_LOG` ⇒ PhysTemp not in backward |
+| 2026-05-19 | Overnight A teacher-only (`overnight_step2`, `PhysTemp=0`, TBPTT=6, `DETACH=1`, `W_MuLog=2`, 18ep) | **0.3868** (ep17) | **1.7183** | **0.335** | high **1.3558** | New best on patient007; 194 min |
+| 2026-05-19 | Overnight B teacher-only (`overnight_step2` + `DATA_ONLY_PHYS_TEMP=1`, TBPTT=6, `DETACH=1`, `W_MuLog=2`, 18ep) | **0.4081** (ep12) | **1.7618** | **0.414** | high **1.4153** | PhysTemp variant underperforms A on all/wall/high-μ; 235 min |
+| 2026-05-19 | Laptop A architecture sweep A0-A4 (`MU_LOG` isolate, TBPTT=6, 8ep, `delta1` except A4 `delta0`) | **A3 0.4756** (best); A1 0.4911; A0 0.5027; A2 0.5090; **A4 1.4548** | best wall **1.7086** (A3) | best all-r **0.383** (A2); A3 r **-0.105** | high best **1.0677** (A0) | `delta0` collapses (~1.45); compact `lat192` legs are much faster (~69m) than `lat256` (~92-95m) with similar all-truth logMAE |
+| 2026-05-19 | Laptop B architecture sweep B0-B4 (`MU_LOG` isolate, TBPTT=6, 8ep, wide and prior variants) | **B1 0.4738** (best); B0 0.4740; B3 0.4743; B2 0.4794; **B4 1.4453** | best wall **1.7476** (B2) | best all-r **0.340** (B0); B2/B4 near zero or negative | high best **1.0463** (B4, despite bad all) | Width/prior changes are minor vs `delta0/delta1` switch; wide legs cost more time (~143-145m) for tiny or no gain vs non-wide |
 
 ---
 
