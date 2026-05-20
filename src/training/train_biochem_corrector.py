@@ -37,6 +37,12 @@ knobs (e.g. raise ``BIOCHEM_TEACHER_EPOCHS``, ``BIOCHEM_AE_EPOCHS``, ``BIOCHEM_D
   Corona bundle + longer schedules + μ best-practice env. Same validation status as corona.
   See ``scripts/run_biochem_comprehensive_mu.ps1``.
 
+- **Teacher viscosity baseline (recommended new base for incremental loss studies)**:
+  ``BIOCHEM_PRESET=teacher_visc_baseline`` (aliases ``visc_teacher_baseline``,
+  ``teacher_mu_base``). Keeps teacher-only step-2 data-loss optimization while emphasizing
+  all-time SI log-μ fit (global + wall + high-μ_gt tail) and preserving flow/species via
+  ``L_Data_Kine`` + ``L_Data_Bio``.
+
 - **Teacher max-complexity (recommended for robust viscosity teacher runs)**:
   ``BIOCHEM_PRESET=teacher_max_complexity`` (aliases ``max_complexity_teacher``,
   ``teacher_step3_robust``). Forces **complexity step 3** (full multitask backward),
@@ -550,6 +556,66 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
     )
 
 
+_TEACHER_VISC_BASELINE_PRESET_ALIASES = frozenset({
+    "teacher_visc_baseline",
+    "visc_teacher_baseline",
+    "teacher_mu_base",
+})
+
+
+def _apply_biochem_preset_teacher_visc_baseline_if_requested() -> None:
+    """Teacher-only viscosity baseline for incremental loss ablations.
+
+    Goal: stable core objective for viscosity fidelity over time (global + wall + high-μ),
+    while retaining essential flow/species supervision via ``L_Data_Kine`` + ``L_Data_Bio``.
+    """
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _TEACHER_VISC_BASELINE_PRESET_ALIASES:
+        return
+    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_NO_TEACHER_DEFAULTS": "1",
+        "BIOCHEM_DATA_ONLY_PHYS_TEMP": "0",
+        "BIOCHEM_TEACHER_EPOCHS": "18",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "6",
+        "BIOCHEM_TBPTT_WINDOW_CURRICULUM": "0",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_TEACHER_FORCE_MIN": "0.0",
+        "BIOCHEM_TEACHER_TF_WARMUP_EPOCHS": "4",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "2.0",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "2.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.5",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.5",
+        "BIOCHEM_MU_SI_MULTI_STEP": "1",
+        "BIOCHEM_MU_ANCHOR_LATE_TIME_WEIGHT": "1",
+        "BIOCHEM_MU_LATE_TIME_POWER": "2.0",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_GELATION_PRIOR_GATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "12",
+        "BIOCHEM_DATALOADER_WORKERS": "0",
+        "BIOCHEM_ABORT_BAD_TEACHER_INIT": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
+    _apply_biochem_mu_best_practice_env(only_if_missing=False)
+    print(
+        "✅ BIOCHEM_PRESET=teacher_visc_baseline: teacher-only step-2 baseline "
+        "(Data_Kine/Data_Bio + μ log global/wall/high + μ SI) enabled.",
+        flush=True,
+    )
+
+
 _TEACHER_MAX_COMPLEXITY_PRESET_ALIASES = frozenset({
     "teacher_max_complexity",
     "max_complexity_teacher",
@@ -780,6 +846,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_step2p5_phys_temp_if_requested()
     _apply_biochem_preset_thrombus_corona_if_requested()
     _apply_biochem_preset_comprehensive_mu_if_requested()
+    _apply_biochem_preset_teacher_visc_baseline_if_requested()
     _apply_biochem_preset_teacher_max_complexity_if_requested()
     _apply_biochem_complexity_step3_env()
 
@@ -2463,6 +2530,66 @@ def _anchor_mu_si_and_log_losses(
     return l_mu_si, l_mu_log
 
 
+def _anchor_mu_subset_log_losses(
+    pred_series: torch.Tensor,
+    y_true: torch.Tensor,
+    truth_mask: torch.Tensor,
+    data,
+    cfg_mu,
+    mu_ch: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extra SI log-μ anchor losses on clinically important subsets.
+
+    Returns:
+    - ``l_mu_log_wall``: mean |log μ_pred − log μ_gt| on truth ∩ wall nodes
+    - ``l_mu_log_high``: mean |log μ_pred − log μ_gt| on high-μ_gt tail nodes (per-step quantile)
+    """
+    device = pred_series.device
+    dtype = pred_series.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    m_truth = truth_mask.view(-1).bool()
+    if (not m_truth.any()) or pred_series.shape[0] < 1 or y_true.shape[0] < 1:
+        return z, z
+
+    has_wall_mask = hasattr(data, "mask_wall") and data.mask_wall is not None
+    m_wall_base = (
+        data.mask_wall.view(-1).bool().to(device)
+        if has_wall_mask
+        else torch.zeros_like(m_truth, device=device)
+    )
+    try:
+        q_high = float(os.environ.get("BIOCHEM_MU_HIGH_QUANTILE", "0.9"))
+    except ValueError:
+        q_high = 0.9
+    q_high = min(max(q_high, 0.5), 0.999)
+
+    t_cap = min(int(pred_series.shape[0]), int(y_true.shape[0]))
+    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
+    wall_terms: List[torch.Tensor] = []
+    high_terms: List[torch.Tensor] = []
+
+    for t in range(t_cap):
+        mu_p = cfg_mu.viscosity_nd_to_si(pred_series[t, :, mu_ch])
+        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch])
+        dlog = (torch.log(mu_p.float().clamp(min=1e-8)) - torch.log(mu_g.float().clamp(min=1e-8))).abs()
+
+        if has_wall_mask:
+            m_wall = m_truth & m_wall_base
+            if m_wall.any():
+                wall_terms.append(dlog[m_wall].mean().to(dtype=dtype) * tw[t])
+
+        g_truth = mu_g[m_truth].float()
+        if g_truth.numel() >= 8:
+            high_thr = torch.quantile(g_truth, q_high)
+            m_high = m_truth & (mu_g >= high_thr)
+            if m_high.any():
+                high_terms.append(dlog[m_high].mean().to(dtype=dtype) * tw[t])
+
+    l_mu_log_wall = torch.stack(wall_terms).sum() if wall_terms else z
+    l_mu_log_high = torch.stack(high_terms).sum() if high_terms else z
+    return l_mu_log_wall, l_mu_log_high
+
+
 def _biochem_resolve_isolated_loss(
     key: str,
     *,
@@ -2489,6 +2616,10 @@ def _biochem_resolve_isolated_loss(
     w_mu_aux: float,
     l_mu_log_anchor: torch.Tensor,
     w_mu_log: float,
+    l_mu_log_wall: torch.Tensor,
+    w_mu_log_wall: float,
+    l_mu_log_high: torch.Tensor,
+    w_mu_log_high: float,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -2544,16 +2675,26 @@ def _biochem_resolve_isolated_loss(
         return (
             _biochem_scale_for_isolate(w_mu_aux) * l_mu_si_anchor
             + _biochem_scale_for_isolate(w_mu_log) * l_mu_log_anchor
+            + _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
+            + _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
         )
     if k == "MU_LOG":
-        return _biochem_scale_for_isolate(w_mu_log) * l_mu_log_anchor
+        return (
+            _biochem_scale_for_isolate(w_mu_log) * l_mu_log_anchor
+            + _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
+            + _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
+        )
+    if k == "MU_LOG_WALL":
+        return _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
+    if k == "MU_LOG_HIGH":
+        return _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
     if k in ("FI_GATE", "FI_GATE_START"):
         return _biochem_scale_for_isolate(w_fi_gate_start_eff) * l_fi_gate_start
     if k in ("RES_SPARSE", "RESIDUAL_SPARSE"):
         return _biochem_scale_for_isolate(lambda_residual_sparse) * l_residual_sparse
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
-        "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, FI_GATE, RES_SPARSE"
+        "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, FI_GATE, RES_SPARSE"
     )
     raise ValueError(f"Unknown BIOCHEM_LOSS_ISOLATE={key!r}; expected one of: {valid}")
 
@@ -2986,8 +3127,12 @@ def compute_biochem_loss(
     # matches validation ``mu_log_mae`` (mean |log μ_pred − log μ_gt| in SI on truth nodes).
     l_mu_si_anchor = torch.tensor(0.0, device=device)
     l_mu_log_anchor = torch.tensor(0.0, device=device)
+    l_mu_log_wall = torch.tensor(0.0, device=device)
+    l_mu_log_high = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
+    w_mu_log_wall = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
+    w_mu_log_high = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
     mu_aux_early_epochs = max(0, int(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_EPOCHS", "0")))
     mu_aux_early_mult = max(1.0, float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_MULT", "1.0")))
     if model.training and mu_aux_early_epochs > 0 and epoch < mu_aux_early_epochs:
@@ -2998,7 +3143,7 @@ def compute_biochem_loss(
         "yes",
         "on",
     )
-    if model.training and has_anchor_supervision and (w_mu_aux > 0.0 or w_mu_log > 0.0):
+    if model.training and has_anchor_supervision and (w_mu_aux > 0.0 or w_mu_log > 0.0 or w_mu_log_wall > 0.0 or w_mu_log_high > 0.0):
         cfg_mu = kernels.core.cfg
         ma = truth_mask
         if ma.any():
@@ -3013,10 +3158,23 @@ def compute_biochem_loss(
                 multi_step=_mu_si_multi_step,
                 include_log=(w_mu_log > 0.0),
             )
+            if w_mu_log_wall > 0.0 or w_mu_log_high > 0.0:
+                l_mu_log_wall, l_mu_log_high = _anchor_mu_subset_log_losses(
+                    pred_series_data_freq,
+                    target_series,
+                    ma,
+                    data,
+                    cfg_mu,
+                    mu_ch,
+                )
             if w_mu_aux <= 0.0:
                 l_mu_si_anchor = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
             if w_mu_log <= 0.0:
                 l_mu_log_anchor = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
+            if w_mu_log_wall <= 0.0:
+                l_mu_log_wall = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
+            if w_mu_log_high <= 0.0:
+                l_mu_log_high = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
 
     mu_dbg = _compute_mu_flow_debug_metrics(
         model=model,
@@ -3136,6 +3294,10 @@ def compute_biochem_loss(
             w_mu_aux=float(w_mu_aux),
             l_mu_log_anchor=l_mu_log_anchor,
             w_mu_log=float(w_mu_log),
+            l_mu_log_wall=l_mu_log_wall,
+            w_mu_log_wall=float(w_mu_log_wall),
+            l_mu_log_high=l_mu_log_high,
+            w_mu_log_high=float(w_mu_log_high),
             l_fi_gate_start=l_fi_gate_start,
             w_fi_gate_start_eff=float(w_fi_gate_start_eff),
             l_residual_sparse=l_residual_sparse,
@@ -3148,6 +3310,8 @@ def compute_biochem_loss(
                 + l_data_bio
                 + (w_mu_aux * l_mu_si_anchor)
                 + (w_mu_log * l_mu_log_anchor)
+                + (w_mu_log_wall * l_mu_log_wall)
+                + (w_mu_log_high * l_mu_log_high)
             )
             if model.training and data_only_phys_temp_wanted:
                 loss = loss + (w_pt * l_phys_temp)
@@ -3172,6 +3336,8 @@ def compute_biochem_loss(
             + (w_pt * l_phys_temp)
             + (w_mu_aux * l_mu_si_anchor)
             + (w_mu_log * l_mu_log_anchor)
+            + (w_mu_log_wall * l_mu_log_wall)
+            + (w_mu_log_high * l_mu_log_high)
             + (w_fi_gate_start_eff * l_fi_gate_start)
             + (lambda_residual_sparse * l_residual_sparse)
         )
@@ -3218,6 +3384,10 @@ def compute_biochem_loss(
         "W_MuSI_aux_eff": float(w_mu_aux),
         "L_MuLog_aux": l_mu_log_anchor.item(),
         "W_MuLog_aux_eff": float(w_mu_log),
+        "L_MuLog_wall": l_mu_log_wall.item(),
+        "W_MuLog_wall_eff": float(w_mu_log_wall),
+        "L_MuLog_high": l_mu_log_high.item(),
+        "W_MuLog_high_eff": float(w_mu_log_high),
         "DataOnlyPhysTempOn": float(data_only_phys_temp_wanted),
         "W_DataOnlyPhysTemp_eff": float(w_pt) if data_only_phys_temp_wanted else 0.0,
         "L_FIGateStart": l_fi_gate_start.item(),
@@ -4127,6 +4297,7 @@ def train_teacher_on_anchors(
             epoch_l_tot, epoch_l_bio = 0.0, 0.0
             epoch_l_kine, epoch_l_back = 0.0, 0.0
             epoch_mu_si_w, epoch_mu_log_w = 0.0, 0.0
+            epoch_mu_log_wall_w, epoch_mu_log_high_w = 0.0, 0.0
             epoch_mu_batches = 0
             epoch_dbg_mu1_sum = 0.0
             epoch_dbg_mu2_sum = 0.0
@@ -4181,6 +4352,8 @@ def train_teacher_on_anchors(
                 if metrics.get("Has_Anchor_Supervision", 0.0) > 0.5:
                     epoch_mu_si_w += float(metrics.get("W_MuSI_aux_eff", 0.0)) * float(metrics.get("L_MuSI_aux", 0.0))
                     epoch_mu_log_w += float(metrics.get("W_MuLog_aux_eff", 0.0)) * float(metrics.get("L_MuLog_aux", 0.0))
+                    epoch_mu_log_wall_w += float(metrics.get("W_MuLog_wall_eff", 0.0)) * float(metrics.get("L_MuLog_wall", 0.0))
+                    epoch_mu_log_high_w += float(metrics.get("W_MuLog_high_eff", 0.0)) * float(metrics.get("L_MuLog_high", 0.0))
                     epoch_mu_batches += 1
                 dbg_mu1 = float(metrics.get("DBG_mu1_mean", float("nan")))
                 dbg_mu2 = float(metrics.get("DBG_mu2_mean", float("nan")))
@@ -4292,7 +4465,9 @@ def train_teacher_on_anchors(
                         (
                             f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
                             f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
-                            f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}"
+                            f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}, "
+                            f"W·L_MuLogWall={epoch_mu_log_wall_w / max(1, epoch_mu_batches):.3e}, "
+                            f"W·L_MuLogHigh={epoch_mu_log_high_w / max(1, epoch_mu_batches):.3e}"
                         ),
                         (
                             f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
