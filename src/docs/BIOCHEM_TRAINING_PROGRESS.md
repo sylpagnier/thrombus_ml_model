@@ -288,6 +288,15 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Fix**: make preset truly override-safe for CLI knobs (or switch to `BIOCHEM_STOCK_DEFAULTS=1` in ablation script), then rerun A/B before interpreting subtle weight effects.
 - **Status**: Actionable but partially confounded evidence; next iteration should first remove override ambiguity.
 
+### 28. SAFEVAL dual runs (2026-05-20): stable execution, improved all-truth, wall still bottleneck
+
+- **Setup**: Both laptops rerun with explicit `BIOCHEM_STOCK_DEFAULTS=1`, `VAL_TIME_STRIDE=20`, `TEACHER_VAL_EVERY=4`, TBPTT=6, `DETACH=1`, warm-start, and early-stop thresholds (0.55 / 0.52).
+- **Run 1 (Quadro, wall-focused weights 2.6/1.0)**: best all-truth **0.5249** (ep8), wall **2.0795**, high-μ **0.9621**, `r` **0.402**.
+- **Run 2 (RTX500, global-stable weights 1.4/0.6)**: best all-truth **0.5055** (ep8), wall **1.9687**, high-μ **0.9978**, `r` **0.419**.
+- **Interpretation**: SAFEVAL fixed the validation hang and produced cleaner A/B behavior. Lower wall/high weights improved global μ and wall simultaneously (run 2 beats run 1 on all-truth and wall), but high-μ tail remains weak and wall is still far from target.
+- **Fix**: use run 2 as the base checkpoint line; next changes should target high-μ and wall without regressing all-truth (e.g., mild high-μ curriculum, then selective wall-local temporal/physics term).
+- **Status**: New best for this baseline family is **0.5055**; still below prior global best (~0.39-0.40).
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -526,6 +535,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-20 | Viscosity baseline preset (`teacher_visc_baseline`, teacher-only step-2, warm-start, TBPTT=6, `DETACH=1`, `W_MuSI=2`, `W_MuLog=2`, `W_MuLogWall=2.5`, `W_MuLogHigh=1.5`) | **0.5418** (best, ep6) | **2.0983** | **0.401** (best epoch) | high **0.5961** (best late, ep17) | Fast early gain then degradation (ep16-17 all-truth **0.90/0.85**); wall remains weak; useful ablation baseline but below current best (~0.39-0.40) |
 | 2026-05-20 | Dual-run A (Quadro): baseline script with aggressive wall/high CLI (`MuLogWall=2.8`, `MuLogHigh=1.6`, target `DETACH=0`, TBPTT=5) | **0.5196** (best, ep14) | **2.0581** | **0.405** | high **0.9014** | Better all-truth than run B; logs still show runtime `DETACH_MACRO=1` and `W_MuSI=8.0` (preset override), so this is partially confounded |
 | 2026-05-20 | Dual-run B (RTX500): baseline script with milder wall/high CLI (`MuLogWall=1.8`, `MuLogHigh=0.8`, early-stop 0.55) | **0.5398** (best, ep12) | **1.9456** | **0.446** | high **0.9426** | Better wall + `r`, slightly worse all-truth; early stop prevented late drift; same preset-override confound (`W_MuSI=8.0`, `DETACH=1`) |
+| 2026-05-20 | SAFEVAL run 1 (Quadro): explicit stock env, wall-focused (`MuLogWall=2.6`, `MuLogHigh=1.0`), `VAL_STRIDE=20`, `VAL_EVERY=4`, early-stop 0.55 | **0.5249** (best, ep8) | **2.0795** | **0.402** | high **0.9621** | Stable completion (no val hang), but weaker than run 2 on all-truth and wall |
+| 2026-05-20 | SAFEVAL run 2 (RTX500): explicit stock env, global-stable (`MuLogWall=1.4`, `MuLogHigh=0.6`), `VAL_STRIDE=20`, `VAL_EVERY=4`, early-stop 0.52 | **0.5055** (best, ep8) | **1.9687** | **0.419** | high **0.9978** | Best in this baseline family so far; improves all-truth and wall vs run 1, but high-μ tail still lags |
 
 ---
 
