@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; new viscosity-baseline reached **0.5418** ep6 then degraded; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) but can degrade late; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -305,6 +305,22 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Interpretation**: Increasing wall weight while reducing high-μ weight (`Wall/High = 2.2/0.6`) did not improve wall on patient007; it degraded all-truth and correlation vs `1.4/1.2`.
 - **Status**: Keep Run 1 weighting as the safer baseline for this family; treat Run 2 as a negative ablation unless late epochs reverse trend.
 
+### 30. V4 `global_plus` first attempt (2026-05-20): 4GB OOM with wide latent
+
+- **Setup**: `run_biochem_teacher_visc_v4.ps1 -Profile global_plus` on RTX 500 4GB; latent **320**, prior=2, TBPTT=6, RK4=8, warm-start on.
+- **Symptom**: OOM before first val/epoch (`torch.OutOfMemoryError` in ODE adjoint + GAT softmax path) after startup.
+- **Additional signal**: warm-start reported many shape mismatches/skips due width change (`latent 256 -> 320`), increasing instability/risk for this hardware budget.
+- **Fix**: Make V4 script **4GB-safe by default** (`latent=256`, TBPTT=5, RK4=6, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) and keep `-WideArch` as opt-in for larger VRAM.
+- **Status**: Script updated; rerun `global_plus` and `high_mu_only` in safe mode first.
+
+### 31. V4 safe reruns (`global_plus` + `high_mu_only`): early optimum + late collapse, tail isolate confirms tradeoff (2026-05-20)
+
+- **`global_plus` (RTX500, latent256/prior2, TBPTT=5/RK4=6)**: best all-truth **0.5030** (ep8), wall **1.9661**, high-μ **0.9495**, `r` **0.432**; then severe late drift (**0.7782** ep16, **1.3298** ep20, **0.9836** ep23) while train-side `final_anchor_logMAE` stayed ~0.50.
+- **Signal**: this profile can hit the target band quickly but lacks stability; once teacher forcing decays and long-horizon rollout dominates, held-out all/bulk degrade sharply.
+- **`high_mu_only` (P2200, latent320/prior4, isolate `MU_LOG_HIGH`)**: strong high-tail gain (**0.9434 -> 0.5822** by ep4, ~0.5838 ep8), but all-truth remains poor (~**1.00**) and wall stays high (~**2.02-2.09**).
+- **Interpretation**: pure high-tail isolate is useful as a diagnostic for clot-region capacity, but not as a final teacher objective; it needs a bridge back to global/wall terms to avoid sacrificing full-field fidelity.
+- **Fix**: move to long-run low-LR profiles: (1) stable global objective with TF floor + reduced μ-path LR, and (2) tail-emphasis **without isolate** on wider arch for 5GB+ cards.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -547,6 +563,9 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-20 | SAFEVAL run 2 (RTX500): explicit stock env, global-stable (`MuLogWall=1.4`, `MuLogHigh=0.6`), `VAL_STRIDE=20`, `VAL_EVERY=4`, early-stop 0.52 | **0.5055** (best, ep8) | **1.9687** | **0.419** | high **0.9978** | Best in this baseline family so far; improves all-truth and wall vs run 1, but high-μ tail still lags |
 | 2026-05-20 | VISC_V3 `TAIL_RECOVERY` (RTX500): explicit stock env, teacher-only, `MuLogWall=1.4`, `MuLogHigh=1.2`, TBPTT=6, `DETACH=1`, early-stop target 0.52 | **0.5153** (best, ep12) | **1.9728** | **0.443** | high **0.9655** | Hit early-stop threshold; stronger than paired wall-push on all/wall/r, still above global best |
 | 2026-05-20 | VISC_V3 `WALL_PUSH` (P2200, in progress): explicit stock env, teacher-only, `MuLogWall=2.2`, `MuLogHigh=0.6`, TBPTT=6, `DETACH=1`, target 0.52 | **0.5289** (best so far, ep8) | **2.0814** | **0.402** | high **0.9874** | Did not hit target yet; val drift after ep8 (0.5360 ep12, 0.5395 ep16), wall remains worse than Run 1 |
+| 2026-05-20 | V4 `global_plus` first try (RTX500 4GB): latent320/prior2, TBPTT=6, RK4=8, early-stop 0.50 | n/a (failed pre-epoch) | n/a | n/a | n/a | **OOM** in ODE adjoint/GAT path before ep0 val; prompted switch to 4GB-safe defaults in script |
+| 2026-05-20 | V4 `global_plus` safe rerun (RTX500 4GB): latent256/prior2, TBPTT=5, RK4=6, `W(MuLog/MuSI/Wall/High)=2.0/2.0/1.6/1.4`, target 0.50 | **0.5030** (best, ep8) | **1.9661** | **0.432** | high **0.9495** | Early strong checkpoint then unstable late drift (ep16 0.7782, ep20 1.3298); indicates optimizer/AR stability issue rather than capacity floor |
+| 2026-05-20 | V4 `high_mu_only` (P2200, in progress to ep12): latent320/prior4, isolate `MU_LOG_HIGH`, `W_high=3.0` | **0.9962** (best so far, ep4) | **2.0248** | **0.373** | high **0.5822** | Confirms high-tail can be learned in isolation, but all/wall stay poor; use as curriculum signal, not standalone objective |
 
 ---
 
