@@ -592,8 +592,10 @@ def _apply_biochem_preset_teacher_visc_baseline_if_requested() -> None:
         "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "2.0",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "2.0",
-        "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.5",
-        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.5",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS": "6",
+        "BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS": "8",
         "BIOCHEM_MU_SI_MULTI_STEP": "1",
         "BIOCHEM_MU_ANCHOR_LATE_TIME_WEIGHT": "1",
         "BIOCHEM_MU_LATE_TIME_POWER": "2.0",
@@ -2477,6 +2479,16 @@ def _biochem_scale_for_isolate(w: float) -> float:
     return float(w) if float(w) > 0.0 else 1.0
 
 
+def _biochem_linear_ramp_weight(base_w: float, epoch: int, ramp_epochs: int) -> float:
+    """Linearly ramp a loss weight from 0 -> base_w over ``ramp_epochs`` epochs."""
+    w = max(float(base_w), 0.0)
+    r = max(int(ramp_epochs), 0)
+    if w <= 0.0 or r <= 0:
+        return w
+    progress = min(max((float(epoch) + 1.0) / float(r), 0.0), 1.0)
+    return w * progress
+
+
 def _anchor_mu_si_and_log_losses(
     pred_series: torch.Tensor,
     y_true: torch.Tensor,
@@ -3131,8 +3143,20 @@ def compute_biochem_loss(
     l_mu_log_high = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
-    w_mu_log_wall = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
-    w_mu_log_high = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
+    w_mu_log_wall_base = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
+    w_mu_log_high_base = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
+    wall_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS", "0")))
+    high_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS", "0")))
+    w_mu_log_wall = (
+        _biochem_linear_ramp_weight(w_mu_log_wall_base, epoch, wall_ramp_epochs)
+        if model.training
+        else w_mu_log_wall_base
+    )
+    w_mu_log_high = (
+        _biochem_linear_ramp_weight(w_mu_log_high_base, epoch, high_ramp_epochs)
+        if model.training
+        else w_mu_log_high_base
+    )
     mu_aux_early_epochs = max(0, int(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_EPOCHS", "0")))
     mu_aux_early_mult = max(1.0, float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_MULT", "1.0")))
     if model.training and mu_aux_early_epochs > 0 and epoch < mu_aux_early_epochs:

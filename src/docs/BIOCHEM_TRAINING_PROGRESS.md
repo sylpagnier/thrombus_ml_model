@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; step-3 teacher max-complexity run stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; new viscosity-baseline reached **0.5418** ep6 then degraded; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -269,6 +269,14 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Interpretation**: Turning on full step-3 teacher loss too early destabilizes optimization on this stack; PDE/multitask gradients dominate and trip safety caps before μ path can improve patient007.
 - **Fix**: Keep mainline training at step-2 teacher (`MU_LOG`/joint step-2), and only retry step-3 after reducing teacher LR / rebalancing caps and verifying non-skipped updates. Also fix preset-vs-CLI epoch precedence so `-TeacherEpochs` is honored.
 - **Status**: Confirms step-3 remains blocked for current teacher-only viscosity target.
+
+### 26. Viscosity-baseline preset (`teacher_visc_baseline`): strong early gain, then late drift (2026-05-20)
+
+- **Setup**: Teacher-only step-2 baseline with warm-start, Quadro P2200, `DETACH=1`, TBPTT=6, `W_MuSI=2`, `W_MuLog=2`, plus subset log losses (`W_MuLogWall=2.5`, `W_MuLogHigh=1.5`), 18 epochs.
+- **Result**: Rapid μ improvement by ep6: all-truth **1.4044 -> 0.5418** (best), wall **2.3677 -> 2.0983**, high-μ **0.7994 -> 0.9935** (worse than ep0). Late epochs drifted: all worsened to **0.8451** by ep17, while high-μ improved to **0.5961** and `r` rose to **~0.47**.
+- **Interpretation**: Baseline objective can quickly improve global μ scale but is not yet stable; wall remains the dominant blocker (~2.06-2.14), and late training shifts capacity toward tail/correlation at the expense of all-truth error.
+- **Fix**: Keep this as the new incremental base, but add checkpoint selection/early-stop on all-truth μ around ep4-8, then ablate added terms one at a time (wall/high weights, temporal term, then selective physics).
+- **Status**: Useful base model for incremental ablations; not a replacement for current best (~0.39-0.40) yet.
 
 ---
 
@@ -505,6 +513,7 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-19 | Laptop A architecture sweep A0-A4 (`MU_LOG` isolate, TBPTT=6, 8ep, `delta1` except A4 `delta0`) | **A3 0.4756** (best); A1 0.4911; A0 0.5027; A2 0.5090; **A4 1.4548** | best wall **1.7086** (A3) | best all-r **0.383** (A2); A3 r **-0.105** | high best **1.0677** (A0) | `delta0` collapses (~1.45); compact `lat192` legs are much faster (~69m) than `lat256` (~92-95m) with similar all-truth logMAE |
 | 2026-05-19 | Laptop B architecture sweep B0-B4 (`MU_LOG` isolate, TBPTT=6, 8ep, wide and prior variants) | **B1 0.4738** (best); B0 0.4740; B3 0.4743; B2 0.4794; **B4 1.4453** | best wall **1.7476** (B2) | best all-r **0.340** (B0); B2/B4 near zero or negative | high best **1.0463** (B4, despite bad all) | Width/prior changes are minor vs `delta0/delta1` switch; wide legs cost more time (~143-145m) for tiny or no gain vs non-wide |
 | 2026-05-20 | Teacher max-complexity preset (`teacher_max_complexity`, step-3 multitask, teacher-only, Quadro P2200; TBPTT=8, `DETACH=0`, `W_MuSI=8`, `W_MuLog=2`) | **1.5116** (best, ep6) | **2.4279** | **0.395** | high **0.9148** | Failed run for μ learning: pervasive bio-grad cap skips every epoch (L2 >> 5000), val μ flat; preset also overrode CLI `-TeacherEpochs 30` to 24 |
+| 2026-05-20 | Viscosity baseline preset (`teacher_visc_baseline`, teacher-only step-2, warm-start, TBPTT=6, `DETACH=1`, `W_MuSI=2`, `W_MuLog=2`, `W_MuLogWall=2.5`, `W_MuLogHigh=1.5`) | **0.5418** (best, ep6) | **2.0983** | **0.401** (best epoch) | high **0.5961** (best late, ep17) | Fast early gain then degradation (ep16-17 all-truth **0.90/0.85**); wall remains weak; useful ablation baseline but below current best (~0.39-0.40) |
 
 ---
 
