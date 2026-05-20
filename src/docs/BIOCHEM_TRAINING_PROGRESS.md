@@ -278,6 +278,16 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Fix**: Keep this as the new incremental base, but add checkpoint selection/early-stop on all-truth μ around ep4-8, then ablate added terms one at a time (wall/high weights, temporal term, then selective physics).
 - **Status**: Useful base model for incremental ablations; not a replacement for current best (~0.39-0.40) yet.
 
+### 27. Dual baseline runs (2026-05-20): wall-vs-all tradeoff + preset override confound
+
+- **Setup**: Two runs of `run_biochem_teacher_visc_baseline.ps1` on different GPUs (Quadro P2200 vs RTX 500 Ada) with different CLI knobs (A: more aggressive wall/high + `DETACH=0`, B: milder wall/high + early stop target 0.55).
+- **Result A (Quadro)**: best all-truth **0.5196** (ep14), wall **2.0581**, high-μ **0.9014**, `r` **0.405**.
+- **Result B (RTX500)**: best all-truth **0.5398** (ep12), wall **1.9456**, high-μ **0.9426**, `r` **0.446**; early-stop fired at target.
+- **Interpretation**: A is better on global all-truth μ; B is better on wall and correlation. Both remain far from wall target and both underperform prior best all-truth (~0.39-0.40). This confirms a persistent wall-vs-all tradeoff.
+- **Critical confound**: runtime logs show `W_MuSI=8.0` and `DETACH_MACRO=1` despite CLI attempts to set lower `W_MuSI` / `DETACH=0`; preset defaults are overriding some script knobs, so these A/B runs are not clean ablations yet.
+- **Fix**: make preset truly override-safe for CLI knobs (or switch to `BIOCHEM_STOCK_DEFAULTS=1` in ablation script), then rerun A/B before interpreting subtle weight effects.
+- **Status**: Actionable but partially confounded evidence; next iteration should first remove override ambiguity.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -514,6 +524,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-19 | Laptop B architecture sweep B0-B4 (`MU_LOG` isolate, TBPTT=6, 8ep, wide and prior variants) | **B1 0.4738** (best); B0 0.4740; B3 0.4743; B2 0.4794; **B4 1.4453** | best wall **1.7476** (B2) | best all-r **0.340** (B0); B2/B4 near zero or negative | high best **1.0463** (B4, despite bad all) | Width/prior changes are minor vs `delta0/delta1` switch; wide legs cost more time (~143-145m) for tiny or no gain vs non-wide |
 | 2026-05-20 | Teacher max-complexity preset (`teacher_max_complexity`, step-3 multitask, teacher-only, Quadro P2200; TBPTT=8, `DETACH=0`, `W_MuSI=8`, `W_MuLog=2`) | **1.5116** (best, ep6) | **2.4279** | **0.395** | high **0.9148** | Failed run for μ learning: pervasive bio-grad cap skips every epoch (L2 >> 5000), val μ flat; preset also overrode CLI `-TeacherEpochs 30` to 24 |
 | 2026-05-20 | Viscosity baseline preset (`teacher_visc_baseline`, teacher-only step-2, warm-start, TBPTT=6, `DETACH=1`, `W_MuSI=2`, `W_MuLog=2`, `W_MuLogWall=2.5`, `W_MuLogHigh=1.5`) | **0.5418** (best, ep6) | **2.0983** | **0.401** (best epoch) | high **0.5961** (best late, ep17) | Fast early gain then degradation (ep16-17 all-truth **0.90/0.85**); wall remains weak; useful ablation baseline but below current best (~0.39-0.40) |
+| 2026-05-20 | Dual-run A (Quadro): baseline script with aggressive wall/high CLI (`MuLogWall=2.8`, `MuLogHigh=1.6`, target `DETACH=0`, TBPTT=5) | **0.5196** (best, ep14) | **2.0581** | **0.405** | high **0.9014** | Better all-truth than run B; logs still show runtime `DETACH_MACRO=1` and `W_MuSI=8.0` (preset override), so this is partially confounded |
+| 2026-05-20 | Dual-run B (RTX500): baseline script with milder wall/high CLI (`MuLogWall=1.8`, `MuLogHigh=0.8`, early-stop 0.55) | **0.5398** (best, ep12) | **1.9456** | **0.446** | high **0.9426** | Better wall + `r`, slightly worse all-truth; early stop prevented late drift; same preset-override confound (`W_MuSI=8.0`, `DETACH=1`) |
 
 ---
 
