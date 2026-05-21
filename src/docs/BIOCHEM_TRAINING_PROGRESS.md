@@ -347,6 +347,39 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Lesson**: stage the objective and regularizers. Early tail-probe should be lighter-constrained (smaller floors, boundary-aware signal), then add stronger global recovery in Stage B.
 - **Action**: add V7 staged profiles: `carreau_tail_stageA_diag_4g` (tail bug-check) and `carreau_tail_stageAB_5g` (A->B curriculum) with separate bulk/tail/gate LR multipliers.
 
+### 35. V7 staged split-head runs show major recovery vs V6, but still far from prior best global score (2026-05-21)
+
+- **Run 1 (`carreau_tail_stageA_diag_4g`, RTX500)**: clear improvement from V6 failure mode. Best so far reached by ep21: all-truth **~0.8922**, high-μ **~0.5016**, `r` **~0.288** (high-μ `r` ~0.56), while wall stays unconstrained/high (~**2.48**) by design.
+- **Run 1 trajectory**: initially poor (~1.54) then drops sharply (ep18/21), confirming tail pathway is trainable with lighter floors + stronger tail LR. This satisfies the “bug-check” intent but does not recover global fidelity.
+- **Run 2 (`carreau_tail_stageAB_5g`, P2200, early)**: much better than prior 5G split run already by ep6: all-truth **~0.8694**, high-μ **~0.4761**, high-μ `r` **~0.71**, wall ~**2.24** (unconstrained).
+- **Interpretation**: staged training fixed the early optimization trap from V6 on both machines (especially 5G), and high-tail metrics now move strongly. Remaining gap is global/bulk quality vs historical teacher best (~0.39-0.41) and wall (expected with wall loss disabled).
+- **Status**: promising direction for tail-focused science; not yet a production teacher for overall viscosity fidelity.
+
+### 36. V8 `carreau_tail_stageAB_wall_4g` repeated twice: deterministic replay, no new global/wall gain (2026-05-21)
+
+- **Setup**: `run_biochem_teacher_visc_v4.ps1 -Profile carreau_tail_stageAB_wall_4g`, teacher-only (`STOP_AFTER_TEACHER=1`), RTX500 4GB, 48 epochs, split-head+gate, Pareto checkpointing on, Stage-B wall reintroduced at epoch 18.
+- **Result (both runs)**: metric traces are effectively identical run-to-run; final saved teacher checkpoint remains epoch 21 with all-truth **0.7471**, wall **3.2250**, high-μ **0.4778**, `r` **0.376**.
+- **Observed tradeoff**: all-truth reaches local minima later (e.g., **0.5694** at ep36) but with weaker high-μ (**0.6805**) and no wall recovery; Pareto rule preserves the earlier all/high compromise.
+- **Interpretation**: this profile is reproducible, but still off target for clot-usable global fidelity: high-tail can be good while wall stays catastrophically high (~**3.22**) and all-truth remains worse than prior teacher best (~**0.39-0.40**).
+- **Status**: no gate change; keep as reproducibility evidence and revisit Stage-B weighting/checkpoint policy before further long runs.
+
+### 37. V7 `carreau_tail_stageAB_5g` mid/late continuation: strong recovery vs V6, but still a tail-first compromise (2026-05-21)
+
+- **Setup**: continuation of `carreau_tail_stageAB_5g` on P2200 through ep35 (teacher-only, split-head staged A→B, wall objective disabled by profile design, Pareto checkpointing on).
+- **Result**: best all-truth improved from early **0.8694** (ep6) to **0.7121** (ep30); wall reached **~2.083** (ep27); high-μ best **0.4447** (ep15); all-truth `r` peaked around **0.471** (ep21).
+- **Trajectory**: optimization is non-monotonic (e.g., regressions around ep15/24), but recovers repeatedly and stays far better than V6 split-head basins (~1.48+).
+- **Interpretation**: staged split-head training is now clearly viable on 5GB for tail-sensitive behavior, yet still underperforms the existing global best (~0.39-0.40 all-truth) and does not solve wall error.
+- **Status**: no gate flip; keep this branch as a promising tail-focused track, not the primary production teacher objective.
+
+### 38. Architecture update: wall-aware residual μ branch added for split-head runs (2026-05-21)
+
+- **Change**: added optional `BIOCHEM_USE_WALL_DELTA_HEAD=1` path in `GNODE_Phase3` with near-wall gating:
+  `Δlogμ_total = (1-g)Δbulk + gΔtail + gain * g_wall * Δwall`.
+- **Why**: current split-head runs can improve high-μ tail while leaving wall μ severely underfit; a dedicated wall branch gives separate capacity for near-wall correction.
+- **Control knobs**: `BIOCHEM_MU_WALL_GATE_TEMP`, `BIOCHEM_MU_WALL_GATE_CENTER`, `BIOCHEM_MU_WALL_DELTA_GAIN`, and optimizer `BIOCHEM_MU_WALL_LR_MULT`.
+- **Runner support**: new profiles `walltail_arch_v1_4g` and `walltail_arch_v1_5g` added to `run_biochem_teacher_visc_v4.ps1`.
+- **Status**: ready for A/B runs on both laptops; no gate change until validation metrics arrive.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -596,6 +629,11 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-21 | V4 `tail_bridge_long` (P2200 5GB): 64ep, latent320/prior4, TBPTT=6, RK4=8, LR 8e-4, μ-path LR mult 0.50, `W(MuLog/MuSI/Wall/High)=1.2/0.8/1.6/2.8` | **0.5184** (best, ep9) | **2.0761** | **0.434** | high **0.9290** | Tail emphasis improved late high-μ (to ~0.42) and high-tail r (~0.74) but did not improve all-truth or wall on patient007 |
 | 2026-05-21 | V6 `carreau_tail_split_4g` (RTX500 4GB): split-head+gate, wall=0, Pareto on, trigger floors 0.8/0.4 | **~1.5194** (best so far, ep3) | **~3.22** | **0.374** | high **0.8971** (ep15) | Mild tail-only gain with severe global failure; demonstrates early split-head config is over-constrained and wall-unbounded |
 | 2026-05-21 | V6 `carreau_tail_split_5g` (P2200 5GB, in progress): split-head+gate, wall=0, Pareto on, trigger floors 0.8/0.4 | **~1.4784** (best so far, ep0) | **~2.51** | **-0.135** | high **~1.266** (ep3) | Poor initial basin (negative high/all correlation) with little movement; needs staged/lighter-constraint curriculum |
+| 2026-05-21 | V7 `carreau_tail_stageA_diag_4g` (RTX500 4GB, in progress): split-head, wall=0, lighter floors, stronger tail/gate LR, boundary loss on | **~0.8922** (best so far, ep21) | **~2.48** | **~0.288** | high **~0.5016** | Large recovery vs V6; validates tail pathway movement and loss signal, but global still far from best teacher band |
+| 2026-05-21 | V7 `carreau_tail_stageAB_5g` (P2200 5GB, early): split-head with staged A->B schedule, wall=0, boundary loss on | **~0.8694** (best so far, ep6) | **~2.24** | **~0.421** | high **~0.4761** | Early trajectory is strongly improved vs V6 and better than 4G run at same phase; continue to Stage B to test global recovery |
+| 2026-05-21 | V8 `carreau_tail_stageAB_wall_4g` repeated x2 (RTX500 4GB): split-head staged run with Stage-B wall reintroduced, Pareto checkpoint on, 48ep | **0.7471** (saved best, ep21) | **3.2250** | **0.376** | high **0.4778** | Two runs reproduced nearly identical curves; later all-truth minima (e.g. 0.5694 ep36) sacrificed high-μ and still did not fix wall; no improvement vs prior global best |
+| 2026-05-21 | V8 `carreau_tail_stageAB_wall_4g` replay (RUN 1, RTX500 4GB): same profile/seed path as prior V8, 48ep | **0.7471** (ep21 checkpoint) | **3.2250** | **0.376** | high **0.4778** | Confirms deterministic replay of prior V8 curve/checkpoint selection; no new gain on all/wall |
+| 2026-05-21 | V7 `carreau_tail_stageAB_5g` continuation (RUN 2, P2200 5GB to ep35): staged split-head A→B, wall=0, Pareto on | **0.7121** (ep30) | **2.0834** | **0.445** (best all-r ~0.471 ep21) | high **0.4447** (ep15) | Significant improvement vs early V7 and V6 basins; still tail-first compromise and below global best (~0.39-0.40) |
 
 ---
 

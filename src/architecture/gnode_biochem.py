@@ -53,6 +53,12 @@ def _biochem_split_mu_regime_head_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _biochem_wall_delta_head_enabled() -> bool:
+    """Enable an extra near-wall residual log-μ correction branch."""
+    raw = (os.environ.get("BIOCHEM_USE_WALL_DELTA_HEAD", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
     if not hasattr(batch, "is_anchor"):
@@ -283,8 +289,18 @@ class GNODE_Phase3(nn.Module):
             nn.SiLU(),
             nn.Linear(32, 1),
         )
+        # Optional near-wall residual branch.
+        # Uses kinematics + species + wall cues to correct underfit wall viscosity.
+        self.mu_delta_wall_head = nn.Sequential(
+            nn.Linear(latent_dim + 16, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+        )
         self.mu_trigger_gate_temp = max(float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP", "0.20")), 1e-5)
         self.mu_delta_log_clip = max(float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP", "1.5")), 1e-6)
+        self.mu_wall_gate_temp = max(float(os.environ.get("BIOCHEM_MU_WALL_GATE_TEMP", "0.18")), 1e-5)
+        self.mu_wall_gate_center = float(os.environ.get("BIOCHEM_MU_WALL_GATE_CENTER", "0.55"))
+        self.mu_wall_delta_gain = float(os.environ.get("BIOCHEM_MU_WALL_DELTA_GAIN", "0.65"))
         self._init_mu_delta_head_near_zero()
 
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
@@ -404,6 +420,7 @@ class GNODE_Phase3(nn.Module):
                 self.mu_delta_head,
                 self.mu_delta_bulk_head,
                 self.mu_delta_tail_head,
+                self.mu_delta_wall_head,
             ):
                 for m in head.modules():
                     if isinstance(m, nn.Linear):
@@ -519,6 +536,8 @@ class GNODE_Phase3(nn.Module):
         self._last_mu_trigger_gate = None
         self._last_mu_delta_bulk = None
         self._last_mu_delta_tail = None
+        self._last_mu_wall_gate = None
+        self._last_mu_delta_wall = None
 
         truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
         species_prior = _default_resting_species(num_nodes, device, batch)
@@ -668,6 +687,15 @@ class GNODE_Phase3(nn.Module):
                     delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
                     delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
                     delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+                    if _biochem_wall_delta_head_enabled():
+                        wall_logits = (wall_prox - self.mu_wall_gate_center) / max(
+                            self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
+                        )
+                        wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
+                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, trigger_feats], dim=1))
+                        delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
+                        self._last_mu_wall_gate = wall_gate
+                        self._last_mu_delta_wall = delta_wall
                     # Expose lightweight diagnostics for training loss/metrics.
                     self._last_mu_trigger_gate = gate
                     self._last_mu_delta_bulk = delta_bulk

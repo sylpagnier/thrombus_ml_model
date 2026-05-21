@@ -9,6 +9,9 @@
 #   carreau_tail_split_5g - new physics split-head run for 5GB.
 #   carreau_tail_stageA_diag_4g - stage-A diagnostic (tail learning behavior).
 #   carreau_tail_stageAB_5g - two-stage tail->global recovery (5GB).
+#   carreau_tail_stageAB_wall_4g - 4GB follow-up: reintroduce wall in Stage B.
+#   walltail_arch_v1_4g - new wall-aware split architecture (4GB).
+#   walltail_arch_v1_5g - new wall-aware split architecture (5GB).
 #
 # Usage:
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -Profile global_plus
@@ -16,7 +19,7 @@
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -ListProfiles
 #
 param(
-    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g")]
+    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g", "carreau_tail_stageAB_wall_4g", "walltail_arch_v1_4g", "walltail_arch_v1_5g")]
     [string] $Profile = "global_plus",
     [switch] $ListProfiles,
     [switch] $WideArch,
@@ -38,6 +41,9 @@ if ($ListProfiles) {
     Write-Host "  carreau_tail_split_5g - split bulk/tail heads + trigger gate, wall=0 (5GB)"
     Write-Host "  carreau_tail_stageA_diag_4g - stage-A loss diagnostic (tail bug-check)"
     Write-Host "  carreau_tail_stageAB_5g - staged curriculum (A tail-heavy -> B global recovery)"
+    Write-Host "  carreau_tail_stageAB_wall_4g - staged curriculum with wall reintroduced in Stage B (4GB)"
+    Write-Host "  walltail_arch_v1_4g - wall-aware residual branch + split-head staged objective (4GB)"
+    Write-Host "  walltail_arch_v1_5g - wall-aware residual branch + split-head staged objective (5GB)"
     Write-Host ""
     Write-Host "Use -WideArch on >=6-8GB GPUs to try latent=320 variants."
     exit 0
@@ -72,6 +78,7 @@ $env:BIOCHEM_USE_MU_PATH_GROUP = "1"
 $env:BIOCHEM_TRAIN_MU_ENCODER = "1"
 $env:BIOCHEM_USE_DELTA_MU_HEAD = "1"
 $env:BIOCHEM_USE_SPLIT_MU_HEAD = "0"
+$env:BIOCHEM_USE_WALL_DELTA_HEAD = "0"
 $env:BIOCHEM_DATALOADER_WORKERS = "0"
 $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
@@ -80,6 +87,7 @@ $env:BIOCHEM_MU_PATH_LR_MULT = "1.0"
 $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "0"
 $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.0"
 $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.0"
+$env:BIOCHEM_MU_WALL_LR_MULT = "1.0"
 
 switch ($Profile) {
     "global_plus" {
@@ -302,6 +310,150 @@ switch ($Profile) {
         $env:BIOCHEM_RUN_NOTE = "VISC_V7_STAGEAB_5G"
         Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
     }
+    "carreau_tail_stageAB_wall_4g" {
+        # 4GB follow-up: keep split-tail architecture, then reintroduce wall in Stage B.
+        # Goal: preserve tail gains from Stage A while recovering all/wall in Stage B.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.11"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_START = "0.17"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_END = "0.08"
+        $env:BIOCHEM_LATENT_DIM = "256"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "2"
+        $env:BIOCHEM_TEACHER_EPOCHS = "48"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
+        $env:BIOCHEM_TEACHER_LR = "0.0009"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.75"
+        $env:BIOCHEM_MU_BULK_LR_MULT = "0.65"
+        $env:BIOCHEM_MU_TAIL_LR_MULT = "1.50"
+        $env:BIOCHEM_MU_GATE_LR_MULT = "1.20"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.12"
+        # Stage A (tail-focused, wall off)
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "0.7"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.08"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "3.4"
+        $env:BIOCHEM_MU_LOG_BOUNDARY_WEIGHT = "1.2"
+        # Stage B switch (bring global + wall back, reduce tail pressure)
+        $env:BIOCHEM_MU_STAGE_SWITCH_EPOCH = "18"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B = "1.5"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B = "0.30"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B = "0.8"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B = "1.9"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "0"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "14"
+        # Keep anti-collapse light; avoid V6 over-constraint.
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.20"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.25"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.10"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.02"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.03"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.05"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.008"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V8_STAGEAB_WALL_4G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
+    "walltail_arch_v1_4g" {
+        # New architecture probe (4GB): split bulk/tail + dedicated near-wall residual head.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_USE_WALL_DELTA_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.11"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_START = "0.16"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_END = "0.07"
+        $env:BIOCHEM_MU_WALL_GATE_TEMP = "0.16"
+        $env:BIOCHEM_MU_WALL_GATE_CENTER = "0.52"
+        $env:BIOCHEM_MU_WALL_DELTA_GAIN = "0.75"
+        $env:BIOCHEM_LATENT_DIM = "256"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "2"
+        $env:BIOCHEM_TEACHER_EPOCHS = "52"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
+        $env:BIOCHEM_TEACHER_LR = "0.00085"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.72"
+        $env:BIOCHEM_MU_BULK_LR_MULT = "0.65"
+        $env:BIOCHEM_MU_TAIL_LR_MULT = "1.45"
+        $env:BIOCHEM_MU_GATE_LR_MULT = "1.20"
+        $env:BIOCHEM_MU_WALL_LR_MULT = "1.55"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.12"
+        # Stage A: tail+boundary discovery without explicit wall penalty.
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "0.9"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.10"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "3.0"
+        $env:BIOCHEM_MU_LOG_BOUNDARY_WEIGHT = "1.4"
+        # Stage B: recover global + wall while retaining high-tail.
+        $env:BIOCHEM_MU_STAGE_SWITCH_EPOCH = "18"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B = "1.6"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B = "0.30"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B = "1.1"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B = "2.0"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "0"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "12"
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.20"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.25"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.10"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.02"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.03"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.05"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.008"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V9_WALLTAIL_ARCH_V1_4G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
+    "walltail_arch_v1_5g" {
+        # New architecture probe (5GB): wider split-head with explicit near-wall residual branch.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_USE_WALL_DELTA_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.12"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_START = "0.18"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_END = "0.07"
+        $env:BIOCHEM_MU_WALL_GATE_TEMP = "0.15"
+        $env:BIOCHEM_MU_WALL_GATE_CENTER = "0.50"
+        $env:BIOCHEM_MU_WALL_DELTA_GAIN = "0.85"
+        $env:BIOCHEM_LATENT_DIM = "320"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "4"
+        $env:BIOCHEM_TEACHER_EPOCHS = "64"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "6"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "8"
+        $env:BIOCHEM_TEACHER_LR = "0.00078"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.62"
+        $env:BIOCHEM_MU_BULK_LR_MULT = "0.60"
+        $env:BIOCHEM_MU_TAIL_LR_MULT = "1.40"
+        $env:BIOCHEM_MU_GATE_LR_MULT = "1.20"
+        $env:BIOCHEM_MU_WALL_LR_MULT = "1.70"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.15"
+        # Stage A
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "1.0"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.12"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "2.8"
+        $env:BIOCHEM_MU_LOG_BOUNDARY_WEIGHT = "1.3"
+        # Stage B
+        $env:BIOCHEM_MU_STAGE_SWITCH_EPOCH = "24"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B = "1.8"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B = "0.35"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B = "1.2"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B = "1.8"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "0"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "14"
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.20"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.25"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.10"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.02"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.03"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.05"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.008"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V9_WALLTAIL_ARCH_V1_5G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "Teacher viscosity V4 run | profile=$Profile" -ForegroundColor Cyan
@@ -310,7 +462,7 @@ Write-Host "Arch: latent=$env:BIOCHEM_LATENT_DIM prior_dim=$env:BIOCHEM_BIO_ENCO
 Write-Host "OOM guard: TBPTT=$env:BIOCHEM_TBPTT_MAX_WINDOW RK4=$env:BIOCHEM_ADJOINT_RK4_SUBSTEPS CUDA_ALLOC_CONF=$env:PYTORCH_CUDA_ALLOC_CONF" -ForegroundColor DarkGray
 Write-Host "Optimizer: teacher_lr=$env:BIOCHEM_TEACHER_LR mu_path_lr_mult=$env:BIOCHEM_MU_PATH_LR_MULT TFmin=$env:BIOCHEM_TEACHER_FORCE_MIN val_every=$env:BIOCHEM_TEACHER_VAL_EVERY" -ForegroundColor DarkGray
 Write-Host "Weights: MuLog=$env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT MuSI=$env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT Wall=$env:BIOCHEM_MU_LOG_WALL_WEIGHT High=$env:BIOCHEM_MU_LOG_HIGH_WEIGHT" -ForegroundColor Cyan
-Write-Host "New physics: split_mu_head=$env:BIOCHEM_USE_SPLIT_MU_HEAD pareto_ckpt=$env:BIOCHEM_TEACHER_PARETO_CHECKPOINT trigger_floor=$env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT/$env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT" -ForegroundColor DarkGray
+Write-Host "New physics: split_mu_head=$env:BIOCHEM_USE_SPLIT_MU_HEAD wall_delta_head=$env:BIOCHEM_USE_WALL_DELTA_HEAD pareto_ckpt=$env:BIOCHEM_TEACHER_PARETO_CHECKPOINT trigger_floor=$env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT/$env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT" -ForegroundColor DarkGray
 if ($env:BIOCHEM_LOSS_ISOLATE) {
     Write-Host "Isolate objective: $env:BIOCHEM_LOSS_ISOLATE" -ForegroundColor Yellow
 }

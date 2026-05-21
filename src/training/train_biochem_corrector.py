@@ -2018,6 +2018,9 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     if hasattr(model, "mu_trigger_gate_head"):
         for param in model.mu_trigger_gate_head.parameters():
             param.requires_grad = True
+    if hasattr(model, "mu_delta_wall_head"):
+        for param in model.mu_delta_wall_head.parameters():
+            param.requires_grad = True
 
     train_mu_encoder = _biochem_env_truthy("BIOCHEM_TRAIN_MU_ENCODER", default=False)
     if train_mu_encoder and hasattr(model, "mu_encoder"):
@@ -2038,6 +2041,7 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         "mu_delta_bulk_head.",
         "mu_delta_tail_head.",
         "mu_trigger_gate_head.",
+        "mu_delta_wall_head.",
     )
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -2063,6 +2067,7 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     mu_bulk_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_BULK_LR_MULT", "1.0"))
     mu_tail_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_TAIL_LR_MULT", "1.0"))
     mu_gate_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_GATE_LR_MULT", "1.0"))
+    mu_wall_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_WALL_LR_MULT", "1.0"))
     print(
         f"   μ trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
         f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)}"
@@ -2085,6 +2090,7 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
             mu_group_bulk: List[torch.nn.Parameter] = []
             mu_group_tail: List[torch.nn.Parameter] = []
             mu_group_gate: List[torch.nn.Parameter] = []
+            mu_group_wall: List[torch.nn.Parameter] = []
             mu_group_rest: List[torch.nn.Parameter] = []
             for n, p in zip(mu_names, mu_params):
                 if n.startswith("mu_delta_bulk_head."):
@@ -2093,6 +2099,8 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
                     mu_group_tail.append(p)
                 elif n.startswith("mu_trigger_gate_head."):
                     mu_group_gate.append(p)
+                elif n.startswith("mu_delta_wall_head."):
+                    mu_group_wall.append(p)
                 else:
                     mu_group_rest.append(p)
             mu_param_groups: List[Dict[str, Any]] = []
@@ -2104,9 +2112,11 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
                 mu_param_groups.append({"params": mu_group_tail, "lr": mu_tail_lr})
             if mu_group_gate:
                 mu_param_groups.append({"params": mu_group_gate, "lr": mu_gate_lr})
+            if mu_group_wall:
+                mu_param_groups.append({"params": mu_group_wall, "lr": mu_wall_lr})
             print(
                 f"   μ split-head lrs: base={mu_lr:.3e}, bulk={mu_bulk_lr:.3e}, "
-                f"tail={mu_tail_lr:.3e}, gate={mu_gate_lr:.3e}"
+                f"tail={mu_tail_lr:.3e}, gate={mu_gate_lr:.3e}, wall={mu_wall_lr:.3e}"
             )
             opt_mu = optim.AdamW(mu_param_groups, weight_decay=1e-5)
         else:
