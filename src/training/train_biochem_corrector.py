@@ -2547,6 +2547,21 @@ def _biochem_linear_ramp_weight(base_w: float, epoch: int, ramp_epochs: int) -> 
     return w * progress
 
 
+def _biochem_stage_blend(epoch: int, switch_epoch: int, transition_epochs: int) -> float:
+    """Smoothly blend Stage-A -> Stage-B weights around switch epoch."""
+    if switch_epoch <= 0:
+        return 0.0
+    tr = max(int(transition_epochs), 0)
+    if epoch < switch_epoch:
+        return 0.0
+    if tr <= 0:
+        return 1.0
+    # Start blending at switch epoch and reach full Stage-B at switch+transition.
+    p = (float(epoch) - float(switch_epoch) + 1.0) / float(tr)
+    p = min(max(p, 0.0), 1.0)
+    return p * p * (3.0 - 2.0 * p)  # smoothstep
+
+
 def _anchor_mu_si_and_log_losses(
     pred_series: torch.Tensor,
     y_true: torch.Tensor,
@@ -3205,17 +3220,23 @@ def compute_biochem_loss(
     w_mu_log_wall_base = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
     w_mu_log_high_base = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
     stage_switch_ep = max(0, int(os.environ.get("BIOCHEM_MU_STAGE_SWITCH_EPOCH", "0")))
-    if stage_switch_ep > 0 and epoch >= stage_switch_ep:
-        w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B", str(w_mu_aux))), 0.0)
-        w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B", str(w_mu_log))), 0.0)
-        w_mu_log_wall_base = max(
+    stage_transition_ep = max(0, int(os.environ.get("BIOCHEM_MU_STAGE_TRANSITION_EPOCHS", "0")))
+    stage_blend = _biochem_stage_blend(epoch, stage_switch_ep, stage_transition_ep)
+    if stage_switch_ep > 0:
+        w_mu_aux_b = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B", str(w_mu_aux))), 0.0)
+        w_mu_log_b = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B", str(w_mu_log))), 0.0)
+        w_mu_log_wall_b = max(
             float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B", str(w_mu_log_wall_base))),
             0.0,
         )
-        w_mu_log_high_base = max(
+        w_mu_log_high_b = max(
             float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B", str(w_mu_log_high_base))),
             0.0,
         )
+        w_mu_aux = ((1.0 - stage_blend) * w_mu_aux) + (stage_blend * w_mu_aux_b)
+        w_mu_log = ((1.0 - stage_blend) * w_mu_log) + (stage_blend * w_mu_log_b)
+        w_mu_log_wall_base = ((1.0 - stage_blend) * w_mu_log_wall_base) + (stage_blend * w_mu_log_wall_b)
+        w_mu_log_high_base = ((1.0 - stage_blend) * w_mu_log_high_base) + (stage_blend * w_mu_log_high_b)
     wall_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS", "0")))
     high_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS", "0")))
     w_mu_log_wall = (

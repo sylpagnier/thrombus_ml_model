@@ -301,6 +301,10 @@ class GNODE_Phase3(nn.Module):
         self.mu_wall_gate_temp = max(float(os.environ.get("BIOCHEM_MU_WALL_GATE_TEMP", "0.18")), 1e-5)
         self.mu_wall_gate_center = float(os.environ.get("BIOCHEM_MU_WALL_GATE_CENTER", "0.55"))
         self.mu_wall_delta_gain = float(os.environ.get("BIOCHEM_MU_WALL_DELTA_GAIN", "0.65"))
+        self.mu_wall_mask_mix = min(
+            max(float(os.environ.get("BIOCHEM_MU_WALL_MASK_MIX", "0.80")), 0.0),
+            1.0,
+        )
         self._init_mu_delta_head_near_zero()
 
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
@@ -688,7 +692,12 @@ class GNODE_Phase3(nn.Module):
                     delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
                     delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
                     if _biochem_wall_delta_head_enabled():
-                        wall_logits = (wall_prox - self.mu_wall_gate_center) / max(
+                        wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
+                        wall_signal = torch.maximum(
+                            wall_prox,
+                            self.mu_wall_mask_mix * wall_mask,
+                        )
+                        wall_logits = (wall_signal - self.mu_wall_gate_center) / max(
                             self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
                         )
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))

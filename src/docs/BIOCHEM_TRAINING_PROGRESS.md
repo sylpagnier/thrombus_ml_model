@@ -380,6 +380,20 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Runner support**: new profiles `walltail_arch_v1_4g` and `walltail_arch_v1_5g` added to `run_biochem_teacher_visc_v4.ps1`.
 - **Status**: ready for A/B runs on both laptops; no gate change until validation metrics arrive.
 
+### 39. V9 wall-aware runs (`walltail_arch_v1_4g/5g`): mixed outcome, clear cues for next architecture step (2026-05-21)
+
+- **4G run (`walltail_arch_v1_4g`, ongoing)**: strong all-truth recovery to **0.5778** (ep30) and high-μ **~0.3837-0.4269**, but wall remains stuck at **~3.07** despite Stage-B wall loss activation. After ep30, run shows sharp instability (ep33 all-truth **1.1755**).
+- **5G run (`walltail_arch_v1_5g`, ongoing early)**: very unstable trajectory (all-truth swings **1.53 -> 0.77 -> 1.72 -> 0.85** by ep12), while wall holds around **~2.44-2.47** and high-μ can be good (**0.435** at ep9).
+- **Interpretation**: wall-aware branch improved global/tail capacity on 4G but did not convert to wall fidelity; abrupt stage transitions and weakly anchored wall gating likely contribute to late collapses.
+- **Action**: implement smoother Stage-A->B interpolation and stronger wall-mask-informed wall-gate signal; launch long V2 runs with lower LR + higher wall-branch LR.
+
+### 40. Architecture update V2: smooth stage blending + stronger wall-gate anchoring (2026-05-21)
+
+- **Stage blending**: added `BIOCHEM_MU_STAGE_TRANSITION_EPOCHS` to interpolate Stage-A/B loss weights with smoothstep instead of hard switching.
+- **Wall gating**: wall branch now mixes geometric wall proximity with explicit `mask_wall` (`BIOCHEM_MU_WALL_MASK_MIX`) before gate activation, reducing under-activation on near-wall truth nodes.
+- **New long profiles**: `walltail_arch_v2_long_4g` and `walltail_arch_v2_long_5g` configured for ~10h teacher runs with lower base LR, smoother transition, and stronger wall branch learning rate.
+- **Status**: code-complete and ready for dual-laptop launch.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -634,6 +648,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-21 | V8 `carreau_tail_stageAB_wall_4g` repeated x2 (RTX500 4GB): split-head staged run with Stage-B wall reintroduced, Pareto checkpoint on, 48ep | **0.7471** (saved best, ep21) | **3.2250** | **0.376** | high **0.4778** | Two runs reproduced nearly identical curves; later all-truth minima (e.g. 0.5694 ep36) sacrificed high-μ and still did not fix wall; no improvement vs prior global best |
 | 2026-05-21 | V8 `carreau_tail_stageAB_wall_4g` replay (RUN 1, RTX500 4GB): same profile/seed path as prior V8, 48ep | **0.7471** (ep21 checkpoint) | **3.2250** | **0.376** | high **0.4778** | Confirms deterministic replay of prior V8 curve/checkpoint selection; no new gain on all/wall |
 | 2026-05-21 | V7 `carreau_tail_stageAB_5g` continuation (RUN 2, P2200 5GB to ep35): staged split-head A→B, wall=0, Pareto on | **0.7121** (ep30) | **2.0834** | **0.445** (best all-r ~0.471 ep21) | high **0.4447** (ep15) | Significant improvement vs early V7 and V6 basins; still tail-first compromise and below global best (~0.39-0.40) |
+| 2026-05-21 | V9 `walltail_arch_v1_4g` (RTX500 4GB, ongoing to ep36 shown): split-head + wall-delta branch, staged wall-on, Pareto on | **0.5778** (ep30 best so far) | **3.0722** | **0.433** | high **0.3837** (ep27) | Strong all/high gains but wall remains catastrophic; late instability after ep30 (ep33 all=1.1755) |
+| 2026-05-21 | V9 `walltail_arch_v1_5g` (P2200 5GB, ongoing to ep15 shown): split-head + wall-delta branch, staged wall-on, Pareto on | **0.7744** (ep3 best so far) | **2.4378** | **0.285** | high **0.4350** (ep9) | Highly non-monotonic early dynamics; wall modestly better than 4G but all-truth unstable; motivates smoother stage transition + stronger wall gating |
 
 ---
 

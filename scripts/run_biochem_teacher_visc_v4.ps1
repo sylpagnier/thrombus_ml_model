@@ -12,6 +12,8 @@
 #   carreau_tail_stageAB_wall_4g - 4GB follow-up: reintroduce wall in Stage B.
 #   walltail_arch_v1_4g - new wall-aware split architecture (4GB).
 #   walltail_arch_v1_5g - new wall-aware split architecture (5GB).
+#   walltail_arch_v2_long_4g - smoother staged transition, long 4GB wall-tail run.
+#   walltail_arch_v2_long_5g - smoother staged transition, long 5GB wall-tail run.
 #
 # Usage:
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -Profile global_plus
@@ -19,7 +21,7 @@
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -ListProfiles
 #
 param(
-    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g", "carreau_tail_stageAB_wall_4g", "walltail_arch_v1_4g", "walltail_arch_v1_5g")]
+    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g", "carreau_tail_stageAB_wall_4g", "walltail_arch_v1_4g", "walltail_arch_v1_5g", "walltail_arch_v2_long_4g", "walltail_arch_v2_long_5g")]
     [string] $Profile = "global_plus",
     [switch] $ListProfiles,
     [switch] $WideArch,
@@ -44,6 +46,8 @@ if ($ListProfiles) {
     Write-Host "  carreau_tail_stageAB_wall_4g - staged curriculum with wall reintroduced in Stage B (4GB)"
     Write-Host "  walltail_arch_v1_4g - wall-aware residual branch + split-head staged objective (4GB)"
     Write-Host "  walltail_arch_v1_5g - wall-aware residual branch + split-head staged objective (5GB)"
+    Write-Host "  walltail_arch_v2_long_4g - long wall-tail run with smooth Stage-A->B transition (4GB)"
+    Write-Host "  walltail_arch_v2_long_5g - long wall-tail run with smooth Stage-A->B transition (5GB)"
     Write-Host ""
     Write-Host "Use -WideArch on >=6-8GB GPUs to try latent=320 variants."
     exit 0
@@ -79,6 +83,7 @@ $env:BIOCHEM_TRAIN_MU_ENCODER = "1"
 $env:BIOCHEM_USE_DELTA_MU_HEAD = "1"
 $env:BIOCHEM_USE_SPLIT_MU_HEAD = "0"
 $env:BIOCHEM_USE_WALL_DELTA_HEAD = "0"
+$env:BIOCHEM_MU_WALL_MASK_MIX = "0.80"
 $env:BIOCHEM_DATALOADER_WORKERS = "0"
 $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
@@ -88,6 +93,7 @@ $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "0"
 $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.0"
 $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.0"
 $env:BIOCHEM_MU_WALL_LR_MULT = "1.0"
+$env:BIOCHEM_MU_STAGE_TRANSITION_EPOCHS = "0"
 
 switch ($Profile) {
     "global_plus" {
@@ -452,6 +458,108 @@ switch ($Profile) {
         $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
         $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.008"
         $env:BIOCHEM_RUN_NOTE = "VISC_V9_WALLTAIL_ARCH_V1_5G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
+    "walltail_arch_v2_long_4g" {
+        # 4GB long run (~10h): smooth objective transition + stronger wall branch supervision.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_USE_WALL_DELTA_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.11"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_START = "0.16"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_END = "0.07"
+        $env:BIOCHEM_MU_WALL_GATE_TEMP = "0.14"
+        $env:BIOCHEM_MU_WALL_GATE_CENTER = "0.48"
+        $env:BIOCHEM_MU_WALL_MASK_MIX = "0.90"
+        $env:BIOCHEM_MU_WALL_DELTA_GAIN = "0.95"
+        $env:BIOCHEM_LATENT_DIM = "256"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "2"
+        $env:BIOCHEM_TEACHER_EPOCHS = "66"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
+        $env:BIOCHEM_TEACHER_LR = "0.00072"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.58"
+        $env:BIOCHEM_MU_BULK_LR_MULT = "0.62"
+        $env:BIOCHEM_MU_TAIL_LR_MULT = "1.32"
+        $env:BIOCHEM_MU_GATE_LR_MULT = "1.15"
+        $env:BIOCHEM_MU_WALL_LR_MULT = "1.85"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.14"
+        # Stage A: stabilize global+tail before wall pressure.
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "1.0"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.12"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "2.6"
+        $env:BIOCHEM_MU_LOG_BOUNDARY_WEIGHT = "1.2"
+        # Stage B: introduce wall smoothly.
+        $env:BIOCHEM_MU_STAGE_SWITCH_EPOCH = "18"
+        $env:BIOCHEM_MU_STAGE_TRANSITION_EPOCHS = "12"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B = "1.9"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B = "0.32"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B = "1.6"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B = "1.8"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "12"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "16"
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.16"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.22"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.08"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.015"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.025"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.045"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.007"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V10_WALLTAIL_ARCH_V2_LONG_4G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
+    "walltail_arch_v2_long_5g" {
+        # 5GB long run (~10h): wider model + smooth Stage-A->B, with stronger wall branch.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_USE_WALL_DELTA_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.12"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_START = "0.18"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP_END = "0.07"
+        $env:BIOCHEM_MU_WALL_GATE_TEMP = "0.13"
+        $env:BIOCHEM_MU_WALL_GATE_CENTER = "0.46"
+        $env:BIOCHEM_MU_WALL_MASK_MIX = "0.95"
+        $env:BIOCHEM_MU_WALL_DELTA_GAIN = "1.00"
+        $env:BIOCHEM_LATENT_DIM = "320"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "4"
+        $env:BIOCHEM_TEACHER_EPOCHS = "64"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "6"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "8"
+        $env:BIOCHEM_TEACHER_LR = "0.00068"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.56"
+        $env:BIOCHEM_MU_BULK_LR_MULT = "0.60"
+        $env:BIOCHEM_MU_TAIL_LR_MULT = "1.28"
+        $env:BIOCHEM_MU_GATE_LR_MULT = "1.12"
+        $env:BIOCHEM_MU_WALL_LR_MULT = "1.95"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.16"
+        # Stage A
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "1.1"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.14"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "2.4"
+        $env:BIOCHEM_MU_LOG_BOUNDARY_WEIGHT = "1.2"
+        # Stage B
+        $env:BIOCHEM_MU_STAGE_SWITCH_EPOCH = "21"
+        $env:BIOCHEM_MU_STAGE_TRANSITION_EPOCHS = "12"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B = "2.0"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B = "0.34"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B = "1.7"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B = "1.7"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "12"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "16"
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.16"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.22"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.08"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.015"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.025"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.045"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.007"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V10_WALLTAIL_ARCH_V2_LONG_5G"
         Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
     }
 }
