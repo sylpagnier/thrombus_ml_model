@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) but can degrade late; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) and 64-epoch runs confirm no new best with late degradation after ~30 ep; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -321,6 +321,24 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Interpretation**: pure high-tail isolate is useful as a diagnostic for clot-region capacity, but not as a final teacher objective; it needs a bridge back to global/wall terms to avoid sacrificing full-field fidelity.
 - **Fix**: move to long-run low-LR profiles: (1) stable global objective with TF floor + reduced μ-path LR, and (2) tail-emphasis **without isolate** on wider arch for 5GB+ cards.
 
+### 32. Long-horizon V4 runs (`global_long_stable` + `tail_bridge_long`): best remains early, late epochs mostly trade all-truth for tail (2026-05-21)
+
+- **`global_long_stable` (RTX500, 64ep, latent256/prior2, LR 1e-3, μ-path LR mult 0.65)**: best all-truth **0.5068** (ep30), wall **1.9507**, high-μ **0.9062**, `r` **0.441**. After ep33, all-truth degrades sharply (**0.61 → 1.07** range), while high-μ improves (**0.77 → 0.63/0.60**) and wall remains ~**1.95–2.08**.
+- **`tail_bridge_long` (P2200, 64ep, latent320/prior4, LR 8e-4, μ-path LR mult 0.50, tail-heavy joint loss)**: best all-truth **0.5184** (ep9), wall **2.0761**, high-μ **0.9290**, `r` **0.434**. Late epochs consistently favor high-tail (**~0.42–0.49**) with strong high-μ `r` (~**0.74**), but all-truth stays poor (**~0.76–0.86**) and wall stays high (~**2.05**).
+- **Interpretation**: both long runs reinforce the same regime: after early epochs, optimization shifts toward tail/wall-local behavior while bulk/all-truth deteriorates. Lower LR and TF floor slowed catastrophic collapse on RTX500 but did not prevent objective drift.
+- **Actionable rule**: for current teacher-only step-2, select checkpoints in the **ep8–30 window** (before drift) and avoid assuming longer schedules improve held-out all-truth.
+- **Status**: no gate flip; long horizon did not surpass existing bests and confirms persistent wall-vs-all-vs-tail tradeoff.
+
+### 33. New physics branch (Carreau baseline + trigger-gated tail correction) — implementation note (2026-05-21)
+
+- **Hypothesis**: bulk should remain near Carreau; high-μ uplift should activate only in clot-triggered regions (species + mechanics).
+- **Architecture change**: optional split residual log-μ heads (`BIOCHEM_USE_SPLIT_MU_HEAD=1`) with gate:
+  `log μ = log μ_carreau + (1-g)*Δ_bulk + g*Δ_tail`, where `g` is a learned trigger gate.
+- **Loss change**: wall objective can be disabled (`MU_LOG_WALL_WEIGHT=0`) to focus on global + high-tail.
+- **Anti-collapse priors** (opt-in): floor penalties on trigger gate and learned gelation on high-μ truth nodes (`BIOCHEM_TRIGGER_*` env knobs) to prevent tail path collapse late in training.
+- **Checkpointing change** (opt-in): Pareto checkpoint rule (`BIOCHEM_TEACHER_PARETO_CHECKPOINT=1`) updates best model only when all/high tradeoff improves within configured tolerances.
+- **Safety**: all features are env-gated defaults-off so prior behavior is preserved for A/B comparison.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -566,6 +584,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-20 | V4 `global_plus` first try (RTX500 4GB): latent320/prior2, TBPTT=6, RK4=8, early-stop 0.50 | n/a (failed pre-epoch) | n/a | n/a | n/a | **OOM** in ODE adjoint/GAT path before ep0 val; prompted switch to 4GB-safe defaults in script |
 | 2026-05-20 | V4 `global_plus` safe rerun (RTX500 4GB): latent256/prior2, TBPTT=5, RK4=6, `W(MuLog/MuSI/Wall/High)=2.0/2.0/1.6/1.4`, target 0.50 | **0.5030** (best, ep8) | **1.9661** | **0.432** | high **0.9495** | Early strong checkpoint then unstable late drift (ep16 0.7782, ep20 1.3298); indicates optimizer/AR stability issue rather than capacity floor |
 | 2026-05-20 | V4 `high_mu_only` (P2200, in progress to ep12): latent320/prior4, isolate `MU_LOG_HIGH`, `W_high=3.0` | **0.9962** (best so far, ep4) | **2.0248** | **0.373** | high **0.5822** | Confirms high-tail can be learned in isolation, but all/wall stay poor; use as curriculum signal, not standalone objective |
+| 2026-05-21 | V4 `global_long_stable` (RTX500 4GB): 64ep, latent256/prior2, TBPTT=5, RK4=6, LR 1e-3, μ-path LR mult 0.65, TFmin 0.10 | **0.5068** (best, ep30) | **1.9507** | **0.441** | high **0.9062** | More stable than earlier collapse runs but still drifts late (all ~0.95–1.08 by ep63); high-tail improves while all/bulk regresses |
+| 2026-05-21 | V4 `tail_bridge_long` (P2200 5GB): 64ep, latent320/prior4, TBPTT=6, RK4=8, LR 8e-4, μ-path LR mult 0.50, `W(MuLog/MuSI/Wall/High)=1.2/0.8/1.6/2.8` | **0.5184** (best, ep9) | **2.0761** | **0.434** | high **0.9290** | Tail emphasis improved late high-μ (to ~0.42) and high-tail r (~0.74) but did not improve all-truth or wall on patient007 |
 
 ---
 

@@ -5,6 +5,8 @@
 #   high_mu_only       - short high-mu isolate probe (existing).
 #   global_long_stable - long (~10h) stability-oriented global objective.
 #   tail_bridge_long   - long tail-emphasis joint objective (5GB+ suggested).
+#   carreau_tail_split_4g - new physics split-head run for 4GB.
+#   carreau_tail_split_5g - new physics split-head run for 5GB.
 #
 # Usage:
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -Profile global_plus
@@ -12,7 +14,7 @@
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -ListProfiles
 #
 param(
-    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long")]
+    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g")]
     [string] $Profile = "global_plus",
     [switch] $ListProfiles,
     [switch] $WideArch,
@@ -30,6 +32,8 @@ if ($ListProfiles) {
     Write-Host "  high_mu_only       - short MU_LOG_HIGH isolate, 4GB-safe arch by default"
     Write-Host "  global_long_stable - long run, lower LR + TF floor to reduce late collapse"
     Write-Host "  tail_bridge_long   - long run, high-tail emphasis without hard isolate (5GB+)"
+    Write-Host "  carreau_tail_split_4g - split bulk/tail heads + trigger gate, wall=0 (4GB-safe)"
+    Write-Host "  carreau_tail_split_5g - split bulk/tail heads + trigger gate, wall=0 (5GB)"
     Write-Host ""
     Write-Host "Use -WideArch on >=6-8GB GPUs to try latent=320 variants."
     exit 0
@@ -63,11 +67,15 @@ $env:BIOCHEM_MU_SI_MULTI_STEP = "1"
 $env:BIOCHEM_USE_MU_PATH_GROUP = "1"
 $env:BIOCHEM_TRAIN_MU_ENCODER = "1"
 $env:BIOCHEM_USE_DELTA_MU_HEAD = "1"
+$env:BIOCHEM_USE_SPLIT_MU_HEAD = "0"
 $env:BIOCHEM_DATALOADER_WORKERS = "0"
 $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 $env:BIOCHEM_TEACHER_LR = "0.002"
 $env:BIOCHEM_MU_PATH_LR_MULT = "1.0"
+$env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "0"
+$env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.0"
+$env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.0"
 
 switch ($Profile) {
     "global_plus" {
@@ -145,6 +153,70 @@ switch ($Profile) {
         $env:BIOCHEM_RUN_NOTE = "VISC_V5_TAIL_BRIDGE_LONG"
         Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
     }
+    "carreau_tail_split_4g" {
+        # New-physics architecture: Carreau baseline + trigger-gated split residual heads.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.12"
+        $env:BIOCHEM_LATENT_DIM = "256"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "2"
+        $env:BIOCHEM_TEACHER_EPOCHS = "64"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "6"
+        $env:BIOCHEM_TEACHER_LR = "0.0009"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.60"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.10"
+        # Remove wall objective; focus on all + high tail.
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "1.0"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.2"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "3.2"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "0"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "20"
+        # Anti-collapse + Pareto checkpointing.
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.8"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.35"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.4"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.03"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.035"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.04"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.01"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V6_CARREAU_TAIL_SPLIT_4G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
+    "carreau_tail_split_5g" {
+        # Same new-physics design on wider model for 5GB machine.
+        $env:BIOCHEM_USE_SPLIT_MU_HEAD = "1"
+        $env:BIOCHEM_MU_TRIGGER_GATE_TEMP = "0.10"
+        $env:BIOCHEM_LATENT_DIM = "320"
+        $env:BIOCHEM_BIO_ENCODER_PRIOR_DIM = "4"
+        $env:BIOCHEM_TEACHER_EPOCHS = "64"
+        $env:BIOCHEM_TEACHER_VAL_EVERY = "3"
+        $env:BIOCHEM_TBPTT_MAX_WINDOW = "6"
+        $env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "8"
+        $env:BIOCHEM_TEACHER_LR = "0.0007"
+        $env:BIOCHEM_MU_PATH_LR_MULT = "0.45"
+        $env:BIOCHEM_TEACHER_FORCE_MIN = "0.15"
+        $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "1.2"
+        $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.2"
+        $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+        $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "3.0"
+        $env:BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS = "0"
+        $env:BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS = "24"
+        $env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT = "0.8"
+        $env:BIOCHEM_TRIGGER_GATE_MIN_HIGH = "0.35"
+        $env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT = "0.4"
+        $env:BIOCHEM_TRIGGER_LEARNED_MIN_HIGH = "0.03"
+        $env:BIOCHEM_TEACHER_PARETO_CHECKPOINT = "1"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_TOL = "0.04"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_TOL = "0.04"
+        $env:BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN = "0.0015"
+        $env:BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN = "0.01"
+        $env:BIOCHEM_RUN_NOTE = "VISC_V6_CARREAU_TAIL_SPLIT_5G"
+        Remove-Item Env:BIOCHEM_TEACHER_TARGET_MU_LOG_MAE -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "Teacher viscosity V4 run | profile=$Profile" -ForegroundColor Cyan
@@ -153,6 +225,7 @@ Write-Host "Arch: latent=$env:BIOCHEM_LATENT_DIM prior_dim=$env:BIOCHEM_BIO_ENCO
 Write-Host "OOM guard: TBPTT=$env:BIOCHEM_TBPTT_MAX_WINDOW RK4=$env:BIOCHEM_ADJOINT_RK4_SUBSTEPS CUDA_ALLOC_CONF=$env:PYTORCH_CUDA_ALLOC_CONF" -ForegroundColor DarkGray
 Write-Host "Optimizer: teacher_lr=$env:BIOCHEM_TEACHER_LR mu_path_lr_mult=$env:BIOCHEM_MU_PATH_LR_MULT TFmin=$env:BIOCHEM_TEACHER_FORCE_MIN val_every=$env:BIOCHEM_TEACHER_VAL_EVERY" -ForegroundColor DarkGray
 Write-Host "Weights: MuLog=$env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT MuSI=$env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT Wall=$env:BIOCHEM_MU_LOG_WALL_WEIGHT High=$env:BIOCHEM_MU_LOG_HIGH_WEIGHT" -ForegroundColor Cyan
+Write-Host "New physics: split_mu_head=$env:BIOCHEM_USE_SPLIT_MU_HEAD pareto_ckpt=$env:BIOCHEM_TEACHER_PARETO_CHECKPOINT trigger_floor=$env:BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT/$env:BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT" -ForegroundColor DarkGray
 if ($env:BIOCHEM_LOSS_ISOLATE) {
     Write-Host "Isolate objective: $env:BIOCHEM_LOSS_ISOLATE" -ForegroundColor Yellow
 }

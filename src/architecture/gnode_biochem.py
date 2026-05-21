@@ -47,6 +47,12 @@ def _biochem_delta_mu_head_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _biochem_split_mu_regime_head_enabled() -> bool:
+    """Enable split residual log-μ heads with trigger-gated bulk/tail mixing."""
+    raw = (os.environ.get("BIOCHEM_USE_SPLIT_MU_HEAD", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
     if not hasattr(batch, "is_anchor"):
@@ -259,6 +265,25 @@ class GNODE_Phase3(nn.Module):
             nn.SiLU(),
             nn.Linear(64, 1),
         )
+        # Optional split residual correction:
+        # log(μ) = log(μ_base) + (1-g)*Δ_bulk + g*Δ_tail
+        # where g∈[0,1] is a trigger gate from species + mechanics cues.
+        self.mu_delta_bulk_head = nn.Sequential(
+            nn.Linear(latent_dim + 12, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+        self.mu_delta_tail_head = nn.Sequential(
+            nn.Linear(latent_dim + 16, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+        self.mu_trigger_gate_head = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+        )
+        self.mu_trigger_gate_temp = max(float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP", "0.20")), 1e-5)
         self.mu_delta_log_clip = max(float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP", "1.5")), 1e-6)
         self._init_mu_delta_head_near_zero()
 
@@ -375,7 +400,17 @@ class GNODE_Phase3(nn.Module):
     def _init_mu_delta_head_near_zero(self) -> None:
         """Keep residual μ correction neutral at startup (factor ~= 1)."""
         with torch.no_grad():
-            for m in self.mu_delta_head.modules():
+            for head in (
+                self.mu_delta_head,
+                self.mu_delta_bulk_head,
+                self.mu_delta_tail_head,
+            ):
+                for m in head.modules():
+                    if isinstance(m, nn.Linear):
+                        m.weight.uniform_(-1e-4, 1e-4)
+                        if m.bias is not None:
+                            m.bias.zero_()
+            for m in self.mu_trigger_gate_head.modules():
                 if isinstance(m, nn.Linear):
                     m.weight.uniform_(-1e-4, 1e-4)
                     if m.bias is not None:
@@ -481,6 +516,9 @@ class GNODE_Phase3(nn.Module):
         if self.training:
             self.ode_func.derivative_energy_sum = 0.0
             self.ode_func.derivative_eval_count = 0
+        self._last_mu_trigger_gate = None
+        self._last_mu_delta_bulk = None
+        self._last_mu_delta_tail = None
 
         truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
         species_prior = _default_resting_species(num_nodes, device, batch)
@@ -609,8 +647,34 @@ class GNODE_Phase3(nn.Module):
             total_multiplier = 1.0 + gel_extra
             current_mu_eff = mu_kin_baseline * total_multiplier
             if _biochem_delta_mu_head_enabled():
-                delta_in = torch.cat([z_kin, sp_safe], dim=1)
-                delta_log_mu = self.mu_delta_head(delta_in)
+                if _biochem_split_mu_regime_head_enabled():
+                    # Trigger features (SI/physics aligned):
+                    # [log1p species(12), FI_si, Mat_si, gamma_dot, wall_proximity]
+                    sdf_nd = kin_in[:, NodeFeat.SDF]
+                    wall_prox = torch.exp(-torch.abs(sdf_nd)).to(dtype=sp_safe.dtype)
+                    trigger_feats = torch.cat(
+                        [
+                            sp_safe,
+                            FI_si,
+                            Mat_si,
+                            gamma_dot.to(dtype=sp_safe.dtype),
+                            wall_prox,
+                        ],
+                        dim=1,
+                    )
+                    gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
+                    gate_logits = self.mu_trigger_gate_head(trigger_feats)
+                    gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
+                    delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
+                    delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
+                    delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+                    # Expose lightweight diagnostics for training loss/metrics.
+                    self._last_mu_trigger_gate = gate
+                    self._last_mu_delta_bulk = delta_bulk
+                    self._last_mu_delta_tail = delta_tail
+                else:
+                    delta_in = torch.cat([z_kin, sp_safe], dim=1)
+                    delta_log_mu = self.mu_delta_head(delta_in)
                 delta_log_mu = torch.clamp(delta_log_mu, min=-self.mu_delta_log_clip, max=self.mu_delta_log_clip)
                 current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
             current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)

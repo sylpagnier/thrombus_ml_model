@@ -3266,6 +3266,44 @@ def compute_biochem_loss(
             residual_excess = torch.relu(mu_excess_all - guide)
             l_residual_sparse = torch.mean(residual_excess.pow(2))
 
+    # Trigger anti-collapse priors (opt-in):
+    # keep tail trigger/gelation pathway alive on high-μ anchor nodes even when
+    # global losses favor collapsing back to near-pure Carreau.
+    l_trigger_gate_floor = torch.tensor(0.0, device=device)
+    l_trigger_learned_floor = torch.tensor(0.0, device=device)
+    w_trigger_gate_floor = 0.0
+    w_trigger_learned_floor = 0.0
+    if model.training and has_anchor_supervision:
+        w_trigger_gate_floor = max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT", "0.0")), 0.0)
+        w_trigger_learned_floor = max(float(os.environ.get("BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT", "0.0")), 0.0)
+        if w_trigger_gate_floor > 0.0 or w_trigger_learned_floor > 0.0:
+            ma = truth_mask
+            if ma.any():
+                mu_g_si_last = phys_cfg.viscosity_nd_to_si(target_series[-1, :, mu_ch])
+                mu_truth_nodes = mu_g_si_last[ma]
+                q_high = _mu_val_high_quantile()
+                mu_cut = torch.quantile(mu_truth_nodes.detach(), q_high)
+                high_mask = ma & (mu_g_si_last >= mu_cut)
+                if bool(high_mask.any()):
+                    if w_trigger_gate_floor > 0.0:
+                        gate = getattr(model, "_last_mu_trigger_gate", None)
+                        if torch.is_tensor(gate):
+                            gate_h = gate.reshape(-1)[high_mask]
+                            gate_target = max(
+                                0.0,
+                                min(1.0, float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN_HIGH", "0.35"))),
+                            )
+                            l_trigger_gate_floor = torch.relu(
+                                torch.tensor(gate_target, device=device, dtype=gate_h.dtype) - gate_h.mean()
+                            ).pow(2)
+                    if w_trigger_learned_floor > 0.0 and hasattr(model, "learned_clot_penalty"):
+                        sp_last = torch.clamp(pred_final[:, 4:16], min=-10.0, max=8.0)
+                        learned_h = model.learned_clot_penalty(sp_last).reshape(-1)[high_mask]
+                        learned_target = max(float(os.environ.get("BIOCHEM_TRIGGER_LEARNED_MIN_HIGH", "0.03")), 0.0)
+                        l_trigger_learned_floor = torch.relu(
+                            torch.tensor(learned_target, device=device, dtype=learned_h.dtype) - learned_h.mean()
+                        ).pow(2)
+
     latent_scale = train_cfg.latent_reg_scale
 
     # Eight Kendall tasks: skip supervised heads on non-anchor batches.
@@ -3365,6 +3403,12 @@ def compute_biochem_loss(
             + (w_fi_gate_start_eff * l_fi_gate_start)
             + (lambda_residual_sparse * l_residual_sparse)
         )
+    if model.training and (w_trigger_gate_floor > 0.0 or w_trigger_learned_floor > 0.0):
+        loss = (
+            loss
+            + (w_trigger_gate_floor * l_trigger_gate_floor)
+            + (w_trigger_learned_floor * l_trigger_learned_floor)
+        )
 
     # Guard for sparse pseudo-only windows where every active term can become
     # graph-disconnected (e.g., all-zero residual/mimic terms in low-anchor mode).
@@ -3418,6 +3462,10 @@ def compute_biochem_loss(
         "W_FIGateStart": float(w_fi_gate_start_eff),
         "L_ResidualSparse": l_residual_sparse.item(),
         "W_ResidualSparse": float(lambda_residual_sparse),
+        "L_TriggerGateFloor": l_trigger_gate_floor.item(),
+        "W_TriggerGateFloor": float(w_trigger_gate_floor),
+        "L_TriggerLearnedFloor": l_trigger_learned_floor.item(),
+        "W_TriggerLearnedFloor": float(w_trigger_learned_floor),
         "BIOCHEM_LOSS_DATA_ONLY": float(data_only),
         "BIOCHEM_LOSS_ISOLATE": isolate_key or "",
         "L_Backprop": float(loss.detach().item()),
@@ -4235,6 +4283,13 @@ def train_teacher_on_anchors(
     best_state = None
     best_mu_score = -float("inf")
     best_epoch = -1
+    best_mu_log_all = float("inf")
+    best_mu_log_high = float("inf")
+    pareto_ckpt = _biochem_env_truthy("BIOCHEM_TEACHER_PARETO_CHECKPOINT", default=False)
+    pareto_all_tol = max(float(os.environ.get("BIOCHEM_TEACHER_PARETO_ALL_TOL", "0.03")), 0.0)
+    pareto_high_tol = max(float(os.environ.get("BIOCHEM_TEACHER_PARETO_HIGH_TOL", "0.05")), 0.0)
+    pareto_all_gain = max(float(os.environ.get("BIOCHEM_TEACHER_PARETO_ALL_GAIN_MIN", "0.002")), 0.0)
+    pareto_high_gain = max(float(os.environ.get("BIOCHEM_TEACHER_PARETO_HIGH_GAIN_MIN", "0.01")), 0.0)
 
     _early_stop_note = (
         f"early_stop@mu_log_mae<={target_mu_log_mae:.3f}"
@@ -4247,6 +4302,11 @@ def train_teacher_on_anchors(
         f"accum={accumulation_steps}, bio_clip={clip_teacher:.2f}, phys_clip={clip_teacher_phys:.2f}, "
         f"tf_warmup_epochs={teacher_curriculum.biochem_warmup_epochs} ---"
     )
+    if pareto_ckpt:
+        print(
+            "   🧭 Pareto checkpointing enabled: accept checkpoints only when "
+            "all/high-μ tradeoff improves within configured tolerances."
+        )
     if _biochem_env_truthy("BIOCHEM_LOSS_DATA_ONLY") and _biochem_env_truthy(
         "BIOCHEM_DETACH_MACRO_STATE", default=False
     ):
@@ -4507,10 +4567,37 @@ def train_teacher_on_anchors(
                     f"({time.perf_counter() - val_t0:.2f}s) | mu_score={val_mu_score:.4f} "
                     f"(best running {best_mu_score:.4f})."
                 )
-                if val_mu_score > best_mu_score:
+                cand_all = float(val_stats["mu_log_mae"])
+                cand_high = float(val_stats.get("mu_log_mae_high_mu", float("inf")))
+                take_ckpt = False
+                ckpt_reason = ""
+                if best_state is None:
+                    take_ckpt = True
+                    ckpt_reason = "first checkpoint"
+                elif pareto_ckpt:
+                    all_improves = cand_all <= (best_mu_log_all - pareto_all_gain)
+                    high_improves = cand_high <= (best_mu_log_high - pareto_high_gain)
+                    all_ok = cand_all <= (best_mu_log_all + pareto_all_tol)
+                    high_ok = cand_high <= (best_mu_log_high + pareto_high_tol)
+                    if all_improves and high_ok:
+                        take_ckpt = True
+                        ckpt_reason = "Pareto(all improved, high within tol)"
+                    elif high_improves and all_ok:
+                        take_ckpt = True
+                        ckpt_reason = "Pareto(high improved, all within tol)"
+                elif val_mu_score > best_mu_score:
+                    take_ckpt = True
+                    ckpt_reason = "mu_score improved"
+                if take_ckpt:
                     best_mu_score = val_mu_score
+                    best_mu_log_all = cand_all
+                    best_mu_log_high = cand_high
                     best_state = copy.deepcopy(teacher.state_dict())
                     best_epoch = int(epoch)
+                    print(
+                        f"   💾 Teacher checkpoint updated ({ckpt_reason}) | "
+                        f"all={best_mu_log_all:.4f}, high={best_mu_log_high:.4f}"
+                    )
                 if (
                     early_stop_allowed
                     and target_mu_log_mae is not None
