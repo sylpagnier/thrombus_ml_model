@@ -14,6 +14,8 @@
 #   walltail_arch_v1_5g - new wall-aware split architecture (5GB).
 #   walltail_arch_v2_long_4g - smoother staged transition, long 4GB wall-tail run.
 #   walltail_arch_v2_long_5g - smoother staged transition, long 5GB wall-tail run.
+#   sweep_arch_4g - unattended 2-leg architecture sweep for 4GB.
+#   sweep_arch_5g - unattended 2-leg architecture sweep for 5GB.
 #
 # Usage:
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -Profile global_plus
@@ -21,7 +23,7 @@
 #   .\scripts\run_biochem_teacher_visc_v4.ps1 -ListProfiles
 #
 param(
-    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g", "carreau_tail_stageAB_wall_4g", "walltail_arch_v1_4g", "walltail_arch_v1_5g", "walltail_arch_v2_long_4g", "walltail_arch_v2_long_5g")]
+    [ValidateSet("global_plus", "high_mu_only", "global_long_stable", "tail_bridge_long", "carreau_tail_split_4g", "carreau_tail_split_5g", "carreau_tail_stageA_diag_4g", "carreau_tail_stageAB_5g", "carreau_tail_stageAB_wall_4g", "walltail_arch_v1_4g", "walltail_arch_v1_5g", "walltail_arch_v2_long_4g", "walltail_arch_v2_long_5g", "sweep_arch_4g", "sweep_arch_5g")]
     [string] $Profile = "global_plus",
     [switch] $ListProfiles,
     [switch] $WideArch,
@@ -48,9 +50,33 @@ if ($ListProfiles) {
     Write-Host "  walltail_arch_v1_5g - wall-aware residual branch + split-head staged objective (5GB)"
     Write-Host "  walltail_arch_v2_long_4g - long wall-tail run with smooth Stage-A->B transition (4GB)"
     Write-Host "  walltail_arch_v2_long_5g - long wall-tail run with smooth Stage-A->B transition (5GB)"
+    Write-Host "  sweep_arch_4g - sequential sweep: carreau_tail_stageAB_wall_4g -> walltail_arch_v2_long_4g"
+    Write-Host "  sweep_arch_5g - sequential sweep: walltail_arch_v1_5g -> walltail_arch_v2_long_5g"
     Write-Host ""
     Write-Host "Use -WideArch on >=6-8GB GPUs to try latent=320 variants."
     exit 0
+}
+
+function Invoke-TeacherProfileChild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ChildProfile
+    )
+    Write-Host ""
+    Write-Host "=== Sweep leg start: $ChildProfile ===" -ForegroundColor Magenta
+    $childArgs = @(
+        "-ExecutionPolicy", "Bypass",
+        "-File", $PSCommandPath,
+        "-Profile", $ChildProfile
+    )
+    if ($ForcePretrain) {
+        $childArgs += "-ForcePretrain"
+    }
+    & powershell @childArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Sweep leg '$ChildProfile' failed with exit code $LASTEXITCODE"
+    }
+    Write-Host "=== Sweep leg complete: $ChildProfile ===" -ForegroundColor Magenta
 }
 
 # Clear stale env from prior experiments.
@@ -96,6 +122,20 @@ $env:BIOCHEM_MU_WALL_LR_MULT = "1.0"
 $env:BIOCHEM_MU_STAGE_TRANSITION_EPOCHS = "0"
 
 switch ($Profile) {
+    "sweep_arch_4g" {
+        Invoke-TeacherProfileChild -ChildProfile "carreau_tail_stageAB_wall_4g"
+        Invoke-TeacherProfileChild -ChildProfile "walltail_arch_v2_long_4g"
+        Write-Host ""
+        Write-Host "Sweep finished: sweep_arch_4g" -ForegroundColor Green
+        exit 0
+    }
+    "sweep_arch_5g" {
+        Invoke-TeacherProfileChild -ChildProfile "walltail_arch_v1_5g"
+        Invoke-TeacherProfileChild -ChildProfile "walltail_arch_v2_long_5g"
+        Write-Host ""
+        Write-Host "Sweep finished: sweep_arch_5g" -ForegroundColor Green
+        exit 0
+    }
     "global_plus" {
         # 4GB-safe by default; optional wide arch for larger GPUs.
         $env:BIOCHEM_LATENT_DIM = if ($WideArch) { "320" } else { "256" }
