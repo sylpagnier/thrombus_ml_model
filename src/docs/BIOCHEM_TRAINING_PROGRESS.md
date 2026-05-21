@@ -339,6 +339,14 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Checkpointing change** (opt-in): Pareto checkpoint rule (`BIOCHEM_TEACHER_PARETO_CHECKPOINT=1`) updates best model only when all/high tradeoff improves within configured tolerances.
 - **Safety**: all features are env-gated defaults-off so prior behavior is preserved for A/B comparison.
 
+### 34. First split-head tail-focused runs (`carreau_tail_split_4g/5g`) expose an early-training failure mode (2026-05-21)
+
+- **Run 1 (`carreau_tail_split_4g`, RTX500)**: all-truth stayed flat/bad (**~1.519–1.524**), while high-μ improved only mildly (**0.946 -> 0.897** by ep15). Wall error rose to **~3.22** with wall loss disabled.
+- **Run 2 (`carreau_tail_split_5g`, P2200)**: started in a poor basin (all **~1.48**, high **~1.27**, negative `r` on all/high), with no meaningful improvement by ep6.
+- **Interpretation**: turning on split-head + strong anti-collapse floors from epoch 0 can trap optimization before trigger/tail pathway aligns; Pareto kept "least-bad" checkpoints but did not produce useful teacher quality.
+- **Lesson**: stage the objective and regularizers. Early tail-probe should be lighter-constrained (smaller floors, boundary-aware signal), then add stronger global recovery in Stage B.
+- **Action**: add V7 staged profiles: `carreau_tail_stageA_diag_4g` (tail bug-check) and `carreau_tail_stageAB_5g` (A->B curriculum) with separate bulk/tail/gate LR multipliers.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -586,6 +594,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-20 | V4 `high_mu_only` (P2200, in progress to ep12): latent320/prior4, isolate `MU_LOG_HIGH`, `W_high=3.0` | **0.9962** (best so far, ep4) | **2.0248** | **0.373** | high **0.5822** | Confirms high-tail can be learned in isolation, but all/wall stay poor; use as curriculum signal, not standalone objective |
 | 2026-05-21 | V4 `global_long_stable` (RTX500 4GB): 64ep, latent256/prior2, TBPTT=5, RK4=6, LR 1e-3, μ-path LR mult 0.65, TFmin 0.10 | **0.5068** (best, ep30) | **1.9507** | **0.441** | high **0.9062** | More stable than earlier collapse runs but still drifts late (all ~0.95–1.08 by ep63); high-tail improves while all/bulk regresses |
 | 2026-05-21 | V4 `tail_bridge_long` (P2200 5GB): 64ep, latent320/prior4, TBPTT=6, RK4=8, LR 8e-4, μ-path LR mult 0.50, `W(MuLog/MuSI/Wall/High)=1.2/0.8/1.6/2.8` | **0.5184** (best, ep9) | **2.0761** | **0.434** | high **0.9290** | Tail emphasis improved late high-μ (to ~0.42) and high-tail r (~0.74) but did not improve all-truth or wall on patient007 |
+| 2026-05-21 | V6 `carreau_tail_split_4g` (RTX500 4GB): split-head+gate, wall=0, Pareto on, trigger floors 0.8/0.4 | **~1.5194** (best so far, ep3) | **~3.22** | **0.374** | high **0.8971** (ep15) | Mild tail-only gain with severe global failure; demonstrates early split-head config is over-constrained and wall-unbounded |
+| 2026-05-21 | V6 `carreau_tail_split_5g` (P2200 5GB, in progress): split-head+gate, wall=0, Pareto on, trigger floors 0.8/0.4 | **~1.4784** (best so far, ep0) | **~2.51** | **-0.135** | high **~1.266** (ep3) | Poor initial basin (negative high/all correlation) with little movement; needs staged/lighter-constraint curriculum |
 
 ---
 

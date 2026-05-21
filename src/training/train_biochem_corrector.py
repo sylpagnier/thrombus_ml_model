@@ -2009,6 +2009,15 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     if hasattr(model, "mu_delta_head"):
         for param in model.mu_delta_head.parameters():
             param.requires_grad = True
+    if hasattr(model, "mu_delta_bulk_head"):
+        for param in model.mu_delta_bulk_head.parameters():
+            param.requires_grad = True
+    if hasattr(model, "mu_delta_tail_head"):
+        for param in model.mu_delta_tail_head.parameters():
+            param.requires_grad = True
+    if hasattr(model, "mu_trigger_gate_head"):
+        for param in model.mu_trigger_gate_head.parameters():
+            param.requires_grad = True
 
     train_mu_encoder = _biochem_env_truthy("BIOCHEM_TRAIN_MU_ENCODER", default=False)
     if train_mu_encoder and hasattr(model, "mu_encoder"):
@@ -2022,7 +2031,14 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     mu_names: List[str] = []
     bio_names: List[str] = []
     use_mu_path_group = _biochem_env_truthy("BIOCHEM_USE_MU_PATH_GROUP", default=True)
-    mu_group_prefixes = ("mu_encoder.", "learned_clot_penalty.", "mu_delta_head.")
+    mu_group_prefixes = (
+        "mu_encoder.",
+        "learned_clot_penalty.",
+        "mu_delta_head.",
+        "mu_delta_bulk_head.",
+        "mu_delta_tail_head.",
+        "mu_trigger_gate_head.",
+    )
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -2044,6 +2060,9 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     physics_lr = base_lr * float(os.environ.get("BIOCHEM_PHYSICS_LR_MULT", "0.3"))
     mu_lr = base_lr * float(os.environ.get("BIOCHEM_MU_PATH_LR_MULT", "1.0"))
     bio_lr = base_lr * float(os.environ.get("BIOCHEM_BIO_LR_MULT", "1.0"))
+    mu_bulk_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_BULK_LR_MULT", "1.0"))
+    mu_tail_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_TAIL_LR_MULT", "1.0"))
+    mu_gate_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_GATE_LR_MULT", "1.0"))
     print(
         f"   μ trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
         f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)}"
@@ -2060,11 +2079,40 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         if physics_params
         else None
     )
-    opt_mu = (
-        optim.AdamW(mu_params, lr=mu_lr, weight_decay=1e-5)
-        if mu_params
-        else None
-    )
+    split_mu = _biochem_env_truthy("BIOCHEM_USE_SPLIT_MU_HEAD", default=False)
+    if mu_params:
+        if split_mu:
+            mu_group_bulk: List[torch.nn.Parameter] = []
+            mu_group_tail: List[torch.nn.Parameter] = []
+            mu_group_gate: List[torch.nn.Parameter] = []
+            mu_group_rest: List[torch.nn.Parameter] = []
+            for n, p in zip(mu_names, mu_params):
+                if n.startswith("mu_delta_bulk_head."):
+                    mu_group_bulk.append(p)
+                elif n.startswith("mu_delta_tail_head."):
+                    mu_group_tail.append(p)
+                elif n.startswith("mu_trigger_gate_head."):
+                    mu_group_gate.append(p)
+                else:
+                    mu_group_rest.append(p)
+            mu_param_groups: List[Dict[str, Any]] = []
+            if mu_group_rest:
+                mu_param_groups.append({"params": mu_group_rest, "lr": mu_lr})
+            if mu_group_bulk:
+                mu_param_groups.append({"params": mu_group_bulk, "lr": mu_bulk_lr})
+            if mu_group_tail:
+                mu_param_groups.append({"params": mu_group_tail, "lr": mu_tail_lr})
+            if mu_group_gate:
+                mu_param_groups.append({"params": mu_group_gate, "lr": mu_gate_lr})
+            print(
+                f"   μ split-head lrs: base={mu_lr:.3e}, bulk={mu_bulk_lr:.3e}, "
+                f"tail={mu_tail_lr:.3e}, gate={mu_gate_lr:.3e}"
+            )
+            opt_mu = optim.AdamW(mu_param_groups, weight_decay=1e-5)
+        else:
+            opt_mu = optim.AdamW(mu_params, lr=mu_lr, weight_decay=1e-5)
+    else:
+        opt_mu = None
     opt_bio = optim.AdamW(bio_params, lr=bio_lr, weight_decay=1e-5)
     opt_weighter = optim.AdamW(loss_weighter.parameters(), lr=5e-2, weight_decay=0.0)
     return SplitBiochemOptimizers(
@@ -3141,10 +3189,23 @@ def compute_biochem_loss(
     l_mu_log_anchor = torch.tensor(0.0, device=device)
     l_mu_log_wall = torch.tensor(0.0, device=device)
     l_mu_log_high = torch.tensor(0.0, device=device)
+    l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
     w_mu_log_wall_base = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
     w_mu_log_high_base = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
+    stage_switch_ep = max(0, int(os.environ.get("BIOCHEM_MU_STAGE_SWITCH_EPOCH", "0")))
+    if stage_switch_ep > 0 and epoch >= stage_switch_ep:
+        w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT_STAGE_B", str(w_mu_aux))), 0.0)
+        w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT_STAGE_B", str(w_mu_log))), 0.0)
+        w_mu_log_wall_base = max(
+            float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT_STAGE_B", str(w_mu_log_wall_base))),
+            0.0,
+        )
+        w_mu_log_high_base = max(
+            float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT_STAGE_B", str(w_mu_log_high_base))),
+            0.0,
+        )
     wall_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_WALL_RAMP_EPOCHS", "0")))
     high_ramp_epochs = max(0, int(os.environ.get("BIOCHEM_MU_LOG_HIGH_RAMP_EPOCHS", "0")))
     w_mu_log_wall = (
@@ -3191,6 +3252,33 @@ def compute_biochem_loss(
                     cfg_mu,
                     mu_ch,
                 )
+            w_mu_log_boundary = max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0)
+            if (
+                w_mu_log_boundary > 0.0
+                and hasattr(data, "edge_index")
+                and data.edge_index is not None
+                and data.edge_index.numel() >= 2
+            ):
+                pred_last = pred_series_data_freq[-1, :, mu_ch]
+                targ_last = target_series[-1, :, mu_ch]
+                pred_mu = cfg_mu.viscosity_nd_to_si(pred_last)
+                targ_mu = cfg_mu.viscosity_nd_to_si(targ_last)
+                mu_cut = torch.quantile(targ_mu[ma], _mu_val_high_quantile())
+                high_nodes = ma & (targ_mu >= mu_cut)
+                row, col = data.edge_index
+                boundary_edge = high_nodes[row] ^ high_nodes[col]
+                boundary_nodes = torch.zeros_like(ma)
+                if bool(boundary_edge.any()):
+                    boundary_nodes[row[boundary_edge]] = True
+                    boundary_nodes[col[boundary_edge]] = True
+                boundary_nodes = boundary_nodes & ma
+                if bool(boundary_nodes.any()):
+                    l_mu_log_boundary = torch.mean(
+                        torch.abs(
+                            torch.log(torch.clamp(pred_mu[boundary_nodes], min=1e-12))
+                            - torch.log(torch.clamp(targ_mu[boundary_nodes], min=1e-12))
+                        )
+                    )
             if w_mu_aux <= 0.0:
                 l_mu_si_anchor = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
             if w_mu_log <= 0.0:
@@ -3367,6 +3455,7 @@ def compute_biochem_loss(
         )
     elif data_only:
         if has_anchor_supervision:
+            w_mu_log_boundary = max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0)
             loss = (
                 l_data_kine
                 + l_data_bio
@@ -3374,6 +3463,7 @@ def compute_biochem_loss(
                 + (w_mu_log * l_mu_log_anchor)
                 + (w_mu_log_wall * l_mu_log_wall)
                 + (w_mu_log_high * l_mu_log_high)
+                + (w_mu_log_boundary * l_mu_log_boundary)
             )
             if model.training and data_only_phys_temp_wanted:
                 loss = loss + (w_pt * l_phys_temp)
@@ -3400,6 +3490,7 @@ def compute_biochem_loss(
             + (w_mu_log * l_mu_log_anchor)
             + (w_mu_log_wall * l_mu_log_wall)
             + (w_mu_log_high * l_mu_log_high)
+            + (max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0) * l_mu_log_boundary)
             + (w_fi_gate_start_eff * l_fi_gate_start)
             + (lambda_residual_sparse * l_residual_sparse)
         )
@@ -3456,6 +3547,8 @@ def compute_biochem_loss(
         "W_MuLog_wall_eff": float(w_mu_log_wall),
         "L_MuLog_high": l_mu_log_high.item(),
         "W_MuLog_high_eff": float(w_mu_log_high),
+        "L_MuLog_boundary": l_mu_log_boundary.item(),
+        "W_MuLog_boundary_eff": max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0),
         "DataOnlyPhysTempOn": float(data_only_phys_temp_wanted),
         "W_DataOnlyPhysTemp_eff": float(w_pt) if data_only_phys_temp_wanted else 0.0,
         "L_FIGateStart": l_fi_gate_start.item(),
@@ -4363,6 +4456,12 @@ def train_teacher_on_anchors(
             )
             teacher.T_scale = current_T_scale
             kernels.kinetics.T_scale = current_T_scale
+            # Optional explicit trigger-gate sharpening schedule for split μ heads.
+            gate_t_start = float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP_START", "0.20"))
+            gate_t_end = float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP_END", "0.08"))
+            if hasattr(teacher, "mu_trigger_gate_temp"):
+                gate_temp_now = gate_t_start + (gate_t_end - gate_t_start) * decay_progress
+                teacher.mu_trigger_gate_temp = max(gate_temp_now, 1e-5)
             teacher_phys_ceiling = float(
                 os.environ.get(
                     "BIOCHEM_TEACHER_PHYSICS_PRECISION_CEILING",
