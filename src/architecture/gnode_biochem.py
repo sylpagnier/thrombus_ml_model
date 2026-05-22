@@ -11,6 +11,7 @@ from torch_geometric.utils import degree
 # often stabler than adjoint on stiff segments / low RK substep counts).
 from torchdiffeq import odeint, odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
+from src.architecture.siren_decoder import SIRENDecoder
 from src.config import BiochemConfig, NodeFeat
 from src.core_physics.kinematics_clot_prior import clot_prior_features, clot_prior_score_flat
 from src.utils.batching import get_batch_tensor
@@ -103,13 +104,17 @@ class BioODEFunc(nn.Module):
     """
     Calculates the temporal derivative dz/dt of the biochemical latent state.
     """
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, gnode_layers: int = 1):
         super().__init__()
         self.latent_dim = latent_dim
+        self.gnode_layers = max(1, int(gnode_layers))
         # Processor to compute spatial interactions for the derivative
         # Plain Linear (no spectral norm): ODE inner loop runs many times per dopri5 step;
         # spectral_norm power iterations + odeint backprop peak GPU memory.
         self.derivative_processor = GINOBlock(latent_dim, use_spectral_norm=False)
+        self.derivative_processor_extra = nn.ModuleList(
+            [GINOBlock(latent_dim, use_spectral_norm=False) for _ in range(self.gnode_layers - 1)]
+        )
         # Start from a near-steady system (dz/dt ~ 0) and let training grow dynamics.
         self.derivative_scale = nn.Parameter(torch.tensor(1e-5, dtype=torch.float32))
         # Memory-safe accumulator for latent derivative magnitude.
@@ -127,7 +132,10 @@ class BioODEFunc(nn.Module):
     ) -> Tensor:
         n_e = int(edge_index.shape[1])
         mod_dummy = torch.zeros(n_e, 1, dtype=torch.float32, device=z.device)
-        return self.derivative_processor(z, edge_index, edge_attr, batch_idx, mb, mod_dummy, mod_dummy)
+        out = self.derivative_processor(z, edge_index, edge_attr, batch_idx, mb, mod_dummy, mod_dummy)
+        for layer in self.derivative_processor_extra:
+            out = layer(out, edge_index, edge_attr, batch_idx, mb, mod_dummy, mod_dummy)
+        return out
 
     def forward(self, t, z, edge_index, edge_attr, batch_idx, mod_biochem=None):
         # The derivative dz/dt depends strictly on the current biochemical state 'z' and frozen physics.
@@ -190,6 +198,9 @@ class GNODE_Phase3(nn.Module):
         temp_fi=0.05,
         rtol=1e-3,
         atol=1e-4,
+        num_fourier_freqs: int = 8,
+        use_siren_decoder: bool = False,
+        gnode_layers: int = 1,
     ):
         super().__init__()
 
@@ -223,9 +234,11 @@ class GNODE_Phase3(nn.Module):
         self.rheo_log_clamp_min = float(self.phys_cfg.gino_rheo_log_clamp_min)
         self.adv_log_clamp_min = float(self.phys_cfg.gino_adv_log_clamp_min)
 
-        self.num_fourier_freqs = 8
+        self.num_fourier_freqs = max(1, int(num_fourier_freqs))
         freqs = (2.0 ** torch.arange(self.num_fourier_freqs)) * torch.pi
         self.register_buffer("fourier_freqs", freqs)
+        self.use_siren_decoder = bool(use_siren_decoder)
+        self.gnode_layers = max(1, int(gnode_layers))
 
         fourier_channels = 5 * self.num_fourier_freqs * 2
         encoded_channels = (15 - 5) + 5 + fourier_channels
@@ -236,7 +249,15 @@ class GNODE_Phase3(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
         self.kin_processor = GINOBlock(latent_dim, edge_dim=3, num_global_tokens=16)
-        self.kinematics_decoder = nn.Linear(latent_dim, 3)
+        self.kin_processor_extra = nn.ModuleList(
+            [GINOBlock(latent_dim, edge_dim=3, num_global_tokens=16) for _ in range(self.gnode_layers - 1)]
+        )
+        if self.use_siren_decoder:
+            self.siren_decoder = SIRENDecoder(latent_dim=latent_dim)
+            self.kinematics_decoder = None
+        else:
+            self.siren_decoder = None
+            self.kinematics_decoder = nn.Linear(latent_dim, 3)
         self.mu_encoder = nn.Linear(1, latent_dim)
         self.z_prior_proj = SpectralLinear(4, latent_dim)
 
@@ -257,7 +278,7 @@ class GNODE_Phase3(nn.Module):
         self.biochem_attention_boost = math.log(5.0)
 
         # The ODE Function
-        self.ode_func = BioODEFunc(latent_dim)
+        self.ode_func = BioODEFunc(latent_dim, gnode_layers=self.gnode_layers)
 
         # Physical Decoder
         self.biochem_decoder = SpectralLinear(in_features=latent_dim, out_features=12)
@@ -368,8 +389,22 @@ class GNODE_Phase3(nn.Module):
         super().train(mode)
         self.kin_encoder.eval()
         self.kin_processor.eval()
-        self.kinematics_decoder.eval()
+        for layer in self.kin_processor_extra:
+            layer.eval()
+        if self.kinematics_decoder is not None:
+            self.kinematics_decoder.eval()
+        if self.siren_decoder is not None:
+            self.siren_decoder.eval()
         self.mu_encoder.eval()
+
+    def _apply_kin_processor_stack(self, z_in: torch.Tensor, batch, mod_adv, mod_rheo, mod_curve) -> torch.Tensor:
+        num_nodes = int(z_in.shape[0])
+        device = z_in.device
+        batch_idx = get_batch_tensor(batch, num_nodes, device)
+        z_out = self.kin_processor(z_in, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
+        for layer in self.kin_processor_extra:
+            z_out = layer(z_out, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
+        return z_out
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
         nodes_nd = pos_nd if pos_nd is not None else x[:, NodeFeat.XY]
@@ -423,7 +458,11 @@ class GNODE_Phase3(nn.Module):
         Decode latent kinematics directly to (u, v, p) using SDF hard constraints,
         matching the updated GINO_DEQ model.
         """
-        u_v_p = self.kinematics_decoder(z_kin)
+        if self.use_siren_decoder and self.siren_decoder is not None:
+            pos_nd = kin_in[:, NodeFeat.XY]
+            u_v_p, _ = self.siren_decoder(z_kin, pos_nd)
+        else:
+            u_v_p = self.kinematics_decoder(z_kin)
         sdf = kin_in[:, NodeFeat.SDF]
         uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
         u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
@@ -512,14 +551,10 @@ class GNODE_Phase3(nn.Module):
 
         mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
-        def apply_kin_processor(x):
-            batch_idx = get_batch_tensor(batch, num_nodes, device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
-
         with torch.no_grad():
             for _ in range(self.max_inner_iters):
                 injection = self.kin_encoder(kin_encoded) + mu_enc
-                z_kin_next = apply_kin_processor(injection + z_kin)
+                z_kin_next = self._apply_kin_processor_stack(injection + z_kin, batch, mod_adv, mod_rheo, mod_curve)
                 diff = torch.norm(z_kin_next - z_kin, p=2, dim=-1).mean()
                 z_kin = 0.5 * z_kin + 0.5 * z_kin_next
                 if diff < 1e-4:
@@ -628,10 +663,6 @@ class GNODE_Phase3(nn.Module):
 
         mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
-        def apply_kin_processor(x):
-            batch_idx = get_batch_tensor(batch, num_nodes, device)
-            return self.kin_processor(x, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
-
         pred_trajectory = []
         detach_macro_state = self.detach_macro_state_default if detach_macro_state is None else bool(detach_macro_state)
         prev_clot_gate = None
@@ -654,7 +685,9 @@ class GNODE_Phase3(nn.Module):
                 zc = z_kin_ws
                 for _ in range(self.max_inner_iters):
                     injection = self.kin_encoder(kin_encoded) + mu_enc
-                    z_kin_next = apply_kin_processor(injection + zc)
+                    z_kin_next = self._apply_kin_processor_stack(
+                        injection + zc, batch, mod_adv, mod_rheo, mod_curve
+                    )
                     diff = torch.norm(z_kin_next - zc, p=2, dim=-1).mean()
                     zc = 0.5 * zc + 0.5 * z_kin_next
                     if diff < 1e-4:
@@ -662,7 +695,9 @@ class GNODE_Phase3(nn.Module):
                 z_kin_ws = zc
 
             injection = self.kin_encoder(kin_encoded) + mu_enc
-            z_kin = apply_kin_processor(injection + z_kin_ws.detach())
+            z_kin = self._apply_kin_processor_stack(
+                injection + z_kin_ws.detach(), batch, mod_adv, mod_rheo, mod_curve
+            )
             u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
 
             # --- B. UPDATE DYNAMIC RHEOLOGY FOR CURRENT TIME ---

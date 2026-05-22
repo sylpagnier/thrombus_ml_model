@@ -170,6 +170,16 @@ def _biochem_teacher_mu_ratio_max(bio_cfg) -> float:
     return max(float(getattr(bio_cfg, "mu_ratio_max", 80.0)), 1.0)
 
 
+def _apply_biochem_env_aliases() -> None:
+    """Map sweep-friendly alias env vars to canonical training knobs."""
+    tbptt_alias = (os.environ.get("BIOCHEM_TBPTT_WINDOW") or "").strip()
+    if tbptt_alias and "BIOCHEM_TBPTT_MAX_WINDOW" not in os.environ:
+        os.environ["BIOCHEM_TBPTT_MAX_WINDOW"] = tbptt_alias
+    rheo_alias = (os.environ.get("BIOCHEM_RHEOLOGY_CAP") or "").strip()
+    if rheo_alias and "BIOCHEM_TEACHER_MU_RATIO_MAX" not in os.environ:
+        os.environ["BIOCHEM_TEACHER_MU_RATIO_MAX"] = rheo_alias
+
+
 def _resolve_tbptt_anchor_start_idx(
     actual_num_steps: int,
     window_size: int,
@@ -2102,10 +2112,15 @@ def inject_biochem_kinematic_lora(model: GNODE_Phase3, rank: int = 4, alpha: flo
     """Attach LoRA to SpectralLinear layers in the kinematic stack (call before ``setup_biochem_optimization``)."""
     n_enc = inject_lora_to_spectral_linears(model.kin_encoder, rank=rank, alpha=alpha)
     n_proc = inject_lora_to_spectral_linears(model.kin_processor, rank=rank, alpha=alpha)
-    n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
+    n_proc_extra = 0
+    if hasattr(model, "kin_processor_extra"):
+        n_proc_extra = inject_lora_to_spectral_linears(model.kin_processor_extra, rank=rank, alpha=alpha)
+    n_dec = 0
+    if getattr(model, "kinematics_decoder", None) is not None:
+        n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
     print(
         f"💉 LoRA injected (SpectralLinear count): kin_encoder={n_enc}, "
-        f"kin_processor={n_proc}, kinematics_decoder={n_dec} "
+        f"kin_processor={n_proc + n_proc_extra}, kinematics_decoder={n_dec} "
         f"(rank={rank}, alpha={alpha}); plain nn.Linear modules contribute 0."
     )
 
@@ -2290,7 +2305,8 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     # Set the frozen kinematic backbone to eval mode!
     model.kin_encoder.eval()
     model.kin_processor.eval()
-    model.kinematics_decoder.eval()
+    if getattr(model, "kinematics_decoder", None) is not None:
+        model.kinematics_decoder.eval()
 
     # Freeze everything by default to be absolutely safe
     for param in model.parameters():
@@ -3534,6 +3550,12 @@ def compute_biochem_loss(
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
     w_mu_log_wall_base = max(float(os.environ.get("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.0")), 0.0)
     w_mu_log_high_base = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "0.0")), 0.0)
+    mu_loss_scale = max(float(os.environ.get("BIOCHEM_MU_LOSS_SCALE", "1.0")), 0.0)
+    if mu_loss_scale != 1.0:
+        w_mu_aux *= mu_loss_scale
+        w_mu_log *= mu_loss_scale
+        w_mu_log_wall_base *= mu_loss_scale
+        w_mu_log_high_base *= mu_loss_scale
     stage_switch_ep = max(0, int(os.environ.get("BIOCHEM_MU_STAGE_SWITCH_EPOCH", "0")))
     stage_transition_ep = max(0, int(os.environ.get("BIOCHEM_MU_STAGE_TRANSITION_EPOCHS", "0")))
     stage_blend = _biochem_stage_blend(epoch, stage_switch_ep, stage_transition_ep)
@@ -5276,6 +5298,7 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
 
 
 def train_biochem_corrector(epochs=60, lr=1e-3):
+    _apply_biochem_env_aliases()
     _apply_pycharm_biochem_optimal_defaults()
     _preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if _preset in _OVERNIGHT_STEP2_PRESET_ALIASES:
@@ -5348,6 +5371,9 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     # PASS PHYS_CFG TO MODEL
     bio_enc_prior = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2")))
     latent_dim = max(8, int(os.environ.get("BIOCHEM_LATENT_DIM", "256")))
+    fourier_bands = max(1, int(os.environ.get("BIOCHEM_FOURIER_BANDS", "8")))
+    use_siren_decoder = _biochem_env_truthy("BIOCHEM_USE_SIREN", default=False)
+    gnode_layers = max(1, int(os.environ.get("BIOCHEM_GNODE_LAYERS", "1")))
     model = GNODE_Phase3(
         phys_cfg=phys_cfg,
         in_channels=12,
@@ -5360,6 +5386,9 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         fi_crit=bio_cfg.viscosity_fi_crit,
         temp_mat=bio_cfg.viscosity_gnode_temp_mat,
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
+        num_fourier_freqs=fourier_bands,
+        use_siren_decoder=use_siren_decoder,
+        gnode_layers=gnode_layers,
     ).to(device)
     if bio_enc_prior > 0:
         print(
@@ -5367,6 +5396,10 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             f"(BIOCHEM_BIO_ENCODER_PRIOR_DIM)."
         )
     print(f"🧠 Biochem latent_dim={latent_dim} (BIOCHEM_LATENT_DIM).")
+    print(
+        f"🧩 Spatial config: gnode_layers={gnode_layers}, fourier_bands={fourier_bands}, "
+        f"use_siren={int(use_siren_decoder)}."
+    )
 
     # 1. Backbone weights: stage-A kinematics_best.pth is required; optional biochem_best_bio or full latest resume.
     root = get_project_root()
@@ -5446,8 +5479,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         initialize_biochem_priors(model)
     loss_weighter = make_biochem_dynamic_loss_weighter(curriculum, device)
 
-    print("💉 Injecting LoRA into kinematic modules (SpectralLinear layers)...")
-    inject_biochem_kinematic_lora(model)
+    lora_rank = max(0, int(os.environ.get("BIOCHEM_LORA_RANK", "4")))
+    lora_alpha = max(1e-6, float(os.environ.get("BIOCHEM_LORA_ALPHA", "1.0")))
+    if lora_rank > 0:
+        print("💉 Injecting LoRA into kinematic modules (SpectralLinear layers)...")
+        inject_biochem_kinematic_lora(model, rank=lora_rank, alpha=lora_alpha)
+    else:
+        print("💉 LoRA injection skipped (BIOCHEM_LORA_RANK=0).")
 
     if _biochem_debug_enabled():
         cap = _biochem_debug_batches_cap()
@@ -6513,6 +6551,23 @@ def _parse_args():
         action="store_true",
         help="Skip Phase 3a.5 ODE reaction mimic only (sets BIOCHEM_SKIP_ODE_RXN_PRETRAIN=1).",
     )
+    p.add_argument(
+        "--run-name",
+        type=str,
+        default="",
+        help="Optional run note label (maps to BIOCHEM_RUN_NOTE).",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=0,
+        help="Override BIOCHEM_TEACHER_EPOCHS for sweep-style launches.",
+    )
+    p.add_argument(
+        "--save-best",
+        action="store_true",
+        help="Compatibility flag for sweep scripts (best checkpoint saving is enabled by default).",
+    )
     return p.parse_args()
 
 
@@ -6568,6 +6623,15 @@ if __name__ == "__main__":
     else:
         banner = "🆕 Starting a new Biochem run."
     print(banner)
+    if getattr(args, "run_name", ""):
+        os.environ["BIOCHEM_RUN_NOTE"] = str(args.run_name).strip()
+    if int(getattr(args, "epochs", 0) or 0) > 0:
+        ep = str(int(args.epochs))
+        os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep
+        os.environ["BIOCHEM_EPOCHS"] = ep
+    if getattr(args, "save_best", False):
+        # Kept for CLI compatibility with generic sweep launchers.
+        os.environ.setdefault("BIOCHEM_SAVE_BEST", "1")
     try:
         train_biochem_corrector()
     except KeyboardInterrupt:
