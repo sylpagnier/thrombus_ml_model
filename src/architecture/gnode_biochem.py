@@ -688,26 +688,36 @@ class GNODE_Phase3(nn.Module):
                     gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
                     gate_logits = self.mu_trigger_gate_head(trigger_feats)
                     gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
-                    suppressor_thresh = max(
-                        float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI", "1e-4")),
-                        1e-8,
-                    )
-                    bio_signal = torch.clamp((FI_si + Mat_si) / suppressor_thresh, min=0.0, max=1.0)
                     # Physics prior: suppress neural tail/wall corrections when no local clotting mass exists.
                     bio_suppressor_enabled = (
                         (os.environ.get("BIOCHEM_USE_BIO_GATE_SUPPRESSOR", "0") or "").strip().lower()
                         in ("1", "true", "yes", "on")
                     )
                     if bio_suppressor_enabled:
+                        suppressor_thresh = max(
+                            float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI", "1e-4")),
+                            1e-8,
+                        )
+                        suppressor_power = max(
+                            float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_POWER", "1.0")),
+                            0.1,
+                        )
+                        bio_gate_floor = min(
+                            max(float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR", "0.0")), 0.0),
+                            0.95,
+                        )
+                        bio_signal = torch.clamp((FI_si + Mat_si) / suppressor_thresh, min=0.0, max=1.0)
+                        bio_signal = torch.pow(bio_signal, suppressor_power)
+                        if bio_gate_floor > 0.0:
+                            bio_signal = torch.clamp(bio_signal, min=bio_gate_floor, max=1.0)
                         # Detached to avoid rewarding artificial FI/Mat spikes to open the gate.
                         gate = gate * bio_signal.detach()
-                    # Anti-collapse floor: keep trigger path minimally active in biology-supported regions.
-                    gate_floor_bio = max(float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_MIN_BIO", "0.0")), 0.0)
-                    if gate_floor_bio > 0.0:
-                        gate = torch.maximum(
-                            gate,
-                            min(gate_floor_bio, 1.0) * bio_signal.detach(),
-                        )
+                    trigger_gate_min = min(
+                        max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN", "0.0")), 0.0),
+                        0.95,
+                    )
+                    if trigger_gate_min > 0.0:
+                        gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
                     delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
                     delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
                     delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
@@ -722,13 +732,19 @@ class GNODE_Phase3(nn.Module):
                         )
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
                         if bio_suppressor_enabled:
-                            wall_gate = wall_gate * bio_signal.detach()
-                        wall_gate_floor_bio = max(float(os.environ.get("BIOCHEM_MU_WALL_GATE_MIN_BIO", "0.0")), 0.0)
-                        if wall_gate_floor_bio > 0.0:
-                            wall_gate = torch.maximum(
-                                wall_gate,
-                                min(wall_gate_floor_bio, 1.0) * bio_signal.detach(),
+                            wall_suppress_alpha = min(
+                                max(float(os.environ.get("BIOCHEM_BIO_SUPPRESS_WALL_ALPHA", "0.35")), 0.0),
+                                1.0,
                             )
+                            wall_gate = wall_gate * (
+                                (1.0 - wall_suppress_alpha) + (wall_suppress_alpha * bio_signal.detach())
+                            )
+                        wall_gate_min = min(
+                            max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
+                            0.95,
+                        )
+                        if wall_gate_min > 0.0:
+                            wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
                         delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, trigger_feats], dim=1))
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate

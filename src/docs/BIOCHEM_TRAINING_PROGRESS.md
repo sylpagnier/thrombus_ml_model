@@ -410,6 +410,29 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Action**: keep Pareto for safety, but add post-hoc selection from `metrics.jsonl` with a clot-focused score (e.g., weighted all + wall + high) before deciding deployment checkpoint.
 - **Status**: open workflow fix (analysis-side), not a training-kernel blocker.
 
+### 43. Step-2 isolate sweep smoke (`sweep_bio_suppressor` + `sweep_wall_sentinel`): config fix validated, early μ metric still flat (2026-05-22)
+
+- **Setup**: both presets run with `BIOCHEM_STOCK_DEFAULTS=1`, `BIOCHEM_LOSS_ISOLATE=MU_LOG`, `W_MuSI=0.0`, latent=320, prior dim=4, teacher-only startup logs.
+- **What worked**: desired preset wiring is active (explicit isolate banner, `μ SI w=0.0`); no non-finite grad-skip spam was observed before termination.
+- **Validation metric reality**: both runs are effectively flat in early teacher validation: `sweep_bio_suppressor` all-truth `1.5155` (ep00) -> `1.5158/1.5159` (ep06/ep03); `sweep_wall_sentinel` `1.5096` (ep00) -> `1.5101/1.5102` (ep06/ep03).
+- **Subset nuance**: wall/high-μ tradeoff is tiny and non-decisive in both runs; no clear early separation between suppressor-on and suppressor-off at this loss tier.
+- **Resource note**: 4GB run (`sweep_bio_suppressor`) OOMed at ep07 during adjoint backward; 5GB run (`sweep_wall_sentinel`) reached ep06 shown without OOM under the same latent/prior settings.
+
+### 44. Fast split-μ probe (`sweep_wall_sentinel`) unlocked all-truth quickly, but wall remained stuck and gates collapsed (2026-05-22)
+
+- **Setup**: `BIOCHEM_PRESET=sweep_wall_sentinel` with updated fast architecture defaults (`TRAIN_MU_ENCODER=1`, `USE_SPLIT_MU_HEAD=1`, `USE_DELTA_MU_HEAD=1`, `TBPTT=5`, `DETACH_MACRO=1`, teacher-only 14 ep).
+- **What improved**: held-out all-truth `mu_log_mae` dropped strongly from `1.0131` (ep00) to **`0.5496`** (ep08 best checkpoint), confirming the new sweep architecture is trainable and informative within <1h probe budget.
+- **What stayed broken**: wall logMAE remained effectively pinned around **`2.57`** across epochs; bulk `r` stayed weak/negative and final all-truth `r` degraded vs the early best.
+- **Gate diagnosis**: trigger gates rapidly collapsed toward zero (`gate_all` ~`5e-1` -> `1e-20`; `gate_wall` ~`8e-1` -> ~`1.9e-22`), which likely explains improving global magnitude while failing to recover wall-region behavior.
+- **Selection nuance**: best checkpoint by all-truth is ep08 (`all=0.5496`, `high=0.8368`), while best high-μ arrives later (ep12 `high=0.4046`) with weaker all-truth, reaffirming objective tradeoff.
+
+### 45. Fast split-μ probe (`sweep_bio_suppressor`) confirms suppressor can preserve clot-tail but still fails wall recovery (2026-05-22)
+
+- **Setup**: RTX500 4GB, `BIOCHEM_PRESET=sweep_bio_suppressor`, latent=320, prior dim=4, teacher-only 14 ep, `DETACH_MACRO=1`, TBPTT=5.
+- **Result**: best all-truth **0.5923** (ep10), high-μ **0.5563** at that checkpoint (best high-μ reached later **0.3182** ep13), but wall degraded to **~2.59** baseline and **~3.40** at late spikes.
+- **Gate signal**: `gate_all` and `gate_clot` remain high/stable (~0.48), while `gate_wall` is numerically pinned near zero (~1.9e-22) throughout, indicating wall branch starvation despite non-zero wall loss weight.
+- **Interpretation**: this run isolates the current failure mode: suppressor protects tail selectivity but over-suppresses wall correction, producing a strong high-μ vs wall tradeoff rather than balanced gains.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -670,6 +693,10 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Sweep 4G leg B (`walltail_arch_v2_long_4g`, completed 66ep): wall-delta + smooth stage transition | **0.5506** (ep54) | **3.0708** | **0.434** | high **0.3513** (ep48) | Best all/high on 4G but wall remained poor; objective tradeoff persists |
 | 2026-05-22 | Sweep 5G leg A (`walltail_arch_v1_5g`, completed 64ep): wall-delta staged run, Pareto on | **0.5028** (saved ep18) | **3.3940** | **0.312** | high **0.2516** | Later all-truth improved (~0.439) but high-μ worsened; Pareto kept early checkpoint |
 | 2026-05-22 | Sweep 5G leg B (`walltail_arch_v2_long_5g`, in progress / pasted partial): startup + early epochs only | n/a | n/a | n/a | n/a | Await full run completion before ranking against leg A |
+| 2026-05-22 | Step-2 isolate smoke (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4): stock defaults on + `LOSS_ISOLATE=MU_LOG`, `W_MuSI=0`, suppressor on | **1.5155** (ep00; ep06 **1.5158**) | **2.2552** (ep00; ep06 **2.2505**) | **0.369** (ep00; ep06 **0.358**) | high **0.9019** (ep00; ep06 **0.9078**) | Wiring fix verified; metrics flat; OOM at ep07 during adjoint backward |
+| 2026-05-22 | Step-2 isolate smoke (`sweep_wall_sentinel`, P2200 5GB, latent320/prior4): stock defaults on + `LOSS_ISOLATE=MU_LOG`, `W_MuSI=0`, suppressor off | **1.5096** (ep00; ep06 **1.5101**) | **2.2391** (ep00; ep06 **2.2510**) | **0.392** (ep00; ep06 **0.358**) | high **0.8968** (ep00; ep06 **0.9010**) | Same early plateau behavior as suppressor run; no clear separation yet from suppressor toggle alone |
+| 2026-05-22 | Fast split-μ probe (`sweep_wall_sentinel`, P2200 5GB, latent320/prior4, updated preset with μ encoder + split head): 14ep teacher-only, TBPTT=5, `DETACH=1` | **0.5496** (ep08 best) | **2.5698** | **0.402** | high **0.8368** (best-all ckpt; high best **0.4046** ep12) | Major all-truth recovery vs prior ~1.51 plateau, but wall remains stuck and gate values collapse toward zero by late epochs |
+| 2026-05-22 | Fast split-μ probe (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4, updated preset with μ encoder + split head): 14ep teacher-only, TBPTT=5, `DETACH=1` | **0.5923** (ep10 best) | **2.5887** (late spikes **~3.3988**) | **0.398** | high **0.5563** (best-all ckpt; high best **0.3182** ep13) | Suppressor run improves all/high vs old plateau but keeps wall poor; `gate_wall` pinned near zero suggests wall-branch suppression bottleneck |
 
 ---
 
