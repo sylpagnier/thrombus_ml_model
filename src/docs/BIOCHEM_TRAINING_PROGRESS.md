@@ -394,6 +394,22 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **New long profiles**: `walltail_arch_v2_long_4g` and `walltail_arch_v2_long_5g` configured for ~10h teacher runs with lower base LR, smoother transition, and stronger wall branch learning rate.
 - **Status**: code-complete and ready for dual-laptop launch.
 
+### 41. Unattended sweep results: 4G completed, 5G partly completed (2026-05-22)
+
+- **4G sweep leg A (`carreau_tail_stageAB_wall_4g`)**: best all-truth **0.5738** (ep47), wall **1.9561**, high-μ **0.5055**, `r` **0.395**. This is a major wall recovery versus prior ~3.2 wall runs.
+- **4G sweep leg B (`walltail_arch_v2_long_4g`)**: best all-truth **0.5506** (ep54), high-μ **0.3513** (ep48), `r` **0.434**, but wall stayed poor (**~3.07**).
+- **5G sweep leg A (`walltail_arch_v1_5g`)**: checkpoint selected at ep18 with all **0.5028**, wall **3.3940**, high-μ **0.2516**; later epochs improved all-truth to ~**0.439** but worsened high-μ, so Pareto kept earlier checkpoint.
+- **5G sweep leg B (`walltail_arch_v2_long_5g`)**: pasted log is **incomplete** (startup + very early epochs only), so no final comparison yet.
+- **Runtime note**: despite higher VRAM, the 5G machine is **not faster** in wall-clock terms on these profiles; per-val time is roughly ~800s (vs ~400s on 4G), so full runs can take as long or longer.
+- **Decision signal**: on 4G, no single objective dominates — leg A wins wall, leg B wins all/high. On 5G, all-high Pareto tension is now the main blocker.
+
+### 42. Pareto checkpoint policy now blocks “best-for-goal” selection in some runs (2026-05-22)
+
+- **Symptom**: runs can reach much better all-truth later, but saved checkpoint stays earlier because high-μ regresses slightly (example: 5G `walltail_arch_v1_5g`).
+- **Risk**: for clot-use, we need explicit control over wall/high/all tradeoffs; strict 2-objective Pareto can hide practically better checkpoints.
+- **Action**: keep Pareto for safety, but add post-hoc selection from `metrics.jsonl` with a clot-focused score (e.g., weighted all + wall + high) before deciding deployment checkpoint.
+- **Status**: open workflow fix (analysis-side), not a training-kernel blocker.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -650,6 +666,10 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-21 | V7 `carreau_tail_stageAB_5g` continuation (RUN 2, P2200 5GB to ep35): staged split-head A→B, wall=0, Pareto on | **0.7121** (ep30) | **2.0834** | **0.445** (best all-r ~0.471 ep21) | high **0.4447** (ep15) | Significant improvement vs early V7 and V6 basins; still tail-first compromise and below global best (~0.39-0.40) |
 | 2026-05-21 | V9 `walltail_arch_v1_4g` (RTX500 4GB, ongoing to ep36 shown): split-head + wall-delta branch, staged wall-on, Pareto on | **0.5778** (ep30 best so far) | **3.0722** | **0.433** | high **0.3837** (ep27) | Strong all/high gains but wall remains catastrophic; late instability after ep30 (ep33 all=1.1755) |
 | 2026-05-21 | V9 `walltail_arch_v1_5g` (P2200 5GB, ongoing to ep15 shown): split-head + wall-delta branch, staged wall-on, Pareto on | **0.7744** (ep3 best so far) | **2.4378** | **0.285** | high **0.4350** (ep9) | Highly non-monotonic early dynamics; wall modestly better than 4G but all-truth unstable; motivates smoother stage transition + stronger wall gating |
+| 2026-05-22 | Sweep 4G leg A (`carreau_tail_stageAB_wall_4g`, completed 48ep): split-head staged run, wall reintroduced in Stage B, Pareto on | **0.5738** (ep47) | **1.9561** | **0.395** | high **0.5055** | Best wall result in this sweep; stable late improvement and strong global recovery |
+| 2026-05-22 | Sweep 4G leg B (`walltail_arch_v2_long_4g`, completed 66ep): wall-delta + smooth stage transition | **0.5506** (ep54) | **3.0708** | **0.434** | high **0.3513** (ep48) | Best all/high on 4G but wall remained poor; objective tradeoff persists |
+| 2026-05-22 | Sweep 5G leg A (`walltail_arch_v1_5g`, completed 64ep): wall-delta staged run, Pareto on | **0.5028** (saved ep18) | **3.3940** | **0.312** | high **0.2516** | Later all-truth improved (~0.439) but high-μ worsened; Pareto kept early checkpoint |
+| 2026-05-22 | Sweep 5G leg B (`walltail_arch_v2_long_5g`, in progress / pasted partial): startup + early epochs only | n/a | n/a | n/a | n/a | Await full run completion before ranking against leg A |
 
 ---
 

@@ -688,19 +688,34 @@ class GNODE_Phase3(nn.Module):
                     gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
                     gate_logits = self.mu_trigger_gate_head(trigger_feats)
                     gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
+                    # Physics prior: suppress neural tail/wall corrections when no local clotting mass exists.
+                    bio_suppressor_enabled = (
+                        (os.environ.get("BIOCHEM_USE_BIO_GATE_SUPPRESSOR", "0") or "").strip().lower()
+                        in ("1", "true", "yes", "on")
+                    )
+                    if bio_suppressor_enabled:
+                        suppressor_thresh = max(
+                            float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI", "1e-4")),
+                            1e-8,
+                        )
+                        bio_signal = torch.clamp((FI_si + Mat_si) / suppressor_thresh, min=0.0, max=1.0)
+                        # Detached to avoid rewarding artificial FI/Mat spikes to open the gate.
+                        gate = gate * bio_signal.detach()
                     delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
                     delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
                     delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
                     if _biochem_wall_delta_head_enabled():
                         wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
-                        wall_signal = torch.maximum(
+                        wall_signal_val = torch.maximum(
                             wall_prox,
                             self.mu_wall_mask_mix * wall_mask,
                         )
-                        wall_logits = (wall_signal - self.mu_wall_gate_center) / max(
+                        wall_logits = (wall_signal_val - self.mu_wall_gate_center) / max(
                             self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
                         )
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
+                        if bio_suppressor_enabled:
+                            wall_gate = wall_gate * bio_signal.detach()
                         delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, trigger_feats], dim=1))
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate

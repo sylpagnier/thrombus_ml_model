@@ -735,6 +735,57 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
     )
 
 
+_SWEEP_WALL_SENTINEL_ALIASES = frozenset({"sweep_wall_sentinel"})
+
+
+def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_WALL_SENTINEL_ALIASES:
+        return
+    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "3",
+        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_TEACHER_EPOCHS": "35",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.08",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.01",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "0",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Heavy Wall penalties + Sharp gates active.", flush=True)
+
+
+_SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
+
+
+def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_BIO_SUPPRESSOR_ALIASES:
+        return
+    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "3",
+        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_TEACHER_EPOCHS": "35",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
+        "BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI": "1e-4",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Physics-inspired Biological Suppressor active.", flush=True)
+
+
 def _apply_pycharm_biochem_optimal_defaults() -> None:
     """Apply set-if-missing env defaults: fast-iterate schedule + data-only step-2 supervision.
 
@@ -850,6 +901,8 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_comprehensive_mu_if_requested()
     _apply_biochem_preset_teacher_visc_baseline_if_requested()
     _apply_biochem_preset_teacher_max_complexity_if_requested()
+    _apply_biochem_preset_sweep_wall_sentinel_if_requested()
+    _apply_biochem_preset_sweep_bio_suppressor_if_requested()
     _apply_biochem_complexity_step3_env()
 
 
@@ -1135,6 +1188,23 @@ def _compute_mu_flow_debug_metrics(
         out["DBG_mu_log_mae_final_anchor"] = float("nan")
         out["DBG_mu_gt_si_mean_truth"] = float("nan")
         out["DBG_mu_gt_si_p90_truth"] = float("nan")
+
+    if hasattr(model, "_last_mu_trigger_gate") and model._last_mu_trigger_gate is not None:
+        gate = model._last_mu_trigger_gate.view(-1).float()
+        out["DBG_gate_mean_all"] = _masked_mean(gate, m_all)
+        out["DBG_gate_mean_wall"] = _masked_mean(gate, m_truth & m_wall)
+        if target_final_mu_nd is not None and bool(m_truth.any().item()):
+            mu_gt_si = (
+                phys_cfg.viscosity_nd_to_si(target_final_mu_nd).reshape(-1).float().to(mu_pred_si.device)
+            )
+            if mu_gt_si[m_truth].numel() > 0:
+                high_thr = torch.quantile(mu_gt_si[m_truth], 0.9)
+                m_high = m_truth & (mu_gt_si >= high_thr)
+                out["DBG_gate_mean_clot"] = _masked_mean(gate, m_high)
+            else:
+                out["DBG_gate_mean_clot"] = float("nan")
+        else:
+            out["DBG_gate_mean_clot"] = float("nan")
 
     # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref × width).
     u = pred_final[:, 0].float()
@@ -4521,6 +4591,10 @@ def train_teacher_on_anchors(
             epoch_dbg_flow_trivial_sum = 0.0
             epoch_dbg_flux_n = 0
             epoch_dbg_mu_log_anchor_sum = 0.0
+            epoch_dbg_gate_all_sum = 0.0
+            epoch_dbg_gate_wall_sum = 0.0
+            epoch_dbg_gate_clot_sum = 0.0
+            epoch_dbg_gate_n = 0
             epoch_dbg_n = 0
             n_batches = 0
             for batch_idx, data in enumerate(teacher_loader):
@@ -4576,6 +4650,9 @@ def train_teacher_on_anchors(
                 dbg_qre = float(metrics.get("DBG_Q_inlet_rel_err", float("nan")))
                 dbg_triv = float(metrics.get("DBG_flow_trivial_score", float("nan")))
                 dbg_lm = float(metrics.get("DBG_mu_log_mae_final_anchor", float("nan")))
+                dbg_gate_all = float(metrics.get("DBG_gate_mean_all", float("nan")))
+                dbg_gate_wall = float(metrics.get("DBG_gate_mean_wall", float("nan")))
+                dbg_gate_clot = float(metrics.get("DBG_gate_mean_clot", float("nan")))
                 if (
                     math.isfinite(dbg_mu1)
                     and math.isfinite(dbg_mu2)
@@ -4593,6 +4670,11 @@ def train_teacher_on_anchors(
                     epoch_dbg_q_rel_err_sum += dbg_qre
                     epoch_dbg_flow_trivial_sum += dbg_triv
                     epoch_dbg_flux_n += 1
+                if math.isfinite(dbg_gate_all) and math.isfinite(dbg_gate_wall) and math.isfinite(dbg_gate_clot):
+                    epoch_dbg_gate_all_sum += dbg_gate_all
+                    epoch_dbg_gate_wall_sum += dbg_gate_wall
+                    epoch_dbg_gate_clot_sum += dbg_gate_clot
+                    epoch_dbg_gate_n += 1
                 n_batches += 1
                 if ema_l_bio is None:
                     ema_l_bio = current_l_bio
@@ -4782,6 +4864,21 @@ def train_teacher_on_anchors(
                     else None
                 ),
                 "dbg_final_anchor_mu_log_mae_mean": (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n))),
+                "dbg_gate_mean_all": (
+                    epoch_dbg_gate_all_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else None
+                ),
+                "dbg_gate_mean_wall": (
+                    epoch_dbg_gate_wall_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else None
+                ),
+                "dbg_gate_mean_clot": (
+                    epoch_dbg_gate_clot_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else None
+                ),
                 "val_mu_mae_si": float(val_stats["mu_mae_si"]) if val_stats is not None else None,
                 "val_mu_rmse_si": float(val_stats["mu_rmse_si"]) if val_stats is not None else None,
                 "val_mu_log_mae": float(val_stats["mu_log_mae"]) if val_stats is not None else None,

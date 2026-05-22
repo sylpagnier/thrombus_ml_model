@@ -62,7 +62,7 @@ def _viz_biochem_ode_speedups() -> Iterator[None]:
         if saved["BIOCHEM_ODEINT_USE_ADJOINT"] is None:
             os.environ["BIOCHEM_ODEINT_USE_ADJOINT"] = "0"
         if saved["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] is None:
-            os.environ["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] = "8"
+            os.environ["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] = "4"
         yield
     finally:
         for k, old in saved.items():
@@ -367,6 +367,8 @@ def run_phase_comparison(regenerate=True, seed=42, biochem_checkpoint: Optional[
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ Using device: {device}")
     print(f"🎲 Geometry seed: {seed}")
+    fast_mode = (os.environ.get("VIZ_FAST", "1").strip().lower() not in ("0", "false", "no", "off"))
+    print(f"⚡ Fast visualization mode: {'ON' if fast_mode else 'OFF'}")
     refresh_state = {"requested": False}
 
     # ------------------------------------------------------------------
@@ -431,7 +433,8 @@ def run_phase_comparison(regenerate=True, seed=42, biochem_checkpoint: Optional[
     biochem_meta, biochem_state = _checkpoint_state_dict(_load_torch_checkpoint(biochem_ckpt))
 
     # Kinematics setup (optional faster DEQ for visualization — default matches training)
-    kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", "25"))
+    kin_default_iters = "12" if fast_mode else "25"
+    kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", kin_default_iters))
     kin_max_iters = max(5, min(80, kin_max_iters))
     phys_cfg_kine = PhysicsConfig(phase="kinematics")
     model_kine_base = GINO_DEQ(
@@ -470,7 +473,7 @@ def run_phase_comparison(regenerate=True, seed=42, biochem_checkpoint: Optional[
     print(f"   ↳ bio_encoder prior dim: {bio_enc_prior}")
     print(f"   ↳ latent_dim: {latent_dim}")
     _viz_inner = os.environ.get("VIZ_BIOCHEM_MAX_INNER_ITERS", "").strip()
-    biochem_inner_iters = int(_viz_inner) if _viz_inner else 10
+    biochem_inner_iters = int(_viz_inner) if _viz_inner else (6 if fast_mode else 10)
     biochem_inner_iters = max(3, min(25, biochem_inner_iters))
     model_biochem = GNODE_Phase3(
         phys_cfg=phys_cfg_biochem,
@@ -515,55 +518,77 @@ def run_phase_comparison(regenerate=True, seed=42, biochem_checkpoint: Optional[
         t_ref = float(bio_cfg.t_final)
         t_final_si = float(dense_times_si_full[-1].item())
         n_full = int(dense_times_si_full.numel())
-        # Each macro step runs a full DEQ-style kinematics solve + an ODE segment — interactive viz
-        # must subsample the COMSOL-sized grid (often ~60+ steps) or a single run can take many minutes.
-        n_cap_raw = (os.environ.get("VIZ_BIOCHEM_MACRO_STEPS") or "16").strip()
-        if n_cap_raw == "0" or (n_cap_raw.lower() in ("full", "all")):
-            n_macro_use = n_full
-        else:
-            try:
-                n_cap = max(4, min(512, int(n_cap_raw)))
-            except ValueError:
-                n_cap = 16
-            n_macro_use = min(n_full, n_cap)
-        dense_times_si = torch.linspace(
-            0.0, t_final_si, steps=n_macro_use, device=device, dtype=torch.float32
-        )
-        dense_times = to_t_nd(dense_times_si, t_ref)
-        dt_si = float((dense_times_si[1] - dense_times_si[0]).item())
-        if dt_si <= 0.0:
-            raise ValueError(f"Invalid biochem timeline step dt_si={dt_si}. Expected strictly positive spacing.")
-        dt_nd = float((dense_times[1] - dense_times[0]).item())
-        if dt_nd <= 0.0:
-            raise ValueError(f"Invalid ND timeline step dt_nd={dt_nd}. Expected strictly positive spacing.")
+        default_mode = "keyframes" if fast_mode else "dense"
+        time_mode = (os.environ.get("VIZ_BIOCHEM_TIME_MODE", default_mode) or default_mode).strip().lower()
+        extend_mult_default = 1.2 if fast_mode else 1.5
+        try:
+            extend_mult = float(os.environ.get("VIZ_BIOCHEM_EXTEND_MULT", str(extend_mult_default)))
+        except ValueError:
+            extend_mult = extend_mult_default
+        extend_mult = max(1.0, extend_mult)
+        custom_times = [0.0, t_final_si * 0.33, t_final_si * 0.66, t_final_si, t_final_si * extend_mult]
 
-        num_extra = max(1, int((t_final_si * 0.5) / dt_si))
-        extended_times = torch.cat([            dense_times,
-            dense_times[-1] + dt_nd * torch.arange(1, num_extra + 1, device=device, dtype=dense_times.dtype),
-        ])
-        print(
-            f"   ↳ Biochem rollout: {extended_times.numel()} macro knots "
-            f"(using {n_macro_use}/{n_full} time samples; set VIZ_BIOCHEM_MACRO_STEPS=0 for full density)",
-            flush=True,
-        )
+        if time_mode in ("keyframe", "keyframes", "sparse"):
+            rollout_times_si = torch.tensor(custom_times, device=device, dtype=torch.float32)
+            rollout_times = to_t_nd(rollout_times_si, t_ref)
+            print(
+                f"   ↳ Biochem rollout: {rollout_times.numel()} keyframes "
+                f"(mode={time_mode}; set VIZ_BIOCHEM_TIME_MODE=dense for higher fidelity)",
+                flush=True,
+            )
+        else:
+            # Each macro step runs a full DEQ-style kinematics solve + an ODE segment — interactive viz
+            # must subsample the COMSOL-sized grid (often ~60+ steps) or a single run can take many minutes.
+            n_cap_default = "8" if fast_mode else "16"
+            n_cap_raw = (os.environ.get("VIZ_BIOCHEM_MACRO_STEPS") or n_cap_default).strip()
+            if n_cap_raw == "0" or (n_cap_raw.lower() in ("full", "all")):
+                n_macro_use = n_full
+            else:
+                try:
+                    n_cap = max(4, min(512, int(n_cap_raw)))
+                except ValueError:
+                    n_cap = int(n_cap_default)
+                n_macro_use = min(n_full, n_cap)
+            dense_times_si = torch.linspace(
+                0.0, t_final_si, steps=n_macro_use, device=device, dtype=torch.float32
+            )
+            dense_times = to_t_nd(dense_times_si, t_ref)
+            dt_si = float((dense_times_si[1] - dense_times_si[0]).item())
+            if dt_si <= 0.0:
+                raise ValueError(f"Invalid biochem timeline step dt_si={dt_si}. Expected strictly positive spacing.")
+            dt_nd = float((dense_times[1] - dense_times[0]).item())
+            if dt_nd <= 0.0:
+                raise ValueError(f"Invalid ND timeline step dt_nd={dt_nd}. Expected strictly positive spacing.")
+            extra_frac_default = 0.2 if fast_mode else 0.5
+            try:
+                extra_frac = float(os.environ.get("VIZ_BIOCHEM_EXTRA_FRACTION", str(extra_frac_default)))
+            except ValueError:
+                extra_frac = extra_frac_default
+            extra_frac = max(0.0, extra_frac)
+            num_extra = max(1, int((t_final_si * extra_frac) / max(dt_si, 1e-9)))
+            rollout_times = torch.cat([
+                dense_times,
+                dense_times[-1] + dt_nd * torch.arange(1, num_extra + 1, device=device, dtype=dense_times.dtype),
+            ])
+            print(
+                f"   ↳ Biochem rollout: {rollout_times.numel()} macro knots "
+                f"(mode={time_mode}; using {n_macro_use}/{n_full} base samples)",
+                flush=True,
+            )
 
         t_b0 = time.perf_counter()
         with _viz_biochem_ode_speedups():
-            pred_biochem_series_dense = model_biochem(data_biochem, extended_times)
+            pred_biochem_series_dense = model_biochem(data_biochem, rollout_times)
         _cuda_sync()
         print(f"   ↳ Biochem trajectory done in {time.perf_counter() - t_b0:.1f}s", flush=True)
 
         # Extract the keyframes used by the temporal slider (labels stay in SI seconds for the UI).
-        custom_times = [0.0, t_final_si * 0.33, t_final_si * 0.66, t_final_si, t_final_si * 1.5]
         custom_times_nd = [t / t_ref for t in custom_times]
-        frame_indices = [
-            torch.argmin(torch.abs(extended_times - t_nd)).item()
-            for t_nd in custom_times_nd
-        ]
+        frame_indices = [torch.argmin(torch.abs(rollout_times - t_nd)).item() for t_nd in custom_times_nd]
         pred_biochem_series = pred_biochem_series_dense[frame_indices]
 
         # Extract the final *trained* time step for static Fig 1 comparison.
-        idx_t_final = torch.argmin(torch.abs(extended_times - (t_final_si / t_ref))).item()
+        idx_t_final = torch.argmin(torch.abs(rollout_times - (t_final_si / t_ref))).item()
         pred_biochem = pred_biochem_series_dense[idx_t_final]
 
     pred_kine_base_np = pred_kine_base.detach().cpu().numpy()
