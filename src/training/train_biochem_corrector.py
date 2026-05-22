@@ -750,26 +750,33 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
         "BIOCHEM_VAL_TIME_STRIDE": "10",
         "BIOCHEM_STOP_AFTER_TEACHER": "1",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
-        "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
-        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.5",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.8",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
         "BIOCHEM_USE_MU_PATH_GROUP": "1",
         "BIOCHEM_TRAIN_MU_ENCODER": "1",
         "BIOCHEM_USE_DELTA_MU_HEAD": "1",
         "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
         "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
-        "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.08",
-        "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.01",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.12",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.04",
+        "BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT": "2.0",
+        "BIOCHEM_TRIGGER_GATE_MIN_HIGH": "0.10",
+        "BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT": "0.5",
+        "BIOCHEM_TRIGGER_LEARNED_MIN_HIGH": "0.01",
         "BIOCHEM_TBPTT_MAX_WINDOW": "5",
         "BIOCHEM_DETACH_MACRO_STATE": "1",
         "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
-        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "0",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
+        "BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI": "1e-4",
+        "BIOCHEM_MU_TRIGGER_GATE_MIN_BIO": "0.02",
+        "BIOCHEM_MU_WALL_GATE_MIN_BIO": "0.05",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
         "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Step-2 MU isolate + split μ architecture (fast probe).", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: anti-bleed wall-focused split μ probe active.", flush=True)
 
 
 _SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
