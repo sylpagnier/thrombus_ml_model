@@ -935,73 +935,70 @@ def _apply_biochem_preset_sweep_clot_nuc_growth_if_requested() -> None:
     print("✅ BIOCHEM_PRESET=sweep_clot_nuc_growth: sparse nucleation + growth gate probe active.", flush=True)
 
 
-_SWEEP_DECOUPLED_WALL_ALIASES = frozenset({"sweep_decoupled_wall"})
+_SWEEP_FREE_WALL_ALIASES = frozenset({"sweep_free_wall_a"})
 
 
-def _apply_biochem_preset_sweep_decoupled_wall() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_DECOUPLED_WALL_ALIASES:
+def _apply_biochem_preset_sweep_free_wall_a() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_FREE_WALL_ALIASES:
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
         "BIOCHEM_LOSS_DATA_ONLY": "1",
         "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
         "BIOCHEM_TEACHER_EPOCHS": "25",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
-        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
-        "BIOCHEM_STOP_AFTER_TEACHER": "1",
-        "BIOCHEM_TEACHER_VAL_EVERY": "2",
-        "BIOCHEM_VAL_TIME_STRIDE": "10",
-        # VRAM guardrails for 4-5GB cards (avoid adjoint OOM during teacher backward).
-        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
-        "BIOCHEM_DETACH_MACRO_STATE": "1",
-        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
+
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
-        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
-        # Fix 1: Uncap the multiplier so it can hit the 45x Comsol gap.
-        "BIOCHEM_DELTA_MU_LOG_CLIP": "5.0",
-        # Fix 2: Wall ignores biology (since walls do not have fibrin).
         "BIOCHEM_BIO_SUPPRESS_WALL_ALPHA": "0.0",
-        # Fix 3: Wall head ONLY looks at kinematics, zeroing out bio features.
+        "BIOCHEM_DELTA_MU_LOG_CLIP_BULK": "1.5",
+        "BIOCHEM_DELTA_MU_LOG_CLIP_WALL": "5.0",
         "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
         "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_decoupled_wall: Uncapped multiplier & decoupled kinematic wall.", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_free_wall_a: Free Wall Gate + Split Clipping active.", flush=True)
 
 
-_SWEEP_HARD_BC_ALIASES = frozenset({"sweep_hard_bc"})
+_SWEEP_FREE_WALL_B_ALIASES = frozenset({"sweep_free_wall_b"})
 
 
-def _apply_biochem_preset_sweep_hard_bc() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_HARD_BC_ALIASES:
+def _apply_biochem_preset_sweep_free_wall_b() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_FREE_WALL_B_ALIASES:
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
         "BIOCHEM_LOSS_DATA_ONLY": "1",
         "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
         "BIOCHEM_TEACHER_EPOCHS": "25",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
-        "BIOCHEM_MU_LOG_WALL_WEIGHT": "0.0",
-        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "3.0",
-        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
-        "BIOCHEM_STOP_AFTER_TEACHER": "1",
-        "BIOCHEM_TEACHER_VAL_EVERY": "2",
-        "BIOCHEM_VAL_TIME_STRIDE": "10",
-        # VRAM guardrails for 4-5GB cards (avoid adjoint OOM during teacher backward).
-        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
-        "BIOCHEM_DETACH_MACRO_STATE": "1",
-        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "1.5",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "3.5",
+
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
-        "BIOCHEM_USE_WALL_DELTA_HEAD": "0",
-        "BIOCHEM_FORCE_WALL_MU0": "1",
+        "BIOCHEM_BIO_SUPPRESS_WALL_ALPHA": "0.0",
+        "BIOCHEM_DELTA_MU_LOG_CLIP_BULK": "1.5",
+        "BIOCHEM_DELTA_MU_LOG_CLIP_WALL": "5.0",
+        "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
         "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_hard_bc: Hardcoded CFD boundary active. Neural wall disabled.", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_free_wall_b: High Clot Penalty + Split Clipping active.", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
@@ -1123,8 +1120,8 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_sweep_bio_suppressor_if_requested()
     _apply_biochem_preset_sweep_wall_overcomp_if_requested()
     _apply_biochem_preset_sweep_clot_nuc_growth_if_requested()
-    _apply_biochem_preset_sweep_decoupled_wall()
-    _apply_biochem_preset_sweep_hard_bc()
+    _apply_biochem_preset_sweep_free_wall_a()
+    _apply_biochem_preset_sweep_free_wall_b()
     _apply_biochem_complexity_step3_env()
 
 

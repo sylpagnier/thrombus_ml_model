@@ -481,6 +481,45 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Fix**: align both wall feature constructors to the new 19-D trigger schema in `GNODE_Phase3.forward` (including detached cues), restoring shape parity with `mu_delta_wall_head`.
 - **Status**: fixed in code; rerun the same preset pair to resume A/B testing.
 
+### 53. First A/B after nucleation-growth rollout: better all-truth, unchanged wall, unstable high-tail tradeoff (2026-05-22)
+
+- **A (new preset `sweep_clot_nuc_growth`, RTX500 4GB)**: best all-truth improved to **0.4854** (ep15), but wall stayed pinned at **~2.589** and high-μ at the best-all checkpoint was weak (**0.9232**). Best high-μ occurred on a different checkpoint (**0.4812** at ep14) where all-truth regressed (**0.6198**).
+- **B (old baseline `sweep_bio_suppressor`, P2200 5GB)**: best all-truth **0.5220** (ep13), wall still **~2.589**, with better high-μ at best-all (**0.6200**).
+- **Gate behavior contrast**: run A showed near-saturated wall gate throughout (`gate_wall≈1.0`, `gate_all≈0.41` almost flat), while run B remained floor-clamped at wall (`gate_wall≈0.06`) with broader gate_all variation; neither behavior translated to wall-logMAE movement.
+- **Interpretation**: new architecture gives a meaningful global μ gain (~0.037 all-truth vs baseline) but does not solve wall, and still shows all-vs-high checkpoint tension. This is progress, but not a gate flip for wall.
+
+### 54. New boundary presets (`sweep_hard_bc`, `sweep_decoupled_wall`) fail by memory before signal (2026-05-22)
+
+- **Setup**: both runs used latent `320`, prior dim `4`, teacher-only objective isolate `MU_LOG`, stock env path active (`BIOCHEM_STOCK_DEFAULTS=1`) with teacher epochs `25`.
+- **Observed training behavior**: both presets stayed essentially flat around the known plateau (`all ~1.48`) through available validation checkpoints; subset movement was negligible despite different wall handling strategies.
+- **Failure mode**: both crashed in teacher backward (`torchdiffeq` adjoint path) with CUDA OOM (`+40-44 MiB` alloc failure) after several epochs; this occurred on both 4GB and 5GB GPUs.
+- **Likely cause**: with current preset bundles, runtime still used heavy memory settings (`TBPTT_cap=12`, `DETACH_MACRO=0`) and did not expose split/gated wall diagnostics (`gate_*` reported `nan`), so the runs were dominated by adjoint memory pressure before boundary-learning hypotheses could be tested.
+- **Implication**: these two presets are not yet valid scientific A/B probes in their current runtime envelope; they need an explicit 4-5GB-safe teacher profile before comparing boundary mechanisms.
+
+### 55. Boundary A/B rerun with VRAM-safe profile completed; expected wall effects did not appear (2026-05-22)
+
+- **Setup**: reran both presets after adding memory guardrails (`TBPTT=5`, `DETACH=1`, `ADJOINT_RK4_SUBSTEPS=8`, teacher-only). Both runs completed all 25 teacher epochs without OOM.
+- **Run A (`sweep_hard_bc`) outcome**: wall stayed flat at **~2.4594** from ep00 to ep24; all-truth remained poor/flat (**1.5145 -> 1.5142**), high-μ was nearly unchanged (**0.9671 -> 0.9668**).
+- **Run B (`sweep_decoupled_wall`) outcome**: no wall unfreeze (`~2.2517` throughout), while all/high improved only marginally (**all 1.4593 -> 1.4589**, high 0.9508 -> 0.9507).
+- **Expectation check**: predicted signatures did not occur — no ep00 wall collapse in hard-BC and no progressive wall drop in decoupled-wall.
+- **Additional signal**: both runs still show `gate_all/gate_wall/gate_clot = nan`, meaning split-gate diagnostics are not active in this preset path; `μ trainability` also reports `BIOCHEM_TRAIN_MU_ENCODER=0`.
+- **Interpretation**: memory stability is fixed, but these settings still sit in the same teacher plateau regime; boundary overrides alone (without an actively trainable split/gated μ path and matching wall objective behavior) are insufficient in this stack.
+
+### 56. Decoupled-wall rerun with split-head explicitly on still shows early plateau behavior (2026-05-22, in progress)
+
+- **Setup**: `BIOCHEM_PRESET=sweep_decoupled_wall` on RTX500 with explicit `BIOCHEM_USE_SPLIT_MU_HEAD=1`, VRAM-safe teacher settings (`TBPTT=5`, `DETACH=1`, `ADJOINT_RK4_SUBSTEPS=8`).
+- **What improved**: startup now confirms split-head optimizer groups are active (`μ split-head lrs` printed), and run remains stable (no OOM through ep10 shown).
+- **What has not improved yet**: validation metrics remain nearly flat in early teacher epochs (`all 1.4805 -> 1.4803`, wall fixed at `2.4299`, high `0.9372` unchanged), with `gate_all/gate_wall/gate_clot` still logged as `nan`.
+- **Interpretation**: enabling split-head alone did not immediately unlock wall dynamics in this configuration; continue run for full curve, but early trend still matches the historical plateau family.
+
+### 57. Decoupled-wall rerun with master μ switches on: major global recovery, wall improved but still bottleneck (2026-05-22, in progress)
+
+- **Setup**: `sweep_decoupled_wall` on RTX500 with explicit μ-path switches enabled (`USE_MU_PATH_GROUP=1`, `TRAIN_MU_ENCODER=1`, `USE_DELTA_MU_HEAD=1`) plus split-head and VRAM-safe teacher profile.
+- **Immediate effect**: run escaped the old ~1.48 plateau quickly (ep00 all-truth `0.7680`, ep02 `0.5475`, ep10 best-so-far `0.3236`).
+- **Wall signal**: wall error improved from `2.1440` (ep00) to `~1.43` (ep06/ep14 neighborhood), so wall is no longer fully pinned in the old ~2.4-2.6 band.
+- **Tradeoff still active**: high-μ tail is unstable across checkpoints (e.g., `1.0205` ep00 -> `0.8271` ep08 -> `1.1690` ep12 -> `0.5702` ep14) while all-truth also oscillates (`0.3236` ep10 then worse at ep12/14).
+- **Diagnostics note**: gates are now finite (`gate_all ~0.48`, `gate_clot ~0.47`), but `gate_wall` remains `0.000e+00` in printed μ debug.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -758,6 +797,14 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Crash-only run (`sweep_bio_suppressor`, P2200 5GB, latent320/prior4, post nucleation-growth patch) | n/a (preflight crash) | n/a | n/a | n/a | Runtime shape mismatch in wall residual path (`16127x336` vs `339x64`) due to 16-D wall-detach features feeding 19-D wall head; fixed same day |
 | 2026-05-22 | Newest Run1 (`sweep_bio_suppressor`, RTX500 4GB): teacher-only, `LOSS_ISOLATE=MU_LOG`, latent320/prior4, TBPTT=5, `DETACH=1`, 14ep | **0.4720** (ep10 best) | **2.5933** | **0.403** | high **0.6169** (best-all ckpt; high best **0.4174** ep12) | Strong global recovery and decent tail checkpoint, but wall remains locked near ~2.59; confirms persistent wall bottleneck under MU_LOG isolate |
 | 2026-05-22 | Newest Run2 (`sweep_wall_overcomp`, P2200 5GB): teacher-only, `LOSS_ISOLATE=MU_LOG_WALL`, latent320/prior4, TBPTT=5, `DETACH=1`, 14ep | **0.6115** (ep04 best) | **3.0573** (ep13 shown; ~3.06 band after ep2) | **0.409** | high **1.1266** | Wall-isolate objective overcompensates and collapses gates to floor (0.03), degrading wall and high-μ despite early all-truth gains |
+| 2026-05-22 | A/B post-hotfix **A** (`sweep_clot_nuc_growth`, RTX500 4GB, latent320/prior4, 16ep, `MU_LOG` isolate, nucleation-growth enabled) | **0.4854** (ep15 best) | **2.5885** | **0.403** | high **0.9232** (best-all ckpt; high best **0.4812** ep14) | Best all-truth beats paired baseline, but wall is unchanged and high-μ remains checkpoint-sensitive (all-vs-high tradeoff persists) |
+| 2026-05-22 | A/B post-hotfix **B** (`sweep_bio_suppressor`, P2200 5GB, latent320/prior4, 14ep, `MU_LOG` isolate, nucleation-growth disabled) | **0.5220** (ep13 best) | **2.5890** | **0.401** | high **0.6200** | Baseline underperforms new preset on all-truth but gives better high-μ at best-all checkpoint; wall remains effectively pinned |
+| 2026-05-22 | Boundary A/B **Run 1** (`sweep_hard_bc`, RTX500 4GB): latent320/prior4, teacher-only isolate `MU_LOG`, hard wall override enabled (`FORCE_WALL_MU0=1`, wall head off) | **1.4808** (ep03-06 best shown) | **2.4594** | **0.037** | high **0.9761** | Flat μ trajectory with no meaningful epoch-wise gain; crashed at teacher ep07 backward with adjoint CUDA OOM (+40 MiB alloc fail) |
+| 2026-05-22 | Boundary A/B **Run 2** (`sweep_decoupled_wall`, P2200 5GB): latent320/prior4, teacher-only isolate `MU_LOG`, uncapped delta + wall decoupling | **1.4828** (ep15 best shown) | **2.2522** | **0.352** | high **0.9514** | Also flat around ~1.48 despite longer survival; crashed at/after ep15 with adjoint CUDA OOM (+44 MiB alloc fail); run not completed to 25 epochs |
+| 2026-05-22 | Boundary A/B rerun **Run 1** (`sweep_hard_bc`, RTX500 4GB, VRAM-safe profile): `TBPTT=5`, `DETACH=1`, teacher-only 25ep | **1.5142** (ep24) | **2.4594** | **0.036** | high **0.9668** | Completed without OOM; expected hard-BC wall collapse did not occur (wall flat across all vals) |
+| 2026-05-22 | Boundary A/B rerun **Run 2** (`sweep_decoupled_wall`, P2200 5GB, VRAM-safe profile): `TBPTT=5`, `DETACH=1`, teacher-only 25ep | **1.4589** (ep24) | **2.2517** | **0.353** | high **0.9507** | Completed without OOM; no wall unfreeze trend and only tiny all/high drift within same plateau family |
+| 2026-05-22 | Decoupled-wall split-head rerun (RTX500 4GB, **in progress** through ep10): `sweep_decoupled_wall`, `USE_SPLIT_MU_HEAD=1`, `TBPTT=5`, `DETACH=1` | **1.4803** (ep10 best so far) | **2.4299** | **0.395** | high **0.9372** | Stable/no OOM and split-head LR groups are active, but early metrics remain flat; wall has not unfrozen yet |
+| 2026-05-22 | Decoupled-wall rerun with master μ switches (RTX500 4GB, **in progress** through ep14): `sweep_decoupled_wall` + `USE_MU_PATH_GROUP=1` + `TRAIN_MU_ENCODER=1` + `USE_DELTA_MU_HEAD=1` + split-head | **0.3236** (ep10 best so far) | **1.4307** (best shown) | **0.420** (peak shown ep00; ~0.258-0.358 later) | high **0.5702** (best shown ep14; unstable) | Strong escape from plateau and meaningful wall improvement; still non-monotonic with all/high tradeoff and `gate_wall` printed as zero |
 
 ---
 

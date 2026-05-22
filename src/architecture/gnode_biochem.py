@@ -792,33 +792,14 @@ class GNODE_Phase3(nn.Module):
                         gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
                     delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
                     delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
-                    delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+                    delta_log_mu_bulk_tail = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+
+                    # --- NEW: SPLIT CLIPPING (Safe Bulk) ---
+                    bulk_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_BULK", "1.5"))
+                    delta_log_mu = torch.clamp(delta_log_mu_bulk_tail, min=-bulk_clip, max=bulk_clip)
+
                     if _biochem_wall_delta_head_enabled():
                         wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
-                        wall_detach_species = (
-                            (os.environ.get("BIOCHEM_WALL_DETACH_SPECIES", "0") or "").strip().lower()
-                            in ("1", "true", "yes", "on")
-                        )
-                        if wall_detach_species:
-                            wall_trigger_feats = torch.cat(
-                                [
-                                    sp_safe.detach(),
-                                    FI_si.detach(),
-                                    Mat_si.detach(),
-                                    gamma_dot.to(dtype=sp_safe.dtype),
-                                    wall_prox,
-                                    wall_mask,
-                                    adverse_shear_cue.detach(),
-                                    low_shear_cue.detach(),
-                                ],
-                                dim=1,
-                            )
-                        else:
-                            wall_trigger_feats = trigger_feats
-                        wall_phys_mix = min(
-                            max(float(os.environ.get("BIOCHEM_WALL_HEAD_PHYS_MIX", "0.0")), 0.0),
-                            1.0,
-                        )
                         wall_signal_val = torch.maximum(
                             wall_prox,
                             self.mu_wall_mask_mix * wall_mask,
@@ -826,65 +807,26 @@ class GNODE_Phase3(nn.Module):
                         wall_logits = (wall_signal_val - self.mu_wall_gate_center) / max(
                             self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
                         )
-                        # Optional explicit wall-bias controls to break wall under-activation plateaus.
-                        wall_gate_bias = float(os.environ.get("BIOCHEM_WALL_GATE_BIAS", "0.0"))
-                        wall_mask_boost = float(os.environ.get("BIOCHEM_WALL_MASK_LOGIT_BOOST", "0.0"))
-                        if wall_gate_bias != 0.0 or wall_mask_boost != 0.0:
-                            wall_logits = wall_logits + wall_gate_bias + (wall_mask_boost * wall_mask)
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
+
                         if bio_suppressor_enabled:
-                            wall_suppress_alpha = min(
-                                max(float(os.environ.get("BIOCHEM_BIO_SUPPRESS_WALL_ALPHA", "0.35")), 0.0),
-                                1.0,
-                            )
-                            wall_gate = wall_gate * (
-                                (1.0 - wall_suppress_alpha) + (wall_suppress_alpha * bio_signal.detach())
-                            )
-                        wall_gate_min = min(
-                            max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
-                            0.95,
-                        )
-                        if wall_gate_min > 0.0:
-                            wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
-                        wall_base_blend = min(
-                            max(float(os.environ.get("BIOCHEM_WALL_DELTA_BASE_BLEND", "0.0")), 0.0),
-                            1.0,
-                        )
-                        if wall_base_blend > 0.0:
-                            # Inject a direct wall-mask component so wall branch can move
-                            # even when learned gate remains too conservative.
-                            wall_gate = ((1.0 - wall_base_blend) * wall_gate) + (wall_base_blend * wall_mask)
-                            wall_gate = torch.clamp(wall_gate, min=0.0, max=1.0)
-                        # Optional decoupling: reduce bio-feature leakage into the wall correction head.
-                        if wall_phys_mix > 0.0:
-                            wall_feats_phys = torch.cat(
-                                [
-                                    torch.zeros_like(sp_safe),
-                                    torch.zeros_like(FI_si),
-                                    torch.zeros_like(Mat_si),
-                                    gamma_dot.to(dtype=sp_safe.dtype),
-                                    wall_prox,
-                                    wall_mask,
-                                    adverse_shear_cue,
-                                    low_shear_cue,
-                                ],
-                                dim=1,
-                            )
-                            wall_feats = ((1.0 - wall_phys_mix) * wall_trigger_feats) + (wall_phys_mix * wall_feats_phys)
-                        else:
-                            wall_feats = wall_trigger_feats
-                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, wall_feats], dim=1))
-                        # Optional anti-tail correction: remove part of tail leakage from wall branch.
-                        # Helps separate "near-wall clot tail" from healthy-wall baseline.
-                        wall_anti_tail_coeff = max(
-                            float(os.environ.get("BIOCHEM_WALL_ANTI_TAIL_COEFF", "0.0")),
-                            0.0,
-                        )
-                        if wall_anti_tail_coeff > 0.0:
-                            delta_wall = delta_wall - (wall_anti_tail_coeff * gate * delta_tail.detach())
+                            # --- FIXED: Listen to the Alpha environment variable! ---
+                            wall_alpha = float(os.environ.get("BIOCHEM_BIO_SUPPRESS_WALL_ALPHA", "1.0"))
+                            # If alpha=0, effective_bio is 1.0 (no suppression).
+                            # If alpha=1, effective_bio is strictly the biological mass.
+                            effective_bio = bio_signal.detach() * wall_alpha + (1.0 - wall_alpha)
+                            wall_gate = wall_gate * effective_bio
+
+                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, trigger_feats], dim=1))
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate
                         self._last_mu_delta_wall = delta_wall
+
+                    # --- NEW: SPLIT CLIPPING (Uncapped Wall Boundary) ---
+                    wall_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0"))
+                    delta_log_mu = torch.clamp(delta_log_mu, min=-wall_clip, max=wall_clip)
+                    # ----------------------------------------------------
+
                     # Expose lightweight diagnostics for training loss/metrics.
                     self._last_mu_trigger_gate = gate
                     self._last_mu_delta_bulk = delta_bulk
@@ -898,7 +840,16 @@ class GNODE_Phase3(nn.Module):
                 else:
                     delta_in = torch.cat([z_kin, sp_safe], dim=1)
                     delta_log_mu = self.mu_delta_head(delta_in)
-                delta_log_mu = torch.clamp(delta_log_mu, min=-self.mu_delta_log_clip, max=self.mu_delta_log_clip)
+                effective_delta_clip = self.mu_delta_log_clip
+                if (
+                    (os.environ.get("BIOCHEM_USE_SPLIT_MU_HEAD", "0") or "").strip().lower()
+                    in ("1", "true", "yes", "on")
+                ):
+                    effective_delta_clip = max(
+                        effective_delta_clip,
+                        float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0")),
+                    )
+                delta_log_mu = torch.clamp(delta_log_mu, min=-effective_delta_clip, max=effective_delta_clip)
                 current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
             # --- NEW: CFD STRICT BOUNDARY OVERRIDE ---
             if (os.environ.get("BIOCHEM_FORCE_WALL_MU0", "0") or "").strip().lower() in ("1", "true", "yes", "on"):
