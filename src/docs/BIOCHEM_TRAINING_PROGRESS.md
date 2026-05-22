@@ -52,7 +52,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
 | Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) and 64-epoch runs confirm no new best with late degradation after ~30 ep; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Wall μ logMAE | ≲ 1.5 | **Fail** | Marathon μ winners still **wall ~1.76–1.92**; bulk logMAE can be **~0.28–0.40** |
+| Wall μ logMAE | ≲ 1.5 | **Partial** | New wall-geometry isolate run reached **1.4669** (ep21) and ~**1.55** at best-all ckpt, but paired spatial-decay run stayed ~**2.12** and improvements are not yet stable across objectives |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
 | Phase B: `MU_SI` + low TF + μ-path | Val logMAE drops | **Pass** | Marathon **I2** best **0.44** ep3 (same recipe as MU_LOG) |
@@ -64,7 +64,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients. Latest teacher-only step-3 attempt hit pervasive bio-grad cap skips and flat μ.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
 
-**We are roughly at: μ formulation validated on patient007** (MU_LOG / MU_SI / DATA_KINE isolates + TBPTT=6 all reach **~0.40–0.49** val logMAE) **with subset caveats** (wall ~1.8, high-μ tail often worsens when bulk improves, bulk **r** weak). Next: finish **J2**, confirm **J3** (laptop B), then step-2 joint without isolate; not at corona / step 3.
+**We are roughly at: μ formulation validated on patient007** (MU_LOG / MU_SI / DATA_KINE isolates + TBPTT=6 all reach **~0.40–0.49** val logMAE, and latest spatial-decay run reached **0.3016**) **with subset caveats** (wall can reach ~**1.47** in geometry-isolate mode but is not robust; high-μ tail still trades off against wall in several checkpoints, bulk **r** weak/inconsistent). Next: finish **J2**, confirm **J3** (laptop B), then step-2 joint without isolate; not at corona / step 3.
 
 ---
 
@@ -512,7 +512,14 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **What has not improved yet**: validation metrics remain nearly flat in early teacher epochs (`all 1.4805 -> 1.4803`, wall fixed at `2.4299`, high `0.9372` unchanged), with `gate_all/gate_wall/gate_clot` still logged as `nan`.
 - **Interpretation**: enabling split-head alone did not immediately unlock wall dynamics in this configuration; continue run for full curve, but early trend still matches the historical plateau family.
 
-### 57. Decoupled-wall rerun with master μ switches on: major global recovery, wall improved but still bottleneck (2026-05-22, in progress)
+### 57. New A/B wall controls split the tradeoff: geometry-isolate improves wall, spatial-decay improves all/high (2026-05-22)
+
+- **Run A (`sweep_free_wall_a` + `BIOCHEM_WALL_HEAD_ISOLATE_GEOM=1`, RTX500 4GB)**: best all-truth **0.4547** (ep18), wall **1.5478** at best-all and best wall **1.4669** (ep21), high-μ degrades late (to **~1.49** by ep24).
+- **Run B (`sweep_free_wall_b` + `BIOCHEM_WALL_SPATIAL_DECAY=1`, P2200 5GB)**: best all-truth **0.3016** (ep24) with strong high-μ **0.6915**, but wall remains weaker (**2.1246**).
+- **Expectation check**: partially met — wall/clot conflicts are now more clearly separable by configuration, but no single setting simultaneously "nails" boundary and high-μ tail.
+- **Gate signal caveat**: `gate_wall` remains numerically tiny (~`1.9e-22`) in both runs after startup, so improvements are likely coming from branch-feature effects and loss weighting, not sustained wall-gate activation.
+
+### 58. Decoupled-wall rerun with master μ switches on: major global recovery, wall improved but still bottleneck (2026-05-22, in progress)
 
 - **Setup**: `sweep_decoupled_wall` on RTX500 with explicit μ-path switches enabled (`USE_MU_PATH_GROUP=1`, `TRAIN_MU_ENCODER=1`, `USE_DELTA_MU_HEAD=1`) plus split-head and VRAM-safe teacher profile.
 - **Immediate effect**: run escaped the old ~1.48 plateau quickly (ep00 all-truth `0.7680`, ep02 `0.5475`, ep10 best-so-far `0.3236`).
@@ -805,6 +812,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Boundary A/B rerun **Run 2** (`sweep_decoupled_wall`, P2200 5GB, VRAM-safe profile): `TBPTT=5`, `DETACH=1`, teacher-only 25ep | **1.4589** (ep24) | **2.2517** | **0.353** | high **0.9507** | Completed without OOM; no wall unfreeze trend and only tiny all/high drift within same plateau family |
 | 2026-05-22 | Decoupled-wall split-head rerun (RTX500 4GB, **in progress** through ep10): `sweep_decoupled_wall`, `USE_SPLIT_MU_HEAD=1`, `TBPTT=5`, `DETACH=1` | **1.4803** (ep10 best so far) | **2.4299** | **0.395** | high **0.9372** | Stable/no OOM and split-head LR groups are active, but early metrics remain flat; wall has not unfrozen yet |
 | 2026-05-22 | Decoupled-wall rerun with master μ switches (RTX500 4GB, **in progress** through ep14): `sweep_decoupled_wall` + `USE_MU_PATH_GROUP=1` + `TRAIN_MU_ENCODER=1` + `USE_DELTA_MU_HEAD=1` + split-head | **0.3236** (ep10 best so far) | **1.4307** (best shown) | **0.420** (peak shown ep00; ~0.258-0.358 later) | high **0.5702** (best shown ep14; unstable) | Strong escape from plateau and meaningful wall improvement; still non-monotonic with all/high tradeoff and `gate_wall` printed as zero |
+| 2026-05-22 | New wall-controls **Run A** (`sweep_free_wall_a`, RTX500 4GB, teacher-only 25ep): `MU_LOG` isolate, split clipping, `WALL_HEAD_ISOLATE_GEOM=1`, latent320/prior4, `TBPTT=5`, `DETACH=1` | **0.4547** (ep18 best-all) | **1.5478** (best-all ckpt; best wall **1.4669** ep21) | **0.347** | high **1.0757** (best-all ckpt) | Geometry-isolate materially improves wall and reaches near-target boundary band, but high-μ worsens and late-epoch instability persists |
+| 2026-05-22 | New wall-controls **Run B** (`sweep_free_wall_b`, P2200 5GB, teacher-only 25ep): `MU_LOG` isolate, split clipping, `WALL_SPATIAL_DECAY=1`, latent320/prior4, `TBPTT=5`, `DETACH=1` | **0.3016** (ep24 best-all) | **2.1246** | **0.444** | high **0.6915** | Spatial decay gives strongest global score in this session and good high-μ recovery, but wall remains far above target and gate_wall stays near-zero after startup |
 
 ---
 

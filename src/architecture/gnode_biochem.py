@@ -808,6 +808,12 @@ class GNODE_Phase3(nn.Module):
                             self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
                         )
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
+                        wall_gate_min = min(
+                            max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
+                            0.99,
+                        )
+                        if wall_gate_min > 0.0:
+                            wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
 
                         if bio_suppressor_enabled:
                             # --- FIXED: Listen to the Alpha environment variable! ---
@@ -821,24 +827,27 @@ class GNODE_Phase3(nn.Module):
                             (os.environ.get("BIOCHEM_WALL_HEAD_ISOLATE_GEOM", "0") or "").strip().lower()
                             in ("1", "true", "yes", "on")
                         )
+                        # Keep wall-head tensor width unchanged while allowing geometric isolation/blending.
+                        geom_only_feats = torch.cat(
+                            [
+                                torch.zeros_like(sp_safe),
+                                torch.zeros_like(FI_si),
+                                torch.zeros_like(Mat_si),
+                                sdf_nd.view(-1, 1).to(dtype=sp_safe.dtype),
+                                wall_prox,
+                                torch.zeros_like(wall_mask),
+                                torch.zeros_like(adverse_shear_cue),
+                                torch.zeros_like(low_shear_cue),
+                            ],
+                            dim=1,
+                        )
+                        geom_blend = min(
+                            max(float(os.environ.get("BIOCHEM_WALL_HEAD_GEOM_BLEND", "0.0")), 0.0),
+                            1.0,
+                        )
                         if wall_isolate_geom:
-                            # Keep wall-head tensor width unchanged while isolating geometric cues.
-                            # Only SDF and wall proximity remain active; all flow/bio channels are zeroed.
-                            wall_input_feats = torch.cat(
-                                [
-                                    torch.zeros_like(sp_safe),
-                                    torch.zeros_like(FI_si),
-                                    torch.zeros_like(Mat_si),
-                                    sdf_nd.view(-1, 1).to(dtype=sp_safe.dtype),
-                                    wall_prox,
-                                    torch.zeros_like(wall_mask),
-                                    torch.zeros_like(adverse_shear_cue),
-                                    torch.zeros_like(low_shear_cue),
-                                ],
-                                dim=1,
-                            )
-                        else:
-                            wall_input_feats = trigger_feats
+                            geom_blend = 1.0
+                        wall_input_feats = ((1.0 - geom_blend) * trigger_feats) + (geom_blend * geom_only_feats)
 
                         delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, wall_input_feats], dim=1))
                         if (
@@ -849,8 +858,14 @@ class GNODE_Phase3(nn.Module):
                                 float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FACTOR", "6.0")),
                                 0.0,
                             )
+                            wall_decay_floor = min(
+                                max(float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FLOOR", "0.0")), 0.0),
+                                1.0,
+                            )
                             wall_dist = torch.abs(sdf_nd).view(-1, 1).to(dtype=sp_safe.dtype)
                             wall_decay = torch.exp(-wall_dist * wall_decay_factor)
+                            if wall_decay_floor > 0.0:
+                                wall_decay = wall_decay_floor + ((1.0 - wall_decay_floor) * wall_decay)
                             delta_wall = delta_wall * wall_decay
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate
