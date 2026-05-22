@@ -59,6 +59,12 @@ def _biochem_wall_delta_head_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _biochem_clot_nucleation_growth_enabled() -> bool:
+    """Enable sparse clot nucleation + temporal growth trigger dynamics."""
+    raw = (os.environ.get("BIOCHEM_USE_CLOT_NUCLEATION_GROWTH", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def biochem_truth_node_mask(batch, num_nodes: int, device: torch.device) -> torch.Tensor:
     """Nodes whose entries in ``y`` are trusted COMSOL labels (per-node mask or graph-level ``is_anchor``)."""
     if not hasattr(batch, "is_anchor"):
@@ -279,20 +285,34 @@ class GNODE_Phase3(nn.Module):
             nn.SiLU(),
             nn.Linear(64, 1),
         )
+        self.mu_trigger_feat_dim = 19
         self.mu_delta_tail_head = nn.Sequential(
-            nn.Linear(latent_dim + 16, 64),
+            nn.Linear(latent_dim + self.mu_trigger_feat_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 1),
         )
         self.mu_trigger_gate_head = nn.Sequential(
-            nn.Linear(16, 32),
+            nn.Linear(self.mu_trigger_feat_dim, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+        )
+        # Sparse trigger decomposition:
+        # - nucleation head detects local initiation cues
+        # - growth head continues expansion from existing activated regions
+        self.mu_nucleation_gate_head = nn.Sequential(
+            nn.Linear(self.mu_trigger_feat_dim, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+        )
+        self.mu_growth_gate_head = nn.Sequential(
+            nn.Linear(self.mu_trigger_feat_dim, 32),
             nn.SiLU(),
             nn.Linear(32, 1),
         )
         # Optional near-wall residual branch.
         # Uses kinematics + species + wall cues to correct underfit wall viscosity.
         self.mu_delta_wall_head = nn.Sequential(
-            nn.Linear(latent_dim + 16, 64),
+            nn.Linear(latent_dim + self.mu_trigger_feat_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 1),
         )
@@ -305,6 +325,20 @@ class GNODE_Phase3(nn.Module):
             max(float(os.environ.get("BIOCHEM_MU_WALL_MASK_MIX", "0.80")), 0.0),
             1.0,
         )
+        self.mu_clot_growth_memory = min(
+            max(float(os.environ.get("BIOCHEM_CLOT_GROWTH_MEMORY", "0.85")), 0.0),
+            0.995,
+        )
+        self.mu_clot_wall_prior_mix = min(
+            max(float(os.environ.get("BIOCHEM_CLOT_GATE_WALL_PRIOR_MIX", "0.65")), 0.0),
+            1.0,
+        )
+        self.mu_clot_wall_prior_floor = min(
+            max(float(os.environ.get("BIOCHEM_CLOT_GATE_WALL_PRIOR_FLOOR", "0.10")), 0.0),
+            1.0,
+        )
+        self.mu_clot_nucleation_bias = float(os.environ.get("BIOCHEM_CLOT_GATE_NUCLEATION_BIAS", "0.0"))
+        self.mu_clot_growth_bias = float(os.environ.get("BIOCHEM_CLOT_GATE_GROWTH_BIAS", "0.0"))
         self._init_mu_delta_head_near_zero()
 
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
@@ -431,11 +465,12 @@ class GNODE_Phase3(nn.Module):
                         m.weight.uniform_(-1e-4, 1e-4)
                         if m.bias is not None:
                             m.bias.zero_()
-            for m in self.mu_trigger_gate_head.modules():
-                if isinstance(m, nn.Linear):
-                    m.weight.uniform_(-1e-4, 1e-4)
-                    if m.bias is not None:
-                        m.bias.zero_()
+            for gate_head in (self.mu_trigger_gate_head, self.mu_nucleation_gate_head, self.mu_growth_gate_head):
+                for m in gate_head.modules():
+                    if isinstance(m, nn.Linear):
+                        m.weight.uniform_(-1e-4, 1e-4)
+                        if m.bias is not None:
+                            m.bias.zero_()
 
     def mu1_sigmoid(self, mat):
         """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
@@ -542,6 +577,9 @@ class GNODE_Phase3(nn.Module):
         self._last_mu_delta_tail = None
         self._last_mu_wall_gate = None
         self._last_mu_delta_wall = None
+        self._last_mu_nucleation_prob = None
+        self._last_mu_growth_prob = None
+        self._last_mu_nucleation_cue = None
 
         truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
         species_prior = _default_resting_species(num_nodes, device, batch)
@@ -596,6 +634,7 @@ class GNODE_Phase3(nn.Module):
 
         pred_trajectory = []
         detach_macro_state = self.detach_macro_state_default if detach_macro_state is None else bool(detach_macro_state)
+        prev_clot_gate = None
 
         # ==========================================
         # 2. MACRO-MICRO STEPPING (Two-Way Coupling)
@@ -638,6 +677,13 @@ class GNODE_Phase3(nn.Module):
             scale_grad = u_ref / d_bar
             gamma_dot = torch.sqrt(2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2) +
                                    ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2 + 1e-8)
+            dshear_dx = torch.sparse.mm(batch.G_x, gamma_dot)
+            dshear_dy = torch.sparse.mm(batch.G_y, gamma_dot)
+            vel_mag = torch.sqrt(u_nd ** 2 + v_nd ** 2) + 1e-8
+            u_dir = u_nd / vel_mag
+            v_dir = v_nd / vel_mag
+            dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
+            dshear_ds_phys = dshear_ds / torch.clamp(d_bar, min=1e-8)
 
             # 1) Pure shear-thinning kinematic baseline (no species coupling).
             mu_kin_baseline = mu_inf + (mu_0 - mu_inf) * torch.pow(
@@ -672,9 +718,14 @@ class GNODE_Phase3(nn.Module):
             if _biochem_delta_mu_head_enabled():
                 if _biochem_split_mu_regime_head_enabled():
                     # Trigger features (SI/physics aligned):
-                    # [log1p species(12), FI_si, Mat_si, gamma_dot, wall_proximity]
+                    # [log1p species(12), FI_si, Mat_si, gamma_dot, wall_prox, wall_mask,
+                    #  adverse_shear_cue, low_shear_cue]
                     sdf_nd = kin_in[:, NodeFeat.SDF]
                     wall_prox = torch.exp(-torch.abs(sdf_nd)).to(dtype=sp_safe.dtype)
+                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
+                    adverse_shear_cue = torch.relu(-(dshear_ds_phys - self.sgt)).to(dtype=sp_safe.dtype)
+                    adverse_shear_cue = adverse_shear_cue / (adverse_shear_cue + abs(float(self.sgt)) + 1e-6)
+                    low_shear_cue = 1.0 / (1.0 + gamma_dot.to(dtype=sp_safe.dtype))
                     trigger_feats = torch.cat(
                         [
                             sp_safe,
@@ -682,12 +733,33 @@ class GNODE_Phase3(nn.Module):
                             Mat_si,
                             gamma_dot.to(dtype=sp_safe.dtype),
                             wall_prox,
+                            wall_mask,
+                            adverse_shear_cue,
+                            low_shear_cue,
                         ],
                         dim=1,
                     )
                     gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
-                    gate_logits = self.mu_trigger_gate_head(trigger_feats)
-                    gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
+                    use_nucleation_growth = _biochem_clot_nucleation_growth_enabled()
+                    if use_nucleation_growth:
+                        nuc_logits = self.mu_nucleation_gate_head(trigger_feats) + self.mu_clot_nucleation_bias
+                        growth_logits = self.mu_growth_gate_head(trigger_feats) + self.mu_clot_growth_bias
+                        nucleation_prob = torch.sigmoid(torch.clamp(nuc_logits / gate_temp, min=-50.0, max=50.0))
+                        growth_prob = torch.sigmoid(torch.clamp(growth_logits / gate_temp, min=-50.0, max=50.0))
+                        if prev_clot_gate is None:
+                            gate = nucleation_prob
+                        else:
+                            growth_mix = (self.mu_clot_growth_memory * prev_clot_gate) + (
+                                (1.0 - self.mu_clot_growth_memory) * growth_prob
+                            )
+                            gate = torch.maximum(nucleation_prob, growth_mix)
+                        wall_prior = torch.maximum(wall_prox, self.mu_clot_wall_prior_mix * wall_mask)
+                        gate = gate * torch.clamp(wall_prior, min=self.mu_clot_wall_prior_floor, max=1.0)
+                    else:
+                        gate_logits = self.mu_trigger_gate_head(trigger_feats)
+                        gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
+                        nucleation_prob = gate
+                        growth_prob = gate
                     # Physics prior: suppress neural tail/wall corrections when no local clotting mass exists.
                     bio_suppressor_enabled = (
                         (os.environ.get("BIOCHEM_USE_BIO_GATE_SUPPRESSOR", "0") or "").strip().lower()
@@ -811,6 +883,12 @@ class GNODE_Phase3(nn.Module):
                     self._last_mu_trigger_gate = gate
                     self._last_mu_delta_bulk = delta_bulk
                     self._last_mu_delta_tail = delta_tail
+                    self._last_mu_nucleation_prob = nucleation_prob
+                    self._last_mu_growth_prob = growth_prob
+                    self._last_mu_nucleation_cue = (
+                        0.50 * adverse_shear_cue + 0.20 * wall_prox + 0.30 * torch.clamp((FI_si + Mat_si), min=0.0, max=1.0)
+                    ).detach()
+                    prev_clot_gate = gate.detach() if detach_macro_state else gate
                 else:
                     delta_in = torch.cat([z_kin, sp_safe], dim=1)
                     delta_log_mu = self.mu_delta_head(delta_in)
@@ -821,16 +899,6 @@ class GNODE_Phase3(nn.Module):
             # ==========================================
             # BIOCHEM ATTENTION MODULATOR (Streamwise + detached)
             # ==========================================
-            dshear_dx = torch.sparse.mm(batch.G_x, gamma_dot)
-            dshear_dy = torch.sparse.mm(batch.G_y, gamma_dot)
-
-            vel_mag = torch.sqrt(u_nd ** 2 + v_nd ** 2) + 1e-8
-            u_dir = u_nd / vel_mag
-            v_dir = v_nd / vel_mag
-
-            dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
-            dshear_ds_phys = dshear_ds / torch.clamp(d_bar, min=1e-8)
-
             row, _ = batch.edge_index
             dshear_edge = dshear_ds_phys[row]
 

@@ -879,6 +879,62 @@ def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
     print("✅ BIOCHEM_PRESET=sweep_wall_overcomp: MU_LOG_WALL overcomp proof probe active.", flush=True)
 
 
+_SWEEP_CLOT_NUC_GROWTH_ALIASES = frozenset({"sweep_clot_nuc_growth", "sweep_clot_nucleation_growth"})
+
+
+def _apply_biochem_preset_sweep_clot_nuc_growth_if_requested() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_CLOT_NUC_GROWTH_ALIASES:
+        return
+    bundle: Dict[str, str] = {
+        # Teacher-only step-2 probe.
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
+        "BIOCHEM_TEACHER_EPOCHS": "16",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        # Objective: global + moderate wall/high balance.
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.8",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "1.8",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.6",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        # Architecture: split residual + wall branch + nucleation/growth gate dynamics.
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+        "BIOCHEM_USE_CLOT_NUCLEATION_GROWTH": "1",
+        "BIOCHEM_CLOT_GROWTH_MEMORY": "0.88",
+        "BIOCHEM_CLOT_GATE_WALL_PRIOR_MIX": "0.72",
+        "BIOCHEM_CLOT_GATE_WALL_PRIOR_FLOOR": "0.08",
+        # Trigger/gate behavior.
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.12",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.05",
+        "BIOCHEM_TRIGGER_GATE_MIN": "0.04",
+        "BIOCHEM_WALL_GATE_MIN": "0.06",
+        "BIOCHEM_MU_WALL_GATE_CENTER": "0.48",
+        "BIOCHEM_MU_WALL_GATE_TEMP": "0.15",
+        "BIOCHEM_MU_WALL_DELTA_GAIN": "0.90",
+        "BIOCHEM_WALL_GATE_BIAS": "0.15",
+        "BIOCHEM_WALL_MASK_LOGIT_BOOST": "0.45",
+        # New trigger priors: sparse activation + near-wall preference + physical cue alignment.
+        "BIOCHEM_CLOT_TRIGGER_SPARSITY_WEIGHT": "0.03",
+        "BIOCHEM_CLOT_TRIGGER_NONWALL_WEIGHT": "0.06",
+        "BIOCHEM_CLOT_NUCLEATION_ALIGN_WEIGHT": "0.12",
+        # Runtime guardrails.
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_clot_nuc_growth: sparse nucleation + growth gate probe active.", flush=True)
+
+
 def _apply_pycharm_biochem_optimal_defaults() -> None:
     """Apply set-if-missing env defaults: fast-iterate schedule + data-only step-2 supervision.
 
@@ -997,6 +1053,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_sweep_wall_sentinel_if_requested()
     _apply_biochem_preset_sweep_bio_suppressor_if_requested()
     _apply_biochem_preset_sweep_wall_overcomp_if_requested()
+    _apply_biochem_preset_sweep_clot_nuc_growth_if_requested()
     _apply_biochem_complexity_step3_env()
 
 
@@ -1299,6 +1356,14 @@ def _compute_mu_flow_debug_metrics(
                 out["DBG_gate_mean_clot"] = float("nan")
         else:
             out["DBG_gate_mean_clot"] = float("nan")
+    if hasattr(model, "_last_mu_nucleation_prob") and model._last_mu_nucleation_prob is not None:
+        nuc = model._last_mu_nucleation_prob.view(-1).float()
+        out["DBG_gate_nucleation_all"] = _masked_mean(nuc, m_all)
+        out["DBG_gate_nucleation_wall"] = _masked_mean(nuc, m_truth & m_wall)
+    if hasattr(model, "_last_mu_growth_prob") and model._last_mu_growth_prob is not None:
+        grow = model._last_mu_growth_prob.view(-1).float()
+        out["DBG_gate_growth_all"] = _masked_mean(grow, m_all)
+        out["DBG_gate_growth_wall"] = _masked_mean(grow, m_truth & m_wall)
 
     # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref × width).
     u = pred_final[:, 0].float()
@@ -2205,6 +2270,8 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         "mu_delta_bulk_head.",
         "mu_delta_tail_head.",
         "mu_trigger_gate_head.",
+        "mu_nucleation_gate_head.",
+        "mu_growth_gate_head.",
         "mu_delta_wall_head.",
     )
     for name, param in model.named_parameters():
@@ -2262,6 +2329,10 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
                 elif n.startswith("mu_delta_tail_head."):
                     mu_group_tail.append(p)
                 elif n.startswith("mu_trigger_gate_head."):
+                    mu_group_gate.append(p)
+                elif n.startswith("mu_nucleation_gate_head."):
+                    mu_group_gate.append(p)
+                elif n.startswith("mu_growth_gate_head."):
                     mu_group_gate.append(p)
                 elif n.startswith("mu_delta_wall_head."):
                     mu_group_wall.append(p)
@@ -3587,6 +3658,36 @@ def compute_biochem_loss(
                             torch.tensor(learned_target, device=device, dtype=learned_h.dtype) - learned_h.mean()
                         ).pow(2)
 
+    # Sparse nucleation-growth priors (opt-in): keep most nodes in Carreau mode and
+    # reward activation only where physical trigger cues are present.
+    l_trigger_sparse = torch.tensor(0.0, device=device)
+    l_trigger_nonwall = torch.tensor(0.0, device=device)
+    l_trigger_nuc_align = torch.tensor(0.0, device=device)
+    w_trigger_sparse = max(float(os.environ.get("BIOCHEM_CLOT_TRIGGER_SPARSITY_WEIGHT", "0.0")), 0.0)
+    w_trigger_nonwall = max(float(os.environ.get("BIOCHEM_CLOT_TRIGGER_NONWALL_WEIGHT", "0.0")), 0.0)
+    w_trigger_nuc_align = max(float(os.environ.get("BIOCHEM_CLOT_NUCLEATION_ALIGN_WEIGHT", "0.0")), 0.0)
+    if model.training and (w_trigger_sparse > 0.0 or w_trigger_nonwall > 0.0 or w_trigger_nuc_align > 0.0):
+        gate = getattr(model, "_last_mu_trigger_gate", None)
+        if torch.is_tensor(gate):
+            gate_flat = gate.reshape(-1)
+            mask_ref = truth_mask if has_anchor_supervision else torch.ones_like(gate_flat, dtype=torch.bool)
+            if bool(mask_ref.any()):
+                l_trigger_sparse = gate_flat[mask_ref].mean()
+            if w_trigger_nonwall > 0.0:
+                wall_mask = (
+                    data.mask_wall.view(-1).bool().to(device)
+                    if hasattr(data, "mask_wall") and data.mask_wall is not None
+                    else torch.zeros_like(mask_ref)
+                )
+                nonwall_ref = mask_ref & (~wall_mask)
+                if bool(nonwall_ref.any()):
+                    l_trigger_nonwall = gate_flat[nonwall_ref].mean()
+        if w_trigger_nuc_align > 0.0:
+            nuc_prob = getattr(model, "_last_mu_nucleation_prob", None)
+            nuc_cue = getattr(model, "_last_mu_nucleation_cue", None)
+            if torch.is_tensor(nuc_prob) and torch.is_tensor(nuc_cue):
+                l_trigger_nuc_align = F.mse_loss(nuc_prob.reshape(-1), nuc_cue.reshape(-1).to(nuc_prob.device))
+
     latent_scale = train_cfg.latent_reg_scale
 
     # Eight Kendall tasks: skip supervised heads on non-anchor batches.
@@ -3689,11 +3790,20 @@ def compute_biochem_loss(
             + (w_fi_gate_start_eff * l_fi_gate_start)
             + (lambda_residual_sparse * l_residual_sparse)
         )
-    if model.training and (w_trigger_gate_floor > 0.0 or w_trigger_learned_floor > 0.0):
+    if model.training and (
+        w_trigger_gate_floor > 0.0
+        or w_trigger_learned_floor > 0.0
+        or w_trigger_sparse > 0.0
+        or w_trigger_nonwall > 0.0
+        or w_trigger_nuc_align > 0.0
+    ):
         loss = (
             loss
             + (w_trigger_gate_floor * l_trigger_gate_floor)
             + (w_trigger_learned_floor * l_trigger_learned_floor)
+            + (w_trigger_sparse * l_trigger_sparse)
+            + (w_trigger_nonwall * l_trigger_nonwall)
+            + (w_trigger_nuc_align * l_trigger_nuc_align)
         )
 
     # Guard for sparse pseudo-only windows where every active term can become
@@ -3754,6 +3864,12 @@ def compute_biochem_loss(
         "W_TriggerGateFloor": float(w_trigger_gate_floor),
         "L_TriggerLearnedFloor": l_trigger_learned_floor.item(),
         "W_TriggerLearnedFloor": float(w_trigger_learned_floor),
+        "L_TriggerSparse": l_trigger_sparse.item(),
+        "W_TriggerSparse": float(w_trigger_sparse),
+        "L_TriggerNonWall": l_trigger_nonwall.item(),
+        "W_TriggerNonWall": float(w_trigger_nonwall),
+        "L_TriggerNucAlign": l_trigger_nuc_align.item(),
+        "W_TriggerNucAlign": float(w_trigger_nuc_align),
         "BIOCHEM_LOSS_DATA_ONLY": float(data_only),
         "BIOCHEM_LOSS_ISOLATE": isolate_key or "",
         "L_Backprop": float(loss.detach().item()),

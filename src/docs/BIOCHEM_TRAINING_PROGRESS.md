@@ -467,6 +467,13 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Gate evidence**: suppressor run often sits at floor-clamped gates (`~0.06`), while overcomp run keeps `gate_wall` near floor (`~0.03`) with intermittent increases in `gate_all`; wall movement is present but saturates quickly.
 - **Interpretation**: architecture now reliably demonstrates wall-path responsiveness (not a bug), but balanced optimization remains unresolved; best practical point is still a global-vs-wall compromise rather than simultaneous improvement.
 
+### 51. Newest pair (`sweep_bio_suppressor` MU_LOG vs `sweep_wall_overcomp` MU_LOG_WALL): global improves, wall isolate destabilizes (2026-05-22)
+
+- **Run 1 (`sweep_bio_suppressor`, RTX500 4GB, `LOSS_ISOLATE=MU_LOG`)**: strong held-out all-truth recovery to **0.4720** (ep10), with high-μ best **0.4174** (ep12), but wall remains effectively pinned at **~2.593** throughout.
+- **Run 2 (`sweep_wall_overcomp`, P2200 5GB, `LOSS_ISOLATE=MU_LOG_WALL`)**: early all-truth improves to **0.6115** (ep4) but then degrades; wall gets **worse** than baseline to **~3.06** and high-μ drifts to **~1.13**.
+- **Gate evidence**: overcomp wall-isolate run rapidly floor-clamps gates (`gate_all/gate_wall/gate_clot -> 0.03`), indicating a collapsed low-capacity basin rather than productive wall specialization.
+- **Interpretation**: this pair reinforces that pure wall-isolate pressure is not sufficient and can be counterproductive; `MU_LOG` remains the safer teacher objective for global fit while wall needs targeted capacity/curriculum, not isolate-only weighting.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -741,6 +748,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | New overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4, `MU_LOG_WALL` isolate) | **0.7012** (ep02 best-all) | **2.3064** (best shown late) | **0.397** | high **1.2564** | Overcomp still demonstrates wall path activity, but this seed/hardware pairing underperforms prior wall-best and harms high-μ/global |
 | 2026-05-22 | Latest suppressor rerun (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4; wall-decoupling patch active) | **0.5195** (ep12 best) | **2.5906** | **0.403** | high **0.7849** | Global fit remains strong, but wall is still stuck; episodic instability after best checkpoint (e.g., ep10/ep12 swings) |
 | 2026-05-22 | Latest overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4; wall-decoupling patch active, `MU_LOG_WALL` isolate) | **0.5085** (best-all ckpt ep06) | **2.0868** (best shown) | **0.413** | high **0.9300** | Best wall recovery in this pair confirms wall pathway works; however, high-μ remains weak and wall improvement still plateaus above target |
+| 2026-05-22 | Newest Run1 (`sweep_bio_suppressor`, RTX500 4GB): teacher-only, `LOSS_ISOLATE=MU_LOG`, latent320/prior4, TBPTT=5, `DETACH=1`, 14ep | **0.4720** (ep10 best) | **2.5933** | **0.403** | high **0.6169** (best-all ckpt; high best **0.4174** ep12) | Strong global recovery and decent tail checkpoint, but wall remains locked near ~2.59; confirms persistent wall bottleneck under MU_LOG isolate |
+| 2026-05-22 | Newest Run2 (`sweep_wall_overcomp`, P2200 5GB): teacher-only, `LOSS_ISOLATE=MU_LOG_WALL`, latent320/prior4, TBPTT=5, `DETACH=1`, 14ep | **0.6115** (ep04 best) | **3.0573** (ep13 shown; ~3.06 band after ep2) | **0.409** | high **1.1266** | Wall-isolate objective overcompensates and collapses gates to floor (0.03), degrading wall and high-μ despite early all-truth gains |
 
 ---
 
