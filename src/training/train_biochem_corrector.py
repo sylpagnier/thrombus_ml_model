@@ -739,51 +739,51 @@ _SWEEP_WALL_SENTINEL_ALIASES = frozenset({"sweep_wall_sentinel"})
 
 
 def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
-    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
-    if preset not in _SWEEP_WALL_SENTINEL_ALIASES:
-        return
-    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_WALL_SENTINEL_ALIASES:
         return
     bundle: Dict[str, str] = {
-        "BIOCHEM_COMPLEXITY_STEP": "3",
-        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
         "BIOCHEM_TEACHER_EPOCHS": "35",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.08",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.01",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "0",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Heavy Wall penalties + Sharp gates active.", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Heavy Wall + Sharp gates (Step-2 Isolate).", flush=True)
 
 
 _SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
 
 
 def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
-    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
-    if preset not in _SWEEP_BIO_SUPPRESSOR_ALIASES:
-        return
-    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_BIO_SUPPRESSOR_ALIASES:
         return
     bundle: Dict[str, str] = {
-        "BIOCHEM_COMPLEXITY_STEP": "3",
-        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
         "BIOCHEM_TEACHER_EPOCHS": "35",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI": "1e-4",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Physics-inspired Biological Suppressor active.", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Biological Suppressor active (Step-2 Isolate).", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
