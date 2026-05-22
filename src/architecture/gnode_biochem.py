@@ -807,6 +807,9 @@ class GNODE_Phase3(nn.Module):
                                     Mat_si.detach(),
                                     gamma_dot.to(dtype=sp_safe.dtype),
                                     wall_prox,
+                                    wall_mask,
+                                    adverse_shear_cue.detach(),
+                                    low_shear_cue.detach(),
                                 ],
                                 dim=1,
                             )
@@ -861,6 +864,9 @@ class GNODE_Phase3(nn.Module):
                                     torch.zeros_like(Mat_si),
                                     gamma_dot.to(dtype=sp_safe.dtype),
                                     wall_prox,
+                                    wall_mask,
+                                    adverse_shear_cue,
+                                    low_shear_cue,
                                 ],
                                 dim=1,
                             )
