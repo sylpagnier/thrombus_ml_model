@@ -745,20 +745,31 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
         "BIOCHEM_COMPLEXITY_STEP": "2",
         "BIOCHEM_LOSS_DATA_ONLY": "1",
         "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
-        "BIOCHEM_TEACHER_EPOCHS": "35",
+        "BIOCHEM_TEACHER_EPOCHS": "14",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.08",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.01",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "0",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
         "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Heavy Wall + Sharp gates (Step-2 Isolate).", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Step-2 MU isolate + split μ architecture (fast probe).", flush=True)
 
 
 _SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
@@ -771,11 +782,22 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
         "BIOCHEM_COMPLEXITY_STEP": "2",
         "BIOCHEM_LOSS_DATA_ONLY": "1",
         "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
-        "BIOCHEM_TEACHER_EPOCHS": "35",
+        "BIOCHEM_TEACHER_EPOCHS": "14",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
         "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "2.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI": "1e-4",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
@@ -783,7 +805,7 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Biological Suppressor active (Step-2 Isolate).", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Step-2 MU isolate + bio suppressor (fast probe).", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
@@ -4751,6 +4773,21 @@ def train_teacher_on_anchors(
                 dbg_q_rel_e = (epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_n)))
                 dbg_triv_e = (epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_n)))
                 dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
+                dbg_gate_all_e = (
+                    epoch_dbg_gate_all_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
+                dbg_gate_wall_e = (
+                    epoch_dbg_gate_wall_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
+                dbg_gate_clot_e = (
+                    epoch_dbg_gate_clot_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
                 val_stats = _log_mu_validation_report(
                     stage="teacher",
                     epoch=epoch,
@@ -4769,7 +4806,9 @@ def train_teacher_on_anchors(
                             f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
                             f"learned={dbg_mlearn_e:.3e} "
                             f"final_anchor_logMAE={dbg_mu_log_e:.3e} Q_imb={dbg_flow_imb_e:.3e} "
-                            f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial={dbg_triv_e:.3f}"
+                            f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial={dbg_triv_e:.3f} "
+                            f"gate_all={dbg_gate_all_e:.3e} gate_wall={dbg_gate_wall_e:.3e} "
+                            f"gate_clot={dbg_gate_clot_e:.3e}"
                         ),
                     ],
                 )
@@ -4828,13 +4867,30 @@ def train_teacher_on_anchors(
                 dbg_q_rel_e = (epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_flux_n)))
                 dbg_triv_e = (epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_flux_n)))
                 dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
+                dbg_gate_all_e = (
+                    epoch_dbg_gate_all_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
+                dbg_gate_wall_e = (
+                    epoch_dbg_gate_wall_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
+                dbg_gate_clot_e = (
+                    epoch_dbg_gate_clot_sum / float(max(1, epoch_dbg_gate_n))
+                    if epoch_dbg_gate_n > 0
+                    else float("nan")
+                )
                 print(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
                     f"L_Bio (Avg): {avg_bio:.3e}] | "
                     f"μdbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
                     f"logMAE_f={dbg_mu_log_e:.2e},Q_imb={dbg_flow_imb_e:.2e},"
-                    f"Q_rel={dbg_q_rel_e:.2e},trivial={dbg_triv_e:.3f}] | "
+                    f"Q_rel={dbg_q_rel_e:.2e},trivial={dbg_triv_e:.3f},"
+                    f"gate_all={dbg_gate_all_e:.2e},gate_wall={dbg_gate_wall_e:.2e},"
+                    f"gate_clot={dbg_gate_clot_e:.2e}] | "
                     f"Val skipped (BIOCHEM_TEACHER_VAL_EVERY={teacher_val_every})"
                 )
 
