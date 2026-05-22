@@ -441,6 +441,13 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Tradeoff**: suppressor run gives better global/high balance (`all=0.5758`, `high=0.6040`) than sentinel (`all=0.6622`, `high=0.6849`) but does not improve wall.
 - **Interpretation**: architecture fix solved gate-collapse pathology, but not the wall-identifiability bottleneck; wall target is still underfit even when gate starvation is prevented.
 
+### 47. Wall-overcompensation probe validates directionality limits: wall modestly improves vs old baselines but remains sticky (2026-05-22)
+
+- **Run 1 (`sweep_bio_suppressor`, RTX500 4GB)**: best all-truth **0.5055** (ep13), high-μ **0.6268**, wall **2.4888**. This is the best all-truth seen in the latest patched fast probes, with wall better than earlier ~2.57-3.40 failures but still far from target.
+- **Run 2 (`sweep_wall_overcomp`, P2200 5GB)**: best all-truth **0.5682** (ep13), high-μ **1.1207**, wall **2.4951**. Despite aggressive wall weighting/gating, wall does not materially beat Run 1 and high-μ degrades strongly.
+- **Gate behavior evidence**: overcomp run drives gates to saturation (`gate_wall≈1.0`, `gate_all≈0.98+`), proving the architectural controls work, but the metric response stays wall-limited.
+- **Conclusion**: we now have causal evidence that simply forcing wall-gate activation and wall loss magnitude is insufficient; current wall error is dominated by representational/confounding limits rather than gate starvation alone.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -707,6 +714,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Fast split-μ probe (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4, updated preset with μ encoder + split head): 14ep teacher-only, TBPTT=5, `DETACH=1` | **0.5923** (ep10 best) | **2.5887** (late spikes **~3.3988**) | **0.398** | high **0.5563** (best-all ckpt; high best **0.3182** ep13) | Suppressor run improves all/high vs old plateau but keeps wall poor; `gate_wall` pinned near zero suggests wall-branch suppression bottleneck |
 | 2026-05-22 | Patched fast sentinel (`sweep_wall_sentinel`, RTX500 4GB, latent320/prior4): gate-floor architecture update active | **0.6622** (ep13 best) | **2.4937** | **0.363** | high **0.6849** | Gate collapse fixed (`gate_all/gate_wall/gate_clot` floor at 0.06), modest wall gain vs prior sentinel, but weaker all/high than prior best split-μ run |
 | 2026-05-22 | Patched fast suppressor (`sweep_bio_suppressor`, P2200 5GB, latent320/prior4): suppressor wall-mix + gate floors active | **0.5758** (ep13 best) | **2.5878** | **0.399** | high **0.6040** | Best global score among patched pair; high-μ reasonable, but wall remains flat (~2.588) despite non-collapsing gates |
+| 2026-05-22 | Latest patched suppressor (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4): wall-bias architecture + floor controls | **0.5055** (ep13 best) | **2.4888** | **0.375** | high **0.6268** | Strongest all-truth among newest runs; wall improves vs earlier suppressor failures but remains far above target |
+| 2026-05-22 | Wall-overcomp probe (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4): aggressive wall-weight + wall-gate bias/boost | **0.5682** (ep13 best) | **2.4951** | **0.370** | high **1.1207** | Gates saturate (`gate_wall≈1.0`) confirming overcomp path activation, but wall barely improves and high-μ severely regresses |
 
 ---
 

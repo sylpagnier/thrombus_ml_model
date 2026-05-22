@@ -723,6 +723,10 @@ class GNODE_Phase3(nn.Module):
                     delta_log_mu = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
                     if _biochem_wall_delta_head_enabled():
                         wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
+                        wall_phys_mix = min(
+                            max(float(os.environ.get("BIOCHEM_WALL_HEAD_PHYS_MIX", "0.0")), 0.0),
+                            1.0,
+                        )
                         wall_signal_val = torch.maximum(
                             wall_prox,
                             self.mu_wall_mask_mix * wall_mask,
@@ -750,7 +754,22 @@ class GNODE_Phase3(nn.Module):
                         )
                         if wall_gate_min > 0.0:
                             wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
-                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, trigger_feats], dim=1))
+                        # Optional decoupling: reduce bio-feature leakage into the wall correction head.
+                        if wall_phys_mix > 0.0:
+                            wall_feats_phys = torch.cat(
+                                [
+                                    torch.zeros_like(sp_safe),
+                                    torch.zeros_like(FI_si),
+                                    torch.zeros_like(Mat_si),
+                                    gamma_dot.to(dtype=sp_safe.dtype),
+                                    wall_prox,
+                                ],
+                                dim=1,
+                            )
+                            wall_feats = ((1.0 - wall_phys_mix) * trigger_feats) + (wall_phys_mix * wall_feats_phys)
+                        else:
+                            wall_feats = trigger_feats
+                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, wall_feats], dim=1))
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate
                         self._last_mu_delta_wall = delta_wall

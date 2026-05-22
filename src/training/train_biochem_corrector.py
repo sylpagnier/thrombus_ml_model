@@ -811,6 +811,7 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
         "BIOCHEM_MU_WALL_DELTA_GAIN": "0.90",
         "BIOCHEM_WALL_GATE_BIAS": "0.25",
         "BIOCHEM_WALL_MASK_LOGIT_BOOST": "0.60",
+        "BIOCHEM_WALL_HEAD_PHYS_MIX": "0.35",
         "BIOCHEM_TBPTT_MAX_WINDOW": "5",
         "BIOCHEM_DETACH_MACRO_STATE": "1",
         "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
@@ -836,14 +837,14 @@ def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
         "BIOCHEM_LOSS_DATA_ONLY": "1",
-        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG_WALL",
         "BIOCHEM_TEACHER_EPOCHS": "14",
         "BIOCHEM_TEACHER_VAL_EVERY": "2",
         "BIOCHEM_VAL_TIME_STRIDE": "10",
         "BIOCHEM_STOP_AFTER_TEACHER": "1",
-        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
-        "BIOCHEM_MU_LOG_WALL_WEIGHT": "6.5",
-        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "0.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "9.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "0.0",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
         "BIOCHEM_USE_MU_PATH_GROUP": "1",
         "BIOCHEM_TRAIN_MU_ENCODER": "1",
@@ -856,9 +857,10 @@ def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
         "BIOCHEM_WALL_GATE_MIN": "0.20",
         "BIOCHEM_MU_WALL_GATE_CENTER": "0.30",
         "BIOCHEM_MU_WALL_GATE_TEMP": "0.10",
-        "BIOCHEM_MU_WALL_DELTA_GAIN": "1.30",
+        "BIOCHEM_MU_WALL_DELTA_GAIN": "1.45",
         "BIOCHEM_WALL_GATE_BIAS": "0.90",
         "BIOCHEM_WALL_MASK_LOGIT_BOOST": "1.50",
+        "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
         "BIOCHEM_TBPTT_MAX_WINDOW": "5",
         "BIOCHEM_DETACH_MACRO_STATE": "1",
         "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
@@ -868,7 +870,7 @@ def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_overcomp: intentional wall-overcompensation probe active.", flush=True)
+    print("✅ BIOCHEM_PRESET=sweep_wall_overcomp: MU_LOG_WALL overcomp proof probe active.", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
