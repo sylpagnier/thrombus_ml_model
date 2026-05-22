@@ -448,6 +448,12 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Gate behavior evidence**: overcomp run drives gates to saturation (`gate_wall≈1.0`, `gate_all≈0.98+`), proving the architectural controls work, but the metric response stays wall-limited.
 - **Conclusion**: we now have causal evidence that simply forcing wall-gate activation and wall loss magnitude is insufficient; current wall error is dominated by representational/confounding limits rather than gate starvation alone.
 
+### 48. MU_LOG_WALL isolate confirms wall is controllable but expensive to global/high fit (2026-05-22)
+
+- **Run 1 (`sweep_bio_suppressor`, RTX500 4GB)**: best all-truth **0.6365** (ep06), wall **2.4953**, high-μ **0.7107**. Better high-tail balance than wall-overcomp, but wall remains essentially unchanged.
+- **Run 2 (`sweep_wall_overcomp`, P2200 5GB, `LOSS_ISOLATE=MU_LOG_WALL`)**: wall improves materially to **2.0927** (ep10 best wall-point), proving wall loss path is active and not bugged, but all-truth/high-μ regress (`all=0.6640`, `high=1.1330` at best-all checkpoint).
+- **Interpretation**: this is direct causal proof that architecture can move wall logMAE when forced; remaining challenge is multi-objective interference and representation sharing, not a dead wall-loss plumbing path.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -716,6 +722,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Patched fast suppressor (`sweep_bio_suppressor`, P2200 5GB, latent320/prior4): suppressor wall-mix + gate floors active | **0.5758** (ep13 best) | **2.5878** | **0.399** | high **0.6040** | Best global score among patched pair; high-μ reasonable, but wall remains flat (~2.588) despite non-collapsing gates |
 | 2026-05-22 | Latest patched suppressor (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4): wall-bias architecture + floor controls | **0.5055** (ep13 best) | **2.4888** | **0.375** | high **0.6268** | Strongest all-truth among newest runs; wall improves vs earlier suppressor failures but remains far above target |
 | 2026-05-22 | Wall-overcomp probe (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4): aggressive wall-weight + wall-gate bias/boost | **0.5682** (ep13 best) | **2.4951** | **0.370** | high **1.1207** | Gates saturate (`gate_wall≈1.0`) confirming overcomp path activation, but wall barely improves and high-μ severely regresses |
+| 2026-05-22 | Latest suppressor rerun (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4): patched wall-bias/floor controls | **0.6365** (ep06 best) | **2.4953** | **0.340** | high **0.7107** | Global/high weaker than prior best suppressor run; wall still sticky near ~2.50 despite non-collapsing gates |
+| 2026-05-22 | Latest overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4, `LOSS_ISOLATE=MU_LOG_WALL`) | **0.6640** (best-all ckpt ep10) | **2.0927** (best wall shown) | **0.424** | high **1.1330** | Wall objective can be pushed down strongly, but high-μ/global degrade — confirms tradeoff, not plumbing bug |
 
 ---
 

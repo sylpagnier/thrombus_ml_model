@@ -754,6 +754,15 @@ class GNODE_Phase3(nn.Module):
                         )
                         if wall_gate_min > 0.0:
                             wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
+                        wall_base_blend = min(
+                            max(float(os.environ.get("BIOCHEM_WALL_DELTA_BASE_BLEND", "0.0")), 0.0),
+                            1.0,
+                        )
+                        if wall_base_blend > 0.0:
+                            # Inject a direct wall-mask component so wall branch can move
+                            # even when learned gate remains too conservative.
+                            wall_gate = ((1.0 - wall_base_blend) * wall_gate) + (wall_base_blend * wall_mask)
+                            wall_gate = torch.clamp(wall_gate, min=0.0, max=1.0)
                         # Optional decoupling: reduce bio-feature leakage into the wall correction head.
                         if wall_phys_mix > 0.0:
                             wall_feats_phys = torch.cat(
