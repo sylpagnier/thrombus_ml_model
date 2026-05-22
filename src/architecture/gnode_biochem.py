@@ -796,6 +796,14 @@ class GNODE_Phase3(nn.Module):
                         else:
                             wall_feats = wall_trigger_feats
                         delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, wall_feats], dim=1))
+                        # Optional anti-tail correction: remove part of tail leakage from wall branch.
+                        # Helps separate "near-wall clot tail" from healthy-wall baseline.
+                        wall_anti_tail_coeff = max(
+                            float(os.environ.get("BIOCHEM_WALL_ANTI_TAIL_COEFF", "0.0")),
+                            0.0,
+                        )
+                        if wall_anti_tail_coeff > 0.0:
+                            delta_wall = delta_wall - (wall_anti_tail_coeff * gate * delta_tail.detach())
                         delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
                         self._last_mu_wall_gate = wall_gate
                         self._last_mu_delta_wall = delta_wall

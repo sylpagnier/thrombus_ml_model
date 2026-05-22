@@ -460,6 +460,13 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Run 2 (`sweep_wall_overcomp`, P2200 5GB, `MU_LOG_WALL` isolate)**: best all-truth **0.7012** (ep02), wall reaches only **~2.306** late, worse than prior overcomp best (~2.09). High-μ remains poor (**~1.25**) and run is wall-heavy but not wall-winning.
 - **Takeaway**: wall can be moved by objective pressure, but response is brittle and non-monotonic; additional decoupling from clot-species channels is required to reduce spatial confounding on the wall branch.
 
+### 50. New rerun pair after wall-decoupling patch: global recovered, wall still plateaus near ~2.1-2.6 band (2026-05-22)
+
+- **Run 1 (`sweep_bio_suppressor`, RTX500 4GB)**: best all-truth **0.5195** (ep12), wall **2.5906**, high-μ **0.7849**. This recovers strong global fit but does not move wall off its sticky band.
+- **Run 2 (`sweep_wall_overcomp`, P2200 5GB, `MU_LOG_WALL` isolate)**: best all-truth **0.5085** (ep06), wall **2.0868** (best shown), high-μ **0.9300** at best-all checkpoint. Confirms wall can still be pushed down, but not without high-μ/global tradeoff.
+- **Gate evidence**: suppressor run often sits at floor-clamped gates (`~0.06`), while overcomp run keeps `gate_wall` near floor (`~0.03`) with intermittent increases in `gate_all`; wall movement is present but saturates quickly.
+- **Interpretation**: architecture now reliably demonstrates wall-path responsiveness (not a bug), but balanced optimization remains unresolved; best practical point is still a global-vs-wall compromise rather than simultaneous improvement.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -732,6 +739,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Latest overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4, `LOSS_ISOLATE=MU_LOG_WALL`) | **0.6640** (best-all ckpt ep10) | **2.0927** (best wall shown) | **0.424** | high **1.1330** | Wall objective can be pushed down strongly, but high-μ/global degrade — confirms tradeoff, not plumbing bug |
 | 2026-05-22 | New suppressor rerun (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4) | **0.5195** (ep12 best) | **2.5906** | **0.403** | high **0.7849** | Strong all-truth recovery but wall regresses to sticky ~2.59 band; gate metrics frequently floor-clamped |
 | 2026-05-22 | New overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4, `MU_LOG_WALL` isolate) | **0.7012** (ep02 best-all) | **2.3064** (best shown late) | **0.397** | high **1.2564** | Overcomp still demonstrates wall path activity, but this seed/hardware pairing underperforms prior wall-best and harms high-μ/global |
+| 2026-05-22 | Latest suppressor rerun (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4; wall-decoupling patch active) | **0.5195** (ep12 best) | **2.5906** | **0.403** | high **0.7849** | Global fit remains strong, but wall is still stuck; episodic instability after best checkpoint (e.g., ep10/ep12 swings) |
+| 2026-05-22 | Latest overcomp rerun (`sweep_wall_overcomp`, P2200 5GB, latent320/prior4; wall-decoupling patch active, `MU_LOG_WALL` isolate) | **0.5085** (best-all ckpt ep06) | **2.0868** (best shown) | **0.413** | high **0.9300** | Best wall recovery in this pair confirms wall pathway works; however, high-μ remains weak and wall improvement still plateaus above target |
 
 ---
 
