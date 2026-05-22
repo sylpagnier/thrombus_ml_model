@@ -433,6 +433,14 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Gate signal**: `gate_all` and `gate_clot` remain high/stable (~0.48), while `gate_wall` is numerically pinned near zero (~1.9e-22) throughout, indicating wall branch starvation despite non-zero wall loss weight.
 - **Interpretation**: this run isolates the current failure mode: suppressor protects tail selectivity but over-suppresses wall correction, producing a strong high-μ vs wall tradeoff rather than balanced gains.
 
+### 46. Gate-floor architecture patch removed gate collapse, but wall paradox remains (2026-05-22)
+
+- **Setup**: both patched fast probes (`sweep_wall_sentinel` on RTX500 4GB, `sweep_bio_suppressor` on P2200 5GB) with new gate floors (`TRIGGER_GATE_MIN=0.06`, `WALL_GATE_MIN=0.08`) and suppressor wall-mixing controls.
+- **What improved**: catastrophic gate collapse is gone; gates stay finite (`gate_all` around `0.06–0.72`, `gate_wall` floor-clamped at `0.06`), and both runs complete quickly without OOM.
+- **Wall behavior**: still poor and nearly flat despite heavy wall loss. Sentinel run wall settles around **2.49** (better than earlier ~2.57 baseline), while suppressor run remains around **2.588**.
+- **Tradeoff**: suppressor run gives better global/high balance (`all=0.5758`, `high=0.6040`) than sentinel (`all=0.6622`, `high=0.6849`) but does not improve wall.
+- **Interpretation**: architecture fix solved gate-collapse pathology, but not the wall-identifiability bottleneck; wall target is still underfit even when gate starvation is prevented.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -697,6 +705,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Step-2 isolate smoke (`sweep_wall_sentinel`, P2200 5GB, latent320/prior4): stock defaults on + `LOSS_ISOLATE=MU_LOG`, `W_MuSI=0`, suppressor off | **1.5096** (ep00; ep06 **1.5101**) | **2.2391** (ep00; ep06 **2.2510**) | **0.392** (ep00; ep06 **0.358**) | high **0.8968** (ep00; ep06 **0.9010**) | Same early plateau behavior as suppressor run; no clear separation yet from suppressor toggle alone |
 | 2026-05-22 | Fast split-μ probe (`sweep_wall_sentinel`, P2200 5GB, latent320/prior4, updated preset with μ encoder + split head): 14ep teacher-only, TBPTT=5, `DETACH=1` | **0.5496** (ep08 best) | **2.5698** | **0.402** | high **0.8368** (best-all ckpt; high best **0.4046** ep12) | Major all-truth recovery vs prior ~1.51 plateau, but wall remains stuck and gate values collapse toward zero by late epochs |
 | 2026-05-22 | Fast split-μ probe (`sweep_bio_suppressor`, RTX500 4GB, latent320/prior4, updated preset with μ encoder + split head): 14ep teacher-only, TBPTT=5, `DETACH=1` | **0.5923** (ep10 best) | **2.5887** (late spikes **~3.3988**) | **0.398** | high **0.5563** (best-all ckpt; high best **0.3182** ep13) | Suppressor run improves all/high vs old plateau but keeps wall poor; `gate_wall` pinned near zero suggests wall-branch suppression bottleneck |
+| 2026-05-22 | Patched fast sentinel (`sweep_wall_sentinel`, RTX500 4GB, latent320/prior4): gate-floor architecture update active | **0.6622** (ep13 best) | **2.4937** | **0.363** | high **0.6849** | Gate collapse fixed (`gate_all/gate_wall/gate_clot` floor at 0.06), modest wall gain vs prior sentinel, but weaker all/high than prior best split-μ run |
+| 2026-05-22 | Patched fast suppressor (`sweep_bio_suppressor`, P2200 5GB, latent320/prior4): suppressor wall-mix + gate floors active | **0.5758** (ep13 best) | **2.5878** | **0.399** | high **0.6040** | Best global score among patched pair; high-μ reasonable, but wall remains flat (~2.588) despite non-collapsing gates |
 
 ---
 

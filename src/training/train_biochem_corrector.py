@@ -762,6 +762,11 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.04",
         "BIOCHEM_TRIGGER_GATE_MIN": "0.06",
         "BIOCHEM_WALL_GATE_MIN": "0.08",
+        "BIOCHEM_MU_WALL_GATE_CENTER": "0.45",
+        "BIOCHEM_MU_WALL_GATE_TEMP": "0.14",
+        "BIOCHEM_MU_WALL_DELTA_GAIN": "0.85",
+        "BIOCHEM_WALL_GATE_BIAS": "0.25",
+        "BIOCHEM_WALL_MASK_LOGIT_BOOST": "0.60",
         "BIOCHEM_TBPTT_MAX_WINDOW": "5",
         "BIOCHEM_DETACH_MACRO_STATE": "1",
         "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
@@ -801,6 +806,11 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.04",
         "BIOCHEM_TRIGGER_GATE_MIN": "0.06",
         "BIOCHEM_WALL_GATE_MIN": "0.08",
+        "BIOCHEM_MU_WALL_GATE_CENTER": "0.45",
+        "BIOCHEM_MU_WALL_GATE_TEMP": "0.14",
+        "BIOCHEM_MU_WALL_DELTA_GAIN": "0.90",
+        "BIOCHEM_WALL_GATE_BIAS": "0.25",
+        "BIOCHEM_WALL_MASK_LOGIT_BOOST": "0.60",
         "BIOCHEM_TBPTT_MAX_WINDOW": "5",
         "BIOCHEM_DETACH_MACRO_STATE": "1",
         "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
@@ -815,6 +825,50 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
     for k, v in bundle.items():
         os.environ[k] = v
     print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Step-2 MU isolate + bio suppressor (fast probe).", flush=True)
+
+
+_SWEEP_WALL_OVERCOMP_ALIASES = frozenset({"sweep_wall_overcomp", "sweep_wall_overcompensate"})
+
+
+def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_WALL_OVERCOMP_ALIASES:
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
+        "BIOCHEM_TEACHER_EPOCHS": "14",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "6.5",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "1.0",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_USE_MU_PATH_GROUP": "1",
+        "BIOCHEM_TRAIN_MU_ENCODER": "1",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "1",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "1",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.10",
+        "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.04",
+        "BIOCHEM_TRIGGER_GATE_MIN": "0.03",
+        "BIOCHEM_WALL_GATE_MIN": "0.20",
+        "BIOCHEM_MU_WALL_GATE_CENTER": "0.30",
+        "BIOCHEM_MU_WALL_GATE_TEMP": "0.10",
+        "BIOCHEM_MU_WALL_DELTA_GAIN": "1.30",
+        "BIOCHEM_WALL_GATE_BIAS": "0.90",
+        "BIOCHEM_WALL_MASK_LOGIT_BOOST": "1.50",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "0",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_wall_overcomp: intentional wall-overcompensation probe active.", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
@@ -934,6 +988,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_teacher_max_complexity_if_requested()
     _apply_biochem_preset_sweep_wall_sentinel_if_requested()
     _apply_biochem_preset_sweep_bio_suppressor_if_requested()
+    _apply_biochem_preset_sweep_wall_overcomp_if_requested()
     _apply_biochem_complexity_step3_env()
 
 

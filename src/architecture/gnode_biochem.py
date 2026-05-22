@@ -730,6 +730,11 @@ class GNODE_Phase3(nn.Module):
                         wall_logits = (wall_signal_val - self.mu_wall_gate_center) / max(
                             self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
                         )
+                        # Optional explicit wall-bias controls to break wall under-activation plateaus.
+                        wall_gate_bias = float(os.environ.get("BIOCHEM_WALL_GATE_BIAS", "0.0"))
+                        wall_mask_boost = float(os.environ.get("BIOCHEM_WALL_MASK_LOGIT_BOOST", "0.0"))
+                        if wall_gate_bias != 0.0 or wall_mask_boost != 0.0:
+                            wall_logits = wall_logits + wall_gate_bias + (wall_mask_boost * wall_mask)
                         wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
                         if bio_suppressor_enabled:
                             wall_suppress_alpha = min(
