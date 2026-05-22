@@ -4,11 +4,14 @@
 #   .\scripts\run_biochem_sweep_comp_b.ps1
 #   .\scripts\run_biochem_sweep_comp_b.ps1 -Epochs 8 -DryRun
 #   .\scripts\run_biochem_sweep_comp_b.ps1 -FullMatrix
+#   .\scripts\run_biochem_sweep_comp_b.ps1 -MemoryProfile High
 #
 param(
     [int] $Epochs = 8,
     [switch] $DryRun,
     [switch] $FullMatrix,
+    [ValidateSet("Safe", "High")]
+    [string] $MemoryProfile = "Safe",
     [double] $EstimatedMinutesPerLeg = 75.0,
     [string[]] $ExtraArgs = @()
 )
@@ -25,6 +28,18 @@ $env:BIOCHEM_PRESET = ""
 $env:BIOCHEM_COMPLEXITY_STEP = "2"
 $env:BIOCHEM_TEACHER_EPOCHS = "$Epochs"
 $env:BIOCHEM_EPOCHS = "$Epochs"
+# 5GB-safe runtime defaults (memory only; no physics-equation changes).
+$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+$env:BIOCHEM_DATALOADER_WORKERS = "0"
+$env:BIOCHEM_PIN_MEMORY = "0"
+$env:BIOCHEM_DETACH_MACRO_STATE = "1"
+$env:BIOCHEM_TBPTT_MAX_WINDOW = "5"
+$env:BIOCHEM_TBPTT_WINDOW_CURRICULUM = "0"
+$env:BIOCHEM_ADJOINT_RK4_SUBSTEPS = "8"
+$env:BIOCHEM_ODE_GRADIENT_CHECKPOINT = "1"
+$env:BIOCHEM_KIN_GRADIENT_CHECKPOINT = "1"
+# Computer B sweep is about loss/rheology dynamics; keep LoRA fixed off for VRAM stability.
+$env:BIOCHEM_LORA_RANK = "0"
 
 if ($FullMatrix) {
     $Legs = @()
@@ -44,21 +59,35 @@ if ($FullMatrix) {
     }
 } else {
     # Budgeted ~10h profile on one machine (8 representative legs).
-    $Legs = @(
-        @{ scale = 1.0;  cap = 100.0;  adj = 0; tbptt = 5  },
-        @{ scale = 1.0;  cap = 500.0;  adj = 1; tbptt = 10 },
-        @{ scale = 10.0; cap = 100.0;  adj = 1; tbptt = 10 },
-        @{ scale = 10.0; cap = 500.0;  adj = 0; tbptt = 5  },
-        @{ scale = 10.0; cap = 1000.0; adj = 1; tbptt = 5  },
-        @{ scale = 50.0; cap = 500.0;  adj = 1; tbptt = 5  },
-        @{ scale = 50.0; cap = 1000.0; adj = 0; tbptt = 10 },
-        @{ scale = 50.0; cap = 100.0;  adj = 0; tbptt = 10 }
-    )
+    # Safe profile avoids dense odeint on 5GB cards; High keeps mixed adjoint/dense exploration.
+    if ($MemoryProfile -eq "High") {
+        $Legs = @(
+            @{ scale = 1.0;  cap = 100.0;  adj = 0; tbptt = 5  },
+            @{ scale = 1.0;  cap = 500.0;  adj = 1; tbptt = 8  },
+            @{ scale = 10.0; cap = 100.0;  adj = 1; tbptt = 8  },
+            @{ scale = 10.0; cap = 500.0;  adj = 0; tbptt = 5  },
+            @{ scale = 10.0; cap = 1000.0; adj = 1; tbptt = 5  },
+            @{ scale = 50.0; cap = 500.0;  adj = 1; tbptt = 5  },
+            @{ scale = 50.0; cap = 1000.0; adj = 0; tbptt = 8  },
+            @{ scale = 50.0; cap = 100.0;  adj = 1; tbptt = 8  }
+        )
+    } else {
+        $Legs = @(
+            @{ scale = 1.0;  cap = 100.0;  adj = 1; tbptt = 4 },
+            @{ scale = 1.0;  cap = 500.0;  adj = 1; tbptt = 5 },
+            @{ scale = 10.0; cap = 100.0;  adj = 1; tbptt = 5 },
+            @{ scale = 10.0; cap = 500.0;  adj = 1; tbptt = 4 },
+            @{ scale = 10.0; cap = 1000.0; adj = 1; tbptt = 5 },
+            @{ scale = 50.0; cap = 500.0;  adj = 1; tbptt = 4 },
+            @{ scale = 50.0; cap = 1000.0; adj = 1; tbptt = 5 },
+            @{ scale = 50.0; cap = 100.0;  adj = 1; tbptt = 4 }
+        )
+    }
 }
 
 $estHours = [math]::Round(($Legs.Count * $EstimatedMinutesPerLeg) / 60.0, 1)
 Write-Host "Computer B sweep started: MuScale x RheologyCap x Adjoint x TBPTT" -ForegroundColor Cyan
-Write-Host "Profile: $(if ($FullMatrix) {'full-matrix'} else {'budgeted-10h'}) | legs=$($Legs.Count) | epochs=$Epochs | est_hours~$estHours" -ForegroundColor DarkGray
+Write-Host "Profile: $(if ($FullMatrix) {'full-matrix'} else {'budgeted-10h'})/$MemoryProfile | legs=$($Legs.Count) | epochs=$Epochs | est_hours~$estHours" -ForegroundColor DarkGray
 
 foreach ($leg in $Legs) {
     $scale = [double]$leg.scale

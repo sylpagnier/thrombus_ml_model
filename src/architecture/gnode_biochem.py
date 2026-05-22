@@ -30,6 +30,12 @@ def _biochem_ode_grad_checkpoint_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _biochem_kin_grad_checkpoint_enabled() -> bool:
+    """Recompute kinematic GINO stack in backward to reduce VRAM on low-memory GPUs."""
+    v = (os.environ.get("BIOCHEM_KIN_GRADIENT_CHECKPOINT", "0") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _biochem_gelation_prior_gate_enabled() -> bool:
     """When true (default), scale FI/Mat + learned gelation by wall-local kinematic clot-risk prior.
 
@@ -401,9 +407,36 @@ class GNODE_Phase3(nn.Module):
         num_nodes = int(z_in.shape[0])
         device = z_in.device
         batch_idx = get_batch_tensor(batch, num_nodes, device)
-        z_out = self.kin_processor(z_in, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
+        use_ckpt = self.training and _biochem_kin_grad_checkpoint_enabled()
+        if use_ckpt:
+            z_out = checkpoint(
+                self.kin_processor,
+                z_in,
+                batch.edge_index,
+                batch.edge_attr,
+                batch_idx,
+                mod_adv,
+                mod_rheo,
+                mod_curve,
+                use_reentrant=False,
+            )
+        else:
+            z_out = self.kin_processor(z_in, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
         for layer in self.kin_processor_extra:
-            z_out = layer(z_out, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
+            if use_ckpt:
+                z_out = checkpoint(
+                    layer,
+                    z_out,
+                    batch.edge_index,
+                    batch.edge_attr,
+                    batch_idx,
+                    mod_adv,
+                    mod_rheo,
+                    mod_curve,
+                    use_reentrant=False,
+                )
+            else:
+                z_out = layer(z_out, batch.edge_index, batch.edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
         return z_out
 
     def _apply_fourier_encoding(self, x, pos_nd=None):

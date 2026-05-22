@@ -535,6 +535,13 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Expectation check**: not met for boundary stabilization — this setting can still produce strong global fit, but it does not robustly anchor wall; it introduces a two-basin dynamic (moderate-wall vs wall-collapse) instead of a stable compromise.
 - **Most likely cause**: wall branch is still too sensitive to gate/suppressor dynamics under this blend/decay profile, so optimization jumps between incompatible wall regimes.
 
+### 60. New exploratory pair confirms high-geom blend is too aggressive; lower blend is safer but still wall-limited (2026-05-22)
+
+- **Run A (`sweep_free_wall_a`, RTX500 4GB; `GEOM_BLEND=0.80`, `WALL_GATE_MIN=0.12`, decay `3.0` floor `0.30`)**: best all-truth remained **0.7295** (ep00), wall stayed poor (**~3.84**), and training degraded afterward; `gate_wall` stayed at `0.0` while learned wall contribution exploded late (`learned` rising to `~3.9e-1`), indicating unstable compensation rather than boundary recovery.
+- **Run B (`sweep_free_wall_b`, P2200 5GB; `GEOM_BLEND=0.15`, `WALL_GATE_MIN=0.10`, decay `4.0` floor `0.20`)**: best all-truth **0.4323** (ep09), wall still pinned around **3.70**, high-μ remained weak (**~0.96-1.07**), with `gate_wall` effectively near-zero throughout.
+- **Expectation check**: partially met only for global fit (Run B); not met for boundary-layer objective — neither run approaches the prior best wall band (~1.47-2.12), and high-μ remains in tradeoff.
+- **Interpretation**: pushing geometric dominance too hard (Run A) destabilizes the wall branch; softer blend (Run B) is more stable but still lacks a mechanism to reliably reduce wall error.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -824,6 +831,10 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | New wall-controls **Run B** (`sweep_free_wall_b`, P2200 5GB, teacher-only 25ep): `MU_LOG` isolate, split clipping, `WALL_SPATIAL_DECAY=1`, latent320/prior4, `TBPTT=5`, `DETACH=1` | **0.3016** (ep24 best-all) | **2.1246** | **0.444** | high **0.6915** | Spatial decay gives strongest global score in this session and good high-μ recovery, but wall remains far above target and gate_wall stays near-zero after startup |
 | 2026-05-22 | Geom-blend+decay retest **Run 1** (`sweep_free_wall_b`, RTX500 4GB): `GEOM_BLEND=0.35`, `WALL_GATE_MIN=0.05`, decay `7.0` floor `0.05`, teacher-only 25ep | **0.5296** (ep15 best-all) | **3.8510** (best-all; frequent **~6.19** regime) | **-0.126** | high **1.0369** (best-all ckpt; high best **0.5681** ep21 in collapse regime) | Regressed vs prior sweep_free_wall_b baseline; wall branch collapsed and gates decayed to near-zero |
 | 2026-05-22 | Geom-blend+decay retest **Run 2** (`sweep_free_wall_b`, P2200 5GB): `GEOM_BLEND=0.35`, `WALL_GATE_MIN=0.05`, decay `7.0` floor `0.05`, teacher-only 25ep | **0.3145** (ep24 best-all) | **3.4304** (best-all; alternate regime **~6.61**) | **-0.078** | high **1.0097** (best-all ckpt; high best **0.5254** ep21) | Strong all-truth but unstable bimodal wall dynamics (gate_wall toggles 1.0 <-> ~1.9e-22), so boundary objective remains unsolved |
+| 2026-05-22 | Exploratory **Run A** (`sweep_free_wall_a`, RTX500 4GB): `GEOM_BLEND=0.80`, `WALL_GATE_MIN=0.12`, decay `3.0` floor `0.30`, teacher-only 25ep | **0.7295** (ep00 best-all) | **3.8385** | **-0.126** | high **1.8299** | High-geometry blend was too aggressive: run never beat startup checkpoint, wall stayed poor, and late epochs showed unstable learned-wall escalation |
+| 2026-05-22 | Exploratory **Run B** (`sweep_free_wall_b`, P2200 5GB): `GEOM_BLEND=0.15`, `WALL_GATE_MIN=0.10`, decay `4.0` floor `0.20`, teacher-only 25ep | **0.4323** (ep09 best-all) | **3.7021** | **-0.141** | high **1.0749** | Softer blend is more stable and improves all-truth vs Run A, but wall/high-μ remain far from target; gate_wall still effectively inactive |
+| 2026-05-22 | New budgeted comp-A sweep attempt (`compA_L4_S0_B8_R0`, RTX500 4GB, 8ep): script default profile after spatial-knob merge | n/a (teacher startup OOM) | n/a | n/a | n/a | OOM at first teacher forward (`GINO softmax` path) with `gnode_layers=4`; fixed by adding 4GB-safe runtime defaults + kinematic gradient checkpointing + safer default layer profile (2/3 layers) |
+| 2026-05-22 | New budgeted comp-B sweep attempt (`compB_M1_C100_A0_T5`, P2200 5GB, 8ep): first leg with dense ODE backward (`A0`) | n/a (teacher startup OOM) | n/a | n/a | n/a | OOM in ODE/GINO path during first teacher step (dense `odeint` + GAT softmax); fixed by 5GB-safe defaults (allocator/checkpointing, workers/pin tuning), safe TBPTT profile, and adjoint-only budget legs |
 
 ---
 
