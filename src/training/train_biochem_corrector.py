@@ -956,12 +956,18 @@ def _apply_biochem_preset_sweep_free_wall_a() -> None:
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
 
+        # --- THE SAFETY OVERRIDES ---
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "0",
+        # ----------------------------
+
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_BIO_SUPPRESS_WALL_ALPHA": "0.0",
         "BIOCHEM_DELTA_MU_LOG_CLIP_BULK": "1.5",
         "BIOCHEM_DELTA_MU_LOG_CLIP_WALL": "5.0",
         "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
-        "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
@@ -989,12 +995,18 @@ def _apply_biochem_preset_sweep_free_wall_b() -> None:
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "1.5",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "3.5",
 
+        # --- THE SAFETY OVERRIDES ---
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "0",
+        # ----------------------------
+
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_BIO_SUPPRESS_WALL_ALPHA": "0.0",
         "BIOCHEM_DELTA_MU_LOG_CLIP_BULK": "1.5",
         "BIOCHEM_DELTA_MU_LOG_CLIP_WALL": "5.0",
         "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
-        "BIOCHEM_STOCK_DEFAULTS": "1",
     }
     for k, v in bundle.items():
         os.environ[k] = v
