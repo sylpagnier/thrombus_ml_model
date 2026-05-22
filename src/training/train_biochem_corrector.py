@@ -935,6 +935,61 @@ def _apply_biochem_preset_sweep_clot_nuc_growth_if_requested() -> None:
     print("✅ BIOCHEM_PRESET=sweep_clot_nuc_growth: sparse nucleation + growth gate probe active.", flush=True)
 
 
+_SWEEP_DECOUPLED_WALL_ALIASES = frozenset({"sweep_decoupled_wall"})
+
+
+def _apply_biochem_preset_sweep_decoupled_wall() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_DECOUPLED_WALL_ALIASES:
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
+        "BIOCHEM_TEACHER_EPOCHS": "25",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
+        # Fix 1: Uncap the multiplier so it can hit the 45x Comsol gap.
+        "BIOCHEM_DELTA_MU_LOG_CLIP": "5.0",
+        # Fix 2: Wall ignores biology (since walls do not have fibrin).
+        "BIOCHEM_BIO_SUPPRESS_WALL_ALPHA": "0.0",
+        # Fix 3: Wall head ONLY looks at kinematics, zeroing out bio features.
+        "BIOCHEM_WALL_HEAD_PHYS_MIX": "1.0",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_decoupled_wall: Uncapped multiplier & decoupled kinematic wall.", flush=True)
+
+
+_SWEEP_HARD_BC_ALIASES = frozenset({"sweep_hard_bc"})
+
+
+def _apply_biochem_preset_sweep_hard_bc() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_HARD_BC_ALIASES:
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_COMPLEXITY_STEP": "2",
+        "BIOCHEM_LOSS_DATA_ONLY": "1",
+        "BIOCHEM_LOSS_ISOLATE": "MU_LOG",
+        "BIOCHEM_TEACHER_EPOCHS": "25",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "1.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "0.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "3.0",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "0",
+        "BIOCHEM_FORCE_WALL_MU0": "1",
+        "BIOCHEM_STOCK_DEFAULTS": "1",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print("✅ BIOCHEM_PRESET=sweep_hard_bc: Hardcoded CFD boundary active. Neural wall disabled.", flush=True)
+
+
 def _apply_pycharm_biochem_optimal_defaults() -> None:
     """Apply set-if-missing env defaults: fast-iterate schedule + data-only step-2 supervision.
 
@@ -1054,6 +1109,8 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_sweep_bio_suppressor_if_requested()
     _apply_biochem_preset_sweep_wall_overcomp_if_requested()
     _apply_biochem_preset_sweep_clot_nuc_growth_if_requested()
+    _apply_biochem_preset_sweep_decoupled_wall()
+    _apply_biochem_preset_sweep_hard_bc()
     _apply_biochem_complexity_step3_env()
 
 

@@ -900,6 +900,17 @@ class GNODE_Phase3(nn.Module):
                     delta_log_mu = self.mu_delta_head(delta_in)
                 delta_log_mu = torch.clamp(delta_log_mu, min=-self.mu_delta_log_clip, max=self.mu_delta_log_clip)
                 current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
+            # --- NEW: CFD STRICT BOUNDARY OVERRIDE ---
+            if (os.environ.get("BIOCHEM_FORCE_WALL_MU0", "0") or "").strip().lower() in ("1", "true", "yes", "on"):
+                # Force exact wall nodes to resting viscosity (mu_0), bypassing the neural network.
+                # This perfectly mimics COMSOL's no-slip boundary and severs the dead gradients.
+                wall_mask_bool = batch.mask_wall.view(-1).bool()
+                current_mu_eff = torch.where(
+                    wall_mask_bool.unsqueeze(-1),
+                    torch.full_like(current_mu_eff, mu_0),
+                    current_mu_eff,
+                )
+            # -----------------------------------------
             current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
 
             # ==========================================
