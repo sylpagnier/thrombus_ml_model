@@ -950,6 +950,13 @@ def _apply_biochem_preset_sweep_decoupled_wall() -> None:
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "3.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "2.5",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        # VRAM guardrails for 4-5GB cards (avoid adjoint OOM during teacher backward).
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "1",
         # Fix 1: Uncap the multiplier so it can hit the 45x Comsol gap.
@@ -980,6 +987,13 @@ def _apply_biochem_preset_sweep_hard_bc() -> None:
         "BIOCHEM_MU_LOG_WALL_WEIGHT": "0.0",
         "BIOCHEM_MU_LOG_HIGH_WEIGHT": "3.0",
         "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_TEACHER_VAL_EVERY": "2",
+        "BIOCHEM_VAL_TIME_STRIDE": "10",
+        # VRAM guardrails for 4-5GB cards (avoid adjoint OOM during teacher backward).
+        "BIOCHEM_TBPTT_MAX_WINDOW": "5",
+        "BIOCHEM_DETACH_MACRO_STATE": "1",
+        "BIOCHEM_ADJOINT_RK4_SUBSTEPS": "8",
         "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
         "BIOCHEM_USE_WALL_DELTA_HEAD": "0",
         "BIOCHEM_FORCE_WALL_MU0": "1",
