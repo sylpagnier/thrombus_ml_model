@@ -689,6 +689,139 @@ def inspect_boundaries(stem: str, export_dir: Path) -> None:
     print(f"Interior nodes  : {int(m_int.sum())}")
 
 
+def _print_boundary_time_stats(boundary_name: str, times: np.ndarray, data_map: dict[str, np.ndarray]) -> None:
+    print(f"\n[{boundary_name}] aggregate over time (node-wise mean at each t)")
+    print(f"{'t':>10} {'u_mean':>12} {'v_mean':>12} {'p_mean':>12} {'mu_mean':>12}")
+    for ti, t_val in enumerate(times):
+        u_mean = float(np.nanmean(data_map["u"][ti]))
+        v_mean = float(np.nanmean(data_map["v"][ti]))
+        p_mean = float(np.nanmean(data_map["p"][ti]))
+        mu_mean = float(np.nanmean(data_map["mu_eff"][ti]))
+        print(f"{t_val:10.5g} {u_mean:12.5g} {v_mean:12.5g} {p_mean:12.5g} {mu_mean:12.5g}")
+
+
+def _print_boundary_node_drift(
+    boundary_name: str,
+    node_ids: np.ndarray,
+    coords: np.ndarray,
+    data_map: dict[str, np.ndarray],
+    *,
+    max_nodes_to_print: int,
+) -> None:
+    print(f"\n[{boundary_name}] node-level drift (range across time)")
+    print(
+        f"{'node_id':>8} {'x':>10} {'y':>10} {'du':>11} {'dv':>11} {'dp':>11} {'dmu':>11} "
+        f"{'std_u':>11} {'std_v':>11} {'std_p':>11} {'std_mu':>11}"
+    )
+    n_nodes = int(node_ids.size)
+    if n_nodes == 0:
+        print("(none)")
+        return
+    n_show = n_nodes if max_nodes_to_print <= 0 else min(n_nodes, max_nodes_to_print)
+    for k in range(n_show):
+        u_ts = data_map["u"][:, k]
+        v_ts = data_map["v"][:, k]
+        p_ts = data_map["p"][:, k]
+        mu_ts = data_map["mu_eff"][:, k]
+        du = float(np.nanmax(u_ts) - np.nanmin(u_ts))
+        dv = float(np.nanmax(v_ts) - np.nanmin(v_ts))
+        dp = float(np.nanmax(p_ts) - np.nanmin(p_ts))
+        dmu = float(np.nanmax(mu_ts) - np.nanmin(mu_ts))
+        su = float(np.nanstd(u_ts))
+        sv = float(np.nanstd(v_ts))
+        sp = float(np.nanstd(p_ts))
+        smu = float(np.nanstd(mu_ts))
+        xk, yk = float(coords[k, 0]), float(coords[k, 1])
+        print(
+            f"{int(node_ids[k]):8d} {xk:10.4g} {yk:10.4g} {du:11.4g} {dv:11.4g} {dp:11.4g} "
+            f"{dmu:11.4g} {su:11.4g} {sv:11.4g} {sp:11.4g} {smu:11.4g}"
+        )
+    if n_show < n_nodes:
+        print(f"... printed {n_show}/{n_nodes} nodes (use --boundary-trace-max-nodes 0 for all).")
+
+
+def inspect_boundary_traces(
+    stem: str,
+    export_dir: Path,
+    *,
+    max_nodes_to_print: int = 20,
+    csv_out: Path | None = None,
+) -> None:
+    """
+    Print inlet/outlet/wall trajectory diagnostics for u,v,p,mu_eff.
+
+    Includes:
+    - per-boundary aggregate mean at each time step
+    - per-node drift ranges/std across time (helps detect fixed-value targets)
+    - optional long-form CSV export: boundary,node_id,x,y,t,u,v,p,mu_eff
+    """
+    domain_file = export_dir / f"{stem}.txt"
+    if not domain_file.exists():
+        raise FileNotFoundError(f"Missing domain export: {domain_file}")
+
+    times, blocks = _load_comsol_trajectory(domain_file)
+    if not times:
+        raise ValueError(f"No time steps parsed for {domain_file.name}")
+    times_sorted = sorted(blocks.keys())
+    t_axis = np.asarray(times_sorted, dtype=np.float64)
+    base = blocks[times_sorted[0]]
+    tree = cKDTree(base[["x", "y"]].values)
+    n = len(base)
+
+    boundary_masks = {
+        "inlet": _boundary_mask(export_dir / f"{stem}_inlet.txt", tree, n),
+        "outlet": _boundary_mask(export_dir / f"{stem}_outlet.txt", tree, n),
+        "wall": _boundary_mask(export_dir / f"{stem}_wall.txt", tree, n),
+    }
+    tracked_fields = ("u", "v", "p", "mu_eff")
+    csv_rows: list[dict[str, float | int | str]] = []
+
+    print(f"\n=== Boundary traces: {stem} ===")
+    print(f"time steps: {len(times_sorted)} ({t_axis[0]:.6g} -> {t_axis[-1]:.6g})")
+    for b_name, mask in boundary_masks.items():
+        ids = np.flatnonzero(mask)
+        print(f"{b_name:>6} nodes: {int(ids.size)}")
+        if ids.size == 0:
+            continue
+
+        coords = base.iloc[ids][["x", "y"]].to_numpy(dtype=np.float64)
+        data_map = {
+            field: np.stack([blocks[tv].iloc[ids][field].to_numpy(dtype=np.float64) for tv in times_sorted], axis=0)
+            for field in tracked_fields
+        }
+        _print_boundary_time_stats(b_name, t_axis, data_map)
+        _print_boundary_node_drift(
+            b_name,
+            ids,
+            coords,
+            data_map,
+            max_nodes_to_print=max_nodes_to_print,
+        )
+
+        if csv_out is not None:
+            for ni, node_id in enumerate(ids):
+                x_n, y_n = float(coords[ni, 0]), float(coords[ni, 1])
+                for ti, t_val in enumerate(t_axis):
+                    csv_rows.append(
+                        {
+                            "boundary": b_name,
+                            "node_id": int(node_id),
+                            "x": x_n,
+                            "y": y_n,
+                            "t": float(t_val),
+                            "u": float(data_map["u"][ti, ni]),
+                            "v": float(data_map["v"][ti, ni]),
+                            "p": float(data_map["p"][ti, ni]),
+                            "mu_eff": float(data_map["mu_eff"][ti, ni]),
+                        }
+                    )
+
+    if csv_out is not None:
+        csv_out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(csv_rows).to_csv(csv_out, index=False)
+        print(f"\nWrote boundary traces CSV: {csv_out}")
+
+
 def audit_units(stem: str, export_dir: Path, sample_rows: int = 50000) -> None:
     domain_file = export_dir / f"{stem}.txt"
     if not domain_file.exists():
@@ -1057,6 +1190,23 @@ def main() -> None:
         help="Print the stems/times/graph table only, then exit (no matplotlib).",
     )
     parser.add_argument("--boundaries", action="store_true", help="Print boundary node counts for the selected stem.")
+    parser.add_argument(
+        "--boundary-traces",
+        action="store_true",
+        help="Print inlet/outlet/wall node trajectories (u,v,p,mu_eff) over time for the selected stem.",
+    )
+    parser.add_argument(
+        "--boundary-trace-max-nodes",
+        type=int,
+        default=20,
+        help="Max boundary nodes to print in per-node drift table (0 means all).",
+    )
+    parser.add_argument(
+        "--boundary-trace-csv",
+        type=str,
+        default=None,
+        help="Optional CSV output path for full boundary node-by-time traces.",
+    )
     parser.add_argument("--unit-audit", action="store_true", help="Run unit-magnitude audit for the selected stem.")
     parser.add_argument("--graph-summary", action="store_true", help="Print processed .pt summary for the selected stem.")
     parser.add_argument("--sample-rows", type=int, default=50000, help="Rows to sample for unit audit and domain plots.")
@@ -1094,6 +1244,7 @@ def main() -> None:
 
     plot_flags = (
         args.boundaries,
+        args.boundary_traces,
         args.unit_audit,
         args.graph_summary,
         args.plot_domain,
@@ -1124,7 +1275,7 @@ def main() -> None:
     if needs_auto_stem:
         domain_stems = _domain_txt_stems(export_dir)
         graph_stems = _list_graph_stems(graph_dir)
-        needs_domain = args.boundaries or args.unit_audit or args.plot_domain
+        needs_domain = args.boundaries or args.boundary_traces or args.unit_audit or args.plot_domain
         needs_graph_file = args.plot_graph or args.graph_summary
         if needs_graph_file:
             if not graph_stems:
@@ -1143,6 +1294,13 @@ def main() -> None:
 
     if args.boundaries and stem:
         inspect_boundaries(stem, export_dir)
+    if args.boundary_traces and stem:
+        inspect_boundary_traces(
+            stem,
+            export_dir,
+            max_nodes_to_print=args.boundary_trace_max_nodes,
+            csv_out=Path(args.boundary_trace_csv).expanduser() if args.boundary_trace_csv else None,
+        )
     if args.unit_audit and stem:
         audit_units(stem, export_dir, sample_rows=max(1000, args.sample_rows))
     if args.graph_summary and stem:

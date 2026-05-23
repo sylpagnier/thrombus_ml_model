@@ -542,6 +542,15 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Expectation check**: partially met only for global fit (Run B); not met for boundary-layer objective — neither run approaches the prior best wall band (~1.47-2.12), and high-μ remains in tradeoff.
 - **Interpretation**: pushing geometric dominance too hard (Run A) destabilizes the wall branch; softer blend (Run B) is more stable but still lacks a mechanism to reliably reduce wall error.
 
+### 61. Budgeted safe sweeps remove OOM but re-enter a teacher plateau basin (2026-05-23)
+
+- **Comp-A (RTX500 4GB, safe profile, 8 legs)** completed all legs without OOM after checkpointing + safe TBPTT defaults.
+- **Best comp-A leg**: `compA_L3_S0_B8_R0` with val all **1.4599**, wall **2.2509**, high-μ **0.9404**, `r~0.354`.
+- **Architecture readout**: deeper safe stack (`layers=3`) beats `layers=2`; SIREN and high Fourier bands did not help in this short detached teacher regime; LoRA-on legs often worsened all/wall.
+- **Comp-B (P2200 5GB, safe profile, 8 legs)** also completed without OOM; the dense-backward failure mode is fixed by adjoint+safe profile.
+- **Best comp-B basin** appears at low rheology caps (**100**) with all-truth around **~1.49**; raising cap to **500/1000** systematically degrades wall and global fit (wall often **~2.85-3.27**).
+- **Interpretation**: safe profile is now operationally robust, but with `DETACH_MACRO_STATE=1` the teacher signal is heavily truncated and runs sit in the known ~1.46-1.59 plateau family; no gate flip vs prior best teacher (~0.3868).
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -835,6 +844,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | Exploratory **Run B** (`sweep_free_wall_b`, P2200 5GB): `GEOM_BLEND=0.15`, `WALL_GATE_MIN=0.10`, decay `4.0` floor `0.20`, teacher-only 25ep | **0.4323** (ep09 best-all) | **3.7021** | **-0.141** | high **1.0749** | Softer blend is more stable and improves all-truth vs Run A, but wall/high-μ remain far from target; gate_wall still effectively inactive |
 | 2026-05-22 | New budgeted comp-A sweep attempt (`compA_L4_S0_B8_R0`, RTX500 4GB, 8ep): script default profile after spatial-knob merge | n/a (teacher startup OOM) | n/a | n/a | n/a | OOM at first teacher forward (`GINO softmax` path) with `gnode_layers=4`; fixed by adding 4GB-safe runtime defaults + kinematic gradient checkpointing + safer default layer profile (2/3 layers) |
 | 2026-05-22 | New budgeted comp-B sweep attempt (`compB_M1_C100_A0_T5`, P2200 5GB, 8ep): first leg with dense ODE backward (`A0`) | n/a (teacher startup OOM) | n/a | n/a | n/a | OOM in ODE/GINO path during first teacher step (dense `odeint` + GAT softmax); fixed by 5GB-safe defaults (allocator/checkpointing, workers/pin tuning), safe TBPTT profile, and adjoint-only budget legs |
+| 2026-05-23 | Budgeted comp-A safe sweep (RTX500 4GB, 8 legs, teacher-only 8ep): `layers∈{2,3}`, SIREN/Fourier/LoRA ablations under VRAM-safe defaults | **best 1.4599** (`L3,S0,B8,R0`) | **~2.25–2.43** | **~0.35** | high **~0.91–1.03** | OOM resolved, but all legs remain in teacher plateau basin; best leg is `layers=3` without SIREN/LoRA |
+| 2026-05-23 | Budgeted comp-B safe sweep (P2200 5GB, 8 legs, teacher-only 8ep): `MU_LOSS_SCALE×RHEOLOGY_CAP` with adjoint-only safe profile | **best ~1.4937** (`M1,C100` / `M10,C100`) | **~2.29–3.27** | **~0.39–0.43** | high **~0.89–0.98** | OOM resolved; low cap (100) dominates, while cap 500/1000 degrades wall/global strongly in this short detached regime |
 
 ---
 
