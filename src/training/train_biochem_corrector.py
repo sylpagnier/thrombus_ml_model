@@ -3095,11 +3095,15 @@ def _biochem_resolve_isolated_loss(
             + _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
         )
     if k == "MU_LOG":
-        return (
+        loss = (
             _biochem_scale_for_isolate(w_mu_log) * l_mu_log_anchor
             + _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
             + _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
         )
+        wall_bio_blend = max(float(os.environ.get("BIOCHEM_WALL_BIO_BLEND_WEIGHT", "0") or "0"), 0.0)
+        if wall_bio_blend > 0.0:
+            loss = loss + wall_bio_blend * l_wall_bio
+        return loss
     if k == "MU_LOG_WALL":
         return _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
     if k == "MU_LOG_HIGH":
@@ -3412,6 +3416,11 @@ def compute_biochem_loss(
 
             dC_dt_t = d_dt_t[:, 4:13]
             dM_dt_t = d_dt_t[:, 13:16]
+
+            if hasattr(data, "t_global"):
+                data.t_global = evaluation_times[t_idx + 1]
+            else:
+                setattr(data, "t_global", evaluation_times[t_idx + 1])
 
             l_af, l_as = kernels.biochem_adr_residual(biochem_t, vel_t, props, data, d_pred_dt=dC_dt_t)
             l_wb, l_wp = kernels.biochem_wall_residual(biochem_t, wall_t, vel_t, props, data, dM_dt_t)
@@ -5297,9 +5306,28 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
     return pseudo
 
 
+def _restore_cli_teacher_epoch_override_after_presets() -> None:
+    """Re-apply ``--epochs`` / ``BIOCHEM_CLI_TEACHER_EPOCHS`` after preset bundles run.
+
+    Named presets (e.g. ``sweep_free_wall_a``) assign ``BIOCHEM_TEACHER_EPOCHS`` directly;
+    without this, ``train_biochem_corrector()`` would ignore CLI/shell epoch caps.
+    """
+    raw = (os.environ.get("BIOCHEM_CLI_TEACHER_EPOCHS") or "").strip()
+    if not raw:
+        return
+    try:
+        ep = max(1, int(raw))
+    except ValueError:
+        return
+    ep_s = str(ep)
+    os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep_s
+    os.environ["BIOCHEM_EPOCHS"] = ep_s
+
+
 def train_biochem_corrector(epochs=60, lr=1e-3):
     _apply_biochem_env_aliases()
     _apply_pycharm_biochem_optimal_defaults()
+    _restore_cli_teacher_epoch_override_after_presets()
     _preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if _preset in _OVERNIGHT_STEP2_PRESET_ALIASES:
         print(
@@ -6627,6 +6655,7 @@ if __name__ == "__main__":
         os.environ["BIOCHEM_RUN_NOTE"] = str(args.run_name).strip()
     if int(getattr(args, "epochs", 0) or 0) > 0:
         ep = str(int(args.epochs))
+        os.environ["BIOCHEM_CLI_TEACHER_EPOCHS"] = ep
         os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep
         os.environ["BIOCHEM_EPOCHS"] = ep
     if getattr(args, "save_best", False):

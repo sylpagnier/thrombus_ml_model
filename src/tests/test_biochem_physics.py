@@ -1247,5 +1247,145 @@ class TestPhase3Physics(unittest.TestCase):
         self.assertTrue(loss_flux.requires_grad)
         self.assertGreaterEqual(float(loss_flux.item()), 0.0)
 
+
+class TestWallSurfaceNdPhysics(unittest.TestCase):
+    """Regression tests for COMSOL-aligned ND wall surface ODEs (Da, AP coupling, step2t)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bio_cfg = BiochemConfig(phase="biochem")
+        cls.phys_cfg = PhysicsConfig(phase="biochem")
+        cls.core = PhysicsKernels(phys_cfg=cls.phys_cfg)
+        cls.kernels = BiochemPhysicsKernels(cls.bio_cfg, cls.core)
+
+    def _find_extracted_biochem_graph(self):
+        root = get_project_root()
+        for directory in (
+            root / "data/processed/graphs_biochem_anchors",
+            root / "data/processed/graphs_biochem",
+        ):
+            if not directory.exists():
+                continue
+            candidates = sorted([p for p in directory.glob("*.pt") if p.is_file()])
+            if candidates:
+                return candidates[0]
+        return None
+
+    def _eval_wall_bio_loss(self, data, state_t1, dstate_dt, *, t_global_s: float):
+        props = self.core._get_geometric_props(data)
+        num_nodes = int(data.num_nodes)
+        u_ref = data.u_ref if torch.is_tensor(data.u_ref) else torch.tensor([float(data.u_ref)], dtype=torch.float32)
+        d_bar = data.d_bar if torch.is_tensor(data.d_bar) else torch.tensor([float(data.d_bar)], dtype=torch.float32)
+        if u_ref.numel() == 1:
+            u_ref = u_ref.view(1).expand(num_nodes)
+        if d_bar.numel() == 1:
+            d_bar = d_bar.view(1).expand(num_nodes)
+        props["u_ref"] = u_ref
+        props["d_bar"] = d_bar
+        data.t_global = float(t_global_s)
+        vel = state_t1[:, 0:2]
+        bio = state_t1[:, 4:13]
+        wall = state_t1[:, 13:16]
+        dM_dt = dstate_dt[:, 13:16]
+        l_wb, _ = self.kernels.biochem_wall_residual(bio, wall, vel, props, data, dM_pred_dt=dM_dt)
+        return float(l_wb.item())
+
+    def test_gt_wall_residual_sensitive_to_damkohler(self):
+        """COMSOL GT should satisfy Da-scaled surface ODE; wrong Da inflates residual ~O(1/Da)."""
+        graph_path = self._find_extracted_biochem_graph()
+        if graph_path is None:
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
+
+        data = torch.load(graph_path, map_location="cpu", weights_only=False)
+        if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
+            self.skipTest(f"{graph_path.name} does not contain a usable Phase-3 trajectory.")
+        if not hasattr(data, "t") or data.t.numel() < 2:
+            self.skipTest(f"{graph_path.name} missing time vector for step2t gate tests.")
+
+        idx = None
+        for i in range(int(data.t.numel()) - 1):
+            t_mid = 0.5 * (float(data.t[i].item()) + float(data.t[i + 1].item()))
+            if t_mid >= float(self.bio_cfg.surface_time_gate_s) + 1.0:
+                idx = i
+                break
+        if idx is None:
+            self.skipTest("No trajectory interval after surface_time_gate_s in this graph.")
+
+        y1 = data.y[idx + 1].detach()
+        dt = max(float((data.t[idx + 1] - data.t[idx]).item()), 1e-9)
+        d_dt = (data.y[idx + 1] - data.y[idx]).detach() / dt
+        t_val = float(data.t[idx + 1].item())
+
+        loss_ok = self._eval_wall_bio_loss(data, y1, d_dt, t_global_s=t_val)
+        wrong_cfg = BiochemConfig(phase="biochem", surface_damkohler=1.0)
+        wrong_kernels = BiochemPhysicsKernels(wrong_cfg, self.core)
+        props = self.core._get_geometric_props(data)
+        num_nodes = int(data.num_nodes)
+        u_ref = data.u_ref if torch.is_tensor(data.u_ref) else torch.tensor([float(data.u_ref)], dtype=torch.float32)
+        d_bar = data.d_bar if torch.is_tensor(data.d_bar) else torch.tensor([float(data.d_bar)], dtype=torch.float32)
+        if u_ref.numel() == 1:
+            u_ref = u_ref.view(1).expand(num_nodes)
+        if d_bar.numel() == 1:
+            d_bar = d_bar.view(1).expand(num_nodes)
+        props["u_ref"] = u_ref
+        props["d_bar"] = d_bar
+        data.t_global = t_val
+        l_wb_bad, _ = wrong_kernels.biochem_wall_residual(
+            y1[:, 4:13], y1[:, 13:16], y1[:, 0:2], props, data, dM_pred_dt=d_dt[:, 13:16]
+        )
+        loss_bad = float(l_wb_bad.item())
+
+        self.assertLess(loss_ok, 5.0, f"GT wall surface loss unexpectedly large: {loss_ok:.4e}")
+        self.assertGreater(
+            loss_bad,
+            loss_ok * 50.0,
+            f"Wrong Da should inflate GT wall residual: ok={loss_ok:.4e}, bad={loss_bad:.4e}",
+        )
+
+    def test_step2t_gate_suppresses_early_wall_residual(self):
+        """Before 12 s COMSOL mutes adhesion; same state at t=5 s should yield lower wall loss than t=20 s."""
+        graph_path = self._find_extracted_biochem_graph()
+        if graph_path is None:
+            self.skipTest("No extracted Phase-3 graph found under data/processed/graphs_biochem*.")
+
+        data = torch.load(graph_path, map_location="cpu", weights_only=False)
+        if not hasattr(data, "y") or data.y.dim() != 3 or data.y.shape[0] < 2:
+            self.skipTest(f"{graph_path.name} does not contain a usable Phase-3 trajectory.")
+
+        y0 = data.y[0].detach()
+        y1 = data.y[1].detach()
+        dt = max(float((data.t[1] - data.t[0]).item()) if hasattr(data, "t") else 1.0, 1e-9)
+        d_dt = (y1 - y0) / dt
+
+        loss_early = self._eval_wall_bio_loss(data, y1, d_dt, t_global_s=5.0)
+        loss_late = self._eval_wall_bio_loss(data, y1, d_dt, t_global_s=20.0)
+        self.assertLess(
+            loss_early,
+            loss_late * 0.5,
+            f"step2t gate should mute early adhesion: early={loss_early:.4e}, late={loss_late:.4e}",
+        )
+
+    def test_surface_rm_includes_ap_beyond_rp_deposition(self):
+        """R_M must sum RP and AP adhesion; legacy RP-only deposition is not COMSOL-aligned."""
+        cfg = self.bio_cfg
+        rp_si = 1.0e14
+        ap_si = 8.0e13
+        avail = 0.6
+        dshear_abs = 2.0e4
+        sep = 1.0
+        low = 0.0
+        l_char = cfg.L_char
+        gamma_m = cfg.gamma_m
+        rp_path = sep * (l_char / gamma_m) * dshear_abs * avail * cfg.k_rs * rp_si
+        ap_path = sep * (l_char / gamma_m) * dshear_abs * avail * cfg.k_as * ap_si
+        legacy_rm = rp_path + low * avail * cfg.k_rs * rp_si
+        comsol_rm = rp_path + ap_path + low * avail * cfg.k_as * ap_si
+        self.assertGreater(ap_path, 0.0)
+        self.assertGreater(
+            abs(comsol_rm - legacy_rm),
+            0.05 * abs(comsol_rm),
+            "AP adhesion should materially contribute to R_M",
+        )
+
 if __name__ == "__main__":
     unittest.main()

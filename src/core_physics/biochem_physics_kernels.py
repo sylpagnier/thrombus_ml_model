@@ -8,6 +8,22 @@ from src.utils.nondim import time_ratio_global_to_convective
 from src.utils.tensor_utils import as_tensor_like
 
 
+def surface_time_gate_scalar(data, cfg, *, device, dtype) -> torch.Tensor:
+    """Smooth COMSOL step2t(t) gate (adhesion active after ``cfg.surface_time_gate_s``)."""
+    t_raw = getattr(data, "t_global", None)
+    if t_raw is None:
+        t_val = float(cfg.t_final)
+    elif torch.is_tensor(t_raw):
+        t_val = float(t_raw.reshape(-1)[0].detach().cpu())
+    else:
+        t_val = float(t_raw)
+    gate_t = float(cfg.surface_time_gate_s)
+    gate_slope = float(cfg.surface_time_gate_slope)
+    return torch.sigmoid(
+        (torch.as_tensor(t_val, device=device, dtype=dtype) - gate_t) * gate_slope
+    )
+
+
 class BiochemPhysicsKernels:
     """
     Biochem Biochemical Physics Kernels for Eulerian Thrombosis Modeling.
@@ -507,36 +523,38 @@ class BiochemPhysicsKernels:
                     Mas / Minf) * k_aa * AP_wall
         low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * k_aa * AP_wall
 
-        # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
-        # COMSOL srf1 SurfaceReactionsFlux copy-paste bug:
-        # J0_M, J0_Mas, and J0_Mat were set to the same string, so deposition is
-        # dumped uniformly into all three species and the -k_pa*M / +k_pa*M
-        # activation transfer coupling is effectively ignored.
-        R_deposition = pathological_RP_adhesion + low_shear_RP_adhesion
-        R_M = R_deposition
-        R_Mas = R_deposition
-        R_Mat = R_deposition
-
-        # --- TRANSIENT SURFACE RESIDUALS (ODEs) ---
-        # Apply chain rule and rescale to local Convective Time (O(1)) so the surface
-        # ODE landscape matches the bulk ADR loss landscape.
-        # Equivalent to (dM/dt_global - R_M) but expressed via dM/dt_nd:
-        #   res = conv_time * (dM/dt_nd / t_ref_global - R_M) / Minf
-        res_M = conv_time * ((dM_dt_nd / t_ref_global) - R_M) / Minf
-        res_Mas = conv_time * ((dMas_dt_nd / t_ref_global) - R_Mas) / Minf
-        res_Mat = conv_time * ((dMat_dt_nd / t_ref_global) - R_Mat) / Minf
+        is_active_phase = surface_time_gate_scalar(
+            data, self.cfg, device=biochem_preds.device, dtype=biochem_preds.dtype
+        )
+        R_M = (
+            pathological_RP_adhesion
+            + low_shear_RP_adhesion
+            + pathological_AP_adhesion
+            + low_shear_AP_adhesion
+        ) * is_active_phase
+        R_Mas = R_M
+        R_Mat = (R_M + pathological_Mas_adhesion + low_shear_Mas_adhesion) * is_active_phase
+        Da = float(self.cfg.surface_damkohler)
+        res_M = conv_time * ((dM_dt_nd / t_ref_global) - (Da * R_M)) / Minf
+        res_Mas = conv_time * ((dMas_dt_nd / t_ref_global) - (Da * R_Mas)) / Minf
+        res_Mat = conv_time * ((dMat_dt_nd / t_ref_global) - (Da * R_Mat)) / Minf
+        adhesion_gate = is_active_phase
 
         loss_surface = (
-                               F.huber_loss(res_M, torch.zeros_like(res_M), delta=self._biochem_huber_delta) +
-                               F.huber_loss(res_Mas, torch.zeros_like(res_Mas), delta=self._biochem_huber_delta) +
-                               F.huber_loss(res_Mat, torch.zeros_like(res_Mat), delta=self._biochem_huber_delta)
-                       ) / 3.0
+            F.huber_loss(res_M, torch.zeros_like(res_M), delta=self._biochem_huber_delta)
+            + F.huber_loss(res_Mas, torch.zeros_like(res_Mas), delta=self._biochem_huber_delta)
+            + F.huber_loss(res_Mat, torch.zeros_like(res_Mat), delta=self._biochem_huber_delta)
+        ) / 3.0
 
         # --- 6. NEUMANN BOUNDARY FLUX COUPLING (Bulk-to-Wall) ---
-        J_in_RP = - (pathological_RP_adhesion + low_shear_RP_adhesion)
+        J_in_RP = - (pathological_RP_adhesion + low_shear_RP_adhesion) * adhesion_gate
         J_in_AP = - (
-                    pathological_AP_adhesion + low_shear_AP_adhesion + pathological_Mas_adhesion + low_shear_Mas_adhesion)
-        J_in_APR = self.cfg.lambda_adp * (pathological_RP_adhesion + low_shear_RP_adhesion)
+            pathological_AP_adhesion
+            + low_shear_AP_adhesion
+            + pathological_Mas_adhesion
+            + low_shear_Mas_adhesion
+        ) * adhesion_gate
+        J_in_APR = self.cfg.lambda_adp * (pathological_RP_adhesion + low_shear_RP_adhesion) * adhesion_gate
         J_in_APS = self.cfg.s_t * Mat
         J_in_PT = - self.cfg.beta * self.cfg.phi_at * Mat * PT_wall
         J_in_T = self.cfg.beta * self.cfg.phi_at * Mat * PT_wall

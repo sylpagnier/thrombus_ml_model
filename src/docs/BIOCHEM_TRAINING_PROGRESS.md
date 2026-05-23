@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) and 64-epoch runs confirm no new best with late degradation after ~30 ep; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) and 64-epoch runs confirm no new best with late degradation after ~30 ep; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8**; fair 6ep h2h (2026-05-23): geom-isolate **0.5259** all / **1.6610** wall at ep04 |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Best wall remains **1.4669** (ep21, geometry-isolate), but newer geom-blend + decay runs regressed to **~3.43-3.85** (with spikes ~**6.6**), so boundary recovery is currently fragile/seed-sensitive |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -551,6 +551,81 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Best comp-B basin** appears at low rheology caps (**100**) with all-truth around **~1.49**; raising cap to **500/1000** systematically degrades wall and global fit (wall often **~2.85-3.27**).
 - **Interpretation**: safe profile is now operationally robust, but with `DETACH_MACRO_STATE=1` the teacher signal is heavily truncated and runs sit in the known ~1.46-1.59 plateau family; no gate flip vs prior best teacher (~0.3868).
 
+### 62. Fair head-to-head (6 ep, warm start): geometry-isolate beats spatial-decay; runtime ~5× faster than budgeted (2026-05-23)
+
+- **Setup**: `scripts/run_biochem_best_vs_second_30min.ps1` on **SPAGNIER only** (RTX500 4GB; both variants run sequentially on the faster laptop, not in parallel on two machines). Shared fair base: teacher-only 6ep, `MU_LOG` isolate, `TBPTT=5`, `DETACH=1`, warm-start from `biochem_post_pretrain.pth`, val every 2ep, balanced loss weights (anchor/wall/high = 1.0/2.0/2.0). Single architecture axis: **BestAllArch** = `WALL_SPATIAL_DECAY=1`; **BalancedArch** = `WALL_HEAD_ISOLATE_GEOM=1`.
+- **Timing vs expectation**: script targeted **~30 min per variant** (from overnight sweep leg estimates); actual wall-clock **~3 min** (BestAllArch) + **~2 min** (BalancedArch), **~6.7 min** sequential including gap between runs (11:32:26 → 11:39:06). Cause: skipped pretrain, only 6 teacher epochs, `VAL_TIME_STRIDE=10`, and fast val passes (~5.6 s each).
+- **Best checkpoint (ep04, patient007)**:
+  - **BestAllArch** (`wall_spatial_decay`): all **0.6496**, wall **3.8468**, high-μ **1.1247**, `r≈-0.20`; `gate_wall=0` throughout.
+  - **BalancedArch** (`wall_geom_isolate`): all **0.5259**, wall **1.6610**, high-μ **1.0205**, `r≈0.43`; `gate_wall=0` throughout.
+- **Readout**: under identical detached safe training, **geometry-isolate wins on all three subsets** at best ckpt (including wall by ~2.2 logMAE units). Spatial-decay path re-enters the familiar **~3.85 wall plateau** seen in longer `sweep_free_wall_b` runs. Preflight medians: BestAll **1.6605** vs Balanced **1.4815**.
+- **Caveat**: still short-horizon / detached; does not beat historical long-run bests (e.g. overnight all **0.3868**, geometry-isolate wall **1.4669** at 25ep). For a longer fair rematch, rerun at **12–18 ep** with `DETACH=0` if VRAM allows.
+
+### 63. Wall-μ₀ override A/B: `FORCE_WALL_MU0=0` (fix) beats forced resting μ at wall (2026-05-23)
+
+- **Setup**: `scripts/run_biochem_wall_mu0_ab_10min.ps1` on SPAGNIER (RTX500 4GB), sequential both legs, geometry-isolate best arch, 8ep warm-start, `DETACH=1`, `MU_LOG` isolate. **LearnWallMu** = `FORCE_WALL_MU0=0`; **ForceWallMu0** = `FORCE_WALL_MU0=1` (CFD strict override in `gnode_biochem.py`).
+- **Timing**: **~6.3 min** total (**~3.1 min/leg**); under the ~10 min budget.
+- **Best checkpoint (patient007)**:
+  - **LearnWallMu**: all **0.4763** (ep06), wall **1.7743**, high-μ **0.6933**, `r≈0.36`.
+  - **ForceWallMu0**: all **0.4883** (ep06), wall **2.4594** (flat every val epoch), high-μ **0.9204** at best-all ckpt, `r=0` on wall.
+- **Readout**: the recommended fix is **optimal in this probe** — forcing `μ=μ₀` at walls removes the learning signal and pins wall error at the historical **~2.4594** plateau (same as `sweep_hard_bc`). Keep **`BIOCHEM_FORCE_WALL_MU0=0`**; do not enable the override for clot/wall μ work.
+
+### 64. Removed `BIOCHEM_FORCE_WALL_MU0` override from `gnode_biochem.py` (2026-05-23)
+
+- **Change**: deleted the CFD strict wall-μ₀ block in `GNODE_Phase3` forward (previously forced `μ=μ₀` on `mask_wall` nodes). No-slip is kinematic (u,v); wall clot viscosity must remain learnable.
+- **Env**: `BIOCHEM_FORCE_WALL_MU0` is **ignored** (removed from code). `scripts/run_biochem_wall_mu0_ab_10min.ps1` is now a single-leg wall-learning probe only.
+
+### 65. ND surface-physics A/B: opt-in fix wins all-truth, marginal wall, high-μ tradeoff at best ckpt (2026-05-23)
+
+- **Setup**: `scripts/run_biochem_nd_surface_ab_10min.ps1` on SPAGNIER (RTX500), sequential 8ep warm-start, geom-isolate best arch, `MU_LOG` + `WALL_BIO_BLEND=0.15`, `DETACH=1`, val every 2ep. **Baseline** = legacy surface ODEs; **NdSurfaceFix** = `BIOCHEM_ND_SURFACE_PHYSICS=1` (Da=1e-4, full AP/Mas adhesion, step2t gate 12s).
+- **Timing**: **~7.0 min** total (~198s + ~199s/leg).
+- **Best checkpoint (patient007)**:
+  - **Baseline** (ep04): all **0.7267**, wall **1.8845**, high-μ **0.6194**, `r≈0.33`.
+  - **NdSurfaceFix** (ep06): all **0.4941**, wall **1.8015**, high-μ **0.9425**, `r≈0.36`.
+- **Final epoch (ep07)**: Baseline **regressed** (all **1.4418**, high **1.1595**); Fix remained stable (all **0.6129**, wall **1.7434**, high **0.7687**).
+- **Readout**: fix is **clearly better on primary score (all logMAE)** and more stable late-epoch; wall improves slightly at best ckpt (~0.08 logMAE) but high-μ is worse at best ckpt (0.94 vs 0.62) yet better at ep07. Not yet at long-run bests (overnight all **0.3868**). `gate_wall=0` both runs. Promoted to default in code after this A/B (see §66).
+
+### 66. ND surface physics promoted to default; legacy wall ODE path removed (2026-05-23)
+
+- **Code**: `biochem_wall_residual` always uses Da (`BiochemConfig.surface_damkohler=1e-4`), full AP/Mas adhesion in `R_M`/`R_Mat`, step2t gate (`surface_time_gate_s=12`), and gated Neumann fluxes. Legacy RP-only deposition path and `BIOCHEM_ND_SURFACE_PHYSICS` env removed.
+- **Tests**: `TestWallSurfaceNdPhysics` in `test_biochem_physics.py` — GT Da sensitivity (~50× inflation when Da wrong), early step2t gate, AP-in-R_M formula guard. Full `test_biochem_physics.py` + `test_unit_consistency.py`: **44 passed**.
+
+### 67. Wall-gate A/B: `sweep_free_wall_a` helps wall/high at cost of `gate_wall` still zero; preset re-applies 25 ep (2026-05-23)
+
+- **Setup**: manual fair base on SPAGNIER (RTX500 4GB), geom-isolate, `MU_LOG` isolate, `DETACH=1`, warm-start, val stride 10. **A** = baseline (`wall/wall=2.0`, `high=2.0`, `WALL_BIO_BLEND=0.15`, intended 8ep). **B** = `BIOCHEM_PRESET=sweep_free_wall_a` + `WALL_HEAD_ISOLATE_GEOM=1` (`wall=3.0`, `high=2.5`, `BIO_SUPPRESS_WALL_ALPHA=0`; `--epochs 8` passed but **`train_biochem_corrector()` re-applies preset → 25 teacher ep**).
+- **Best checkpoint (patient007)**:
+  - **A (8ep)**: all **0.3729** (ep07), wall **1.7928** (ep04 best wall), high **0.5558** (ep02), `r≈0.46` at best-all.
+  - **B (25ep)**: all **0.3472** (ep20), wall **1.5667** (ep20), high **0.6777** (ep18), `r≈0.22` at best-all.
+- **Matched ~8ep (B ep08 vs A ep07)**: all **0.4009** vs **0.3729** (A wins); wall **1.7512** vs **1.9621** (B wins ~0.21); high **0.7087** vs **0.8292** (B wins).
+- **Gate**: `gate_wall=0.000e+00` **both legs every epoch**; B drives `gate_clot` → **~0.94** late while `gate_all` ~0.48 (A). Wall gains are **not** from opening the wall transition gate.
+- **Readout**: **Adopt loss-weight + longer-train recipe for wall** (B beats A on wall at ep08 and at best ckpt), but **reject “fix the shut wall gate”** as validated — same starvation signature. Re-run fair 8×8 with `BIOCHEM_TEACHER_EPOCHS=8` set **after** preset or without preset bundle epoch override.
+
+### 68. `wall_ab_fix_8ep` retry: preset still forced 25 ep; best ep06 only; unstable after (2026-05-23)
+
+- **Setup**: `sweep_free_wall_a` + `WALL_HEAD_ISOLATE_GEOM=1`, shell `BIOCHEM_TEACHER_EPOCHS=8` + `--epochs 8` — **preset re-apply still set 25 ep** (fixed in code via `BIOCHEM_CLI_TEACHER_EPOCHS` restore after presets).
+- **Best ckpt (ep06)**: all **0.4369**, wall **1.6777**, high **0.8202**, `r≈0.49`; saved teacher-best at ep06 (`gate_wall=0`).
+- **vs fair A/B baseline (8ep)**: baseline ep07 all **0.3729** / wall **1.9621** — **baseline wins global**; this run wins wall at best (~0.18) but **regresses at ep08** (all **0.9003**, wall **1.7312**). Never reached prior 25ep B best (all **0.3472**, wall **1.5667**).
+- **Readout**: minimal preset-only launch is **less stable** than full fair-base A/B; do not treat as definitive 8ep loss. Re-run with full fair base + `BIOCHEM_CLI_TEACHER_EPOCHS=8` after code fix.
+
+### 69. `wall_ab_fix_8ep_v2`: CLI epoch cap works (8ep); confounded run loses to baseline on all (2026-05-23)
+
+- **Setup**: `sweep_free_wall_a` + geom-isolate, `--epochs 8` → **`BIOCHEM_TEACHER_EPOCHS=8` confirmed** (`BIOCHEM_CLI_TEACHER_EPOCHS` restore). **Not fair vs §67 A**: fresh AE+ODE-RXN pretrain (no warm-skip), **LoRA rank=4**, `val_every=3`, `TBPTT curriculum=1`, `workers=4` / `pin_memory=1` (stock defaults), no `WALL_BIO_BLEND` / fair loss weights.
+- **Best ckpt (ep06, mu_score)**: all **0.7789**, wall **1.6271**, high **1.0421**, `r≈0.22`; `gate_wall=0`; `gate_clot→~0.74`.
+- **Ep07 (not saved)**: all **0.8810**, wall **1.5403** (best wall in run), high **0.9544**.
+- **vs fair A/B baseline (8ep, warm-start, fair base)**: baseline all **0.3729** / wall **1.79–1.96** — **baseline wins global by ~0.41 logMAE**; v2 best wall **1.54** @ ep07 beats baseline best wall **1.79** @ ep04 but with poor all/high and low `r`.
+- **Readout**: epoch-cap fix validated; **do not** conclude preset loses — rerun with full `Set-FairBase` + `$env:BIOCHEM_CLI_TEACHER_EPOCHS='8'` only changing preset/weights.
+
+### 70. Fair wall-gate A/B (8ep, warm-start, `Set-FairBase`): **B wins all-truth**; wall mixed; `gate_wall=0` (2026-05-23)
+
+- **Setup**: identical fair base (geom-isolate, `MU_LOG`, `DETACH=1`, `LORA=0`, blend 0.15 on A only, val/2, 8ep CLI cap). **A** = wall/high weights 2/2; **B** = `sweep_free_wall_a` (3.0 / 2.5). Same `biochem_post_pretrain.pth` (post v2 LoRA pretrain — `L_bio~3e2`, not ~1.4e2 from first A/B).
+- **Saved best ckpt (mu_score = all logMAE)**:
+  - **A** ep02: all **0.7615**, wall **2.0946**, high **0.9370**, `r≈0.36`.
+  - **B** ep06: all **0.5081**, wall **1.9513**, high **0.9889**, `r≈0.30`.
+- **Not saved but notable**: A ep04 wall **1.5027** (all 0.8866); B ep07 all **0.5384** wall **1.8189** high **0.8214** `r≈0.39`; B ep02 high **0.6406** but all **1.1606** (spike).
+- **Matched ep06**: A all **0.8880** wall **1.5472** vs B all **0.5081** wall **1.9513** — B wins global by **0.38**, A wins wall by **0.40**.
+- **Gate**: `gate_wall=0` both legs; B does not open wall gate.
+- **Readout**: under fair 8ep, **adopt `sweep_free_wall_a` loss weights for teacher** (clear all-truth win at best ckpt); add **wall-aware or Pareto ckpt** if wall target matters (A ep04 wall beat B saved wall). Absolute scores still above first-session A/B (0.37/0.35) — warm-start changed; optional rerun from clean post-pretrain without LoRA.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -846,6 +921,18 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-22 | New budgeted comp-B sweep attempt (`compB_M1_C100_A0_T5`, P2200 5GB, 8ep): first leg with dense ODE backward (`A0`) | n/a (teacher startup OOM) | n/a | n/a | n/a | OOM in ODE/GINO path during first teacher step (dense `odeint` + GAT softmax); fixed by 5GB-safe defaults (allocator/checkpointing, workers/pin tuning), safe TBPTT profile, and adjoint-only budget legs |
 | 2026-05-23 | Budgeted comp-A safe sweep (RTX500 4GB, 8 legs, teacher-only 8ep): `layers∈{2,3}`, SIREN/Fourier/LoRA ablations under VRAM-safe defaults | **best 1.4599** (`L3,S0,B8,R0`) | **~2.25–2.43** | **~0.35** | high **~0.91–1.03** | OOM resolved, but all legs remain in teacher plateau basin; best leg is `layers=3` without SIREN/LoRA |
 | 2026-05-23 | Budgeted comp-B safe sweep (P2200 5GB, 8 legs, teacher-only 8ep): `MU_LOSS_SCALE×RHEOLOGY_CAP` with adjoint-only safe profile | **best ~1.4937** (`M1,C100` / `M10,C100`) | **~2.29–3.27** | **~0.39–0.43** | high **~0.89–0.98** | OOM resolved; low cap (100) dominates, while cap 500/1000 degrades wall/global strongly in this short detached regime |
+| 2026-05-23 | Fair h2h **BestAllArch** (`WALL_SPATIAL_DECAY=1`, SPAGNIER RTX500, 6ep warm-start, `DETACH=1`, ~3m) | **0.6496** (ep04 best) | **3.8468** | **~-0.20** | high **1.1247** | Sequential on one fast laptop (not dual-machine); wall stuck ~3.85; `gate_wall=0`; finished ~6× faster than ~30m budget |
+| 2026-05-23 | Fair h2h **BalancedArch** (`WALL_HEAD_ISOLATE_GEOM=1`, SPAGNIER RTX500, 6ep warm-start, `DETACH=1`, ~2m) | **0.5259** (ep04 best) | **1.6610** | **~0.43** | high **1.0205** | Wins fair A/B on all/wall/high at best ckpt; positive `r`; still `gate_wall=0`; ep05 regressed slightly (all 0.5892) |
+| 2026-05-23 | Wall-μ₀ A/B **LearnWallMu** (`FORCE_WALL_MU0=0`, geom-isolate, 8ep, ~3m) | **0.4763** (ep06) | **1.7743** | **~0.36** | high **0.6933** | Fix path: wall improves vs forced-μ₀; batch ~6.3m on SPAGNIER |
+| 2026-05-23 | Wall-μ₀ A/B **ForceWallMu0** (`FORCE_WALL_MU0=1`, same base, 8ep, ~3m) | **0.4883** (ep06) | **2.4594** (flat) | **0** (wall) | high **0.9204** | Override stunts wall learning; wall logMAE identical every val — confirms hazard |
+| 2026-05-23 | ND surface A/B **Baseline** (legacy surface ODEs, geom-isolate, 8ep, blend 0.15, ~3.3m) | **0.7267** (ep04 best) | **1.8845** | **~0.33** | high **0.6194** | Ep07 collapse (all 1.44); less stable than fix arm |
+| 2026-05-23 | ND surface A/B **NdSurfaceFix** (`ND_SURFACE_PHYSICS=1`, Da+gate, same base, ~3.3m) | **0.4941** (ep06 best) | **1.8015** | **~0.36** | high **0.9425** (ep07 **0.7687**) | Wins all-truth; marginal wall gain; high-μ worse at best ckpt but stable late |
+| 2026-05-23 | Wall-gate A/B **baseline** (geom-isolate, wall/high=2, blend 0.15, 8ep, `DETACH=1`) | **0.3729** (ep07) | **1.7928** (ep04) | **~0.46** | high **0.5558** (ep02) | Best-all strong; wall ~1.74–1.96; `gate_wall=0` |
+| 2026-05-23 | Wall-gate A/B **`sweep_free_wall_a`** (intended 8ep; preset forced **25ep**) | **0.3472** (ep20) | **1.5667** (ep20) | **~0.22** | high **0.6777** (ep18) | Beats A on wall at ep08+long run; `gate_wall=0`; `gate_clot` saturates late |
+| 2026-05-23 | `wall_ab_fix_8ep` (`sweep_free_wall_a`, geom-isolate; **still 25ep**) | **0.4369** (ep06 best) | **1.6777** (ep06) | **~0.49** | high **0.8202** | Ep08 collapse (all 0.90); worse than baseline 8ep; epoch-cap bug confirmed |
+| 2026-05-23 | `wall_ab_fix_8ep_v2` (preset, **8ep OK**; fresh pretrain+LoRA; confounded) | **0.7789** (ep06) | **1.6271** (ep06; ep07 **1.5403**) | **~0.22** | high **1.0421** | All-truth far worse than fair baseline; wall ep07 promising; `gate_wall=0` |
+| 2026-05-23 | Fair wall A/B **A baseline** (`Set-FairBase`, 8ep, warm-start) | **0.7615** (ep02 best-all) | **1.5027** (ep04) | **~0.36** | high **0.9370** | Ckpt on all only; wall best ep04 not saved |
+| 2026-05-23 | Fair wall A/B **B `sweep_free_wall_a`** (same base, 8ep) | **0.5081** (ep06 best-all) | **1.9513** (ep06) | **~0.30** | high **0.9889** | **Wins fair A/B on saved all**; ep07 high **0.8214**; `gate_wall=0` |
 
 ---
 

@@ -398,6 +398,11 @@ class BiochemConfig:
     # COMSOL parameter is 0.045 [cm/s] -> SI is 4.5e-4 [m/s].
     k_aa: float = 4.5e-4  # Adhesion rate for activated platelets on Mas [m/s]
 
+    # Surface ODE nondimensionalization (COMSOL Da + step2t adhesion gate)
+    surface_damkohler: float = 1.0e-4  # Da [s/cm^2] mapped to ND surface source scale
+    surface_time_gate_s: float = 12.0  # step2t(t): adhesion off before this time [s]
+    surface_time_gate_slope: float = 10.0  # sigmoid steepness for smooth step2t
+
     # Curriculum Learning Bounds (Predictor-Corrector Architecture)
     mu_ratio_init: float = 1.0  # Kine phase: Rheologically neutral flow field
     mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
