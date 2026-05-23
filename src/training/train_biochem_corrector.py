@@ -1430,6 +1430,10 @@ def _compute_mu_flow_debug_metrics(
         out["DBG_mu_gt_si_mean_truth"] = float("nan")
         out["DBG_mu_gt_si_p90_truth"] = float("nan")
 
+    if hasattr(model, "_last_mu_wall_gate") and model._last_mu_wall_gate is not None:
+        wgate = model._last_mu_wall_gate.view(-1).float()
+        out["DBG_wall_gate_mean_all"] = _masked_mean(wgate, m_all)
+        out["DBG_wall_gate_mean_wall"] = _masked_mean(wgate, m_truth & m_wall)
     if hasattr(model, "_last_mu_trigger_gate") and model._last_mu_trigger_gate is not None:
         gate = model._last_mu_trigger_gate.view(-1).float()
         out["DBG_gate_mean_all"] = _masked_mean(gate, m_all)
@@ -3006,6 +3010,44 @@ def _anchor_mu_subset_log_losses(
     return l_mu_log_wall, l_mu_log_high
 
 
+def _anchor_mu_wall_head_bypass_log_loss(
+    model,
+    *,
+    target_final_mu_nd: torch.Tensor,
+    truth_mask: torch.Tensor,
+    data,
+    cfg_mu,
+    mu_ch: int,
+) -> torch.Tensor:
+    """Fix B: supervise raw wall-head log-μ contribution on wall nodes (ungated)."""
+    device = target_final_mu_nd.device
+    dtype = target_final_mu_nd.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    if (
+        not hasattr(model, "_last_mu_delta_wall")
+        or model._last_mu_delta_wall is None
+        or not hasattr(model, "_last_log_mu_before_wall")
+        or model._last_log_mu_before_wall is None
+    ):
+        return z
+    if not hasattr(data, "mask_wall") or data.mask_wall is None:
+        return z
+    m_truth = truth_mask.view(-1).bool()
+    m_wall = data.mask_wall.view(-1).bool().to(device)
+    m = m_truth & m_wall
+    if not bool(m.any().item()):
+        return z
+    from src.architecture.gnode_biochem import _mu_wall_branch_delta
+
+    gain = float(getattr(model, "mu_wall_delta_gain", 0.65))
+    wall_delta_act = _mu_wall_branch_delta(model._last_mu_delta_wall)
+    log_mu_bypass = model._last_log_mu_before_wall + (gain * wall_delta_act)
+    mu_g = cfg_mu.viscosity_nd_to_si(target_final_mu_nd).reshape(-1).float()
+    log_g = torch.log(mu_g[m].clamp(min=1e-8))
+    log_p = log_mu_bypass.reshape(-1).float()[m]
+    return (log_p - log_g).abs().mean().to(dtype=dtype)
+
+
 def _biochem_resolve_isolated_loss(
     key: str,
     *,
@@ -3036,6 +3078,8 @@ def _biochem_resolve_isolated_loss(
     w_mu_log_wall: float,
     l_mu_log_high: torch.Tensor,
     w_mu_log_high: float,
+    l_mu_wall_bypass: torch.Tensor,
+    w_mu_wall_bypass: float,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -3099,6 +3143,7 @@ def _biochem_resolve_isolated_loss(
             _biochem_scale_for_isolate(w_mu_log) * l_mu_log_anchor
             + _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
             + _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
+            + _biochem_scale_for_isolate(w_mu_wall_bypass) * l_mu_wall_bypass
         )
         wall_bio_blend = max(float(os.environ.get("BIOCHEM_WALL_BIO_BLEND_WEIGHT", "0") or "0"), 0.0)
         if wall_bio_blend > 0.0:
@@ -3137,6 +3182,8 @@ def compute_biochem_loss(
     curriculum = curriculum or CurriculumConfig()
     train_cfg = train_cfg or BiochemTrainingConfig.from_env()
     kernels.set_biochem_huber_delta(_scheduled_biochem_huber_delta(bio_cfg, epoch))
+    if model.training:
+        model._biochem_teacher_epoch = int(epoch)
 
     num_nodes_d = int(data.x.shape[0])
     truth_mask = biochem_truth_node_mask(data, num_nodes_d, device)
@@ -3554,6 +3601,7 @@ def compute_biochem_loss(
     l_mu_log_anchor = torch.tensor(0.0, device=device)
     l_mu_log_wall = torch.tensor(0.0, device=device)
     l_mu_log_high = torch.tensor(0.0, device=device)
+    l_mu_wall_bypass = torch.tensor(0.0, device=device)
     l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
@@ -3595,6 +3643,7 @@ def compute_biochem_loss(
         if model.training
         else w_mu_log_high_base
     )
+    w_mu_wall_bypass = max(float(os.environ.get("BIOCHEM_MU_WALL_BYPASS_WEIGHT", "0.0")), 0.0)
     mu_aux_early_epochs = max(0, int(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_EPOCHS", "0")))
     mu_aux_early_mult = max(1.0, float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_MULT", "1.0")))
     if model.training and mu_aux_early_epochs > 0 and epoch < mu_aux_early_epochs:
@@ -3664,6 +3713,15 @@ def compute_biochem_loss(
                 l_mu_log_wall = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
             if w_mu_log_high <= 0.0:
                 l_mu_log_high = torch.tensor(0.0, device=device, dtype=pred_series_data_freq.dtype)
+            if w_mu_wall_bypass > 0.0:
+                l_mu_wall_bypass = _anchor_mu_wall_head_bypass_log_loss(
+                    model,
+                    target_final_mu_nd=target_series[-1, :, mu_ch],
+                    truth_mask=truth_mask,
+                    data=data,
+                    cfg_mu=kernels.core.cfg,
+                    mu_ch=mu_ch,
+                )
 
     mu_dbg = _compute_mu_flow_debug_metrics(
         model=model,
@@ -3855,6 +3913,8 @@ def compute_biochem_loss(
             w_mu_log_wall=float(w_mu_log_wall),
             l_mu_log_high=l_mu_log_high,
             w_mu_log_high=float(w_mu_log_high),
+            l_mu_wall_bypass=l_mu_wall_bypass,
+            w_mu_wall_bypass=float(w_mu_wall_bypass),
             l_fi_gate_start=l_fi_gate_start,
             w_fi_gate_start_eff=float(w_fi_gate_start_eff),
             l_residual_sparse=l_residual_sparse,
@@ -3870,6 +3930,7 @@ def compute_biochem_loss(
                 + (w_mu_log * l_mu_log_anchor)
                 + (w_mu_log_wall * l_mu_log_wall)
                 + (w_mu_log_high * l_mu_log_high)
+                + (w_mu_wall_bypass * l_mu_wall_bypass)
                 + (w_mu_log_boundary * l_mu_log_boundary)
             )
             if model.training and data_only_phys_temp_wanted:
@@ -3897,6 +3958,7 @@ def compute_biochem_loss(
             + (w_mu_log * l_mu_log_anchor)
             + (w_mu_log_wall * l_mu_log_wall)
             + (w_mu_log_high * l_mu_log_high)
+            + (w_mu_wall_bypass * l_mu_wall_bypass)
             + (max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0) * l_mu_log_boundary)
             + (w_fi_gate_start_eff * l_fi_gate_start)
             + (lambda_residual_sparse * l_residual_sparse)
@@ -3963,6 +4025,8 @@ def compute_biochem_loss(
         "W_MuLog_wall_eff": float(w_mu_log_wall),
         "L_MuLog_high": l_mu_log_high.item(),
         "W_MuLog_high_eff": float(w_mu_log_high),
+        "L_MuWall_bypass": l_mu_wall_bypass.item(),
+        "W_MuWall_bypass_eff": float(w_mu_wall_bypass),
         "L_MuLog_boundary": l_mu_log_boundary.item(),
         "W_MuLog_boundary_eff": max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0),
         "DataOnlyPhysTempOn": float(data_only_phys_temp_wanted),

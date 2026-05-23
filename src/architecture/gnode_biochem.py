@@ -60,6 +60,88 @@ def _biochem_split_mu_regime_head_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _biochem_env_truthy(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _biochem_mu_wall_mix_mode() -> str:
+    """How the wall residual branch is mixed into log-μ.
+
+    - ``gate`` (default): ``gain * wall_gate * delta_wall`` (legacy).
+    - ``relu_add`` / ``additive``: ``gain * ReLU(delta_wall)`` on wall-mask nodes only (Fix D).
+    """
+    v = (os.environ.get("BIOCHEM_MU_WALL_MIX_MODE", "gate") or "gate").strip().lower()
+    if v in ("relu_add", "additive", "add", "residual", "siren_add"):
+        return "relu_add"
+    return "gate"
+
+
+def _biochem_mu_wall_head_activation() -> str:
+    return (os.environ.get("BIOCHEM_MU_WALL_HEAD_ACTIVATION", "silu") or "silu").strip().lower()
+
+
+def _make_mu_delta_wall_head(in_dim: int) -> nn.Sequential:
+    act = _biochem_mu_wall_head_activation()
+    if act == "relu":
+        hidden_act: nn.Module = nn.ReLU()
+    elif act == "siren":
+        from src.architecture.siren_decoder import Sine
+
+        hidden_act = Sine(w0=30.0)
+    else:
+        hidden_act = nn.SiLU()
+    return nn.Sequential(
+        nn.Linear(in_dim, 64),
+        hidden_act,
+        nn.Linear(64, 1),
+    )
+
+
+def _wall_gate_from_signal(
+    wall_signal_val: torch.Tensor,
+    *,
+    center: float,
+    temp: float,
+    t_scale: float,
+    logit_bias: float = 0.0,
+    gate_min: float = 0.0,
+) -> torch.Tensor:
+    wall_logits = (wall_signal_val - center) / max(temp * max(t_scale, 0.25), 1e-5)
+    if logit_bias != 0.0:
+        wall_logits = wall_logits + logit_bias
+    wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
+    if gate_min > 0.0:
+        wall_gate = torch.clamp(wall_gate, min=gate_min, max=1.0)
+    return wall_gate
+
+
+def _apply_wall_gate_curriculum(
+    wall_gate: torch.Tensor,
+    wall_mask: torch.Tensor,
+    *,
+    teacher_epoch: int | None,
+    curriculum_epochs: int,
+) -> torch.Tensor:
+    """Fix A: force wall gate open on wall-mask nodes for the first N teacher epochs."""
+    if curriculum_epochs <= 0 or teacher_epoch is None or teacher_epoch >= curriculum_epochs:
+        return wall_gate
+    on_wall = wall_mask.view(-1, 1).to(dtype=wall_gate.dtype) > 0.5
+    return torch.where(on_wall, torch.ones_like(wall_gate), wall_gate)
+
+
+def _mu_wall_branch_delta(delta_wall: torch.Tensor) -> torch.Tensor:
+    """Activation applied to raw wall-head output before mixing into log-μ."""
+    if _biochem_mu_wall_mix_mode() == "relu_add":
+        return F.relu(delta_wall)
+    act = _biochem_mu_wall_head_activation()
+    if act == "relu":
+        return F.relu(delta_wall)
+    return delta_wall
+
+
 def _biochem_wall_delta_head_enabled() -> bool:
     """Enable an extra near-wall residual log-μ correction branch."""
     raw = (os.environ.get("BIOCHEM_USE_WALL_DELTA_HEAD", "0") or "").strip().lower()
@@ -338,15 +420,20 @@ class GNODE_Phase3(nn.Module):
         )
         # Optional near-wall residual branch.
         # Uses kinematics + species + wall cues to correct underfit wall viscosity.
-        self.mu_delta_wall_head = nn.Sequential(
-            nn.Linear(latent_dim + self.mu_trigger_feat_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, 1),
-        )
+        self.mu_delta_wall_head = _make_mu_delta_wall_head(latent_dim + self.mu_trigger_feat_dim)
         self.mu_trigger_gate_temp = max(float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP", "0.20")), 1e-5)
         self.mu_delta_log_clip = max(float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP", "1.5")), 1e-6)
         self.mu_wall_gate_temp = max(float(os.environ.get("BIOCHEM_MU_WALL_GATE_TEMP", "0.18")), 1e-5)
         self.mu_wall_gate_center = float(os.environ.get("BIOCHEM_MU_WALL_GATE_CENTER", "0.55"))
+        gate_pos_init = os.environ.get("BIOCHEM_MU_WALL_GATE_POS_INIT", "").strip()
+        if gate_pos_init:
+            self._mu_wall_gate_logit_bias = float(gate_pos_init)
+        else:
+            self._mu_wall_gate_logit_bias = float(os.environ.get("BIOCHEM_WALL_GATE_BIAS", "0.0"))
+        self._mu_wall_gate_curriculum_epochs = max(
+            0, int(os.environ.get("BIOCHEM_WALL_GATE_CURRICULUM_EPOCHS", "0"))
+        )
+        self._biochem_teacher_epoch: int | None = None
         self.mu_wall_delta_gain = float(os.environ.get("BIOCHEM_MU_WALL_DELTA_GAIN", "0.65"))
         self.mu_wall_mask_mix = min(
             max(float(os.environ.get("BIOCHEM_MU_WALL_MASK_MIX", "0.80")), 0.0),
@@ -645,6 +732,7 @@ class GNODE_Phase3(nn.Module):
         self._last_mu_delta_tail = None
         self._last_mu_wall_gate = None
         self._last_mu_delta_wall = None
+        self._last_log_mu_before_wall = None
         self._last_mu_nucleation_prob = None
         self._last_mu_growth_prob = None
         self._last_mu_nucleation_cue = None
@@ -872,16 +960,18 @@ class GNODE_Phase3(nn.Module):
                             wall_prox,
                             self.mu_wall_mask_mix * wall_mask,
                         )
-                        wall_logits = (wall_signal_val - self.mu_wall_gate_center) / max(
-                            self.mu_wall_gate_temp * max(self.T_scale, 0.25), 1e-5
-                        )
-                        wall_gate = torch.sigmoid(torch.clamp(wall_logits, min=-50.0, max=50.0))
                         wall_gate_min = min(
                             max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
                             0.99,
                         )
-                        if wall_gate_min > 0.0:
-                            wall_gate = torch.clamp(wall_gate, min=wall_gate_min, max=1.0)
+                        wall_gate = _wall_gate_from_signal(
+                            wall_signal_val,
+                            center=self.mu_wall_gate_center,
+                            temp=self.mu_wall_gate_temp,
+                            t_scale=float(self.T_scale),
+                            logit_bias=float(self._mu_wall_gate_logit_bias),
+                            gate_min=wall_gate_min,
+                        )
 
                         if bio_suppressor_enabled:
                             # --- FIXED: Listen to the Alpha environment variable! ---
@@ -935,7 +1025,25 @@ class GNODE_Phase3(nn.Module):
                             if wall_decay_floor > 0.0:
                                 wall_decay = wall_decay_floor + ((1.0 - wall_decay_floor) * wall_decay)
                             delta_wall = delta_wall * wall_decay
-                        delta_log_mu = delta_log_mu + (self.mu_wall_delta_gain * wall_gate * delta_wall)
+                        self._last_log_mu_before_wall = (
+                            torch.log(current_mu_eff.clamp(min=1e-8)) + delta_log_mu
+                        )
+                        wall_delta_act = _mu_wall_branch_delta(delta_wall)
+                        wall_mix = _biochem_mu_wall_mix_mode()
+                        if wall_mix == "relu_add":
+                            wall_term = self.mu_wall_delta_gain * wall_delta_act
+                            delta_log_mu = delta_log_mu + (wall_mask * wall_term)
+                            wall_gate = torch.ones_like(wall_gate)
+                        else:
+                            wall_gate = _apply_wall_gate_curriculum(
+                                wall_gate,
+                                wall_mask,
+                                teacher_epoch=self._biochem_teacher_epoch,
+                                curriculum_epochs=self._mu_wall_gate_curriculum_epochs,
+                            )
+                            delta_log_mu = delta_log_mu + (
+                                self.mu_wall_delta_gain * wall_gate * wall_delta_act
+                            )
                         self._last_mu_wall_gate = wall_gate
                         self._last_mu_delta_wall = delta_wall
 

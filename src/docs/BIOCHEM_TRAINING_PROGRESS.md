@@ -50,16 +50,16 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Overnight A (TBPTT=6, `MU_LOG`, 18ep): best **0.3868** ep17; Marathon T2 **0.40** ep6; I1/I2/I4 ~0.44–0.49 ep3; SAFEVAL/V4 family around **~0.50** (best **0.5030** ep8) and 64-epoch runs confirm no new best with late degradation after ~30 ep; step-3 teacher max-complexity stayed flat **~1.51** with grad-skip; wall still **~1.7–1.8**; fair 6ep h2h (2026-05-23): geom-isolate **0.5259** all / **1.6610** wall at ep04 |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Wall3h fair sweep (2026-05-23): **`sweep_wall_sentinel` all **0.3185** ep17** (new session best); fair baseline **0.4239** @34ep; `sweep_free_wall_a` **0.3422** @34ep; prior overnight A **0.3868**; fair 8ep **0.37/0.35**; wall still **~1.5–2.0**; `gate_wall=0` on baseline/free_wall_a |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Wall μ logMAE | ≲ 1.5 | **Partial** | Best wall remains **1.4669** (ep21, geometry-isolate), but newer geom-blend + decay runs regressed to **~3.43-3.85** (with spikes ~**6.6**), so boundary recovery is currently fragile/seed-sensitive |
+| Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
 | Phase B: `MU_SI` + low TF + μ-path | Val logMAE drops | **Pass** | Marathon **I2** best **0.44** ep3 (same recipe as MU_LOG) |
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: **Interim pass on patient007** — overnight A best **0.3868** (MU_LOG, TBPTT=6, 18ep); marathon **T2** **0.40**; A0/I1/I2/I4 **~0.44–0.49**. Wall/high-μ still weak; **J2** joint (+`W_MuSI`) blocked by flux-debug crash (fixed locally). Corrector not started.
+- **Step-2 teacher “done”**: **Interim pass on patient007** — overnight A best **0.3868** (MU_LOG, TBPTT=6, 18ep); marathon **T2** **0.40**; A0/I1/I2/I4 **~0.44–0.49**. Dual-laptop **wall3h fair sweep** (2026-05-23): best saved all **0.3185** (`sweep_wall_sentinel` ep17, SPAGNIER); fair baseline ladder to **0.4239** @ 34ep with wall **~1.67–2.02** but **`gate_wall` never opens** on baseline/`sweep_free_wall_a`. Wall/high-μ still weak; **J2** joint blocked by flux-debug crash (fixed locally). Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients. Latest teacher-only step-3 attempt hit pervasive bio-grad cap skips and flat μ.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
@@ -626,6 +626,26 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Gate**: `gate_wall=0` both legs; B does not open wall gate.
 - **Readout**: under fair 8ep, **adopt `sweep_free_wall_a` loss weights for teacher** (clear all-truth win at best ckpt); add **wall-aware or Pareto ckpt** if wall target matters (A ep04 wall beat B saved wall). Absolute scores still above first-session A/B (0.37/0.35) — warm-start changed; optional rerun from clean post-pretrain without LoRA.
 
+### 71. Wall3h fair epoch-ladder sweep (2026-05-23): sentinel opens `gate_wall`; baseline/`free_wall_a` do not
+
+- **Setup**: `scripts/run_biochem_wall_gate_fair_sweep_3h.ps1` — **Arm A** (SPAGNIER RTX500): fair base (`MU_LOG`, geom-isolate, `LORA=0`, warm-start, val/2, `DETACH=1`, `CLI_TEACHER_EPOCHS` honored) + epoch ladder **8→34** on baseline, **Pareto** baseline@20ep, **`sweep_wall_sentinel`@18ep**. **Arm B** (SILKSPECTRE P2200): same fair base + **`sweep_free_wall_a`** ladder, **`sweep_free_wall_b`@20ep**, **`sweep_bio_suppressor`@18ep**. Batch **~62m + ~76m**; summary `outputs/reports/training/biochem/wall_gate_fair_sweep_3h_summary.txt`.
+- **Best all-truth (saved ckpt, patient007)**:
+  - **Baseline** `B0_ep34`: all **0.4239** (ep33); wall **1.9708** @ best-all ep; best wall **1.6753** ep24.
+  - **`sweep_free_wall_a`** `FWa_ep34`: all **0.3422** (ep33); wall **2.1341** @ best-all ep.
+  - **`sweep_wall_sentinel`** `WS_ep18`: all **0.3185** (ep17); wall **1.5479** @ best-all ep; best wall **1.5605** ep12.
+- **`gate_wall` (train μ debug)**:
+  - Baseline + `sweep_free_wall_a`: **`0.000e+00`** every val line (same as prior fair A/B).
+  - **`sweep_wall_sentinel`**: ep00 **0.812** → ep02 **0.06** floor → ep10–17 train **`gate_wall=1.000e+00`** (val still reports wall logMAE ~1.5–1.7).
+  - **`sweep_bio_suppressor`**: **`gate_wall≈6e-02`** (floor); all **0.7279** ep08 best.
+- **Matched-epoch snapshots** (same fair base, warm-start):
+  - **~20ep**: baseline all **0.5982** / wall **1.9737**; `FWa_ep20` all **0.4704** / wall **1.7016** — B wins global, comparable wall.
+  - **~14ep**: baseline all **0.4577** (ep04); `FWa_ep14` all **0.4790** (ep12).
+- **Pareto @20ep** (`B0_ep20_pareto`): saved **ep02** all **0.7504** / wall **1.5388** — Pareto did not retain later wall wins (ep24 wall **1.6753** unreachable).
+- **Cause / readout**:
+  - **Loss weights alone** (`sweep_free_wall_a`: wall=3, high=2.5) improve **all** vs fair baseline at long horizons but **do not** activate the wall transition gate.
+  - **`sweep_wall_sentinel`** (high `MU_LOG_WALL_WEIGHT`, wall gate bias) is the **only** leg in this sweep that saturates **`gate_wall`**; wall logMAE still **~1.55** at best-all — gate open ≠ wall metric solved.
+  - **Next**: wall-aware checkpoint selection (not mu_score-only); short sentinel continuation from ep17 ckpt; avoid conflating train `gate_wall` with val wall logMAE.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -933,6 +953,23 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-23 | `wall_ab_fix_8ep_v2` (preset, **8ep OK**; fresh pretrain+LoRA; confounded) | **0.7789** (ep06) | **1.6271** (ep06; ep07 **1.5403**) | **~0.22** | high **1.0421** | All-truth far worse than fair baseline; wall ep07 promising; `gate_wall=0` |
 | 2026-05-23 | Fair wall A/B **A baseline** (`Set-FairBase`, 8ep, warm-start) | **0.7615** (ep02 best-all) | **1.5027** (ep04) | **~0.36** | high **0.9370** | Ckpt on all only; wall best ep04 not saved |
 | 2026-05-23 | Fair wall A/B **B `sweep_free_wall_a`** (same base, 8ep) | **0.5081** (ep06 best-all) | **1.9513** (ep06) | **~0.30** | high **0.9889** | **Wins fair A/B on saved all**; ep07 high **0.8214**; `gate_wall=0` |
+| 2026-05-23 | Wall3h sweep **batch** (fair base, warm-start, `DETACH=1`, `LORA=0`, val/2; SPAGNIER+SILKSPECTRE; `wall_gate_fair_sweep_3h`) | see legs below | — | — | ~62m+76m total; `CLI_TEACHER_EPOCHS` ladder honored |
+| 2026-05-23 | Wall3h **baseline** `B0_ep8` (SPAGNIER) | **0.8695** (ep06) | **1.6052** (ep06) | **0.36** | high **2.0640** | `gate_wall=0`; early-stop not used |
+| 2026-05-23 | Wall3h **baseline** `B0_ep14` (SPAGNIER) | **0.4577** (ep04) | **1.9106** (ep04) | **0.37** | high **0.6238** (ep08) | `gate_wall=0`; best all early ep04 |
+| 2026-05-23 | Wall3h **baseline** `B0_ep20` (SPAGNIER) | **0.5982** (ep19) | **2.0260** (ep19) | **0.42** | high **0.9692** (ep19) | `gate_wall=0`; late improves all, wall drifts up |
+| 2026-05-23 | Wall3h **baseline** `B0_ep26` (SPAGNIER) | **0.5069** (ep20) | **1.9737** (ep20) | **0.32** | high **1.1427** (ep20) | `gate_wall=0`; ep24 wall **1.7110** not saved (all ckpt) |
+| 2026-05-23 | Wall3h **baseline** `B0_ep30` (SPAGNIER) | **0.4328** (ep29) | **2.0210** (ep29) | **0.34** | high **1.0729** (ep29) | `gate_wall=0`; best all in ladder |
+| 2026-05-23 | Wall3h **baseline** `B0_ep34` (SPAGNIER) | **0.4239** (ep33) | **1.9708** (ep33) | **0.31** | high **1.0464** (ep33) | `gate_wall=0`; wall still ~2.0 at best-all |
+| 2026-05-23 | Wall3h **baseline Pareto** `B0_ep20_pareto` (SPAGNIER) | **0.7504** (ep02 saved) | **1.5388** (ep04) | **~0.25** | high **0.8646** (ep04) | Pareto froze early; missed ep20+ wall **1.67** |
+| 2026-05-23 | Wall3h **`sweep_wall_sentinel`** `WS_ep18` (SPAGNIER) | **0.3185** (ep17) | **1.5479** (ep17) | **0.12** | high **0.9962** (ep17) | **`gate_wall=1.0`** train ep10–17; best all in sweep |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep8` (SILKSPECTRE) | **0.9812** (ep00) | **2.5124** (ep00) | **0.37** | high **0.9100** (ep00) | `gate_wall~0` after ep02; poor start |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep14` (SILKSPECTRE) | **0.4790** (ep12) | **1.7933** (ep12) | **0.28** | high **0.9023** (ep12) | Beats baseline ep14 on all; `gate_wall~0` |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep20` (SILKSPECTRE) | **0.4704** (ep19) | **1.7016** (ep19) | **0.30** | high **0.9414** (ep19) | Beats baseline ep20 on all; wall similar |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep26` (SILKSPECTRE) | **0.4116** (ep22) | **1.9674** (ep22) | **0.29** | high **1.1376** (ep22) | Best all @22ep; wall still ~2.0 |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep30` (SILKSPECTRE) | **0.4425** (ep22) | **2.1296** (ep22) | **0.45** | high **0.7069** (ep22) | `gate_wall~0`; ep30 all **0.5004** |
+| 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep34` (SILKSPECTRE) | **0.3422** (ep33) | **2.1341** (ep33) | **0.37** | high **1.0464** (ep33) | **Best all** in sweep; wall not improved |
+| 2026-05-23 | Wall3h **`sweep_free_wall_b`** `FWb_ep20` (SILKSPECTRE) | **0.5060** (ep19) | **1.9180** (ep19) | **0.36** | high **0.6895** (ep19) | High-clot penalty preset; wall ~1.9 |
+| 2026-05-23 | Wall3h **`sweep_bio_suppressor`** `BIO_ep18` (SILKSPECTRE) | **0.7279** (ep08) | **1.7623** (ep10) | **0.45** | high **0.6834** (ep16) | `gate_wall≈0.06`; clot-tail ok, wall stuck |
 
 ---
 

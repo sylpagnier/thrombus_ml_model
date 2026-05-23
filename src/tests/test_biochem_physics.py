@@ -1387,5 +1387,82 @@ class TestWallSurfaceNdPhysics(unittest.TestCase):
             "AP adhesion should materially contribute to R_M",
         )
 
+class TestMuWallGateFixes(unittest.TestCase):
+    """Unit tests for anti gate-collapse wall-branch controls (Fix A–D helpers)."""
+
+    def test_wall_gate_logit_bias_raises_gate(self):
+        from src.architecture.gnode_biochem import _wall_gate_from_signal
+
+        signal = torch.tensor([[0.55], [0.30], [0.70]])
+        gate0 = _wall_gate_from_signal(
+            signal, center=0.55, temp=0.18, t_scale=1.0, logit_bias=0.0, gate_min=0.0
+        )
+        gate_pos = _wall_gate_from_signal(
+            signal, center=0.55, temp=0.18, t_scale=1.0, logit_bias=3.0, gate_min=0.0
+        )
+        self.assertTrue(torch.all(gate_pos >= gate0).item())
+        self.assertGreater(float(gate_pos.mean().item()), float(gate0.mean().item()) + 0.2)
+
+    def test_wall_gate_curriculum_forces_open_on_wall_nodes(self):
+        from src.architecture.gnode_biochem import _apply_wall_gate_curriculum
+
+        wall_gate = torch.tensor([[0.01], [0.02], [0.5]])
+        wall_mask = torch.tensor([[1.0], [0.0], [1.0]])
+        forced = _apply_wall_gate_curriculum(
+            wall_gate, wall_mask, teacher_epoch=2, curriculum_epochs=8
+        )
+        self.assertAlmostEqual(float(forced[0].item()), 1.0, places=5)
+        self.assertAlmostEqual(float(forced[2].item()), 1.0, places=5)
+        self.assertAlmostEqual(float(forced[1].item()), 0.02, places=5)
+        released = _apply_wall_gate_curriculum(
+            wall_gate, wall_mask, teacher_epoch=10, curriculum_epochs=8
+        )
+        self.assertTrue(torch.allclose(released, wall_gate))
+
+    def test_relu_add_wall_branch_is_nonnegative(self):
+        from src.architecture.gnode_biochem import _mu_wall_branch_delta
+
+        prev = os.environ.get("BIOCHEM_MU_WALL_MIX_MODE")
+        os.environ["BIOCHEM_MU_WALL_MIX_MODE"] = "relu_add"
+        try:
+            delta = torch.tensor([[-2.0], [0.5], [1.0]])
+            out = _mu_wall_branch_delta(delta)
+            self.assertTrue(torch.all(out >= 0.0).item())
+            self.assertAlmostEqual(float(out[0].item()), 0.0, places=5)
+            self.assertAlmostEqual(float(out[1].item()), 0.5, places=5)
+        finally:
+            if prev is None:
+                os.environ.pop("BIOCHEM_MU_WALL_MIX_MODE", None)
+            else:
+                os.environ["BIOCHEM_MU_WALL_MIX_MODE"] = prev
+
+    def test_wall_bypass_loss_runs_with_stored_diagnostics(self):
+        from src.training.train_biochem_corrector import _anchor_mu_wall_head_bypass_log_loss
+
+        n = 8
+        model = SimpleNamespace(
+            mu_wall_delta_gain=0.65,
+            _last_mu_delta_wall=torch.tensor([[0.2], [-0.5], [0.1], [0.0], [0.3], [0.0], [0.0], [0.0]]),
+            _last_log_mu_before_wall=torch.zeros(n, 1),
+        )
+        truth = torch.zeros(n, dtype=torch.bool)
+        truth[:3] = True
+        data = SimpleNamespace(mask_wall=torch.tensor([1, 1, 1, 0, 0, 0, 0, 0], dtype=torch.bool))
+        target_nd = torch.full((n,), 2.0)
+        cfg_mu = SimpleNamespace(
+            viscosity_nd_to_si=lambda x: x * 1.0,
+        )
+        loss = _anchor_mu_wall_head_bypass_log_loss(
+            model,
+            target_final_mu_nd=target_nd,
+            truth_mask=truth,
+            data=data,
+            cfg_mu=cfg_mu,
+            mu_ch=0,
+        )
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertGreater(float(loss.item()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
