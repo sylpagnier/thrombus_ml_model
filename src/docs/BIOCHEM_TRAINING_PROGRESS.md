@@ -50,7 +50,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Wall3h fair sweep (2026-05-23): **`sweep_wall_sentinel` all **0.3185** ep17** (new session best); fair baseline **0.4239** @34ep; `sweep_free_wall_a` **0.3422** @34ep; prior overnight A **0.3868**; fair 8ep **0.37/0.35**; wall still **~1.5–2.0**; `gate_wall=0` on baseline/free_wall_a |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Gate-fix 18ep (2026-05-23): **Fix A 0.5155**, **D relu 0.5091**, baseline **0.6227** (fair 18ep); wall3h sentinel **0.3185** @34ep ladder still best all; overnight **0.3868** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
@@ -646,6 +646,18 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
   - **`sweep_wall_sentinel`** (high `MU_LOG_WALL_WEIGHT`, wall gate bias) is the **only** leg in this sweep that saturates **`gate_wall`**; wall logMAE still **~1.55** at best-all — gate open ≠ wall metric solved.
   - **Next**: wall-aware checkpoint selection (not mu_score-only); short sentinel continuation from ep17 ckpt; avoid conflating train `gate_wall` with val wall logMAE.
 
+### 72. Gate-fix sweep (2026-05-23): Fix A / relu-add win **all** on 18ep; wall still ~1.9–2.3; bypass helps high-μ on P2200
+
+- **Setup**: `scripts/run_biochem_gate_fix_sweep.ps1` — fair base (`MU_LOG`, geom-isolate, `LORA=0`, warm-start, val/2, 18ep, `DETACH=1`). **Arm A** (SPAGNIER RTX500): baseline, Fix A (curriculum 12ep), B (bypass 1.5), C (gate pos-init 3.0), D relu-add, D siren-add. **Arm B** (SILKSPECTRE P2200): sentinel ref, AB, AC, ABC combos. Batch **~43m + ~33m**.
+- **Best all-truth (saved ckpt, patient007)**:
+  - **Arm A**: **baseline 0.6227** ep16; **Fix A 0.5155** ep16; **Fix D relu 0.5091** ep17; Fix B **0.5335** ep14 (ep16 collapse 0.85); Fix C **0.5936** ep16; Fix D siren **0.5650** ep12 (ep17 regress 0.91).
+  - **Arm B**: **sentinel 0.4282** ep16; **fix_ab 0.4354** ep16; fix_ac **0.4356** ep17; fix_abc **0.4752** ep10 (combo underperforms AB/AC alone).
+- **Wall @ best-all ckpt**: still **~1.87–2.35** on every leg (best wall in batch **fix_ac 1.8957**); **no leg reached wall3h sentinel 1.55** or geom-isolate **~1.66** band on this 18ep schedule.
+- **High-μ @ best-all**: **fix_ab 0.5258** ep16 (P2200) — best high-μ in sweep; Fix D relu **0.8945** ep17 (SPAGNIER); sentinel **1.2191** ep16.
+- **Diagnostics**: printed **`gate_wall=0`** on all Arm A legs (trigger gate on wall nodes, not `_last_mu_wall_gate`). Sentinel B: **`gate_wall` 0.93 ep00 → floor ~0.06**; curriculum AB shows **`gate_wall` on wall nodes ~0.45–0.64** during ep0–7 then ~0. Fix C: **`gate_all` collapse** ep12–14 (0.12–0.17) after pos-init — hurts bulk trigger path.
+- **Train signal**: Fix B **`L_tot` ~1.5–2× baseline** (bypass term in backward); watch **`W·L_MuWall_bypass`** separately from anchor μ losses.
+- **Readout**: **Fix A (curriculum)** and **Fix D (relu_add)** are the best **all-truth** interventions in this fair 18ep test; **fix_ab** is the best **high-μ** trade but wall explodes. None replaces **`sweep_wall_sentinel` @ 0.3185** (wall3h, longer ladder) or **overnight 0.3868** without more epochs / wall-aware ckpt. **Next**: 24–34ep Fix A or D relu; Pareto; log **`DBG_wall_gate_mean_wall`**; try **fix_ab + sentinel wall weights** (not full ABC); wall-aware save on wall logMAE.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -970,6 +982,18 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-23 | Wall3h **`sweep_free_wall_a`** `FWa_ep34` (SILKSPECTRE) | **0.3422** (ep33) | **2.1341** (ep33) | **0.37** | high **1.0464** (ep33) | **Best all** in sweep; wall not improved |
 | 2026-05-23 | Wall3h **`sweep_free_wall_b`** `FWb_ep20` (SILKSPECTRE) | **0.5060** (ep19) | **1.9180** (ep19) | **0.36** | high **0.6895** (ep19) | High-clot penalty preset; wall ~1.9 |
 | 2026-05-23 | Wall3h **`sweep_bio_suppressor`** `BIO_ep18` (SILKSPECTRE) | **0.7279** (ep08) | **1.7623** (ep10) | **0.45** | high **0.6834** (ep16) | `gate_wall≈0.06`; clot-tail ok, wall stuck |
+| 2026-05-23 | Gate-fix **Arm A batch** (`gate_fix_sweep`, SPAGNIER, fair 18ep) | see legs | — | — | ~43m; `scripts/run_biochem_gate_fix_sweep.ps1` |
+| 2026-05-23 | Gate-fix **baseline** (Arm A, fair 18ep) | **0.6227** (ep16) | **1.8311** | **0.31** | high **1.0805** | `gate_wall=0`; wall ep04 dip **1.521** not saved |
+| 2026-05-23 | Gate-fix **Fix A** curriculum 12ep (Arm A) | **0.5155** (ep16) | **1.9864** | **0.28** | high **1.2763** | **Best all Arm A**; wall not improved vs baseline |
+| 2026-05-23 | Gate-fix **Fix B** bypass w=1.5 (Arm A) | **0.5335** (ep14) | **1.9000** | **0.43** | high **1.0433** | Train `L_tot` ~2×; ep16 val collapse **0.85** |
+| 2026-05-23 | Gate-fix **Fix C** pos-init 3.0 (Arm A) | **0.5936** (ep16) | **1.8729** | **0.27** | high **1.0346** | `gate_all` collapse ep12–14; below baseline all |
+| 2026-05-23 | Gate-fix **Fix D relu_add** (Arm A) | **0.5091** (ep17) | **1.9673** | **0.43** | high **0.8945** | Strong all + best high-μ trade on SPAGNIER |
+| 2026-05-23 | Gate-fix **Fix D siren_add** (Arm A) | **0.5650** (ep12) | **1.9644** | **0.39** | high **0.9566** | Mid pack; ep17 regress **0.91** |
+| 2026-05-23 | Gate-fix **Arm B batch** (`gate_fix_sweep`, SILKSPECTRE, fair 18ep) | see legs | — | — | ~33m |
+| 2026-05-23 | Gate-fix **sentinel ref** (Arm B, 18ep) | **0.4282** (ep16) | **2.0973** | **0.27** | high **1.2191** | `gate_wall` floor ~0.06; below wall3h **0.3185** |
+| 2026-05-23 | Gate-fix **fix_ab** curriculum+bypass (Arm B) | **0.4354** (ep16) | **2.3458** | **0.33** | high **0.5258** | **Best high-μ**; wall worst in batch |
+| 2026-05-23 | Gate-fix **fix_ac** curriculum+pos-init (Arm B) | **0.4356** (ep17) | **1.8957** | **0.31** | high **0.8425** | Best wall in batch; ties sentinel all |
+| 2026-05-23 | Gate-fix **fix_abc** combo (Arm B) | **0.4752** (ep10) | **1.9142** | **0.40** | high **1.4000** | Combo worse than AB or AC alone |
 
 ---
 
