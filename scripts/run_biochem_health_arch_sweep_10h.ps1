@@ -391,6 +391,11 @@ Write-Host "Health architecture sweep (~10h)" -ForegroundColor Cyan
 Write-Host "  legs=$legTotal  default_ep=$TeacherEp  (K0 uses QuickEp=8)" -ForegroundColor DarkGray
 Write-Host "  order: $($Legs -join ' -> ')" -ForegroundColor DarkGray
 Write-Host "  archive: $SweepDir" -ForegroundColor DarkGray
+if ($UseWarmStart) {
+    Write-Host "  pretrain: reuse $PostPretrain on legs after K0" -ForegroundColor DarkGray
+} else {
+    Write-Host "  pretrain: K0 runs AE+ODE cold start (no biochem_post_pretrain.pth yet)" -ForegroundColor Yellow
+}
 Write-Host ""
 
 $legIndex = 0
