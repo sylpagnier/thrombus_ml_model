@@ -88,7 +88,7 @@ import gc
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -351,7 +351,44 @@ from torch.utils.data import WeightedRandomSampler
 from src.utils.batching import get_batch_tensor
 from src.utils.metrics import DynamicLossWeighter
 from src.utils.boundary_flux import flux_debug_from_graph_data, flux_debug_to_training_metrics
-from src.utils.training_diary import TrainingDiary, env_snapshot
+from src.utils.training_diary import BiochemRunLogger
+
+_active_biochem_run_log: Optional["BiochemRunLogger"] = None
+
+
+def _biochem_set_run_log(logger: Optional[BiochemRunLogger]) -> None:
+    global _active_biochem_run_log
+    _active_biochem_run_log = logger
+
+
+def _biochem_log_teacher_val(epoch: int, val_stats: Mapping[str, Any], **extra: Any) -> None:
+    """Append a compact teacher validation row to the active run log."""
+    log = _active_biochem_run_log
+    if log is None or not log.enabled:
+        return
+    metrics = {
+        "mu_log_mae": val_stats.get("mu_log_mae"),
+        "mu_log_mae_wall": val_stats.get("mu_log_mae_wall"),
+        "mu_log_mae_high_mu": val_stats.get("mu_log_mae_high_mu"),
+        "mu_pearson": val_stats.get("mu_pearson"),
+        "mu_score": (-float(val_stats["mu_log_mae"])) if val_stats.get("mu_log_mae") is not None else None,
+    }
+    for key in (
+        "viz_health_score",
+        "viz_t0_speed_mean",
+        "viz_t0_mu_log_mae",
+        "viz_final_mu1_mean",
+        "viz_final_mu2_mean",
+        "viz_final_mu2_p90",
+        "viz_final_clot_frac",
+        "viz_final_gate_mean_all",
+        "viz_final_delta_bulk_mean",
+        "viz_bulk_mu_log_mae",
+    ):
+        v = val_stats.get(key)
+        if v is not None:
+            metrics[key] = v
+    log.log_val("teacher", epoch, metrics, **extra)
 from src.training.physics_curriculum import ease01 as _ease01
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 from src.utils.nondim import to_t_nd
@@ -770,8 +807,8 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
         "BIOCHEM_TEACHER_MU_RATIO_MAX": "80.0",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_START": "0.10",
         "BIOCHEM_MU_TRIGGER_GATE_TEMP_END": "0.04",
-        "BIOCHEM_TRIGGER_GATE_MIN": "0.06",
-        "BIOCHEM_WALL_GATE_MIN": "0.08",
+        "BIOCHEM_TRIGGER_GATE_MIN": "0.0",
+        "BIOCHEM_WALL_GATE_MIN": "0.0",
         "BIOCHEM_MU_WALL_GATE_CENTER": "0.45",
         "BIOCHEM_MU_WALL_GATE_TEMP": "0.14",
         "BIOCHEM_MU_WALL_DELTA_GAIN": "0.85",
@@ -787,6 +824,32 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
     for k, v in bundle.items():
         os.environ[k] = v
     print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Step-2 MU isolate + split μ architecture (fast probe).", flush=True)
+
+
+_SWEEP_GEMINI_ALIASES = frozenset({"sweep_gemini", "gemini"})
+
+
+def _apply_biochem_preset_sweep_gemini_if_requested() -> None:
+    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_GEMINI_ALIASES:
+        return
+    bundle: Dict[str, str] = {
+        "BIOCHEM_MU_GEMINI_FIX": "1",
+        "BIOCHEM_DELTA_MU_SYMMETRIC_BULK_CLIP": "1",
+        "BIOCHEM_DELTA_MU_LOG_CLIP_BULK": "0.05",
+        "BIOCHEM_DELTA_MU_LOG_CLIP_WALL": "5.0",
+        "BIOCHEM_USE_BIO_GATE_SUPPRESSOR": "1",
+        "BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR": "0.0",
+        "BIOCHEM_MU_SOFT_GATE_SCOPE": "wall_only",
+        "BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH": "0.15",
+        "BIOCHEM_TRIGGER_GATE_MIN": "0.0",
+        "BIOCHEM_WALL_GATE_MIN": "0.0",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print(
+        "✅ BIOCHEM_PRESET=sweep_gemini: additive Δlogμ + symmetric bulk clip + nonnegative wall clip.",
+        flush=True,
+    )
 
 
 _SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
@@ -1139,6 +1202,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_preset_teacher_visc_baseline_if_requested()
     _apply_biochem_preset_teacher_max_complexity_if_requested()
     _apply_biochem_preset_sweep_wall_sentinel_if_requested()
+    _apply_biochem_preset_sweep_gemini_if_requested()
     _apply_biochem_preset_sweep_bio_suppressor_if_requested()
     _apply_biochem_preset_sweep_wall_overcomp_if_requested()
     _apply_biochem_preset_sweep_clot_nuc_growth_if_requested()
@@ -1234,23 +1298,6 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     )
 
 
-def _biochem_metrics_jsonl_path():
-    run_dir = os.environ.get("KINEMATICS_TRAINING_RUN_DIR", "").strip()
-    if run_dir:
-        return Path(run_dir) / "metrics.jsonl"
-    return reports_training_dir("biochem") / "metrics.jsonl"
-
-
-def _biochem_append_jsonl(record: Dict[str, Any]) -> None:
-    path = _biochem_metrics_jsonl_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-    except OSError:
-        pass
-
-
 def _graph_has_anchor_nodes(data) -> bool:
     """True if this graph carries any COMSOL-matched (patient/anchor) nodes."""
     ia = getattr(data, "is_anchor", None)
@@ -1264,6 +1311,88 @@ def _graph_has_anchor_nodes(data) -> bool:
 # --- Optional diagnostics (compare with f958b74 ~2026-04-03: that revision mutated
 # ``phys_cfg.re_target`` inside ``compute_biochem_loss``; current code keeps config fixed
 # and passes ``re_ref`` from ``data.re_actual`` only into ``navier_stokes_residual``.)
+_BIOCHEM_CONSOLE_VT_ENABLED = False
+
+
+def _biochem_enable_windows_vt_if_needed() -> None:
+    """Enable ANSI colors on Windows consoles that support virtual terminal processing."""
+    global _BIOCHEM_CONSOLE_VT_ENABLED
+    if _BIOCHEM_CONSOLE_VT_ENABLED or sys.platform != "win32":
+        return
+    _BIOCHEM_CONSOLE_VT_ENABLED = True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def _biochem_console_color_enabled() -> bool:
+    if (os.environ.get("NO_COLOR") or "").strip():
+        return False
+    if (os.environ.get("BIOCHEM_NO_COLOR") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    if (os.environ.get("FORCE_COLOR") or "").strip():
+        return True
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _biochem_console_red(text: str) -> str:
+    if not _biochem_console_color_enabled():
+        return text
+    _biochem_enable_windows_vt_if_needed()
+    return f"\033[91m{text}\033[0m"
+
+
+def _biochem_flow_trivial_warn_threshold() -> float:
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BIOCHEM_FLOW_TRIVIAL_WARN_THRESHOLD", "0.9"))))
+    except ValueError:
+        return 0.9
+
+
+def _biochem_warn_trivial_flow_if_needed(
+    score: float,
+    *,
+    stage: str,
+    epoch: int,
+    batch_idx: Optional[int] = None,
+    mean_over_epoch: bool = False,
+    metrics: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Print a red console warning when predicted inlet flux is near-zero vs reference."""
+    thr = _biochem_flow_trivial_warn_threshold()
+    if not math.isfinite(score) or score < thr:
+        return
+    where = f"{stage} ep {epoch:02d}"
+    if batch_idx is not None:
+        where += f" batch {batch_idx}"
+    if mean_over_epoch:
+        where += " (epoch mean)"
+    msg = f"⚠️ TRIVIAL FLOW FIELD — {where}: flow_trivial_score={score:.3f} (warn if ≥ {thr:.2f})"
+    if metrics is not None:
+        q_pred = float(metrics.get("DBG_Q_pred_inlet", float("nan")))
+        q_ref = float(metrics.get("DBG_Q_ref_re", metrics.get("DBG_Q_ref_bc", float("nan"))))
+        q_ratio = float(metrics.get("DBG_Q_flow_ratio", float("nan")))
+        extras: List[str] = []
+        if math.isfinite(q_pred):
+            extras.append(f"Q_pred_inlet={q_pred:.4e}")
+        if math.isfinite(q_ref):
+            extras.append(f"Q_ref={q_ref:.4e}")
+        if math.isfinite(q_ratio):
+            extras.append(f"Q_flow_ratio={q_ratio:.4f}")
+        if extras:
+            msg += " | " + ", ".join(extras)
+    msg += " — velocity field may be stagnant vs COMSOL/BC reference."
+    print(_biochem_console_red(msg), flush=True)
+
+
 def _biochem_debug_enabled() -> bool:
     return (os.environ.get("BIOCHEM_DEBUG", "0") or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -1795,7 +1924,274 @@ def _filter_compatible_state_dict(
     return compatible, skipped
 
 
+BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME = "biochem_teacher_best_high_mu.pth"
+BIOCHEM_TEACHER_LAST_CKPT_NAME = "biochem_teacher_last.pth"
+# Legacy all-truth global best (optional; not written unless BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL=1).
 BIOCHEM_TEACHER_BEST_CKPT_NAME = "biochem_teacher_best.pth"
+# Corrector-phase global high-μ (teacher runs use TEACHER_BEST_HIGH_MU instead).
+BIOCHEM_BEST_HIGH_MU_CKPT_NAME = "biochem_best_high_mu.pth"
+BIOCHEM_BEST_BIO_LEGACY_CKPT_NAME = "biochem_best_bio.pth"
+
+
+def _teacher_val_log_mae_from_score(teacher_best_mu_score: float) -> float:
+    if teacher_best_mu_score > -float("inf"):
+        return float(-teacher_best_mu_score)
+    return float("nan")
+
+
+def _read_teacher_checkpoint_meta(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k != "model_state_dict"}
+
+
+def _save_biochem_checkpoint_file(
+    path: Path,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    checkpoint_role: str,
+    run_note: str = "",
+    best_epoch: int = -1,
+    val_mu_log_mae: float = float("nan"),
+    val_mu_log_mae_high_mu: float = float("nan"),
+    teacher_best_mu_score: Optional[float] = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "model_state_dict": state_dict,
+        "val_mu_log_mae": float(val_mu_log_mae),
+        "val_mu_log_mae_high_mu": float(val_mu_log_mae_high_mu),
+        "best_epoch": int(best_epoch),
+        "run_note": (run_note or "").strip(),
+        "checkpoint_role": checkpoint_role,
+    }
+    if teacher_best_mu_score is not None:
+        payload["teacher_best_mu_score"] = float(teacher_best_mu_score)
+    torch.save(payload, path)
+    ep_note = f" epoch={best_epoch:02d}" if best_epoch >= 0 else ""
+    high_note = ""
+    if math.isfinite(float(val_mu_log_mae_high_mu)):
+        high_note = f", high-μ logMAE≈{float(val_mu_log_mae_high_mu):.4f}"
+    print(
+        f"💾 Saved {checkpoint_role} -> {path.name} "
+        f"(all logMAE≈{float(val_mu_log_mae):.4f}{high_note}{ep_note})",
+        flush=True,
+    )
+
+
+def _save_biochem_teacher_checkpoint_file(
+    path: Path,
+    teacher: torch.nn.Module,
+    *,
+    teacher_best_mu_score: float,
+    best_epoch: int,
+    run_note: str,
+    checkpoint_role: str,
+    val_mu_log_mae_high_mu: float = float("nan"),
+) -> float:
+    val_log_mae = _teacher_val_log_mae_from_score(teacher_best_mu_score)
+    _save_biochem_checkpoint_file(
+        path,
+        teacher.state_dict(),
+        checkpoint_role=checkpoint_role,
+        run_note=run_note,
+        best_epoch=best_epoch,
+        val_mu_log_mae=val_log_mae,
+        val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
+        teacher_best_mu_score=teacher_best_mu_score,
+    )
+    return val_log_mae
+
+
+def _maybe_update_global_checkpoint(
+    model_dir: Path,
+    ckpt_name: str,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    checkpoint_role: str,
+    metric_key: str,
+    metric_value: float,
+    best_epoch: int,
+    run_note: str,
+    val_mu_log_mae: float = float("nan"),
+    val_mu_log_mae_high_mu: float = float("nan"),
+    teacher_best_mu_score: Optional[float] = None,
+    keep_global: bool = True,
+    kept_label: str = "Global best",
+) -> None:
+    """Update a checkpoint file only when ``metric_value`` improves (lower is better)."""
+    global_path = Path(model_dir) / ckpt_name
+    if not keep_global:
+        _save_biochem_checkpoint_file(
+            global_path,
+            state_dict,
+            checkpoint_role=checkpoint_role,
+            run_note=run_note,
+            best_epoch=best_epoch,
+            val_mu_log_mae=val_mu_log_mae,
+            val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
+            teacher_best_mu_score=teacher_best_mu_score,
+        )
+        return
+
+    prev_meta = _read_teacher_checkpoint_meta(global_path)
+    prev_raw = prev_meta.get(metric_key)
+    try:
+        prev_val = float(prev_raw) if prev_raw is not None else float("nan")
+    except (TypeError, ValueError):
+        prev_val = float("nan")
+
+    cand = float(metric_value)
+    if not math.isfinite(cand):
+        return
+
+    improves = math.isnan(prev_val) or cand < prev_val
+    if improves:
+        _save_biochem_checkpoint_file(
+            global_path,
+            state_dict,
+            checkpoint_role=checkpoint_role,
+            run_note=run_note,
+            best_epoch=best_epoch,
+            val_mu_log_mae=val_mu_log_mae,
+            val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
+            teacher_best_mu_score=teacher_best_mu_score,
+        )
+        return
+
+    prev_note = (prev_meta.get("run_note") or "").strip()
+    print(
+        f"🏆 {kept_label} kept -> {global_path.name} "
+        f"({metric_key}≈{prev_val:.4f}"
+        + (f", run_note={prev_note!r}" if prev_note else "")
+        + f"); this run ≈{cand:.4f} did not beat it.",
+        flush=True,
+    )
+
+
+def _maybe_update_global_best_high_mu(
+    model_dir: Path,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    val_mu_log_mae_high_mu: float,
+    best_epoch: int,
+    run_note: str,
+    val_mu_log_mae: float = float("nan"),
+    teacher_best_mu_score: Optional[float] = None,
+    ckpt_name: str = BIOCHEM_BEST_HIGH_MU_CKPT_NAME,
+    checkpoint_role: str = "best_high_mu",
+    kept_label: str = "Global high-μ best",
+) -> None:
+    """Corrector (or legacy) high-μ checkpoint — teacher runs use ``biochem_teacher_best_high_mu.pth``."""
+    _maybe_update_global_checkpoint(
+        model_dir,
+        ckpt_name,
+        state_dict,
+        checkpoint_role=checkpoint_role,
+        metric_key="val_mu_log_mae_high_mu",
+        metric_value=float(val_mu_log_mae_high_mu),
+        best_epoch=best_epoch,
+        run_note=run_note,
+        val_mu_log_mae=val_mu_log_mae,
+        val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
+        teacher_best_mu_score=teacher_best_mu_score,
+        keep_global=_biochem_env_truthy("BIOCHEM_KEEP_GLOBAL_BEST_HIGH_MU", default=True),
+        kept_label=kept_label,
+    )
+
+
+def _persist_biochem_teacher_checkpoints(
+    model_dir: Path,
+    teacher: torch.nn.Module,
+    *,
+    teacher_best_mu_score: float,
+    best_epoch: int = -1,
+    run_note: str = "",
+    val_mu_log_mae_high_mu: float = float("nan"),
+    best_high_epoch: int = -1,
+    best_high_state: Optional[Dict[str, torch.Tensor]] = None,
+) -> None:
+    """Write ``biochem_teacher_last.pth`` every run; update global teacher high-μ best when val improves."""
+    model_dir = Path(model_dir)
+    run_note = (run_note or "").strip()
+    val_log_mae = _teacher_val_log_mae_from_score(teacher_best_mu_score)
+
+    _save_biochem_teacher_checkpoint_file(
+        model_dir / BIOCHEM_TEACHER_LAST_CKPT_NAME,
+        teacher,
+        teacher_best_mu_score=teacher_best_mu_score,
+        best_epoch=best_epoch,
+        run_note=run_note,
+        checkpoint_role="teacher_last",
+        val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
+    )
+
+    high_state = best_high_state if best_high_state is not None else teacher.state_dict()
+    high_ep = int(best_high_epoch) if int(best_high_epoch) >= 0 else int(best_epoch)
+    _maybe_update_global_checkpoint(
+        model_dir,
+        BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME,
+        high_state,
+        checkpoint_role="teacher_best_high_mu",
+        metric_key="val_mu_log_mae_high_mu",
+        metric_value=float(val_mu_log_mae_high_mu),
+        best_epoch=high_ep,
+        run_note=run_note,
+        val_mu_log_mae=val_log_mae,
+        val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
+        teacher_best_mu_score=teacher_best_mu_score,
+        keep_global=_biochem_env_truthy("BIOCHEM_TEACHER_KEEP_GLOBAL_BEST", default=True),
+        kept_label="Global teacher high-μ best",
+    )
+
+    if _biochem_env_truthy("BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL", default=False):
+        _maybe_update_global_checkpoint(
+            model_dir,
+            BIOCHEM_TEACHER_BEST_CKPT_NAME,
+            teacher.state_dict(),
+            checkpoint_role="teacher_best_all",
+            metric_key="val_mu_log_mae",
+            metric_value=float(val_log_mae),
+            best_epoch=int(best_epoch),
+            run_note=run_note,
+            val_mu_log_mae=val_log_mae,
+            val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
+            teacher_best_mu_score=teacher_best_mu_score,
+            keep_global=True,
+            kept_label="Global teacher all-truth best",
+        )
+
+    archive_dir = (os.environ.get("BIOCHEM_ARCHIVE_CHECKPOINT_DIR") or "").strip()
+    if archive_dir:
+        arch = Path(archive_dir)
+        arch.mkdir(parents=True, exist_ok=True)
+        _save_biochem_teacher_checkpoint_file(
+            arch / BIOCHEM_TEACHER_LAST_CKPT_NAME,
+            teacher,
+            teacher_best_mu_score=teacher_best_mu_score,
+            best_epoch=best_epoch,
+            run_note=run_note,
+            checkpoint_role="teacher_last",
+            val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
+        )
+        _save_biochem_checkpoint_file(
+            arch / BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME,
+            high_state,
+            checkpoint_role="teacher_best_high_mu",
+            run_note=run_note,
+            best_epoch=high_ep,
+            val_mu_log_mae=val_log_mae,
+            val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
+            teacher_best_mu_score=teacher_best_mu_score,
+        )
+        print(f"💾 Archived teacher checkpoints -> {arch}", flush=True)
 
 
 def _save_biochem_teacher_best_checkpoint(
@@ -1806,28 +2202,14 @@ def _save_biochem_teacher_best_checkpoint(
     best_epoch: int = -1,
     run_note: str = "",
 ) -> None:
-    """Persist best teacher weights for inference / ``visualize_pipeline.py``."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    val_log_mae = (
-        float(-teacher_best_mu_score)
-        if teacher_best_mu_score > -float("inf")
-        else float("nan")
-    )
-    payload = {
-        "model_state_dict": teacher.state_dict(),
-        "teacher_best_mu_score": float(teacher_best_mu_score),
-        "val_mu_log_mae": val_log_mae,
-        "best_epoch": int(best_epoch),
-        "run_note": (run_note or "").strip(),
-        "checkpoint_role": "teacher_best",
-    }
-    torch.save(payload, path)
-    ep_note = f" epoch={best_epoch:02d}" if best_epoch >= 0 else ""
-    print(
-        f"💾 Saved teacher-best checkpoint -> {path} "
-        f"(val logMAE≈{val_log_mae:.4f}, mu_score={teacher_best_mu_score:.4f}{ep_note})",
-        flush=True,
+    """Backward-compatible single-file save (prefer ``_persist_biochem_teacher_checkpoints``)."""
+    _save_biochem_teacher_checkpoint_file(
+        path,
+        teacher,
+        teacher_best_mu_score=teacher_best_mu_score,
+        best_epoch=best_epoch,
+        run_note=run_note,
+        checkpoint_role="teacher_best",
     )
 
 
@@ -2137,7 +2519,7 @@ class SplitBiochemOptimizers:
         *,
         physics_optimizer: Optional[optim.Optimizer],
         mu_optimizer: Optional[optim.Optimizer],
-        bio_optimizer: optim.Optimizer,
+        bio_optimizer: Optional[optim.Optimizer],
         weighter_optimizer: optim.Optimizer,
         physics_params: List[torch.nn.Parameter],
         mu_params: List[torch.nn.Parameter],
@@ -2154,14 +2536,31 @@ class SplitBiochemOptimizers:
     @property
     def param_groups(self):
         # Preserve existing call sites that log ``optimizer.param_groups[0]["lr"]``.
-        return self.bio_optimizer.param_groups
+        if self.bio_optimizer is not None:
+            return self.bio_optimizer.param_groups
+        if self.mu_optimizer is not None:
+            return self.mu_optimizer.param_groups
+        if self.physics_optimizer is not None:
+            return self.physics_optimizer.param_groups
+        return self.weighter_optimizer.param_groups
+
+    def lr_scheduler_target(self) -> optim.Optimizer:
+        """Optimizer for ``CosineAnnealingWarmRestarts`` (μ-only runs have no bio group)."""
+        if self.bio_optimizer is not None:
+            return self.bio_optimizer
+        if self.mu_optimizer is not None:
+            return self.mu_optimizer
+        if self.physics_optimizer is not None:
+            return self.physics_optimizer
+        return self.weighter_optimizer
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self.physics_optimizer is not None:
             self.physics_optimizer.zero_grad(set_to_none=set_to_none)
         if self.mu_optimizer is not None:
             self.mu_optimizer.zero_grad(set_to_none=set_to_none)
-        self.bio_optimizer.zero_grad(set_to_none=set_to_none)
+        if self.bio_optimizer is not None:
+            self.bio_optimizer.zero_grad(set_to_none=set_to_none)
         self.weighter_optimizer.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
@@ -2169,7 +2568,8 @@ class SplitBiochemOptimizers:
             self.physics_optimizer.step()
         if self.mu_optimizer is not None:
             self.mu_optimizer.step()
-        self.bio_optimizer.step()
+        if self.bio_optimizer is not None:
+            self.bio_optimizer.step()
         self.weighter_optimizer.step()
 
     def clip_and_step(
@@ -2199,7 +2599,7 @@ class SplitBiochemOptimizers:
             "type": "SplitBiochemOptimizers",
             "physics": self.physics_optimizer.state_dict() if self.physics_optimizer is not None else None,
             "mu": self.mu_optimizer.state_dict() if self.mu_optimizer is not None else None,
-            "bio": self.bio_optimizer.state_dict(),
+            "bio": self.bio_optimizer.state_dict() if self.bio_optimizer is not None else None,
             "weighter": self.weighter_optimizer.state_dict(),
         }
 
@@ -2209,7 +2609,8 @@ class SplitBiochemOptimizers:
                 self.physics_optimizer.load_state_dict(state_dict["physics"])
             if self.mu_optimizer is not None and state_dict.get("mu") is not None:
                 self.mu_optimizer.load_state_dict(state_dict["mu"])
-            self.bio_optimizer.load_state_dict(state_dict["bio"])
+            if self.bio_optimizer is not None and state_dict.get("bio") is not None:
+                self.bio_optimizer.load_state_dict(state_dict["bio"])
             self.weighter_optimizer.load_state_dict(state_dict["weighter"])
             return
         print(
@@ -2302,9 +2703,60 @@ def _biochem_bio_grad_global_l2(split: SplitBiochemOptimizers) -> float:
     return math.sqrt(sq) if sq > 0.0 else 0.0
 
 
-def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=False):
+def _biochem_teacher_ode_freeze_epochs(max_epochs: int) -> int:
+    """Epochs to keep ``ode_func`` frozen at teacher start (0 = train ODE from ep0).
+
+    ``BIOCHEM_ODE_WARMUP_EPOCHS`` aliases ``BIOCHEM_TEACHER_ODE_FREEZE_EPOCHS``.
+    When ``BIOCHEM_TRAIN_ODE=0``, ODE stays frozen for the full teacher stage.
+    """
+    if not _biochem_env_truthy("BIOCHEM_TRAIN_ODE", default=True):
+        return max(1, int(max_epochs))
+    raw = (
+        os.environ.get("BIOCHEM_ODE_WARMUP_EPOCHS")
+        or os.environ.get("BIOCHEM_TEACHER_ODE_FREEZE_EPOCHS")
+        or "3"
+    )
+    return max(0, int(str(raw).strip() or "3"))
+
+
+def _biochem_will_run_ae_ode_pretrain(model_dir: Path) -> bool:
+    """True when Phase 3a / 3a.5 will run (strict μ-freeze must not apply yet)."""
+    if _biochem_env_truthy("BIOCHEM_SKIP_PRETRAIN", default=False):
+        return False
+    if _biochem_env_truthy("BIOCHEM_REUSE_LAST_PRETRAIN", default=False):
+        if (model_dir / "biochem_post_pretrain.pth").exists():
+            return False
+    return True
+
+
+def setup_biochem_optimization(
+    model,
+    loss_weighter,
+    base_lr=1e-3,
+    freeze_lora=False,
+    *,
+    for_pretrain: bool = False,
+):
     print("❄️  Verifying Kinematic Backbone is Frozen.")
     print("🔥 Activating split optimizers: kinematic LoRA isolated from biochemistry.")
+
+    if for_pretrain:
+        train_kin_lora = False
+        train_bio_encoder = True
+        train_ode = False
+        train_bio_decoder = not _biochem_env_truthy("BIOCHEM_FREEZE_DECODER_PRETRAIN", default=False)
+        freeze_lora = True
+        print(
+            "   ℹ️ Pretrain optimizer: bio_encoder + decoder trainable; ODE/LoRA off "
+            "(BIOCHEM_TRAIN_* freeze flags apply at teacher stage only)."
+        )
+    else:
+        train_kin_lora = _biochem_env_truthy("BIOCHEM_TRAIN_KIN_LORA", default=True)
+        train_bio_encoder = _biochem_env_truthy("BIOCHEM_TRAIN_BIO_ENCODER", default=True)
+        train_ode = _biochem_env_truthy("BIOCHEM_TRAIN_ODE", default=True)
+        train_bio_decoder = _biochem_env_truthy("BIOCHEM_TRAIN_BIO_DECODER", default=True)
+        if not train_kin_lora:
+            freeze_lora = True
 
     # Set the frozen kinematic backbone to eval mode!
     model.kin_encoder.eval()
@@ -2318,22 +2770,25 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
 
     # Unfreeze specifically intended modules conditionally
     for name, param in model.named_parameters():
-        if "lora" in name.lower() and not freeze_lora:
+        if "lora" in name.lower() and not freeze_lora and train_kin_lora:
             param.requires_grad = True
 
-    for param in model.bio_encoder.parameters():
-        param.requires_grad = True
-
-    for param in model.ode_func.parameters():
-        param.requires_grad = True
-
-    for name, param in model.biochem_decoder.named_parameters():
-        if 'lora' not in name.lower():
+    if train_bio_encoder:
+        for param in model.bio_encoder.parameters():
             param.requires_grad = True
 
-    if hasattr(model, "learned_clot_penalty"):
-        for param in model.learned_clot_penalty.parameters():
+    if train_ode:
+        for param in model.ode_func.parameters():
             param.requires_grad = True
+
+    if train_bio_decoder:
+        for name, param in model.biochem_decoder.named_parameters():
+            if "lora" not in name.lower():
+                param.requires_grad = True
+
+        if hasattr(model, "learned_clot_penalty"):
+            for param in model.learned_clot_penalty.parameters():
+                param.requires_grad = True
 
     if hasattr(model, "mu_delta_head"):
         for param in model.mu_delta_head.parameters():
@@ -2373,6 +2828,7 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
         "mu_nucleation_gate_head.",
         "mu_growth_gate_head.",
         "mu_delta_wall_head.",
+        "mu_soft_gate_log_temp",
     )
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -2389,8 +2845,8 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
             bio_params.append(param)
             bio_names.append(name)
 
-    if not bio_params:
-        raise RuntimeError("setup_biochem_optimization found no trainable biology parameters.")
+    if not bio_params and not mu_params and not physics_params:
+        raise RuntimeError("setup_biochem_optimization found no trainable parameters.")
 
     physics_lr = base_lr * float(os.environ.get("BIOCHEM_PHYSICS_LR_MULT", "0.3"))
     mu_lr = base_lr * float(os.environ.get("BIOCHEM_MU_PATH_LR_MULT", "1.0"))
@@ -2401,7 +2857,9 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
     mu_wall_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_WALL_LR_MULT", "1.0"))
     print(
         f"   μ trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
-        f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)}"
+        f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)} | "
+        f"TRAIN_KIN_LORA={int(train_kin_lora)} TRAIN_BIO_ENC={int(train_bio_encoder)} "
+        f"TRAIN_ODE={int(train_ode)} TRAIN_BIO_DEC={int(train_bio_decoder)}"
     )
     print(
         f"   trainable groups: physics_lora={len(physics_params)} tensors (lr={physics_lr:.3e}), "
@@ -2458,7 +2916,7 @@ def setup_biochem_optimization(model, loss_weighter, base_lr=1e-3, freeze_lora=F
             opt_mu = optim.AdamW(mu_params, lr=mu_lr, weight_decay=1e-5)
     else:
         opt_mu = None
-    opt_bio = optim.AdamW(bio_params, lr=bio_lr, weight_decay=1e-5)
+    opt_bio = optim.AdamW(bio_params, lr=bio_lr, weight_decay=1e-5) if bio_params else None
     opt_weighter = optim.AdamW(loss_weighter.parameters(), lr=5e-2, weight_decay=0.0)
     return SplitBiochemOptimizers(
         physics_optimizer=opt_physics,
@@ -2521,6 +2979,12 @@ def pretrain_autoencoder(
         )
     else:
         print("\n🚀 --- Phase 3a: Autoencoder Pre-Training (Freezing ODE) ---")
+        for param in model.bio_encoder.parameters():
+            param.requires_grad = True
+        if not freeze_decoder:
+            for name, param in model.biochem_decoder.named_parameters():
+                if "lora" not in name.lower():
+                    param.requires_grad = True
         best_ae_loss = float("inf")
         ae_bad_epochs = 0
         for epoch in range(epochs):
@@ -4274,6 +4738,24 @@ def _log_mu_validation_report(
     return out
 
 
+def _format_viz_health_val_line(val_bundle: Mapping[str, Any]) -> Optional[str]:
+    """One-line summary for console + run.jsonl (lower ``viz_health_score`` = healthier)."""
+    if val_bundle.get("viz_health_score") is None:
+        return None
+
+    def _f(key: str) -> str:
+        v = float(val_bundle.get(key, float("nan")))
+        return f"{v:.3f}" if math.isfinite(v) else "n/a"
+
+    return (
+        "   🩺 Viz health (lower=better): "
+        f"score={_f('viz_health_score')} t0|u|={_f('viz_t0_speed_mean')} t0_logμ={_f('viz_t0_mu_log_mae')} "
+        f"μ1={_f('viz_final_mu1_mean')} μ2={_f('viz_final_mu2_mean')} "
+        f"μ2_p90={_f('viz_final_mu2_p90')} clot_frac={_f('viz_final_clot_frac')} "
+        f"gate={_f('viz_final_gate_mean_all')} Δbulk={_f('viz_final_delta_bulk_mean')}"
+    )
+
+
 def calculate_validation_metrics(pred, data, kernels, device):
     props = kernels.core._get_geometric_props(data)
 
@@ -4518,6 +5000,92 @@ def _biochem_save_val_debug_plot(
     plt.close(fig)
 
 
+def _compute_slice_viz_health_metrics(
+    pred_slice: torch.Tensor,
+    y_slice: torch.Tensor,
+    data,
+    model,
+    kernels,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Metrics aligned with ``visualize_pipeline`` failure modes (t=0 flow, μ₁/μ₂ triggers)."""
+    num_nodes = int(data.num_nodes)
+    truth_mask = biochem_truth_node_mask(data, num_nodes, device)
+    mu_ch = STATE_CHANNEL_MU_EFF_ND
+    phys_cfg = kernels.core.cfg
+    out: Dict[str, float] = {
+        "speed_mean": float("nan"),
+        "mu_log_mae": float("nan"),
+        "mu1_mean": float("nan"),
+        "mu2_mean": float("nan"),
+        "mu2_p90": float("nan"),
+        "clot_frac": float("nan"),
+        "gate_mean_all": float("nan"),
+        "delta_bulk_mean": float("nan"),
+    }
+    u = pred_slice[:, 0].float()
+    v = pred_slice[:, 1].float()
+    out["speed_mean"] = float(torch.sqrt(u * u + v * v + 1e-20).mean().item())
+
+    sp_safe = torch.clamp(pred_slice[:, 4:16], min=-10.0, max=8.0)
+    species_si = model.species_log_nd_to_si(sp_safe)
+    fi_si = species_si[:, 8:9]
+    mat_si = species_si[:, 11:12]
+    mu1 = model.mu1_sigmoid(mat_si) if hasattr(model, "mu1_sigmoid") else torch.zeros_like(fi_si)
+    mu2 = model.mu2_sigmoid(fi_si) if hasattr(model, "mu2_sigmoid") else torch.zeros_like(fi_si)
+    out["mu1_mean"] = float(mu1.mean().item())
+    out["mu2_mean"] = float(mu2.mean().item())
+    out["mu2_p90"] = float(torch.quantile(mu2.view(-1), 0.9).item())
+    mu2_thr = max(float(os.environ.get("BIOCHEM_VIZ_MU2_FLOOD_THRESH", "10.0")), 0.0)
+    out["clot_frac"] = float((mu2.view(-1) >= mu2_thr).float().mean().item())
+
+    if hasattr(model, "_last_mu_trigger_gate") and model._last_mu_trigger_gate is not None:
+        out["gate_mean_all"] = float(model._last_mu_trigger_gate.view(-1).float().mean().item())
+    if hasattr(model, "_last_mu_delta_bulk") and model._last_mu_delta_bulk is not None:
+        out["delta_bulk_mean"] = float(model._last_mu_delta_bulk.view(-1).float().mean().item())
+
+    if truth_mask.any() and y_slice.shape[-1] > mu_ch:
+        mu_p = phys_cfg.viscosity_nd_to_si(pred_slice[:, mu_ch])[truth_mask].clamp(min=1e-8)
+        mu_g = phys_cfg.viscosity_nd_to_si(y_slice[:, mu_ch].to(device))[truth_mask].clamp(min=1e-8)
+        out["mu_log_mae"] = float((torch.log(mu_p) - torch.log(mu_g)).abs().mean().item())
+    return out
+
+
+def _aggregate_viz_health(per_graph_health: List[Dict[str, float]]) -> Dict[str, float]:
+    if not per_graph_health:
+        return {}
+    keys = per_graph_health[0].keys()
+    out: Dict[str, float] = {}
+    for k in keys:
+        vals = [float(g[k]) for g in per_graph_health if math.isfinite(float(g.get(k, float("nan"))))]
+        out[k] = sum(vals) / float(len(vals)) if vals else float("nan")
+    return out
+
+
+def _viz_health_score(agg: Mapping[str, float], *, mu_log_mae_final: float) -> float:
+    """Lower is healthier for morning viz triage (penalize weak t=0 flow and μ₂ flood)."""
+    score = float(mu_log_mae_final) if math.isfinite(mu_log_mae_final) else 10.0
+    t0_speed = float(agg.get("t0_speed_mean", float("nan")))
+    if math.isfinite(t0_speed):
+        score += 3.0 * max(0.0, 0.45 - t0_speed)
+    t0_mu = float(agg.get("t0_mu_log_mae", float("nan")))
+    if math.isfinite(t0_mu):
+        score += 0.5 * t0_mu
+    mu2_mean = float(agg.get("final_mu2_mean", float("nan")))
+    if math.isfinite(mu2_mean):
+        score += 0.08 * min(mu2_mean, 80.0)
+    clot_frac = float(agg.get("final_clot_frac", float("nan")))
+    if math.isfinite(clot_frac):
+        score += 6.0 * clot_frac
+    gate_all = float(agg.get("final_gate_mean_all", float("nan")))
+    if math.isfinite(gate_all):
+        score += 2.0 * max(0.0, gate_all - 0.55)
+    mu1_mean = float(agg.get("final_mu1_mean", float("nan")))
+    if math.isfinite(mu1_mean) and mu1_mean < 0.05:
+        score += 0.35
+    return score
+
+
 def _compute_anchor_mu_metrics(
     model,
     loader,
@@ -4539,6 +5107,8 @@ def _compute_anchor_mu_metrics(
         return empty
     model.eval()
     per_graph: List[Dict[str, Any]] = []
+    t0_health_rows: List[Dict[str, float]] = []
+    final_health_rows: List[Dict[str, float]] = []
 
     with torch.no_grad():
         for v_data in loader:
@@ -4552,6 +5122,18 @@ def _compute_anchor_mu_metrics(
             mu_dbg = _compute_mu_debug_metrics(pred_last, y_last, v_data, kernels, device)
             if int((mu_dbg.get("subsets") or {}).get("all", {}).get("n", 0)) >= 1:
                 per_graph.append(mu_dbg)
+            pred_t0 = v_pred[0]
+            y_t0 = v_data.y[0].to(device)
+            final_health_rows.append(
+                _compute_slice_viz_health_metrics(
+                    pred_last, y_last, v_data, model, kernels, device
+                )
+            )
+            t0_health_rows.append(
+                _compute_slice_viz_health_metrics(
+                    pred_t0, y_t0, v_data, model, kernels, device
+                )
+            )
 
     if not per_graph:
         return empty
@@ -4559,6 +5141,19 @@ def _compute_anchor_mu_metrics(
     agg = _aggregate_mu_subset_metrics(per_graph, "all")
     agg_wall = _aggregate_mu_subset_metrics(per_graph, "wall")
     agg_high = _aggregate_mu_subset_metrics(per_graph, "high_mu")
+    agg_bulk = _aggregate_mu_subset_metrics(per_graph, "bulk")
+    t0_agg = _aggregate_viz_health(t0_health_rows)
+    fin_agg = _aggregate_viz_health(final_health_rows)
+    health_for_score = {
+        "t0_speed_mean": t0_agg.get("speed_mean", float("nan")),
+        "t0_mu_log_mae": t0_agg.get("mu_log_mae", float("nan")),
+        "final_mu1_mean": fin_agg.get("mu1_mean", float("nan")),
+        "final_mu2_mean": fin_agg.get("mu2_mean", float("nan")),
+        "final_mu2_p90": fin_agg.get("mu2_p90", float("nan")),
+        "final_clot_frac": fin_agg.get("clot_frac", float("nan")),
+        "final_gate_mean_all": fin_agg.get("gate_mean_all", float("nan")),
+        "final_delta_bulk_mean": fin_agg.get("delta_bulk_mean", float("nan")),
+    }
     out: Dict[str, Any] = {
         "mu_mae_si": float(agg["mu_mae_si"]),
         "mu_rmse_si": float(agg["mu_rmse_si"]),
@@ -4567,7 +5162,20 @@ def _compute_anchor_mu_metrics(
         "mu_r2": float(agg["mu_r2"]) if math.isfinite(float(agg["mu_r2"])) else 0.0,
         "mu_log_mae_wall": float(agg_wall.get("mu_log_mae", float("nan"))),
         "mu_log_mae_high_mu": float(agg_high.get("mu_log_mae", float("nan"))),
+        "mu_log_mae_bulk": float(agg_bulk.get("mu_log_mae", float("nan"))),
         "per_graph": per_graph,
+        "viz_t0_speed_mean": health_for_score["t0_speed_mean"],
+        "viz_t0_mu_log_mae": health_for_score["t0_mu_log_mae"],
+        "viz_final_mu1_mean": health_for_score["final_mu1_mean"],
+        "viz_final_mu2_mean": health_for_score["final_mu2_mean"],
+        "viz_final_mu2_p90": health_for_score["final_mu2_p90"],
+        "viz_final_clot_frac": health_for_score["final_clot_frac"],
+        "viz_final_gate_mean_all": health_for_score["final_gate_mean_all"],
+        "viz_final_delta_bulk_mean": health_for_score["final_delta_bulk_mean"],
+        "viz_bulk_mu_log_mae": float(agg_bulk.get("mu_log_mae", float("nan"))),
+        "viz_health_score": _viz_health_score(
+            health_for_score, mu_log_mae_final=float(agg["mu_log_mae"])
+        ),
     }
     return out
 
@@ -4785,7 +5393,7 @@ def train_teacher_on_anchors(
     """Train a teacher only on anchor graphs for pseudo-label distillation."""
     if len(train_anchor_dataset) == 0:
         print("⚠️ Teacher stage skipped: no anchor graphs in training split.")
-        return None, 0.0
+        return None, 0.0, -1, float("inf"), -1, None
 
     teacher = copy.deepcopy(student_model).to(device)
     dl_kw = _biochem_dataloader_kw(device)
@@ -4860,8 +5468,10 @@ def train_teacher_on_anchors(
         teacher, teacher_weighter, base_lr=teacher_lr, freeze_lora=True
     )
     best_state = None
+    best_high_state: Optional[Dict[str, torch.Tensor]] = None
     best_mu_score = -float("inf")
     best_epoch = -1
+    best_high_epoch = -1
     best_mu_log_all = float("inf")
     best_mu_log_high = float("inf")
     pareto_ckpt = _biochem_env_truthy("BIOCHEM_TEACHER_PARETO_CHECKPOINT", default=False)
@@ -4927,13 +5537,17 @@ def train_teacher_on_anchors(
         ema_beta = min(max(ema_beta, 0.0), 0.999999)
         ema_l_bio: Optional[float] = None
         for epoch in range(max_epochs):
-            freeze_ode_epochs = max(0, int(os.environ.get("BIOCHEM_TEACHER_ODE_FREEZE_EPOCHS", "3")))
-            ode_frozen = epoch < freeze_ode_epochs
+            freeze_ode_epochs = _biochem_teacher_ode_freeze_epochs(max_epochs)
+            train_ode = _biochem_env_truthy("BIOCHEM_TRAIN_ODE", default=True)
+            ode_frozen = (not train_ode) or (epoch < freeze_ode_epochs)
             for p in teacher.ode_func.parameters():
-                p.requires_grad = not ode_frozen
+                p.requires_grad = not ode_frozen and train_ode
             if epoch == 0 and freeze_ode_epochs > 0:
-                print(f"   🧊 Teacher startup: freezing ODE reaction path for first {freeze_ode_epochs} epoch(s).")
-            if epoch == freeze_ode_epochs and freeze_ode_epochs > 0:
+                if train_ode:
+                    print(f"   🧊 Teacher startup: freezing ODE reaction path for first {freeze_ode_epochs} epoch(s).")
+                else:
+                    print("   🧊 Teacher: ODE reaction path frozen (BIOCHEM_TRAIN_ODE=0).")
+            if train_ode and epoch == freeze_ode_epochs and freeze_ode_epochs > 0:
                 print("   🔓 Teacher startup: unfreezing ODE reaction path.")
             # Decay softened kinetics across teacher stage to progressively sharpen boundaries.
             decay_progress = epoch / float(max(1, max_epochs - 1))
@@ -4981,6 +5595,10 @@ def train_teacher_on_anchors(
             epoch_dbg_gate_clot_sum = 0.0
             epoch_dbg_gate_n = 0
             epoch_dbg_n = 0
+            epoch_trivial_flow_warned = False
+            warn_trivial_every_batch = _biochem_env_truthy(
+                "BIOCHEM_FLOW_TRIVIAL_WARN_EVERY_BATCH", default=False
+            )
             n_batches = 0
             for batch_idx, data in enumerate(teacher_loader):
                 data = data.to(device, non_blocking=nb_xfer)
@@ -5055,6 +5673,17 @@ def train_teacher_on_anchors(
                     epoch_dbg_q_rel_err_sum += dbg_qre
                     epoch_dbg_flow_trivial_sum += dbg_triv
                     epoch_dbg_flux_n += 1
+                    if dbg_triv >= _biochem_flow_trivial_warn_threshold() and (
+                        warn_trivial_every_batch or not epoch_trivial_flow_warned
+                    ):
+                        _biochem_warn_trivial_flow_if_needed(
+                            dbg_triv,
+                            stage="teacher",
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            metrics=metrics,
+                        )
+                        epoch_trivial_flow_warned = True
                 if math.isfinite(dbg_gate_all) and math.isfinite(dbg_gate_wall) and math.isfinite(dbg_gate_clot):
                     epoch_dbg_gate_all_sum += dbg_gate_all
                     epoch_dbg_gate_wall_sum += dbg_gate_wall
@@ -5135,6 +5764,11 @@ def train_teacher_on_anchors(
                 dbg_flow_imb_e = (epoch_dbg_flow_imb_sum / float(max(1, epoch_dbg_n)))
                 dbg_q_rel_e = (epoch_dbg_q_rel_err_sum / float(max(1, epoch_dbg_n)))
                 dbg_triv_e = (epoch_dbg_flow_trivial_sum / float(max(1, epoch_dbg_n)))
+                dbg_triv_flux_e = (
+                    epoch_dbg_flow_trivial_sum / float(epoch_dbg_flux_n)
+                    if epoch_dbg_flux_n > 0
+                    else float("nan")
+                )
                 dbg_mu_log_e = (epoch_dbg_mu_log_anchor_sum / float(max(1, epoch_dbg_n)))
                 dbg_gate_all_e = (
                     epoch_dbg_gate_all_sum / float(max(1, epoch_dbg_gate_n))
@@ -5151,30 +5785,56 @@ def train_teacher_on_anchors(
                     if epoch_dbg_gate_n > 0
                     else float("nan")
                 )
+                if math.isfinite(dbg_triv_flux_e):
+                    _biochem_warn_trivial_flow_if_needed(
+                        dbg_triv_flux_e,
+                        stage="teacher",
+                        epoch=epoch,
+                        mean_over_epoch=True,
+                    )
+                viz_extra = _format_viz_health_val_line(val_bundle)
+                val_extra_lines = [
+                    f"   Train Ep {epoch:02d}: L_tot={avg_tot:.3e} L_kine={avg_kine:.3e} "
+                    f"L_bio(avg)={avg_bio:.3e} L_bio(ema)={ema_bio_str} | Pceil={teacher_phys_ceiling:.2g}",
+                    (
+                        f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
+                        f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W·L_MuLogWall={epoch_mu_log_wall_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W·L_MuLogHigh={epoch_mu_log_high_w / max(1, epoch_mu_batches):.3e}"
+                    ),
+                    (
+                        f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
+                        f"learned={dbg_mlearn_e:.3e} "
+                        f"final_anchor_logMAE={dbg_mu_log_e:.3e} Q_imb={dbg_flow_imb_e:.3e} "
+                        f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial="
+                        f"{(dbg_triv_flux_e if math.isfinite(dbg_triv_flux_e) else dbg_triv_e):.3f} "
+                        f"gate_all={dbg_gate_all_e:.3e} gate_wall={dbg_gate_wall_e:.3e} "
+                        f"gate_clot={dbg_gate_clot_e:.3e}"
+                    ),
+                ]
+                if viz_extra:
+                    val_extra_lines.append(viz_extra)
                 val_stats = _log_mu_validation_report(
                     stage="teacher",
                     epoch=epoch,
                     per_graph=list(val_bundle.get("per_graph") or []),
-                    extra_lines=[
-                        f"   Train Ep {epoch:02d}: L_tot={avg_tot:.3e} L_kine={avg_kine:.3e} "
-                        f"L_bio(avg)={avg_bio:.3e} L_bio(ema)={ema_bio_str} | Pceil={teacher_phys_ceiling:.2g}",
-                        (
-                            f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
-                            f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
-                            f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}, "
-                            f"W·L_MuLogWall={epoch_mu_log_wall_w / max(1, epoch_mu_batches):.3e}, "
-                            f"W·L_MuLogHigh={epoch_mu_log_high_w / max(1, epoch_mu_batches):.3e}"
-                        ),
-                        (
-                            f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
-                            f"learned={dbg_mlearn_e:.3e} "
-                            f"final_anchor_logMAE={dbg_mu_log_e:.3e} Q_imb={dbg_flow_imb_e:.3e} "
-                            f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial={dbg_triv_e:.3f} "
-                            f"gate_all={dbg_gate_all_e:.3e} gate_wall={dbg_gate_wall_e:.3e} "
-                            f"gate_clot={dbg_gate_clot_e:.3e}"
-                        ),
-                    ],
+                    extra_lines=val_extra_lines,
                 )
+                for hk in (
+                    "viz_health_score",
+                    "viz_t0_speed_mean",
+                    "viz_t0_mu_log_mae",
+                    "viz_final_mu1_mean",
+                    "viz_final_mu2_mean",
+                    "viz_final_mu2_p90",
+                    "viz_final_clot_frac",
+                    "viz_final_gate_mean_all",
+                    "viz_final_delta_bulk_mean",
+                    "viz_bulk_mu_log_mae",
+                ):
+                    if hk in val_bundle:
+                        val_stats[hk] = val_bundle[hk]
                 val_mu_score = -float(val_stats["mu_log_mae"])
                 print(
                     f"   ✅ Teacher Ep {epoch:02d} validation complete "
@@ -5202,10 +5862,13 @@ def train_teacher_on_anchors(
                 elif val_mu_score > best_mu_score:
                     take_ckpt = True
                     ckpt_reason = "mu_score improved"
+                if math.isfinite(cand_high) and cand_high < best_mu_log_high:
+                    best_mu_log_high = cand_high
+                    best_high_state = copy.deepcopy(teacher.state_dict())
+                    best_high_epoch = int(epoch)
                 if take_ckpt:
                     best_mu_score = val_mu_score
                     best_mu_log_all = cand_all
-                    best_mu_log_high = cand_high
                     best_state = copy.deepcopy(teacher.state_dict())
                     best_epoch = int(epoch)
                     print(
@@ -5245,6 +5908,13 @@ def train_teacher_on_anchors(
                     if epoch_dbg_gate_n > 0
                     else float("nan")
                 )
+                if math.isfinite(dbg_triv_e):
+                    _biochem_warn_trivial_flow_if_needed(
+                        dbg_triv_e,
+                        stage="teacher",
+                        epoch=epoch,
+                        mean_over_epoch=True,
+                    )
                 print(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
@@ -5314,18 +5984,33 @@ def train_teacher_on_anchors(
                 "tbptt_max_window": int(os.environ.get("BIOCHEM_TBPTT_MAX_WINDOW", "0") or "0"),
             }
             if val_stats is not None and run_teacher_val:
-                for g in val_bundle.get("per_graph") or []:
-                    row = dict(teacher_metrics_row)
-                    row["anchor"] = g.get("anchor")
-                    row["per_anchor"] = True
-                    sub = g.get("subsets") or {}
-                    for sk, sm in sub.items():
-                        if isinstance(sm, dict):
-                            for mk, mv in sm.items():
-                                row[f"val_{sk}_{mk}"] = mv
-                    _biochem_append_jsonl(row)
-            else:
-                _biochem_append_jsonl(teacher_metrics_row)
+                per_anchor = _biochem_env_truthy("BIOCHEM_LOG_PER_ANCHOR", default=False)
+                dbg_extra = {
+                    k: teacher_metrics_row[k]
+                    for k in (
+                        "dbg_gate_mean_wall",
+                        "dbg_gate_mean_all",
+                        "train_L_back_avg",
+                        "train_L_tot",
+                    )
+                    if teacher_metrics_row.get(k) is not None
+                }
+                if per_anchor:
+                    for g in val_bundle.get("per_graph") or []:
+                        anchor = g.get("anchor")
+                        sub = g.get("subsets") or {}
+                        anchor_metrics = dict(val_stats)
+                        if isinstance(sub.get("all"), dict):
+                            anchor_metrics.update(sub["all"])
+                        _biochem_log_teacher_val(
+                            int(epoch),
+                            anchor_metrics,
+                            per_anchor=True,
+                            anchor=anchor,
+                            **dbg_extra,
+                        )
+                else:
+                    _biochem_log_teacher_val(int(epoch), val_stats, **dbg_extra)
     finally:
         if _prev_tbptt_anchor_rand is None:
             os.environ.pop("BIOCHEM_TBPTT_ANCHOR_RANDOM_START", None)
@@ -5341,7 +6026,14 @@ def train_teacher_on_anchors(
         print("✅ Teacher frozen. Validation skipped (BIOCHEM_TEACHER_SKIP_VAL=1); using last training weights.")
     else:
         print(f"✅ Teacher frozen. Best anchor validation mu_score (-log_MAE): {best_mu_score:.4f}")
-    return teacher, float(best_mu_score), int(best_epoch)
+    return (
+        teacher,
+        float(best_mu_score),
+        int(best_epoch),
+        float(best_mu_log_high),
+        int(best_high_epoch),
+        best_high_state,
+    )
 
 
 def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
@@ -5388,10 +6080,83 @@ def _restore_cli_teacher_epoch_override_after_presets() -> None:
     os.environ["BIOCHEM_EPOCHS"] = ep_s
 
 
+def _apply_biochem_supervised_data_leash_after_presets() -> None:
+    """Middle-ground supervised fix after MU-isolate presets (e.g. ``sweep_wall_sentinel``).
+
+    When ``BIOCHEM_SUPERVISED_DATA_LEASH=1``, clears single-term isolate, keeps physics off
+    (``BIOCHEM_LOSS_DATA_ONLY=1``), reconnects temporal gradients, and enables μ SI anchor weight.
+    Shell/CLI can still override individual keys *before* Python starts by setting them in the
+    environment; this hook only runs when the leash flag is set.
+    """
+    if not _biochem_env_truthy("BIOCHEM_SUPERVISED_DATA_LEASH"):
+        return
+    os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
+    os.environ["BIOCHEM_LOSS_DATA_ONLY"] = "1"
+    os.environ["BIOCHEM_DETACH_MACRO_STATE"] = "0"
+    # MU-isolate presets often zero this; leash re-enables SI anchor for peak μ.
+    w_mu_si = (os.environ.get("BIOCHEM_SUPERVISED_DATA_LEASH_MU_SI_WEIGHT") or "2.0").strip() or "2.0"
+    os.environ["BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT"] = w_mu_si
+    print(
+        "✅ BIOCHEM_SUPERVISED_DATA_LEASH=1: backward uses L_Data_Kine+L_Data_Bio "
+        f"(data-only) + μ anchors (W_MuSI={os.environ.get('BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT', '?')}); "
+        f"DETACH_MACRO={os.environ.get('BIOCHEM_DETACH_MACRO_STATE', '?')}; "
+        "BIOCHEM_LOSS_ISOLATE cleared.",
+        flush=True,
+    )
+
+
+def _apply_biochem_bulk_fluid_surgical_fix_after_presets() -> None:
+    """Tight bulk-fluid lock: survives presets that disable bio gate (e.g. ``sweep_wall_sentinel``).
+
+    Enable with ``BIOCHEM_BULK_FLUID_SURGICAL_FIX=1``. Optional overrides:
+    ``BIOCHEM_DELTA_MU_LOG_CLIP_BULK``, ``BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR``.
+    """
+    if not _biochem_env_truthy("BIOCHEM_BULK_FLUID_SURGICAL_FIX"):
+        return
+    clip_bulk = (os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_BULK") or "0.05").strip() or "0.05"
+    gate_floor = (os.environ.get("BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR") or "0.0").strip() or "0.0"
+    os.environ["BIOCHEM_DELTA_MU_LOG_CLIP_BULK"] = clip_bulk
+    os.environ["BIOCHEM_USE_BIO_GATE_SUPPRESSOR"] = "1"
+    os.environ["BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR"] = gate_floor
+    print(
+        "✅ BIOCHEM_BULK_FLUID_SURGICAL_FIX=1: bulk Δlogμ clip="
+        f"{clip_bulk}, bio gate suppressor on (floor={gate_floor}).",
+        flush=True,
+    )
+
+
+def _apply_biochem_mu_gate_hard_threshold_after_presets() -> None:
+    """Sever wall-Δlogμ bleed into bulk lumen (survives sentinel gate-floor preset)."""
+    raw = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH") or "").strip()
+    if not raw:
+        return
+    thresh = max(float(raw), 0.0)
+    if thresh <= 0.0:
+        return
+    os.environ["BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH"] = str(thresh)
+    os.environ["BIOCHEM_TRIGGER_GATE_MIN"] = "0"
+    os.environ["BIOCHEM_WALL_GATE_MIN"] = "0"
+    scope = (os.environ.get("BIOCHEM_MU_SOFT_GATE_SCOPE") or "wall_only").strip().lower()
+    if scope not in ("all", "bulk", "bulk_tail", "clot"):
+        os.environ["BIOCHEM_MU_SOFT_GATE_SCOPE"] = "wall_only"
+        scope = "wall_only"
+    learned = _biochem_env_truthy("BIOCHEM_MU_GATE_LEARNED_TEMP")
+    steep = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_STEEPNESS") or "10.0").strip() or "10.0"
+    steep_note = "learned softplus(temp)" if learned else f"steepness={steep}"
+    print(
+        f"✅ BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH={thresh}: soft gate ({steep_note}) "
+        f"scope={scope}; TRIGGER_GATE_MIN and WALL_GATE_MIN cleared.",
+        flush=True,
+    )
+
+
 def train_biochem_corrector(epochs=60, lr=1e-3):
     _apply_biochem_env_aliases()
     _apply_pycharm_biochem_optimal_defaults()
     _restore_cli_teacher_epoch_override_after_presets()
+    _apply_biochem_supervised_data_leash_after_presets()
+    _apply_biochem_bulk_fluid_surgical_fix_after_presets()
+    _apply_biochem_mu_gate_hard_threshold_after_presets()
     _preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if _preset in _OVERNIGHT_STEP2_PRESET_ALIASES:
         print(
@@ -5493,10 +6258,16 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         f"use_siren={int(use_siren_decoder)}."
     )
 
-    # 1. Backbone weights: stage-A kinematics_best.pth is required; optional biochem_best_bio or full latest resume.
+    # 1. Backbone weights: stage-A kinematics_best.pth is required; optional biochem_best_high_mu or full latest resume.
     root = get_project_root()
     model_dir = stage_b_dir()
-    biochem_resume_path = resolve_checkpoint("b", "biochem_best_bio.pth")
+    biochem_resume_path = resolve_checkpoint("b", BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME)
+    if not biochem_resume_path.exists():
+        biochem_resume_path = resolve_checkpoint("b", BIOCHEM_BEST_HIGH_MU_CKPT_NAME)
+    if not biochem_resume_path.exists():
+        biochem_resume_path = resolve_checkpoint("b", BIOCHEM_TEACHER_BEST_CKPT_NAME)
+    if not biochem_resume_path.exists():
+        biochem_resume_path = resolve_checkpoint("b", BIOCHEM_BEST_BIO_LEGACY_CKPT_NAME)
     kinematics_path = resolve_checkpoint("a", "kinematics_best.pth")
     if not kinematics_path.is_file():
         raise FileNotFoundError(
@@ -5741,11 +6512,18 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         loader = DataLoader(train_dataset, batch_size=1, shuffle=True, **dl_kw)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, **dl_kw)
 
-    optimizer = setup_biochem_optimization(model, loss_weighter, base_lr=lr)
-    scheduler = CosineAnnealingWarmRestarts(optimizer.bio_optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    run_pretrain_opt = (not resume_enabled) and _biochem_will_run_ae_ode_pretrain(model_dir)
+    optimizer = setup_biochem_optimization(
+        model, loss_weighter, base_lr=lr, for_pretrain=run_pretrain_opt
+    )
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer.lr_scheduler_target(), T_0=10, T_mult=2, eta_min=1e-6
+    )
 
     start_epoch = 0
     best_composite = -1.0e9
+    best_high_mu_log_mae = float("inf")
+    best_high_mu_epoch = -1
     mu_score_ema: Optional[float] = None
     teacher_best_mu_score = 0.0
     latest_ckpt_save = model_dir / "biochem_latest_checkpoint.pth"
@@ -5756,6 +6534,50 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     ckpt_every = max(1, int(os.environ.get("BIOCHEM_CKPT_EVERY", "4")))
     resume_ema_state = None
     stop_after_teacher = _biochem_stop_after_teacher()
+    teacher_best_epoch = -1
+
+    run_log = BiochemRunLogger()
+    _biochem_set_run_log(run_log)
+    run_log_end_emitted = False
+
+    def _emit_biochem_run_log_end(
+        *,
+        interrupted: bool = False,
+        teacher_best_mu_score: float = 0.0,
+        teacher_best_epoch: int = -1,
+        best_composite: Optional[float] = None,
+        last_epoch_completed: Optional[int] = None,
+    ) -> None:
+        nonlocal run_log_end_emitted
+        if run_log_end_emitted or not run_log.enabled:
+            return
+        run_log_end_emitted = True
+        if interrupted:
+            print("\n⚠️ Training interrupted; appending biochem run log end row.")
+        run_log.log_end(
+            run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+            stop_after_teacher=bool(stop_after_teacher),
+            teacher_best_mu_score=float(teacher_best_mu_score),
+            teacher_best_epoch=int(teacher_best_epoch),
+            best_composite=best_composite,
+            last_epoch_completed=last_epoch_completed,
+            interrupted=bool(interrupted),
+            checkpoint_teacher=str(model_dir / BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME),
+            checkpoint_high_mu=str(model_dir / BIOCHEM_BEST_HIGH_MU_CKPT_NAME),
+            checkpoint_latest=str(latest_ckpt_save),
+        )
+
+    run_log.log_meta(
+        device=str(device),
+        n_graphs_total=len(dataset),
+        n_train_anchors=len(train_anchors),
+        n_val_anchors=len(val_anchors),
+        n_train_physics=len(train_physics),
+        low_anchor_mode=bool(low_anchor_mode),
+        metrics_trustworthy=bool(metrics_trustworthy),
+        stop_after_teacher=bool(stop_after_teacher),
+        run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+    )
 
     if resume_enabled and latest_ckpt_path.exists():
         print(f"🔄 Resuming Biochem from checkpoint: {latest_ckpt_path}")
@@ -5858,7 +6680,14 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
-        teacher, teacher_best_mu_score, teacher_best_epoch = train_teacher_on_anchors(
+        (
+            teacher,
+            teacher_best_mu_score,
+            teacher_best_epoch,
+            teacher_best_high_mu,
+            teacher_best_high_epoch,
+            teacher_best_high_state,
+        ) = train_teacher_on_anchors(
             student_model=model,
             train_anchor_dataset=train_anchor_dataset,
             val_anchor_dataset=val_anchor_dataset,
@@ -5869,12 +6698,15 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             base_lr=lr,
             low_anchor_mode=low_anchor_mode,
         )
-        _save_biochem_teacher_best_checkpoint(
-            model_dir / BIOCHEM_TEACHER_BEST_CKPT_NAME,
+        _persist_biochem_teacher_checkpoints(
+            model_dir,
             teacher,
             teacher_best_mu_score=float(teacher_best_mu_score),
             best_epoch=int(teacher_best_epoch),
             run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+            val_mu_log_mae_high_mu=float(teacher_best_high_mu),
+            best_high_epoch=int(teacher_best_high_epoch),
+            best_high_state=teacher_best_high_state,
         )
         if stop_after_teacher:
             pseudo_bank = {}
@@ -5935,6 +6767,11 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             )
 
     if stop_after_teacher:
+        _emit_biochem_run_log_end(
+            teacher_best_mu_score=float(teacher_best_mu_score),
+            teacher_best_epoch=int(teacher_best_epoch),
+            last_epoch_completed=int(teacher_best_epoch) if teacher_best_epoch >= 0 else None,
+        )
         print("🛑 BIOCHEM_STOP_AFTER_TEACHER enabled: stopping after teacher stage.")
         return
 
@@ -5958,87 +6795,18 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     mu_score_ema_beta = float(os.environ.get("BIOCHEM_VAL_MU_SCORE_EMA", "0.25"))
     ckpt_pearson_w = float(os.environ.get("BIOCHEM_CKPT_WSS_PEARSON_WEIGHT", "0.02"))
 
-    cfg_paths = VesselConfig(phase="biochem")
-    diary = TrainingDiary("biochem")
-    diary.log_run_start(
-        device=str(device),
-        re_target=float(phys_cfg.re_target),
-        graph_dir=str(cfg_paths.graph_output_dir),
-        n_graphs_total=len(dataset),
-        n_files_indexed=len(all_files),
-        n_anchors_total=int(n_anchors_total),
-        n_train_graphs=len(train_data),
-        n_val_graphs=len(val_data),
-        n_train_anchors=len(train_anchors),
-        n_val_anchors=len(val_anchors),
-        n_train_physics=len(train_physics),
-        n_val_physics=len(val_physics),
-        low_anchor_mode=bool(low_anchor_mode),
-        metrics_trustworthy=bool(metrics_trustworthy),
-        accumulation_steps=int(accumulation_steps),
-        epochs=int(epochs),
-        lr=float(lr),
-        start_epoch=int(start_epoch),
-        best_composite_checkpoint=float(best_composite),
-        mu_score_ema_checkpoint=float(mu_score_ema) if mu_score_ema is not None else None,
-        teacher_best_mu_score=float(teacher_best_mu_score),
-        pseudo_w=float(pseudo_w),
-        pseudo_bank_size=len(pseudo_bank),
-        biochem_warmup_epochs=int(curriculum.biochem_warmup_epochs),
-        mu_score_ema_beta=float(mu_score_ema_beta),
-        ckpt_wss_pearson_weight=float(ckpt_pearson_w),
-        train_cfg=asdict(train_cfg),
-        ema_enabled=bool(ema_enabled),
-        ema_decay=float(ema_decay),
-        resume_enabled=bool(resume_enabled),
-        resumed_latest_checkpoint=bool(resume_enabled and latest_ckpt_path.exists()),
-        ckpt_every=int(ckpt_every),
-        env_biochem_kinematics=env_snapshot("BIOCHEM_", "KINEMATICS_"),
-        run_dir=str(diary.run_dir) if diary.run_dir is not None else None,
-        diary_main_path=str(diary.path) if diary.path is not None else None,
-    )
-    if diary.run_dir is not None:
-        try:
-            (diary.run_dir / "biochem_training_config.json").write_text(
-                json.dumps(
-                    {
-                        "train_cfg": asdict(train_cfg),
-                        "ema_enabled": bool(ema_enabled),
-                        "ema_decay": float(ema_decay),
-                        "env": env_snapshot("BIOCHEM_", "KINEMATICS_"),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                    default=str,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    run_end_emitted = False
     last_epoch_completed: Optional[int] = None
 
-    def _emit_biochem_run_end(interrupted: bool = False) -> None:
-        nonlocal run_end_emitted
-        if run_end_emitted or not diary.enabled:
-            return
-        run_end_emitted = True
-        if interrupted:
-            print("\n⚠️ Training interrupted; appending training diary run_end (JSONL report).")
-        diary.log_run_end(
-            best_composite=float(best_composite),
+    def _emit_corrector_run_end(interrupted: bool = False) -> None:
+        _emit_biochem_run_log_end(
+            interrupted=interrupted,
             teacher_best_mu_score=float(teacher_best_mu_score),
-            pseudo_w=float(pseudo_w),
-            mu_score_ema=float(mu_score_ema) if mu_score_ema is not None else None,
-            diary_path=str(diary.path) if diary.path else None,
-            biochem_best_bio=str(model_dir / "biochem_best_bio.pth"),
-            biochem_latest_checkpoint=str(latest_ckpt_save),
-            interrupted=bool(interrupted),
+            teacher_best_epoch=int(teacher_best_epoch),
+            best_composite=float(best_composite),
             last_epoch_completed=last_epoch_completed,
         )
 
-    atexit.register(lambda: _emit_biochem_run_end(True))
+    atexit.register(lambda: _emit_corrector_run_end(True))
 
     print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
@@ -6523,18 +7291,23 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             composite_score = float(mu_score_ema_local) + ckpt_pearson_w * float(avg_pearson)
             mu_score_ema = mu_score_ema_local
 
-            if composite_score > best_composite:
-                best_composite = composite_score
-                model_dir.mkdir(parents=True, exist_ok=True)
+            best_composite = max(best_composite, composite_score)
+            cand_high_mu = float(mu_agg.get("mu_log_mae_high_mu", float("inf")))
+            if math.isfinite(cand_high_mu) and cand_high_mu < best_high_mu_log_mae:
+                best_high_mu_log_mae = cand_high_mu
+                best_high_mu_epoch = int(epoch)
                 best_state_to_save = (
                     ema_model.module.state_dict()
                     if ema_model is not None and hasattr(ema_model, "module")
                     else model.state_dict()
                 )
-                torch.save(best_state_to_save, model_dir / "biochem_best_bio.pth")
-                print(
-                    f"⭐ Saved best checkpoint (composite={composite_score:.4f} = mu_score_ema + "
-                    f"{ckpt_pearson_w:g}*wss_pearson; mu_score_ema={mu_score_ema_local:.4f})"
+                _maybe_update_global_best_high_mu(
+                    model_dir,
+                    best_state_to_save,
+                    val_mu_log_mae_high_mu=cand_high_mu,
+                    best_epoch=int(epoch),
+                    run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+                    val_mu_log_mae=float(avg_mu_log_mae),
                 )
 
             val_log = {
@@ -6558,40 +7331,17 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 "avg_rp_mae": float(val_rp_mae_total / n_val_anchor_safe),
                 "avg_t_mae": float(val_t_mae_total / n_val_anchor_safe),
             }
-            diary.log_validation(epoch, val_log, **learned_w)
-
-        diary.log_epoch_end(
-            epoch,
-            train_loss_mean=float(train_loss_mean),
-            lr=float(optimizer.param_groups[0]["lr"]),
-            mu_ratio=float(current_mu_ratio),
-            T_scale=float(current_T_scale),
-            teacher_forcing_ratio=float(teacher_forcing_ratio),
-            best_composite_so_far=float(best_composite),
-            mu_score_ema=float(mu_score_ema) if mu_score_ema is not None else None,
-            total_batches=int(total_batches),
-            anchor_supervised_batches=int(anchor_supervised_batches),
-            pseudo_supervised_batches=int(pseudo_supervised_batches),
-            low_anchor_mode=bool(low_anchor_mode),
-            pseudo_w=float(pseudo_w),
-            teacher_best_mu_score=float(teacher_best_mu_score),
-            # --- NEW Gradient Logging ---
-            avg_grad_norm=float(total_grad_norm_epoch / max(1, optimizer_steps)),
-            grad_clip_rate=float(grad_clip_count / max(1, optimizer_steps)),
-            **epoch_l_musi_log,
-        )
-        log_row: Dict[str, Any] = {
-            "epoch": int(epoch),
-            "train_loss_mean_microbatch": float(train_loss_mean),
-            "mu_ratio": float(current_mu_ratio),
-            "T_scale": float(current_T_scale),
-            "teacher_forcing_epoch": float(teacher_forcing_ratio),
-            "metrics_trustworthy": metrics_trustworthy,
-        }
-        log_row.update(epoch_l_musi_log)
-        if val_log is not None:
-            log_row.update(val_log)
-        _biochem_append_jsonl(log_row)
+            run_log.log_val(
+                "corrector",
+                int(epoch),
+                {
+                    "mu_log_mae": val_log.get("avg_mu_log_mae"),
+                    "mu_log_mae_wall": val_log.get("avg_mu_log_mae_wall"),
+                    "mu_log_mae_high_mu": val_log.get("avg_mu_log_mae_high_mu"),
+                    "mu_pearson": val_log.get("avg_mu_pearson"),
+                    "composite_score": val_log.get("composite_score"),
+                },
+            )
 
         should_save_ckpt = ((epoch + 1) % ckpt_every == 0) or (epoch == epochs - 1)
         if should_save_ckpt:
@@ -6612,7 +7362,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             torch.save(checkpoint, latest_ckpt_save)
             print(f"💾 Saved Biochem checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
 
-    _emit_biochem_run_end(interrupted=False)
+    _emit_corrector_run_end(interrupted=False)
 
 
 def _parse_args():
@@ -6632,6 +7382,14 @@ def _parse_args():
         "--skip-pretrain",
         action="store_true",
         help="Skip AE + ODE-RXN (sets BIOCHEM_SKIP_PRETRAIN=1). Use with BIOCHEM_INIT_FROM_BEST or a good checkpoint.",
+    )
+    p.add_argument(
+        "--init-from-best",
+        action="store_true",
+        help=(
+            "Load biochem_teacher_best_high_mu.pth (or legacy best) before teacher training "
+            "(sets BIOCHEM_INIT_FROM_BEST=1; use with --skip-pretrain)."
+        ),
     )
     p.add_argument(
         "--skip-ae",
@@ -6699,6 +7457,8 @@ if __name__ == "__main__":
     os.environ["BIOCHEM_RESUME"] = "1" if resume_enabled else "0"
     if not resume_enabled:
         os.environ["BIOCHEM_INIT_FROM_BEST"] = "0"
+    if getattr(args, "init_from_best", False):
+        os.environ["BIOCHEM_INIT_FROM_BEST"] = "1"
     if "BIOCHEM_REUSE_LAST_PRETRAIN" not in os.environ:
         os.environ["BIOCHEM_REUSE_LAST_PRETRAIN"] = "0"
 

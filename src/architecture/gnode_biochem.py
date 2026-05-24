@@ -60,11 +60,96 @@ def _biochem_split_mu_regime_head_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _biochem_mu_gemini_fix_enabled() -> bool:
+    """Additive bulk+tail log-μ residuals with symmetric bulk clip and nonnegative wall clip."""
+    return _biochem_env_truthy("BIOCHEM_MU_GEMINI_FIX")
+
+
+def _biochem_mu_additive_delta_enabled() -> bool:
+    """Stack bulk and gated tail additively instead of (1-gate)*bulk + gate*tail."""
+    if _biochem_mu_gemini_fix_enabled():
+        return True
+    return _biochem_env_truthy("BIOCHEM_MU_ADDITIVE_DELTA")
+
+
+def _biochem_mu_simple_log_residual_enabled() -> bool:
+    """Carreau baseline × exp(Δlogμ) only — no explicit μ₁/μ₂ gelation multiplier."""
+    return _biochem_env_truthy("BIOCHEM_MU_SIMPLE_LOG_RESIDUAL")
+
+
+def _biochem_mu_disable_explicit_gelation() -> bool:
+    """Skip FI/Mat sigmoid gelation and learned clot penalty in the μ multiplier."""
+    return _biochem_mu_simple_log_residual_enabled() or _biochem_env_truthy(
+        "BIOCHEM_MU_DISABLE_EXPLICIT_GELATION"
+    )
+
+
+def _biochem_mu_disable_mu1() -> bool:
+    return _biochem_env_truthy("BIOCHEM_MU_DISABLE_MU1")
+
+
+def _biochem_mu_disable_mu2() -> bool:
+    return _biochem_env_truthy("BIOCHEM_MU_DISABLE_MU2")
+
+
+def _biochem_delta_mu_symmetric_bulk_clip() -> bool:
+    if _biochem_mu_gemini_fix_enabled() or _biochem_mu_simple_log_residual_enabled():
+        return True
+    return _biochem_env_truthy("BIOCHEM_DELTA_MU_SYMMETRIC_BULK_CLIP")
+
+
 def _biochem_env_truthy(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
     return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _mu_trigger_gate_hard_threshold() -> float:
+    """Cutoff center for bulk/tail and wall μ gates; 0 disables (continuous gate)."""
+    raw = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH") or "").strip()
+    if not raw:
+        return 0.0
+    return max(float(raw), 0.0)
+
+
+def _mu_trigger_gate_hard_steepness() -> float:
+    """Sigmoid steepness for soft hard-gate (higher = sharper cutoff, still differentiable)."""
+    raw = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_STEEPNESS") or "10.0").strip() or "10.0"
+    return max(float(raw), 1.0)
+
+
+def _mu_soft_gate_scope() -> str:
+    """Where to apply the soft cutoff when ``BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH`` is set.
+
+    ``wall_only`` (default): bulk/tail clot ``gate`` uses bio suppressor + optional floor only;
+    wall ``wall_gate`` / ``wall_signal`` get the differentiable cutoff (stops lumen bleed).
+    ``all``: legacy behavior — soft cutoff on clot gate too (can saturate bulk when gate > thresh).
+    """
+    raw = (os.environ.get("BIOCHEM_MU_SOFT_GATE_SCOPE") or "wall_only").strip().lower()
+    if raw in ("all", "bulk", "bulk_tail", "clot"):
+        return "all"
+    return "wall_only"
+
+
+def _apply_mu_gate_soft_threshold(
+    g: Tensor,
+    *,
+    steepness: float | Tensor | None = None,
+) -> Tensor:
+    """Differentiable sharp cutoff: ``g * sigmoid(steepness * (g - thresh))``.
+
+    Replaces a hard ``torch.where`` (which blocks gradients below the threshold) on paths
+    where lumen must stay quiet. Above ``thresh``, output ≈ ``g`` — do not use on bulk clot
+    ``gate`` unless species/bio suppressor already keep ``g`` small in the lumen.
+    """
+    thresh = _mu_trigger_gate_hard_threshold()
+    if thresh <= 0.0:
+        return g
+    if steepness is None:
+        steepness = _mu_trigger_gate_hard_steepness()
+    activation = torch.sigmoid(steepness * (g - thresh))
+    return g * activation
 
 
 def _biochem_mu_wall_mix_mode() -> str:
@@ -422,6 +507,8 @@ class GNODE_Phase3(nn.Module):
         # Uses kinematics + species + wall cues to correct underfit wall viscosity.
         self.mu_delta_wall_head = _make_mu_delta_wall_head(latent_dim + self.mu_trigger_feat_dim)
         self.mu_trigger_gate_temp = max(float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP", "0.20")), 1e-5)
+        # Learnable steepness for wall-only soft cutoff (``BIOCHEM_MU_GATE_LEARNED_TEMP=1``).
+        self.mu_soft_gate_log_temp = nn.Parameter(torch.tensor(10.0))
         self.mu_delta_log_clip = max(float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP", "1.5")), 1e-6)
         self.mu_wall_gate_temp = max(float(os.environ.get("BIOCHEM_MU_WALL_GATE_TEMP", "0.18")), 1e-5)
         self.mu_wall_gate_center = float(os.environ.get("BIOCHEM_MU_WALL_GATE_CENTER", "0.55"))
@@ -456,6 +543,11 @@ class GNODE_Phase3(nn.Module):
         self._init_mu_delta_head_near_zero()
 
         self.register_buffer("species_si_scales", _bio.get_species_scales(device="cpu"))
+
+    def _mu_soft_gate_steepness(self) -> float | Tensor:
+        if _biochem_env_truthy("BIOCHEM_MU_GATE_LEARNED_TEMP"):
+            return F.softplus(self.mu_soft_gate_log_temp) + 1e-3
+        return _mu_trigger_gate_hard_steepness()
 
     def _kinematics_prior_tail(self, batch, u_nd: torch.Tensor, v_nd: torch.Tensor) -> torch.Tensor | None:
         """Extra ``bio_encoder`` channels from kinematics clot prior (COMSOL-aligned cues)."""
@@ -853,8 +945,26 @@ class GNODE_Phase3(nn.Module):
             # STRICT COMSOL PARITY: viscosity depends on Mat (channel 11) only.
             Mat_si = species_si[:, 11:12]
 
-            explicit_gelation = self.mu1_sigmoid(Mat_si) + self.mu2_sigmoid(FI_si)
-            learned_gelation = self.learned_clot_penalty(sp_safe)
+            if _biochem_mu_disable_explicit_gelation():
+                explicit_gelation = torch.zeros_like(Mat_si)
+                learned_gelation = torch.zeros_like(Mat_si)
+            else:
+                mu1_term = (
+                    torch.zeros_like(Mat_si)
+                    if _biochem_mu_disable_mu1()
+                    else self.mu1_sigmoid(Mat_si)
+                )
+                mu2_term = (
+                    torch.zeros_like(FI_si)
+                    if _biochem_mu_disable_mu2()
+                    else self.mu2_sigmoid(FI_si)
+                )
+                mu2_cap_raw = (os.environ.get("BIOCHEM_MU2_SIGMOID_CAP") or "").strip()
+                if mu2_cap_raw:
+                    mu2_cap = max(float(mu2_cap_raw), 0.0)
+                    mu2_term = torch.clamp(mu2_term, max=mu2_cap)
+                explicit_gelation = mu1_term + mu2_term
+                learned_gelation = self.learned_clot_penalty(sp_safe)
             gel_extra = explicit_gelation + learned_gelation
             if _biochem_gelation_prior_gate_enabled():
                 # Wall-localised [0,1] map: keeps bulk lumen near pure Carreau (μ_kin_baseline) unless
@@ -940,19 +1050,34 @@ class GNODE_Phase3(nn.Module):
                             bio_signal = torch.clamp(bio_signal, min=bio_gate_floor, max=1.0)
                         # Detached to avoid rewarding artificial FI/Mat spikes to open the gate.
                         gate = gate * bio_signal.detach()
-                    trigger_gate_min = min(
-                        max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN", "0.0")), 0.0),
-                        0.95,
-                    )
-                    if trigger_gate_min > 0.0:
-                        gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
-                    delta_bulk = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
-                    delta_tail = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
-                    delta_log_mu_bulk_tail = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
-
-                    # --- NEW: SPLIT CLIPPING (Safe Bulk) ---
+                    gate_hard_thresh = _mu_trigger_gate_hard_threshold()
+                    soft_gate_steepness = self._mu_soft_gate_steepness()
+                    if gate_hard_thresh > 0.0 and _mu_soft_gate_scope() == "all":
+                        gate = _apply_mu_gate_soft_threshold(gate, steepness=soft_gate_steepness)
+                    else:
+                        trigger_gate_min = min(
+                            max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN", "0.0")), 0.0),
+                            0.95,
+                        )
+                        if trigger_gate_min > 0.0:
+                            gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
+                    delta_bulk_raw = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
+                    delta_tail_raw = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
                     bulk_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_BULK", "1.5"))
-                    delta_log_mu = torch.clamp(delta_log_mu_bulk_tail, min=-bulk_clip, max=bulk_clip)
+                    wall_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0"))
+                    if _biochem_delta_mu_symmetric_bulk_clip():
+                        delta_bulk = torch.clamp(delta_bulk_raw, min=-bulk_clip, max=bulk_clip)
+                    else:
+                        delta_bulk = delta_bulk_raw
+                    if _biochem_mu_gemini_fix_enabled():
+                        delta_tail = torch.clamp(delta_tail_raw, min=0.0, max=wall_clip)
+                    else:
+                        delta_tail = delta_tail_raw
+                    if _biochem_mu_additive_delta_enabled():
+                        delta_log_mu_bulk_tail = delta_bulk + (gate * delta_tail)
+                    else:
+                        delta_log_mu_bulk_tail = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+                    delta_log_mu = delta_log_mu_bulk_tail
 
                     if _biochem_wall_delta_head_enabled():
                         wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
@@ -981,6 +1106,14 @@ class GNODE_Phase3(nn.Module):
                             effective_bio = bio_signal.detach() * wall_alpha + (1.0 - wall_alpha)
                             wall_gate = wall_gate * effective_bio
 
+                        if gate_hard_thresh > 0.0:
+                            wall_gate = _apply_mu_gate_soft_threshold(
+                                wall_gate, steepness=soft_gate_steepness
+                            )
+                            wall_gate = wall_gate * _apply_mu_gate_soft_threshold(
+                                wall_signal_val, steepness=soft_gate_steepness
+                            )
+
                         wall_isolate_geom = (
                             (os.environ.get("BIOCHEM_WALL_HEAD_ISOLATE_GEOM", "0") or "").strip().lower()
                             in ("1", "true", "yes", "on")
@@ -1007,7 +1140,15 @@ class GNODE_Phase3(nn.Module):
                             geom_blend = 1.0
                         wall_input_feats = ((1.0 - geom_blend) * trigger_feats) + (geom_blend * geom_only_feats)
 
-                        delta_wall = self.mu_delta_wall_head(torch.cat([z_kin, wall_input_feats], dim=1))
+                        delta_wall_raw = self.mu_delta_wall_head(
+                            torch.cat([z_kin, wall_input_feats], dim=1)
+                        )
+                        if _biochem_mu_gemini_fix_enabled():
+                            delta_wall = torch.clamp(
+                                delta_wall_raw, min=0.0, max=wall_clip
+                            )
+                        else:
+                            delta_wall = delta_wall_raw
                         if (
                             (os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY", "0") or "").strip().lower()
                             in ("1", "true", "yes", "on")
@@ -1047,10 +1188,11 @@ class GNODE_Phase3(nn.Module):
                         self._last_mu_wall_gate = wall_gate
                         self._last_mu_delta_wall = delta_wall
 
-                    # --- NEW: SPLIT CLIPPING (Uncapped Wall Boundary) ---
-                    wall_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0"))
-                    delta_log_mu = torch.clamp(delta_log_mu, min=-wall_clip, max=wall_clip)
-                    # ----------------------------------------------------
+                    delta_log_mu = torch.clamp(
+                        delta_log_mu,
+                        min=-wall_clip,
+                        max=wall_clip,
+                    )
 
                     # Expose lightweight diagnostics for training loss/metrics.
                     self._last_mu_trigger_gate = gate
