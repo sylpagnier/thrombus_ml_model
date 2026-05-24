@@ -55,53 +55,53 @@ $DefaultLegOrder = @(
 
 $LegCatalog = [ordered]@{
     K0_carreau_kinematic = @{
-        Title = 'Quick: Carreau-only μ, no clot (DATA_KINE, bio/ODE frozen)'
-        Hypothesis = 'Baseline kinematics+rollout before biochem μ/clot; expect healthy t=0 |u|, μ₂~0.'
-        Preset = ''
+        Title = "Quick: Carreau-only mu, no clot (DATA_KINE, bio/ODE frozen)"
+        Hypothesis = "Baseline kinematics rollout before biochem mu/clot; expect healthy t=0 speed, mu2~0"
+        Preset = ""
         QuickEp = 8
         Apply = { Set-LegCarreauKinematic }
     }
     G0_gemini_leash = @{
-        Title = 'Gemini additive μ + data leash + sentinel wall weights'
-        Hypothesis = 'Symmetric bulk clip, additive Δlogμ, bio suppressor; fixes t=0 μ collapse and μ₂ flood.'
+        Title = "Gemini additive mu + data leash + sentinel wall weights"
+        Hypothesis = "Symmetric bulk clip, additive delta_log_mu, bio suppressor; fix t=0 mu and mu2 flood"
         # Do not use preset sweep_wall_sentinel here: it forces USE_BIO_GATE_SUPPRESSOR=0 and overwrites Gemini.
-        Preset = ''
+        Preset = ""
         Apply = { Set-LegGemini; Set-LegSentinelLeash; Set-LegBulkSurgicalFix }
     }
     G1_gemini_mu_log = @{
-        Title = 'Gemini fix + MU_LOG isolate (no leash)'
-        Hypothesis = 'Pure μ objective with stable residual path; check if flow leash still needed.'
-        Preset = 'sweep_gemini'
+        Title = "Gemini fix + MU_LOG isolate (no leash)"
+        Hypothesis = "Pure mu objective with stable residual path; check if flow leash still needed"
+        Preset = "sweep_gemini"
         Apply = { Set-LegGemini; Set-LegMuLogOnly }
     }
     S0_simple_residual = @{
-        Title = 'Simple log residual: μ_kin*exp(Δlogμ) only (no μ₁/μ₂ multiplier)'
-        Hypothesis = 'Can the model memorize μ field without gelation multiplier breaking kine?'
-        Preset = ''
+        Title = "Simple log residual: mu_kin*exp(delta_log_mu) only, no mu1/mu2 multiplier"
+        Hypothesis = "Can the model memorize mu field without gelation multiplier breaking kine?"
+        Preset = ""
         Apply = { Set-LegSimpleResidual; Set-LegMuLogOnly }
     }
     S1_simple_residual_leash = @{
-        Title = 'Simple log residual + supervised data leash'
-        Hypothesis = 'Simple μ path + flow anchor; best chance of healthy t=0 |u|.'
-        Preset = ''
+        Title = "Simple log residual + supervised data leash"
+        Hypothesis = "Simple mu path + flow anchor; best chance of healthy t=0 velocity"
+        Preset = ""
         Apply = { Set-LegSimpleResidual; Set-LegMuFreezeRef }
     }
     M0_mu2_cap_leash = @{
-        Title = 'Data leash + cap μ₂ sigmoid at 8 (limit FI flood)'
-        Hypothesis = 'High μ₂ drives clot-everywhere; cap explicit FI path while keeping μ₁.'
-        Preset = ''
+        Title = "Data leash + cap mu2 sigmoid at 8 (limit FI flood)"
+        Hypothesis = "High mu2 drives clot-everywhere; cap explicit FI path while keeping mu1"
+        Preset = ""
         Apply = { Set-LegMuFreezeRef; Set-LegMu2Cap }
     }
     M1_mu1_only_leash = @{
-        Title = 'Data leash + disable μ₂ explicit gelation (Mat-only)'
-        Hypothesis = 'Force wall Mat trigger; stop FI domain flood.'
-        Preset = ''
+        Title = "Data leash + disable mu2 explicit gelation (Mat-only)"
+        Hypothesis = "Force wall Mat trigger; stop FI domain flood"
+        Preset = ""
         Apply = { Set-LegMuFreezeRef; Set-LegMu1Only }
     }
     M2_no_explicit_gel = @{
-        Title = 'Data leash + disable all explicit gelation (delta heads only)'
-        Hypothesis = 'Learn μ only via neural Δlogμ; isolate bad μ₁/μ₂ sigmoid coupling.'
-        Preset = ''
+        Title = "Data leash + disable all explicit gelation (delta heads only)"
+        Hypothesis = "Learn mu only via neural delta_log_mu; isolate bad mu1/mu2 sigmoid coupling"
+        Preset = ""
         Apply = { Set-LegMuFreezeRef; Set-LegNoExplicitGel }
     }
     R0_ref_leash = @{
@@ -387,9 +387,9 @@ $batchStart = Get-Date
 Add-Content -Path $SummaryPath -Value "BATCH_START host=$hostName ts=$($batchStart.ToString('o')) legs=$legTotal default_ep=$TeacherEp order=$($Legs -join ',')"
 
 Write-Host ""
-Write-Host "Health architecture sweep (~10h)" -ForegroundColor Cyan
-Write-Host "  legs=$legTotal  default_ep=$TeacherEp  (K0 uses QuickEp=8)" -ForegroundColor DarkGray
-Write-Host "  order: $($Legs -join ' -> ')" -ForegroundColor DarkGray
+Write-Host 'Health architecture sweep (~10h)' -ForegroundColor Cyan
+Write-Host "  legs=$legTotal  default_ep=$TeacherEp  K0_QuickEp=8" -ForegroundColor DarkGray
+Write-Host ('  order: ' + ($Legs -join ' | ')) -ForegroundColor DarkGray
 Write-Host "  archive: $SweepDir" -ForegroundColor DarkGray
 if ($UseWarmStart) {
     Write-Host "  pretrain: reuse $PostPretrain on legs after K0" -ForegroundColor DarkGray
@@ -413,7 +413,7 @@ foreach ($legId in $Legs) {
     $runNote = "health10h_${legId}_ep${legEp}_${hostName}"
 
     Write-Host ""
-    Write-Host "========== [$legIndex/$legTotal] $legId (ep=$legEp) ==========" -ForegroundColor Yellow
+    Write-Host "========== [$legIndex/$legTotal] $legId ep=$legEp ==========" -ForegroundColor Yellow
     Write-Host "  $($def.Title)" -ForegroundColor DarkGray
 
     if (Test-Path $legCkpt) {

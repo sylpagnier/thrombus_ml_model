@@ -20,13 +20,13 @@ $logPath = Join-Path $logDir "health10h_console_$ts.log"
 
 $postPretrain = Join-Path $RepoRoot "outputs\biochem\biochem_post_pretrain.pth"
 Write-Host ""
-Write-Host "go_health10h — unattended sweep (~10h target)" -ForegroundColor Cyan
-Write-Host "  K0_carreau_kinematic (8 ep, no clot) -> R0 -> G0 -> G1 -> S0 -> S1 -> M0 -> M1 -> M2" -ForegroundColor DarkGray
+Write-Host 'go_health10h - unattended sweep (~10h target)' -ForegroundColor Cyan
+Write-Host '  K0_carreau_kinematic [8 ep, no clot] then R0, G0, G1, S0, S1, M0, M1, M2' -ForegroundColor DarkGray
 if (Test-Path $postPretrain) {
     Write-Host "  Warm-start: REUSE $postPretrain on legs 2-9" -ForegroundColor DarkGray
 } else {
-    Write-Host "  Warm-start: none (K0 runs AE+ODE pretrain first, then saves post_pretrain)" -ForegroundColor Yellow
-    Write-Host "  Do NOT pass -ForcePretrain (that skips pretrain). Missing file is correct for a fresh run." -ForegroundColor DarkGray
+    Write-Host '  Warm-start: none (K0 runs AE+ODE pretrain first, then saves post_pretrain)' -ForegroundColor Yellow
+    Write-Host '  Do NOT pass -ForcePretrain (that skips pretrain). Missing post_pretrain is OK for a fresh run.' -ForegroundColor DarkGray
 }
 Write-Host "  Console log: $logPath" -ForegroundColor DarkGray
 Write-Host "  Manifest:    outputs\biochem\sweep_health_arch_10h\manifest.jsonl" -ForegroundColor DarkGray
