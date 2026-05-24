@@ -72,6 +72,11 @@ def _biochem_mu_additive_delta_enabled() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_ADDITIVE_DELTA")
 
 
+def _biochem_mu_carreau_only_enabled() -> bool:
+    """Pure shear-thinning μ_kin (no gelation multiplier, no Δlogμ heads). Kinematic rollout probe."""
+    return _biochem_env_truthy("BIOCHEM_MU_CARREAU_ONLY")
+
+
 def _biochem_mu_simple_log_residual_enabled() -> bool:
     """Carreau baseline × exp(Δlogμ) only — no explicit μ₁/μ₂ gelation multiplier."""
     return _biochem_env_truthy("BIOCHEM_MU_SIMPLE_LOG_RESIDUAL")
@@ -79,8 +84,10 @@ def _biochem_mu_simple_log_residual_enabled() -> bool:
 
 def _biochem_mu_disable_explicit_gelation() -> bool:
     """Skip FI/Mat sigmoid gelation and learned clot penalty in the μ multiplier."""
-    return _biochem_mu_simple_log_residual_enabled() or _biochem_env_truthy(
-        "BIOCHEM_MU_DISABLE_EXPLICIT_GELATION"
+    return (
+        _biochem_mu_carreau_only_enabled()
+        or _biochem_mu_simple_log_residual_enabled()
+        or _biochem_env_truthy("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION")
     )
 
 

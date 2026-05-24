@@ -2,8 +2,9 @@
 # Each leg writes its own checkpoint under outputs/biochem/sweep_health_arch_10h/<leg_id>/ via
 # BIOCHEM_ARCHIVE_CHECKPOINT_DIR (not the global outputs/biochem/biochem_teacher_best_high_mu.pth).
 #
-# One line (repo root):
+# One line (repo root, full ~10h sweep — includes K0 Carreau kinematic probe first):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_health10h.ps1"
+#   .\scripts\go_health10h.ps1
 #
 # Morning viz (one leg):
 #   python -m src.evaluation.visualize_pipeline --teacher-only --biochem-checkpoint "outputs\biochem\sweep_health_arch_10h\G0_gemini_leash\biochem_teacher_best_high_mu.pth"
@@ -39,12 +40,33 @@ if (-not (Test-Path $SweepDir)) {
     New-Item -ItemType Directory -Path $SweepDir -Force | Out-Null
 }
 
+# Default overnight order: kinematic sanity probe first, then architecture legs (~10h total).
+$DefaultLegOrder = @(
+    "K0_carreau_kinematic",
+    "R0_ref_leash",
+    "G0_gemini_leash",
+    "G1_gemini_mu_log",
+    "S0_simple_residual",
+    "S1_simple_residual_leash",
+    "M0_mu2_cap_leash",
+    "M1_mu1_only_leash",
+    "M2_no_explicit_gel"
+)
+
 $LegCatalog = [ordered]@{
+    K0_carreau_kinematic = @{
+        Title = 'Quick: Carreau-only μ, no clot (DATA_KINE, bio/ODE frozen)'
+        Hypothesis = 'Baseline kinematics+rollout before biochem μ/clot; expect healthy t=0 |u|, μ₂~0.'
+        Preset = ''
+        QuickEp = 8
+        Apply = { Set-LegCarreauKinematic }
+    }
     G0_gemini_leash = @{
         Title = 'Gemini additive μ + data leash + sentinel wall weights'
         Hypothesis = 'Symmetric bulk clip, additive Δlogμ, bio suppressor; fixes t=0 μ collapse and μ₂ flood.'
-        Preset = 'sweep_wall_sentinel'
-        Apply = { Set-LegGemini; Set-LegSentinelLeash }
+        # Do not use preset sweep_wall_sentinel here: it forces USE_BIO_GATE_SUPPRESSOR=0 and overwrites Gemini.
+        Preset = ''
+        Apply = { Set-LegGemini; Set-LegSentinelLeash; Set-LegBulkSurgicalFix }
     }
     G1_gemini_mu_log = @{
         Title = 'Gemini fix + MU_LOG isolate (no leash)'
@@ -161,6 +183,11 @@ function Set-LegSentinelLeash {
     $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "1.8"
 }
 
+function Set-LegBulkSurgicalFix {
+    $env:BIOCHEM_BULK_FLUID_SURGICAL_FIX = "1"
+    $env:BIOCHEM_DELTA_MU_LOG_CLIP_BULK = "0.05"
+}
+
 function Set-LegGemini {
     $env:BIOCHEM_MU_GEMINI_FIX = "1"
     $env:BIOCHEM_DELTA_MU_SYMMETRIC_BULK_CLIP = "1"
@@ -205,6 +232,30 @@ function Set-LegNoExplicitGel {
     $env:BIOCHEM_MU_DISABLE_EXPLICIT_GELATION = "1"
 }
 
+function Set-LegCarreauKinematic {
+    # μ_eff = μ_kin(γ̇) only; species ODE/bio frozen; train flow anchor only.
+    $env:BIOCHEM_MU_CARREAU_ONLY = "1"
+    $env:BIOCHEM_MU_DISABLE_EXPLICIT_GELATION = "1"
+    $env:BIOCHEM_GELATION_PRIOR_GATE = "0"
+    $env:BIOCHEM_USE_DELTA_MU_HEAD = "0"
+    $env:BIOCHEM_USE_SPLIT_MU_HEAD = "0"
+    $env:BIOCHEM_USE_WALL_DELTA_HEAD = "0"
+    $env:BIOCHEM_LOSS_ISOLATE = "DATA_KINE"
+    $env:BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT = "0.0"
+    $env:BIOCHEM_MU_LOG_ANCHOR_WEIGHT = "0.0"
+    $env:BIOCHEM_MU_LOG_WALL_WEIGHT = "0.0"
+    $env:BIOCHEM_MU_LOG_HIGH_WEIGHT = "0.0"
+    Remove-Item Env:BIOCHEM_SUPERVISED_DATA_LEASH -ErrorAction SilentlyContinue
+    $env:BIOCHEM_TRAIN_ODE = "0"
+    $env:BIOCHEM_TRAIN_BIO_ENCODER = "0"
+    $env:BIOCHEM_TRAIN_BIO_DECODER = "0"
+    $env:BIOCHEM_TRAIN_KIN_LORA = "0"
+    $env:BIOCHEM_TRAIN_MU_ENCODER = "0"
+    $env:BIOCHEM_ODE_WARMUP_EPOCHS = "999"
+    $env:BIOCHEM_TEACHER_FORCE_MIN = "1.0"
+    $env:BIOCHEM_DETACH_MACRO_STATE = "1"
+}
+
 function Invoke-TrainingPython {
     param([string[]]$Cmd)
     $prevEap = $ErrorActionPreference
@@ -235,13 +286,16 @@ function Get-RunJsonlBestVal {
     $runPath = Join-Path $RepoRoot "outputs\reports\training\biochem\$RunId\run.jsonl"
     if (-not (Test-Path $runPath)) { return $null }
     $best = $null
+    $bestScore = [double]::PositiveInfinity
     foreach ($line in Get-Content $runPath) {
         $row = $line | ConvertFrom-Json
-        if ($row.event -eq "val") {
-            if (-not $best -or ($row.val_viz_health_score -and $row.val_viz_health_score -lt $best.val_viz_health_score)) {
-                $best = $row
-            }
-            if (-not $best) { $best = $row }
+        if ($row.event -ne "val") { continue }
+        $score = $row.val_viz_health_score
+        if ($null -ne $score -and [double]$score -lt $bestScore) {
+            $bestScore = [double]$score
+            $best = $row
+        } elseif ($null -eq $best) {
+            $best = $row
         }
     }
     return $best
@@ -260,10 +314,6 @@ function Save-LegArtifacts {
     $ckptDest = Join-Path $legDir "biochem_teacher_best_high_mu.pth"
     if (-not (Test-Path $ckptDest)) {
         throw "Missing archived checkpoint for leg $LegId at $ckptDest (BIOCHEM_ARCHIVE_CHECKPOINT_DIR must match leg dir)."
-    }
-    $lastSrc = Join-Path $legDir "biochem_teacher_last.pth"
-    if (Test-Path $lastSrc) {
-        Copy-Item -Path $lastSrc -Destination (Join-Path $legDir "biochem_teacher_last.pth") -Force
     }
 
     $valAll = ""
@@ -328,13 +378,20 @@ function Set-WarmStartEnv {
 }
 
 if ($Legs.Count -eq 0) {
-    $Legs = @($LegCatalog.Keys)
+    $Legs = @($DefaultLegOrder)
 }
 
 $UseWarmStart = (-not $ForcePretrain) -and (Test-Path $PostPretrain)
 $legTotal = $Legs.Count
 $batchStart = Get-Date
-Add-Content -Path $SummaryPath -Value "BATCH_START host=$hostName ts=$($batchStart.ToString('o')) legs=$legTotal ep=$TeacherEp"
+Add-Content -Path $SummaryPath -Value "BATCH_START host=$hostName ts=$($batchStart.ToString('o')) legs=$legTotal default_ep=$TeacherEp order=$($Legs -join ',')"
+
+Write-Host ""
+Write-Host "Health architecture sweep (~10h)" -ForegroundColor Cyan
+Write-Host "  legs=$legTotal  default_ep=$TeacherEp  (K0 uses QuickEp=8)" -ForegroundColor DarkGray
+Write-Host "  order: $($Legs -join ' -> ')" -ForegroundColor DarkGray
+Write-Host "  archive: $SweepDir" -ForegroundColor DarkGray
+Write-Host ""
 
 $legIndex = 0
 $firstExecutedLeg = $true
@@ -346,18 +403,19 @@ foreach ($legId in $Legs) {
     $def = $LegCatalog[$legId]
     $legDir = Join-Path $SweepDir $legId
     $legCkpt = Get-LegCheckpointPath -LegId $legId
-    $runNote = "health10h_${legId}_ep${TeacherEp}_${hostName}"
+    $legEp = $TeacherEp
+    if ($null -ne $def.QuickEp) { $legEp = [int]$def.QuickEp }
+    $runNote = "health10h_${legId}_ep${legEp}_${hostName}"
 
     Write-Host ""
-    Write-Host "========== [$legIndex/$legTotal] $legId ==========" -ForegroundColor Yellow
+    Write-Host "========== [$legIndex/$legTotal] $legId (ep=$legEp) ==========" -ForegroundColor Yellow
     Write-Host "  $($def.Title)" -ForegroundColor DarkGray
 
     if (Test-Path $legCkpt) {
         Write-Host "SKIP $legId (checkpoint exists)" -ForegroundColor DarkGray
         continue
     }
-
-    Set-SweepGpuBase -Ep $TeacherEp -ValEvery $ValEvery
+    Set-SweepGpuBase -Ep $legEp -ValEvery $ValEvery
     $preset = [string]$def.Preset
     if ($preset) { $env:BIOCHEM_PRESET = $preset }
     & $def.Apply
@@ -370,7 +428,7 @@ foreach ($legId in $Legs) {
     $cmd = @(
         "-m", "src.training.train_biochem_corrector",
         "--new", "--run-name", $runNote,
-        "--epochs", "$TeacherEp", "--save-best"
+        "--epochs", "$legEp", "--save-best"
     )
     if ($ExtraArgs.Count -gt 0) { $cmd += $ExtraArgs }
 
@@ -394,4 +452,4 @@ foreach ($legId in $Legs) {
 
 Write-Host ""
 Write-Host "Sweep complete | manifest: $ManifestPath" -ForegroundColor Green
-Write-Host "Sort by viz health: Get-Content '$ManifestPath' | % { `$_ | ConvertFrom-Json } | Sort-Object viz_health_score | ft leg_id,viz_health_score,val_mu_log_mae,viz_t0_speed_mean,viz_final_mu2_mean" -ForegroundColor DarkGray
+Write-Host "Sort by viz health: Get-Content '$ManifestPath' | % { `$_ | ConvertFrom-Json } | Sort-Object { [double]`$_.viz_health_score } | ft leg_id,viz_health_score,val_mu_log_mae,viz_t0_speed_mean,viz_final_mu2_mean" -ForegroundColor DarkGray
