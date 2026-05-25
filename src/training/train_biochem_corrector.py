@@ -3481,6 +3481,36 @@ def _anchor_mu_si_and_log_losses(
     return l_mu_si, l_mu_log
 
 
+def _anchor_mu_mse_loss(
+    pred_series: torch.Tensor,
+    y_true: torch.Tensor,
+    truth_mask: torch.Tensor,
+    cfg_mu,
+    mu_ch: int,
+    *,
+    multi_step: bool = True,
+) -> torch.Tensor:
+    """Mean squared error on SI ``μ_eff`` at COMSOL truth nodes (K10d proof loss)."""
+    device = pred_series.device
+    dtype = pred_series.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    ma = truth_mask
+    if (not ma.any()) or pred_series.shape[0] < 1 or y_true.shape[0] < 1:
+        return z
+    t_cap = min(int(pred_series.shape[0]), int(y_true.shape[0]))
+    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
+    terms: List[torch.Tensor] = []
+    for t in range(t_cap):
+        mu_p = cfg_mu.viscosity_nd_to_si(pred_series[t, :, mu_ch])
+        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch])
+        terms.append(F.mse_loss(mu_p[ma], mu_g[ma]) * tw[t])
+    if not terms:
+        return z
+    if multi_step:
+        return torch.stack(terms).sum()
+    return terms[-1]
+
+
 def _anchor_mu_subset_log_losses(
     pred_series: torch.Tensor,
     y_true: torch.Tensor,
@@ -3609,6 +3639,7 @@ def _biochem_resolve_isolated_loss(
     w_mu_log_wall: float,
     l_mu_log_high: torch.Tensor,
     w_mu_log_high: float,
+    l_mu_mse_anchor: torch.Tensor,
     l_mu_wall_bypass: torch.Tensor,
     w_mu_wall_bypass: float,
     l_fi_gate_start: torch.Tensor,
@@ -3684,13 +3715,16 @@ def _biochem_resolve_isolated_loss(
         return _biochem_scale_for_isolate(w_mu_log_wall) * l_mu_log_wall
     if k == "MU_LOG_HIGH":
         return _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
+    if k in ("MU_MSE", "MU_DATA"):
+        return l_mu_mse_anchor
     if k in ("FI_GATE", "FI_GATE_START"):
         return _biochem_scale_for_isolate(w_fi_gate_start_eff) * l_fi_gate_start
     if k in ("RES_SPARSE", "RESIDUAL_SPARSE"):
         return _biochem_scale_for_isolate(lambda_residual_sparse) * l_residual_sparse
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
-        "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, FI_GATE, RES_SPARSE"
+        "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, MU_MSE, MU_DATA, "
+        "FI_GATE, RES_SPARSE"
     )
     raise ValueError(f"Unknown BIOCHEM_LOSS_ISOLATE={key!r}; expected one of: {valid}")
 
@@ -4132,6 +4166,7 @@ def compute_biochem_loss(
     l_mu_log_anchor = torch.tensor(0.0, device=device)
     l_mu_log_wall = torch.tensor(0.0, device=device)
     l_mu_log_high = torch.tensor(0.0, device=device)
+    l_mu_mse_anchor = torch.tensor(0.0, device=device)
     l_mu_wall_bypass = torch.tensor(0.0, device=device)
     l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
@@ -4185,7 +4220,17 @@ def compute_biochem_loss(
         "yes",
         "on",
     )
-    if model.training and has_anchor_supervision and (w_mu_aux > 0.0 or w_mu_log > 0.0 or w_mu_log_wall > 0.0 or w_mu_log_high > 0.0):
+    _mu_mse_isolate = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper() in (
+        "MU_MSE",
+        "MU_DATA",
+    )
+    if model.training and has_anchor_supervision and (
+        w_mu_aux > 0.0
+        or w_mu_log > 0.0
+        or w_mu_log_wall > 0.0
+        or w_mu_log_high > 0.0
+        or _mu_mse_isolate
+    ):
         cfg_mu = kernels.core.cfg
         ma = truth_mask
         if ma.any():
@@ -4208,6 +4253,15 @@ def compute_biochem_loss(
                     data,
                     cfg_mu,
                     mu_ch,
+                )
+            if _mu_mse_isolate:
+                l_mu_mse_anchor = _anchor_mu_mse_loss(
+                    pred_series_data_freq,
+                    target_series,
+                    ma,
+                    cfg_mu,
+                    mu_ch,
+                    multi_step=_mu_si_multi_step,
                 )
             w_mu_log_boundary = max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0)
             if (
@@ -4444,6 +4498,7 @@ def compute_biochem_loss(
             w_mu_log_wall=float(w_mu_log_wall),
             l_mu_log_high=l_mu_log_high,
             w_mu_log_high=float(w_mu_log_high),
+            l_mu_mse_anchor=l_mu_mse_anchor,
             l_mu_wall_bypass=l_mu_wall_bypass,
             w_mu_wall_bypass=float(w_mu_wall_bypass),
             l_fi_gate_start=l_fi_gate_start,
@@ -4555,6 +4610,7 @@ def compute_biochem_loss(
         "L_MuLog_wall": l_mu_log_wall.item(),
         "W_MuLog_wall_eff": float(w_mu_log_wall),
         "L_MuLog_high": l_mu_log_high.item(),
+        "L_MuMSE": l_mu_mse_anchor.item(),
         "W_MuLog_high_eff": float(w_mu_log_high),
         "L_MuWall_bypass": l_mu_wall_bypass.item(),
         "W_MuWall_bypass_eff": float(w_mu_wall_bypass),
@@ -6292,6 +6348,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         print(
             "ℹ️ BIOCHEM_MU_IC_STEADY_KIN=1: macro step 0 μ_eff from steady frozen-kin DEQ (mu_decoder); "
             "no exp(Δlogμ) on step 0.",
+            flush=True,
+        )
+    if (os.environ.get("BIOCHEM_MU_K10D_SIMPLE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        print(
+            "ℹ️ BIOCHEM_MU_K10D_SIMPLE=1: μ_eff = μ_ss (steady kin DEQ) + softplus(mu_delta_head); "
+            "use BIOCHEM_LOSS_ISOLATE=MU_MSE for proof training.",
             flush=True,
         )
     epochs = max(1, int(os.environ.get("BIOCHEM_EPOCHS", str(epochs))))

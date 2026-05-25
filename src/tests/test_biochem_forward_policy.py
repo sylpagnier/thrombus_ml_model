@@ -71,6 +71,11 @@ def test_forward_policy_from_nested_model_config():
     assert fp["mu_ic_steady_kin"] is True
 
 
+def test_k10d_simple_env(monkeypatch):
+    monkeypatch.setenv("BIOCHEM_MU_K10D_SIMPLE", "1")
+    assert gb._biochem_mu_k10d_simple_enabled()
+
+
 def test_model_config_snapshot_includes_forward_policy(monkeypatch):
     from unittest.mock import MagicMock
 

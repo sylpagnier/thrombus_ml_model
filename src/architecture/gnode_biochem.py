@@ -98,6 +98,70 @@ def _biochem_mu_ic_steady_kin_enabled() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_IC_STEADY_KIN")
 
 
+def _biochem_mu_k10d_simple_enabled() -> bool:
+    """K10d proof: ``μ_eff = μ_ss + softplus(learned_Δμ_SI)``; overrides Carreau/exp path each step."""
+    return _biochem_env_truthy("BIOCHEM_MU_K10D_SIMPLE") and not _biochem_mu_k10e_simple_enabled()
+
+
+def _biochem_mu_k10e_simple_enabled() -> bool:
+    """K10e: ``μ_eff = μ_ss + adj_mask * softplus(Δμ_nd)*scale``; clots only in wall-adjacent band."""
+    return _biochem_env_truthy("BIOCHEM_MU_K10E_SIMPLE")
+
+
+def _k10e_env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def k10e_wall_adjacent_mask(
+    sdf_nd: torch.Tensor,
+    wall_mask: torch.Tensor,
+    *,
+    d_peak_nd: float | None = None,
+    sigma_nd: float | None = None,
+    sdf_max_nd: float | None = None,
+) -> torch.Tensor:
+    """Smooth mask in ``[0,1]`` peaked one layer off the wall, zero on ``mask_wall`` nodes.
+
+    ``sdf_nd`` is distance to nearest wall (0 at wall, positive in lumen). Clots nucleate in
+    the boundary layer, not on the solid wall nodes themselves.
+    """
+    d_peak = _k10e_env_float("BIOCHEM_K10E_D_PEAK_ND", 0.004) if d_peak_nd is None else d_peak_nd
+    sigma = max(_k10e_env_float("BIOCHEM_K10E_SIGMA_ND", 0.0035) if sigma_nd is None else sigma_nd, 1e-6)
+    sdf_cap = _k10e_env_float("BIOCHEM_K10E_SDF_MAX_ND", 0.02) if sdf_max_nd is None else sdf_max_nd
+    d = sdf_nd.reshape(-1, 1).to(dtype=torch.float32).clamp(min=0.0)
+    wm = wall_mask.reshape(-1, 1).to(dtype=d.dtype)
+    off_wall = (1.0 - wm).clamp(0.0, 1.0)
+    band = torch.exp(-0.5 * ((d - d_peak) / sigma) ** 2)
+    if sdf_cap > 0.0:
+        band = band * (d <= sdf_cap).to(dtype=d.dtype)
+    return (band * off_wall).clamp(0.0, 1.0)
+
+
+def _k10e_dilate_adjacent_mask(
+    mask: torch.Tensor,
+    edge_index: torch.Tensor,
+    *,
+    mix: float | None = None,
+) -> torch.Tensor:
+    """One-hop corona: clots can grow from wall-adjacent seeds or neighboring high-μ nodes."""
+    if edge_index is None or edge_index.numel() < 2:
+        return mask
+    mix_val = _k10e_env_float("BIOCHEM_K10E_CORONA_MIX", 0.4) if mix is None else mix
+    if mix_val <= 0.0:
+        return mask
+    row, col = edge_index[0], edge_index[1]
+    neigh = torch.zeros_like(mask.reshape(-1))
+    neigh.scatter_reduce_(0, row, mask.reshape(-1)[col], reduce="amax", include_self=False)
+    grown = mask.reshape(-1) + (mix_val * neigh)
+    return grown.reshape_as(mask).clamp(0.0, 1.0)
+
+
 def _biochem_mu_disable_mu1() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_DISABLE_MU1")
 
@@ -165,6 +229,8 @@ _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
     ("delta_mu_symmetric_bulk_clip", "BIOCHEM_DELTA_MU_SYMMETRIC_BULK_CLIP"),
     ("use_clot_nucleation_growth", "BIOCHEM_USE_CLOT_NUCLEATION_GROWTH"),
     ("use_bio_gate_suppressor", "BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
+    ("mu_k10d_simple", "BIOCHEM_MU_K10D_SIMPLE"),
+    ("mu_k10e_simple", "BIOCHEM_MU_K10E_SIMPLE"),
 )
 
 _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
@@ -192,7 +258,23 @@ def snapshot_biochem_forward_policy() -> dict[str, Any]:
         "delta_mu_symmetric_bulk_clip": _biochem_delta_mu_symmetric_bulk_clip(),
         "use_clot_nucleation_growth": _biochem_clot_nucleation_growth_enabled(),
         "use_bio_gate_suppressor": _biochem_env_truthy("BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
+        "mu_k10d_simple": _biochem_mu_k10d_simple_enabled(),
+        "mu_k10e_simple": _biochem_mu_k10e_simple_enabled(),
     }
+    if policy["mu_k10d_simple"]:
+        raw_max = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
+        if raw_max:
+            policy["k10d_mu_delta_si_max"] = raw_max
+    if policy["mu_k10e_simple"]:
+        for field, env_key in (
+            ("k10e_d_peak_nd", "BIOCHEM_K10E_D_PEAK_ND"),
+            ("k10e_sigma_nd", "BIOCHEM_K10E_SIGMA_ND"),
+            ("k10e_sdf_max_nd", "BIOCHEM_K10E_SDF_MAX_ND"),
+            ("k10e_mu_delta_nd_max", "BIOCHEM_K10E_MU_DELTA_ND_MAX"),
+        ):
+            raw = (os.environ.get(env_key) or "").strip()
+            if raw:
+                policy[field] = raw
     for field, env_key in _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS:
         raw = (os.environ.get(env_key) or "").strip()
         if raw:
@@ -234,6 +316,10 @@ def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> s
         tags.append("wall_delta")
     if policy.get("mu_additive_delta"):
         tags.append("additive_delta")
+    if policy.get("mu_k10d_simple"):
+        tags.append("k10d_mu_ss_plus_learned")
+    if policy.get("mu_k10e_simple"):
+        tags.append("k10e_wall_adjacent_mu")
     if policy.get("mu_gemini_fix"):
         tags.append("gemini_fix")
     if policy.get("gelation_prior_gate") is False:
@@ -1267,8 +1353,11 @@ class GNODE_Phase3(nn.Module):
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
         mu_ic_steady_kin = _biochem_mu_ic_steady_kin_enabled()
+        mu_k10d_simple = _biochem_mu_k10d_simple_enabled()
+        mu_k10e_simple = _biochem_mu_k10e_simple_enabled()
         current_mu_eff = self._initial_mu_eff_si(batch)
         mu_eff_ic_steady_si: torch.Tensor | None = None
+        mu_ss_const: torch.Tensor | None = None
 
         # Warm-start for the kinematic DEQ: carried detached between macro time steps so TBPTT
         # does not retain a cross-time graph through the fixed-point iteration.
@@ -1624,6 +1713,40 @@ class GNODE_Phase3(nn.Module):
                     current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
             elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
                 current_mu_eff = mu_eff_ic_steady_si.clone()
+            if mu_k10d_simple or mu_k10e_simple:
+                sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
+                if mu_ss_const is None:
+                    mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
+                        batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
+                    )
+                learned_delta_raw = F.softplus(
+                    self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
+                )
+                if mu_k10e_simple:
+                    learned_delta_nd = torch.clamp(
+                        learned_delta_raw,
+                        max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
+                    )
+                    sdf_nd = kin_in[:, NodeFeat.SDF]
+                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=learned_delta_nd.dtype)
+                    adj_mask = k10e_wall_adjacent_mask(sdf_nd, wall_mask)
+                    if _biochem_env_truthy("BIOCHEM_K10E_CORONA_GROWTH", default=True):
+                        adj_mask = _k10e_dilate_adjacent_mask(
+                            adj_mask, batch.edge_index.to(device=adj_mask.device)
+                        )
+                    learned_delta_si = learned_delta_nd * mu_nd_scale
+                    current_mu_eff = mu_ss_const + (adj_mask * learned_delta_si)
+                    self._last_k10e_adj_mask = adj_mask.detach()
+                    self._last_mu_delta_bulk = learned_delta_nd.detach()
+                else:
+                    learned_delta = learned_delta_raw
+                    max_delta_raw = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
+                    if max_delta_raw:
+                        learned_delta = torch.clamp(learned_delta, max=max(float(max_delta_raw), 1e-8))
+                    current_mu_eff = mu_ss_const + learned_delta
+                    self._last_mu_delta_bulk = learned_delta.detach()
+                self._last_mu_delta_tail = torch.zeros_like(self._last_mu_delta_bulk)
+                self._last_mu_trigger_gate = torch.zeros_like(self._last_mu_delta_bulk)
             current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
 
             # ==========================================

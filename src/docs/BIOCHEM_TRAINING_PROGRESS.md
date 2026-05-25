@@ -925,6 +925,22 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
   - **Still no** biochem wall red bands vs COMSOL; **μ₁/μ₂** rows are GT species, not forward gelation.
 - **Symptom → cause → lesson**: Step B **fixed the wrong bulk offset** but **`DATA_KINE` does not supervise tail/gate** (`MU_LOG_HIGH/WALL` weights inactive under isolate). Gate **collapses** → **`gate·Δ_tail≈0`** → no spatial high-μ despite split head. **Next tiny step (K10c)**: keep K10b forward stack; **drop `BIOCHEM_LOSS_ISOLATE`**; keep **`LOSS_DATA_ONLY=1`**; add **`BIOCHEM_MU_LOG_HIGH_WEIGHT=1.0`** (+ ramp 6ep), **wall weight 0**; optional **`BIOCHEM_TRIGGER_GATE_MIN=0.05`** anti-collapse — **not** full `MU_LOG` isolate (K9 flow regress).
 
+### 101. **K10c** high-μ log aux (`20260525T144600Z`): metrics **slightly better**, viz **≈ K10b**; **wall val ~5.4**; gate **floored at 0.05**
+
+- **Setup**: K10b forward + **`LOSS_DATA_ONLY=1`** (no isolate) + **`MU_LOG_HIGH_WEIGHT=1.0`**, ramp 6ep, **`TRIGGER_GATE_MIN=0.05`**, wall log weight **0**.
+- **Val ep11**: **all 0.546** (best); **high 1.243** (↓ vs K10b **1.40**); **wall 5.379** (≈ K7 wall-fail band, **not** K10b **~1.85**); bulk **r 0.69** (misleading — flat pred on bulk).
+- **Train**: **`W·L_MuLogHigh≈0.7`** active; **`L_tot≈350`** dominated by **`L_Data_Bio`** (bio frozen, still in sum); **`L_kine≈0.72`**; **`gate→0.05`** floor by ep7; **`Δbulk≈−1.3`**; **`clot_frac=0`**.
+- **Viz**: **t=0 μ_eff≈0.04**; **t_final μ_eff** flat **~0.04** — **no** biochem wall clots; COMSOL **μ₁** row can show GT red (species), not biochem forward.
+- **Lesson**: High-μ log aux **reaches backward** but **cannot overcome** (1) **`exp(Δlogμ)`** with **negative bulk** + **floored-low gate**, (2) **μ also in `L_Data_Kine`** as weak channel vs **u,v**, (3) **open-loop** rollout — optimizing logMAE on rare nodes ≠ spatial hotspots in viz. **Proof stack** should simplify **μ_eff** before more loss knobs.
+
+### 102. **K10d** `MU_MSE` + `μ_eff=μ_ss+softplus(Δμ)` (`20260525T150817Z`): **uniform high-μ cheat** — proof **fail**
+
+- **Setup**: `BIOCHEM_MU_K10D_SIMPLE=1`, `LOSS_ISOLATE=MU_MSE`, single `mu_delta_head`, `K10D_MU_DELTA_SI_MAX=0.08`, no `DATA_KINE`.
+- **Train**: **`L_Back≈7.23e-03` flat** all epochs (MSE in SI); **`L_kine≈3.38`** not in backward; **`Δbulk≈0.08`** → **`μ_eff≈0.12`** everywhere (μ_ss~0.04 + max clamp).
+- **Val (patient007)**: **logMAE=2.258** frozen ep0–11 (preflight **2.28**); **MAE_si≈8.9e-02**; **r≈0.06**; viz **t0_logμ≈2.26**, **t0|u|≈0.25** (flow killed by μ in kin prior).
+- **Viz**: **uniform red** `μ_eff` (~0.10 colorbar top); COMSOL **~0.04** blue — **not** localized clots, **global offset cheat**.
+- **Lesson**: Plain **MSE on SI μ** without **spatial mask** / **log metric** / **flow term** → **constant** `softplus(head)≈Δmax` minimizes bulk squared error poorly but **dominates** open-loop; val **logMAE** still awful. **K10e**: wall-only Δμ, or **log-MSE**, + **bulk penalty** `mean(Δμ)²`.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -1304,6 +1320,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **K1_repro_check** (`DATA_KINE`, single Δμ, fresh, 12ep, `20260525T135349Z`) | **0.469** (ep11) | **1.792** | **0.172** bulk ep11 | high **1.145** (ep11) | **§98**: **repro** §90/K8 metrics; viz **no** wall clots, uniform **μ_eff**; **t0\|u\|≈0.61** |
 | 2026-05-25 | **K10a_ic_steady_kin_t0** (`MU_IC_STEADY_KIN=1`, `DATA_KINE`, fresh, 12ep, `20260525T141146Z`) | **0.488** (ep11) | **1.727** | **0.110** bulk ep11 | high **1.159** (ep11) | **§99**: **t=0 μ_eff≈0.04** OK; **t>0** uniform **~0.05–0.06**; still **no** wall clots |
 | 2026-05-25 | **K10b_additive_delta_ic_steady** (K10a+split+`ADDITIVE_DELTA`, `forward_policy`, fresh, 12ep, `20260525T143157Z`) | **0.493** (ep03) | **1.758** ep03; **1.848** ep11 | **0.117** bulk ep03 | high **1.396** (ep11); ep06 **3.56** spike | **§100**: **no** bulk **0.06** bump; **gate→0**; **no** clots; viz t=0 **μ≈0.04** |
+| 2026-05-25 | **K10c_high_mu_aux** (K10b+data-only+`MU_LOG_HIGH=1`, `GATE_MIN=0.05`, 12ep, `20260525T144600Z`) | **0.546** (ep11) | **5.379** | **0.690** bulk ep11 | high **1.243** (ep11) | **§101**: viz **≈K10b** flat **μ**; high-μ metric ↓; **wall val blow-up**; gate **0.05** floor |
+| 2026-05-25 | **K10d_simple_mu_mse** (`MU_K10D_SIMPLE`, `MU_MSE` only, 12ep, `20260525T150817Z`) | **2.258** (flat) | **2.658** | **0.473** bulk | high **1.457** | **§102**: **uniform μ≈0.12** cheat; **not** better — val logMAE disaster vs K10b **0.49** |
 
 ---
 

@@ -615,6 +615,8 @@ def train_kinematics(
         }
 
         if not lbfgs_initialized:
+            ema_metrics: dict[str, float] | None = None
+            ema_alpha = 0.1
             pbar = tqdm(loader, desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, μ0={current_mu_0:.4f}]")
             optimizer.zero_grad()
             accum_counter = 0
@@ -651,6 +653,13 @@ def train_kinematics(
                 total_loss += loss.item()
                 for k in component_sums:
                     component_sums[k] += metrics.get(k, 0.0)
+
+                if ema_metrics is None:
+                    ema_metrics = {k: float(v) for k, v in metrics.items()}
+                else:
+                    for k, v in metrics.items():
+                        ema_metrics[k] = (ema_alpha * float(v)) + ((1.0 - ema_alpha) * ema_metrics[k])
+
                 lr_val = (
                     optimizer.param_groups[0]["lr"]
                     if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0
@@ -658,16 +667,13 @@ def train_kinematics(
                 )
                 pbar.set_postfix(
                     {
-                        "L_tot": f"{metrics['L_total']:.3f}",
-                        "L_data": f"{metrics['L_data']:.3f}",
-                        "L_mu": f"{metrics['L_mu']:.3f}",
-                        "L_mom": f"{metrics['L_mom']:.3f}",
-                        "L_cont": f"{metrics['L_cont']:.3f}",
-                        "L_bc": f"{metrics['L_bc']:.3f}",
-                        "L_io": f"{metrics['L_io']:.3f}",
-                        "L_wss": f"{metrics['L_wss']:.3f}",
-                        "L_pgrad": f"{metrics['L_pgrad']:.3f}",
-                        "L_jac": f"{metrics['L_jac']:.3f}",
+                        "L_tot": f"{ema_metrics['L_total']:.3f}",
+                        "L_data": f"{ema_metrics['L_data']:.3f}",
+                        "L_mu": f"{ema_metrics['L_mu']:.3f}",
+                        "L_mom": f"{ema_metrics['L_mom']:.3f}",
+                        "L_cont": f"{ema_metrics['L_cont']:.3f}",
+                        "L_bc": f"{ema_metrics['L_bc']:.3f}",
+                        "L_io": f"{ema_metrics['L_io']:.3f}",
                         "|g|": f"{grad_norm:.2f}",
                         "LR": f"{lr_val:.2e}",
                     }
