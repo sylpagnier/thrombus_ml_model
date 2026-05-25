@@ -242,6 +242,7 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
         adam_epochs=2,
         stage1_end_epoch=1,
         stage2_end_epoch=2,
+        require_cuda=False,
     )
 
     assert [s for s, _, _ in stage_calls] == [1, 1, 2, 2, 3, 3]

@@ -6,6 +6,7 @@ and curriculum-based loss isolation.
 import argparse
 import json
 import os
+import sys
 import random
 import re
 import time
@@ -349,6 +350,23 @@ def compute_step_loss(
 # -------------------------------------------------------------------------
 # Training Loop
 # -------------------------------------------------------------------------
+def resolve_kinematics_device(*, require_cuda: bool = True) -> str:
+    """Pick training device and refuse CPU-only runs when require_cuda is set."""
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        print(f"🖥️ Training device: CUDA — {device_name}")
+        return "cuda"
+    print("🖥️ Training device: CPU (CUDA not available)")
+    if require_cuda:
+        print(
+            "❌ Kinematics training requires CUDA. Use a CUDA-enabled PyTorch build "
+            "with a visible GPU."
+        )
+        sys.exit(1)
+    print("⚠️ Continuing on CPU (require_cuda=False).")
+    return "cpu"
+
+
 def train_kinematics(
     *,
     epochs: int = 100,
@@ -362,8 +380,9 @@ def train_kinematics(
     weight_wss: float = 10.0,
     max_lbfgs_graphs: int = 4,
     limit_data: int | None = None,
+    require_cuda: bool = True,
 ):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_kinematics_device(require_cuda=require_cuda)
     # Handoff to L-BFGS in late Stage 3 by default.
 
     phys_cfg = PhysicsConfig(phase="kinematics")  # Kinematics supports Carreau
