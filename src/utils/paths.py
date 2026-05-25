@@ -115,8 +115,20 @@ def reports_inspection_dir(*parts: str) -> Path:
 
 
 def kinematics_dir() -> Path:
-    """Kinematics checkpoints and validation artifacts under ``outputs/kinematics``."""
-    p = outputs_root() / "kinematics"
+    """Kinematics checkpoints and validation artifacts under ``outputs/kinematics``.
+
+    Override with env ``KINEMATICS_OUTPUT_DIR`` (absolute or project-relative) for
+    per-leg recovery sweeps without clobbering the global best checkpoint.
+    """
+    import os
+
+    override = os.environ.get("KINEMATICS_OUTPUT_DIR", "").strip()
+    if override:
+        p = Path(override)
+        if not p.is_absolute():
+            p = get_project_root() / p
+    else:
+        p = outputs_root() / "kinematics"
     p.mkdir(parents=True, exist_ok=True)
     return p
 

@@ -111,6 +111,8 @@ def load_dataset(
     limit: int | None = None,
     *,
     attach_geometry: bool = True,
+    shuffle_graphs: bool = False,
+    graph_load_seed: int = 42,
 ):
     cfg = VesselConfig(phase=phase)
     if phase == "kinematics" and rheology:
@@ -129,6 +131,11 @@ def load_dataset(
         )
 
     paths = sorted(data_dir.glob("vessel_*.pt"))
+    if shuffle_graphs:
+        paths = list(paths)
+        rng = random.Random(int(graph_load_seed))
+        rng.shuffle(paths)
+        print(f"🔀 Shuffled graph load order (seed={int(graph_load_seed)}).")
     if limit is not None:
         paths = paths[:limit]
         print(f"⚠️ LIMIT-DATA FLAG ACTIVE: Only loading {limit} graphs.")
@@ -409,6 +416,8 @@ def train_kinematics(
     weight_wss: float = 10.0,
     max_lbfgs_graphs: int = 4,
     limit_data: int | None = None,
+    shuffle_graphs: bool = False,
+    graph_load_seed: int = 42,
     geometry_curriculum: GeometryCurriculumConfig | None = None,
     finetune_lr: float | None = None,
     require_cuda: bool = True,
@@ -432,6 +441,8 @@ def train_kinematics(
         "weight_wss": float(weight_wss),
         "max_lbfgs_graphs": int(max_lbfgs_graphs),
         "limit_data": limit_data,
+        "shuffle_graphs": bool(shuffle_graphs),
+        "graph_load_seed": int(graph_load_seed),
         "geometry_curriculum": {
             "enabled": bool(geometry_cfg.enabled),
             "phase": str(geometry_cfg.phase),
@@ -609,7 +620,13 @@ def train_kinematics(
                 f"\n🔄 Swapping Dataset to {target_phase.upper()}/{target_rheology.upper()} for Stage {stage} "
                 f"(n={current_n:.3f}, μ0={current_mu_0:.4f})"
             )
-            dataset = load_dataset(target_phase, target_rheology, limit=limit_data)
+            dataset = load_dataset(
+                target_phase,
+                target_rheology,
+                limit=limit_data,
+                shuffle_graphs=shuffle_graphs,
+                graph_load_seed=graph_load_seed,
+            )
             if geometry_cfg.enabled:
                 splits = split_anchor_physics_stratified(dataset)
             else:
@@ -887,27 +904,28 @@ def train_kinematics(
                 print(f"📐 Updated {manifest_path.name} in {kinematics_dir()}")
             try:
                 os.makedirs(kinematics_dir(), exist_ok=True)
+                val_record = {
+                    "epoch": int(epoch),
+                    "stage": int(stage),
+                    "rheology": str(target_rheology),
+                    "lr": float(
+                        optimizer.param_groups[0]["lr"]
+                        if hasattr(optimizer, "param_groups")
+                        and len(optimizer.param_groups) > 0
+                        else float("nan")
+                    ),
+                    "rel_l2": rel_l2,
+                    "continuity": continuity,
+                    "composite": val_comp,
+                    "best_so_far": float(best_val_composite_loss),
+                }
+                for lvl in (0, 1, 2):
+                    key = f"rel_l2_level_{lvl}"
+                    lvl_val = scores.get(key)
+                    if lvl_val is not None and lvl_val == lvl_val:
+                        val_record[key] = float(lvl_val)
                 with open(kinematics_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "epoch": int(epoch),
-                                "stage": int(stage),
-                                "rheology": str(target_rheology),
-                                "lr": float(
-                                    optimizer.param_groups[0]["lr"]
-                                    if hasattr(optimizer, "param_groups")
-                                    and len(optimizer.param_groups) > 0
-                                    else float("nan")
-                                ),
-                                "rel_l2": rel_l2,
-                                "continuity": continuity,
-                                "composite": val_comp,
-                                "best_so_far": float(best_val_composite_loss),
-                            }
-                        )
-                        + "\n"
-                    )
+                    f.write(json.dumps(val_record) + "\n")
             except OSError:
                 pass
             diary.log_validation(
@@ -974,6 +992,17 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Max graphs to load for fast debugging (not for production runs).",
+    )
+    parser.add_argument(
+        "--shuffle-graphs",
+        action="store_true",
+        help="Shuffle vessel_*.pt order before limit/split (avoids sorted-prefix bias).",
+    )
+    parser.add_argument(
+        "--graph-load-seed",
+        type=int,
+        default=42,
+        help="RNG seed for --shuffle-graphs.",
     )
     parser.add_argument(
         "--no-geometry-curriculum",
@@ -1081,6 +1110,8 @@ if __name__ == "__main__":
         weight_wss=float(args.weight_wss),
         max_lbfgs_graphs=int(args.max_lbfgs_graphs),
         limit_data=args.limit_data,
+        shuffle_graphs=bool(args.shuffle_graphs),
+        graph_load_seed=int(args.graph_load_seed),
         geometry_curriculum=geometry_curriculum,
         finetune_lr=args.finetune_lr,
     )
