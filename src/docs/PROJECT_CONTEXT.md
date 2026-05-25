@@ -82,7 +82,7 @@ There is **no** separate `src.main` package for training; use **`src.bin.orchest
 | Kinematics/2 datagen | `python -m src.data_gen.pipeline_kinematics` |
 | Biochem datagen | `python -m src.data_gen.pipeline_biochem` |
 
-Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` keeps backward-compatible reads from legacy `stage_a` / `stage_b` runs).
+Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` keeps backward-compatible reads from legacy `stage_a` / `stage_b` runs). Kinematics `.pth` files embed **`model_config`** (see `src/architecture/kinematics_model_config.py`); canonical best-run manifest: `data/reference/kinematics_best_20260426T184600Z.json` and [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md).
 
 **Path helpers**: `data_root()`, `outputs_root()`, `kinematics_dir()`, `biochem_dir()`, `stage_a_dir()`, `stage_b_dir()`, `reports_dir()`, `comsol_models_dir()`, `resolve_checkpoint()`.
 

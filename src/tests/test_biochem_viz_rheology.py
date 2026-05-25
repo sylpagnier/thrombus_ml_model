@@ -20,8 +20,8 @@ def _mock_biochem_model():
     return model
 
 
-def test_explicit_gelation_terms_zero_when_carreau_only(monkeypatch):
-    monkeypatch.setenv("BIOCHEM_MU_CARREAU_ONLY", "1")
+def test_explicit_gelation_terms_zero_when_disable_explicit_gelation(monkeypatch):
+    monkeypatch.setenv("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION", "1")
     model = _mock_biochem_model()
     fi = torch.tensor([[100.0]])
     mat = torch.tensor([[100.0]])
@@ -31,7 +31,7 @@ def test_explicit_gelation_terms_zero_when_carreau_only(monkeypatch):
 
 
 def test_explicit_gelation_respects_disable_mu2(monkeypatch):
-    monkeypatch.delenv("BIOCHEM_MU_CARREAU_ONLY", raising=False)
+    monkeypatch.delenv("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION", raising=False)
     monkeypatch.delenv("BIOCHEM_MU_SIMPLE_LOG_RESIDUAL", raising=False)
     monkeypatch.setenv("BIOCHEM_MU_DISABLE_MU2", "1")
     model = _mock_biochem_model()
@@ -42,10 +42,10 @@ def test_explicit_gelation_respects_disable_mu2(monkeypatch):
     assert float(mu2.sum()) == 0.0
 
 
-def test_slice_viz_health_mu2_zero_under_carreau_only(monkeypatch):
+def test_slice_viz_health_mu2_zero_under_disable_explicit_gelation(monkeypatch):
     from src.training.train_biochem_corrector import _compute_slice_viz_health_metrics
 
-    monkeypatch.setenv("BIOCHEM_MU_CARREAU_ONLY", "1")
+    monkeypatch.setenv("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION", "1")
     model = _mock_biochem_model()
     phys = MagicMock()
     phys.mu_inf = 0.001
@@ -84,3 +84,26 @@ def test_rollout_mu_eff_si_numpy():
     pred[:, STATE_CHANNEL_MU_EFF_ND] = [1.0, 2.0, 3.0]
     out = _rollout_mu_eff_si_numpy(phys, pred)
     assert list(out) == pytest.approx([2.0, 4.0, 6.0])
+
+
+def test_viz_mu_si_clim_fixed_comsol_defaults(monkeypatch):
+    import numpy as np
+
+    from src.evaluation.visualize_pipeline import _viz_mu_si_clim
+
+    monkeypatch.delenv("VIZ_MU_CLIM", raising=False)
+    monkeypatch.delenv("VIZ_MU_VMIN", raising=False)
+    monkeypatch.delenv("VIZ_MU_VMAX", raising=False)
+    arr = np.array([0.0, 5.0])
+    assert _viz_mu_si_clim(arr) == pytest.approx((0.04, 0.10))
+
+
+def test_viz_mu_si_clim_auto_from_data(monkeypatch):
+    import numpy as np
+
+    from src.evaluation.visualize_pipeline import _viz_mu_si_clim
+
+    monkeypatch.setenv("VIZ_MU_CLIM", "auto")
+    a = np.array([1.0, 3.0])
+    b = np.array([0.5, 4.0])
+    assert _viz_mu_si_clim(a, b) == pytest.approx((0.5, 4.0))

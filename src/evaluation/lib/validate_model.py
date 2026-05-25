@@ -9,6 +9,11 @@ from torch_geometric.loader import DataLoader
 
 from src.utils.paths import get_project_root, reports_evaluation_dir
 from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.kinematics_model_config import (
+    build_gino_deq_from_ctor,
+    kinematics_checkpoint_tensors,
+    resolve_gino_deq_ctor_kwargs,
+)
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.config import PhysicsConfig, PredChannels
 from src.utils.channel_schema import BIO_Y_SCHEMA, KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
@@ -31,22 +36,11 @@ class ModelValidator:
 
         # Mirror training-time model recipes so checkpoint loading is shape-compatible.
         if self.phase in {"kinematics", "kinematics"}:
-            self.model = GINO_DEQ(
-                in_channels=15,
-                out_channels=5,
-                latent_dim=256,
-                max_iters=25,
-                num_fourier_freqs=16,
-                phys_cfg=phys_cfg,
-                activation_fn="silu",
-                fourier_base=1.5,
-                use_hard_bcs=True,
-                num_global_tokens=16,
-                use_siren_decoder=True,
-                use_width_priors=True,
-                mu_inf_nd=mu_inf_nd,
-                mu_0_nd=mu_0_nd,
-            )
+            kin_raw = torch.load(model_path, map_location=self.device, weights_only=False)
+            kin_meta, kin_state = kinematics_checkpoint_tensors(kin_raw)
+            ctor = resolve_gino_deq_ctor_kwargs(kin_meta, kin_state)
+            self.model = build_gino_deq_from_ctor(phys_cfg, ctor)
+            state_dict = kin_state
         else:
             self.model = GINO_DEQ(
                 in_channels=15,
@@ -58,7 +52,8 @@ class ModelValidator:
                 mu_0_nd=mu_0_nd,
             )
 
-        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+        if self.phase not in {"kinematics", "kinematics"}:
+            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()

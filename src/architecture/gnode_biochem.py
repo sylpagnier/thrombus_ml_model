@@ -1,7 +1,11 @@
-import torch
-import torch.nn as nn
+from __future__ import annotations
+
 import math
 import os
+from typing import Any, Mapping
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from torch import Tensor
@@ -12,7 +16,8 @@ from torch_geometric.utils import degree
 from torchdiffeq import odeint, odeint_adjoint
 from src.architecture.ginodeq import GINOBlock, SpectralLinear
 from src.architecture.siren_decoder import SIRENDecoder
-from src.config import BiochemConfig, NodeFeat
+from src.config import BiochemConfig, NodeFeat, PredChannels
+from src.core_physics.anderson import anderson_acceleration
 from src.core_physics.kinematics_clot_prior import clot_prior_features, clot_prior_score_flat
 from src.utils.batching import get_batch_tensor
 
@@ -72,11 +77,6 @@ def _biochem_mu_additive_delta_enabled() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_ADDITIVE_DELTA")
 
 
-def _biochem_mu_carreau_only_enabled() -> bool:
-    """Pure shear-thinning μ_kin (no gelation multiplier, no Δlogμ heads). Kinematic rollout probe."""
-    return _biochem_env_truthy("BIOCHEM_MU_CARREAU_ONLY")
-
-
 def _biochem_mu_simple_log_residual_enabled() -> bool:
     """Carreau baseline × exp(Δlogμ) only — no explicit μ₁/μ₂ gelation multiplier."""
     return _biochem_env_truthy("BIOCHEM_MU_SIMPLE_LOG_RESIDUAL")
@@ -84,10 +84,8 @@ def _biochem_mu_simple_log_residual_enabled() -> bool:
 
 def _biochem_mu_disable_explicit_gelation() -> bool:
     """Skip FI/Mat sigmoid gelation and learned clot penalty in the μ multiplier."""
-    return (
-        _biochem_mu_carreau_only_enabled()
-        or _biochem_mu_simple_log_residual_enabled()
-        or _biochem_env_truthy("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION")
+    return _biochem_mu_simple_log_residual_enabled() or _biochem_env_truthy(
+        "BIOCHEM_MU_DISABLE_EXPLICIT_GELATION"
     )
 
 
@@ -387,6 +385,95 @@ class BioODEFunc(nn.Module):
 
         return dz_dt
 
+def infer_use_siren_decoder_from_state_dict(state_dict: Mapping[str, Any]) -> bool | None:
+    """Infer decoder type from checkpoint keys (legacy checkpoints without ``model_config``)."""
+    has_siren = any(str(k).startswith("siren_decoder.") for k in state_dict)
+    has_linear = any(str(k).startswith("kinematics_decoder.") for k in state_dict)
+    if has_siren:
+        return True
+    if has_linear:
+        return False
+    return None
+
+
+def infer_fourier_bands_from_state_dict(state_dict: Mapping[str, Any]) -> int | None:
+    """``kin_encoder`` input width = 15 + 10 * num_fourier_freqs (+3 width priors when enabled)."""
+    w = state_dict.get("kin_encoder.0.weight")
+    if w is None or not hasattr(w, "shape") or len(w.shape) != 2:
+        return None
+    width_extra = 3 if bool(int(os.environ.get("KINEMATICS_USE_WIDTH_PRIORS", "1"))) else 0
+    bands = (int(w.shape[1]) - 15 - width_extra) // 10
+    return bands if bands >= 1 else None
+
+
+def infer_latent_dim_from_state_dict(state_dict: Mapping[str, Any]) -> int | None:
+    w = state_dict.get("kin_encoder.0.weight")
+    if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+        return int(w.shape[0])
+    w = state_dict.get("bio_encoder.linear.parametrizations.weight.original")
+    if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+        return int(w.shape[0])
+    return None
+
+
+def snapshot_biochem_model_config(model: "GNODE_Phase3") -> dict[str, Any]:
+    """Persisted in ``.pth`` so viz/resume do not rely on training env flags."""
+    return {
+        "schema": 1,
+        "latent_dim": int(model.latent_dim),
+        "max_inner_iters": int(model.max_inner_iters),
+        "bio_encoder_prior_dim": int(model.bio_encoder_prior_dim),
+        "num_fourier_freqs": int(model.num_fourier_freqs),
+        "use_siren_decoder": bool(model.use_siren_decoder),
+        "gnode_layers": int(model.gnode_layers),
+        "use_hard_bcs": bool(model.use_hard_bcs),
+        "in_channels": 12,
+        "spatial_channels": 15,
+    }
+
+
+def resolve_gnode_phase3_ctor_kwargs(
+    meta: Mapping[str, Any] | None,
+    state_dict: Mapping[str, Any],
+    *,
+    bio_encoder_prior_dim_default: int = 2,
+    latent_dim_default: int = 256,
+    fourier_bands_default: int = 8,
+    use_siren_default: bool = False,
+    gnode_layers_default: int = 1,
+    max_inner_iters_default: int = 10,
+) -> dict[str, Any]:
+    """Build ``GNODE_Phase3`` kwargs from checkpoint ``model_config``, else tensor shapes."""
+    saved = dict((meta or {}).get("model_config") or {})
+    if int(saved.get("schema", 0)) == 1:
+        return {
+            "latent_dim": max(8, int(saved.get("latent_dim", latent_dim_default))),
+            "max_inner_iters": max(3, int(saved.get("max_inner_iters", max_inner_iters_default))),
+            "bio_encoder_prior_dim": max(0, int(saved.get("bio_encoder_prior_dim", bio_encoder_prior_dim_default))),
+            "num_fourier_freqs": max(1, int(saved.get("num_fourier_freqs", fourier_bands_default))),
+            "use_siren_decoder": bool(saved.get("use_siren_decoder", use_siren_default)),
+            "gnode_layers": max(1, int(saved.get("gnode_layers", gnode_layers_default))),
+            "use_hard_bcs": bool(saved.get("use_hard_bcs", False)),
+            "in_channels": int(saved.get("in_channels", 12)),
+            "spatial_channels": int(saved.get("spatial_channels", 15)),
+        }
+
+    inferred_siren = infer_use_siren_decoder_from_state_dict(state_dict)
+    inferred_fourier = infer_fourier_bands_from_state_dict(state_dict)
+    inferred_latent = infer_latent_dim_from_state_dict(state_dict)
+    return {
+        "latent_dim": inferred_latent if inferred_latent is not None else latent_dim_default,
+        "max_inner_iters": max_inner_iters_default,
+        "bio_encoder_prior_dim": bio_encoder_prior_dim_default,
+        "num_fourier_freqs": inferred_fourier if inferred_fourier is not None else fourier_bands_default,
+        "use_siren_decoder": inferred_siren if inferred_siren is not None else use_siren_default,
+        "gnode_layers": gnode_layers_default,
+        "use_hard_bcs": bool(int(os.environ.get("KINEMATICS_USE_HARD_BCS", "0"))),
+        "in_channels": 12,
+        "spatial_channels": 15,
+    }
+
+
 class GNODE_Phase3(nn.Module):
     """
     Biochem Physics-Informed Graph Neural ODE for dynamic Thrombosis Simulation.
@@ -411,6 +498,7 @@ class GNODE_Phase3(nn.Module):
         num_fourier_freqs: int = 8,
         use_siren_decoder: bool = False,
         gnode_layers: int = 1,
+        use_hard_bcs: bool | None = None,
     ):
         super().__init__()
 
@@ -425,8 +513,12 @@ class GNODE_Phase3(nn.Module):
         self.micro_ode_method = str(os.environ.get("BIOCHEM_ODE_METHOD", "rk4")).strip().lower()
         # Optional TBPTT-style truncation at macro boundaries.
         self.detach_macro_state_default = bool(int(os.environ.get("BIOCHEM_DETACH_MACRO_STATE", "0")))
-        # Match stage-A GINO_DEQ: hard BCs only when KINEMATICS_USE_HARD_BCS=1.
-        self.use_hard_bcs = bool(int(os.environ.get("KINEMATICS_USE_HARD_BCS", "0")))
+        if use_hard_bcs is None:
+            self.use_hard_bcs = bool(int(os.environ.get("KINEMATICS_USE_HARD_BCS", "0")))
+        else:
+            self.use_hard_bcs = bool(use_hard_bcs)
+        # Match kinematics_best.pth encoder width (178 = 175 + 3 width priors when bands=16).
+        self.use_width_priors = bool(int(os.environ.get("KINEMATICS_USE_WIDTH_PRIORS", "1")))
 
         # COMSOL Step Function Approximations (Dual-Trigger)
         self.mu_ratio_max = mu_ratio_max
@@ -453,7 +545,8 @@ class GNODE_Phase3(nn.Module):
         self.gnode_layers = max(1, int(gnode_layers))
 
         fourier_channels = 5 * self.num_fourier_freqs * 2
-        encoded_channels = (15 - 5) + 5 + fourier_channels
+        width_extra = 3 if self.use_width_priors else 0
+        encoded_channels = (15 - 5) + 5 + fourier_channels + width_extra
 
         self.kin_encoder = nn.Sequential(
             nn.Linear(encoded_channels, latent_dim),
@@ -668,14 +761,16 @@ class GNODE_Phase3(nn.Module):
         return z_out
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
-        nodes_nd = pos_nd if pos_nd is not None else x[:, NodeFeat.XY]
-        sdf_nd = x[:, NodeFeat.SDF]
-        shear_pot = x[:, NodeFeat.SHEAR_POT]
-        wall_normal = x[:, NodeFeat.WALL_NORMAL]
-        rest = x[:, NodeFeat.REST]
-        uv_prior = x[:, NodeFeat.UV_PRIOR]
-        mu_prior = x[:, NodeFeat.MU_PRIOR]
-        wss_prior = x[:, NodeFeat.WSS_PRIOR]
+        # Canonical kinematics layout is 15 channels; width priors append three more (see NodeFeat).
+        xb = x[:, :15] if x.size(1) >= 15 else x
+        nodes_nd = pos_nd if pos_nd is not None else xb[:, NodeFeat.XY]
+        sdf_nd = xb[:, NodeFeat.SDF]
+        shear_pot = xb[:, NodeFeat.SHEAR_POT]
+        wall_normal = xb[:, NodeFeat.WALL_NORMAL]
+        rest = xb[:, NodeFeat.REST]
+        uv_prior = xb[:, NodeFeat.UV_PRIOR]
+        mu_prior = xb[:, NodeFeat.MU_PRIOR]
+        wss_prior = xb[:, NodeFeat.WSS_PRIOR]
 
         features_to_encode = torch.cat([nodes_nd, sdf_nd, wall_normal], dim=1)
         N, C = features_to_encode.shape
@@ -688,7 +783,29 @@ class GNODE_Phase3(nn.Module):
             shear_pot, features_to_encode, fourier_feats,
             rest, uv_prior, mu_prior, wss_prior
         ], dim=1)
+        if getattr(self, "use_width_priors", False):
+            if x.size(1) >= NodeFeat.WIDTH_D2.stop:
+                width_features = x[:, NodeFeat.WIDTH_ND.start : NodeFeat.WIDTH_D2.stop]
+            else:
+                width_features = torch.zeros(x.size(0), 3, device=x.device, dtype=x.dtype)
+            encoded_x = torch.cat([encoded_x, width_features], dim=1)
         return encoded_x
+
+    def _kinematics_input_cols(self, batch) -> int:
+        """Kinematics node features: 15 base + optional 3 width-prior channels."""
+        if getattr(self, "use_width_priors", False) and batch.x.size(1) >= NodeFeat.WIDTH_D2.stop:
+            return NodeFeat.WIDTH_D2.stop
+        return 15
+
+    def _slice_kinematics_input(self, batch, *, clone: bool = False) -> torch.Tensor:
+        feat = batch.x[:, : self._kinematics_input_cols(batch)]
+        return feat.clone() if clone else feat
+
+    def _kinematics_deq_warm_start(self, kin_in: torch.Tensor, priors: torch.Tensor) -> torch.Tensor:
+        """Stage-A warm start: geometric encoder output + prior projection."""
+        kin_encoded = self._apply_fourier_encoding(kin_in)
+        x_enc = self.kin_encoder(kin_encoded)
+        return x_enc + self.z_prior_proj(priors)
 
     def _compute_kinematics_modulators(self, batch):
         """Computes physical edge modulators (advection, rheology, curvature) for GINO."""
@@ -715,19 +832,85 @@ class GNODE_Phase3(nn.Module):
         return mod_adv, mod_rheo, mod_curve
 
     def _decode_constrained_uvp(self, z_kin: torch.Tensor, kin_in: torch.Tensor, batch) -> torch.Tensor:
-        """
-        Decode latent kinematics directly to (u, v, p) using SDF hard constraints,
-        matching the updated GINO_DEQ model.
-        """
+        """Decode latent kinematics to (u, v, p); optional SDF hard BCs when stage-A expects them."""
         if self.use_siren_decoder and self.siren_decoder is not None:
             pos_nd = kin_in[:, NodeFeat.XY]
-            u_v_p, _ = self.siren_decoder(z_kin, pos_nd)
+            u_v_p_raw, _ = self.siren_decoder(z_kin, pos_nd)
+            u_v_p = u_v_p_raw[:, PredChannels.KINEMATICS]
         else:
             u_v_p = self.kinematics_decoder(z_kin)
-        sdf = kin_in[:, NodeFeat.SDF]
-        uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
-        u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
-        return torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
+        if self.use_hard_bcs:
+            sdf = kin_in[:, NodeFeat.SDF]
+            uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
+            u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
+            return torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
+        return u_v_p
+
+    def _initial_mu_eff_si(self, batch) -> torch.Tensor:
+        """Bootstrap macro μ from spatial Carreau prior in graph features (not uniform μ_inf)."""
+        mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
+        mu_prior_nd = batch.x[:, NodeFeat.MU_PRIOR]
+        return (mu_prior_nd * mu_nd_scale).clone()
+
+    def _decode_mu_nd_from_latent(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """ND μ from frozen stage-A ``mu_decoder`` (matches GINO_DEQ ``decode_mu``)."""
+        mu_raw = self.mu_decoder(z_flat)
+        return self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw)
+
+    def _solve_kinematics_macro(
+        self,
+        kin_encoded: torch.Tensor,
+        kin_in: torch.Tensor,
+        batch,
+        mod_adv: torch.Tensor,
+        mod_rheo: torch.Tensor,
+        mod_curve: torch.Tensor,
+        z_kin_ws: torch.Tensor,
+        *,
+        use_mu_decoder: bool,
+        current_mu_eff: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Anderson DEQ for frozen kinematics (stage-A parity); returns (z_kin, u_v_p, z_kin_ws_carry)."""
+        mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
+        num_nodes = kin_encoded.size(0)
+        batch_idx = get_batch_tensor(batch, num_nodes, kin_encoded.device)
+
+        def f_kin(curr_z: torch.Tensor) -> torch.Tensor:
+            # Anderson uses (batch, nodes, dim); GINOBlock expects (nodes, dim).
+            curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
+            if use_mu_decoder:
+                mu_nd = self._decode_mu_nd_from_latent(curr_z_flat)
+            else:
+                mu_nd = current_mu_eff / mu_nd_scale
+            mu_enc = self.mu_encoder(mu_nd)
+            injection = self.kin_encoder(kin_encoded) + mu_enc
+            out = self._apply_kin_processor_stack(
+                injection + curr_z_flat, batch, mod_adv, mod_rheo, mod_curve
+            )
+            return out.unsqueeze(0) if curr_z.ndim == 3 else out
+
+        z_init = z_kin_ws.unsqueeze(0) if z_kin_ws.ndim == 2 else z_kin_ws
+        with torch.no_grad():
+            z_kin_ws = anderson_acceleration(
+                f_kin,
+                z_init,
+                batch_idx=batch_idx,
+                max_iter=self.max_inner_iters,
+                beta=0.8,
+                warmup_iters=5,
+            )
+
+        if use_mu_decoder:
+            mu_nd = self._decode_mu_nd_from_latent(z_kin_ws.detach())
+        else:
+            mu_nd = current_mu_eff / mu_nd_scale
+        mu_enc = self.mu_encoder(mu_nd)
+        injection = self.kin_encoder(kin_encoded) + mu_enc
+        z_kin = self._apply_kin_processor_stack(
+            injection + z_kin_ws.detach(), batch, mod_adv, mod_rheo, mod_curve
+        )
+        u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
+        return z_kin, u_v_p, z_kin_ws
 
     def _decode_species_log1p(self, raw_species: torch.Tensor) -> torch.Tensor:
         """Decoder predicts log1p(species_nd) directly; clamp to a safe training range."""
@@ -797,31 +980,31 @@ class GNODE_Phase3(nn.Module):
         current_species = _default_resting_species(num_nodes, device, batch)
 
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
-        mu_inf = self.phys_cfg.mu_inf
-        current_mu_eff = torch.full((num_nodes, 1), mu_inf, dtype=torch.float32, device=device)
+        current_mu_eff = self._initial_mu_eff_si(batch)
 
-        kin_in = batch.x[:, :15].clone()
-        kin_in[:, 13:14] = current_mu_eff / mu_nd_scale
+        kin_in = self._slice_kinematics_input(batch, clone=True)
+        kin_in[:, NodeFeat.MU_PRIOR] = current_mu_eff / mu_nd_scale
         kin_encoded = self._apply_fourier_encoding(kin_in)
-        mu_enc = self.mu_encoder(current_mu_eff / mu_nd_scale)
         uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
         p_prior = kin_in[:, NodeFeat.SHEAR_POT]
         mu_prior = kin_in[:, NodeFeat.MU_PRIOR]
         priors = torch.cat([uv_prior, p_prior, mu_prior], dim=1)
-        z_kin = self.z_prior_proj(priors)
+        z_kin_ws = self._kinematics_deq_warm_start(kin_in, priors)
 
         mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
-        with torch.no_grad():
-            for _ in range(self.max_inner_iters):
-                injection = self.kin_encoder(kin_encoded) + mu_enc
-                z_kin_next = self._apply_kin_processor_stack(injection + z_kin, batch, mod_adv, mod_rheo, mod_curve)
-                diff = torch.norm(z_kin_next - z_kin, p=2, dim=-1).mean()
-                z_kin = 0.5 * z_kin + 0.5 * z_kin_next
-                if diff < 1e-4:
-                    break
         with torch.enable_grad():
-            u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
+            z_kin, u_v_p, _ = self._solve_kinematics_macro(
+                kin_encoded,
+                kin_in,
+                batch,
+                mod_adv,
+                mod_rheo,
+                mod_curve,
+                z_kin_ws,
+                use_mu_decoder=True,
+                current_mu_eff=current_mu_eff,
+            )
 
         prior_tail = self._kinematics_prior_tail(batch, u_v_p[:, 0], u_v_p[:, 1])
         if prior_tail is None:
@@ -912,16 +1095,16 @@ class GNODE_Phase3(nn.Module):
         n_idx = self.phys_cfg.n
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
-        current_mu_eff = torch.full((num_nodes, 1), mu_inf, dtype=torch.float32, device=device)
+        current_mu_eff = self._initial_mu_eff_si(batch)
 
         # Warm-start for the kinematic DEQ: carried detached between macro time steps so TBPTT
         # does not retain a cross-time graph through the fixed-point iteration.
-        kin_in_ws = batch.x[:, :15]
+        kin_in_ws = self._slice_kinematics_input(batch)
         uv_prior_ws = kin_in_ws[:, NodeFeat.UV_PRIOR]
         p_prior_ws = kin_in_ws[:, NodeFeat.SHEAR_POT]
         mu_prior_ws = kin_in_ws[:, NodeFeat.MU_PRIOR]
         priors_ws = torch.cat([uv_prior_ws, p_prior_ws, mu_prior_ws], dim=1)
-        z_kin_ws = self.z_prior_proj(priors_ws)
+        z_kin_ws = self._kinematics_deq_warm_start(kin_in_ws, priors_ws)
 
         mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
 
@@ -934,33 +1117,23 @@ class GNODE_Phase3(nn.Module):
         # ==========================================
         for i in range(num_times):
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
-            kin_in = batch.x[:, :15].clone()
+            kin_in = self._slice_kinematics_input(batch, clone=True)
 
             # ND viscosity for kinematics matches label channel (mu_viscosity_nd_scale)
-            kin_in[:, 13:14] = current_mu_eff / mu_nd_scale
+            kin_in[:, NodeFeat.MU_PRIOR] = current_mu_eff / mu_nd_scale
             kin_encoded = self._apply_fourier_encoding(kin_in)
 
-            mu_nd = current_mu_eff / mu_nd_scale
-            mu_enc = self.mu_encoder(mu_nd)
-
-            with torch.no_grad():
-                zc = z_kin_ws
-                for _ in range(self.max_inner_iters):
-                    injection = self.kin_encoder(kin_encoded) + mu_enc
-                    z_kin_next = self._apply_kin_processor_stack(
-                        injection + zc, batch, mod_adv, mod_rheo, mod_curve
-                    )
-                    diff = torch.norm(z_kin_next - zc, p=2, dim=-1).mean()
-                    zc = 0.5 * zc + 0.5 * z_kin_next
-                    if diff < 1e-4:
-                        break
-                z_kin_ws = zc
-
-            injection = self.kin_encoder(kin_encoded) + mu_enc
-            z_kin = self._apply_kin_processor_stack(
-                injection + z_kin_ws.detach(), batch, mod_adv, mod_rheo, mod_curve
+            z_kin, u_v_p, z_kin_ws = self._solve_kinematics_macro(
+                kin_encoded,
+                kin_in,
+                batch,
+                mod_adv,
+                mod_rheo,
+                mod_curve,
+                z_kin_ws,
+                use_mu_decoder=(i == 0),
+                current_mu_eff=current_mu_eff,
             )
-            u_v_p = self._decode_constrained_uvp(z_kin, kin_in, batch)
 
             # --- B. UPDATE DYNAMIC RHEOLOGY FOR CURRENT TIME ---
             u_nd = u_v_p[:, 0:1]

@@ -19,6 +19,14 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.kinematics_model_config import (
+    build_gino_deq_from_ctor,
+    kinematics_checkpoint_tensors,
+    resolve_gino_deq_ctor_kwargs,
+    save_kinematics_checkpoint_file,
+    snapshot_gino_deq_model_config,
+    write_kinematics_architecture_manifest,
+)
 from src.config import VesselConfig, PhysicsConfig, PredChannels
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.utils.anchor_mask import graph_has_anchor, anchor_node_mask
@@ -356,18 +364,20 @@ def train_kinematics(
 
     phys_cfg = PhysicsConfig(phase="kinematics")  # Kinematics supports Carreau
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-    model = GINO_DEQ(
-        in_channels=15,
-        out_channels=5,
-        latent_dim=256,
-        max_iters=25,
-        num_fourier_freqs=16,
-        phys_cfg=phys_cfg,
-        activation_fn="silu",
-        use_hard_bcs=True,
-        use_siren_decoder=True,
-        use_width_priors=True,
-    ).to(device)
+    default_ctor = resolve_gino_deq_ctor_kwargs(None, {})
+    model = build_gino_deq_from_ctor(phys_cfg, default_ctor).to(device)
+    training_manifest = {
+        "epochs": int(epochs),
+        "adam_epochs": int(adam_epochs),
+        "stage1_end_epoch": int(stage1_end_epoch),
+        "stage2_end_epoch": int(stage2_end_epoch),
+        "accum_steps": int(accum_steps),
+        "weight_data": float(weight_data),
+        "weight_mu": float(weight_mu),
+        "weight_wss": float(weight_wss),
+        "max_lbfgs_graphs": int(max_lbfgs_graphs),
+        "model_config": snapshot_gino_deq_model_config(model),
+    }
 
     # Kendall loss weighter bounds
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
@@ -399,7 +409,23 @@ def train_kinematics(
         print(f"🔁 Resuming training from: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
+            resume_meta, resume_state = kinematics_checkpoint_tensors(ckpt)
+            resume_ctor = resolve_gino_deq_ctor_kwargs(resume_meta, resume_state)
+            if resume_meta.get("model_config"):
+                print("🧩 GINO_DEQ architecture from checkpoint model_config.")
+            model = build_gino_deq_from_ctor(phys_cfg, resume_ctor).to(device)
+            opt_params = list(model.parameters()) + list(loss_weighter.parameters())
+            optimizer = optim.AdamW(opt_params, lr=1e-4, weight_decay=1e-5)
+            warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warm_up_epochs)
+            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=decay_epochs, eta_min=1e-6)
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warm_up_epochs],
+            )
+            model.load_state_dict(resume_state)
+            if isinstance(ckpt.get("training_manifest"), dict):
+                training_manifest.update(ckpt["training_manifest"])
             if "loss_weighter_state_dict" in ckpt:
                 loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
             if "optimizer_state_dict" in ckpt and ckpt.get("optimizer_name", "AdamW") == "AdamW":
@@ -412,7 +438,7 @@ def train_kinematics(
                     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 except (ValueError, RuntimeError):
                     print("⚠️ Could not restore scheduler state; continuing with fresh scheduler.")
-            start_epoch = int(ckpt.get("epoch", -1)) + 1
+            start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
             best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
             # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
             lbfgs_initialized = False
@@ -431,7 +457,23 @@ def train_kinematics(
         stage1_end_epoch=int(stage1_end_epoch),
         stage2_end_epoch=int(stage2_end_epoch),
         device=str(device),
+        model_config=training_manifest.get("model_config"),
     )
+    try:
+        arch_path = diary.run_dir / "kinematics_architecture.json"
+        with open(arch_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "run_id": diary.run_dir.name,
+                    "training_manifest": training_manifest,
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        print(f"📐 Architecture manifest: {arch_path}")
+    except OSError:
+        pass
 
     def make_loader(data_split, n_anchors, n_physics):
         # 50/50 Weighted Random Sampler logic extracted from Kinematics
@@ -647,12 +689,26 @@ def train_kinematics(
         if epoch % 5 == 0 or epoch == epochs - 1:
             os.makedirs(kinematics_dir(), exist_ok=True)
             ckpt_path = kinematics_dir() / f"kinematics_ckpt_{epoch + 1}.pth"
-            torch.save(model.state_dict(), ckpt_path)
-            torch.save(model.state_dict(), kinematics_dir() / "kinematics_ckpt_latest.pth")
+            save_kinematics_checkpoint_file(
+                ckpt_path,
+                model,
+                checkpoint_role=f"kinematics_ckpt_{epoch + 1}",
+                best_epoch=int(epoch),
+                training_manifest=training_manifest,
+            )
+            save_kinematics_checkpoint_file(
+                kinematics_dir() / "kinematics_ckpt_latest.pth",
+                model,
+                checkpoint_role="kinematics_ckpt_latest",
+                best_epoch=int(epoch),
+                training_manifest=training_manifest,
+            )
             state_path = kinematics_dir() / f"kinematics_state_{epoch + 1}.pth"
             state_payload = {
                 "epoch": int(epoch),
                 "model_state_dict": model.state_dict(),
+                "model_config": snapshot_gino_deq_model_config(model),
+                "training_manifest": dict(training_manifest),
                 "optimizer_state_dict": (
                     optimizer.state_dict()
                     if hasattr(optimizer, "state_dict")
@@ -683,8 +739,28 @@ def train_kinematics(
             )
             if stage == 3 and val_comp < best_val_composite_loss:
                 best_val_composite_loss = val_comp
-                torch.save(model.state_dict(), kinematics_dir() / "kinematics_best.pth")
+                save_kinematics_checkpoint_file(
+                    kinematics_dir() / "kinematics_best.pth",
+                    model,
+                    checkpoint_role="kinematics_best",
+                    best_epoch=int(epoch),
+                    rel_l2=rel_l2,
+                    continuity=continuity,
+                    composite=val_comp,
+                    run_id=str(getattr(diary, "run_dir", Path(".")).name),
+                    training_manifest=training_manifest,
+                )
+                manifest_path = write_kinematics_architecture_manifest(
+                    snapshot_gino_deq_model_config(model),
+                    best_epoch=int(epoch),
+                    rel_l2=rel_l2,
+                    continuity=continuity,
+                    composite=val_comp,
+                    run_id=str(getattr(diary, "run_dir", Path(".")).name),
+                    extra={"training_manifest": training_manifest},
+                )
                 print("⭐ Saved New Best Kinematics Model")
+                print(f"📐 Updated {manifest_path.name} in {kinematics_dir()}")
             try:
                 os.makedirs(kinematics_dir(), exist_ok=True)
                 with open(kinematics_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:

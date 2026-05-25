@@ -14,14 +14,19 @@ from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.kinematics_model_config import (
+    build_gino_deq_from_ctor,
+    kinematics_checkpoint_tensors,
+    resolve_gino_deq_ctor_kwargs,
+)
 from src.architecture.gnode_biochem import (
     GNODE_Phase3,
     _SPECIES_LOG1P_MAX,
     _SPECIES_LOG1P_MIN,
-    _biochem_mu_carreau_only_enabled,
     _biochem_mu_disable_explicit_gelation,
     _biochem_mu_simple_log_residual_enabled,
     biochem_explicit_gelation_terms,
+    resolve_gnode_phase3_ctor_kwargs,
 )
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
@@ -60,14 +65,53 @@ _DEFAULT_VAL_ANCHOR_STEM = "patient007"
 _MU_DYNAMIC_SI_LABEL = r"$\mu_b \times (\mu_1(\mathrm{Mat}) + \mu_2(\mathrm{FI}))$ [Pa·s]"
 _MU1_PRODUCT_SI_LABEL = r"$\mu_{blood}\times\mu_1$(Mat) [Pa·s]"
 _MU2_TRIGGER_LABEL = r"$\mu_2$ trigger (FI) [−]"
+# COMSOL Surface default "WaveLightClassic" ≈ matplotlib blue–white–red (``bwr``).
+_MU_VIZ_CMAP_DEFAULT = "bwr"
+# COMSOL WaveLightClassic legend on ``mu_b*(mu2+mu1)`` exports (patient007 t_final reference).
+_MU_VIZ_VMIN_DEFAULT = 0.04
+_MU_VIZ_VMAX_DEFAULT = 0.10
+
+
+def _viz_mu_cmap() -> str:
+    """Colormap for dynamic μ and μ₁-product panels (override: ``VIZ_MU_CMAP``, e.g. ``magma``)."""
+    raw = (os.environ.get("VIZ_MU_CMAP") or _MU_VIZ_CMAP_DEFAULT).strip()
+    return raw or _MU_VIZ_CMAP_DEFAULT
+
+
+def _viz_mu_clim_fixed() -> bool:
+    """True unless ``VIZ_MU_CLIM=auto`` (data min/max across panels)."""
+    raw = (os.environ.get("VIZ_MU_CLIM") or "fixed").strip().lower()
+    return raw not in ("auto", "data", "dynamic")
+
+
+def _viz_mu_si_clim(*arrays: np.ndarray) -> Tuple[float, float]:
+    """
+    Color limits [Pa·s] for μ panels.
+
+    Default: fixed COMSOL-style window (``VIZ_MU_VMIN`` / ``VIZ_MU_VMAX``, else 0.04–0.10).
+    Set ``VIZ_MU_CLIM=auto`` to span the passed arrays (legacy behavior).
+    """
+    if _viz_mu_clim_fixed():
+        vmin_s = (os.environ.get("VIZ_MU_VMIN") or "").strip()
+        vmax_s = (os.environ.get("VIZ_MU_VMAX") or "").strip()
+        vmin = float(vmin_s) if vmin_s else _MU_VIZ_VMIN_DEFAULT
+        vmax = float(vmax_s) if vmax_s else _MU_VIZ_VMAX_DEFAULT
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        return vmin, vmax
+    nonempty = [a for a in arrays if a.size > 0]
+    if not nonempty:
+        return _MU_VIZ_VMIN_DEFAULT, _MU_VIZ_VMAX_DEFAULT
+    vmin = min(float(a.min()) for a in nonempty)
+    vmax = max(float(a.max()) for a in nonempty)
+    if vmax <= vmin + 1e-18:
+        vmax = vmin + 1e-12
+    return vmin, vmax
 
 
 def _biochem_mu_viz_labels() -> Dict[str, str]:
     """Panel titles aligned with the active forward ``μ_eff`` path."""
-    if _biochem_mu_carreau_only_enabled():
-        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout, Carreau-only) [Pa·s]"
-        gel_suffix = "effective μ₁/μ₂ in forward = 0 (Carreau-only)"
-    elif _biochem_mu_simple_log_residual_enabled():
+    if _biochem_mu_simple_log_residual_enabled():
         mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout, $\mu_{\mathrm{kin}}\,e^{\Delta\log\mu}$) [Pa·s]"
         gel_suffix = "effective μ₁/μ₂ in forward = 0 (simple log residual)"
     elif _biochem_mu_disable_explicit_gelation():
@@ -379,10 +423,17 @@ def _inject_biochem_kinematic_lora(model, rank=4, alpha=1.0):
     """Match Biochem training: LoRA on kinematic SpectralLinear layers."""
     n_enc = inject_lora_to_spectral_linears(model.kin_encoder, rank=rank, alpha=alpha)
     n_proc = inject_lora_to_spectral_linears(model.kin_processor, rank=rank, alpha=alpha)
-    n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
+    n_proc_extra = 0
+    if hasattr(model, "kin_processor_extra"):
+        n_proc_extra = inject_lora_to_spectral_linears(
+            model.kin_processor_extra, rank=rank, alpha=alpha
+        )
+    n_dec = 0
+    if getattr(model, "kinematics_decoder", None) is not None:
+        n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
     print(
-        f"   ↳ LoRA injected: kin_encoder={n_enc}, kin_processor={n_proc}, "
-        f"kinematics_decoder={n_dec} (rank={rank}, alpha={alpha})"
+        f"   ↳ LoRA injected: kin_encoder={n_enc}, kin_processor={n_proc + n_proc_extra}, "
+        f"kinematics_decoder={n_dec} (rank={rank}, alpha={alpha}; SIREN ckpts use decoder=0)"
     )
 
 
@@ -624,37 +675,35 @@ def _show_mu_trigger_comparison_figure(
     mu2_ml: np.ndarray,
     *,
     case_label: str = "",
+    time_label: str = "",
     mb_mu1_comsol: Optional[np.ndarray] = None,
     mu2_comsol: Optional[np.ndarray] = None,
     mu_labels: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Static gelation triggers at final time; optional COMSOL vs ML 2×2 grid."""
+    """Static gelation triggers at final rollout time; optional COMSOL vs ML 2×2 grid."""
+    when = f" at {time_label}" if time_label else " at final time"
     labels = mu_labels or _biochem_mu_viz_labels()
     mu1_lbl = labels["mu1_product"]
     mu2_lbl = labels["mu2_trigger"]
     gel_suffix = labels["gelation_suffix"]
     mu2_cap = float(model_biochem.mu_ratio_max)
-    m1_vmin = float(mb_mu1_ml.min())
-    m1_vmax = float(mb_mu1_ml.max())
+    m1_arrays: List[np.ndarray] = [mb_mu1_ml]
     if mb_mu1_comsol is not None:
-        m1_vmin = min(m1_vmin, float(mb_mu1_comsol.min()))
-        m1_vmax = max(m1_vmax, float(mb_mu1_comsol.max()))
-    if m1_vmax <= m1_vmin + 1e-18:
-        m1_vmax = m1_vmin + 1e-12
+        m1_arrays.append(mb_mu1_comsol)
+    m1_vmin, m1_vmax = _viz_mu_si_clim(*m1_arrays)
 
     show_comsol = mb_mu1_comsol is not None and mu2_comsol is not None
     if show_comsol:
         fig, axs = plt.subplots(2, 2, figsize=(14, 10))
         title = (
-            f"Gelation triggers: COMSOL vs Biochem ({case_label}; {gel_suffix})"
+            f"Gelation triggers{when}: COMSOL vs Biochem ({case_label}; {gel_suffix})"
             if case_label
-            else f"Gelation triggers: COMSOL vs Biochem ({gel_suffix})"
+            else f"Gelation triggers{when}: COMSOL vs Biochem ({gel_suffix})"
         )
-        fig.suptitle(title, fontsize=14, fontweight="bold")
         panels = (
-            (axs[0, 0], mb_mu1_comsol, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax),
+            (axs[0, 0], mb_mu1_comsol, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", _viz_mu_cmap(), m1_vmin, m1_vmax),
             (axs[0, 1], mu2_comsol, f"COMSOL: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap),
-            (axs[1, 0], mb_mu1_ml, f"Biochem: {mu1_lbl}", "magma", m1_vmin, m1_vmax),
+            (axs[1, 0], mb_mu1_ml, f"Biochem: {mu1_lbl}", _viz_mu_cmap(), m1_vmin, m1_vmax),
             (axs[1, 1], mu2_ml, f"Biochem: {mu2_lbl}", "Reds", 0.0, mu2_cap),
         )
         for ax, values, subtitle, cmap, vmin, vmax in panels:
@@ -662,18 +711,17 @@ def _show_mu_trigger_comparison_figure(
     else:
         fig, axs = plt.subplots(1, 2, figsize=(14, 5.5))
         title = (
-            f"Gelation triggers at final time ({case_label}; {gel_suffix})"
+            f"Gelation triggers{when} ({case_label}; {gel_suffix})"
             if case_label
-            else f"Gelation triggers at final time ({gel_suffix})"
+            else f"Gelation triggers{when} ({gel_suffix})"
         )
-        fig.suptitle(title, fontsize=14, fontweight="bold")
         _plot_field(
             fig,
             axs[0],
             pos,
             mb_mu1_ml,
             mu1_lbl,
-            "magma",
+            _viz_mu_cmap(),
             vmin=m1_vmin,
             vmax=m1_vmax,
         )
@@ -687,7 +735,8 @@ def _show_mu_trigger_comparison_figure(
             vmin=0.0,
             vmax=mu2_cap,
         )
-    fig.tight_layout(rect=(0, 0.03, 1, 0.92))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.90))
+    _set_figure_suptitle(fig, title, fontsize=14)
 
 
 def _mesh_axis_limits(pos: np.ndarray, pad_frac: float = 0.04) -> Tuple[float, float, float, float]:
@@ -696,6 +745,19 @@ def _mesh_axis_limits(pos: np.ndarray, pad_frac: float = 0.04) -> Tuple[float, f
     dx = max((x1 - x0) * pad_frac, 1e-9)
     dy = max((y1 - y0) * pad_frac, 1e-9)
     return x0 - dx, x1 + dx, y0 - dy, y1 + dy
+
+
+def _set_figure_suptitle(
+    fig,
+    title: str,
+    *,
+    fontsize: float = 14,
+    subplot_top: float = 0.88,
+    title_y: float = 0.96,
+) -> None:
+    """Reserve headroom so the main title stays visible when the window is maximized."""
+    fig.subplots_adjust(top=subplot_top)
+    fig.suptitle(title, fontsize=fontsize, fontweight="bold", y=title_y)
 
 
 def _show_kinematics_static_figure(
@@ -713,14 +775,8 @@ def _show_kinematics_static_figure(
     panel_aspect = yspan / xspan
     panel_h = 4.2
     panel_w = min(panel_h * panel_aspect, 5.5)
-    fig, axes = plt.subplots(
-        1,
-        3,
-        figsize=(panel_w * 3.35, panel_h),
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(1, 3, figsize=(panel_w * 3.35, panel_h + 0.55))
     title = f"Kinematics (GINO-DEQ), steady — {case_label}" if case_label else "Kinematics (GINO-DEQ), steady"
-    fig.suptitle(title, fontsize=15, fontweight="bold", y=1.02)
     panels = (
         (vel, "|u| (ND)", "jet"),
         (pressure, "p (ND)", "coolwarm"),
@@ -738,6 +794,8 @@ def _show_kinematics_static_figure(
             xlim=(xlo, xhi),
             ylim=(ylo, yhi),
         )
+    fig.subplots_adjust(left=0.02, right=0.99, bottom=0.06, wspace=0.14)
+    _set_figure_suptitle(fig, title, fontsize=15, subplot_top=0.86, title_y=0.95)
 
 
 def _vel_pressure_from_series(series_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -848,21 +906,13 @@ def _show_biochem_temporal_slider(
     fib_vmax = float(max(fib_all.max(), comsol_fib.max() if show_comsol else fib_all.max()))
     mat_vmin = float(min(mat_all.min(), comsol_mat.min() if show_comsol else mat_all.min()))
     mat_vmax = float(max(mat_all.max(), comsol_mat.max() if show_comsol else mat_all.max()))
-    mu_vmin = float(mu_dyn_all.min())
-    mu_vmax = float(mu_dyn_all.max())
+    mu_clim_arrays: List[np.ndarray] = [mu_dyn_all.reshape(-1)]
+    m1_clim_arrays: List[np.ndarray] = [mb_mu1_all.reshape(-1)]
     if show_comsol:
-        mu_vmin = min(mu_vmin, float(comsol_mu_dyn.min()))
-        mu_vmax = max(mu_vmax, float(comsol_mu_dyn.max()))
-    if mu_vmax <= mu_vmin + 1e-18:
-        mu_vmax = mu_vmin + 1e-12
-
-    m1_vmin = float(mb_mu1_all.min())
-    m1_vmax = float(mb_mu1_all.max())
-    if show_comsol:
-        m1_vmin = min(m1_vmin, float(comsol_mb_mu1.min()))
-        m1_vmax = max(m1_vmax, float(comsol_mb_mu1.max()))
-    if m1_vmax <= m1_vmin + 1e-18:
-        m1_vmax = m1_vmin + 1e-12
+        mu_clim_arrays.append(comsol_mu_dyn.reshape(-1))
+        m1_clim_arrays.append(comsol_mb_mu1.reshape(-1))
+    mu_vmin, mu_vmax = _viz_mu_si_clim(*mu_clim_arrays)
+    m1_vmin, m1_vmax = _viz_mu_si_clim(*m1_clim_arrays)
 
     t0_label = f"t={custom_times[0]:.1f}s"
 
@@ -878,7 +928,7 @@ def _show_biochem_temporal_slider(
     fig_sp, axs_sp = plt.subplots(2, ncols, figsize=(7 * ncols, 8))
     if ncols == 1:
         axs_sp = np.asarray(axs_sp).reshape(2, 1)
-    fig_sp.suptitle(f"{title_prefix} — Species (SI) ({t0_label})", fontsize=14, fontweight="bold")
+    _set_figure_suptitle(fig_sp, f"{title_prefix} — Species (SI) ({t0_label})", fontsize=14)
     scatters_sp: Dict[str, Any] = {}
     scatters_sp["fib_b"] = _init_scatter(
         fig_sp, axs_sp[0, col_b], fib_all, "Biochem: Fibrin (SI)", "Reds", fib_vmin, fib_vmax
@@ -911,18 +961,20 @@ def _show_biochem_temporal_slider(
     fig, axs = plt.subplots(nrows_main, ncols, figsize=(7 * ncols, 15))
     if ncols == 1:
         axs = np.asarray(axs).reshape(nrows_main, 1)
-    plt.subplots_adjust(bottom=0.08, hspace=0.22)
-    fig.suptitle(f"{title_prefix} — Flow & rheology ({t0_label})", fontsize=16, fontweight="bold")
+    plt.subplots_adjust(bottom=0.08, top=0.90, hspace=0.22)
+    _set_figure_suptitle(
+        fig, f"{title_prefix} — Flow & rheology ({t0_label})", fontsize=16, subplot_top=0.90, title_y=0.97
+    )
 
     scatters: Dict[str, Any] = {}
     scatters["vel_b"] = _init_scatter(
         fig, axs[0, col_b], vel_all, "Biochem: |u| (ND)", "jet", vel_vmin, vel_vmax
     )
     scatters["mu_b"] = _init_scatter(
-        fig, axs[1, col_b], mu_dyn_all, f"Biochem: {mu_labels['mu_dynamic']}", "magma", mu_vmin, mu_vmax
+        fig, axs[1, col_b], mu_dyn_all, f"Biochem: {mu_labels['mu_dynamic']}", _viz_mu_cmap(), mu_vmin, mu_vmax
     )
     scatters["m1_b"] = _init_scatter(
-        fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", "magma", m1_vmin, m1_vmax
+        fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", _viz_mu_cmap(), m1_vmin, m1_vmax
     )
     scatters["m2_b"] = _init_scatter(
         fig, axs[3, col_b], mu2_all, f"Biochem: {mu_labels['mu2_trigger']}", "Reds", 0.0, mu2_cap
@@ -937,34 +989,44 @@ def _show_biochem_temporal_slider(
             axs[1, col_c],
             comsol_mu_dyn,
             f"COMSOL: {mu_labels['mu_dynamic']}",
-            "magma",
+            _viz_mu_cmap(),
             mu_vmin,
             mu_vmax,
         )
         scatters["m1_c"] = _init_scatter(
-            fig, axs[2, col_c], comsol_mb_mu1, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax
+            fig, axs[2, col_c], comsol_mb_mu1, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", _viz_mu_cmap(), m1_vmin, m1_vmax
         )
         scatters["m2_c"] = _init_scatter(
             fig, axs[3, col_c], comsol_mu2, f"COMSOL: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap
         )
 
-    ax_slider = plt.axes([0.2, 0.02, 0.5, 0.03])
-    time_slider = Slider(
-        ax=ax_slider,
-        label="Time Step Index",
-        valmin=0,
-        valmax=len(custom_times) - 1,
-        valinit=0,
-        valstep=1,
-        color="teal",
-    )
+    n_frames = len(custom_times)
+    fig.subplots_adjust(bottom=0.14)
+    fig_sp.subplots_adjust(bottom=0.14)
+
+    def _make_time_slider(parent_fig, bottom: float = 0.03) -> Slider:
+        ax_slider = parent_fig.add_axes([0.15, bottom, 0.55, 0.03])
+        return Slider(
+            ax=ax_slider,
+            label="Time",
+            valmin=0,
+            valmax=max(0, n_frames - 1),
+            valinit=0,
+            valstep=1,
+            color="teal",
+        )
+
+    time_slider_main = _make_time_slider(fig)
+    time_slider_sp = _make_time_slider(fig_sp)
+    sliders = [time_slider_main, time_slider_sp]
+
     if on_refresh is not None:
-        ax_refresh = plt.axes([0.74, 0.015, 0.2, 0.05])
+        ax_refresh = fig.add_axes([0.74, 0.02, 0.2, 0.05])
         refresh_button = Button(ax_refresh, refresh_label, color="lightgray", hovercolor="gainsboro")
         refresh_button.on_clicked(lambda _: on_refresh())
 
-    def update(_):
-        idx = int(time_slider.val)
+    def _apply_frame(idx: int) -> None:
+        idx = int(max(0, min(idx, n_frames - 1)))
         t_lbl = f"t={custom_times[idx]:.1f}s"
         scatters["vel_b"].set_array(vel_all[idx])
         scatters["mu_b"].set_array(mu_dyn_all[idx])
@@ -979,12 +1041,42 @@ def _show_biochem_temporal_slider(
             scatters["m2_c"].set_array(comsol_mu2[idx])
             scatters_sp["fib_c"].set_array(comsol_fib[idx])
             scatters_sp["mat_c"].set_array(comsol_mat[idx])
-        fig.suptitle(f"{title_prefix} — Flow & rheology ({t_lbl})", fontsize=16, fontweight="bold")
-        fig_sp.suptitle(f"{title_prefix} — Species (SI) ({t_lbl})", fontsize=14, fontweight="bold")
+        _set_figure_suptitle(
+            fig, f"{title_prefix} — Flow & rheology ({t_lbl})", fontsize=16, subplot_top=0.88, title_y=0.96
+        )
+        _set_figure_suptitle(
+            fig_sp,
+            f"{title_prefix} — Species (SI) ({t_lbl})",
+            fontsize=14,
+            subplot_top=0.88,
+            title_y=0.96,
+        )
         fig.canvas.draw_idle()
         fig_sp.canvas.draw_idle()
 
-    time_slider.on_changed(update)
+    def _on_slider_change(val) -> None:
+        idx = int(round(float(val)))
+        for s in sliders:
+            if int(round(float(s.val))) != idx:
+                s.eventson = False
+                s.set_val(idx)
+                s.eventson = True
+        _apply_frame(idx)
+
+    for s in sliders:
+        s.on_changed(_on_slider_change)
+
+    if n_frames <= 1:
+        print(
+            "   ⚠️ Temporal slider: only one keyframe in this rollout "
+            f"(n={n_frames}); use --full-viz or VIZ_BIOCHEM_MACRO_STEPS=full for more steps."
+        )
+    else:
+        t_end = custom_times[-1]
+        print(
+            f"   ↳ Temporal slider: {n_frames} keyframes (0…{n_frames - 1}), "
+            f"t ∈ [0, {t_end:.1f}] s — bottom of Species or Flow & rheology window."
+        )
     plt.show()
 
 
@@ -1104,19 +1196,20 @@ def run_phase_comparison(
         kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", kin_default_iters))
         kin_max_iters = max(5, min(80, kin_max_iters))
         phys_cfg_kine = PhysicsConfig(phase="kinematics")
-        model_kine_base = GINO_DEQ(
-            in_channels=15,
-            out_channels=5,
-            latent_dim=256,
-            max_iters=kin_max_iters,
-            num_fourier_freqs=16,
-            phys_cfg=phys_cfg_kine,
-            activation_fn="silu",
-            use_hard_bcs=True,
-            use_siren_decoder=True,
-            use_width_priors=True,
-        ).to(device)
-        model_kine_base.load_state_dict(torch.load(kin_ckpt, map_location=device, weights_only=True))
+        kin_raw = _load_torch_checkpoint(kin_ckpt)
+        kin_meta, kin_state = kinematics_checkpoint_tensors(kin_raw)
+        kin_ctor = resolve_gino_deq_ctor_kwargs(kin_meta, kin_state)
+        kin_ctor = dict(kin_ctor)
+        kin_ctor["max_iters"] = kin_max_iters
+        if kin_meta.get("model_config"):
+            print("   ↳ kinematics GINO_DEQ from checkpoint model_config.")
+        else:
+            print(
+                "   ↳ kinematics GINO_DEQ from weight/reference inference "
+                "(re-save kinematics_best.pth to embed model_config)."
+            )
+        model_kine_base = build_gino_deq_from_ctor(phys_cfg_kine, kin_ctor).to(device)
+        model_kine_base.load_state_dict(kin_state, strict=False)
         model_kine_base.eval()
     elif not use_anchor:
         print("   ↳ No kinematics checkpoint found; skipping GINO-DEQ column.", flush=True)
@@ -1137,24 +1230,49 @@ def run_phase_comparison(
     _viz_inner = os.environ.get("VIZ_BIOCHEM_MAX_INNER_ITERS", "").strip()
     biochem_inner_iters = int(_viz_inner) if _viz_inner else (6 if fast_mode else 10)
     biochem_inner_iters = max(3, min(25, biochem_inner_iters))
+    ctor = resolve_gnode_phase3_ctor_kwargs(
+        biochem_meta,
+        biochem_state,
+        bio_encoder_prior_dim_default=bio_enc_prior,
+        latent_dim_default=latent_dim,
+        max_inner_iters_default=biochem_inner_iters,
+    )
+    if biochem_meta.get("model_config"):
+        print("   ↳ biochem GNODE from checkpoint model_config (saved by train_biochem_corrector).")
+    else:
+        print(
+            f"   ↳ biochem GNODE from weight inference (legacy ckpt): "
+            f"siren={int(ctor['use_siren_decoder'])} fourier={int(ctor['num_fourier_freqs'])} "
+            f"hard_bcs={int(ctor['use_hard_bcs'])} — re-run teacher save to embed model_config."
+        )
     model_biochem = GNODE_Phase3(
         phys_cfg=phys_cfg_biochem,
-        in_channels=12,
-        spatial_channels=15,
-        latent_dim=latent_dim,
-        max_inner_iters=biochem_inner_iters,
-        bio_encoder_prior_dim=bio_enc_prior,
+        in_channels=int(ctor["in_channels"]),
+        spatial_channels=int(ctor["spatial_channels"]),
+        latent_dim=int(ctor["latent_dim"]),
+        max_inner_iters=int(ctor["max_inner_iters"]),
+        bio_encoder_prior_dim=int(ctor["bio_encoder_prior_dim"]),
         mu_ratio_max=bio_cfg.mu_ratio_max,
         mat_crit=bio_cfg.viscosity_mat_crit,
         fi_crit=bio_cfg.viscosity_fi_crit,
         temp_mat=bio_cfg.viscosity_gnode_temp_mat,
         temp_fi=bio_cfg.viscosity_gnode_temp_fi,
+        num_fourier_freqs=int(ctor["num_fourier_freqs"]),
+        use_siren_decoder=bool(ctor["use_siren_decoder"]),
+        gnode_layers=int(ctor["gnode_layers"]),
+        use_hard_bcs=bool(ctor["use_hard_bcs"]),
     ).to(device)
     _inject_biochem_kinematic_lora(model_biochem)
     compatible_bio, skipped_bio = _filter_compatible_state_dict(biochem_state, model_biochem.state_dict())
     model_biochem.load_state_dict(compatible_bio, strict=False)
     if skipped_bio:
         print(f"   ↳ Skipped {len(skipped_bio)} checkpoint key(s) (no target or shape mismatch).")
+        siren_skipped = [k for k in skipped_bio if k.startswith("siren_decoder.")]
+        if siren_skipped and ctor["use_siren_decoder"]:
+            print(
+                f"   ⚠️ siren_decoder not loaded ({len(siren_skipped)} keys) — biochem |u| will look wrong. "
+                "Set BIOCHEM_USE_SIREN=1 and re-run, or use a checkpoint trained with SIREN."
+            )
     model_biochem.eval()
 
     # ------------------------------------------------------------------
@@ -1310,7 +1428,16 @@ def run_phase_comparison(
     # ------------------------------------------------------------------
     # 6. Plotting
     # ------------------------------------------------------------------
+    t_final_si = float(bio_cfg.resolve_biochem_times(data_biochem, device)[-1].item())
+    time_label = f"t_final≈{t_final_si:.0f}s (last COMSOL export step)"
     print("🎨 Generating comparison plots...")
+    print(
+        "   Figure guide (matplotlib order):\n"
+        "     • Steady GINO-DEQ — time-independent Stage-A snapshot (not biochem rollout t_final)\n"
+        f"     • Dynamic μ_eff — biochem rollout at {time_label}\n"
+        f"     • Gelation triggers — same instant as μ_eff panel; COMSOL row = GT species, Biochem row = terms in forward\n"
+        "     • Temporal inspector — Species + Flow/rheology with Time slider (keyframes, not only t_final)"
+    )
 
     if pred_kine_base_np is not None and model_kine_base is not None:
         _show_kinematics_static_figure(
@@ -1325,22 +1452,15 @@ def run_phase_comparison(
     if use_anchor and comsol_final_np is not None:
         comsol_mu_dyn_np = _rollout_mu_eff_si_numpy(model_biochem.phys_cfg, comsol_final_np)
 
-    mu_si_vmin = float(mu_dyn_np.min())
-    mu_si_vmax = float(mu_dyn_np.max())
+    mu_clim_arrays: List[np.ndarray] = [mu_dyn_np]
     if comsol_mu_dyn_np is not None:
-        mu_si_vmin = min(mu_si_vmin, float(comsol_mu_dyn_np.min()))
-        mu_si_vmax = max(mu_si_vmax, float(comsol_mu_dyn_np.max()))
-    if mu_si_vmax <= mu_si_vmin + 1e-18:
-        mu_si_vmax = mu_si_vmin + 1e-12
+        mu_clim_arrays.append(comsol_mu_dyn_np)
+    mu_si_vmin, mu_si_vmax = _viz_mu_si_clim(*mu_clim_arrays)
 
     n_rheo_cols = 2 if comsol_mu_dyn_np is not None else 1
     fig2, axs2 = plt.subplots(1, n_rheo_cols, figsize=(7 * n_rheo_cols, 5.5))
     axs2 = np.atleast_1d(axs2)
-    fig2.suptitle(
-        f"Dynamic viscosity at final time ({case_label}; {mu_labels['mu_dynamic']})",
-        fontsize=14,
-        fontweight="bold",
-    )
+    rheo_title = f"Dynamic viscosity at {time_label} ({case_label}; {mu_labels['mu_dynamic']})"
     col_i = 0
     if comsol_mu_dyn_np is not None:
         _plot_field(
@@ -1349,7 +1469,7 @@ def run_phase_comparison(
             pos,
             comsol_mu_dyn_np,
             f"COMSOL: {mu_labels['mu_dynamic']}",
-            "magma",
+            _viz_mu_cmap(),
             vmin=mu_si_vmin,
             vmax=mu_si_vmax,
         )
@@ -1360,11 +1480,12 @@ def run_phase_comparison(
         pos,
         mu_dyn_np,
         f"Biochem: {mu_labels['mu_dynamic']}",
-        "magma",
+        _viz_mu_cmap(),
         vmin=mu_si_vmin,
         vmax=mu_si_vmax,
     )
-    fig2.tight_layout(rect=(0, 0.03, 1, 0.92))
+    fig2.tight_layout(rect=(0, 0.03, 1, 0.90))
+    _set_figure_suptitle(fig2, rheo_title, fontsize=14)
 
     mb_mu1_ml, mu2_ml = _trigger_fields_numpy(
         model_biochem, data_biochem, pred_biochem_np, biochem_rollout=True
@@ -1380,6 +1501,7 @@ def run_phase_comparison(
         mb_mu1_ml,
         mu2_ml,
         case_label=case_label,
+        time_label=time_label,
         mb_mu1_comsol=mb_mu1_comsol,
         mu2_comsol=mu2_comsol,
         mu_labels=mu_labels,

@@ -233,8 +233,7 @@ function Set-LegNoExplicitGel {
 }
 
 function Set-LegCarreauKinematic {
-    # μ_eff = μ_kin(γ̇) only; species ODE/bio frozen; train flow anchor only.
-    $env:BIOCHEM_MU_CARREAU_ONLY = "1"
+    # μ_eff ≈ μ_kin(γ̇) (no explicit gelation); species ODE/bio frozen; train flow anchor only.
     $env:BIOCHEM_MU_DISABLE_EXPLICIT_GELATION = "1"
     $env:BIOCHEM_GELATION_PRIOR_GATE = "0"
     $env:BIOCHEM_USE_DELTA_MU_HEAD = "0"

@@ -334,11 +334,18 @@ from src.utils.paths import (
     stage_b_dir,
     resolve_checkpoint,
 )
+from src.architecture.kinematics_model_config import (
+    kinematics_checkpoint_tensors,
+    load_kinematics_reference_record,
+    resolve_gino_deq_ctor_kwargs as resolve_kinematics_gino_ctor_kwargs,
+)
 from src.architecture.gnode_biochem import (
     GNODE_Phase3,
     _biochem_mu_disable_explicit_gelation,
     biochem_explicit_gelation_terms,
     biochem_truth_node_mask,
+    resolve_gnode_phase3_ctor_kwargs,
+    snapshot_biochem_model_config,
 )
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
@@ -1956,6 +1963,18 @@ def _read_teacher_checkpoint_meta(path: Path) -> Dict[str, Any]:
     return {k: v for k, v in raw.items() if k != "model_state_dict"}
 
 
+def _biochem_checkpoint_tensors(raw: Any) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """Unpack nested biochem ``.pth`` (``model_state_dict`` + metadata)."""
+    if isinstance(raw, dict) and "model_state_dict" in raw:
+        meta = {k: v for k, v in raw.items() if k != "model_state_dict"}
+        state = raw["model_state_dict"]
+        if isinstance(state, dict):
+            return meta, state
+    if isinstance(raw, dict):
+        return {}, raw
+    raise TypeError(f"Unsupported biochem checkpoint type: {type(raw)!r}")
+
+
 def _save_biochem_checkpoint_file(
     path: Path,
     state_dict: Dict[str, torch.Tensor],
@@ -1966,6 +1985,7 @@ def _save_biochem_checkpoint_file(
     val_mu_log_mae: float = float("nan"),
     val_mu_log_mae_high_mu: float = float("nan"),
     teacher_best_mu_score: Optional[float] = None,
+    model_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1977,6 +1997,8 @@ def _save_biochem_checkpoint_file(
         "run_note": (run_note or "").strip(),
         "checkpoint_role": checkpoint_role,
     }
+    if model_config:
+        payload["model_config"] = dict(model_config)
     if teacher_best_mu_score is not None:
         payload["teacher_best_mu_score"] = float(teacher_best_mu_score)
     torch.save(payload, path)
@@ -2002,6 +2024,7 @@ def _save_biochem_teacher_checkpoint_file(
     val_mu_log_mae_high_mu: float = float("nan"),
 ) -> float:
     val_log_mae = _teacher_val_log_mae_from_score(teacher_best_mu_score)
+    model_config = snapshot_biochem_model_config(teacher) if isinstance(teacher, GNODE_Phase3) else None
     _save_biochem_checkpoint_file(
         path,
         teacher.state_dict(),
@@ -2011,6 +2034,7 @@ def _save_biochem_teacher_checkpoint_file(
         val_mu_log_mae=val_log_mae,
         val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
         teacher_best_mu_score=teacher_best_mu_score,
+        model_config=model_config,
     )
     return val_log_mae
 
@@ -2028,6 +2052,7 @@ def _maybe_update_global_checkpoint(
     val_mu_log_mae: float = float("nan"),
     val_mu_log_mae_high_mu: float = float("nan"),
     teacher_best_mu_score: Optional[float] = None,
+    model_config: Optional[Dict[str, Any]] = None,
     keep_global: bool = True,
     kept_label: str = "Global best",
 ) -> None:
@@ -2043,6 +2068,7 @@ def _maybe_update_global_checkpoint(
             val_mu_log_mae=val_mu_log_mae,
             val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
             teacher_best_mu_score=teacher_best_mu_score,
+            model_config=model_config,
         )
         return
 
@@ -2068,6 +2094,7 @@ def _maybe_update_global_checkpoint(
             val_mu_log_mae=val_mu_log_mae,
             val_mu_log_mae_high_mu=val_mu_log_mae_high_mu,
             teacher_best_mu_score=teacher_best_mu_score,
+            model_config=model_config,
         )
         return
 
@@ -2127,6 +2154,7 @@ def _persist_biochem_teacher_checkpoints(
     model_dir = Path(model_dir)
     run_note = (run_note or "").strip()
     val_log_mae = _teacher_val_log_mae_from_score(teacher_best_mu_score)
+    model_config = snapshot_biochem_model_config(teacher) if isinstance(teacher, GNODE_Phase3) else None
 
     _save_biochem_teacher_checkpoint_file(
         model_dir / BIOCHEM_TEACHER_LAST_CKPT_NAME,
@@ -2152,6 +2180,7 @@ def _persist_biochem_teacher_checkpoints(
         val_mu_log_mae=val_log_mae,
         val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
         teacher_best_mu_score=teacher_best_mu_score,
+        model_config=model_config,
         keep_global=_biochem_env_truthy("BIOCHEM_TEACHER_KEEP_GLOBAL_BEST", default=True),
         kept_label="Global teacher high-μ best",
     )
@@ -2169,6 +2198,7 @@ def _persist_biochem_teacher_checkpoints(
             val_mu_log_mae=val_log_mae,
             val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
             teacher_best_mu_score=teacher_best_mu_score,
+            model_config=model_config,
             keep_global=True,
             kept_label="Global teacher all-truth best",
         )
@@ -2195,6 +2225,7 @@ def _persist_biochem_teacher_checkpoints(
             val_mu_log_mae=val_log_mae,
             val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
             teacher_best_mu_score=teacher_best_mu_score,
+            model_config=model_config,
         )
         print(f"💾 Archived teacher checkpoints -> {arch}", flush=True)
 
@@ -6237,40 +6268,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     core_kernels = PhysicsKernels(phys_cfg=phys_cfg)
     kernels = BiochemPhysicsKernels(biochem_cfg=bio_cfg, core_physics_kernels=core_kernels)
 
-    # PASS PHYS_CFG TO MODEL
-    bio_enc_prior = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2")))
-    latent_dim = max(8, int(os.environ.get("BIOCHEM_LATENT_DIM", "256")))
-    fourier_bands = max(1, int(os.environ.get("BIOCHEM_FOURIER_BANDS", "8")))
-    use_siren_decoder = _biochem_env_truthy("BIOCHEM_USE_SIREN", default=False)
-    gnode_layers = max(1, int(os.environ.get("BIOCHEM_GNODE_LAYERS", "1")))
-    model = GNODE_Phase3(
-        phys_cfg=phys_cfg,
-        in_channels=12,
-        spatial_channels=15,
-        latent_dim=latent_dim,
-        max_inner_iters=10,
-        bio_encoder_prior_dim=bio_enc_prior,
-        mu_ratio_max=bio_cfg.mu_ratio_max,
-        mat_crit=bio_cfg.viscosity_mat_crit,
-        fi_crit=bio_cfg.viscosity_fi_crit,
-        temp_mat=bio_cfg.viscosity_gnode_temp_mat,
-        temp_fi=bio_cfg.viscosity_gnode_temp_fi,
-        num_fourier_freqs=fourier_bands,
-        use_siren_decoder=use_siren_decoder,
-        gnode_layers=gnode_layers,
-    ).to(device)
-    if bio_enc_prior > 0:
-        print(
-            f"🧭 bio_encoder kinematics prior: {bio_enc_prior} extra channel(s) "
-            f"(BIOCHEM_BIO_ENCODER_PRIOR_DIM)."
-        )
-    print(f"🧠 Biochem latent_dim={latent_dim} (BIOCHEM_LATENT_DIM).")
-    print(
-        f"🧩 Spatial config: gnode_layers={gnode_layers}, fourier_bands={fourier_bands}, "
-        f"use_siren={int(use_siren_decoder)}."
-    )
-
-    # 1. Backbone weights: stage-A kinematics_best.pth is required; optional biochem_best_high_mu or full latest resume.
+    # PASS PHYS_CFG TO MODEL — architecture from checkpoint ``model_config`` when resuming, else env.
     root = get_project_root()
     model_dir = stage_b_dir()
     biochem_resume_path = resolve_checkpoint("b", BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME)
@@ -6286,11 +6284,90 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             f"Required kinematics checkpoint missing: {kinematics_path}. "
             "Train stage A (kinematics predictor) until kinematics_best.pth exists, or fix checkpoint paths."
         )
+    kin_raw = torch.load(kinematics_path, map_location=device, weights_only=False)
+    kin_meta, kin_state_for_ctor = kinematics_checkpoint_tensors(kin_raw)
+    kin_ctor = resolve_kinematics_gino_ctor_kwargs(kin_meta, kin_state_for_ctor)
+    if kin_meta.get("model_config"):
+        print("🧩 Stage-A GINO_DEQ architecture from kinematics checkpoint model_config.")
+    elif load_kinematics_reference_record():
+        print(
+            "🧩 Stage-A GINO_DEQ architecture from data/reference kinematics manifest "
+            "(legacy flat checkpoint)."
+        )
+    else:
+        print(
+            "🧩 Stage-A GINO_DEQ architecture from weight/env inference "
+            "(embed model_config by re-saving kinematics_best.pth)."
+        )
+    print(
+        f"   ↳ kin backbone: latent={int(kin_ctor['latent_dim'])} "
+        f"fourier={int(kin_ctor['num_fourier_freqs'])} "
+        f"siren={int(kin_ctor['use_siren_decoder'])} "
+        f"hard_bcs={int(kin_ctor['use_hard_bcs'])} "
+        f"width_priors={int(kin_ctor['use_width_priors'])}"
+    )
     latest_ckpt_path = resolve_checkpoint("b", "biochem_latest_checkpoint.pth")
     resume_enabled = (os.environ.get("BIOCHEM_RESUME", "0").strip().lower() in ("1", "true", "yes", "on"))
     init_from_best = (os.environ.get("BIOCHEM_INIT_FROM_BEST", "0").strip().lower() in ("1", "true", "yes", "on"))
     will_resume_from_latest = bool(resume_enabled and latest_ckpt_path.exists())
     load_biochem_best_weights = (init_from_best or resume_enabled) and biochem_resume_path.exists()
+
+    ckpt_meta_for_ctor: Dict[str, Any] = {}
+    ckpt_state_for_ctor: Dict[str, torch.Tensor] = {}
+    if will_resume_from_latest and latest_ckpt_path.is_file():
+        ckpt_meta_for_ctor, ckpt_state_for_ctor = _biochem_checkpoint_tensors(
+            torch.load(latest_ckpt_path, map_location=device, weights_only=True)
+        )
+    elif load_biochem_best_weights:
+        ckpt_meta_for_ctor, ckpt_state_for_ctor = _biochem_checkpoint_tensors(
+            torch.load(biochem_resume_path, map_location=device, weights_only=True)
+        )
+
+    bio_enc_prior_env = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2")))
+    ctor = resolve_gnode_phase3_ctor_kwargs(
+        ckpt_meta_for_ctor if ckpt_state_for_ctor else None,
+        ckpt_state_for_ctor,
+        bio_encoder_prior_dim_default=bio_enc_prior_env,
+        latent_dim_default=max(8, int(kin_ctor["latent_dim"])),
+        fourier_bands_default=max(1, int(kin_ctor["num_fourier_freqs"])),
+        use_siren_default=bool(kin_ctor["use_siren_decoder"]),
+        gnode_layers_default=max(1, int(os.environ.get("BIOCHEM_GNODE_LAYERS", "1"))),
+    )
+    if not ckpt_state_for_ctor:
+        ctor["latent_dim"] = int(kin_ctor["latent_dim"])
+        ctor["num_fourier_freqs"] = int(kin_ctor["num_fourier_freqs"])
+        ctor["use_siren_decoder"] = bool(kin_ctor["use_siren_decoder"])
+        ctor["use_hard_bcs"] = bool(kin_ctor["use_hard_bcs"])
+    model = GNODE_Phase3(
+        phys_cfg=phys_cfg,
+        in_channels=int(ctor["in_channels"]),
+        spatial_channels=int(ctor["spatial_channels"]),
+        latent_dim=int(ctor["latent_dim"]),
+        max_inner_iters=max(3, int(ctor.get("max_inner_iters", 10))),
+        bio_encoder_prior_dim=int(ctor["bio_encoder_prior_dim"]),
+        mu_ratio_max=bio_cfg.mu_ratio_max,
+        mat_crit=bio_cfg.viscosity_mat_crit,
+        fi_crit=bio_cfg.viscosity_fi_crit,
+        temp_mat=bio_cfg.viscosity_gnode_temp_mat,
+        temp_fi=bio_cfg.viscosity_gnode_temp_fi,
+        num_fourier_freqs=int(ctor["num_fourier_freqs"]),
+        use_siren_decoder=bool(ctor["use_siren_decoder"]),
+        gnode_layers=int(ctor["gnode_layers"]),
+        use_hard_bcs=bool(ctor["use_hard_bcs"]),
+    ).to(device)
+    if ckpt_meta_for_ctor.get("model_config"):
+        print("🧩 GNODE architecture from checkpoint model_config (no viz/train env flags required).")
+    else:
+        print(
+            f"🧩 GNODE architecture: siren={int(ctor['use_siren_decoder'])} "
+            f"fourier={int(ctor['num_fourier_freqs'])} hard_bcs={int(ctor['use_hard_bcs'])} "
+            f"(env/weight inference; re-save teacher ckpt to embed model_config)."
+        )
+    if int(ctor["bio_encoder_prior_dim"]) > 0:
+        print(
+            f"🧭 bio_encoder kinematics prior: {int(ctor['bio_encoder_prior_dim'])} extra channel(s)."
+        )
+    print(f"🧠 Biochem latent_dim={int(ctor['latent_dim'])}.")
 
     loaded_biochem_best_backbone = False
     if will_resume_from_latest:
@@ -6299,8 +6376,9 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             "(skipping backbone load here)."
         )
     elif load_biochem_best_weights:
-        resume_state = torch.load(biochem_resume_path, map_location=device, weights_only=True)
-        compatible_resume, skipped_resume = _filter_compatible_state_dict(resume_state, model.state_dict())
+        compatible_resume, skipped_resume = _filter_compatible_state_dict(
+            ckpt_state_for_ctor, model.state_dict()
+        )
         model.load_state_dict(compatible_resume, strict=False)
         loaded_biochem_best_backbone = True
         print(f"🔁 Initialized Biochem weights from {biochem_resume_path.name}")
@@ -6310,7 +6388,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             )
     else:
         print(f"🔁 Initializing Biochem kinematics backbone from {kinematics_path.name}")
-        state_dict = torch.load(kinematics_path, map_location=device, weights_only=True)
+        state_dict = kin_state_for_ctor
 
         mapped_state_dict = {}
         for key, value in state_dict.items():
@@ -6319,6 +6397,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             elif key.startswith('core.'):
                 mapped_state_dict[key.replace('core.', 'kin_processor.')] = value
             elif key.startswith('kinematics_decoder.'):
+                mapped_state_dict[key] = value
+            elif key.startswith('siren_decoder.'):
+                mapped_state_dict[key] = value
+            elif key.startswith('z_prior_proj.'):
+                mapped_state_dict[key] = value
+            elif key.startswith('mu_decoder.'):
                 mapped_state_dict[key] = value
             # Extract the frozen mu_encoder
             elif key.startswith('mu_encoder.'):

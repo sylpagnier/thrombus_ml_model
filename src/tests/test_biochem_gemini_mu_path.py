@@ -37,12 +37,6 @@ def test_simple_log_residual_disables_explicit_gelation(monkeypatch):
     assert gb._biochem_mu_disable_explicit_gelation()
 
 
-def test_carreau_only_disables_gelation(monkeypatch):
-    monkeypatch.setenv("BIOCHEM_MU_CARREAU_ONLY", "1")
-    assert gb._biochem_mu_carreau_only_enabled()
-    assert gb._biochem_mu_disable_explicit_gelation()
-
-
 def test_viz_health_score_penalizes_mu2_flood():
     from src.training.train_biochem_corrector import _viz_health_score
 
