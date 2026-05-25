@@ -16,7 +16,7 @@ When the user shares **biochem corrector** training outcomes (console logs, `met
 
 ## Metrics to prefer (ignore misleading ones)
 
-- **Use**: val `mu_log_mae`, wall / high-μ subsets, `mu_pearson`, train `L_tot`/`L_Back` under `BIOCHEM_LOSS_ISOLATE`, preflight median.
+- **Use**: val `mu_log_mae`, wall / high-μ subsets, `mu_pearson`, train `L_tot`/`L_Back` under `BIOCHEM_LOSS_ISOLATE`, preflight median. Prefer `runs_index.jsonl` or per-run `run.jsonl` (`event=val`) over legacy `metrics.jsonl` / `training_diary_main.jsonl`.
 - **Do not** treat train `L_kine` or collapsing `L_bio` alone as μ success.
 
 ## Edit style

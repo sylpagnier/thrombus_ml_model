@@ -89,18 +89,16 @@ Write-Host ""
 python -m src.training.train_biochem_corrector --new @ExtraArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-function Get-LatestBiochemMetricsPath {
+function Get-LatestBiochemRunLogPath {
     param([string] $ReportsRoot)
     $timestampDir = Get-ChildItem -Path $ReportsRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^\d{8}T\d{6}Z$' } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($null -ne $timestampDir) {
-        $p = Join-Path $timestampDir.FullName "metrics.jsonl"
+        $p = Join-Path $timestampDir.FullName "run.jsonl"
         if (Test-Path $p) { return $p }
     }
-    $fallback = Join-Path $ReportsRoot "metrics.jsonl"
-    if (Test-Path $fallback) { return $fallback }
     return $null
 }
 
@@ -121,33 +119,31 @@ function Read-Jsonl {
 
 Write-Host ""
 $reportsRoot = Join-Path $RepoRoot "outputs\reports\training\biochem"
-$metricsPath = Get-LatestBiochemMetricsPath -ReportsRoot $reportsRoot
-if ($null -eq $metricsPath) {
-    Write-Host "Done. No metrics.jsonl found under $reportsRoot" -ForegroundColor Yellow
+$runLogPath = Get-LatestBiochemRunLogPath -ReportsRoot $reportsRoot
+if ($null -eq $runLogPath) {
+    Write-Host "Done. No run.jsonl found under $reportsRoot" -ForegroundColor Yellow
     exit 0
 }
 
-$rows = Read-Jsonl -Path $metricsPath
-$teacherRows = @($rows | Where-Object { $_.stage -eq "teacher" })
+$rows = Read-Jsonl -Path $runLogPath
+$teacherRows = @($rows | Where-Object { $_.event -eq "val" -and $_.stage -eq "teacher" })
 if ($teacherRows.Count -eq 0) {
-    Write-Host "Done. Metrics found but no teacher rows: $metricsPath" -ForegroundColor Yellow
+    Write-Host "Done. Run log found but no teacher val rows: $runLogPath" -ForegroundColor Yellow
     exit 0
 }
 
 $showRows = @($teacherRows | Sort-Object epoch | Select-Object -Last ([Math]::Min(6, $teacherRows.Count)))
-Write-Host "Done. Auto-summary from: $metricsPath" -ForegroundColor Green
-Write-Host "ep | L_back | val_logMAE | wall | high | mu1 | mu2 | learned | flow_imb"
+Write-Host "Done. Auto-summary from: $runLogPath" -ForegroundColor Green
+Write-Host "ep | val_logMAE | wall | high | r | gate_wall | L_back"
 foreach ($r in $showRows) {
     $ep = $r.epoch
-    $lb = if ($null -ne $r.train_L_back_avg) { "{0:E3}" -f [double]$r.train_L_back_avg } else { "nan" }
     $va = if ($null -ne $r.val_mu_log_mae) { "{0:F4}" -f [double]$r.val_mu_log_mae } else { "n/a" }
     $vw = if ($null -ne $r.val_mu_log_mae_wall) { "{0:F4}" -f [double]$r.val_mu_log_mae_wall } else { "n/a" }
     $vh = if ($null -ne $r.val_mu_log_mae_high_mu) { "{0:F4}" -f [double]$r.val_mu_log_mae_high_mu } else { "n/a" }
-    $m1 = if ($null -ne $r.dbg_mu1_mean) { "{0:E2}" -f [double]$r.dbg_mu1_mean } else { "n/a" }
-    $m2 = if ($null -ne $r.dbg_mu2_mean) { "{0:E2}" -f [double]$r.dbg_mu2_mean } else { "n/a" }
-    $ml = if ($null -ne $r.dbg_mu_learned_mean) { "{0:E2}" -f [double]$r.dbg_mu_learned_mean } else { "n/a" }
-    $fi = if ($null -ne $r.dbg_flux_imbalance_mean) { "{0:E2}" -f [double]$r.dbg_flux_imbalance_mean } else { "n/a" }
-    Write-Host "$ep | $lb | $va | $vw | $vh | $m1 | $m2 | $ml | $fi"
+    $rp = if ($null -ne $r.val_mu_pearson) { "{0:F3}" -f [double]$r.val_mu_pearson } else { "n/a" }
+    $gw = if ($null -ne $r.dbg_gate_mean_wall) { "{0:F3}" -f [double]$r.dbg_gate_mean_wall } else { "n/a" }
+    $lb = if ($null -ne $r.train_L_back_avg) { "{0:E3}" -f [double]$r.train_L_back_avg } else { "n/a" }
+    Write-Host "$ep | $va | $vw | $vh | $rp | $gw | $lb"
 }
 
-Write-Host "Smoke pass: finite run + downward L_back and/or val_logMAE, with non-trivial mu components and bounded flow imbalance."
+Write-Host "Smoke pass: finite run with improving val_logMAE (all / wall / high) on held-out anchor."

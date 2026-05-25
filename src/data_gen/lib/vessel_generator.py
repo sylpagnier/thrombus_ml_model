@@ -149,6 +149,47 @@ _CURVE_WEIGHTS: Dict[int, Dict[str, float]] = {
 }
 
 
+def default_level_mix(n: int) -> Dict[int, int]:
+    """Default kinematics cohort: mostly L0/L1, ~20% high-thrombus (L2)."""
+    n = max(1, int(n))
+    n2 = max(1, round(n * 0.2))
+    rem = n - n2
+    n0 = rem // 2
+    n1 = rem - n0
+    return {0: n0, 1: n1, 2: n2}
+
+
+def parse_level_mix(spec: str, n: int) -> Dict[int, int]:
+    """Parse ``n0,n1,n2`` counts; must sum to ``n``."""
+    parts = [int(x.strip()) for x in str(spec).split(",")]
+    if len(parts) != 3:
+        raise ValueError("level_mix must have exactly three comma-separated integers (L0,L1,L2)")
+    mix = {0: parts[0], 1: parts[1], 2: parts[2]}
+    total = sum(mix.values())
+    if total != n:
+        raise ValueError(f"level_mix counts sum to {total}, expected n={n}")
+    return mix
+
+
+def cohort_levels(
+    n: int,
+    level: int,
+    level_mix: Optional[Dict[int, int]],
+    rng: np.random.Generator,
+) -> List[int]:
+    """Per-vessel geometry levels for one run (shuffled when ``level_mix`` is set)."""
+    if level_mix is None:
+        return [int(level)] * n
+    total = sum(int(v) for v in level_mix.values())
+    if total != n:
+        raise ValueError(f"level_mix counts sum to {total}, expected n={n}")
+    out: List[int] = []
+    for lvl, cnt in sorted(level_mix.items()):
+        out.extend([int(lvl)] * int(cnt))
+    rng.shuffle(out)
+    return out
+
+
 def _sample_params(
         idx: int,
         level: int,
@@ -264,7 +305,16 @@ def _sample_params(
         amplitude = 0.0
     else:  # s_curve
         angle_span = 0.0
-        amplitude = min(float(rng.uniform(0.003, 0.007)), L * 0.15)
+        amp_mag = min(float(rng.uniform(0.003, 0.007)), L * 0.15)
+        amplitude = amp_mag
+
+    # Level 1/2: arc/hook can bend up (+y) or down (-y); s_curve uses signed amplitude.
+    bend_sign = 1.0
+    if level >= 1:
+        if curve_type in ("arc", "hook"):
+            bend_sign = float(rng.choice([-1.0, 1.0]))
+        elif curve_type == "s_curve":
+            amplitude *= float(rng.choice([-1.0, 1.0]))
 
     return {
         "idx": idx,
@@ -274,6 +324,7 @@ def _sample_params(
         "width": width,
         "angle_span": angle_span,
         "amplitude": amplitude,
+        "bend_sign": bend_sign,
         "jitter": [],
         "tortuosity": tortuosity,
         "noise_top": noise_top,
@@ -307,7 +358,9 @@ def _build_and_mesh(
         if curve_type == "straight":
             pts, tangents = _centerline_straight(n, L, np.zeros(n - 4))
         elif curve_type in ("arc", "hook"):
-            pts, tangents = _centerline_arc(n, L, params["angle_span"])
+            pts, tangents = _centerline_arc(
+                n, L, params["angle_span"], bend_sign=float(params.get("bend_sign", 1.0))
+            )
         else:
             pts, tangents = _centerline_s_curve(n, L, params["amplitude"])
 
@@ -567,6 +620,7 @@ class VesselGenerator:
         self,
         n: int = 50,
         level: int = 0,
+        level_mix: Optional[Dict[int, int]] = None,
         max_retries: int = 3,
         num_workers: Optional[int] = None,
         chunk_size: Optional[int] = None,
@@ -580,7 +634,10 @@ class VesselGenerator:
         Parameters
         ----------
         n           : number of vessels to produce in this run (file indices ``start_idx`` …)
-        level       : geometry complexity (0 = mostly straight, 1 = curved)
+        level       : geometry complexity when ``level_mix`` is None
+                      (0 = mostly straight, 1 = curved, 2 = pro-thrombotic / high-clot)
+        level_mix   : optional per-level counts ``{0: n0, 1: n1, 2: n2}`` (must sum to ``n``);
+                      shuffled across indices for a mixed cohort in one run
         max_retries : retry attempts for failed samples (same ``idx`` as the failure; new parameters)
         num_workers : worker processes (default: cpu_count - 1, min 1)
         chunk_size  : samples per worker chunk (default: auto-balanced)
@@ -596,11 +653,19 @@ class VesselGenerator:
         if start_idx is None:
             start_idx = _next_vessel_index(self.output_dir)
 
-        logger.info(
-            f"Generating {n} Level-{level} vessels → {self.output_dir} "
-            f"[indices {start_idx}..{start_idx + n - 1}] "
-            f"[{num_workers} workers / {phys_cores} logical cores]"
-        )
+        if level_mix is not None:
+            mix_msg = ", ".join(f"L{k}={v}" for k, v in sorted(level_mix.items()))
+            logger.info(
+                f"Generating {n} mixed-level vessels ({mix_msg}) → {self.output_dir} "
+                f"[indices {start_idx}..{start_idx + n - 1}] "
+                f"[{num_workers} workers / {phys_cores} logical cores]"
+            )
+        else:
+            logger.info(
+                f"Generating {n} Level-{level} vessels → {self.output_dir} "
+                f"[indices {start_idx}..{start_idx + n - 1}] "
+                f"[{num_workers} workers / {phys_cores} logical cores]"
+            )
 
         cfg_d   = self._cfg_dict()
         cfg_d["unit"] = unit
@@ -608,7 +673,10 @@ class VesselGenerator:
         rng     = np.random.default_rng(seed)
 
         # Pre-sample everything in the main process
-        all_params = [_sample_params(start_idx + i, level, self.cfg, rng) for i in range(n)]
+        per_vessel_levels = cohort_levels(n, level, level_mix, rng)
+        all_params = [
+            _sample_params(start_idx + i, per_vessel_levels[i], self.cfg, rng) for i in range(n)
+        ]
         params_lookup = _params_by_idx(all_params)
 
         # Split into balanced chunks — larger chunks = less IPC overhead
@@ -681,7 +749,12 @@ class VesselGenerator:
             logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
 
             retry_batch = [
-                _sample_params(int(failed_p["idx"]), level, self.cfg, rng)
+                _sample_params(
+                    int(failed_p["idx"]),
+                    int(failed_p.get("level", level)),
+                    self.cfg,
+                    rng,
+                )
                 for failed_p in failed_params
             ]
 

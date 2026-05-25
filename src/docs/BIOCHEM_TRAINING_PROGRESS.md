@@ -50,8 +50,9 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Gate | Target (teacher) | Status | Notes |
 |------|------------------|--------|--------|
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
-| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | Gate-fix 18ep (2026-05-23): **Fix A 0.5155**, **D relu 0.5091**, baseline **0.6227** (fair 18ep); wall3h sentinel **0.3185** @34ep ladder still best all; overnight **0.3868** |
+| Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Sentinel @34ep: 0.294** (SPAGNIER), **0.367** (SILKSPECTRE); warm leash **0.223**; **visc3h** **0.408** (`L5` MU_LOG) / **0.917** (`L1` leash+soft wall) / high-μ ckpt **0.517** (`L6`); cold soft-gate **0.758** @ep10 then **2.67** @ep25; gate-fix-18ep **0.509**; overnight **0.387** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
+| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Fail** | **health10h**: all legs **viz_t0≈0.25–0.35**; **`viz_mu2=80` / `clot_frac=1` on K0/S0/M1** — metric reads raw FI sigmoid, not `μ_eff` (§85) |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
@@ -59,7 +60,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: **Interim pass on patient007** — overnight A best **0.3868** (MU_LOG, TBPTT=6, 18ep); marathon **T2** **0.40**; A0/I1/I2/I4 **~0.44–0.49**. Dual-laptop **wall3h fair sweep** (2026-05-23): best saved all **0.3185** (`sweep_wall_sentinel` ep17, SPAGNIER); fair baseline ladder to **0.4239** @ 34ep with wall **~1.67–2.02** but **`gate_wall` never opens** on baseline/`sweep_free_wall_a`. Wall/high-μ still weak; **J2** joint blocked by flux-debug crash (fixed locally). Corrector not started.
+- **Step-2 teacher “done”**: **Interim pass on patient007** — overnight A **0.387**; marathon **T2** **0.40**; isolates **~0.44–0.49**. **Dual-laptop deep 4h** (2026-05-23): **sentinel @34ep all 0.294** (SPAGNIER) and **0.367** (SILKSPECTRE); **fix_ac @26ep 0.337** on SILKSPECTRE (best fair fix on B); gate-fix-18ep **0.509**; wall3h fair **0.319** with `gate_wall=1.0` on A. **Data leash** warm-init **0.223** @ ep14 (best all). **Cold bulk-lock** (2026-05-24): **0.907** @ ep12. **Cold + μ-freeze** (`mufreeze`): **0.571** @ ep12, wall flat **~2.25**. **+ hard gate 0.15** (`torch.where`, §78): **0.591** @ ep16, **wall 1.87**. **+ soft gate** (sigmoid steepness 20, §79): **0.758** @ ep10, high **0.597**, wall **~2.25** again; **late collapse** ep22–25 (**2.01→2.67** all, bulk **r** negative). **visc3h sweep** (2026-05-24, 8 legs × 18ep, warm post-pretrain): best **all 0.408** (`L5` MU_LOG isolate, high **1.15**); best **leash family all 0.917** (`L1` soft wall-only); **global high-μ ckpt** updated **`L6` 0.517** (sentinel+leash, `W·L_MuLogWall≈7.5`); **wall val ~2.23 flat** on every leg — **viz** before trusting logMAE. **health10h** (2026-05-25, §85): best **viz score + logMAE S0** (simple `exp(Δlogμ)` only, all **0.451**); **M2** all **0.417**; **K0** still weak t0 flow — architecture ablations **do not** fix kinematic IC; **`viz_mu2` columns broken** for ablation compare. Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (all PDE losses in backward)**: **Blocked** until (1) μ + bio stable at step 2, (2) `DETACH_MACRO_STATE=0` stable without OOM, (3) adjoint not dominating with junk gradients. Latest teacher-only step-3 attempt hit pervasive bio-grad cap skips and flat μ.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
@@ -83,7 +84,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 **Do not** use train `L_kine` alone to judge μ success.
 
-Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl`, `training_diary_main.jsonl`).
+Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / `val` / `end` events). Cross-run index: `outputs/reports/training/biochem/runs_index.jsonl`.
 
 ---
 
@@ -658,6 +659,127 @@ Report in diary: `outputs/reports/training/biochem/<timestamp>/` (`metrics.jsonl
 - **Train signal**: Fix B **`L_tot` ~1.5–2× baseline** (bypass term in backward); watch **`W·L_MuWall_bypass`** separately from anchor μ losses.
 - **Readout**: **Fix A (curriculum)** and **Fix D (relu_add)** are the best **all-truth** interventions in this fair 18ep test; **fix_ab** is the best **high-μ** trade but wall explodes. None replaces **`sweep_wall_sentinel` @ 0.3185** (wall3h, longer ladder) or **overnight 0.3868** without more epochs / wall-aware ckpt. **Next**: 24–34ep Fix A or D relu; Pareto; log **`DBG_wall_gate_mean_wall`**; try **fix_ab + sentinel wall weights** (not full ABC); wall-aware save on wall logMAE.
 
+### 73. Gate-fix **deep 4h** (2026-05-23): **sentinel @34ep all=0.2938** on SPAGNIER; Arm B metrics on other host
+
+- **Setup**: `scripts/run_biochem_gate_fix_deep_4h.ps1` — ladders 8→40 + @34 anchors. **Arm A** 17 legs / **174m** (SPAGNIER); **Arm B** 16 legs / **204m** (SILKSPECTRE). Parsed from **`outputs/reports/training/biochem/metrics.jsonl`** (segmented by teacher `epoch==0`; no `run_note` in JSONL — order matched sweep + `biochem_teacher_best.pth` run_note).
+- **Arm A — Fix D relu ladder** (best saved all @ val): ep8 **0.579** | ep14 **0.510** | ep20 **0.554** | ep26 **0.504** | ep30 **0.580** | ep34 **0.524** | ep40 **0.484** @ep34. vs gate-fix-18ep **0.509** — **modest gain** at 40ep, noisy mid-ladder.
+- **Arm A — Fix A curriculum ladder**: ep14 **0.664** | ep20 **0.740** | ep26 **0.552** | ep30 **0.329** @ep29 | ep34 **0.383** | ep40 **0.373** @ep38. **ep30 curriculum** strong (**0.329** all); wall **~1.85**, high **~0.75**.
+- **Arm A — @34ep specials** (best all | wall | high): **WS sentinel preset `0.294` @ep32** | **1.50** | **0.74** | **new session best all** (beats wall3h **0.3185** @18ep); D relu **0.524** | 2.00 | 0.83; Pareto **0.564** | 2.00 | 0.77; D+A **0.581** | 1.97 | 0.72; TBPTT=6 **0.517** @ep18 | 2.01 | 0.56.
+- **Arm B**: not in this repo’s `metrics.jsonl` (SILKSPECTRE run) — pull from that machine’s `outputs/reports/training/biochem/metrics.jsonl` or diary folders.
+- **Checkpoint**: `biochem_teacher_best.pth` on SPAGNIER = last leg **D_relu_tbptt6** (all **0.517** @ep18), **not** batch best (**WS 0.294**).
+- **Readout**: **Promote `sweep_wall_sentinel` @ 34ep** for follow-up (not fair D relu alone). Curriculum **30ep** worth a dedicated sentinel-weight run. Pareto @34 did not beat mu_score-only on all. Longer fair MU_LOG ladders alone are a weak path.
+
+### 74. Supervised data leash (`SUPERVISED_DATA_LEASH=1`): bulk μ improves, wall trades off (2026-05-24)
+
+- **Symptom**: `MU_LOG` isolate on sentinel reaches strong all-truth (**~0.29–0.31**) but wall stays **~1.48–1.55** with `gate_wall→1` only on long MU_LOG runs.
+- **Hypothesis**: un-isolate `L_Data_Kine` + `L_Data_Bio` with `DATA_ONLY=1`, `DETACH=0`, `W_MuSI=2` — kinematic “leash” without PDE losses.
+- **Result**: fix **is active** (no isolate banner; `L_Back` tracks kine+bio; `L_bio` collapses). Val all **0.223** and high-μ **0.47** @ ep14 beat sentinel; **wall 1.92** @ same ckpt (worse). Late epochs oscillate (ep22: all **0.289**, wall **1.47**, high **1.23**). Checkpoint policy still saves on **all-truth mu_score** only.
+- **Next**: wall-aware save or Pareto; try leash from **post-pretrain** (not teacher-finetune) to reduce bulk overfit; consider raising kine weight vs dominant `W·L_MuLogWall` terms.
+
+### 75. Bulk-fluid surgical lock (`BULK_FLUID_SURGICAL_FIX=1`, `CLIP_BULK=0.05`, bio suppressor floor 0): bulk subset wins, high-μ checkpoint regresses (2026-05-24)
+
+- **Setup**: same data leash as §74 + **`BIOCHEM_DELTA_MU_LOG_CLIP_BULK=0.05`**, **`BIOCHEM_USE_BIO_GATE_SUPPRESSOR=1`**, **`BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR=0.0`** (re-applied after sentinel preset); init-from **`biochem_teacher_best_high_mu.pth`** (prior leash run); 26ep ~23m.
+- **Result @ best-all ep16**: all **0.353**, bulk **0.253**, wall **2.065**, high **1.256**, **r≈0.29**. **Did not** update global high-μ ckpt (kept prior leash **0.470** @ ep14). vs leash-without-lock: all **0.353** vs **0.223**, high **1.256** vs **0.470**, wall **2.06** vs **1.92** — surgical lock **helps bulk logMAE** but **worsens high-μ** and does not fix wall. Training volatile (ep18/25 regress to **~1.42–1.45** all); one bio-grad skip ep5.
+- **Readout**: bulk clamp + bio-gate suppressor is **not** a full fix for catastrophic wall; may be useful as a **stabilizer on bulk-only** objective, not as finetune on a strong high-μ teacher. Viz this run: **`biochem_teacher_last.pth`** (ep16); default **`biochem_teacher_best_high_mu.pth`** is still the earlier leash run.
+
+### 76. Cold start + bulk surgical lock + data leash: clean prior, weak all-truth, wall still stuck (2026-05-24)
+
+- **Setup**: deleted poisoned `.pth`; **`NoInitFromBest -ForcePretrain`** (kinematics backbone → AE ep13 → ODE-RXN ep11 → teacher); same leash + **`BULK_FLUID_SURGICAL_FIX=1`** (`CLIP_BULK=0.05`, bio suppressor floor 0); sentinel preset; 26ep ~23m (`20260524T140238Z`).
+- **Preflight**: median logMAE **1.52** (healthy).
+- **Result @ best-all ep12**: all **0.907**, bulk **0.922**, wall **2.195**, high **0.773**, **r≈0.24**. **High-μ ckpt** saved @ ep22: high **0.702** (all **1.185** that epoch). Late **collapse** ep18 all **1.524** (preflight-like). Final ep25: all **1.103**, wall **2.246**, high **0.751**.
+- **Compare**: vs sentinel MU_LOG @34ep (**0.307** / wall **1.48**); vs warm data leash (**0.223** / **0.470** high); vs warm bulk-lock finetune (**0.353**). Cold + bulk lock **does not** reach prior tiers in 26ep; bulk subset **not** clearly safer than warm leash (bulk **0.92** vs leash bulk often **&lt;0.35** at best).
+- **Readout**: deleting bad teacher weights was correct for diagnosis; **cold + surgical lock** is a **baseline builder**, not a shortcut to sentinel μ. Next: longer cold schedule and/or leash **from `biochem_post_pretrain.pth` only** (no teacher init); wall still needs dedicated objective or `gate_wall` training signal.
+
+### 77. Cold + strict μ-freeze (`-StrictMuFreeze`, μ-path only @ teacher): bulk/all improve vs cold-only; wall numerically frozen (2026-05-24)
+
+- **Setup**: cold start (`ForcePretrain`, no teacher init) + data leash + bulk lock + **`TRAIN_ODE=0` `TRAIN_BIO_ENC=0` `TRAIN_KIN_LORA=0` `TRAIN_BIO_DEC=0`** (22 μ-path tensors @ teacher); AE ep13 / ODE-RXN ep11; `20260524T144958Z`, ~22m teacher after pretrain.
+- **Result @ best-all ep12**: all **0.571**, bulk **0.528**, wall **2.252** (identical ep2–25), high **0.959**, **r≈0.405**. **High-μ ckpt** @ ep24: high **0.593** (all **0.786**). Best bulk ep4 **0.603**. Preflight median **1.50**.
+- **Compare**: vs §76 cold bulk-lock only: all **0.571** vs **0.907** (strict freeze **helps** global/bulk). vs warm leash: all **0.223**, wall **1.92**. vs sentinel @34ep: all **0.307**, wall **1.48**. Train **`L_bio~3×10²`** with `biology=0` — species terms still in `L_Back` graph but no bio/ODE DOF; do not read `L_bio↓` as learning.
+- **Readout**: μ-only teacher can fit **bulk/all** from a clean pretrain better than full cold joint, but **wall logMAE is a flat line (~2.25)** — wall head not moving on val despite `W·L_MuLogWall≈7.4`. Likely need wall-aware ckpt, higher wall weight, or unfreeze wall-adjacent DOF; `gate_wall` stuck at floor **0.06**, `gate_all` collapses late.
+
+### 78. Hard gate threshold (`BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH=0.15`) on cold μ-freeze stack: wall unfreezes; all/bulk trade off (2026-05-24)
+
+- **Setup**: §77 stack + **`TRIGGER_GATE_MIN=0`** (cleared after preset) + hard cutoff on bulk/tail `gate` and `wall_gate` / `wall_signal`; `20260524T153126Z`, ~22m teacher.
+- **Result @ best-all ep16**: all **0.591**, bulk **0.523**, wall **1.868** (best wall in cold stack; was **2.25** flat in §77), high **1.202**, **r≈0.12**. Ep14: all **0.688**, wall **1.878**. Ep2: all **0.941**, wall **2.004**, high **0.672** (high-μ ckpt policy). `dbg_gate_mean_wall` **~0.99** early train, **`gate_all` ~0.038** val after ep6.
+- **Compare**: vs §77 mufreeze: all **0.591** vs **0.571** (similar), **wall 1.87 vs 2.25 frozen** (hard gate **works** for val wall metric). vs warm leash: all **0.223**, wall **1.92**. vs sentinel: all **0.307**, wall **1.48**. High-μ **worse** at best-all ckpt (**1.20** vs **0.96** §77).
+- **Readout**: hard threshold likely **stops center viscosity bleed** (viz should be checked: lumen not fully clotted @ late time). Val wall improved but still **~1.87**; checkpoint still all-truth score. Next: viz confirm geometry; Pareto/wall-weighted save; may need lower wall Δ clip or longer schedule.
+
+### 79. Differentiable soft gate (sigmoid steepness 20) replaces `torch.where` hard gate: better early all/high, wall plateau returns, late bulk collapse (2026-05-24)
+
+- **Symptom**: §78 `torch.where` gate suspected of dead gradients below 0.15; viz still showed full-domain clot concern.
+- **Fix**: `g * sigmoid(20*(g-0.15))` on bulk/tail + wall gates (`BIOCHEM_MU_TRIGGER_GATE_HARD_STEEPNESS=20`); same cold stack as §77–78 (`data leash`, bulk lock, `StrictMuFreeze`, AE13/ODE11); `20260524T160923Z`, ~26ep teacher.
+- **Result @ best-all ep10** (saved ckpt): all **0.758**, bulk **0.776**, wall **2.253** (back to §77 plateau, not §78 **1.87**), high **0.597**, **r≈0.40**. Ep8: all **0.851**; ep6: all **1.354**. **High-μ ckpt** @ ep14: high **0.553** (all **0.887**). **Late regression**: ep22 all **2.012**, ep24 **2.586**, ep25 **2.669**; bulk **r** **-0.44**; train `gate_clot` / `gate_all` **~0.96** from ep6 onward (saturated clot gate).
+- **Compare**: vs §78 hard `where`: all **0.758** vs **0.591** @ best (soft **better** all/high), wall **2.25** vs **1.87** (soft **worse** wall). vs §77 mufreeze: all **0.758** vs **0.571** (soft **worse** than no gate at best). vs warm leash: all **0.223**. Preflight median **1.48**.
+- **Readout**: restoring gradients **does not** fix wall metric in 26ep; early-stop @ ep10 would avoid saving a ckpt that **overfits bulk clot gate** then blows up. Next: viz `biochem_teacher_best_high_mu.pth` (ep10/14); try **early stop on val all**, lower gate steepness or separate wall objective; revisit §78 wall win with soft wall-only path.
+
+### 80. Viz + gate diagnosis: soft gate on bulk ``gate`` saturates clot path; wall floors were partial red herring (2026-05-24)
+
+- **Viz** (`biochem_teacher_best_high_mu.pth`, patient007): **t=0** Biochem **|u|≈0** vs COMSOL peak **~1.4**; late time **μ₂ trigger → 80** and total **μ ~5–6 Pa·s** fill lumen (COMSOL: trigger **~0**, μ near wall only).
+- **Logs**: `gate_wall≈0`, `gate_all`/`gate_clot` **→0.96** from ep6 — soft cutoff on **bulk clot gate** does **not** suppress when `p_gate>0.15` (pass-through); §78 `torch.where` had val **`gate_all≈0.04`**.
+- **`TRIGGER_GATE_MIN`**: already cleared by hard-gate hook when thresh set; **`WALL_GATE_MIN=0.08`** still applied in wall path until preset/hook fix.
+- **Code fix (next run)**: `BIOCHEM_MU_SOFT_GATE_SCOPE=wall_only` (soft cutoff on `wall_gate` / `wall_signal` only); bulk clot gate uses bio suppressor + `TRIGGER_GATE_MIN=0`; optional `BIOCHEM_MU_GATE_LEARNED_TEMP=1` (`mu_soft_gate_log_temp`); sentinel preset floors **0.0**; default steepness **10**.
+
+### 81. **visc3h** architecture sweep (8 legs, warm post-pretrain, data leash / MU_LOG): logMAE leaderboard ≠ velocity winner (2026-05-24)
+
+- **Setup**: `scripts/run_biochem_visc_velocity_arch_sweep_3h.ps1` / `go_visc3h.ps1` — `outputs/biochem/sweep_visc_velocity_3h/`, 18ep teacher, val/2, `BIOCHEM_REUSE_LAST_PRETRAIN=1`, ~113m total (SPAGNIER).
+- **Metric ranking (patient007 val, saved ckpt)**: **L5** all **0.408** high **1.15** (`MU_LOG` isolate, `DETACH=1`, `gate_clot~0.3`); **L1** all **0.917** high **0.59** (leash + **soft wall-only** gate); **L4** all **0.941** high **0.56** (kin LoRA r4); **L6** all **0.995** high **0.517** (**new global `biochem_teacher_best_high_mu.pth`**); **L7** all **0.958** high **0.57** (early-stop 0.65 never fired); **L0** ref all **1.095** high **0.52**; **L3** all **1.15**; **L2** all **1.51** (ReLU wall — **fail**).
+- **Wall**: val logMAE **~2.23 on every leg** (including L6 with train `W·L_MuLogWall≈7.5`); wall metric still decoupled from “localized high-μ” goal.
+- **Gates**: leash legs still **`gate_clot→0.96`** late; L5 suppressor keeps **`gate_clot~0.2–0.3`** but sacrifices high-μ; L1 bulk **r** can go slightly positive.
+- **Readout**: For **viz / velocity**, **L1 confirmed fail** (true `teacher_last`); next **L4 → L6 → L7**; skip **L0** (same stack as failed L1 viz); **L5** metric-only; skip **L2**. Manifest metrics OK; per-leg **`best_high_mu.pth`** often wrong — use **`teacher_last`** unless leg updated global.
+- **Archive caveat** (`Save-LegArtifacts`): per-leg `biochem_teacher_best_high_mu.pth` is a copy of **global** high-μ best at leg end, **not** that leg’s weights unless it updated global. Manifest val columns are correct (`run_note`); **`.pth` can be wrong** (e.g. L1 path showed **L0** ckpt: all **1.095**, high **0.52**, `run_note=L0`). For true leg weights use **`biochem_teacher_last.pth`** in the leg folder (end-of-run snapshot) or re-run the leg.
+
+### 82. Viz **L1** (archive bug then true ckpt): soft wall-only gate **fails** velocity + clot localization (2026-05-24)
+
+- **First viz** (`L1/.../biochem_teacher_best_high_mu.pth`): embedded metadata **L0** (all **1.095**, `run_note=L0`) — §81 archive copies **global** high-μ into leg folder; misleading.
+- **Second viz** (`L1/.../biochem_teacher_last.pth`, **true L1**): all **0.917**, high **0.583**, `run_note=visc3h_L1_softwall_learn` @ ep16 — **same physics failure** as L0/§80.
+- **Viz** (patient007): **t=0** Biochem **|u|≈0** vs COMSOL **~1.2–1.4**; late **μ₂ trigger ~80** **full domain** (COMSOL **~0** bulk, wall spots); total **μ ~5–6 Pa·s** **uniform lumen** (COMSOL wall-localized); **μ₁(Mat)** Biochem **flat** vs COMSOL wall patches — triggers saturated, **no COMSOL-like clots** despite better val logMAE than L0.
+- **Readout**: **L1 soft wall-only + data leash is not a velocity/clot fix** at 18ep (train still **`gate_clot≈0.96`**). Val logMAE can improve while flow dies. Next viz: **L4** `teacher_last`, then **L6** `best_high_mu` (global **0.517** high-μ).
+
+### 83. Viz leash+kin (likely **L4** `teacher_last`): t=0 flow weak; **μ₂(FI) global**, **μ₁(Mat) off** — wrong gelation channel (2026-05-24)
+
+- **Viz** (patient007; user report + screenshots): **t=0** Biochem **|u|** slightly above L1 (thin core vs **≈0**) but still **≪ COMSOL** (~1.2–1.5); late **total μ ~4–5 Pa·s uniform** (COMSOL wall-localized); gelation panel **μ₁(Mat) Biochem black** vs COMSOL wall yellow; **μ₂(FI) Biochem ~80 everywhere** vs COMSOL **~0** — model raises viscosity via **FI tail**, not **Mat wall gelation**.
+- **Mechanism** (code): `explicit_gelation = mu1_sigmoid(Mat) + mu2_sigmoid(FI)` with **`mu2` capped at `mu_ratio_max` (80)**; soft-gate fix (§80) applies to **learned clot `gate` / wall branch**, **not** FI/Mat sigmoids. Log-μ + leash can fit anchors while species/ODE feed **high FI** bulk-side.
+- **Readout**: Dynamic soft-gating + data leash + kin LoRA **does not** restore COMSOL-like **Mat-on-wall / FI-quiet** pattern. **L6** (sentinel wall loss + leash) improves val high-μ (**0.517**) but **same μ₁/μ₂ viz pathology** (§84). Next science: **μ₁-only / wall-masked Mat loss**, or suppress **μ₂** in bulk; do not trust logMAE alone.
+
+### 84. Viz **L6** `sentinel_leash` + train log `20260524T191651Z`: wall loss on, val `gate_wall=0`; `gate_all~0.49` not 0.96 — still μ₂-global (2026-05-24)
+
+- **Ckpt**: `L6_sentinel_leash/biochem_teacher_best_high_mu.pth` — all **0.995**, high **0.517**, ep14 (`run_note=visc3h_L6_sentinel_leash`).
+- **Viz**: same as §83 — weak t=0 **u**; late uniform **~4–5 Pa·s** μ; **μ₁(Mat) off**, **μ₂(FI)~80** domain-wide.
+- **Structured log**: `outputs/reports/training/biochem/20260524T191651Z/run.jsonl` — val **`dbg_gate_mean_wall=0`** every epoch; **`dbg_gate_mean_all≈0.48–0.50`** (lower than L1 **`~0.96`**); best val ep14 all **0.995** / high **0.517** / wall **2.229**.
+- **Console** (visc3h sweep): `W·L_MuLogWall≈7.5`, `W·L_MuLogHigh≈1.8`, `W·L_MuSI=2`, `DETACH_MACRO=0`, floors **0.0** in sentinel preset; train `gate_all~0.48` ep0 (not clot-saturated).
+- **Readout**: Sentinel **wall log-μ weighting does not fix** wall-gate starvation on val or COMSOL-like gelation channel; FI/Mat sigmoid path still wrong in rollout.
+
+### 85. `viz_final_mu2_mean` / `clot_frac` read raw FI sigmoid, not effective μ (2026-05-25)
+
+- **Symptom**: **health10h** manifest shows **`viz_final_mu2_mean=80`** and **`clot_frac=1.0`** on **K0** (Carreau-only), **S0** (no explicit gel), **M1** (`DISABLE_MU2`) — identical across ablations.
+- **Cause**: `_compute_slice_viz_health_metrics` always evaluates **`mu2_sigmoid(FI_si)`** from species; ignores `BIOCHEM_MU_DISABLE_MU2`, `MU2_SIGMOID_CAP`, `MU_SIMPLE_LOG_RESIDUAL`, and what enters **`μ_eff`**.
+- **Fix (next code)**: report **effective** μ₁/μ₂ contribution (or post-forward debug tensors), or zero viz μ₂ when disabled.
+- **Status**: Documented; **do not** sort ablation legs on `viz_mu2` / `clot_frac` until fixed. **`viz_t0_speed_mean`** still useful (and shows shared weak t0 flow **~0.25–0.35**).
+
+### 86. **health10h** architecture sweep (9 legs, cold K0 pretrain → warm rest, viz-health ranking): **S0** wins scoreboard (2026-05-25)
+
+- **Setup**: `scripts/go_health10h.ps1` → `run_biochem_health_arch_sweep_10h.ps1`; `outputs/biochem/sweep_health_arch_10h/`; per-leg **`BIOCHEM_ARCHIVE_CHECKPOINT_DIR`** (true leg weights); manifest `manifest.jsonl`; console `outputs/reports/training/biochem/health10h_console_20260525_000258.log`. **K0** cold AE+ODE pretrain → `biochem_post_pretrain.pth`; legs **R0–M2** warm-reuse. **22ep** (K0 **8ep**). ~**3h** total (not 10h — short teacher budgets).
+- **Ranking** (patient007, **lower `viz_health_score` = better**; manifest best-epoch rows):
+
+| leg | viz_health | val all logMAE | high-μ | viz t0 \|u\| | viz μ₂ mean | viz clot_frac |
+|-----|------------|----------------|--------|--------------|-------------|---------------|
+| **S0** simple residual (`MU_LOG`, no μ₁/μ₂ mult) | **13.37** | **0.451** | 1.12 | **0.346** | 80 | 1.0 |
+| S1 simple + leash | 14.10 | 0.555 | 1.26 | 0.236 | 80 | 1.0 |
+| M2 no explicit gel (leash, Δ heads only) | 14.41 | **0.417** | 1.46 | 0.253 | 80 | 1.0 |
+| R0 ref leash (visc3h L0 stack) | 14.58 | 0.827 | 1.25 | 0.253 | 80 | 1.0 |
+| M1 μ₁-only leash | 14.66 | 0.599 | 1.43 | 0.246 | 80 | 1.0 |
+| M0 μ₂ cap=8 + leash | 15.05 | 1.016 | **0.756** | 0.262 | 80 | 1.0 |
+| G1 gemini + `MU_LOG` | 15.11 | 1.468 | 0.868 | 0.267 | 80 | 1.0 |
+| G0 gemini + leash | 15.13 | 1.465 | 0.864 | 0.260 | 80 | 1.0 |
+| K0 Carreau-only (`DATA_KINE`, no clot heads) | 15.17 | 1.463 | 1.16 | 0.251 | 80 | 1.0 |
+
+- **Val highlights**: **S0** ep20 all **0.451** (best logMAE in sweep); **M2** ep18 all **0.417** (best wall **2.15**); **R0** ep04 all **0.827** / high **1.25** (only leg near prior leash tier on all); **K0** flat **~1.463** all (μ not trained — expected). **S0** train: `L_tot~0.9`, `L_kine~1.75`, `gate=n/a` (simple path).
+- **Viz-health caveats** (critical):
+  - **`viz_final_mu2_mean=80` and `viz_final_clot_frac=1.0` on every leg**, including **K0** (no clot), **S0** (`BIOCHEM_MU_SIMPLE_LOG_RESIDUAL`), **M1** (`DISABLE_MU2`), **M0** (μ₂ cap=8). Cause: `_compute_slice_viz_health_metrics` reads **raw `mu2_sigmoid(FI)`** from rolled-out species, **not** the term that enters `μ_eff` when flags disable/cap explicit gelation (`train_biochem_corrector.py` ~5034–5040). **Do not** use these two columns to compare ablation legs until fixed.
+  - **`viz_t0_speed_mean≈0.25–0.35`** on all legs (target healthy **~1.2–1.5**). Score still ranks **S0** first mainly via **lower final logMAE** + slightly higher t0 speed (**0.35**); **kinematic backbone / IC rollout** issue is **shared**, not fixed by architecture leg alone.
+- **Gemini / sentinel**: **G0/G1** did **not** beat **S0** on viz score or logMAE; additive Δlogμ + symmetric clip **not** the winning knob in this 22ep budget. **G0** `gate→0` late (good) but val all **~1.46**; **R0** ep04 dip **0.827** then regress — same leash pathology as §74–84.
+- **Readout**: **Promote S0** for full viz + optional longer run (leash vs pure `MU_LOG`); **M2** as logMAE/wall runner-up. **Fix viz μ₂/clot_frac** to reflect effective μ path before next sweep sorts on them. **K0** confirms weak t0 flow is **upstream of clot heads** (still **|u|~0.25**). Next: viz **S0**, **M2**, **R0** (baseline), **K0** (kinematic sanity); compare **`μ_eff` panels**, not raw μ₂ debug.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -994,6 +1116,34 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-23 | Gate-fix **fix_ab** curriculum+bypass (Arm B) | **0.4354** (ep16) | **2.3458** | **0.33** | high **0.5258** | **Best high-μ**; wall worst in batch |
 | 2026-05-23 | Gate-fix **fix_ac** curriculum+pos-init (Arm B) | **0.4356** (ep17) | **1.8957** | **0.31** | high **0.8425** | Best wall in batch; ties sentinel all |
 | 2026-05-23 | Gate-fix **fix_abc** combo (Arm B) | **0.4752** (ep10) | **1.9142** | **0.40** | high **1.4000** | Combo worse than AB or AC alone |
+| 2026-05-23 | Gate-fix **deep 4h** `WS_sentinel` @34ep (Arm A) | **0.2938** (ep32) | **1.5001** | **0.11** | high **0.740** | **New best all** on patient007; `metrics.jsonl` run seg 115 |
+| 2026-05-23 | Gate-fix **deep 4h** `A_curriculum` @30ep (Arm A) | **0.3286** (ep29) | **1.8479** | **0.37** | high **0.754** | Fair MU_LOG; no sentinel preset |
+| 2026-05-23 | Gate-fix **deep 4h** `D_relu` @40ep (Arm A) | **0.4839** (ep34) | **2.0158** | **0.48** | high **0.626** | Best in relu ladder; vs 18ep **0.509** |
+| 2026-05-23 | Gate-fix **deep 4h** `D_relu_tbptt6` @34ep (Arm A) | **0.5173** (ep18) | **2.0142** | **0.40** | high **0.564** | Last leg; overwrites `biochem_teacher_best.pth` |
+| 2026-05-23 | Gate-fix **deep 4h** batch Arm B (`gate_fix_deep_4h`, SILKSPECTRE) | (on host B) | — | — | **204m**, 16/16 OK | metrics not in laptop A `metrics.jsonl` |
+| 2026-05-24 | Supervised data leash (`WS_sentinel_data_leash_ep26`, sentinel + **`SUPERVISED_DATA_LEASH=1`**, init-from-best, `DATA_ONLY=1`, no isolate, `DETACH=0`, `W_MuSI=2.0`, 26ep ~23m) | **0.2232** (ep14 ckpt) | **1.9247** @ ep14; **1.538** ep20; **1.474** ep22 | **0.267** (ep14); **0.548** ep22 | high **0.470** (ep14); **1.367** ep24 | **Wiring OK** (`L_Back≈L_tot`, `L_bio`→0.05); **all/high beat** sentinel MU_LOG @34ep (**0.307** / **0.746**) but **wall worse** at saved ckpt; `gate_wall` floor ~0.06 (not saturated) |
+| 2026-05-24 | Data leash + **bulk surgical lock** (`bulklock_ep26`, `CLIP_BULK=0.05`, bio suppressor floor 0, init-from-best-high-μ, 26ep ~23m) | **0.3531** (ep16) | **2.0649** @ ep16; **1.92** ep22 | **0.287** (ep16) | high **1.256** (ep16); global ckpt kept **0.470** (prior leash) | Bulk subset **0.25** @ ep16; **regressed** vs leash on all/high; wall still **~2.0**; volatile late epochs |
+| 2026-05-24 | **Cold** data leash + bulk lock (`bulklock_cold_ep26`, `INIT_FROM_BEST=0`, AE+ODE pretrain, kinematics init, same leash/bulk env, 26ep ~23m, `20260524T140238Z`) | **0.9070** (ep12) | **2.1955** @ ep12; **2.25** ep25 | **0.242** (ep12); **0.321** ep25 | high **0.773** @ ep12; ckpt @ ep22 high **0.702** | Preflight **1.52**; ep18 collapse **1.52** all; **far** from sentinel (**0.307**) / warm leash (**0.223**); wall unchanged; `gate_wall` floor ~0.06 |
+| 2026-05-24 | **Cold + strict μ-freeze** (`bulklock_cold_mufreeze_ep26`, leash+bulk+`TRAIN_*=0` teacher, μ-path=22, AE13/ODE11, ~22m, `20260524T144958Z`) | **0.5713** (ep12) | **2.2516** flat ep2–25 | **0.405** (ep12) | high **0.959** @ ep12; ckpt ep24 high **0.593** | vs §76 cold: all **0.57** vs **0.91**; bulk **0.53**; wall **stuck** ~2.25 (no ep17 dip); still **&gt;** warm leash/sentinel on all; `L_bio~300` with `biology=0` |
+| 2026-05-24 | **Cold μ-freeze + hard gate 0.15** (`bulklock_cold_mufreeze_hardgate_ep26`, same stack + `HARD_THRESH=0.15`, `TRIGGER_GATE_MIN=0`, 26ep, `20260524T153126Z`) | **0.5906** (ep16) | **1.8678** @ ep16 (§77 wall **2.25** flat); **2.27** ep25 | **0.125** (ep16); **0.334** ep25 | high **1.202** @ ep16; ckpt high **0.672** @ ep02 | Wall **unfreezes** on val; all ~§77; bulk **0.52**; train `gate_wall≈1` early; **viz** for full-domain clot |
+| 2026-05-24 | **Cold μ-freeze + soft gate** (`bulklock_cold_mufreeze_hardgate_ep26`, `HARD_THRESH=0.15` sigmoid **steepness=20**, leash+bulk+mufreeze, cold pretrain, 26ep, `20260524T160923Z`) | **0.7579** (ep10 ckpt) | **2.2525** @ ep10 (§78 **1.87**); **2.234** ep25 | **0.400** (ep10); **0.008** ep25 | high **0.597** @ ep10; ckpt high **0.553** @ ep14 | Early peak then **collapse** ep22–25 (**2.67** all); `gate_clot≈0.96` from ep6; beats §78 on all/high at ckpt, **loses** §78 wall gain; **early-stop @ ep10** candidate |
+| 2026-05-24 | **visc3h** `L0_mufreeze_ref` (data leash, μ-freeze, bulk lock, 18ep warm pretrain, `20260524T171304Z`) | **1.095** (ep16) | **2.229** | **0.392** (ep16) | high **0.520** | Reference; `gate_clot≈0.94` late; first run false-FAIL (PS exit-code bug, recovered on rerun) |
+| 2026-05-24 | **visc3h** `L1_softwall_learn` (leash + **soft gate wall_only** + learned temp) | **0.917** (ep16) | **2.229** | **0.395** | high **0.593** | Val best among leash+arch legs; **viz FAIL** (`teacher_last` ep16): t=0 **u≈0**, μ₂ **~80** global, **~5–6 Pa·s** uniform — **not** a deployable clot model |
+| 2026-05-24 | **visc3h** `L2_relu_wall` (ReLU `delta_wall`) | **1.515** (ep17) | **2.229** | **0.344** | high **0.962** | Metrics flat ~1.54 train logMAE; **no gain** vs L0 |
+| 2026-05-24 | **visc3h** `L3_wall_decay` (SDF wall decay) | **1.151** (ep14) | **2.228** | **0.378** | high **0.813** | Mid bulk improvement; wall unchanged |
+| 2026-05-24 | **visc3h** `L4_kine_lora` (leash + μ-freeze + LoRA r4) | **0.941** (ep16) | **2.254** | **0.396** | high **0.561** | Val strong; **viz FAIL** (`teacher_last`): t=0 **u** weak; **μ₂~80** global, **μ₁(Mat)~0**; uniform **~4–5 Pa·s** μ (§83) |
+| 2026-05-24 | **visc3h** `L5_mu_log_suppress` (`MU_LOG` isolate, suppressor, **no leash**, `DETACH=1`) | **0.408** (ep17) | **2.228** | **0.404** | high **1.152** | **Best val all** in sweep; **`gate_clot~0.3`**; **viz velocity** before promote |
+| 2026-05-24 | **visc3h** `L6_sentinel_leash` (`sweep_wall_sentinel` + leash) | **0.995** (ep14) | **2.229** | **0.395** | high **0.517** | **`W·L_MuLogWall≈7.5`** train; global high-μ ckpt; **viz FAIL**: t=0 **u** weak; **μ₂~80** / **μ₁~0**; uniform late μ; val **`gate_wall=0`** despite wall loss (`run.jsonl` `20260524T191651Z`) |
+| 2026-05-24 | **visc3h** `L7_early_stop` (L1 stack + target all≤0.65) | **0.958** (ep16) | **2.229** | **0.394** | high **0.569** | Early-stop threshold **not hit** (best all 0.958); similar to L1 |
+| 2026-05-25 | **health10h** `S0_simple_residual` (`MU_LOG`, `SIMPLE_LOG_RESIDUAL`, 22ep warm) | **0.451** (ep20) | **1.743** | **0.346** viz t0 \|u\| | high **1.12** | **Best viz_health 13.37**; `gate=n/a`; manifest `20260524T230926Z` |
+| 2026-05-25 | **health10h** `S1_simple_residual_leash` (S0 + data leash) | **0.555** (ep04) | **1.774** | **0.236** | high **1.26** | viz **14.10**; worse t0 speed than S0 |
+| 2026-05-25 | **health10h** `M2_no_explicit_gel` (leash, Δ heads only) | **0.417** (ep18) | **2.148** | **0.253** | high **1.46** | **Best all logMAE** in sweep; viz **14.41** |
+| 2026-05-25 | **health10h** `R0_ref_leash` (visc3h L0 stack) | **0.827** (ep04) | **2.556** | **0.253** | high **1.25** | ep04 best then regress; viz **14.58** |
+| 2026-05-25 | **health10h** `M1_mu1_only_leash` (`DISABLE_MU2`) | **0.599** (ep12) | **3.855** | **0.246** | high **1.43** | viz **14.66**; wall metric bad |
+| 2026-05-25 | **health10h** `M0_mu2_cap_leash` (`MU2_SIGMOID_CAP=8`) | **1.016** (ep10) | **2.643** | **0.262** | high **0.756** | viz **15.05**; high-μ ok, all weak |
+| 2026-05-25 | **health10h** `G1_gemini_mu_log` (`sweep_gemini`, `MU_LOG`) | **1.468** (ep16) | **2.428** | **0.267** | high **0.868** | viz **15.11**; Gemini **not** best |
+| 2026-05-25 | **health10h** `G0_gemini_leash` (Gemini + leash + sentinel wall w) | **1.465** (ep04) | **2.403** | **0.260** | high **0.864** | viz **15.13**; `gate→0` late |
+| 2026-05-25 | **health10h** `K0_carreau_kinematic` (`DATA_KINE`, Carreau-only, 8ep cold) | **1.463** (ep04) | **2.053** | **0.251** | high **1.16** | **No μ train**; viz **15.17**; t0 still weak |
 
 ---
 

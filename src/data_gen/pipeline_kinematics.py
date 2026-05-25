@@ -18,6 +18,8 @@ from typing import Optional
 from src.data_gen.lib.mesh_to_graph import MeshToGraph
 from src.data_gen.lib.vessel_generator import (
     VesselGenerator,
+    default_level_mix,
+    parse_level_mix,
     summarize_vessel_mesh_inventory,
     _prompt_int_choice as _vg_prompt_int_choice,
     _prompt_write_mode_vessel as _vg_prompt_write_mode_vessel,
@@ -83,6 +85,7 @@ class PhaseInteractivePlan:
     anchor_target: int
     run_vessel: bool
     level: Optional[int]
+    level_mix: Optional[dict[int, int]]
     overwrite: Optional[bool]
     n_vessels: Optional[int]
     seed: Optional[int]
@@ -156,13 +159,33 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
     run_vessel = n_vessels > 0
 
     level: Optional[int] = None
+    level_mix: Optional[dict[int, int]] = None
     overwrite: Optional[bool] = None
     seed: Optional[int] = None
     num_workers: Optional[int] = None
     chunk_size: Optional[int] = None
 
     if run_vessel:
-        level = _vg_prompt_int_choice("Geometry level", (0, 1))
+        cohort_mode = _vg_prompt_int_choice(
+            "Vessel cohort [1=single level / 2=mixed L0+L1+L2 (40/40/20)]",
+            (1, 2),
+        )
+        if cohort_mode == 2:
+            level_mix = default_level_mix(n_vessels)
+            print(
+                f"  Mixed cohort: L0={level_mix[0]}, L1={level_mix[1]}, L2={level_mix[2]} "
+                f"(high-thrombus geometries for COMSOL + kinematics training).\n"
+            )
+        else:
+            level = _vg_prompt_int_choice(
+                "Geometry level [0=straight / 1=curved / 2=high-thrombus]",
+                (0, 1, 2),
+            )
+            if level == 2:
+                print(
+                    "  Level 2: pro-thrombotic shapes (sharp turns, aneurysm/stenosis) "
+                    "for high-μ biochem-style CFD anchors.\n"
+                )
         if n_on_disk == 0:
             overwrite = True
             print("  No meshes on disk — starting indices at 0 (overwrite).\n")
@@ -223,6 +246,7 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
         anchor_target=0,  # Hardcoded to 0 to trigger the manual count in execution
         run_vessel=run_vessel,
         level=level,
+        level_mix=level_mix,
         overwrite=overwrite,
         n_vessels=n_vessels if run_vessel else None,
         seed=seed,
@@ -245,13 +269,15 @@ def _execute_phase_interactive_plan(
     print(f"\n{'=' * 60}\n  RUN — {rheology.upper()}\n{'=' * 60}\n")
 
     if plan.run_vessel:
-        assert plan.level is not None and plan.overwrite is not None and plan.n_vessels is not None
+        assert plan.overwrite is not None and plan.n_vessels is not None
+        assert plan.level is not None or plan.level_mix is not None
         vg = VesselGenerator(phase="kinematics")
         start_idx = 0 if plan.overwrite else None
         print("\n--- Running vessel generator ---\n")
         vg.run_pipeline(
             n=plan.n_vessels,
-            level=plan.level,
+            level=0 if plan.level is None else plan.level,
+            level_mix=plan.level_mix,
             seed=plan.seed,
             num_workers=plan.num_workers,
             chunk_size=plan.chunk_size,
@@ -358,7 +384,25 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
         help="Run newtonian then carreau sequentially (independent cohorts; use --seed-newtonian/--seed-carreau).",
     )
     p.add_argument("--rheology", choices=("newtonian", "carreau"), help="Rheology target; omit when using --both-rheologies")
-    p.add_argument("--level", type=int, choices=(0, 1), help="Geometry complexity")
+    p.add_argument(
+        "--level",
+        type=int,
+        choices=(0, 1, 2),
+        default=None,
+        help="Single geometry level (0=straight, 1=curved, 2=high-thrombus). Omit with --mixed-levels.",
+    )
+    p.add_argument(
+        "--mixed-levels",
+        action="store_true",
+        help="Mixed L0+L1+L2 cohort (default 40/40/20 split; overrides --level).",
+    )
+    p.add_argument(
+        "--level-mix",
+        type=str,
+        default=None,
+        metavar="N0,N1,N2",
+        help="Explicit per-level counts (must sum to -n); implies mixed cohort.",
+    )
     p.add_argument(
         "-n",
         "--num-vessels",
@@ -457,8 +501,8 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     if not args.skip_vessel:
         if not args.both_rheologies and args.rheology is None:
             missing.append("--rheology or --both-rheologies")
-        if args.level is None:
-            missing.append("--level")
+        if args.level is None and not args.mixed_levels and args.level_mix is None:
+            missing.append("--level, --mixed-levels, or --level-mix")
         if args.both_rheologies:
             ok_nv = args.num_vessels is not None or (
                 args.num_vessels_newtonian is not None and args.num_vessels_carreau is not None
@@ -525,15 +569,27 @@ def _run_batch_for_phase(
 
     if not args.skip_vessel:
         assert num_vessels is not None
+        level_mix = None
+        level = int(args.level) if args.level is not None else 0
+        if args.level_mix is not None:
+            level_mix = parse_level_mix(args.level_mix, num_vessels)
+        elif args.mixed_levels:
+            level_mix = default_level_mix(num_vessels)
+        level_label = (
+            ", ".join(f"L{k}={v}" for k, v in sorted(level_mix.items()))
+            if level_mix is not None
+            else str(level)
+        )
         vg = VesselGenerator(phase="kinematics")
         start_idx = 0 if args.overwrite else None
         print(
-            f"--- Vessel generation: rheology={rheology} level={args.level} n={num_vessels} "
+            f"--- Vessel generation: rheology={rheology} levels={level_label} n={num_vessels} "
             f"seed={vessel_seed!r} ---\n"
         )
         vg.run_pipeline(
             n=num_vessels,
-            level=int(args.level),
+            level=level,
+            level_mix=level_mix,
             seed=vessel_seed,
             num_workers=args.num_workers,
             chunk_size=args.chunk_size,
