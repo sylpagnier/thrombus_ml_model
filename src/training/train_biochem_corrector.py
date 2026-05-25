@@ -3481,6 +3481,81 @@ def _anchor_mu_si_and_log_losses(
     return l_mu_si, l_mu_log
 
 
+def _biochem_mu_k10e_simple_enabled() -> bool:
+    return (os.environ.get("BIOCHEM_MU_K10E_SIMPLE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _anchor_mu_adjacent_log_loss(
+    pred_series: torch.Tensor,
+    y_true: torch.Tensor,
+    truth_mask: torch.Tensor,
+    data,
+    cfg_mu,
+    mu_ch: int,
+) -> torch.Tensor:
+    """Log-μ on truth nodes in the K10e wall-adjacent band (excludes solid wall nodes)."""
+    from src.architecture.gnode_biochem import k10e_wall_adjacent_mask
+
+    device = pred_series.device
+    dtype = pred_series.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    ma = truth_mask.view(-1).bool()
+    if (not ma.any()) or pred_series.shape[0] < 1 or y_true.shape[0] < 1:
+        return z
+    if not hasattr(data, "x") or data.x is None or data.x.shape[1] < 3:
+        return z
+    sdf_nd = data.x[:, 2]
+    wall_mask = (
+        data.mask_wall.view(-1)
+        if hasattr(data, "mask_wall") and data.mask_wall is not None
+        else torch.zeros(sdf_nd.shape[0], device=device, dtype=torch.bool)
+    )
+    adj_w = k10e_wall_adjacent_mask(
+        sdf_nd.to(device=device),
+        wall_mask.to(device=device),
+    ).reshape(-1)
+    m_adj = ma & (adj_w > 0.05)
+    if not bool(m_adj.any()):
+        return z
+    t_cap = min(int(pred_series.shape[0]), int(y_true.shape[0]))
+    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
+    terms: List[torch.Tensor] = []
+    for t in range(t_cap):
+        mu_p = cfg_mu.viscosity_nd_to_si(pred_series[t, :, mu_ch])
+        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch])
+        dlog = (torch.log(mu_p.float().clamp(min=1e-8)) - torch.log(mu_g.float().clamp(min=1e-8))).abs()
+        terms.append(dlog[m_adj].mean().to(dtype=dtype) * tw[t])
+    return torch.stack(terms).sum() if terms else z
+
+
+def _k10e_bulk_delta_penalty(model, data) -> torch.Tensor:
+    """Penalize learned Δμ outside the wall-adjacent band (prevents lumen uniform clot)."""
+    from src.architecture.gnode_biochem import k10e_wall_adjacent_mask
+
+    device = next(model.parameters()).device
+    dtype = torch.float32
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    delta = getattr(model, "_last_mu_delta_bulk", None)
+    if not torch.is_tensor(delta):
+        return z
+    if not hasattr(data, "x") or data.x is None or data.x.shape[1] < 3:
+        return z
+    sdf_nd = data.x[:, 2].to(device=device, dtype=delta.dtype)
+    wall_mask = (
+        data.mask_wall.view(-1).to(device=device)
+        if hasattr(data, "mask_wall") and data.mask_wall is not None
+        else torch.zeros(sdf_nd.shape[0], device=device, dtype=delta.dtype)
+    )
+    adj = k10e_wall_adjacent_mask(sdf_nd, wall_mask).reshape(-1, 1)
+    bulk_w = (1.0 - adj).clamp(0.0, 1.0)
+    return torch.mean((delta.reshape(-1, 1) * bulk_w).pow(2)).to(dtype=dtype)
+
+
 def _anchor_mu_mse_loss(
     pred_series: torch.Tensor,
     y_true: torch.Tensor,
@@ -3642,6 +3717,8 @@ def _biochem_resolve_isolated_loss(
     l_mu_mse_anchor: torch.Tensor,
     l_mu_wall_bypass: torch.Tensor,
     w_mu_wall_bypass: float,
+    l_mu_log_adjacent: torch.Tensor,
+    l_k10e_bulk_delta: torch.Tensor,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -3717,6 +3794,19 @@ def _biochem_resolve_isolated_loss(
         return _biochem_scale_for_isolate(w_mu_log_high) * l_mu_log_high
     if k in ("MU_MSE", "MU_DATA"):
         return l_mu_mse_anchor
+    if k == "K10E":
+        w_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "1.0")), 0.0)
+        w_high = max(float(os.environ.get("BIOCHEM_MU_LOG_HIGH_WEIGHT", "4.0")), 0.0)
+        w_adj = max(float(os.environ.get("BIOCHEM_MU_LOG_ADJACENT_WEIGHT", "3.0")), 0.0)
+        w_bulk = max(float(os.environ.get("BIOCHEM_K10E_BULK_DELTA_WEIGHT", "2.0")), 0.0)
+        w_dk = max(float(os.environ.get("BIOCHEM_K10E_DATA_KINE_WEIGHT", "0.25")), 0.0)
+        return (
+            _biochem_scale_for_isolate(w_log) * l_mu_log_anchor
+            + _biochem_scale_for_isolate(w_high) * l_mu_log_high
+            + _biochem_scale_for_isolate(w_adj) * l_mu_log_adjacent
+            + _biochem_scale_for_isolate(w_bulk) * l_k10e_bulk_delta
+            + _biochem_scale_for_isolate(w_dk) * l_data_kine
+        )
     if k in ("FI_GATE", "FI_GATE_START"):
         return _biochem_scale_for_isolate(w_fi_gate_start_eff) * l_fi_gate_start
     if k in ("RES_SPARSE", "RESIDUAL_SPARSE"):
@@ -3724,7 +3814,7 @@ def _biochem_resolve_isolated_loss(
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
         "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, MU_MSE, MU_DATA, "
-        "FI_GATE, RES_SPARSE"
+        "K10E, FI_GATE, RES_SPARSE"
     )
     raise ValueError(f"Unknown BIOCHEM_LOSS_ISOLATE={key!r}; expected one of: {valid}")
 
