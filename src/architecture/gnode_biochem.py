@@ -99,6 +99,36 @@ def _biochem_mu_disable_mu2() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_DISABLE_MU2")
 
 
+def biochem_explicit_gelation_terms(
+    model: "GNODE_Phase3",
+    fi_si: torch.Tensor,
+    mat_si: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """μ₁/μ₂ terms that enter forward ``μ_kin * (1 + μ₁ + μ₂)`` (zeros when ablated).
+
+    Matches ``GNODE_Phase3.forward`` explicit-gelation branch (caps, disable flags).
+    Use for viz health metrics and plots — not raw species sigmoids when gelation is off.
+    """
+    if _biochem_mu_disable_explicit_gelation():
+        zeros = torch.zeros_like(fi_si)
+        return zeros, zeros
+    mu1_term = (
+        torch.zeros_like(mat_si)
+        if _biochem_mu_disable_mu1()
+        else model.mu1_sigmoid(mat_si)
+    )
+    mu2_term = (
+        torch.zeros_like(fi_si)
+        if _biochem_mu_disable_mu2()
+        else model.mu2_sigmoid(fi_si)
+    )
+    mu2_cap_raw = (os.environ.get("BIOCHEM_MU2_SIGMOID_CAP") or "").strip()
+    if mu2_cap_raw:
+        mu2_cap = max(float(mu2_cap_raw), 0.0)
+        mu2_term = torch.clamp(mu2_term, max=mu2_cap)
+    return mu1_term, mu2_term
+
+
 def _biochem_delta_mu_symmetric_bulk_clip() -> bool:
     if _biochem_mu_gemini_fix_enabled() or _biochem_mu_simple_log_residual_enabled():
         return True
@@ -395,6 +425,8 @@ class GNODE_Phase3(nn.Module):
         self.micro_ode_method = str(os.environ.get("BIOCHEM_ODE_METHOD", "rk4")).strip().lower()
         # Optional TBPTT-style truncation at macro boundaries.
         self.detach_macro_state_default = bool(int(os.environ.get("BIOCHEM_DETACH_MACRO_STATE", "0")))
+        # Match stage-A GINO_DEQ: hard BCs only when KINEMATICS_USE_HARD_BCS=1.
+        self.use_hard_bcs = bool(int(os.environ.get("KINEMATICS_USE_HARD_BCS", "0")))
 
         # COMSOL Step Function Approximations (Dual-Trigger)
         self.mu_ratio_max = mu_ratio_max
@@ -440,6 +472,15 @@ class GNODE_Phase3(nn.Module):
             self.kinematics_decoder = nn.Linear(latent_dim, 3)
         self.mu_encoder = nn.Linear(1, latent_dim)
         self.z_prior_proj = SpectralLinear(4, latent_dim)
+        mu_scale = float(self.phys_cfg.mu_viscosity_nd_scale)
+        self.mu_inf_nd = float(self.phys_cfg.mu_inf / mu_scale)
+        self.mu_0_nd = float(self.phys_cfg.mu_0 / mu_scale)
+        # Frozen stage-A μ decoder (t=0 DEQ parity with kinematics_best.pth).
+        self.mu_decoder = nn.Sequential(
+            SpectralLinear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, 1),
+        )
 
         # ==========================================
         # 2. BIOCHEMISTRY NEURAL ODE
@@ -588,6 +629,7 @@ class GNODE_Phase3(nn.Module):
         if self.siren_decoder is not None:
             self.siren_decoder.eval()
         self.mu_encoder.eval()
+        self.mu_decoder.eval()
 
     def _apply_kin_processor_stack(self, z_in: torch.Tensor, batch, mod_adv, mod_rheo, mod_curve) -> torch.Tensor:
         num_nodes = int(z_in.shape[0])

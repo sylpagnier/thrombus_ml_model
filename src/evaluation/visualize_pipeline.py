@@ -14,7 +14,15 @@ from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
-from src.architecture.gnode_biochem import GNODE_Phase3, _SPECIES_LOG1P_MAX, _SPECIES_LOG1P_MIN
+from src.architecture.gnode_biochem import (
+    GNODE_Phase3,
+    _SPECIES_LOG1P_MAX,
+    _SPECIES_LOG1P_MIN,
+    _biochem_mu_carreau_only_enabled,
+    _biochem_mu_disable_explicit_gelation,
+    _biochem_mu_simple_log_residual_enabled,
+    biochem_explicit_gelation_terms,
+)
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
 from src.utils.nondim import to_t_nd
@@ -48,10 +56,73 @@ _BIOCHEM_TEACHER_CKPT_ROLES = frozenset(
 )
 _BIOCHEM_CKPT_INVENTORY_EXTRA = ("biochem_best_bio.pth",)
 _DEFAULT_VAL_ANCHOR_STEM = "patient007"
-# COMSOL ``mu_b*(mu2(FI)+mu1(Mat))``; GNODE uses ``mu_b * (1 + mu1 + mu2)`` with triggers near 0 at rest.
+# Legacy COMSOL display (species sigmoids); biochem rollout uses stored ``mu_eff`` when ablated.
 _MU_DYNAMIC_SI_LABEL = r"$\mu_b \times (\mu_1(\mathrm{Mat}) + \mu_2(\mathrm{FI}))$ [Pa·s]"
 _MU1_PRODUCT_SI_LABEL = r"$\mu_{blood}\times\mu_1$(Mat) [Pa·s]"
 _MU2_TRIGGER_LABEL = r"$\mu_2$ trigger (FI) [−]"
+
+
+def _biochem_mu_viz_labels() -> Dict[str, str]:
+    """Panel titles aligned with the active forward ``μ_eff`` path."""
+    if _biochem_mu_carreau_only_enabled():
+        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout, Carreau-only) [Pa·s]"
+        gel_suffix = "effective μ₁/μ₂ in forward = 0 (Carreau-only)"
+    elif _biochem_mu_simple_log_residual_enabled():
+        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout, $\mu_{\mathrm{kin}}\,e^{\Delta\log\mu}$) [Pa·s]"
+        gel_suffix = "effective μ₁/μ₂ in forward = 0 (simple log residual)"
+    elif _biochem_mu_disable_explicit_gelation():
+        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout) [Pa·s]"
+        gel_suffix = "effective μ₁/μ₂ in forward = 0"
+    else:
+        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout) [Pa·s]"
+        gel_suffix = "effective μ₁/μ₂ in forward"
+    return {
+        "mu_dynamic": mu_dyn,
+        "mu1_product": r"$\mu_{\mathrm{blood}}\times\mu_1$ (effective) [Pa·s]",
+        "mu2_trigger": r"$\mu_2$ (effective in forward) [−]",
+        "gelation_suffix": gel_suffix,
+    }
+
+
+def _rollout_mu_eff_si_numpy(phys_cfg: PhysicsConfig, pred_np: np.ndarray) -> np.ndarray:
+    """Stored rollout viscosity channel (ND → SI); matches kinematic coupling in forward."""
+    mu_ch = STATE_CHANNEL_MU_EFF_ND
+    mu_nd = torch.from_numpy(pred_np[:, mu_ch]).float().view(-1, 1)
+    return phys_cfg.viscosity_nd_to_si(mu_nd).detach().cpu().numpy().reshape(-1)
+
+
+def _carreau_mu_blood_torch(
+    model: GNODE_Phase3,
+    data,
+    pred_t: torch.Tensor,
+) -> torch.Tensor:
+    """Shear-thinning baseline ``μ_b`` from decoded ``u,v`` (SI)."""
+    device = pred_t.device
+    dtype = pred_t.dtype
+    u_nd = pred_t[:, 0:1]
+    v_nd = pred_t[:, 1:2]
+    mu_inf = model.phys_cfg.mu_inf
+    mu_0 = model.phys_cfg.mu_0
+    lam = model.phys_cfg.lam
+    n_idx = model.phys_cfg.n
+    u_ref = data.u_ref.view(-1, 1).to(device=device, dtype=dtype)
+    d_bar = data.d_bar.view(-1, 1).to(device=device, dtype=dtype)
+
+    du_dx_nd = torch.sparse.mm(data.G_x, u_nd)
+    du_dy_nd = torch.sparse.mm(data.G_y, u_nd)
+    dv_dx_nd = torch.sparse.mm(data.G_x, v_nd)
+    dv_dy_nd = torch.sparse.mm(data.G_y, v_nd)
+
+    scale_grad = u_ref / d_bar
+    gamma_dot = torch.sqrt(
+        2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2)
+        + ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2
+        + 1e-8
+    )
+    mu_blood = mu_inf + (mu_0 - mu_inf) * torch.pow(
+        1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0
+    )
+    return mu_blood.squeeze(-1)
 
 
 @dataclass(frozen=True)
@@ -241,16 +312,41 @@ def _infer_latent_dim_from_state_dict(state_dict) -> int | None:
     return None
 
 
+def _viz_fast_enabled(explicit: Optional[bool] = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return os.environ.get("VIZ_FAST", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _slider_keyframe_times_si(
+    dense_times_si_full: torch.Tensor,
+    t_final_si: float,
+    extend_mult: float,
+) -> List[float]:
+    """Slider keyframes aligned to the anchor/export grid (avoids arbitrary 33/66% gaps)."""
+    n = int(dense_times_si_full.numel())
+    if n >= 4:
+        fracs = (0.0, 0.33, 0.66, 1.0)
+        idxs = [min(n - 1, max(0, int(round(f * (n - 1))))) for f in fracs]
+        times = [float(dense_times_si_full[i].item()) for i in idxs]
+    else:
+        times = [0.0, t_final_si * 0.33, t_final_si * 0.66, t_final_si]
+    times.append(float(t_final_si * extend_mult))
+    return times
+
+
 @contextlib.contextmanager
 def _viz_biochem_ode_speedups() -> Iterator[None]:
-    """Plain ``odeint`` + coarser RK for visualization unless the user already set these env vars."""
-    keys = ("BIOCHEM_ODEINT_USE_ADJOINT", "BIOCHEM_ADJOINT_RK4_SUBSTEPS")
+    """Plain ``odeint`` + coarser RK + COMSOL-like ODE steps for visualization unless already set."""
+    keys = ("BIOCHEM_ODEINT_USE_ADJOINT", "BIOCHEM_ADJOINT_RK4_SUBSTEPS", "BIOCHEM_ODE_MAX_STEP_S")
     saved = {k: os.environ.get(k) for k in keys}
     try:
         if saved["BIOCHEM_ODEINT_USE_ADJOINT"] is None:
             os.environ["BIOCHEM_ODEINT_USE_ADJOINT"] = "0"
         if saved["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] is None:
             os.environ["BIOCHEM_ADJOINT_RK4_SUBSTEPS"] = "4"
+        if saved["BIOCHEM_ODE_MAX_STEP_S"] is None:
+            os.environ["BIOCHEM_ODE_MAX_STEP_S"] = "150"
         yield
     finally:
         for k, old in saved.items():
@@ -399,37 +495,15 @@ def _run_model_once(model, data):
     return pred[0] if isinstance(pred, tuple) else pred
 
 
-def _biochem_rheology_fields(
+def _comsol_style_rheology_fields(
     model: GNODE_Phase3,
     data,
     pred_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """COMSOL-style dynamic viscosity: Carreau ``μ_b`` times gelation ``(μ1+μ2)`` (see ``GNODE_Phase3``)."""
+    """COMSOL reference display: Carreau ``μ_b`` × ``(1+μ₁+μ₂)`` from species sigmoids."""
     device = pred_t.device
     dtype = pred_t.dtype
-    u_nd = pred_t[:, 0:1]
-    v_nd = pred_t[:, 1:2]
-    mu_inf = model.phys_cfg.mu_inf
-    mu_0 = model.phys_cfg.mu_0
-    lam = model.phys_cfg.lam
-    n_idx = model.phys_cfg.n
-    u_ref = data.u_ref.view(-1, 1).to(device=device, dtype=dtype)
-    d_bar = data.d_bar.view(-1, 1).to(device=device, dtype=dtype)
-
-    du_dx_nd = torch.sparse.mm(data.G_x, u_nd)
-    du_dy_nd = torch.sparse.mm(data.G_y, u_nd)
-    dv_dx_nd = torch.sparse.mm(data.G_x, v_nd)
-    dv_dy_nd = torch.sparse.mm(data.G_y, v_nd)
-
-    scale_grad = u_ref / d_bar
-    gamma_dot = torch.sqrt(
-        2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2)
-        + ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2
-        + 1e-8
-    )
-
-    mu_blood = mu_inf + (mu_0 - mu_inf) * torch.pow(1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0)
-
+    mu_blood = _carreau_mu_blood_torch(model, data, pred_t)
     sp_safe = torch.clamp(
         pred_t[:, 4:16],
         min=torch.tensor(_SPECIES_LOG1P_MIN, device=device, dtype=dtype),
@@ -440,13 +514,39 @@ def _biochem_rheology_fields(
     mat_si = species_si[:, 11:12]
     mu1 = model.mu1_sigmoid(mat_si)
     mu2 = model.mu2_sigmoid(fi_si)
-    # Match COMSOL ``mu_b*(mu1+mu2)`` / forward ``mu_kin * (1 + mu1 + mu2)`` (COMSOL μ1 baseline = 1).
-    mu_dynamic_si = mu_blood * (1.0 + mu1 + mu2)
+    mu_dynamic_si = mu_blood.unsqueeze(-1) * (1.0 + mu1 + mu2)
     return (
-        mu_blood.squeeze(-1),
+        mu_blood,
         mu1.squeeze(-1),
         mu2.squeeze(-1),
         mu_dynamic_si.squeeze(-1),
+    )
+
+
+def _biochem_rollout_rheology_fields(
+    model: GNODE_Phase3,
+    data,
+    pred_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Biochem panels: stored ``μ_eff`` rollout + effective explicit μ₁/μ₂ (respects ablation flags)."""
+    mu_dynamic_si = model.phys_cfg.viscosity_nd_to_si(
+        pred_t[:, STATE_CHANNEL_MU_EFF_ND : STATE_CHANNEL_MU_EFF_ND + 1]
+    ).squeeze(-1)
+    mu_blood = _carreau_mu_blood_torch(model, data, pred_t)
+    sp_safe = torch.clamp(
+        pred_t[:, 4:16],
+        min=_SPECIES_LOG1P_MIN,
+        max=_SPECIES_LOG1P_MAX,
+    )
+    species_si = model.species_log_nd_to_si(sp_safe)
+    mu1, mu2 = biochem_explicit_gelation_terms(
+        model, species_si[:, 8:9], species_si[:, 11:12]
+    )
+    return (
+        mu_blood,
+        mu1.squeeze(-1),
+        mu2.squeeze(-1),
+        mu_dynamic_si,
     )
 
 
@@ -454,8 +554,10 @@ def _rheology_series_numpy(
     model: GNODE_Phase3,
     data,
     pred_series_np: np.ndarray,
+    *,
+    biochem_rollout: bool = True,
 ) -> np.ndarray:
-    """``pred_series_np`` shaped ``[T, N, C]`` → COMSOL-style ``μ_b×(μ_1+μ_2)`` in SI ``[T, N]``."""
+    """``pred_series_np`` ``[T,N,C]`` → ``μ_eff`` in SI ``[T,N]`` (rollout channel or COMSOL-style)."""
     device = data.x.device
     dtype = torch.float32
     t_steps = int(pred_series_np.shape[0])
@@ -463,9 +565,12 @@ def _rheology_series_numpy(
     out = np.zeros((t_steps, n), dtype=np.float64)
     with torch.no_grad():
         for ti in range(t_steps):
-            pred_t = torch.from_numpy(pred_series_np[ti]).to(device=device, dtype=dtype)
-            _, _, _, mu_dyn = _biochem_rheology_fields(model, data, pred_t)
-            out[ti] = mu_dyn.detach().cpu().numpy()
+            if biochem_rollout:
+                pred_t = torch.from_numpy(pred_series_np[ti]).to(device=device, dtype=dtype)
+                _, _, _, mu_dyn = _biochem_rollout_rheology_fields(model, data, pred_t)
+                out[ti] = mu_dyn.detach().cpu().numpy()
+            else:
+                out[ti] = _rollout_mu_eff_si_numpy(model.phys_cfg, pred_series_np[ti])
     return out
 
 
@@ -473,18 +578,21 @@ def _rheology_trigger_series_numpy(
     model: GNODE_Phase3,
     data,
     pred_series_np: np.ndarray,
+    *,
+    biochem_rollout: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """``pred_series_np`` shaped ``[T, N, C]`` → ``(μ_blood×μ_1 [T,N], μ_2 [T,N])`` via ``GNODE_Phase3`` sigmoids."""
+    """``[T,N,C]`` → ``(μ_blood×μ_1, μ_2)`` effective (biochem) or COMSOL-style sigmoids."""
     device = data.x.device
     dtype = torch.float32
     t_steps = int(pred_series_np.shape[0])
     n = int(pred_series_np.shape[1])
     mb_mu1 = np.zeros((t_steps, n), dtype=np.float64)
     mu2_out = np.zeros((t_steps, n), dtype=np.float64)
+    fields_fn = _biochem_rollout_rheology_fields if biochem_rollout else _comsol_style_rheology_fields
     with torch.no_grad():
         for ti in range(t_steps):
             pred_t = torch.from_numpy(pred_series_np[ti]).to(device=device, dtype=dtype)
-            mu_blood, mu1, mu2, _ = _biochem_rheology_fields(model, data, pred_t)
+            mu_blood, mu1, mu2, _ = fields_fn(model, data, pred_t)
             mb_mu1[ti] = (mu_blood * mu1).detach().cpu().numpy()
             mu2_out[ti] = mu2.detach().cpu().numpy()
     return mb_mu1, mu2_out
@@ -494,12 +602,15 @@ def _trigger_fields_numpy(
     model: GNODE_Phase3,
     data,
     pred_np: np.ndarray,
+    *,
+    biochem_rollout: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Single-frame ``[N,C]`` → ``(μ_blood×μ_1, μ_2)`` numpy vectors."""
+    """Single-frame ``[N,C]`` → ``(μ_blood×μ_1, μ_2)`` for gelation comparison figure."""
     device = data.x.device
     pred_t = torch.from_numpy(pred_np).to(device=device, dtype=torch.float32)
+    fields_fn = _biochem_rollout_rheology_fields if biochem_rollout else _comsol_style_rheology_fields
     with torch.no_grad():
-        mu_blood, mu1, mu2, _ = _biochem_rheology_fields(model, data, pred_t)
+        mu_blood, mu1, mu2, _ = fields_fn(model, data, pred_t)
     return (
         (mu_blood * mu1).detach().cpu().numpy(),
         mu2.detach().cpu().numpy(),
@@ -515,8 +626,13 @@ def _show_mu_trigger_comparison_figure(
     case_label: str = "",
     mb_mu1_comsol: Optional[np.ndarray] = None,
     mu2_comsol: Optional[np.ndarray] = None,
+    mu_labels: Optional[Dict[str, str]] = None,
 ) -> None:
     """Static gelation triggers at final time; optional COMSOL vs ML 2×2 grid."""
+    labels = mu_labels or _biochem_mu_viz_labels()
+    mu1_lbl = labels["mu1_product"]
+    mu2_lbl = labels["mu2_trigger"]
+    gel_suffix = labels["gelation_suffix"]
     mu2_cap = float(model_biochem.mu_ratio_max)
     m1_vmin = float(mb_mu1_ml.min())
     m1_vmax = float(mb_mu1_ml.max())
@@ -530,25 +646,25 @@ def _show_mu_trigger_comparison_figure(
     if show_comsol:
         fig, axs = plt.subplots(2, 2, figsize=(14, 10))
         title = (
-            f"Gelation triggers: COMSOL vs Biochem ({case_label}; GNODE μ1/μ2 sigmoids on each field)"
+            f"Gelation triggers: COMSOL vs Biochem ({case_label}; {gel_suffix})"
             if case_label
-            else "Gelation triggers: COMSOL vs Biochem"
+            else f"Gelation triggers: COMSOL vs Biochem ({gel_suffix})"
         )
         fig.suptitle(title, fontsize=14, fontweight="bold")
         panels = (
             (axs[0, 0], mb_mu1_comsol, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax),
             (axs[0, 1], mu2_comsol, f"COMSOL: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap),
-            (axs[1, 0], mb_mu1_ml, f"Biochem: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax),
-            (axs[1, 1], mu2_ml, f"Biochem: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap),
+            (axs[1, 0], mb_mu1_ml, f"Biochem: {mu1_lbl}", "magma", m1_vmin, m1_vmax),
+            (axs[1, 1], mu2_ml, f"Biochem: {mu2_lbl}", "Reds", 0.0, mu2_cap),
         )
         for ax, values, subtitle, cmap, vmin, vmax in panels:
             _plot_field(fig, ax, pos, values, subtitle, cmap, vmin=vmin, vmax=vmax)
     else:
         fig, axs = plt.subplots(1, 2, figsize=(14, 5.5))
         title = (
-            f"Gelation triggers at final time ({case_label}; GNODE μ1/μ2)"
+            f"Gelation triggers at final time ({case_label}; {gel_suffix})"
             if case_label
-            else "Gelation triggers at final time (GNODE μ1/μ2)"
+            else f"Gelation triggers at final time ({gel_suffix})"
         )
         fig.suptitle(title, fontsize=14, fontweight="bold")
         _plot_field(
@@ -556,7 +672,7 @@ def _show_mu_trigger_comparison_figure(
             axs[0],
             pos,
             mb_mu1_ml,
-            _MU1_PRODUCT_SI_LABEL,
+            mu1_lbl,
             "magma",
             vmin=m1_vmin,
             vmax=m1_vmax,
@@ -566,7 +682,7 @@ def _show_mu_trigger_comparison_figure(
             axs[1],
             pos,
             mu2_ml,
-            _MU2_TRIGGER_LABEL,
+            mu2_lbl,
             "Reds",
             vmin=0.0,
             vmax=mu2_cap,
@@ -676,6 +792,12 @@ def _plot_field(
     fig.colorbar(tc, ax=ax, fraction=0.042, pad=0.02, shrink=0.88)
 
 
+def _species_si_from_series(series_np: np.ndarray, scales: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    fib = np.expm1(np.clip(series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
+    mat = np.expm1(np.clip(series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
+    return fib, mat
+
+
 def _show_biochem_temporal_slider(
     pos,
     pred_biochem_series_np,
@@ -687,39 +809,40 @@ def _show_biochem_temporal_slider(
     title_prefix: str = "Biochem Temporal Inspector",
     refresh_label: str = "Refresh",
 ):
-    vel_all, p_all = _vel_pressure_from_series(pred_biochem_series_np)
+    vel_all, _ = _vel_pressure_from_series(pred_biochem_series_np)
     bio_cfg = BiochemConfig(phase="biochem")
+    mu_labels = _biochem_mu_viz_labels()
     scales = bio_cfg.get_species_scales(device="cpu").cpu().numpy()
-    fib_all = np.expm1(np.clip(pred_biochem_series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
-    mat_all = np.expm1(np.clip(pred_biochem_series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
-    mu_dyn_all = _rheology_series_numpy(model_biochem, data_biochem, pred_biochem_series_np)
-    mb_mu1_all, mu2_all = _rheology_trigger_series_numpy(model_biochem, data_biochem, pred_biochem_series_np)
+    fib_all, mat_all = _species_si_from_series(pred_biochem_series_np, scales)
+    mu_dyn_all = _rheology_series_numpy(
+        model_biochem, data_biochem, pred_biochem_series_np, biochem_rollout=True
+    )
+    mb_mu1_all, mu2_all = _rheology_trigger_series_numpy(
+        model_biochem, data_biochem, pred_biochem_series_np, biochem_rollout=True
+    )
     mu2_cap = float(model_biochem.mu_ratio_max)
 
     show_comsol = comsol_series_np is not None
     ncols = 2 if show_comsol else 1
     col_b, col_c = 0, (1 if show_comsol else None)
 
-    comsol_vel = comsol_p = comsol_fib = comsol_mat = comsol_mu_dyn = None
+    comsol_vel = comsol_fib = comsol_mat = comsol_mu_dyn = None
     comsol_mb_mu1 = comsol_mu2 = None
     if show_comsol:
-        comsol_vel, comsol_p = _vel_pressure_from_series(comsol_series_np)
-        comsol_fib = np.expm1(np.clip(comsol_series_np[:, :, 12], a_min=0.0, a_max=None)) * scales[8]
-        comsol_mat = np.expm1(np.clip(comsol_series_np[:, :, 15], a_min=0.0, a_max=None)) * scales[11]
-        comsol_mu_dyn = _rheology_series_numpy(model_biochem, data_biochem, comsol_series_np)
+        comsol_vel, _ = _vel_pressure_from_series(comsol_series_np)
+        comsol_fib, comsol_mat = _species_si_from_series(comsol_series_np, scales)
+        comsol_mu_dyn = _rheology_series_numpy(
+            model_biochem, data_biochem, comsol_series_np, biochem_rollout=False
+        )
         comsol_mb_mu1, comsol_mu2 = _rheology_trigger_series_numpy(
-            model_biochem, data_biochem, comsol_series_np
+            model_biochem, data_biochem, comsol_series_np, biochem_rollout=False
         )
 
     vel_vmin = float(vel_all.min())
     vel_vmax = float(vel_all.max())
-    p_vmin = float(p_all.min())
-    p_vmax = float(p_all.max())
     if show_comsol:
         vel_vmin = min(vel_vmin, float(comsol_vel.min()))
         vel_vmax = max(vel_vmax, float(comsol_vel.max()))
-        p_vmin = min(p_vmin, float(comsol_p.min()))
-        p_vmax = max(p_vmax, float(comsol_p.max()))
 
     fib_vmin = float(min(fib_all.min(), comsol_fib.min() if show_comsol else fib_all.min()))
     fib_vmax = float(max(fib_all.max(), comsol_fib.max() if show_comsol else fib_all.max()))
@@ -741,14 +864,9 @@ def _show_biochem_temporal_slider(
     if m1_vmax <= m1_vmin + 1e-18:
         m1_vmax = m1_vmin + 1e-12
 
-    nrows = 7
-    fig, axs = plt.subplots(nrows, ncols, figsize=(7 * ncols, 26))
-    if ncols == 1:
-        axs = np.asarray(axs).reshape(nrows, 1)
-    plt.subplots_adjust(bottom=0.08, hspace=0.20)
-    fig.suptitle(f"{title_prefix} (t={custom_times[0]:.1f}s)", fontsize=16, fontweight="bold")
+    t0_label = f"t={custom_times[0]:.1f}s"
 
-    def _init_scatter(ax, values, title, cmap, vmin, vmax):
+    def _init_scatter(fig, ax, values, title, cmap, vmin, vmax):
         sc = ax.scatter(pos[:, 0], pos[:, 1], c=values[0], cmap=cmap, s=3, vmin=vmin, vmax=vmax)
         ax.set_title(title, fontsize=11)
         ax.set_aspect("equal")
@@ -756,38 +874,78 @@ def _show_biochem_temporal_slider(
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         return sc
 
+    # --- Species (SI): separate figure so the main inspector stays compact ---
+    fig_sp, axs_sp = plt.subplots(2, ncols, figsize=(7 * ncols, 8))
+    if ncols == 1:
+        axs_sp = np.asarray(axs_sp).reshape(2, 1)
+    fig_sp.suptitle(f"{title_prefix} — Species (SI) ({t0_label})", fontsize=14, fontweight="bold")
+    scatters_sp: Dict[str, Any] = {}
+    scatters_sp["fib_b"] = _init_scatter(
+        fig_sp, axs_sp[0, col_b], fib_all, "Biochem: Fibrin (SI)", "Reds", fib_vmin, fib_vmax
+    )
+    scatters_sp["mat_b"] = _init_scatter(
+        fig_sp,
+        axs_sp[1, col_b],
+        mat_all,
+        "Biochem: Surface Platelets (SI)",
+        "Oranges",
+        mat_vmin,
+        mat_vmax,
+    )
+    if show_comsol:
+        scatters_sp["fib_c"] = _init_scatter(
+            fig_sp, axs_sp[0, col_c], comsol_fib, "COMSOL: Fibrin (SI)", "Reds", fib_vmin, fib_vmax
+        )
+        scatters_sp["mat_c"] = _init_scatter(
+            fig_sp,
+            axs_sp[1, col_c],
+            comsol_mat,
+            "COMSOL: Surface Platelets (SI)",
+            "Oranges",
+            mat_vmin,
+            mat_vmax,
+        )
+
+    # --- Main: flow + effective viscosity + gelation triggers ---
+    nrows_main = 4
+    fig, axs = plt.subplots(nrows_main, ncols, figsize=(7 * ncols, 15))
+    if ncols == 1:
+        axs = np.asarray(axs).reshape(nrows_main, 1)
+    plt.subplots_adjust(bottom=0.08, hspace=0.22)
+    fig.suptitle(f"{title_prefix} — Flow & rheology ({t0_label})", fontsize=16, fontweight="bold")
+
     scatters: Dict[str, Any] = {}
-    scatters["vel_b"] = _init_scatter(axs[0, col_b], vel_all, "Biochem: |u| (ND)", "jet", vel_vmin, vel_vmax)
-    scatters["p_b"] = _init_scatter(axs[1, col_b], p_all, "Biochem: p (ND)", "coolwarm", p_vmin, p_vmax)
-    scatters["fib_b"] = _init_scatter(axs[2, col_b], fib_all, "Biochem: Fibrin (SI)", "Reds", fib_vmin, fib_vmax)
-    scatters["mat_b"] = _init_scatter(
-        axs[3, col_b], mat_all, "Biochem: Surface Platelets (SI)", "Oranges", mat_vmin, mat_vmax
+    scatters["vel_b"] = _init_scatter(
+        fig, axs[0, col_b], vel_all, "Biochem: |u| (ND)", "jet", vel_vmin, vel_vmax
     )
     scatters["mu_b"] = _init_scatter(
-        axs[4, col_b], mu_dyn_all, f"Biochem: {_MU_DYNAMIC_SI_LABEL}", "magma", mu_vmin, mu_vmax
+        fig, axs[1, col_b], mu_dyn_all, f"Biochem: {mu_labels['mu_dynamic']}", "magma", mu_vmin, mu_vmax
     )
     scatters["m1_b"] = _init_scatter(
-        axs[5, col_b], mb_mu1_all, f"Biochem: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax
+        fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", "magma", m1_vmin, m1_vmax
     )
     scatters["m2_b"] = _init_scatter(
-        axs[6, col_b], mu2_all, f"Biochem: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap
+        fig, axs[3, col_b], mu2_all, f"Biochem: {mu_labels['mu2_trigger']}", "Reds", 0.0, mu2_cap
     )
 
     if show_comsol:
-        scatters["vel_c"] = _init_scatter(axs[0, col_c], comsol_vel, "COMSOL: |u| (ND)", "jet", vel_vmin, vel_vmax)
-        scatters["p_c"] = _init_scatter(axs[1, col_c], comsol_p, "COMSOL: p (ND)", "coolwarm", p_vmin, p_vmax)
-        scatters["fib_c"] = _init_scatter(axs[2, col_c], comsol_fib, "COMSOL: Fibrin (SI)", "Reds", fib_vmin, fib_vmax)
-        scatters["mat_c"] = _init_scatter(
-            axs[3, col_c], comsol_mat, "COMSOL: Surface Platelets (SI)", "Oranges", mat_vmin, mat_vmax
+        scatters["vel_c"] = _init_scatter(
+            fig, axs[0, col_c], comsol_vel, "COMSOL: |u| (ND)", "jet", vel_vmin, vel_vmax
         )
         scatters["mu_c"] = _init_scatter(
-            axs[4, col_c], comsol_mu_dyn, f"COMSOL: {_MU_DYNAMIC_SI_LABEL}", "magma", mu_vmin, mu_vmax
+            fig,
+            axs[1, col_c],
+            comsol_mu_dyn,
+            f"COMSOL: {mu_labels['mu_dynamic']}",
+            "magma",
+            mu_vmin,
+            mu_vmax,
         )
         scatters["m1_c"] = _init_scatter(
-            axs[5, col_c], comsol_mb_mu1, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax
+            fig, axs[2, col_c], comsol_mb_mu1, f"COMSOL: {_MU1_PRODUCT_SI_LABEL}", "magma", m1_vmin, m1_vmax
         )
         scatters["m2_c"] = _init_scatter(
-            axs[6, col_c], comsol_mu2, f"COMSOL: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap
+            fig, axs[3, col_c], comsol_mu2, f"COMSOL: {_MU2_TRIGGER_LABEL}", "Reds", 0.0, mu2_cap
         )
 
     ax_slider = plt.axes([0.2, 0.02, 0.5, 0.03])
@@ -807,23 +965,24 @@ def _show_biochem_temporal_slider(
 
     def update(_):
         idx = int(time_slider.val)
+        t_lbl = f"t={custom_times[idx]:.1f}s"
         scatters["vel_b"].set_array(vel_all[idx])
-        scatters["p_b"].set_array(p_all[idx])
-        scatters["fib_b"].set_array(fib_all[idx])
-        scatters["mat_b"].set_array(mat_all[idx])
         scatters["mu_b"].set_array(mu_dyn_all[idx])
         scatters["m1_b"].set_array(mb_mu1_all[idx])
         scatters["m2_b"].set_array(mu2_all[idx])
+        scatters_sp["fib_b"].set_array(fib_all[idx])
+        scatters_sp["mat_b"].set_array(mat_all[idx])
         if show_comsol:
             scatters["vel_c"].set_array(comsol_vel[idx])
-            scatters["p_c"].set_array(comsol_p[idx])
-            scatters["fib_c"].set_array(comsol_fib[idx])
-            scatters["mat_c"].set_array(comsol_mat[idx])
             scatters["mu_c"].set_array(comsol_mu_dyn[idx])
             scatters["m1_c"].set_array(comsol_mb_mu1[idx])
             scatters["m2_c"].set_array(comsol_mu2[idx])
-        fig.suptitle(f"{title_prefix} (t={custom_times[idx]:.1f}s)", fontsize=16, fontweight="bold")
+            scatters_sp["fib_c"].set_array(comsol_fib[idx])
+            scatters_sp["mat_c"].set_array(comsol_mat[idx])
+        fig.suptitle(f"{title_prefix} — Flow & rheology ({t_lbl})", fontsize=16, fontweight="bold")
+        fig_sp.suptitle(f"{title_prefix} — Species (SI) ({t_lbl})", fontsize=14, fontweight="bold")
         fig.canvas.draw_idle()
+        fig_sp.canvas.draw_idle()
 
     time_slider.on_changed(update)
     plt.show()
@@ -836,6 +995,7 @@ def run_phase_comparison(
     biochem_checkpoint: Optional[str] = None,
     anchor_stem: Optional[str] = None,
     teacher_only: bool = False,
+    fast_viz: Optional[bool] = None,
 ):
     root = get_project_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -845,8 +1005,11 @@ def run_phase_comparison(
         print(f"📍 Data source: COMSOL anchor graph")
     else:
         print(f"🎲 Geometry seed: {seed}")
-    fast_mode = (os.environ.get("VIZ_FAST", "1").strip().lower() not in ("0", "false", "no", "off"))
-    print(f"⚡ Fast visualization mode: {'ON' if fast_mode else 'OFF'}")
+    fast_mode = _viz_fast_enabled(fast_viz)
+    print(
+        f"⚡ Fast visualization mode: {'ON' if fast_mode else 'OFF'} "
+        f"(dense COMSOL-spaced rollout; use --full-viz or VIZ_FAST=0 for high-fidelity)"
+    )
     refresh_state = {"requested": False}
 
     data_kine_base = None
@@ -1024,7 +1187,7 @@ def run_phase_comparison(
         t_ref = float(bio_cfg.t_final)
         t_final_si = float(dense_times_si_full[-1].item())
         n_full = int(dense_times_si_full.numel())
-        default_mode = "keyframes" if fast_mode else "dense"
+        default_mode = "dense"
         time_mode = (os.environ.get("VIZ_BIOCHEM_TIME_MODE", default_mode) or default_mode).strip().lower()
         extend_mult_default = 1.2 if fast_mode else 1.5
         try:
@@ -1032,7 +1195,7 @@ def run_phase_comparison(
         except ValueError:
             extend_mult = extend_mult_default
         extend_mult = max(1.0, extend_mult)
-        custom_times = [0.0, t_final_si * 0.33, t_final_si * 0.66, t_final_si, t_final_si * extend_mult]
+        custom_times = _slider_keyframe_times_si(dense_times_si_full, t_final_si, extend_mult)
 
         if time_mode in ("keyframe", "keyframes", "sparse"):
             rollout_times_si = torch.tensor(custom_times, device=device, dtype=torch.float32)
@@ -1045,7 +1208,7 @@ def run_phase_comparison(
         else:
             # Each macro step runs a full DEQ-style kinematics solve + an ODE segment — interactive viz
             # must subsample the COMSOL-sized grid (often ~60+ steps) or a single run can take many minutes.
-            n_cap_default = "8" if fast_mode else "16"
+            n_cap_default = "12" if fast_mode else "16"
             n_cap_raw = (os.environ.get("VIZ_BIOCHEM_MACRO_STEPS") or n_cap_default).strip()
             if n_cap_raw == "0" or (n_cap_raw.lower() in ("full", "all")):
                 n_macro_use = n_full
@@ -1055,9 +1218,11 @@ def run_phase_comparison(
                 except ValueError:
                     n_cap = int(n_cap_default)
                 n_macro_use = min(n_full, n_cap)
-            dense_times_si = torch.linspace(
-                0.0, t_final_si, steps=n_macro_use, device=device, dtype=torch.float32
-            )
+            if n_macro_use >= n_full:
+                dense_times_si = dense_times_si_full
+            else:
+                idx = torch.linspace(0, n_full - 1, steps=n_macro_use, device=device).round().long()
+                dense_times_si = dense_times_si_full[idx]
             dense_times = to_t_nd(dense_times_si, t_ref)
             dt_si = float((dense_times_si[1] - dense_times_si[0]).item())
             if dt_si <= 0.0:
@@ -1152,19 +1317,13 @@ def run_phase_comparison(
             pos, vel_kine_base, p_kine_base, mu_kine_base, case_label=case_label
         )
 
-    # --- FIGURE 2: COMSOL-style dynamic viscosity at final rollout time ---
-    with torch.no_grad():
-        pred_bt = torch.from_numpy(pred_biochem_np).to(
-            device=data_biochem.x.device, dtype=torch.float32
-        )
-        _, _, _, mu_dyn_bt = _biochem_rheology_fields(model_biochem, data_biochem, pred_bt)
-    mu_dyn_np = mu_dyn_bt.detach().cpu().numpy()
+    # --- FIGURE 2: rollout μ_eff at final time (stored channel; matches forward coupling) ---
+    mu_labels = _biochem_mu_viz_labels()
+    mu_dyn_np = _rollout_mu_eff_si_numpy(model_biochem.phys_cfg, pred_biochem_np)
 
     comsol_mu_dyn_np = None
     if use_anchor and comsol_final_np is not None:
-        comsol_bt = torch.from_numpy(comsol_final_np).to(device=data_biochem.x.device, dtype=torch.float32)
-        _, _, _, comsol_mu_dyn_bt = _biochem_rheology_fields(model_biochem, data_biochem, comsol_bt)
-        comsol_mu_dyn_np = comsol_mu_dyn_bt.detach().cpu().numpy()
+        comsol_mu_dyn_np = _rollout_mu_eff_si_numpy(model_biochem.phys_cfg, comsol_final_np)
 
     mu_si_vmin = float(mu_dyn_np.min())
     mu_si_vmax = float(mu_dyn_np.max())
@@ -1178,7 +1337,7 @@ def run_phase_comparison(
     fig2, axs2 = plt.subplots(1, n_rheo_cols, figsize=(7 * n_rheo_cols, 5.5))
     axs2 = np.atleast_1d(axs2)
     fig2.suptitle(
-        f"Dynamic viscosity at final time ({case_label}; {_MU_DYNAMIC_SI_LABEL})",
+        f"Dynamic viscosity at final time ({case_label}; {mu_labels['mu_dynamic']})",
         fontsize=14,
         fontweight="bold",
     )
@@ -1189,7 +1348,7 @@ def run_phase_comparison(
             axs2[col_i],
             pos,
             comsol_mu_dyn_np,
-            f"COMSOL: {_MU_DYNAMIC_SI_LABEL}",
+            f"COMSOL: {mu_labels['mu_dynamic']}",
             "magma",
             vmin=mu_si_vmin,
             vmax=mu_si_vmax,
@@ -1200,17 +1359,21 @@ def run_phase_comparison(
         axs2[col_i],
         pos,
         mu_dyn_np,
-        f"Biochem: {_MU_DYNAMIC_SI_LABEL}",
+        f"Biochem: {mu_labels['mu_dynamic']}",
         "magma",
         vmin=mu_si_vmin,
         vmax=mu_si_vmax,
     )
     fig2.tight_layout(rect=(0, 0.03, 1, 0.92))
 
-    mb_mu1_ml, mu2_ml = _trigger_fields_numpy(model_biochem, data_biochem, pred_biochem_np)
+    mb_mu1_ml, mu2_ml = _trigger_fields_numpy(
+        model_biochem, data_biochem, pred_biochem_np, biochem_rollout=True
+    )
     mb_mu1_comsol = mu2_comsol = None
     if use_anchor and comsol_final_np is not None:
-        mb_mu1_comsol, mu2_comsol = _trigger_fields_numpy(model_biochem, data_biochem, comsol_final_np)
+        mb_mu1_comsol, mu2_comsol = _trigger_fields_numpy(
+            model_biochem, data_biochem, comsol_final_np, biochem_rollout=False
+        )
     _show_mu_trigger_comparison_figure(
         pos,
         model_biochem,
@@ -1219,6 +1382,7 @@ def run_phase_comparison(
         case_label=case_label,
         mb_mu1_comsol=mb_mu1_comsol,
         mu2_comsol=mu2_comsol,
+        mu_labels=mu_labels,
     )
 
     def _request_refresh():
@@ -1303,7 +1467,15 @@ if __name__ == "__main__":
             "Same as VIZ_BIOCHEM_REQUIRE_TEACHER=1."
         ),
     )
+    parser.add_argument(
+        "--full-viz",
+        action="store_true",
+        help="Disable fast viz (dense rollout up to 16+ macro steps, finer ODE; sets VIZ_FAST=0).",
+    )
     args = parser.parse_args()
+
+    if args.full_viz:
+        os.environ["VIZ_FAST"] = "0"
 
     if args.list_anchors:
         stems = _list_anchor_stems()
@@ -1351,6 +1523,7 @@ if __name__ == "__main__":
             biochem_checkpoint=args.biochem_checkpoint,
             anchor_stem=current_anchor,
             teacher_only=args.teacher_only,
+            fast_viz=not args.full_viz,
         )
         if not refresh_requested:
             break

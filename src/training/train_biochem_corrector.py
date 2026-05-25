@@ -334,7 +334,12 @@ from src.utils.paths import (
     stage_b_dir,
     resolve_checkpoint,
 )
-from src.architecture.gnode_biochem import GNODE_Phase3, biochem_truth_node_mask
+from src.architecture.gnode_biochem import (
+    GNODE_Phase3,
+    _biochem_mu_disable_explicit_gelation,
+    biochem_explicit_gelation_terms,
+    biochem_truth_node_mask,
+)
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.core_physics.biochem_physics_kernels import BiochemPhysicsKernels
 from src.core_physics.kinematics_clot_prior import clot_prior_score_flat
@@ -5031,13 +5036,20 @@ def _compute_slice_viz_health_metrics(
     species_si = model.species_log_nd_to_si(sp_safe)
     fi_si = species_si[:, 8:9]
     mat_si = species_si[:, 11:12]
-    mu1 = model.mu1_sigmoid(mat_si) if hasattr(model, "mu1_sigmoid") else torch.zeros_like(fi_si)
-    mu2 = model.mu2_sigmoid(fi_si) if hasattr(model, "mu2_sigmoid") else torch.zeros_like(fi_si)
+    mu1, mu2 = biochem_explicit_gelation_terms(model, fi_si, mat_si)
     out["mu1_mean"] = float(mu1.mean().item())
     out["mu2_mean"] = float(mu2.mean().item())
     out["mu2_p90"] = float(torch.quantile(mu2.view(-1), 0.9).item())
-    mu2_thr = max(float(os.environ.get("BIOCHEM_VIZ_MU2_FLOOD_THRESH", "10.0")), 0.0)
-    out["clot_frac"] = float((mu2.view(-1) >= mu2_thr).float().mean().item())
+    if _biochem_mu_disable_explicit_gelation():
+        mu_eff_si = phys_cfg.viscosity_nd_to_si(pred_slice[:, mu_ch]).view(-1).float()
+        clot_thr_si = float((os.environ.get("BIOCHEM_VIZ_CLOT_MU_SI_THRESH") or "").strip() or "0")
+        if clot_thr_si <= 0.0:
+            ratio_max = max(float(os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX", "20.0")), 1.0)
+            clot_thr_si = float(phys_cfg.mu_inf) * ratio_max
+        out["clot_frac"] = float((mu_eff_si >= clot_thr_si).float().mean().item())
+    else:
+        mu2_thr = max(float(os.environ.get("BIOCHEM_VIZ_MU2_FLOOD_THRESH", "10.0")), 0.0)
+        out["clot_frac"] = float((mu2.view(-1) >= mu2_thr).float().mean().item())
 
     if hasattr(model, "_last_mu_trigger_gate") and model._last_mu_trigger_gate is not None:
         out["gate_mean_all"] = float(model._last_mu_trigger_gate.view(-1).float().mean().item())

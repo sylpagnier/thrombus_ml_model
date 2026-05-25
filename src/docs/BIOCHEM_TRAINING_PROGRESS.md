@@ -52,7 +52,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Pass** | ~1.43–1.45 |
 | Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **Sentinel @34ep: 0.294** (SPAGNIER), **0.367** (SILKSPECTRE); warm leash **0.223**; **visc3h** **0.408** (`L5` MU_LOG) / **0.917** (`L1` leash+soft wall) / high-μ ckpt **0.517** (`L6`); cold soft-gate **0.758** @ep10 then **2.67** @ep25; gate-fix-18ep **0.509**; overnight **0.387** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Fail** | **health10h**: all legs **viz_t0≈0.25–0.35**; **`viz_mu2=80` / `clot_frac=1` on K0/S0/M1** — metric reads raw FI sigmoid, not `μ_eff` (§85) |
+| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Fail** | **S0 viz**: t0 rollout **better than K0** but **slider1 open-loop clot flood** (§88); steady GINO-DEQ **inlet-only**; manifest **viz_t0≈0.25–0.35**; **`viz_mu2` broken** (§85) |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
@@ -749,12 +749,12 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Console** (visc3h sweep): `W·L_MuLogWall≈7.5`, `W·L_MuLogHigh≈1.8`, `W·L_MuSI=2`, `DETACH_MACRO=0`, floors **0.0** in sentinel preset; train `gate_all~0.48` ep0 (not clot-saturated).
 - **Readout**: Sentinel **wall log-μ weighting does not fix** wall-gate starvation on val or COMSOL-like gelation channel; FI/Mat sigmoid path still wrong in rollout.
 
-### 85. `viz_final_mu2_mean` / `clot_frac` read raw FI sigmoid, not effective μ (2026-05-25)
+### 85. `viz_final_mu2_mean` / `clot_frac` read raw FI sigmoid, not effective μ (2026-05-25) — **fixed**
 
-- **Symptom**: **health10h** manifest shows **`viz_final_mu2_mean=80`** and **`clot_frac=1.0`** on **K0** (Carreau-only), **S0** (no explicit gel), **M1** (`DISABLE_MU2`) — identical across ablations.
-- **Cause**: `_compute_slice_viz_health_metrics` always evaluates **`mu2_sigmoid(FI_si)`** from species; ignores `BIOCHEM_MU_DISABLE_MU2`, `MU2_SIGMOID_CAP`, `MU_SIMPLE_LOG_RESIDUAL`, and what enters **`μ_eff`**.
-- **Fix (next code)**: report **effective** μ₁/μ₂ contribution (or post-forward debug tensors), or zero viz μ₂ when disabled.
-- **Status**: Documented; **do not** sort ablation legs on `viz_mu2` / `clot_frac` until fixed. **`viz_t0_speed_mean`** still useful (and shows shared weak t0 flow **~0.25–0.35**).
+- **Symptom**: **health10h** manifest showed **`viz_final_mu2_mean=80`** and **`clot_frac=1.0`** on **K0** / **S0** / **M1** identically.
+- **Cause**: `_compute_slice_viz_health_metrics` and `visualize_pipeline` used raw species sigmoids / COMSOL-style **`μ_b×(μ₁+μ₂)`** regardless of forward ablations.
+- **Fix**: **`biochem_explicit_gelation_terms()`** (`gnode_biochem.py`); training viz health uses **effective** μ₁/μ₂; **`clot_frac`** from rollout **`μ_eff`** when explicit gel is off; viz uses **stored `μ_eff` channel** for biochem panels (COMSOL: stored **`μ_eff`** + species sigmoids for trigger rows only).
+- **Status**: Re-run sweeps to refresh manifest **`viz_mu2` / `clot_frac`** columns; old rows are stale.
 
 ### 86. **health10h** architecture sweep (9 legs, cold K0 pretrain → warm rest, viz-health ranking): **S0** wins scoreboard (2026-05-25)
 
@@ -779,6 +779,25 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
   - **`viz_t0_speed_mean≈0.25–0.35`** on all legs (target healthy **~1.2–1.5**). Score still ranks **S0** first mainly via **lower final logMAE** + slightly higher t0 speed (**0.35**); **kinematic backbone / IC rollout** issue is **shared**, not fixed by architecture leg alone.
 - **Gemini / sentinel**: **G0/G1** did **not** beat **S0** on viz score or logMAE; additive Δlogμ + symmetric clip **not** the winning knob in this 22ep budget. **G0** `gate→0` late (good) but val all **~1.46**; **R0** ep04 dip **0.827** then regress — same leash pathology as §74–84.
 - **Readout**: **Promote S0** for full viz + optional longer run (leash vs pure `MU_LOG`); **M2** as logMAE/wall runner-up. **Fix viz μ₂/clot_frac** to reflect effective μ path before next sweep sorts on them. **K0** confirms weak t0 flow is **upstream of clot heads** (still **|u|~0.25**). Next: viz **S0**, **M2**, **R0** (baseline), **K0** (kinematic sanity); compare **`μ_eff` panels**, not raw μ₂ debug.
+
+### 87. K0 viz (`health10h` / `K0_carreau_kinematic`): weak flow is **biochem rollout path**, not standalone GINO-DEQ (2026-05-25)
+
+- **Ckpt**: `outputs/biochem/sweep_health_arch_10h/K0_carreau_kinematic/biochem_teacher_best_high_mu.pth` — `run_note=health10h_K0_carreau_kinematic_ep8`, val all **1.463** (flat), ep7.
+- **Training reality**: teacher **`L_kine≈1.570` constant** all 8 ep (`DATA_KINE` isolate, kin/bio/ODE/mu frozen) — K0 did **not** materially fit velocity; checkpoint ≈ shared cold pretrain + frozen stack.
+- **Temporal inspector (patient007)**: Biochem **|u|≈0** at **t=0** and still **≪ COMSOL** at **t≈9540 s**; **p** nearly flat (~−0.5 ND) vs COMSOL inlet→outlet gradient. **Small drift over time** is expected: forward still **integrates frozen ODE** species between macro knots and recomputes Carreau **γ̇(u,v)** each step — not a steady single-shot solve.
+- **Gelation 2×2 panel**: Biochem **μ₂(FI)≈80 domain-wide** but **μ₁ product ≈0** — **misleading for K0**: `visualize_pipeline._biochem_rheology_fields` always plots **raw `mu1_sigmoid`/`mu2_sigmoid` on rolled-out species**, while forward with `BIOCHEM_MU_CARREAU_ONLY=1` uses **`μ_eff = μ_kin(γ̇)` only** (no explicit gelation in `μ_eff`). Do **not** read K0 gelation figures as “model clotting.”
+- **Fair kinematics comparison**: same run also opens **`Kinematics (GINO-DEQ), steady — patient007`** (`kinematics_best.pth`, one-shot on biochem mesh). If that window shows healthy **|u|~1+** while temporal slider stays weak, the bug is **biochem coupled macro rollout** (DEQ + `mu_encoder` feedback + resting species IC + low-shear Carreau lockup), **not** the kinematics backbone weights.
+- **Readout**: K0 **does not** clear the “healthy kin baseline” hypothesis on **biochem rollout**; it only shows clot architecture is off in **`μ_eff`**. Next compare **steady GINO-DEQ figure** vs **Biochem `μ_eff` channel** at final time (Figure 2 dynamic viscosity), then viz **S0** (best scoreboard leg).
+
+### 88. S0 viz (`health10h` / `S0_simple_residual`): better **t=0** rollout, **open-loop ODE blow-up** by first keyframe (2026-05-25)
+
+- **Ckpt**: `…/S0_simple_residual/biochem_teacher_best_high_mu.pth` — ep21, val all **0.451**, `run_note=health10h_S0_simple_residual_ep22`.
+- **t=0 (slider 0)**: Biochem **|u|** faint but **non-zero** lumen structure vs K0 **≈0**; **p** still flat vs COMSOL; species / trigger rows **at rest** (black / white) — matches resting prior before first ODE segment.
+- **t≈2623 s (slider 1, first post-IC keyframe)**: **Global pathology** — Biochem **FI ~4–5×10³** domain-wide (COMSOL **0**); **μ₂ trigger → cap** (~50 in slider, ~80 in static gelation fig); slider **μ_b×(μ₁+μ₂)** **~6–7.5 Pa·s** everywhere; **|u|→0**, **p** flat. **One macro jump** (~2623 s) with **viz `teacher_forcing_ratio=0`** and **frozen ODE** (`TRAIN_ODE=0` in sweep) — not the TBPTT+anchor-supervised regime that earned **0.451** logMAE.
+- **Forward vs display viscosity (S0)**: training uses **`BIOCHEM_MU_SIMPLE_LOG_RESIDUAL=1`** → **`μ_eff = μ_kin × exp(Δlogμ)`**, **no** explicit μ₁/μ₂ in forward. Temporal slider rows 4–6 and Figure 2 **recompute** COMSOL-style **`μ_b×(1+μ₁+μ₂)`** via `_biochem_rheology_fields` on rolled-out species — **overstates** clot when FI explodes open-loop (§85). For S0, also inspect **stored `mu_eff` ND channel** in the rollout tensor (Figure 1 steady kin panel uses GINO-DEQ, not this channel).
+- **Steady GINO-DEQ (same run)**: **|u|** inlet core **~1.5–1.7** ND but **mostly dark downstream**; **μ_eff** lumen core **elevated** (yellow ~5–8 ND) — **better than biochem rollout** at all slider times, **not** a perfect COMSOL match. Confirms **kin backbone partially OK**, **coupled rollout + chemistry integration** is the failure mode.
+- **Gelation 2×2 (final time)**: same **global μ₂ flood** as K0 — **diagnostic sigmoid on species**, not S0’s trained **`μ_eff`** path.
+- **Readout**: **S0 improves first-step kinematics vs K0** but **does not** fix open-loop rollout health; **do not promote** from val logMAE alone. Next: viz **M2**; optional **`VIZ_BIOCHEM_TIME_MODE=dense`** or shorter first Δt; fix viz to plot **effective `μ_eff`** when `SIMPLE_LOG_RESIDUAL` / `CARREAU_ONLY` / `DISABLE_MU2`.
 
 ---
 
@@ -1135,7 +1154,7 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-24 | **visc3h** `L5_mu_log_suppress` (`MU_LOG` isolate, suppressor, **no leash**, `DETACH=1`) | **0.408** (ep17) | **2.228** | **0.404** | high **1.152** | **Best val all** in sweep; **`gate_clot~0.3`**; **viz velocity** before promote |
 | 2026-05-24 | **visc3h** `L6_sentinel_leash` (`sweep_wall_sentinel` + leash) | **0.995** (ep14) | **2.229** | **0.395** | high **0.517** | **`W·L_MuLogWall≈7.5`** train; global high-μ ckpt; **viz FAIL**: t=0 **u** weak; **μ₂~80** / **μ₁~0**; uniform late μ; val **`gate_wall=0`** despite wall loss (`run.jsonl` `20260524T191651Z`) |
 | 2026-05-24 | **visc3h** `L7_early_stop` (L1 stack + target all≤0.65) | **0.958** (ep16) | **2.229** | **0.394** | high **0.569** | Early-stop threshold **not hit** (best all 0.958); similar to L1 |
-| 2026-05-25 | **health10h** `S0_simple_residual` (`MU_LOG`, `SIMPLE_LOG_RESIDUAL`, 22ep warm) | **0.451** (ep20) | **1.743** | **0.346** viz t0 \|u\| | high **1.12** | **Best viz_health 13.37**; `gate=n/a`; manifest `20260524T230926Z` |
+| 2026-05-25 | **health10h** `S0_simple_residual` (`MU_LOG`, `SIMPLE_LOG_RESIDUAL`, 22ep warm) | **0.451** (ep20) | **1.743** | **0.346** viz t0 \|u\| | high **1.12** | **Best viz_health 13.37**; **viz patient007**: t0 rollout **>K0**; slider1 **FI/μ₂ global flood**, **u→0** (§88); steady GINO-DEQ **partial** |
 | 2026-05-25 | **health10h** `S1_simple_residual_leash` (S0 + data leash) | **0.555** (ep04) | **1.774** | **0.236** | high **1.26** | viz **14.10**; worse t0 speed than S0 |
 | 2026-05-25 | **health10h** `M2_no_explicit_gel` (leash, Δ heads only) | **0.417** (ep18) | **2.148** | **0.253** | high **1.46** | **Best all logMAE** in sweep; viz **14.41** |
 | 2026-05-25 | **health10h** `R0_ref_leash` (visc3h L0 stack) | **0.827** (ep04) | **2.556** | **0.253** | high **1.25** | ep04 best then regress; viz **14.58** |
@@ -1143,7 +1162,7 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **health10h** `M0_mu2_cap_leash` (`MU2_SIGMOID_CAP=8`) | **1.016** (ep10) | **2.643** | **0.262** | high **0.756** | viz **15.05**; high-μ ok, all weak |
 | 2026-05-25 | **health10h** `G1_gemini_mu_log` (`sweep_gemini`, `MU_LOG`) | **1.468** (ep16) | **2.428** | **0.267** | high **0.868** | viz **15.11**; Gemini **not** best |
 | 2026-05-25 | **health10h** `G0_gemini_leash` (Gemini + leash + sentinel wall w) | **1.465** (ep04) | **2.403** | **0.260** | high **0.864** | viz **15.13**; `gate→0` late |
-| 2026-05-25 | **health10h** `K0_carreau_kinematic` (`DATA_KINE`, Carreau-only, 8ep cold) | **1.463** (ep04) | **2.053** | **0.251** | high **1.16** | **No μ train**; viz **15.17**; t0 still weak |
+| 2026-05-25 | **health10h** `K0_carreau_kinematic` (`DATA_KINE`, Carreau-only, 8ep cold) | **1.463** (ep04) | **2.053** | **0.251** | high **1.16** | **No μ train**; viz **15.17**; t0 still weak; **viz**: biochem rollout \|u\|≈0 all t; gelation panel μ₂=80 is **diag-only** (§87) |
 
 ---
 
