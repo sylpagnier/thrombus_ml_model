@@ -221,7 +221,9 @@ def quantify_performance(
     """
     model.eval()
 
-    val_progress = os.environ.get("KINEMATICS_VAL_PROGRESS", "1").strip().lower() not in ("0", "false", "no", "off")
+    from src.utils.kinematics_console import kinematics_val_progress_enabled
+
+    val_progress = kinematics_val_progress_enabled()
 
     metrics: Dict[str, List[float]] = {
         "rel_l2": [],

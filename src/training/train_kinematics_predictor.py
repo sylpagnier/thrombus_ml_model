@@ -36,6 +36,7 @@ from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.paths import kinematics_dir
 from src.utils.training_diary import TrainingDiary
 from src.utils.channel_schema import KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
+from src.utils.kinematics_console import kinematics_tqdm_enabled
 from src.utils.kinematics_geometry import (
     GeometryCurriculumConfig,
     attach_geometry_metadata,
@@ -49,14 +50,6 @@ from src.utils.kinematics_geometry import (
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
-
-
-def kinematics_tqdm_enabled() -> bool:
-    """Progress bars spam logs when tee'd to a file; disable via KINEMATICS_QUIET=1 or KINEMATICS_TQDM=0."""
-    if os.environ.get("KINEMATICS_QUIET", "").strip().lower() in ("1", "true", "yes", "on"):
-        return False
-    raw = os.environ.get("KINEMATICS_TQDM", "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
 
 # -------------------------------------------------------------------------
 # Curriculum Definitions
@@ -1102,6 +1095,8 @@ if __name__ == "__main__":
 
     if args.quiet:
         os.environ["KINEMATICS_QUIET"] = "1"
+        os.environ["KINEMATICS_VAL_PROGRESS"] = "0"
+        os.environ["KINEMATICS_TQDM"] = "0"
 
     if args.fresh and args.resume is not None:
         raise ValueError("Cannot use --fresh together with --resume.")

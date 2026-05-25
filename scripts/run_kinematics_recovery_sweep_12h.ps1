@@ -23,8 +23,10 @@ Set-Location $RepoRoot
 
 # April best used ~2000 graphs; cap avoids RAM blow-up when 3000 .pt files exist on disk.
 $env:KINEMATICS_GRAPH_CAP = "2000"
-# Quiet logs: no tqdm percent spam (epoch + val lines only).
+# Quiet logs: no tqdm on train/val/load (epoch + val summary lines only).
 $env:KINEMATICS_QUIET = "1"
+$env:KINEMATICS_VAL_PROGRESS = "0"
+$env:KINEMATICS_TQDM = "0"
 
 $hostName = $env:COMPUTERNAME
 $SweepDir = Join-Path $RepoRoot "outputs\kinematics\sweep_recovery_12h"
@@ -292,6 +294,8 @@ foreach ($legId in $Legs) {
     Clear-KinematicsSweepEnv
     $env:KINEMATICS_GRAPH_CAP = "2000"
     $env:KINEMATICS_QUIET = "1"
+    $env:KINEMATICS_VAL_PROGRESS = "0"
+    $env:KINEMATICS_TQDM = "0"
     $outDir = Join-Path $legDir "kinematics_out"
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     $env:KINEMATICS_OUTPUT_DIR = $outDir
