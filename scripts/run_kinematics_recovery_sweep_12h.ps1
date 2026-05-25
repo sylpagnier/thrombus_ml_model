@@ -211,7 +211,7 @@ if ($Legs.Count -eq 0) { $Legs = @($DefaultLegOrder) }
 
 $nGraphs = Get-GraphCount
 if ($nGraphs -lt 50) {
-    Write-Host "WARNING: only $nGraphs graphs in $GraphDir — run backfill / check data path." -ForegroundColor Red
+    Write-Host "WARNING: only $nGraphs graphs in $GraphDir - run backfill / check data path." -ForegroundColor Red
 }
 
 $estMinPerEp = 3.0
@@ -221,7 +221,7 @@ $estHours = ($totalEp * $estMinPerEp) / 60.0
 Write-Host ""
 Write-Host "Kinematics recovery sweep (~12h target)" -ForegroundColor Cyan
 Write-Host "  graphs: $nGraphs in graphs_kinematics/newtonian (main tree, pre-A/B)" -ForegroundColor DarkGray
-Write-Host "  legs:   $($Legs.Count)  total_epochs≈$totalEp  est≈$([math]::Round($estHours,1))h @ ${estMinPerEp}m/ep" -ForegroundColor DarkGray
+Write-Host "  legs:   $($Legs.Count)  total_epochs~$totalEp  est~$([math]::Round($estHours,1))h @ ${estMinPerEp}m/ep" -ForegroundColor DarkGray
 Write-Host "  archive: $SweepDir" -ForegroundColor DarkGray
 Write-Host "  target:  val Rel L2 < 0.05 (Apr best ~0.10 @ ep 84 / 2000 graphs)" -ForegroundColor DarkGray
 Write-Host ""
