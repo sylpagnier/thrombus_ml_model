@@ -20,19 +20,38 @@ def vessel_index_from_stem(stem: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def read_geometry_level_from_mesh_json(mesh_input_dir: Path, stem: str) -> Optional[int]:
-    """Read ``level`` from ``vessel_<id>.json`` written by ``vessel_generator``."""
+def read_mesh_sidecar_json(mesh_input_dir: Path, stem: str) -> Optional[dict]:
     json_path = mesh_input_dir / f"{stem}.json"
     if not json_path.is_file():
         return None
     try:
         with open(json_path, encoding="utf-8") as f:
-            meta = json.load(f)
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def read_geometry_level_from_mesh_json(mesh_input_dir: Path, stem: str) -> Optional[int]:
+    """Read ``level`` from ``vessel_<id>.json`` written by ``vessel_generator``."""
+    meta = read_mesh_sidecar_json(mesh_input_dir, stem)
+    if meta is None:
+        return None
+    try:
         level = meta.get("level")
         if level is None:
             return None
         return int(level)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
+        return None
+
+
+def read_bend_sign_from_mesh_json(mesh_input_dir: Path, stem: str) -> Optional[float]:
+    meta = read_mesh_sidecar_json(mesh_input_dir, stem)
+    if meta is None or meta.get("bend_sign") is None:
+        return None
+    try:
+        return float(meta["bend_sign"])
+    except (TypeError, ValueError):
         return None
 
 
@@ -67,6 +86,9 @@ def attach_geometry_metadata(
         data.geometry_level = torch.tensor([-1], dtype=torch.int8)
     else:
         data.geometry_level = torch.tensor([int(level)], dtype=torch.int8)
+    bs = read_bend_sign_from_mesh_json(mesh_input_dir, stem) if stem else None
+    if bs is not None:
+        data.bend_sign = torch.tensor([float(bs)], dtype=torch.float32)
     return data
 
 

@@ -149,6 +149,22 @@ _CURVE_WEIGHTS: Dict[int, Dict[str, float]] = {
 }
 
 
+def resolve_bend_sign_mode(explicit: Optional[str] = None) -> str:
+    """
+    ``down_only``: historical arcs (bend_sign=+1) and non-flipped S-curves (Apr-2026 style).
+    ``bidirectional``: random mirror for L1+ arc/hook and signed S-curve (default since May 2026).
+    """
+    raw = (explicit or os.environ.get("KINEMATICS_BEND_SIGN_MODE", "bidirectional")).strip().lower()
+    if raw in ("down_only", "down", "legacy", "historical", "apr26"):
+        return "down_only"
+    if raw in ("bidirectional", "both", "up_down", "default", "may26"):
+        return "bidirectional"
+    raise ValueError(
+        f"Unknown bend sign mode {raw!r}; use 'down_only' or 'bidirectional' "
+        "(or env KINEMATICS_BEND_SIGN_MODE)."
+    )
+
+
 def default_level_mix(n: int) -> Dict[int, int]:
     """Default kinematics cohort: mostly L0/L1, ~20% high-thrombus (L2)."""
     n = max(1, int(n))
@@ -308,13 +324,20 @@ def _sample_params(
         amp_mag = min(float(rng.uniform(0.003, 0.007)), L * 0.15)
         amplitude = amp_mag
 
-    # Level 1/2: arc/hook can bend up (+y) or down (-y); s_curve uses signed amplitude.
+    bend_mode = resolve_bend_sign_mode()
     bend_sign = 1.0
     if level >= 1:
         if curve_type in ("arc", "hook"):
-            bend_sign = float(rng.choice([-1.0, 1.0]))
+            bend_sign = (
+                1.0
+                if bend_mode == "down_only"
+                else float(rng.choice([-1.0, 1.0]))
+            )
         elif curve_type == "s_curve":
-            amplitude *= float(rng.choice([-1.0, 1.0]))
+            if bend_mode == "bidirectional":
+                amplitude *= float(rng.choice([-1.0, 1.0]))
+            else:
+                amplitude = abs(float(amplitude))
 
     return {
         "idx": idx,
@@ -325,6 +348,7 @@ def _sample_params(
         "angle_span": angle_span,
         "amplitude": amplitude,
         "bend_sign": bend_sign,
+        "bend_sign_mode": bend_mode,
         "jitter": [],
         "tortuosity": tortuosity,
         "noise_top": noise_top,
@@ -468,6 +492,8 @@ def _build_and_mesh(
             "type": f"{v_type}_{curve_type}",
             "curve": curve_type,
             "level": params["level"],
+            "bend_sign": float(params.get("bend_sign", 1.0)),
+            "bend_sign_mode": str(params.get("bend_sign_mode", resolve_bend_sign_mode())),
             "unit": unit,
             "d_bar": d_bar,
             "d_inlet": float(np.linalg.norm(top_coords[0] - bot_coords[0])),

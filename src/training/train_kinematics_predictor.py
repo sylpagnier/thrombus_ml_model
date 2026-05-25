@@ -113,9 +113,14 @@ def load_dataset(
     attach_geometry: bool = True,
 ):
     cfg = VesselConfig(phase=phase)
-    data_dir = cfg.graph_output_dir
-    if rheology:
-        data_dir = data_dir / str(rheology).lower()
+    if phase == "kinematics" and rheology:
+        from src.utils.kinematics_paths import kinematics_graph_rheology_dir
+
+        data_dir = kinematics_graph_rheology_dir(rheology)
+    else:
+        data_dir = cfg.graph_output_dir
+        if rheology:
+            data_dir = data_dir / str(rheology).lower()
 
     if not data_dir.exists():
         raise FileNotFoundError(

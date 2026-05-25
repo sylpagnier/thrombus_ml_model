@@ -147,11 +147,16 @@ class MeshToGraphComplete:
             self.label_dir = self.label_dir / n_subdir
 
         # Resolve Processed Dir
+        use_kin_rheo_dir = phase == "kinematics" and inferred_rheology
         if proc_dir:
             self.proc_dir = Path(proc_dir)
+        elif use_kin_rheo_dir:
+            from src.utils.kinematics_paths import kinematics_graph_rheology_dir
+
+            self.proc_dir = kinematics_graph_rheology_dir(inferred_rheology)
         else:
             self.proc_dir = self.root / self.vessel_cfg.graph_output_dir
-        if n_subdir:
+        if n_subdir and not use_kin_rheo_dir:
             self.proc_dir = self.proc_dir / n_subdir
 
         if phase == "kinematics":
@@ -552,6 +557,8 @@ class MeshToGraph(MeshToGraphComplete):
             data.geometry_level = torch.tensor([int(meta["level"])], dtype=torch.int8)
         else:
             attach_geometry_metadata(data, mesh_input_dir=self.raw_dir, stem=stem)
+        if meta is not None and meta.get("bend_sign") is not None:
+            data.bend_sign = torch.tensor([float(meta["bend_sign"])], dtype=torch.float32)
         idx = vessel_index_from_stem(stem)
         if idx is not None:
             data.config_id = int(idx)

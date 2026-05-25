@@ -5,6 +5,7 @@ from src.data_gen.lib.vessel_generator import (
     cohort_levels,
     default_level_mix,
     parse_level_mix,
+    resolve_bend_sign_mode,
 )
 from src.config import VesselConfig
 
@@ -36,6 +37,9 @@ def test_sample_params_level2_avoids_straight_centerline():
 
 
 def test_sample_params_level1_arc_has_both_bend_signs():
+    import os
+
+    os.environ["KINEMATICS_BEND_SIGN_MODE"] = "bidirectional"
     cfg = VesselConfig(phase="kinematics")
     rng = np.random.default_rng(7)
     signs = set()
@@ -46,3 +50,18 @@ def test_sample_params_level1_arc_has_both_bend_signs():
         if signs == {-1.0, 1.0}:
             break
     assert signs == {-1.0, 1.0}
+
+
+def test_sample_params_level1_down_only_fixed_sign():
+    import os
+
+    os.environ["KINEMATICS_BEND_SIGN_MODE"] = "down_only"
+    cfg = VesselConfig(phase="kinematics")
+    rng = np.random.default_rng(99)
+    for i in range(80):
+        p = _sample_params(i, 1, cfg, rng)
+        if p["curve_type"] in ("arc", "hook"):
+            assert p["bend_sign"] == 1.0
+        if p["curve_type"] == "s_curve":
+            assert p["amplitude"] >= 0.0
+    assert resolve_bend_sign_mode() == "down_only"

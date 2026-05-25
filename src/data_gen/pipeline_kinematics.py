@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -489,6 +490,12 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p.add_argument("--anchor-max-json-scan", type=int, default=None)
     p.add_argument("--anchor-shuffle", action="store_true")
     p.add_argument("--anchor-shuffle-seed", type=int, default=None)
+    p.add_argument(
+        "--bend-sign-mode",
+        choices=("down_only", "bidirectional"),
+        default=None,
+        help="Arc/hook bend: down_only=historical +x bend; bidirectional=random mirror (L1/L2).",
+    )
 
     args = p.parse_args(argv)
     if not args.batch:
@@ -582,9 +589,12 @@ def _run_batch_for_phase(
         )
         vg = VesselGenerator(phase="kinematics")
         start_idx = 0 if args.overwrite else None
+        if args.bend_sign_mode:
+            os.environ["KINEMATICS_BEND_SIGN_MODE"] = str(args.bend_sign_mode)
+        bend_label = os.environ.get("KINEMATICS_BEND_SIGN_MODE", "bidirectional")
         print(
             f"--- Vessel generation: rheology={rheology} levels={level_label} n={num_vessels} "
-            f"seed={vessel_seed!r} ---\n"
+            f"seed={vessel_seed!r} bend_sign_mode={bend_label} ---\n"
         )
         vg.run_pipeline(
             n=num_vessels,

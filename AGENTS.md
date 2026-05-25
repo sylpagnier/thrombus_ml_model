@@ -25,6 +25,7 @@
 - **Foundation** (mixed L0/L1/L2 sampling, full data): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_foundation.ps1" -Fresh`
 - **L2-heavy finetune** (resume + `--finetune-lr 1e-5`): `.\scripts\go_kinematics_l2_finetune.ps1`
 - **Backfill** `geometry_level` on existing graphs from mesh JSON (no COMSOL): `python -m src.data_gen.backfill_kinematics_geometry_level`
+- **Bend-sign A/B** (down-only vs bidirectional, isolated graph dirs): `powershell -File .\scripts\go_kinematics_bend_ab.ps1 -Arm both -NumVessels 120 -AnchorMax 0`
 - Doc: [src/docs/KINEMATICS_BEST_ARCHITECTURE.md](src/docs/KINEMATICS_BEST_ARCHITECTURE.md) (geometry table)
 
 ## Kinematics (Stage A) architecture record
