@@ -6,6 +6,7 @@ from src.utils.kinematics_geometry import (
     cohort_level_counts,
     geometry_sample_weight,
     split_anchor_physics_stratified,
+    train_pool_for_epoch,
 )
 
 
@@ -22,11 +23,24 @@ def _graph(level: int, anchor: bool) -> Data:
 
 
 def test_geometry_curriculum_auto_phases():
-    cfg = GeometryCurriculumConfig(enabled=True, phase="auto")
-    w0 = cfg.level_weights(5, 1, stage1_end=40, stage2_end=60)
-    assert w0[2] < w0[0]
+    cfg = GeometryCurriculumConfig(enabled=True, phase="auto", l0l1_only_epochs=6)
+    assert cfg.resolved_phase(2, 1, 40, 60) == "l0l1_only"
+    w0 = cfg.level_weights(2, 1, stage1_end=40, stage2_end=60)
+    assert w0[2] == 0.0
+    assert cfg.resolved_phase(7, 1, 40, 60) == "foundation"
+    w1 = cfg.level_weights(7, 1, stage1_end=40, stage2_end=60)
+    assert w1[2] < w1[0]
     w2 = cfg.level_weights(65, 3, stage1_end=40, stage2_end=60)
     assert w2[2] > w2[0]
+
+
+def test_train_pool_l0l1_only_excludes_l2():
+    cfg = GeometryCurriculumConfig(enabled=True, l0l1_only_epochs=6)
+    train = [_graph(0, True), _graph(1, False), _graph(2, True)]
+    pool = train_pool_for_epoch(train, curriculum=cfg, epoch=2, stage=1, stage1_end=40, stage2_end=60)
+    assert all(int(d.geometry_level.item()) in (0, 1) for d in pool)
+    pool2 = train_pool_for_epoch(train, curriculum=cfg, epoch=8, stage=1, stage1_end=40, stage2_end=60)
+    assert len(pool2) == 3
 
 
 def test_geometry_sample_weight():

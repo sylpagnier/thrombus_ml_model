@@ -40,8 +40,10 @@ from src.utils.kinematics_geometry import (
     GeometryCurriculumConfig,
     attach_geometry_metadata,
     cohort_level_counts,
+    count_anchor_physics,
     geometry_sample_weight,
     split_anchor_physics_stratified,
+    train_pool_for_epoch,
     warn_if_single_level_cohort,
 )
 
@@ -432,6 +434,7 @@ def train_kinematics(
             "ramp_end_mix": list(geometry_cfg.ramp_end_mix),
             "l2_heavy_mix": list(geometry_cfg.l2_heavy_mix),
             "hard_mining_start_epoch": int(geometry_cfg.hard_mining_start_epoch),
+            "l0l1_only_epochs": int(geometry_cfg.l0l1_only_epochs),
         },
         "finetune_lr": finetune_lr,
         "model_config": snapshot_gino_deq_model_config(model),
@@ -628,9 +631,24 @@ def train_kinematics(
         mining_start = (
             int(geometry_cfg.hard_mining_start_epoch) if geometry_cfg.enabled else 4
         )
+        train_epoch_data = train_pool_for_epoch(
+            train_data,
+            curriculum=geometry_cfg,
+            epoch=epoch,
+            stage=stage,
+            stage1_end=int(stage1_end_epoch),
+            stage2_end=int(stage2_end_epoch),
+        )
+        n_anchors_ep, n_physics_ep = count_anchor_physics(train_epoch_data)
+
         if geometry_cfg.enabled:
+            geo_line = geometry_cfg.describe(
+                epoch, stage, stage1_end=int(stage1_end_epoch), stage2_end=int(stage2_end_epoch)
+            )
+            pool_counts = cohort_level_counts(train_epoch_data)
             print(
-                f"📐 {geometry_cfg.describe(epoch, stage, stage1_end=int(stage1_end_epoch), stage2_end=int(stage2_end_epoch))}"
+                f"📐 {geo_line} | train_pool={len(train_epoch_data)} "
+                f"(L0={pool_counts.get(0, 0)}, L1={pool_counts.get(1, 0)}, L2={pool_counts.get(2, 0)})"
             )
 
         # 2. Hard Mining Management
@@ -641,7 +659,7 @@ def train_kinematics(
             and not lbfgs_initialized
         ):
             print("⛏️ Refreshing Hard Negative Anchor Weights...")
-            refresh_hard_mining(epoch, train_data)
+            refresh_hard_mining(epoch, train_epoch_data)
         elif epoch >= mining_start and epoch % mining_interval == 0 and not lbfgs_initialized:
             # During ramp/no-anchor phases, anchor rel-L2 is not informative.
             flow_diag = evaluate_mass_flow_health(model, train_data, device)
@@ -656,7 +674,7 @@ def train_kinematics(
                     f"imbalance={flow_diag['imbalance']:.3f}, "
                     f"collapse={flow_diag['collapse_score']:.3f}"
                 )
-        loader = make_loader(train_data, n_anchors, n_physics, epoch, stage)
+        loader = make_loader(train_epoch_data, n_anchors_ep, n_physics_ep, epoch, stage)
 
         # 3. L-BFGS Handoff (Kinematics preservation)
         if epoch >= adam_epochs and not lbfgs_initialized:
@@ -970,6 +988,12 @@ if __name__ == "__main__":
         help="First epoch for hard-negative anchor mining (with geometry curriculum).",
     )
     parser.add_argument(
+        "--l0l1-only-epochs",
+        type=int,
+        default=6,
+        help="Stage-1 Newtonian epochs using only L0+L1 graphs (no L2 in train pool).",
+    )
+    parser.add_argument(
         "--finetune-lr",
         type=float,
         default=None,
@@ -1037,6 +1061,7 @@ if __name__ == "__main__":
         enabled=geom_enabled,
         phase=geom_phase,
         hard_mining_start_epoch=int(args.hard_mining_start_epoch),
+        l0l1_only_epochs=int(args.l0l1_only_epochs),
     )
 
     train_kinematics(

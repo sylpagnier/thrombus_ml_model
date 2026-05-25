@@ -1,7 +1,8 @@
 # Stage-A foundation: mixed L0/L1/L2 geometry curriculum (no --limit-data).
 # Prerequisite: mixed cohort graphs + backfill geometry_level (see below).
 param(
-    [switch]$Fresh
+    [switch]$Fresh,
+    [int]$LimitData = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,8 +16,13 @@ Write-Host "  python -m src.data_gen.backfill_kinematics_geometry_level" -Foregr
 $trainArgs = @(
     "-m", "src.training.train_kinematics_predictor",
     "--geometry-phase", "auto",
-    "--hard-mining-start-epoch", "16"
+    "--hard-mining-start-epoch", "16",
+    "--l0l1-only-epochs", "6"
 )
 if ($Fresh) { $trainArgs += "--fresh" }
+if ($LimitData -gt 0) {
+    $trainArgs += @("--limit-data", "$LimitData")
+    Write-Host "Smoke mode: --limit-data $LimitData" -ForegroundColor Yellow
+}
 
 & python @trainArgs

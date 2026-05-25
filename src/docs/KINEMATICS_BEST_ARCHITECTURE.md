@@ -40,7 +40,8 @@ Stage-A training supports **geometry-level weighted sampling** and **stratified 
 
 | Phase | Epochs (default) | Sampling intent |
 |-------|------------------|-----------------|
-| `foundation` | Stage 1 (0–39) | 45% L0, 45% L1, 10% L2 — easy hot start |
+| `l0l1_only` | Stage 1, first **6** epochs (`--l0l1-only-epochs`) | **Train pool = L0+L1 only** (L2 held out of training; still in val) |
+| `foundation` | Rest of stage 1 | 45% L0, 45% L1, 10% L2 — introduce L2 |
 | `ramp` | Stage 2 (40–59) | Blend → 30/30/40 |
 | `l2_heavy` | Stage 3 (60+) | 15/15/70 — thrombus-target geometry |
 

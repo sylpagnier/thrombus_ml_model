@@ -77,6 +77,8 @@ class GeometryCurriculumConfig:
     enabled: bool = True
     # foundation | ramp | l2_heavy | off
     phase: str = "auto"
+    # Stage-1 Newtonian: train on L0+L1 only for this many epochs, then introduce L2.
+    l0l1_only_epochs: int = 6
     foundation_mix: Tuple[float, float, float] = (0.45, 0.45, 0.10)
     ramp_end_mix: Tuple[float, float, float] = (0.30, 0.30, 0.40)
     l2_heavy_mix: Tuple[float, float, float] = (0.15, 0.15, 0.70)
@@ -89,6 +91,8 @@ class GeometryCurriculumConfig:
         if self.phase != "auto":
             return self.phase
         if stage == 1:
+            if int(epoch) < int(self.l0l1_only_epochs):
+                return "l0l1_only"
             return "foundation"
         if stage == 2:
             return "ramp"
@@ -105,6 +109,8 @@ class GeometryCurriculumConfig:
         phase = self.resolved_phase(epoch, stage, stage1_end, stage2_end)
         if phase == "off":
             return {0: 1.0, 1: 1.0, 2: 1.0}
+        if phase == "l0l1_only":
+            return {0: 0.5, 1: 0.5, 2: 0.0}
         if phase == "foundation":
             return _mix_to_dict(self.foundation_mix)
         if phase == "l2_heavy":
@@ -138,6 +144,41 @@ def _mix_to_dict(mix: Tuple[float, float, float]) -> Dict[int, float]:
     if total <= 0:
         return {0: 1.0, 1: 1.0, 2: 1.0}
     return {0: mix[0] / total, 1: mix[1] / total, 2: mix[2] / total}
+
+
+def filter_train_by_levels(
+    train_data: Sequence[Any],
+    allowed_levels: Sequence[int],
+) -> List[Any]:
+    """Restrict the training pool to graphs whose ``geometry_level`` is in ``allowed_levels``."""
+    allowed = {int(x) for x in allowed_levels}
+    out = [d for d in train_data if graph_geometry_level(d, default=-1) in allowed]
+    return out
+
+
+def train_pool_for_epoch(
+    train_data: Sequence[Any],
+    *,
+    curriculum: GeometryCurriculumConfig,
+    epoch: int,
+    stage: int,
+    stage1_end: int,
+    stage2_end: int,
+) -> List[Any]:
+    """Select train graphs for this epoch (L0/L1-only warmstart vs full train pool)."""
+    if not curriculum.enabled:
+        return list(train_data)
+    phase = curriculum.resolved_phase(epoch, stage, stage1_end, stage2_end)
+    if phase == "l0l1_only":
+        filtered = filter_train_by_levels(train_data, (0, 1))
+        return filtered if filtered else list(train_data)
+    return list(train_data)
+
+
+def count_anchor_physics(train_data: Sequence[Any]) -> Tuple[int, int]:
+    n_anchors = sum(1 for d in train_data if graph_has_anchor(d))
+    n_physics = sum(1 for d in train_data if not graph_has_anchor(d))
+    return n_anchors, n_physics
 
 
 def geometry_sample_weight(
@@ -179,7 +220,7 @@ def warn_if_single_level_cohort(
     if known == 0:
         print("⚠️ Geometry curriculum: no geometry_level on graphs — run backfill or re-graph from mesh JSON.")
         return
-    if phase == "foundation" and counts[0] + counts[1] == 0:
+    if phase in ("l0l1_only", "foundation") and counts[0] + counts[1] == 0:
         print(
             "⚠️ Geometry curriculum foundation needs L0/L1 graphs; cohort is L2-only. "
             "Regenerate mixed vessels (--mixed-levels) or disable curriculum."
@@ -252,10 +293,13 @@ __all__ = [
     "GeometryCurriculumConfig",
     "attach_geometry_metadata",
     "cohort_level_counts",
+    "count_anchor_physics",
+    "filter_train_by_levels",
     "geometry_sample_weight",
     "graph_geometry_level",
     "read_geometry_level_from_mesh_json",
     "split_anchor_physics_stratified",
+    "train_pool_for_epoch",
     "vessel_index_from_stem",
     "warn_if_single_level_cohort",
 ]

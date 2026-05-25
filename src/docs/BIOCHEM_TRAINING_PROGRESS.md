@@ -52,7 +52,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Partial** | **K1/K0** ~1.45; **K2** explicit gelation **5.77** (§91) — triggers flood IC |
 | Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **K1** Δμ+`DATA_KINE` **0.464** (§90); **K2** step-3 multitask+gelation **4.22** ep9 (§91, **regress**); sentinel **0.294**; visc3h **0.408** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Partial** | **K10a–e** **t=0 μ_eff≈0.04** OK; **K10e** (§103) **no** red bands, **`clot_frac=0`**, **`learned≈2.5e-03` flat**; **K9** weak t0 flow |
+| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Partial** | **K11b** (§105): **wall halo** (`gate_wall≈1`), not COMSOL-localized bands; **K10e** (§103) flat **`clot_frac=0`**; **K9** weak t0 flow |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
@@ -950,6 +950,20 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Viz (user)**: **no red bands** along walls — same qualitative failure as K10a–c: bulk **μ_eff ~0.04**, no localized high-μ ring.
 - **Symptom → cause → lesson**: Hard **adj_mask** + tiny learned Δ + log loss on sparse adjacent truth nodes → optimizer **matches bulk log scale** without building **O(2–3×)** wall patches. Mask may cover **few** supervised nodes; constant **`learned`** suggests head stuck near zero (bulk penalty wins in lumen). **Not** K10d uniform cheat (no **0.12** flood). **Next**: widen band (`D_PEAK`/`SIGMA`/`SDF_MAX`), raise **`MU_LOG_ADJACENT`** / lower bulk weight, log **adj-mask coverage** on patient007, consider **`MU_LOG` isolate** with mask-only forward or stronger **`K10E_MU_DELTA_ND_MAX`** + μ-path LR.
 
+### 104. **K11b** binary clot gate (`20260525T171500Z`): **wall halo**, not localized COMSOL bands
+
+- **Setup**: `MU_K11_CLOT_GATE`, `LOSS_ISOLATE=K11`, `APPLY=wall_prox`, `GROWTH=1`, `LOGIT_BIAS=0`, `pos_weight=12`.
+- **Train**: `gate_wall→1.0` by ep4; `gate_clot≈0.06`; viz **pink perimeter** on patient007.
+- **Cause**: `wall_prox` apply + graph growth smears `p_clot`; high **pos_weight** + zero logit bias saturates σ on all wall truth nodes.
+- **Next**: K11c — BCE on **`p_raw`**, **wall-FP**, **no growth**, negative logit bias.
+
+### 105. **K11c** sparse gate (`20260525T173456Z`): viz **flat** — **`teacher_last` saved ep0 weights**
+
+- **Setup**: `GROWTH=0`, BCE on `p_raw`, `WALL_FP=2`, `LOGIT_BIAS=-2.5`, `pos_weight=8`.
+- **Train**: ep0 `gate_all≈0.002`; ep4+ `gate_wall→1` again; val ep11 `val_viz_final_gate≈0.036`, `clot_frac≈0.033`.
+- **Viz bug**: End-of-run **`teacher.load_state_dict(best_all_ep0)`** before writing **`biochem_teacher_last.pth`** → user saw **no clots** despite late-epoch train gates.
+- **Fix (code)**: **`teacher_last` = final-epoch weights**; metadata `last_epoch_completed` corrected; stronger **`WALL_FP=5`** in script.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -1332,6 +1346,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **K10c_high_mu_aux** (K10b+data-only+`MU_LOG_HIGH=1`, `GATE_MIN=0.05`, 12ep, `20260525T144600Z`) | **0.546** (ep11) | **5.379** | **0.690** bulk ep11 | high **1.243** (ep11) | **§101**: viz **≈K10b** flat **μ**; high-μ metric ↓; **wall val blow-up**; gate **0.05** floor |
 | 2026-05-25 | **K10d_simple_mu_mse** (`MU_K10D_SIMPLE`, `MU_MSE` only, 12ep, `20260525T150817Z`) | **2.258** (flat) | **2.658** | **0.473** bulk | high **1.457** | **§102**: **uniform μ≈0.12** cheat; **not** better — val logMAE disaster vs K10b **0.49** |
 | 2026-05-25 | **K10e_wall_adjacent_mu_log** (`MU_K10E_SIMPLE`, `LOSS_ISOLATE=K10E`, `IC_STEADY_KIN`, fresh, 12ep, `20260525T153015Z`) | **0.493** (ep03) | **1.78–1.88** wall | **0.512** bulk ep11 | high **0.858** (ep11); ep03 **0.989** | **§103**: **no viz red bands**; `learned` **2.48e-03** flat; `clot_frac=0`; not K10d cheat; best ckpt ep03 |
+| 2026-05-25 | **K11b_clot_gate_wall_prox** (`MU_K11_CLOT_GATE`, `LOSS_ISOLATE=K11`, `APPLY=wall_prox`, `GROWTH=1`, `LOGIT_BIAS=0`, fresh, `20260525T171500Z`) | **0.519** (ep00) | **2.70** wall | **0.656** bulk ep11 | high **0.724** (ep11); r≈0.34 all | **§105**: **viz wall halo** (pink perimeter); `gate_wall≈1`, `gate_clot≈0.06`, `clot_frac=0.033`; not localized COMSOL bands |
+| 2026-05-25 | **K11c_clot_gate_sparse** (`20260525T173456Z`, 12ep) | **0.503** (ep00 best-all) | **2.69** ep11 | **0.498** bulk ep11 | high **0.788** (ep11) | **§106**: viz **flat** — **`teacher_last` was ep00 weights** (`gate≈0.002`); train ep4+ **`gate_wall→1`** again; fix: save **final epoch** in `teacher_last` |
 
 ---
 
