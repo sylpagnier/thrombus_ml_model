@@ -240,15 +240,15 @@ def warn_if_single_level_cohort(
     counts = cohort_level_counts(dataset)
     known = counts[0] + counts[1] + counts[2]
     if known == 0:
-        print("⚠️ Geometry curriculum: no geometry_level on graphs — run backfill or re-graph from mesh JSON.")
+        print("[kin] WARN geometry curriculum: no geometry_level on graphs; run backfill.")
         return
     if phase in ("l0l1_only", "foundation") and counts[0] + counts[1] == 0:
         print(
-            "⚠️ Geometry curriculum foundation needs L0/L1 graphs; cohort is L2-only. "
+            "[kin] WARN geometry curriculum foundation needs L0/L1 graphs; cohort is L2-only. "
             "Regenerate mixed vessels (--mixed-levels) or disable curriculum."
         )
     if phase == "l2_heavy" and counts[2] == 0:
-        print("⚠️ Geometry l2_heavy phase but no L2 graphs in dataset.")
+        print("[kin] WARN geometry l2_heavy phase but no L2 graphs in dataset.")
 
 
 def split_anchor_physics_stratified(

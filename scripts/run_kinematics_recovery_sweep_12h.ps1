@@ -19,9 +19,8 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
-# Python 3.11 on Windows defaults to cp1252; training logs use UTF-8 emoji.
-$env:PYTHONIOENCODING = "utf-8"
-$env:PYTHONUTF8 = "1"
+# April best used ~2000 graphs; cap avoids RAM blow-up when 3000 .pt files exist on disk.
+$env:KINEMATICS_GRAPH_CAP = "2000"
 
 $hostName = $env:COMPUTERNAME
 $SweepDir = Join-Path $RepoRoot "outputs\kinematics\sweep_recovery_12h"

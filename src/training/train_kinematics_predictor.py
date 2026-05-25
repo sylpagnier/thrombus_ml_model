@@ -8,14 +8,6 @@ import json
 import os
 import sys
 import random
-
-# Windows consoles (cp1252) cannot print training emoji without UTF-8 stdout.
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 import re
 import time
 import warnings
@@ -143,18 +135,29 @@ def load_dataset(
         paths = list(paths)
         rng = random.Random(int(graph_load_seed))
         rng.shuffle(paths)
-        print(f"🔀 Shuffled graph load order (seed={int(graph_load_seed)}).")
+        print(f"[kin] Shuffled graph load order (seed={int(graph_load_seed)}).")
     if limit is not None:
         paths = paths[:limit]
-        print(f"⚠️ LIMIT-DATA FLAG ACTIVE: Only loading {limit} graphs.")
+        print(f"[kin] WARN limit-data active: only loading {limit} graphs.")
+    cap_raw = os.environ.get("KINEMATICS_GRAPH_CAP", "").strip()
+    if cap_raw:
+        n_cap = int(cap_raw)
+        n_total = len(paths)
+        if n_total > n_cap:
+            rng = random.Random(int(graph_load_seed))
+            paths = rng.sample(list(paths), n_cap)
+            print(
+                f"[kin] KINEMATICS_GRAPH_CAP={n_cap}: sampled {n_cap}/{n_total} graphs "
+                f"(seed={int(graph_load_seed)})."
+            )
     if not paths:
         raise RuntimeError(
             f"No graph files found in dataset directory: {data_dir}. "
             "Expected at least one vessel_*.pt file."
         )
     dataset = []
-    print(f"📂 Loading {len(paths)} graphs from {data_dir}...")
-    for f in tqdm(paths, leave=False):
+    print(f"[kin] Loading {len(paths)} graphs from {data_dir}...")
+    for f in tqdm(paths, leave=False, ascii=sys.platform == "win32"):
         data = torch.load(f, weights_only=False)
         data = infer_missing_schema(data, phase_hint=phase)
         assert_graph_schema(data, expected_y_schema=(KINE_Y_SCHEMA,))
@@ -398,16 +401,16 @@ def resolve_kinematics_device(*, require_cuda: bool = True) -> str:
     """Pick training device and refuse CPU-only runs when require_cuda is set."""
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
-        print(f"🖥️ Training device: CUDA - {device_name}")
+        print(f"[kin] Training device: CUDA - {device_name}")
         return "cuda"
-    print("🖥️ Training device: CPU (CUDA not available)")
+    print("[kin] Training device: CPU (CUDA not available)")
     if require_cuda:
         print(
-            "❌ Kinematics training requires CUDA. Use a CUDA-enabled PyTorch build "
-            "with a visible GPU."
+            "[kin] ERROR: kinematics training requires CUDA. "
+            "Use a CUDA-enabled PyTorch build with a visible GPU."
         )
         sys.exit(1)
-    print("⚠️ Continuing on CPU (require_cuda=False).")
+    print("[kin] WARN continuing on CPU (require_cuda=False).")
     return "cpu"
 
 
@@ -491,13 +494,13 @@ def train_kinematics(
     start_epoch = 0
 
     if resume_from:
-        print(f"🔁 Resuming training from: {resume_from}")
+        print(f"[kin] Resuming training from: {resume_from}")
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             resume_meta, resume_state = kinematics_checkpoint_tensors(ckpt)
             resume_ctor = resolve_gino_deq_ctor_kwargs(resume_meta, resume_state)
             if resume_meta.get("model_config"):
-                print("🧩 GINO_DEQ architecture from checkpoint model_config.")
+                print("[kin] GINO_DEQ architecture from checkpoint model_config.")
             model = build_gino_deq_from_ctor(phys_cfg, resume_ctor).to(device)
             opt_params = list(model.parameters())
             optimizer = optim.AdamW(opt_params, lr=1e-4, weight_decay=1e-5)
@@ -517,28 +520,28 @@ def train_kinematics(
                 try:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 except (ValueError, RuntimeError):
-                    print("⚠️ Could not restore AdamW optimizer state; continuing with fresh optimizer.")
+                    print("[kin] WARN could not restore AdamW optimizer state; fresh optimizer.")
             if "scheduler_state_dict" in ckpt:
                 try:
                     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 except (ValueError, RuntimeError):
-                    print("⚠️ Could not restore scheduler state; continuing with fresh scheduler.")
+                    print("[kin] WARN could not restore scheduler state; fresh scheduler.")
             start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
             best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
             # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
             lbfgs_initialized = False
-            print(f"✅ Loaded full training state (next epoch: {start_epoch})")
+            print(f"[kin] Loaded full training state (next epoch: {start_epoch})")
         else:
             model.load_state_dict(ckpt)
             m = re.search(r"kinematics_ckpt_(\d+)\.pth$", str(resume_from))
             if m:
                 start_epoch = int(m.group(1))
-            print(f"✅ Loaded model-only checkpoint (next epoch: {start_epoch})")
+            print(f"[kin] Loaded model-only checkpoint (next epoch: {start_epoch})")
 
     if finetune_lr is not None and finetune_lr > 0:
         for pg in optimizer.param_groups:
             pg["lr"] = float(finetune_lr)
-        print(f"🎯 Finetune LR set to {float(finetune_lr):.2e}")
+        print(f"[kin] Finetune LR set to {float(finetune_lr):.2e}")
 
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
@@ -561,7 +564,7 @@ def train_kinematics(
                 indent=2,
             )
             f.write("\n")
-        print(f"📐 Architecture manifest: {arch_path}")
+        print(f"[kin] Architecture manifest: {arch_path}")
     except OSError:
         pass
 
@@ -613,7 +616,7 @@ def train_kinematics(
                 hard_anchor_multiplier[gkey] = (1.0 + 0.8) if err >= q else 1.0  # hard_alpha = 0.8
         model.train()
 
-    print("🚀 Starting Unified Kinematics Training...")
+    print("[kin] Starting unified kinematics training...")
 
     for epoch in range(start_epoch, epochs):
         stage, current_n, current_mu_0, target_rheology = get_stage_physics(
@@ -625,8 +628,8 @@ def train_kinematics(
         # 1. Dynamic DataLoader Swapping
         if current_phase_loaded != target_rheology:
             print(
-                f"\n🔄 Swapping Dataset to {target_phase.upper()}/{target_rheology.upper()} for Stage {stage} "
-                f"(n={current_n:.3f}, μ0={current_mu_0:.4f})"
+                f"\n[kin] Swapping dataset to {target_phase.upper()}/{target_rheology.upper()} "
+                f"for stage {stage} (n={current_n:.3f}, mu0={current_mu_0:.4f})"
             )
             dataset = load_dataset(
                 target_phase,
@@ -654,7 +657,7 @@ def train_kinematics(
             # Reset hard mining when swapping datasets
             hard_anchor_multiplier.clear()
             if stage == 3 and not lbfgs_initialized:
-                print("🧹 Resetting AdamW momentum buffers for Stage 3 Target Phase...")
+                print("[kin] Resetting AdamW momentum buffers for stage 3...")
                 optimizer.state.clear()
 
         mining_interval = int(geometry_cfg.hard_mining_interval)
@@ -677,7 +680,7 @@ def train_kinematics(
             )
             pool_counts = cohort_level_counts(train_epoch_data)
             print(
-                f"📐 {geo_line} | train_pool={len(train_epoch_data)} "
+                f"[kin] {geo_line} | train_pool={len(train_epoch_data)} "
                 f"(L0={pool_counts.get(0, 0)}, L1={pool_counts.get(1, 0)}, L2={pool_counts.get(2, 0)})"
             )
 
@@ -688,16 +691,16 @@ def train_kinematics(
             and epoch % mining_interval == 0
             and not lbfgs_initialized
         ):
-            print("⛏️ Refreshing Hard Negative Anchor Weights...")
+            print("[kin] Refreshing hard-negative anchor weights...")
             refresh_hard_mining(epoch, train_epoch_data)
         elif epoch >= mining_start and epoch % mining_interval == 0 and not lbfgs_initialized:
             # During ramp/no-anchor phases, anchor rel-L2 is not informative.
             flow_diag = evaluate_mass_flow_health(model, train_data, device)
             if flow_diag is None:
-                print("🧪 Flow diagnostic skipped (missing inlet/outlet masks).")
+                print("[kin] Flow diagnostic skipped (missing inlet/outlet masks).")
             else:
                 print(
-                    "🧪 Flow diagnostic "
+                    "[kin] Flow diagnostic "
                     f"(graphs={flow_diag['n_graphs']}): "
                     f"flux_in={flow_diag['inlet_flux']:.3e}, "
                     f"flux_out={flow_diag['outlet_flux']:.3e}, "
@@ -708,7 +711,7 @@ def train_kinematics(
 
         # 3. L-BFGS Handoff (Kinematics preservation)
         if epoch >= adam_epochs and not lbfgs_initialized:
-            print("\n⚡ Switching to L-BFGS Optimizer for final fixed-point refinement...")
+            print("\n[kin] Switching to L-BFGS optimizer for final refinement...")
             lbfgs_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.LBFGS(
                 lbfgs_params, lr=0.01, max_iter=20, history_size=30, line_search_fn="strong_wolfe"
@@ -736,7 +739,11 @@ def train_kinematics(
         if not lbfgs_initialized:
             ema_metrics: dict[str, float] | None = None
             ema_alpha = 0.1
-            pbar = tqdm(loader, desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, μ0={current_mu_0:.4f}]")
+            pbar = tqdm(
+                loader,
+                desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, mu0={current_mu_0:.4f}]",
+                ascii=sys.platform == "win32",
+            )
             optimizer.zero_grad()
             accum_counter = 0
             for idx, data in enumerate(pbar):
@@ -799,7 +806,7 @@ def train_kinematics(
                 )
             scheduler.step()
         else:
-            print(f"⏳ L-BFGS Step (Ep {epoch:02d}) [S{stage}: n={current_n:.3f}]")
+            print(f"[kin] L-BFGS step (ep {epoch:02d}) [S{stage}: n={current_n:.3f}]")
             # static_batches is frozen during LBFGS initialization and already on device.
 
             def closure():
@@ -883,8 +890,8 @@ def train_kinematics(
                     level_bits.append(f"L{lvl}={float(val):.3f}")
             level_msg = f" | {' '.join(level_bits)}" if level_bits else ""
             print(
-                f"📊 [Validation] Rel L2: {rel_l2:.4f} | "
-                f"|∇·u| mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
+                f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
+                f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
             )
             if stage == 3 and val_comp < best_val_composite_loss:
                 best_val_composite_loss = val_comp
@@ -908,8 +915,8 @@ def train_kinematics(
                     run_id=str(getattr(diary, "run_dir", Path(".")).name),
                     extra={"training_manifest": training_manifest},
                 )
-                print("⭐ Saved New Best Kinematics Model")
-                print(f"📐 Updated {manifest_path.name} in {kinematics_dir()}")
+                print("[kin] Saved new best kinematics model")
+                print(f"[kin] Updated {manifest_path.name} in {kinematics_dir()}")
             try:
                 os.makedirs(kinematics_dir(), exist_ok=True)
                 val_record = {
@@ -959,7 +966,7 @@ def train_kinematics(
         component_total = sum(avg_components.values())
         if component_total > 0.0:
             print(
-                "   ↳ Loss breakdown (avg/step): "
+                "   -> Loss breakdown (avg/step): "
                 f"PDE={avg_components['C_weighted_pde']:.3f} ({100.0 * avg_components['C_weighted_pde'] / component_total:5.1f}%), "
                 f"data_u={avg_components['C_data_kine']:.3f} ({100.0 * avg_components['C_data_kine'] / component_total:5.1f}%), "
                 f"data_mu={avg_components['C_data_mu']:.3f} ({100.0 * avg_components['C_data_mu'] / component_total:5.1f}%), "
@@ -970,7 +977,7 @@ def train_kinematics(
                 f"jac={avg_components['C_jac']:.3f} ({100.0 * avg_components['C_jac'] / component_total:5.1f}%)"
             )
         else:
-            print("   ↳ Loss breakdown skipped (non-positive total weighted contribution).")
+            print("   -> Loss breakdown skipped (non-positive total weighted contribution).")
         diary.log_epoch_end(
             epoch,
             stage=int(stage),
@@ -1021,7 +1028,7 @@ if __name__ == "__main__":
         "--geometry-phase",
         choices=("auto", "foundation", "ramp", "l2_heavy", "off"),
         default="auto",
-        help="Geometry curriculum: auto=foundation→ramp→l2_heavy by stage; off=uniform.",
+        help="Geometry curriculum: auto=foundation->ramp->l2_heavy by stage; off=uniform.",
     )
     parser.add_argument(
         "--hard-mining-start-epoch",
@@ -1081,7 +1088,7 @@ if __name__ == "__main__":
             elif latest_model.exists():
                 resume_from = str(latest_model)
             else:
-                print("ℹ️ No latest checkpoint found; starting fresh.")
+                print("[kin] No latest checkpoint found; starting fresh.")
         else:
             resume_path = Path(args.resume)
             if not resume_path.exists():

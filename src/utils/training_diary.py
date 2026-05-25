@@ -92,8 +92,8 @@ def write_t1_experiment_artifact(
         payload["extra"] = extra
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
-    print(f"📒 Experiment artifact: {path}")
-    print("🧾 History reminder: append this run's key metrics to your Phase1 training history log.")
+    print(f"[diary] Experiment artifact: {path}")
+    print("[diary] History reminder: append this run's key metrics to your Phase1 training history log.")
     return path
 
 
@@ -193,8 +193,8 @@ class TrainingDiary:
             self.path = self.run_dir / "training_diary_main.jsonl"
             prune_training_diary_runs(reports, keep=5, current_run_id=self.run_id)
         os.environ["KINEMATICS_TRAINING_RUN_DIR"] = str(self.run_dir)
-        print(f"📝 Training diary (main JSONL): {self.path}")
-        print(f"📂 Training run folder: {self.run_dir}")
+        print(f"[diary] Training diary (main JSONL): {self.path}")
+        print(f"[diary] Training run folder: {self.run_dir}")
 
     def _write(self, event: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or self.path is None:
@@ -257,9 +257,9 @@ class BiochemRunLogger:
         self.path = self.run_dir / self.RUN_JSONL
         _prune_run_folders(reports, marker_name=self.RUN_JSONL, keep=keep, current_run_id=self.run_id)
         os.environ["KINEMATICS_TRAINING_RUN_DIR"] = str(self.run_dir)
-        print(f"📊 Biochem run log: {self.path}")
+        print(f"[biochem] Run log: {self.path}")
         index_path = reports / self.INDEX_JSONL
-        print(f"📋 Run index (append on end): {index_path}")
+        print(f"[biochem] Run index (append on end): {index_path}")
 
     def _append(self, event: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or self.path is None:

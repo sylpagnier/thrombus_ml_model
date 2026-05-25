@@ -18,6 +18,8 @@ Confirm graph count:
 
 **Do not** use `--limit-data` for this sweep (sorted-prefix bias; only sees first N files).
 
+The sweep sets `KINEMATICS_GRAPH_CAP=2000` (random sample, seed 42) to match the April reference size and avoid RAM exhaustion when 3000 `.pt` files exist on disk.
+
 ## One line (Comsol / P2200)
 
 ```powershell
