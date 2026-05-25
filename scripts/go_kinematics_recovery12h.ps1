@@ -10,6 +10,9 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 $ts = Get-Date -Format "yyyyMMdd_HHmmss"
 $logDir = Join-Path $RepoRoot "outputs\reports\training\kinematics"
 if (-not (Test-Path $logDir)) {

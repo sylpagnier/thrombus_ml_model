@@ -19,6 +19,10 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
+# Python 3.11 on Windows defaults to cp1252; training logs use UTF-8 emoji.
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 $hostName = $env:COMPUTERNAME
 $SweepDir = Join-Path $RepoRoot "outputs\kinematics\sweep_recovery_12h"
 $ManifestPath = Join-Path $SweepDir "manifest.jsonl"

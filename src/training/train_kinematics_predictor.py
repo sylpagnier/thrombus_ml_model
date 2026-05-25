@@ -8,6 +8,14 @@ import json
 import os
 import sys
 import random
+
+# Windows consoles (cp1252) cannot print training emoji without UTF-8 stdout.
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import re
 import time
 import warnings
@@ -390,7 +398,7 @@ def resolve_kinematics_device(*, require_cuda: bool = True) -> str:
     """Pick training device and refuse CPU-only runs when require_cuda is set."""
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
-        print(f"🖥️ Training device: CUDA — {device_name}")
+        print(f"🖥️ Training device: CUDA - {device_name}")
         return "cuda"
     print("🖥️ Training device: CPU (CUDA not available)")
     if require_cuda:
