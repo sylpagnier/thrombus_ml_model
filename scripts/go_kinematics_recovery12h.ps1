@@ -1,7 +1,8 @@
-# One-line overnight kinematics recovery sweep (~12h) on main graphs_kinematics/newtonian.
+# One-line overnight kinematics recovery sweep (~10h) on main graphs_kinematics/newtonian.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_recovery12h.ps1"
 param(
     [string[]] $Legs = @(),
+    [double]$TargetHours = 10.0,
     [switch] $DryRun,
     [switch] $Force
 )
@@ -18,13 +19,13 @@ if (-not (Test-Path $logDir)) {
 $logPath = Join-Path $logDir "recovery12h_console_$ts.log"
 
 Write-Host ""
-Write-Host "go_kinematics_recovery12h - 8-leg recovery sweep" -ForegroundColor Cyan
+Write-Host "go_kinematics_recovery12h - 8-leg recovery sweep (~${TargetHours}h)" -ForegroundColor Cyan
 Write-Host "  Prerequisite: python -m src.data_gen.backfill_kinematics_geometry_level" -ForegroundColor Yellow
 Write-Host "  Data: data/processed/graphs_kinematics/newtonian (NOT ab_bend_*)" -ForegroundColor DarkGray
 Write-Host "  Log: $logPath" -ForegroundColor DarkGray
 Write-Host ""
 
-$sweepArgs = @()
+$sweepArgs = @("-TargetHours", "$TargetHours")
 if ($Legs.Count -gt 0) { $sweepArgs += "-Legs"; $sweepArgs += $Legs }
 if ($DryRun) { $sweepArgs += "-DryRun" }
 if ($Force) { $sweepArgs += "-Force" }

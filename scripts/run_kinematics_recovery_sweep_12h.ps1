@@ -1,4 +1,4 @@
-# ~12h kinematics recovery sweep on the MAIN graph tree (graphs_kinematics/newtonian).
+# ~10h kinematics recovery sweep on the MAIN graph tree (graphs_kinematics/newtonian).
 # Goal: find a recipe that approaches Apr-2026 val Rel L2 ~0.10 (target < 0.05 on full val).
 #
 # Prerequisite (once): python -m src.data_gen.backfill_kinematics_geometry_level
@@ -10,6 +10,8 @@
 
 param(
     [string[]] $Legs = @(),
+    [double]$TargetHours = 10.0,
+    [double]$EstMinPerEpoch = 13.0,
     [switch] $DryRun,
     [switch] $Force,
     [string[]] $ExtraArgs = @()
@@ -21,6 +23,8 @@ Set-Location $RepoRoot
 
 # April best used ~2000 graphs; cap avoids RAM blow-up when 3000 .pt files exist on disk.
 $env:KINEMATICS_GRAPH_CAP = "2000"
+# Quiet logs: no tqdm percent spam (epoch + val lines only).
+$env:KINEMATICS_QUIET = "1"
 
 $hostName = $env:COMPUTERNAME
 $SweepDir = Join-Path $RepoRoot "outputs\kinematics\sweep_recovery_12h"
@@ -139,7 +143,32 @@ function Save-LegArtifacts {
     Add-Content -Path $ManifestPath -Value $manifestRow
 }
 
-# Epoch budget ~12h @ ~3 min/epoch on ~500 graphs (adjust if graph count differs).
+function Get-ScaledLegSchedule {
+    param(
+        [hashtable]$Def,
+        [int]$LegEpochs
+    )
+    $base = [int]$Def.Epochs
+    if ($base -lt 1) { $base = 1 }
+    $epochs = [int][math]::Max(4, $LegEpochs)
+    $adam = [int][math]::Min($epochs - 1, [math]::Max(2, [math]::Round($Def.Adam * $epochs / $base)))
+    $s1 = [int][math]::Max(1, [math]::Round($Def.S1 * $epochs / $base))
+    $s2 = [int][math]::Max($s1 + 1, [math]::Round($Def.S2 * $epochs / $base))
+    if ($s2 -ge $epochs) { $s2 = $epochs - 1 }
+    $l0l1 = [int][math]::Min([int]$Def.L0L1Only, [math]::Max(0, $s1 - 1))
+    $hard = [int]$Def.HardMine
+    if ($hard -gt $s1) { $hard = [math]::Max(1, $s1) }
+    return @{
+        Epochs = $epochs
+        Adam = $adam
+        S1 = $s1
+        S2 = $s2
+        L0L1Only = $l0l1
+        HardMine = $hard
+    }
+}
+
+# Reference epoch counts (full recipe); scaled to TargetHours at runtime.
 $LegCatalog = [ordered]@{
     A0_april_ratio = @{
         Title = "April-2026 stage ratios (40/60), no L0/L1 warmstart"
@@ -217,14 +246,27 @@ if ($nGraphs -lt 50) {
     Write-Host "WARNING: only $nGraphs graphs in $GraphDir - run backfill / check data path." -ForegroundColor Red
 }
 
-$estMinPerEp = 3.0
-$totalEp = 0
-foreach ($lid in $Legs) { $totalEp += [int]$LegCatalog[$lid].Epochs }
-$estHours = ($totalEp * $estMinPerEp) / 60.0
+$refTotalEp = 0
+foreach ($lid in $Legs) { $refTotalEp += [int]$LegCatalog[$lid].Epochs }
+$budgetEp = [int][math]::Floor(($TargetHours * 60.0 / $EstMinPerEpoch) * 0.9)
+if ($budgetEp -lt 8) { $budgetEp = 8 }
+
+$LegEpochs = @{}
+$scaledTotal = 0
+foreach ($lid in $Legs) {
+    $ref = [int]$LegCatalog[$lid].Epochs
+    $ep = [int][math]::Max(4, [math]::Round($budgetEp * $ref / [double]$refTotalEp))
+    $LegEpochs[$lid] = $ep
+    $scaledTotal += $ep
+}
+$estHours = ($scaledTotal * $EstMinPerEpoch) / 60.0
+
 Write-Host ""
-Write-Host "Kinematics recovery sweep (~12h target)" -ForegroundColor Cyan
-Write-Host "  graphs: $nGraphs in graphs_kinematics/newtonian (main tree, pre-A/B)" -ForegroundColor DarkGray
-Write-Host "  legs:   $($Legs.Count)  total_epochs~$totalEp  est~$([math]::Round($estHours,1))h @ ${estMinPerEp}m/ep" -ForegroundColor DarkGray
+Write-Host "Kinematics recovery sweep (~${TargetHours}h target)" -ForegroundColor Cyan
+Write-Host "  graphs: $nGraphs on disk; KINEMATICS_GRAPH_CAP=$($env:KINEMATICS_GRAPH_CAP)" -ForegroundColor DarkGray
+Write-Host "  legs:   $($Legs.Count)  scaled_epochs=$scaledTotal (ref=$refTotalEp, budget~$budgetEp)" -ForegroundColor DarkGray
+Write-Host "  est:    ~$([math]::Round($estHours,1))h @ ${EstMinPerEpoch}m/ep (P2200 + ~1800 train steps/ep)" -ForegroundColor DarkGray
+Write-Host "  logs:   KINEMATICS_QUIET=1 (no tqdm; val + epoch summary only)" -ForegroundColor DarkGray
 Write-Host "  archive: $SweepDir" -ForegroundColor DarkGray
 Write-Host "  target:  val Rel L2 < 0.05 (Apr best ~0.10 @ ep 84 / 2000 graphs)" -ForegroundColor DarkGray
 Write-Host ""
@@ -248,19 +290,24 @@ foreach ($legId in $Legs) {
     Write-Host "  $($def.Title)" -ForegroundColor DarkGray
 
     Clear-KinematicsSweepEnv
+    $env:KINEMATICS_GRAPH_CAP = "2000"
+    $env:KINEMATICS_QUIET = "1"
     $outDir = Join-Path $legDir "kinematics_out"
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     $env:KINEMATICS_OUTPUT_DIR = $outDir
 
+    $sched = Get-ScaledLegSchedule -Def $def -LegEpochs $LegEpochs[$legId]
+    Write-Host "  schedule: epochs=$($sched.Epochs) adam=$($sched.Adam) s1=$($sched.S1) s2=$($sched.S2) l0l1=$($sched.L0L1Only)" -ForegroundColor DarkGray
+
     $cmd = @(
         "-m", "src.training.train_kinematics_predictor",
-        "--fresh", "--no-prompt",
-        "--epochs", "$([int]$def.Epochs)",
-        "--adam-epochs", "$([int]$def.Adam)",
-        "--stage1-end-epoch", "$([int]$def.S1)",
-        "--stage2-end-epoch", "$([int]$def.S2)",
-        "--l0l1-only-epochs", "$([int]$def.L0L1Only)",
-        "--hard-mining-start-epoch", "$([int]$def.HardMine)",
+        "--fresh", "--no-prompt", "--quiet",
+        "--epochs", "$([int]$sched.Epochs)",
+        "--adam-epochs", "$([int]$sched.Adam)",
+        "--stage1-end-epoch", "$([int]$sched.S1)",
+        "--stage2-end-epoch", "$([int]$sched.S2)",
+        "--l0l1-only-epochs", "$([int]$sched.L0L1Only)",
+        "--hard-mining-start-epoch", "$([int]$sched.HardMine)",
         "--weight-data", "$([double]$def.WData)",
         "--weight-mu", "$([double]$def.WMu)",
         "--weight-wss", "$([double]$def.WWss)"

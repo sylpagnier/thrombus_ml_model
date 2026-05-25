@@ -50,6 +50,14 @@ from src.utils.kinematics_geometry import (
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
 
+
+def kinematics_tqdm_enabled() -> bool:
+    """Progress bars spam logs when tee'd to a file; disable via KINEMATICS_QUIET=1 or KINEMATICS_TQDM=0."""
+    if os.environ.get("KINEMATICS_QUIET", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    raw = os.environ.get("KINEMATICS_TQDM", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 # -------------------------------------------------------------------------
 # Curriculum Definitions
 # -------------------------------------------------------------------------
@@ -157,7 +165,10 @@ def load_dataset(
         )
     dataset = []
     print(f"[kin] Loading {len(paths)} graphs from {data_dir}...")
-    for f in tqdm(paths, leave=False, ascii=sys.platform == "win32"):
+    file_iter = paths
+    if kinematics_tqdm_enabled():
+        file_iter = tqdm(paths, leave=False, ascii=sys.platform == "win32")
+    for i, f in enumerate(file_iter):
         data = torch.load(f, weights_only=False)
         data = infer_missing_schema(data, phase_hint=phase)
         assert_graph_schema(data, expected_y_schema=(KINE_Y_SCHEMA,))
@@ -165,6 +176,8 @@ def load_dataset(
             data.graph_stem = f.stem
             attach_geometry_metadata(data, mesh_input_dir=cfg.mesh_input_dir, stem=f.stem)
         dataset.append(data)
+        if not kinematics_tqdm_enabled() and (i + 1) % 500 == 0:
+            print(f"[kin]   loaded {i + 1}/{len(paths)} graphs")
     counts = cohort_level_counts(dataset)
     print(
         f"   Geometry levels: L0={counts.get(0, 0)}, L1={counts.get(1, 0)}, "
@@ -739,14 +752,22 @@ def train_kinematics(
         if not lbfgs_initialized:
             ema_metrics: dict[str, float] | None = None
             ema_alpha = 0.1
-            pbar = tqdm(
-                loader,
-                desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, mu0={current_mu_0:.4f}]",
-                ascii=sys.platform == "win32",
-            )
+            use_bar = kinematics_tqdm_enabled()
+            step_iter = loader
+            if use_bar:
+                step_iter = tqdm(
+                    loader,
+                    desc=f"Ep {epoch:02d} [S{stage}: n={current_n:.3f}, mu0={current_mu_0:.4f}]",
+                    ascii=sys.platform == "win32",
+                )
+            elif epoch == 0 or (epoch + 1) % max(1, epochs // 5) == 0:
+                print(
+                    f"[kin] ep {epoch:02d} stage {stage} train "
+                    f"(n={current_n:.3f}, mu0={current_mu_0:.4f}, steps={len(loader)})"
+                )
             optimizer.zero_grad()
             accum_counter = 0
-            for idx, data in enumerate(pbar):
+            for idx, data in enumerate(step_iter):
                 loss, metrics = compute_step_loss(
                     model,
                     data.to(device),
@@ -791,19 +812,20 @@ def train_kinematics(
                     if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0
                     else float("nan")
                 )
-                pbar.set_postfix(
-                    {
-                        "L_tot": f"{ema_metrics['L_total']:.3f}",
-                        "L_data": f"{ema_metrics['L_data']:.3f}",
-                        "L_mu": f"{ema_metrics['L_mu']:.3f}",
-                        "L_mom": f"{ema_metrics['L_mom']:.3f}",
-                        "L_cont": f"{ema_metrics['L_cont']:.3f}",
-                        "L_bc": f"{ema_metrics['L_bc']:.3f}",
-                        "L_io": f"{ema_metrics['L_io']:.3f}",
-                        "|g|": f"{grad_norm:.2f}",
-                        "LR": f"{lr_val:.2e}",
-                    }
-                )
+                if use_bar:
+                    step_iter.set_postfix(
+                        {
+                            "L_tot": f"{ema_metrics['L_total']:.3f}",
+                            "L_data": f"{ema_metrics['L_data']:.3f}",
+                            "L_mu": f"{ema_metrics['L_mu']:.3f}",
+                            "L_mom": f"{ema_metrics['L_mom']:.3f}",
+                            "L_cont": f"{ema_metrics['L_cont']:.3f}",
+                            "L_bc": f"{ema_metrics['L_bc']:.3f}",
+                            "L_io": f"{ema_metrics['L_io']:.3f}",
+                            "|g|": f"{grad_norm:.2f}",
+                            "LR": f"{lr_val:.2e}",
+                        }
+                    )
             scheduler.step()
         else:
             print(f"[kin] L-BFGS step (ep {epoch:02d}) [S{stage}: n={current_n:.3f}]")
@@ -1071,7 +1093,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable interactive prompt; starts fresh unless --resume is explicitly set.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="No tqdm bars; epoch/validation lines only (copy-paste friendly logs).",
+    )
     args = parser.parse_args()
+
+    if args.quiet:
+        os.environ["KINEMATICS_QUIET"] = "1"
 
     if args.fresh and args.resume is not None:
         raise ValueError("Cannot use --fresh together with --resume.")

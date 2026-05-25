@@ -1,4 +1,4 @@
-# Kinematics recovery sweep (~12 h)
+# Kinematics recovery sweep (~10 h)
 
 Recover **Stage-A** val quality toward the April-2026 reference (~**Rel L2 0.10** @ epoch 84, 2000 graphs). Stretch goal: **Rel L2 &lt; 0.05** on the full stratified val set.
 
@@ -26,7 +26,11 @@ The sweep sets `KINEMATICS_GRAPH_CAP=2000` (random sample, seed 42) to match the
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_recovery12h.ps1"
 ```
 
-## Legs (8 × ~40–55 epochs ≈ 12 h @ ~3 min/epoch on ~500 graphs)
+Default **~10 h** budget: scales reference recipes to ~40 epochs total @ ~13 min/epoch (2000 graphs, ~1800 train steps). Override: `-TargetHours 12` or `-EstMinPerEpoch 11`.
+
+Logs use **`KINEMATICS_QUIET=1`** (no tqdm bars) — copy-paste friendly: load summary, `[kin] [Validation]`, `Epoch NNN complete`.
+
+## Legs (8 recipes; epoch count scaled to TargetHours)
 
 | Leg | Idea |
 |-----|------|
@@ -60,6 +64,6 @@ Replace `F0_foundation` with the best `leg_id`.
 
 ## Notes
 
-- **&lt; 5% Rel L2** on full mixed val may require **full graph count** (2000+) and **longer** than 12 h; this sweep finds the best *recipe* to scale next.
+- **&lt; 5% Rel L2** on full mixed val may require **full graph count** (2000+) and **longer** than 10 h; this sweep finds the best *recipe* to scale next.
 - Bend-sign A/B showed **bidirectional ≥ down_only** on 120-graph smoke; sweep does not regen meshes.
 - April reference: [data/reference/kinematics_best_20260426T184600Z.json](../../data/reference/kinematics_best_20260426T184600Z.json).
