@@ -217,6 +217,105 @@ def k11_mu_clot_si(phys_cfg) -> float:
     return max(0.10, float(phys_cfg.mu_inf) * 2.5)
 
 
+def _k11_trigger_apply_enabled() -> bool:
+    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_APPLY")
+
+
+def _k11_trigger_loss_enabled() -> bool:
+    raw = (os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT") or "").strip()
+    if raw:
+        return float(raw) > 0.0
+    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_LOSS", default=False)
+
+
+def k11_bio_trigger_score(
+    model: "GNODE_Phase3",
+    species_log: torch.Tensor,
+) -> torch.Tensor:
+    """Soft biological clot readiness from FI/Mat (SI), in ``[0, 1]``."""
+    sp = torch.clamp(species_log, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
+    species_si = model.species_log_nd_to_si(sp)
+    fi_si = species_si[:, 8:9]
+    mat_si = species_si[:, 11:12]
+    fi_thr = max(
+        _k11_env_float("BIOCHEM_K11_FI_THRESH_SI", "BIOCHEM_K11_FI_THRESH_SI", float(model.fi_crit) * 0.02),
+        1e-12,
+    )
+    mat_thr = max(
+        _k11_env_float("BIOCHEM_K11_MAT_THRESH_SI", "BIOCHEM_K11_MAT_THRESH_SI", float(model.mat_crit) * 0.02),
+        1e-12,
+    )
+    fi_s = torch.clamp(fi_si / fi_thr, 0.0, 4.0)
+    mat_s = torch.clamp(mat_si / mat_thr, 0.0, 4.0)
+    power = max(_k11_env_float("BIOCHEM_K11_BIO_TRIGGER_POWER", "BIOCHEM_K11_BIO_TRIGGER_POWER", 1.0), 0.25)
+    mode = (os.environ.get("BIOCHEM_K11_BIO_TRIGGER_MODE") or "or").strip().lower()
+    if mode in ("and", "both"):
+        bio = (fi_s * mat_s).pow(power)
+    else:
+        bio = torch.maximum(fi_s, mat_s).pow(power)
+    return bio.clamp(0.0, 1.0)
+
+
+def k11_mech_trigger_score(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    bio_cfg,
+    props: dict,
+) -> torch.Tensor:
+    """Wall-local kinematic clot-risk prior (COMSOL-aligned or legacy), ``[N, 1]``."""
+    from src.core_physics.clot_kinematics_fields import (
+        clot_prior_score_mode,
+        compute_clot_kinematics_fields,
+        score_clot_risk_from_fields,
+    )
+    from src.core_physics.kinematics_clot_prior import clot_prior_score_flat
+
+    u_flat = u_nd.reshape(-1).to(dtype=torch.float32)
+    v_flat = v_nd.reshape(-1).to(dtype=torch.float32)
+    if clot_prior_score_mode() == "legacy":
+        score = clot_prior_score_flat(data, u_flat, v_flat, bio_cfg, props)
+    else:
+        fields = compute_clot_kinematics_fields(data, u_flat, v_flat, bio_cfg, props)
+        score, _, _ = score_clot_risk_from_fields(fields, bio_cfg)
+    q_raw = (os.environ.get("BIOCHEM_K11_MECH_QUANTILE") or "").strip()
+    if q_raw and clot_prior_score_mode() == "legacy":
+        q = min(max(float(q_raw), 0.5), 0.999)
+        flat = score.reshape(-1)
+        thr = torch.quantile(flat, q)
+        score = torch.where(flat >= thr, flat, torch.zeros_like(flat))
+    return score.reshape(-1, 1).clamp(0.0, 1.0)
+
+
+def k11_clot_trigger_score(
+    model: "GNODE_Phase3",
+    species_log: torch.Tensor,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    data,
+    bio_cfg,
+    props: dict,
+) -> torch.Tensor:
+    """Combine COMSOL-aligned biological + mechanical triggers, ``[N, 1]`` in ``[floor, 1]``."""
+    w_bio = max(_k11_env_float("BIOCHEM_K11_TRIGGER_W_BIO", "BIOCHEM_K11_TRIGGER_W_BIO", 0.45), 0.0)
+    w_mech = max(_k11_env_float("BIOCHEM_K11_TRIGGER_W_MECH", "BIOCHEM_K11_TRIGGER_W_MECH", 0.55), 0.0)
+    bio = k11_bio_trigger_score(model, species_log)
+    mech = k11_mech_trigger_score(data, u_nd, v_nd, bio_cfg, props)
+    combine = (os.environ.get("BIOCHEM_K11_TRIGGER_COMBINE") or "or").strip().lower()
+    if w_bio <= 0.0 and w_mech <= 0.0:
+        union = torch.ones_like(bio)
+    elif w_bio <= 0.0:
+        union = mech
+    elif w_mech <= 0.0:
+        union = bio
+    elif combine in ("avg", "mean", "weighted"):
+        union = (w_bio * bio + w_mech * mech) / (w_bio + w_mech)
+    else:
+        union = 1.0 - (1.0 - bio) * (1.0 - mech)
+    floor = max(_k11_env_float("BIOCHEM_K11_TRIGGER_FLOOR", "BIOCHEM_K11_TRIGGER_FLOOR", 0.02), 0.0)
+    return union.clamp(floor, 1.0)
+
+
 def _k11_dilate_clot_prob(
     p_clot: torch.Tensor,
     edge_index: torch.Tensor,
@@ -324,6 +423,8 @@ _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
     ("mu_k10e_simple", "BIOCHEM_MU_K10E_SIMPLE"),
     ("mu_k10g_oracle_clots", "BIOCHEM_K10G_ORACLE_CLOTS"),
     ("mu_k11_clot_gate", "BIOCHEM_MU_K11_CLOT_GATE"),
+    ("k11_trigger_apply", "BIOCHEM_K11_TRIGGER_APPLY"),
+    ("k11_clot_growth", "BIOCHEM_K11_CLOT_GROWTH"),
 )
 
 _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
@@ -360,6 +461,9 @@ def snapshot_biochem_forward_policy() -> dict[str, Any]:
         raw_clot = (os.environ.get("BIOCHEM_K11_MU_CLOT_SI") or "").strip()
         if raw_clot:
             policy["k11_mu_clot_si"] = raw_clot
+        policy["k11_trigger_apply"] = _k11_trigger_apply_enabled()
+        policy["k11_apply_mode"] = (os.environ.get("BIOCHEM_K11_APPLY_MODE") or "wall_prox").strip()
+        policy["k11_clot_growth"] = _biochem_env_truthy("BIOCHEM_K11_CLOT_GROWTH", default=False)
     if policy["mu_k10d_simple"]:
         raw_max = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
         if raw_max:
@@ -423,6 +527,11 @@ def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> s
         tags.append("k10g_oracle_clots")
     if policy.get("mu_k11_clot_gate"):
         tags.append("k11_clot_gate")
+        if policy.get("k11_trigger_apply") is False:
+            tags.append("no_trigger_apply")
+        mode = (policy.get("k11_apply_mode") or "").strip()
+        if mode and mode not in ("wall_prox",):
+            tags.append(f"apply_{mode}")
     if policy.get("mu_gemini_fix"):
         tags.append("gemini_fix")
     if policy.get("gelation_prior_gate") is False:
@@ -458,6 +567,7 @@ def apply_biochem_forward_policy(
         ("k10e_sdf_max_nd", "BIOCHEM_K10E_SDF_MAX_ND"),
         ("k10e_mu_delta_nd_max", "BIOCHEM_K10E_MU_DELTA_ND_MAX"),
         ("k11_mu_clot_si", "BIOCHEM_K11_MU_CLOT_SI"),
+        ("k11_apply_mode", "BIOCHEM_K11_APPLY_MODE"),
     ):
         if field not in policy:
             continue
@@ -1873,6 +1983,24 @@ class GNODE_Phase3(nn.Module):
                     sdf_nd = kin_in[:, NodeFeat.SDF]
                     wall_mask = batch.mask_wall.view(-1, 1).to(dtype=p_raw.dtype)
                     apply_mask = k11_clot_apply_mask(sdf_nd, wall_mask)
+                    if _k11_trigger_apply_enabled():
+                        props_g = {
+                            "u_ref": u_ref.to(dtype=p_raw.dtype),
+                            "d_bar": d_bar.to(dtype=p_raw.dtype),
+                        }
+                        trig = k11_clot_trigger_score(
+                            self,
+                            sp_safe,
+                            u_nd,
+                            v_nd,
+                            batch,
+                            self._bio_cfg,
+                            props_g,
+                        )
+                        apply_mask = (apply_mask * trig).clamp(0.0, 1.0)
+                        self._last_k11_trigger_mask = trig.detach()
+                    else:
+                        self._last_k11_trigger_mask = None
                     p_clot = (p_raw * apply_mask).clamp(0.0, 1.0)
                     if _biochem_env_truthy("BIOCHEM_K11_CLOT_GROWTH", default=False):
                         p_clot = _k11_dilate_clot_prob(p_clot, batch.edge_index.to(device=p_clot.device))

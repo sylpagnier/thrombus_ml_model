@@ -1596,6 +1596,10 @@ def _compute_mu_flow_debug_metrics(
         raw = model._last_p_clot_raw.view(-1).float()
         out["DBG_gate_raw_mean_all"] = _masked_mean(raw, m_all)
         out["DBG_gate_raw_mean_wall"] = _masked_mean(raw, m_truth & m_wall)
+    if hasattr(model, "_last_k11_trigger_mask") and model._last_k11_trigger_mask is not None:
+        tr = model._last_k11_trigger_mask.view(-1).float()
+        out["DBG_k11_trigger_mean_all"] = _masked_mean(tr, m_all)
+        out["DBG_k11_trigger_mean_wall"] = _masked_mean(tr, m_truth & m_wall)
     if hasattr(model, "_last_mu_nucleation_prob") and model._last_mu_nucleation_prob is not None:
         nuc = model._last_mu_nucleation_prob.view(-1).float()
         out["DBG_gate_nucleation_all"] = _masked_mean(nuc, m_all)
@@ -3514,10 +3518,74 @@ def _k11_clot_gt_label(
     mu_g_si: torch.Tensor,
     cfg_mu,
 ) -> torch.Tensor:
-    """Binary clot label from GT ``μ_eff`` (all truth nodes, not only off-wall band)."""
-    ratio = max(float(os.environ.get("BIOCHEM_K11_CLOT_GT_RATIO", "1.20")), 1.01)
+    """Binary clot label from GT ``μ_eff`` (all truth nodes, not only off-wall band).
+
+    Uses an absolute SI floor only. The legacy ``ratio * mu_inf`` branch used plasma
+    ``mu_inf`` (~0.0035 Pa·s) and marked essentially every anchor node positive.
+    """
     mu_floor = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_SI_MIN", "0.055")), float(cfg_mu.mu_inf))
-    return ((mu_g_si >= mu_floor) | (mu_g_si >= ratio * float(cfg_mu.mu_inf))).float()
+    return (mu_g_si >= mu_floor).float()
+
+
+def _k11_bce_support_mode() -> str:
+    return (os.environ.get("BIOCHEM_K11_BCE_SUPPORT") or "adjacent_trigger").strip().lower()
+
+
+def _k11_bce_trig_threshold() -> float:
+    return max(float(os.environ.get("BIOCHEM_K11_BCE_TRIG_THRESH", "0.25")), 0.05)
+
+
+def _k11_bce_node_mask(
+    data,
+    truth_mask: torch.Tensor,
+    y_clot: torch.Tensor,
+    trig: Optional[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Nodes included in K11 BCE (default: adjacent band ∪ GT clot ∪ high COMSOL trigger)."""
+    ma = truth_mask.view(-1).bool()
+    mode = _k11_bce_support_mode()
+    if mode in ("all", "off", "none", "full"):
+        return ma
+    from src.architecture.gnode_biochem import k11_clot_apply_mask
+
+    sdf = data.x[:, 2].to(device=device, dtype=torch.float32)
+    wall = (
+        data.mask_wall.view(-1, 1).to(device=device, dtype=torch.float32)
+        if hasattr(data, "mask_wall") and data.mask_wall is not None
+        else torch.zeros(ma.shape[0], 1, device=device)
+    )
+    apply_hi = k11_clot_apply_mask(sdf, wall).reshape(-1) > 0.05
+    if mode in ("adjacent", "adjacent_only"):
+        return ma & apply_hi
+    clot_pos = y_clot.view(-1).bool() > 0.5
+    if trig is None:
+        return ma & (apply_hi | clot_pos)
+    thr = _k11_bce_trig_threshold()
+    return ma & (apply_hi | clot_pos | (trig.reshape(-1) >= thr))
+
+
+def _k11_teacher_checkpoint_score(val_stats: Mapping[str, Any]) -> float:
+    """Higher is better — balances logMAE with localized gate (not global wall halo)."""
+    base = -float(val_stats.get("mu_log_mae", float("inf")))
+    gate = float(val_stats.get("viz_final_gate_mean_all", float("nan")))
+    clot_frac = float(val_stats.get("viz_final_clot_frac", float("nan")))
+    score = base
+    if math.isfinite(gate):
+        # Penalize collapsed gates (flat μ_eff ≈ μ_ss everywhere).
+        score -= 80.0 * max(0.0, 0.002 - gate)
+        score -= 20.0 * max(0.0, gate - 0.03)
+    if math.isfinite(clot_frac):
+        score -= 15.0 * max(0.0, clot_frac - 0.05)
+        score -= 12.0 * max(0.0, 0.002 - clot_frac)
+    return score
+
+
+def _teacher_val_selection_score(val_stats: Mapping[str, Any]) -> float:
+    """Score used for teacher ``take_ckpt`` (higher = better)."""
+    if _biochem_mu_k11_clot_gate_enabled() and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True):
+        return _k11_teacher_checkpoint_score(val_stats)
+    return -float(val_stats.get("mu_log_mae", float("inf")))
 
 
 def _k11_bce_use_raw_prob() -> bool:
@@ -3527,6 +3595,74 @@ def _k11_bce_use_raw_prob() -> bool:
         "yes",
         "on",
     )
+
+
+def _k11_trigger_loss_enabled() -> bool:
+    raw = (os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT") or "").strip()
+    if raw:
+        return float(raw) > 0.0
+    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_LOSS", default=False)
+
+
+def _k11_trigger_time_index(t: int, t_cap: int) -> int:
+    """GT trigger time: ``sync`` = same macro step as μ; ``ic`` = COMSOL t0 only."""
+    mode = (os.environ.get("BIOCHEM_K11_TRIGGER_TIME") or "sync").strip().lower()
+    if mode in ("ic", "t0", "0"):
+        return 0
+    return int(max(0, min(t, t_cap - 1)))
+
+
+def _k11_graph_scale_props(data, device: torch.device, dtype: torch.dtype) -> dict:
+    """Per-graph ``u_ref`` / ``d_bar`` for clot-prior triggers (from batch, not ``BiochemConfig``)."""
+    if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == data.num_nodes:
+        u_ref = data.u_ref.to(device=device, dtype=dtype).reshape(-1)[:1]
+        d_bar = data.d_bar.to(device=device, dtype=dtype).reshape(-1)[:1]
+    else:
+        u_ref = torch.as_tensor(data.u_ref, device=device, dtype=dtype).reshape(1)
+        d_bar = torch.as_tensor(data.d_bar, device=device, dtype=dtype).reshape(1)
+    return {"u_ref": u_ref, "d_bar": d_bar}
+
+
+def _k11_gt_trigger_mask(
+    model,
+    y_true: torch.Tensor,
+    data,
+    bio_cfg,
+    t: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Detached COMSOL trigger score ``[N]`` from GT species + velocity at chosen time."""
+    from src.architecture.gnode_biochem import k11_clot_trigger_score
+
+    t_cap = int(y_true.shape[0])
+    t_src = _k11_trigger_time_index(t, t_cap)
+    species_log = y_true[t_src, :, 4:16].to(device=device, dtype=dtype)
+    u_nd = y_true[t_src, :, 0].to(device=device, dtype=dtype)
+    v_nd = y_true[t_src, :, 1].to(device=device, dtype=dtype)
+    props = _k11_graph_scale_props(data, device, dtype)
+    trig = k11_clot_trigger_score(model, species_log, u_nd, v_nd, data, bio_cfg, props)
+    return trig.reshape(-1).detach()
+
+
+def _k11_trigger_sample_weights(
+    trig: torch.Tensor,
+    y: torch.Tensor,
+    base_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Up-weight nodes where COMSOL triggers support clot; down-weight off-trigger negatives."""
+    scale = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT", "1.0")), 0.0)
+    if scale <= 0.0:
+        return base_weight
+    eps = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_MIN_WEIGHT", "0.12")), 0.02)
+    trig_w = eps + (1.0 - eps) * trig.clamp(0.0, 1.0)
+    w = base_weight * (0.5 + 0.5 * scale * trig_w)
+    pos_boost = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_POS_BOOST", "1.5")), 1.0)
+    w = torch.where(y > 0.5, w * pos_boost, w)
+    low_trig = trig < max(float(os.environ.get("BIOCHEM_K11_TRIGGER_NEG_THRESH", "0.20")), 0.05)
+    neg_extra = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_NEG_MULT", "3.0")), 1.0)
+    w = torch.where((y < 0.5) & low_trig, w * neg_extra, w)
+    return w
 
 
 def _anchor_k11_clot_bce_loss(
@@ -3564,18 +3700,88 @@ def _anchor_k11_clot_bce_loss(
     neg_weight = float(neg_weight_raw) if neg_weight_raw else 2.0
     wall_neg_raw = (os.environ.get("BIOCHEM_K11_WALL_NEG_WEIGHT") or "").strip()
     wall_neg_mult = float(wall_neg_raw) if wall_neg_raw else 4.0
+    bio_cfg = getattr(model, "_bio_cfg", None)
     for t in range(t_cap):
         p_all = steps[t].reshape(-1).clamp(1e-6, 1.0 - 1e-6)
         mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch]).reshape(-1).float()
         y_clot = _k11_clot_gt_label(mu_g, cfg_mu)
-        p = p_all[ma]
-        y = y_clot[ma]
+        trig_t = None
+        if bio_cfg is not None:
+            trig_t = _k11_gt_trigger_mask(model, y_true, data, bio_cfg, t, device, dtype)
+        sup = _k11_bce_node_mask(data, ma, y_clot, trig_t, device)
+        if not bool(sup.any().item()):
+            continue
+        p = p_all[sup]
+        y = y_clot[sup]
         w = torch.full_like(y, neg_weight)
         w = torch.where(y > 0.5, torch.full_like(y, pos_weight), w)
-        w = torch.where((y < 0.5) & wall[ma], w * wall_neg_mult, w)
+        w = torch.where((y < 0.5) & wall[sup], w * wall_neg_mult, w)
+        if _k11_trigger_loss_enabled() and trig_t is not None:
+            w = _k11_trigger_sample_weights(trig_t[sup], y, w)
         bce = F.binary_cross_entropy(p, y, weight=w)
         terms.append(bce.to(dtype=dtype) * tw[t])
     return torch.stack(terms).sum() if terms else z
+
+
+def _anchor_k11_trigger_suppress_loss(
+    model,
+    y_true: torch.Tensor,
+    truth_mask: torch.Tensor,
+    data,
+    cfg_mu,
+    mu_ch: int,
+) -> torch.Tensor:
+    """Penalize ``p_clot`` where COMSOL mechanical/biological triggers are low (off-clot regions)."""
+    device = y_true.device
+    dtype = y_true.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    if not _k11_trigger_loss_enabled():
+        return z
+    steps = getattr(model, "_k11_p_clot_steps", None)
+    if not steps:
+        return z
+    ma = truth_mask.view(-1).bool()
+    if not ma.any():
+        return z
+    bio_cfg = getattr(model, "_bio_cfg", None)
+    if bio_cfg is None:
+        return z
+    thr = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_THRESH", "0.25")), 0.05)
+    t_cap = min(len(steps), int(y_true.shape[0]))
+    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
+    terms: List[torch.Tensor] = []
+    for t in range(t_cap):
+        p_all = steps[t].reshape(-1).clamp(0.0, 1.0)
+        trig = _k11_gt_trigger_mask(model, y_true, data, bio_cfg, t, device, dtype)
+        m = ma & (trig < thr)
+        if bool(m.any()):
+            terms.append((p_all[m] ** 2).mean().to(dtype=dtype) * tw[t])
+    return torch.stack(terms).sum() if terms else z
+
+
+def _anchor_k11_gate_mean_target_loss(
+    model,
+    truth_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Hinge on mean ``p_clot`` (truth nodes) so the gate does not collapse to ~0."""
+    device = truth_mask.device
+    dtype = truth_mask.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    w = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0)
+    if w <= 0.0:
+        return z
+    target = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_MEAN", "0.006")), 1e-5)
+    steps = getattr(model, "_k11_p_clot_steps", None)
+    if not steps:
+        return z
+    ma = truth_mask.view(-1).bool()
+    if not ma.any():
+        return z
+    terms: List[torch.Tensor] = []
+    for p_step in steps:
+        p_mean = p_step.reshape(-1)[ma].mean()
+        terms.append(F.relu(target - p_mean).pow(2) * w)
+    return torch.stack(terms).mean() if terms else z
 
 
 def _anchor_k11_wall_fp_penalty(
@@ -3880,6 +4086,8 @@ def _biochem_resolve_isolated_loss(
     l_k11_clot_bce: torch.Tensor,
     l_k11_clot_mu: torch.Tensor,
     l_k11_wall_fp: torch.Tensor,
+    l_k11_trigger_suppress: torch.Tensor,
+    l_k11_gate_target: torch.Tensor,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -3972,11 +4180,15 @@ def _biochem_resolve_isolated_loss(
         w_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "1.0")), 0.0)
         w_mu = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_HUBER_WEIGHT", "0.5")), 0.0)
         w_fp = max(float(os.environ.get("BIOCHEM_K11_WALL_FP_WEIGHT", "2.0")), 0.0)
+        w_ts = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_WEIGHT", "3.0")), 0.0)
+        w_gt = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0)
         w_dk = max(float(os.environ.get("BIOCHEM_K11_DATA_KINE_WEIGHT", "0.25")), 0.0)
         return (
             _biochem_scale_for_isolate(w_bce) * l_k11_clot_bce
             + _biochem_scale_for_isolate(w_mu) * l_k11_clot_mu
             + _biochem_scale_for_isolate(w_fp) * l_k11_wall_fp
+            + _biochem_scale_for_isolate(w_ts) * l_k11_trigger_suppress
+            + _biochem_scale_for_isolate(w_gt) * l_k11_gate_target
             + _biochem_scale_for_isolate(w_dk) * l_data_kine
         )
     if k in ("FI_GATE", "FI_GATE_START"):
@@ -4435,6 +4647,8 @@ def compute_biochem_loss(
     l_k11_clot_bce = torch.tensor(0.0, device=device)
     l_k11_clot_mu = torch.tensor(0.0, device=device)
     l_k11_wall_fp = torch.tensor(0.0, device=device)
+    l_k11_trigger_suppress = torch.tensor(0.0, device=device)
+    l_k11_gate_target = torch.tensor(0.0, device=device)
     l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
@@ -4601,6 +4815,7 @@ def compute_biochem_loss(
                 w_k11_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "0.0")), 0.0)
                 w_k11_mu = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_HUBER_WEIGHT", "0.0")), 0.0)
                 w_k11_fp = max(float(os.environ.get("BIOCHEM_K11_WALL_FP_WEIGHT", "0.0")), 0.0)
+                w_k11_ts = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_WEIGHT", "0.0")), 0.0)
                 if _k11_isolate or w_k11_bce > 0.0:
                     l_k11_clot_bce = _anchor_k11_clot_bce_loss(
                         model,
@@ -4627,6 +4842,19 @@ def compute_biochem_loss(
                         kernels.core.cfg,
                         mu_ch,
                     )
+                if _k11_isolate or w_k11_ts > 0.0:
+                    l_k11_trigger_suppress = _anchor_k11_trigger_suppress_loss(
+                        model,
+                        target_series,
+                        ma,
+                        data,
+                        kernels.core.cfg,
+                        mu_ch,
+                    )
+                if _k11_isolate or max(
+                    float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0
+                ) > 0.0:
+                    l_k11_gate_target = _anchor_k11_gate_mean_target_loss(model, ma)
 
     mu_dbg = _compute_mu_flow_debug_metrics(
         model=model,
@@ -4826,6 +5054,8 @@ def compute_biochem_loss(
             l_k11_clot_bce=l_k11_clot_bce,
             l_k11_clot_mu=l_k11_clot_mu,
             l_k11_wall_fp=l_k11_wall_fp,
+            l_k11_trigger_suppress=l_k11_trigger_suppress,
+            l_k11_gate_target=l_k11_gate_target,
             l_fi_gate_start=l_fi_gate_start,
             w_fi_gate_start_eff=float(w_fi_gate_start_eff),
             l_residual_sparse=l_residual_sparse,
@@ -6310,11 +6540,17 @@ def train_teacher_on_anchors(
                 ):
                     if hk in val_bundle:
                         val_stats[hk] = val_bundle[hk]
-                val_mu_score = -float(val_stats["mu_log_mae"])
+                val_mu_score = _teacher_val_selection_score(val_stats)
+                ckpt_score_label = (
+                    "k11_score"
+                    if _biochem_mu_k11_clot_gate_enabled()
+                    and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True)
+                    else "mu_score"
+                )
                 print(
                     f"   ✅ Teacher Ep {epoch:02d} validation complete "
-                    f"({time.perf_counter() - val_t0:.2f}s) | mu_score={val_mu_score:.4f} "
-                    f"(best running {best_mu_score:.4f})."
+                    f"({time.perf_counter() - val_t0:.2f}s) | {ckpt_score_label}={val_mu_score:.4f} "
+                    f"(best running {best_mu_score:.4f}, logMAE={float(val_stats['mu_log_mae']):.4f})."
                 )
                 cand_all = float(val_stats["mu_log_mae"])
                 cand_high = float(val_stats.get("mu_log_mae_high_mu", float("inf")))
@@ -6494,6 +6730,13 @@ def train_teacher_on_anchors(
 
     last_state = copy.deepcopy(teacher.state_dict())
     last_epoch = int(epoch) if max_epochs > 0 else -1
+    if (
+        best_state is not None
+        and _biochem_mu_k11_clot_gate_enabled()
+        and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True)
+    ):
+        best_high_state = copy.deepcopy(best_state)
+        best_high_epoch = int(best_epoch)
     if best_state is not None:
         teacher.load_state_dict(best_state, strict=False)
     teacher.eval()
@@ -6699,9 +6942,14 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             flush=True,
         )
     if (os.environ.get("BIOCHEM_MU_K11_CLOT_GATE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        trig_note = (
+            "p_clot=σ(head)×apply (no trigger apply)"
+            if not _biochem_env_truthy("BIOCHEM_K11_TRIGGER_APPLY")
+            else "p_clot=σ(head)×apply×trigger"
+        )
         print(
             "ℹ️ BIOCHEM_MU_K11_CLOT_GATE=1: μ_eff = μ_ss + p_clot×(μ_clot−μ_ss); "
-            "p_clot=σ(head)×apply_mask; LOSS_ISOLATE=K11 (BCE on p_raw + μ Huber + wall-FP + DATA_KINE).",
+            f"{trig_note}; LOSS_ISOLATE=K11 (BCE + μ Huber + wall-FP + trigger-suppress + gate-target + DATA_KINE).",
             flush=True,
         )
     epochs = max(1, int(os.environ.get("BIOCHEM_EPOCHS", str(epochs))))

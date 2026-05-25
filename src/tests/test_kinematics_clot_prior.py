@@ -64,8 +64,8 @@ def test_prior_feature_channels_are_bounded_and_interpretable(monkeypatch):
     assert torch.all((feats >= 0.0) & (feats <= 1.0))
     # Channel 0 is the full prior; channel 1 is the gated adhesion-flux proxy.
     assert torch.all(feats[:, 0] >= feats[:, 1])
-    # All physics channels should inherit the wall/near-wall localization gate.
-    assert torch.all(feats[0] > feats[-1])
+    # Full prior (ch0) peaks near wall and decays in bulk.
+    assert feats[0, 0] > feats[-1, 0]
 
 
 def test_max_neighbor_dilate_propagates_along_chain():

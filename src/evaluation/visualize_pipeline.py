@@ -29,6 +29,7 @@ from src.architecture.gnode_biochem import (
     _SPECIES_LOG1P_MAX,
     _SPECIES_LOG1P_MIN,
     _biochem_mu_disable_explicit_gelation,
+    _biochem_mu_k11_clot_gate_enabled,
     _biochem_mu_simple_log_residual_enabled,
     biochem_explicit_gelation_terms,
     resolve_gnode_phase3_ctor_kwargs,
@@ -138,6 +139,21 @@ def _rollout_mu_eff_si_numpy(phys_cfg: PhysicsConfig, pred_np: np.ndarray) -> np
     mu_ch = STATE_CHANNEL_MU_EFF_ND
     mu_nd = torch.from_numpy(pred_np[:, mu_ch]).float().view(-1, 1)
     return phys_cfg.viscosity_nd_to_si(mu_nd).detach().cpu().numpy().reshape(-1)
+
+
+def _k11_p_clot_series_numpy(
+    model: GNODE_Phase3,
+    frame_indices: List[int],
+) -> Optional[np.ndarray]:
+    """Per-keyframe K11 ``p_clot`` from the last dense rollout (macro steps)."""
+    steps = getattr(model, "_k11_p_clot_steps", None)
+    if not steps:
+        return None
+    stacked = torch.stack([s.reshape(-1).float() for s in steps], dim=0).detach().cpu().numpy()
+    out = np.zeros((len(frame_indices), stacked.shape[1]), dtype=np.float32)
+    for fi, idx in enumerate(frame_indices):
+        out[fi] = stacked[min(int(idx), stacked.shape[0] - 1)]
+    return out
 
 
 def _carreau_mu_blood_torch(
@@ -871,6 +887,7 @@ def _show_biochem_temporal_slider(
     comsol_series_np: Optional[np.ndarray] = None,
     title_prefix: str = "Biochem Temporal Inspector",
     refresh_label: str = "Refresh",
+    k11_p_clot_series: Optional[np.ndarray] = None,
 ):
     vel_all, _ = _vel_pressure_from_series(pred_biochem_series_np)
     bio_cfg = BiochemConfig(phase="biochem")
@@ -884,6 +901,8 @@ def _show_biochem_temporal_slider(
         model_biochem, data_biochem, pred_biochem_series_np, biochem_rollout=True
     )
     mu2_cap = float(model_biochem.mu_ratio_max)
+    show_k11_gate = k11_p_clot_series is not None and k11_p_clot_series.ndim == 2
+    show_legacy_gel = not _biochem_mu_disable_explicit_gelation() and not show_k11_gate
 
     show_comsol = comsol_series_np is not None
     ncols = 2 if show_comsol else 1
@@ -961,7 +980,7 @@ def _show_biochem_temporal_slider(
             mat_vmax,
         )
 
-    # --- Main: flow + effective viscosity + gelation triggers ---
+    # --- Main: flow + effective viscosity + (K11 p_clot or legacy μ₁/μ₂) ---
     nrows_main = 4
     fig, axs = plt.subplots(nrows_main, ncols, figsize=(7 * ncols, 15))
     if ncols == 1:
@@ -978,12 +997,44 @@ def _show_biochem_temporal_slider(
     scatters["mu_b"] = _init_scatter(
         fig, axs[1, col_b], mu_dyn_all, f"Biochem: {mu_labels['mu_dynamic']}", _viz_mu_cmap(), mu_vmin, mu_vmax
     )
-    scatters["m1_b"] = _init_scatter(
-        fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", _viz_mu_cmap(), m1_vmin, m1_vmax
-    )
-    scatters["m2_b"] = _init_scatter(
-        fig, axs[3, col_b], mu2_all, f"Biochem: {mu_labels['mu2_trigger']}", "Reds", 0.0, mu2_cap
-    )
+    if show_k11_gate:
+        scatters["pclot_b"] = _init_scatter(
+            fig,
+            axs[2, col_b],
+            k11_p_clot_series,
+            r"Biochem: $p_{\mathrm{clot}}$ (K11 gate) [−]",
+            "Reds",
+            0.0,
+            1.0,
+        )
+        scatters["m2_b"] = _init_scatter(
+            fig,
+            axs[3, col_b],
+            mu2_all,
+            f"Biochem: {mu_labels['mu2_trigger']} (legacy)",
+            "Reds",
+            0.0,
+            mu2_cap,
+        )
+    elif show_legacy_gel:
+        scatters["m1_b"] = _init_scatter(
+            fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", _viz_mu_cmap(), m1_vmin, m1_vmax
+        )
+        scatters["m2_b"] = _init_scatter(
+            fig, axs[3, col_b], mu2_all, f"Biochem: {mu_labels['mu2_trigger']}", "Reds", 0.0, mu2_cap
+        )
+    else:
+        scatters["m2_b"] = _init_scatter(
+            fig,
+            axs[2, col_b],
+            mu2_all,
+            f"Biochem: {mu_labels['mu2_trigger']}",
+            "Reds",
+            0.0,
+            mu2_cap,
+        )
+        axs[3, col_b].axis("off")
+        axs[3, col_b].set_title("")
 
     if show_comsol:
         scatters["vel_c"] = _init_scatter(
@@ -1035,7 +1086,10 @@ def _show_biochem_temporal_slider(
         t_lbl = f"t={custom_times[idx]:.1f}s"
         scatters["vel_b"].set_array(vel_all[idx])
         scatters["mu_b"].set_array(mu_dyn_all[idx])
-        scatters["m1_b"].set_array(mb_mu1_all[idx])
+        if "pclot_b" in scatters:
+            scatters["pclot_b"].set_array(k11_p_clot_series[idx])
+        if "m1_b" in scatters:
+            scatters["m1_b"].set_array(mb_mu1_all[idx])
         scatters["m2_b"].set_array(mu2_all[idx])
         scatters_sp["fib_b"].set_array(fib_all[idx])
         scatters_sp["mat_b"].set_array(mat_all[idx])
@@ -1306,6 +1360,7 @@ def run_phase_comparison(
 
     comsol_series_np: Optional[np.ndarray] = None
     comsol_final_np: Optional[np.ndarray] = None
+    k11_p_clot_slider: Optional[np.ndarray] = None
 
     pred_kine_on_biochem_mesh = None
     with torch.no_grad():
@@ -1417,6 +1472,8 @@ def run_phase_comparison(
         custom_times_nd = [t / t_ref for t in custom_times]
         frame_indices = [torch.argmin(torch.abs(rollout_times - t_nd)).item() for t_nd in custom_times_nd]
         pred_biochem_series = pred_biochem_series_dense[frame_indices]
+        if _biochem_mu_k11_clot_gate_enabled():
+            k11_p_clot_slider = _k11_p_clot_series_numpy(model_biochem, frame_indices)
 
         # Extract the final *trained* time step for static Fig 1 comparison.
         idx_t_final = torch.argmin(torch.abs(rollout_times - (t_final_si / t_ref))).item()
@@ -1565,6 +1622,7 @@ def run_phase_comparison(
         comsol_series_np=comsol_series_np,
         title_prefix=f"Biochem Temporal Inspector ({case_label})",
         refresh_label=slider_refresh_label,
+        k11_p_clot_series=k11_p_clot_slider,
     )
     return refresh_state["requested"]
 

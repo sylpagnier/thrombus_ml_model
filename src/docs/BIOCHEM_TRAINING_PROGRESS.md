@@ -52,7 +52,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Partial** | **K1/K0** ~1.45; **K2** explicit gelation **5.77** (§91) — triggers flood IC |
 | Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **K1** Δμ+`DATA_KINE` **0.464** (§90); **K2** step-3 multitask+gelation **4.22** ep9 (§91, **regress**); sentinel **0.294**; visc3h **0.408** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Partial** | **K11b** (§105): **wall halo** (`gate_wall≈1`), not COMSOL-localized bands; **K10e** (§103) flat **`clot_frac=0`**; **K9** weak t0 flow |
+| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Partial** | **K11d** (§107): red band persists on **μ₁/μ₂** inspector rows; **`gate_wall=0`** (adjacent apply); **K11b** wall halo; **K10e** no clots |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
@@ -964,6 +964,37 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Viz bug**: End-of-run **`teacher.load_state_dict(best_all_ep0)`** before writing **`biochem_teacher_last.pth`** → user saw **no clots** despite late-epoch train gates.
 - **Fix (code)**: **`teacher_last` = final-epoch weights**; metadata `last_epoch_completed` corrected; stronger **`WALL_FP=5`** in script.
 
+### 106. **K11d** COMSOL trigger-localized gate (`go_k11_clot_gate.ps1` default)
+
+- **Symptom**: Full-wall red band — `wall_prox` apply × saturated `p_raw` on all wall nodes.
+- **Fix**: **`APPLY_MODE=adjacent`**; forward **`p_clot = p_raw × adjacent × trigger(model)`**; loss **BCE weights from COMSOL GT** FI/Mat + `clot_prior_score_flat` at same macro step (`TRIGGER_TIME=sync`, or `ic` for t0-only); **`TRIGGER_SUPPRESS`** + stronger **wall-FP** on low-trigger nodes.
+- **Watch**: `DBG_k11_trigger_mean_wall`, `gate_wall` (should stay **≪ 1**), localized red in viz.
+
+### 107. **K11d** run + prior diagnostic (patient007, `20260525T181453Z`)
+
+- **Symptom**: Viz still shows **continuous red wall band** on **μ_blood×μ₁** / **μ₂** rows and weak t0 **|u|**; train logs show **`gate_wall=0`**, **`gate_all≈0.005`**, **`clot_frac≈0.004`** — metrics look “safe” but plots disagree.
+- **Cause (multi)**:
+  1. **Inspector rows ≠ K11 gate**: temporal **μ₁/μ₂** come from **open-loop species → sigmoid gelation** (`_biochem_rollout_rheology_fields`), not **`p_clot`**; can halo walls even when `val_viz_final_mu1_mean=0`.
+  2. **`gate_wall=0` with `APPLY=adjacent`**: clot mass lives on **off-wall shell**; wall metric is the wrong probe.
+  3. **K11 BCE label bug**: `_k11_clot_gt_label` used **`μ ≥ 1.2×μ_inf` (~0.004 Pa·s)** OR floor → **~100% positives** on anchors; BCE could not teach localization (fixed: floor-only).
+  4. **Mech prior at GT time**: `clot_prior_score_flat` **≈0** on high-μ nodes (thresh 0.25); **bio trigger** on COMSOL species fires **~93%** of nodes with **~10% precision** vs p90 high-μ clots — not COMSOL-localized.
+  5. **Best ckpt still ep0** by all-truth logMAE; 12 ep did not beat preflight.
+- **Tool**: `python scripts/diagnose_k11_clot_prior.py --anchor patient007 [--checkpoint …]`.
+- **Next**: re-run K11 with fixed label; add viz panel for **`p_clot`**; try **`BIOCHEM_K11_TRIGGER_APPLY=0`** at inference (train triggers only); tighten BCE support to **adjacent ∩ (GT clot ∨ high trigger)**.
+
+### 108. **K11e** first run: collapsed gate + wrong viz ckpt epoch
+
+- **Symptom**: `gate_all≈2e-5`, `clot_frac=0`, viz **uniform blue** μ_eff; train `L_tot≈0.6–1.2` (K11 losses active but gate dead).
+- **Cause**: **`LOGIT_BIAS=-2.5`** + strong **trigger-suppress** drove `p_clot→0`; **`teacher_best_high_mu.pth` used ep11** (high-μ metric) while **k11_score best was ep0** — viz loaded weak gate weights.
+- **Fix (code/script)**: `LOGIT_BIAS=-0.5`, **`BIOCHEM_K11_GATE_TARGET_WEIGHT=3`**, milder suppress, **μ Huber w=1**; end-of-teacher **sync `best_high_state` with k11-best** when `K11_CKPT_SCORE=1`; stronger k11_score penalty for `gate<0.002`.
+
+### 109. Mech prior misaligned with COMSOL `d(spf.sr,x)` (K11 localization)
+
+- **Symptom**: Legacy `clot_prior_score_flat` **~0%** nodes ≥0.25 on patient007; mech trigger useless for **where** to clot; COMSOL clots track **dγ/dx ≲ −800** not streamwise `dshear/ds` alone.
+- **Cause**: Per-graph **max** normalisation + stream-only path channel; **`BIOCHEM_K11_MECH_QUANTILE=0.90`** zeroed residual mech signal.
+- **Fix (code)**: `src/core_physics/clot_kinematics_fields.py` — **`comsol_hybrid`** = max(stream sep, **dγ/dx gate**), **adjacent p95** norm; K11e sets `BIOCHEM_PRIOR_COMSOL_ALIGNED=1`, drops mech quantile; `test_clot_node_pattern.py` compares clot vs non-clot on anchor (t0 + t_final).
+- **Next**: Re-run **`go_k11e_clot_gate.ps1 -Fresh`**; check diagnostic clot vs non-clot **dγ/dx** means and mech precision on adjacent band.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -1347,7 +1378,9 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **K10d_simple_mu_mse** (`MU_K10D_SIMPLE`, `MU_MSE` only, 12ep, `20260525T150817Z`) | **2.258** (flat) | **2.658** | **0.473** bulk | high **1.457** | **§102**: **uniform μ≈0.12** cheat; **not** better — val logMAE disaster vs K10b **0.49** |
 | 2026-05-25 | **K10e_wall_adjacent_mu_log** (`MU_K10E_SIMPLE`, `LOSS_ISOLATE=K10E`, `IC_STEADY_KIN`, fresh, 12ep, `20260525T153015Z`) | **0.493** (ep03) | **1.78–1.88** wall | **0.512** bulk ep11 | high **0.858** (ep11); ep03 **0.989** | **§103**: **no viz red bands**; `learned` **2.48e-03** flat; `clot_frac=0`; not K10d cheat; best ckpt ep03 |
 | 2026-05-25 | **K11b_clot_gate_wall_prox** (`MU_K11_CLOT_GATE`, `LOSS_ISOLATE=K11`, `APPLY=wall_prox`, `GROWTH=1`, `LOGIT_BIAS=0`, fresh, `20260525T171500Z`) | **0.519** (ep00) | **2.70** wall | **0.656** bulk ep11 | high **0.724** (ep11); r≈0.34 all | **§105**: **viz wall halo** (pink perimeter); `gate_wall≈1`, `gate_clot≈0.06`, `clot_frac=0.033`; not localized COMSOL bands |
-| 2026-05-25 | **K11c_clot_gate_sparse** (`20260525T173456Z`, 12ep) | **0.503** (ep00 best-all) | **2.69** ep11 | **0.498** bulk ep11 | high **0.788** (ep11) | **§106**: viz **flat** — **`teacher_last` was ep00 weights** (`gate≈0.002`); train ep4+ **`gate_wall→1`** again; fix: save **final epoch** in `teacher_last` |
+| 2026-05-25 | **K11c_clot_gate_sparse** (`20260525T173456Z`, 12ep) | **0.503** (ep00 best-all) | **2.69** ep11 | **0.498** bulk ep11 | high **0.788** (ep11) | **§105–106**: viz **flat** (ckpt bug); train **`gate_wall→1`**; **K11d** trigger+adjacent pending |
+| 2026-05-25 | **K11d_trigger_localized** (`LOSS_ISOLATE=K11`, `APPLY=adjacent`, `GROWTH=0`, trigger BCE/suppress, fresh, `20260525T181453Z`) | **0.496** (ep00) | **1.83** wall ep11 | **0.275** bulk ep11 | high **1.05** (ep11); r≈0.04 all | **§107**: val **flat ~0.50**; train `gate_wall=0`, `gate_all≈0.005`; viz **still red wall band** (μ₁/μ₂ species path + weak t0 flow); **K11 GT label bug** (`ratio×μ_inf`); prior overlap poor |
+| 2026-05-25 | **K11e_localized_best_practice** (`20260525T183843Z`, first K11e script) | **0.502** (ep00 k11) | **1.89** wall ep11 | **0.514** bulk ep11 | high **0.856** (ep11) | **§108**: `gate_all≈2e-5` → **flat μ_eff** (no clots); `teacher_best_high_mu` saved **ep11** not k11-best ep0; **fix**: bias −0.5, gate-target loss, sync high_mu ckpt |
 
 ---
 
