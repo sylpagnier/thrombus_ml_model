@@ -75,6 +75,77 @@ def test_slice_viz_health_mu2_zero_under_disable_explicit_gelation(monkeypatch):
     assert out["clot_frac"] == pytest.approx(0.0)
 
 
+def test_clot_frac_uses_rollout_mu_eff_when_explicit_gelation_on(monkeypatch):
+    from src.training.train_biochem_corrector import _compute_slice_viz_health_metrics
+
+    monkeypatch.delenv("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION", raising=False)
+    monkeypatch.delenv("BIOCHEM_MU_SIMPLE_LOG_RESIDUAL", raising=False)
+    monkeypatch.delenv("BIOCHEM_VIZ_CLOT_FRAC_USE_MU2", raising=False)
+    monkeypatch.setenv("BIOCHEM_TEACHER_MU_RATIO_MAX", "80.0")
+    model = _mock_biochem_model()
+    phys = MagicMock()
+    phys.mu_inf = 0.001
+    phys.viscosity_nd_to_si = lambda x: x * phys.mu_inf
+    kernels = MagicMock()
+    kernels.core.cfg = phys
+
+    n = 100
+    pred = torch.zeros(n, 16)
+    pred[:, STATE_CHANNEL_MU_EFF_ND] = 40.0
+    pred[0, STATE_CHANNEL_MU_EFF_ND] = 120.0
+    pred[:, 12] = 8.0
+    y = pred.clone()
+    data = MagicMock()
+    data.num_nodes = n
+
+    monkeypatch.setattr(
+        "src.training.train_biochem_corrector.biochem_truth_node_mask",
+        lambda *a, **k: torch.zeros(n, dtype=torch.bool),
+    )
+    out = _compute_slice_viz_health_metrics(
+        pred, y, data, model, kernels, torch.device("cpu")
+    )
+    assert out["mu2_mean"] == pytest.approx(80.0)
+    assert out["clot_frac"] == pytest.approx(0.01)
+
+
+def test_clot_frac_legacy_mu2_when_env_set(monkeypatch):
+    from src.training.train_biochem_corrector import _compute_slice_viz_health_metrics
+
+    monkeypatch.delenv("BIOCHEM_MU_DISABLE_EXPLICIT_GELATION", raising=False)
+    monkeypatch.setenv("BIOCHEM_VIZ_CLOT_FRAC_USE_MU2", "1")
+    model = _mock_biochem_model()
+    phys = MagicMock()
+    phys.mu_inf = 0.001
+    phys.viscosity_nd_to_si = lambda x: x * phys.mu_inf
+    kernels = MagicMock()
+    kernels.core.cfg = phys
+
+    n = 4
+    pred = torch.zeros(n, 16)
+    pred[:, STATE_CHANNEL_MU_EFF_ND] = 40.0
+    pred[:, 12] = 8.0
+    y = pred.clone()
+    data = MagicMock()
+    data.num_nodes = n
+
+    monkeypatch.setattr(
+        "src.training.train_biochem_corrector.biochem_truth_node_mask",
+        lambda *a, **k: torch.zeros(n, dtype=torch.bool),
+    )
+    out = _compute_slice_viz_health_metrics(
+        pred, y, data, model, kernels, torch.device("cpu")
+    )
+    assert out["clot_frac"] == pytest.approx(1.0)
+
+
+def test_mu_ic_steady_kin_env_flag(monkeypatch):
+    monkeypatch.delenv("BIOCHEM_MU_IC_STEADY_KIN", raising=False)
+    assert not gb._biochem_mu_ic_steady_kin_enabled()
+    monkeypatch.setenv("BIOCHEM_MU_IC_STEADY_KIN", "1")
+    assert gb._biochem_mu_ic_steady_kin_enabled()
+
+
 def test_rollout_mu_eff_si_numpy():
     from src.evaluation.visualize_pipeline import _rollout_mu_eff_si_numpy
 

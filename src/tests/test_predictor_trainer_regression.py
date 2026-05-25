@@ -111,7 +111,6 @@ def test_compute_step_loss_respects_curriculum_stage_logic(monkeypatch):
 
 def test_fast_forward_curriculum_three_epochs(monkeypatch):
     stage_calls = []
-    freeze_states = []
     optimizer_kinds = []
     loaded = []
 
@@ -141,10 +140,6 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
 
         def forward(self, losses):
             return losses[0] + losses[1] + self.p * 0.0
-
-        def requires_grad_(self, flag=True):
-            freeze_states.append(bool(flag))
-            return super().requires_grad_(flag)
 
     class _FakeAdam:
         def __init__(self, *_args, **_kwargs):
@@ -176,8 +171,9 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
         def step(self):
             return None
 
-    def _fake_load_dataset(phase, target_n=None):
-        loaded.append((phase, target_n))
+    def _fake_load_dataset(phase, rheology=None, limit=None):
+        _ = limit
+        loaded.append((phase, rheology))
         return [_SimpleGraph(False), _SimpleGraph(False)]
 
     def _fake_split(dataset, seed=42, train_ratio=0.9):
@@ -250,8 +246,6 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
 
     assert [s for s, _, _ in stage_calls] == [1, 1, 2, 2, 3, 3]
     assert loaded == [("kinematics", "newtonian"), ("kinematics", "carreau")]
-    assert False in freeze_states  # Stage 2 freezes Kendall weighter
-    assert True in freeze_states   # Stage 1/3 unfreezes it
     assert "lbfgs" in optimizer_kinds
 
 

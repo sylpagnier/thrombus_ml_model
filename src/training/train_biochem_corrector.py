@@ -345,6 +345,7 @@ from src.architecture.gnode_biochem import (
     biochem_explicit_gelation_terms,
     biochem_truth_node_mask,
     resolve_gnode_phase3_ctor_kwargs,
+    apply_biochem_forward_policy_from_checkpoint_meta,
     snapshot_biochem_model_config,
 )
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
@@ -2847,6 +2848,36 @@ def setup_biochem_optimization(
         for param in model.mu_encoder.parameters():
             param.requires_grad = True
 
+    train_wall_only = _biochem_env_truthy("BIOCHEM_MU_TRAIN_WALL_ONLY", default=False)
+    train_clot_only = _biochem_env_truthy("BIOCHEM_MU_TRAIN_CLOT_ONLY", default=False)
+    if train_wall_only and train_clot_only:
+        raise ValueError("Set only one of BIOCHEM_MU_TRAIN_WALL_ONLY or BIOCHEM_MU_TRAIN_CLOT_ONLY.")
+    if train_wall_only or train_clot_only:
+        _clot_mu_modules = (
+            "mu_delta_head",
+            "mu_delta_bulk_head",
+            "mu_delta_tail_head",
+            "mu_trigger_gate_head",
+            "mu_nucleation_gate_head",
+            "mu_growth_gate_head",
+            "learned_clot_penalty",
+        )
+        _wall_mu_modules = ("mu_delta_wall_head",)
+        freeze_modules = _clot_mu_modules if train_wall_only else _wall_mu_modules
+        for mod_name in freeze_modules:
+            mod = getattr(model, mod_name, None)
+            if mod is None:
+                continue
+            for param in mod.parameters():
+                param.requires_grad = False
+        if train_wall_only:
+            train_mu_encoder = False
+            if hasattr(model, "mu_encoder"):
+                for param in model.mu_encoder.parameters():
+                    param.requires_grad = False
+        label = "wall-only" if train_wall_only else "clot-only (split tail/gate; wall frozen)"
+        print(f"   🎯 BIOCHEM μ staged train scope: {label}", flush=True)
+
     physics_params: List[torch.nn.Parameter] = []
     mu_params: List[torch.nn.Parameter] = []
     bio_params: List[torch.nn.Parameter] = []
@@ -5036,6 +5067,27 @@ def _biochem_save_val_debug_plot(
     plt.close(fig)
 
 
+def _viz_clot_threshold_si(phys_cfg) -> float:
+    """SI viscosity above which a rollout node counts as clot in viz health (``μ_eff`` channel)."""
+    raw = (os.environ.get("BIOCHEM_VIZ_CLOT_MU_SI_THRESH") or "").strip()
+    if raw:
+        return max(float(raw), 0.0)
+    ratio_max = max(float(os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX", "20.0")), 1.0)
+    return float(phys_cfg.mu_inf) * ratio_max
+
+
+def _viz_clot_fraction_from_rollout(
+    pred_slice: torch.Tensor,
+    phys_cfg,
+    *,
+    mu_ch: int = STATE_CHANNEL_MU_EFF_ND,
+) -> float:
+    """Fraction of nodes with high **stored** ``μ_eff`` (same channel as ``visualize_pipeline`` dynamic μ)."""
+    mu_eff_si = phys_cfg.viscosity_nd_to_si(pred_slice[:, mu_ch]).view(-1).float()
+    thr = _viz_clot_threshold_si(phys_cfg)
+    return float((mu_eff_si >= thr).float().mean().item())
+
+
 def _compute_slice_viz_health_metrics(
     pred_slice: torch.Tensor,
     y_slice: torch.Tensor,
@@ -5071,16 +5123,13 @@ def _compute_slice_viz_health_metrics(
     out["mu1_mean"] = float(mu1.mean().item())
     out["mu2_mean"] = float(mu2.mean().item())
     out["mu2_p90"] = float(torch.quantile(mu2.view(-1), 0.9).item())
-    if _biochem_mu_disable_explicit_gelation():
-        mu_eff_si = phys_cfg.viscosity_nd_to_si(pred_slice[:, mu_ch]).view(-1).float()
-        clot_thr_si = float((os.environ.get("BIOCHEM_VIZ_CLOT_MU_SI_THRESH") or "").strip() or "0")
-        if clot_thr_si <= 0.0:
-            ratio_max = max(float(os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX", "20.0")), 1.0)
-            clot_thr_si = float(phys_cfg.mu_inf) * ratio_max
-        out["clot_frac"] = float((mu_eff_si >= clot_thr_si).float().mean().item())
-    else:
+    # ``clot_frac`` always uses rollout μ_eff (gated path in forward), not raw μ₂ sigmoid(FI).
+    # Legacy raw-μ₂ rule: BIOCHEM_VIZ_CLOT_FRAC_USE_MU2=1 (misleading when GELATION_PRIOR_GATE masks bulk).
+    if _biochem_env_truthy("BIOCHEM_VIZ_CLOT_FRAC_USE_MU2") and not _biochem_mu_disable_explicit_gelation():
         mu2_thr = max(float(os.environ.get("BIOCHEM_VIZ_MU2_FLOOD_THRESH", "10.0")), 0.0)
         out["clot_frac"] = float((mu2.view(-1) >= mu2_thr).float().mean().item())
+    else:
+        out["clot_frac"] = _viz_clot_fraction_from_rollout(pred_slice, phys_cfg, mu_ch=mu_ch)
 
     if hasattr(model, "_last_mu_trigger_gate") and model._last_mu_trigger_gate is not None:
         out["gate_mean_all"] = float(model._last_mu_trigger_gate.view(-1).float().mean().item())
@@ -6239,6 +6288,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             f"ℹ️ BIOCHEM_LOSS_ISOLATE={_iso!r} — backward uses only that term. "
             "Unset it to use BIOCHEM_LOSS_DATA_ONLY (default) or full multitask loss."
         )
+    if (os.environ.get("BIOCHEM_MU_IC_STEADY_KIN") or "").strip().lower() in ("1", "true", "yes", "on"):
+        print(
+            "ℹ️ BIOCHEM_MU_IC_STEADY_KIN=1: macro step 0 μ_eff from steady frozen-kin DEQ (mu_decoder); "
+            "no exp(Δlogμ) on step 0.",
+            flush=True,
+        )
     epochs = max(1, int(os.environ.get("BIOCHEM_EPOCHS", str(epochs))))
     lr = float(os.environ.get("BIOCHEM_LR", str(lr)))
     device = resolve_training_device()
@@ -6323,6 +6378,21 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             torch.load(biochem_resume_path, map_location=device, weights_only=True)
         )
 
+    if ckpt_meta_for_ctor:
+        applied_fp = apply_biochem_forward_policy_from_checkpoint_meta(ckpt_meta_for_ctor)
+        if applied_fp:
+            print(
+                f"🧩 μ/rollout forward_policy from checkpoint ({len(applied_fp)} env knob(s)); "
+                "shell BIOCHEM_* overrides before load are replaced.",
+                flush=True,
+            )
+        elif load_biochem_best_weights or will_resume_from_latest:
+            print(
+                "⚠️ Checkpoint has no forward_policy (legacy ckpt); μ rollout uses current shell env. "
+                "Re-save teacher after training to embed policy.",
+                flush=True,
+            )
+
     bio_enc_prior_env = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2")))
     ctor = resolve_gnode_phase3_ctor_kwargs(
         ckpt_meta_for_ctor if ckpt_state_for_ctor else None,
@@ -6356,7 +6426,10 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         use_hard_bcs=bool(ctor["use_hard_bcs"]),
     ).to(device)
     if ckpt_meta_for_ctor.get("model_config"):
-        print("🧩 GNODE architecture from checkpoint model_config (no viz/train env flags required).")
+        print(
+            "🧩 GNODE architecture from checkpoint model_config "
+            "(forward_policy restored when present)."
+        )
     else:
         print(
             f"🧩 GNODE architecture: siren={int(ctor['use_siren_decoder'])} "

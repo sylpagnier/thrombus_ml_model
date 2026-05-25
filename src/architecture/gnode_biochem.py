@@ -89,6 +89,15 @@ def _biochem_mu_disable_explicit_gelation() -> bool:
     )
 
 
+def _biochem_mu_ic_steady_kin_enabled() -> bool:
+    """Bootstrap rollout ``μ_eff`` at macro step 0 from one-shot frozen-kin DEQ (viz steady panel).
+
+    Also skips ``exp(Δlogμ)`` on step 0 so the stored channel matches steady kinematics μ,
+    not graph ``MU_PRIOR`` + learned residual. Set ``BIOCHEM_MU_IC_STEADY_KIN=1``.
+    """
+    return _biochem_env_truthy("BIOCHEM_MU_IC_STEADY_KIN")
+
+
 def _biochem_mu_disable_mu1() -> bool:
     return _biochem_env_truthy("BIOCHEM_MU_DISABLE_MU1")
 
@@ -138,6 +147,138 @@ def _biochem_env_truthy(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Canonical μ/rollout policy persisted in ``model_config["forward_policy"]`` (schema 1).
+_BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("use_delta_mu_head", "BIOCHEM_USE_DELTA_MU_HEAD"),
+    ("use_split_mu_head", "BIOCHEM_USE_SPLIT_MU_HEAD"),
+    ("use_wall_delta_head", "BIOCHEM_USE_WALL_DELTA_HEAD"),
+    ("mu_disable_explicit_gelation", "BIOCHEM_MU_DISABLE_EXPLICIT_GELATION"),
+    ("mu_simple_log_residual", "BIOCHEM_MU_SIMPLE_LOG_RESIDUAL"),
+    ("mu_ic_steady_kin", "BIOCHEM_MU_IC_STEADY_KIN"),
+    ("mu_additive_delta", "BIOCHEM_MU_ADDITIVE_DELTA"),
+    ("mu_gemini_fix", "BIOCHEM_MU_GEMINI_FIX"),
+    ("gelation_prior_gate", "BIOCHEM_GELATION_PRIOR_GATE"),
+    ("mu_disable_mu1", "BIOCHEM_MU_DISABLE_MU1"),
+    ("mu_disable_mu2", "BIOCHEM_MU_DISABLE_MU2"),
+    ("delta_mu_symmetric_bulk_clip", "BIOCHEM_DELTA_MU_SYMMETRIC_BULK_CLIP"),
+    ("use_clot_nucleation_growth", "BIOCHEM_USE_CLOT_NUCLEATION_GROWTH"),
+    ("use_bio_gate_suppressor", "BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
+)
+
+_BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
+    ("delta_mu_log_clip", "BIOCHEM_DELTA_MU_LOG_CLIP"),
+    ("delta_mu_log_clip_bulk", "BIOCHEM_DELTA_MU_LOG_CLIP_BULK"),
+    ("delta_mu_log_clip_wall", "BIOCHEM_DELTA_MU_LOG_CLIP_WALL"),
+)
+
+
+def snapshot_biochem_forward_policy() -> dict[str, Any]:
+    """Effective μ/rollout branch flags at save time (not only raw env strings)."""
+    policy: dict[str, Any] = {
+        "schema": 1,
+        "use_delta_mu_head": _biochem_delta_mu_head_enabled(),
+        "use_split_mu_head": _biochem_split_mu_regime_head_enabled(),
+        "use_wall_delta_head": _biochem_wall_delta_head_enabled(),
+        "mu_disable_explicit_gelation": _biochem_mu_disable_explicit_gelation(),
+        "mu_simple_log_residual": _biochem_mu_simple_log_residual_enabled(),
+        "mu_ic_steady_kin": _biochem_mu_ic_steady_kin_enabled(),
+        "mu_additive_delta": _biochem_mu_additive_delta_enabled(),
+        "mu_gemini_fix": _biochem_mu_gemini_fix_enabled(),
+        "gelation_prior_gate": _biochem_gelation_prior_gate_enabled(),
+        "mu_disable_mu1": _biochem_mu_disable_mu1(),
+        "mu_disable_mu2": _biochem_mu_disable_mu2(),
+        "delta_mu_symmetric_bulk_clip": _biochem_delta_mu_symmetric_bulk_clip(),
+        "use_clot_nucleation_growth": _biochem_clot_nucleation_growth_enabled(),
+        "use_bio_gate_suppressor": _biochem_env_truthy("BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
+    }
+    for field, env_key in _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS:
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            policy[field] = raw
+    return policy
+
+
+def biochem_forward_policy_from_checkpoint_meta(
+    meta: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Read ``forward_policy`` from nested ``model_config`` or top-level checkpoint metadata."""
+    if not meta:
+        return None
+    for container in (
+        (meta or {}).get("model_config"),
+        meta,
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        fp = container.get("forward_policy")
+        if isinstance(fp, Mapping) and int(fp.get("schema", 0)) == 1:
+            return dict(fp)
+    return None
+
+
+def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> str:
+    if not policy or int(policy.get("schema", 0)) != 1:
+        return ""
+    tags: list[str] = []
+    if policy.get("mu_ic_steady_kin"):
+        tags.append("IC_steady_kin")
+    if policy.get("mu_disable_explicit_gelation"):
+        tags.append("no_explicit_gelation")
+    if policy.get("use_delta_mu_head"):
+        tags.append("delta_mu")
+    if policy.get("use_split_mu_head"):
+        tags.append("split_mu")
+    if policy.get("use_wall_delta_head"):
+        tags.append("wall_delta")
+    if policy.get("mu_additive_delta"):
+        tags.append("additive_delta")
+    if policy.get("mu_gemini_fix"):
+        tags.append("gemini_fix")
+    if policy.get("gelation_prior_gate") is False:
+        tags.append("gel_prior_off")
+    return ", ".join(tags) if tags else "default branches"
+
+
+def apply_biochem_forward_policy(
+    policy: Mapping[str, Any] | None,
+    *,
+    quiet: bool = False,
+) -> list[str]:
+    """Set ``os.environ`` from checkpoint policy so ``forward()`` matches training."""
+    if not policy or int(policy.get("schema", 0)) != 1:
+        return []
+    applied: list[str] = []
+    for field, env_key in _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS:
+        if field not in policy:
+            continue
+        os.environ[env_key] = "1" if bool(policy[field]) else "0"
+        applied.append(env_key)
+    for field, env_key in _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS:
+        if field not in policy:
+            continue
+        raw = policy.get(field)
+        if raw is None or str(raw).strip() == "":
+            continue
+        os.environ[env_key] = str(raw).strip()
+        applied.append(env_key)
+    if not quiet:
+        summary = format_biochem_forward_policy_summary(policy)
+        if summary:
+            print(f"   ↳ forward_policy restored ({summary})", flush=True)
+    return applied
+
+
+def apply_biochem_forward_policy_from_checkpoint_meta(
+    meta: Mapping[str, Any] | None,
+    *,
+    quiet: bool = False,
+) -> list[str]:
+    policy = biochem_forward_policy_from_checkpoint_meta(meta)
+    if policy is None:
+        return []
+    return apply_biochem_forward_policy(policy, quiet=quiet)
 
 
 def _mu_trigger_gate_hard_threshold() -> float:
@@ -429,6 +570,7 @@ def snapshot_biochem_model_config(model: "GNODE_Phase3") -> dict[str, Any]:
         "use_hard_bcs": bool(model.use_hard_bcs),
         "in_channels": 12,
         "spatial_channels": 15,
+        "forward_policy": snapshot_biochem_forward_policy(),
     }
 
 
@@ -852,6 +994,35 @@ class GNODE_Phase3(nn.Module):
         mu_prior_nd = batch.x[:, NodeFeat.MU_PRIOR]
         return (mu_prior_nd * mu_nd_scale).clone()
 
+    def _steady_kinematics_mu_uv(
+        self,
+        batch,
+        z_kin_ws: torch.Tensor,
+        mod_adv: torch.Tensor,
+        mod_rheo: torch.Tensor,
+        mod_curve: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One-shot frozen-kin DEQ (``use_mu_decoder``) — same μ path as steady GINO-DEQ viz."""
+        mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
+        mu_seed_si = self._initial_mu_eff_si(batch)
+        kin_in = self._slice_kinematics_input(batch, clone=True)
+        kin_in[:, NodeFeat.MU_PRIOR] = mu_seed_si / mu_nd_scale
+        kin_encoded = self._apply_fourier_encoding(kin_in)
+        z_kin, u_v_p, z_kin_ws_out = self._solve_kinematics_macro(
+            kin_encoded,
+            kin_in,
+            batch,
+            mod_adv,
+            mod_rheo,
+            mod_curve,
+            z_kin_ws,
+            use_mu_decoder=True,
+            current_mu_eff=mu_seed_si,
+        )
+        mu_nd = self._decode_mu_nd_from_latent(z_kin.detach())
+        mu_eff_si = (mu_nd * mu_nd_scale).clamp(min=1e-8)
+        return mu_eff_si, u_v_p, z_kin_ws_out
+
     def _decode_mu_nd_from_latent(self, z_flat: torch.Tensor) -> torch.Tensor:
         """ND μ from frozen stage-A ``mu_decoder`` (matches GINO_DEQ ``decode_mu``)."""
         mu_raw = self.mu_decoder(z_flat)
@@ -1095,7 +1266,9 @@ class GNODE_Phase3(nn.Module):
         n_idx = self.phys_cfg.n
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
+        mu_ic_steady_kin = _biochem_mu_ic_steady_kin_enabled()
         current_mu_eff = self._initial_mu_eff_si(batch)
+        mu_eff_ic_steady_si: torch.Tensor | None = None
 
         # Warm-start for the kinematic DEQ: carried detached between macro time steps so TBPTT
         # does not retain a cross-time graph through the fixed-point iteration.
@@ -1107,6 +1280,12 @@ class GNODE_Phase3(nn.Module):
         z_kin_ws = self._kinematics_deq_warm_start(kin_in_ws, priors_ws)
 
         mod_adv, mod_rheo, mod_curve = self._compute_kinematics_modulators(batch)
+
+        if mu_ic_steady_kin:
+            mu_eff_ic_steady_si, _u_ic, z_kin_ws = self._steady_kinematics_mu_uv(
+                batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
+            )
+            current_mu_eff = mu_eff_ic_steady_si.clone()
 
         pred_trajectory = []
         detach_macro_state = self.detach_macro_state_default if detach_macro_state is None else bool(detach_macro_state)
@@ -1439,7 +1618,12 @@ class GNODE_Phase3(nn.Module):
                         float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0")),
                     )
                 delta_log_mu = torch.clamp(delta_log_mu, min=-effective_delta_clip, max=effective_delta_clip)
-                current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
+                if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                    current_mu_eff = mu_eff_ic_steady_si.clone()
+                else:
+                    current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
+            elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                current_mu_eff = mu_eff_ic_steady_si.clone()
             current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
 
             # ==========================================

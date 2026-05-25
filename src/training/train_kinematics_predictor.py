@@ -94,7 +94,7 @@ def get_stage_physics(epoch: int, s1_end: int, s2_end: int):
 # -------------------------------------------------------------------------
 # Data Loading & Management
 # -------------------------------------------------------------------------
-def load_dataset(phase: str, rheology: str | None = None):
+def load_dataset(phase: str, rheology: str | None = None, limit: int | None = None):
     cfg = VesselConfig(phase=phase)
     data_dir = cfg.graph_output_dir
     if rheology:
@@ -107,6 +107,9 @@ def load_dataset(phase: str, rheology: str | None = None):
         )
 
     paths = sorted(data_dir.glob("vessel_*.pt"))
+    if limit is not None:
+        paths = paths[:limit]
+        print(f"⚠️ LIMIT-DATA FLAG ACTIVE: Only loading {limit} graphs.")
     if not paths:
         raise RuntimeError(
             f"No graph files found in dataset directory: {data_dir}. "
@@ -293,9 +296,9 @@ def compute_step_loss(
         weight_mu = weight_mu_base
         weight_wss = weight_wss_base
 
-    # 5. Kendall Loss Weighting for PDEs
-    raw_pdes = [l_mom, l_cont]
-    weighted_pdes = loss_weighter(raw_pdes)
+    # 5. Static PDE weights (Kendall weighter disabled — avoids negative weighted PDE collapse)
+    _ = loss_weighter
+    weighted_pdes = 1.0 * l_mom + 1.0 * l_cont
 
     # Scale up IO/BC weight severely ONLY in Stage 2 when interior data supervision is removed.
     io_weight = 100.0 if stage == 2 else 5.0
@@ -358,6 +361,7 @@ def train_kinematics(
     weight_mu: float = 10.0,
     weight_wss: float = 10.0,
     max_lbfgs_graphs: int = 4,
+    limit_data: int | None = None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Handoff to L-BFGS in late Stage 3 by default.
@@ -376,12 +380,13 @@ def train_kinematics(
         "weight_mu": float(weight_mu),
         "weight_wss": float(weight_wss),
         "max_lbfgs_graphs": int(max_lbfgs_graphs),
+        "limit_data": limit_data,
         "model_config": snapshot_gino_deq_model_config(model),
     }
 
-    # Kendall loss weighter bounds
+    # Legacy checkpoint field only; PDE terms use fixed 1:1 weights in compute_step_loss.
     loss_weighter = DynamicLossWeighter(num_losses=2).to(device)
-    opt_params = list(model.parameters()) + list(loss_weighter.parameters())
+    opt_params = list(model.parameters())
     optimizer = optim.AdamW(opt_params, lr=1e-4, weight_decay=1e-5)
     warm_up_epochs = 5
     decay_epochs = max(1, adam_epochs - warm_up_epochs)
@@ -414,7 +419,7 @@ def train_kinematics(
             if resume_meta.get("model_config"):
                 print("🧩 GINO_DEQ architecture from checkpoint model_config.")
             model = build_gino_deq_from_ctor(phys_cfg, resume_ctor).to(device)
-            opt_params = list(model.parameters()) + list(loss_weighter.parameters())
+            opt_params = list(model.parameters())
             optimizer = optim.AdamW(opt_params, lr=1e-4, weight_decay=1e-5)
             warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warm_up_epochs)
             cosine_scheduler = CosineAnnealingLR(optimizer, T_max=decay_epochs, eta_min=1e-6)
@@ -531,7 +536,7 @@ def train_kinematics(
                 f"\n🔄 Swapping Dataset to {target_phase.upper()}/{target_rheology.upper()} for Stage {stage} "
                 f"(n={current_n:.3f}, μ0={current_mu_0:.4f})"
             )
-            dataset = load_dataset(target_phase, target_rheology)
+            dataset = load_dataset(target_phase, target_rheology, limit=limit_data)
             splits = split_anchor_physics(dataset)
             train_data, val_data = splits["train"], splits["val"]
             n_anchors, n_physics = splits["n_anchors"], splits["n_physics"]
@@ -563,16 +568,9 @@ def train_kinematics(
                 )
         loader = make_loader(train_data, n_anchors, n_physics)
 
-        # 3. Kendall Loss Weighter Management
-        if stage == 2:
-            loss_weighter.requires_grad_(False)  # Freeze during physics shift
-        else:
-            loss_weighter.requires_grad_(True)
-
-        # 4. L-BFGS Handoff (Kinematics preservation)
+        # 3. L-BFGS Handoff (Kinematics preservation)
         if epoch >= adam_epochs and not lbfgs_initialized:
             print("\n⚡ Switching to L-BFGS Optimizer for final fixed-point refinement...")
-            loss_weighter.requires_grad_(False)
             lbfgs_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.LBFGS(
                 lbfgs_params, lr=0.01, max_iter=20, history_size=30, line_search_fn="strong_wolfe"
@@ -846,6 +844,12 @@ if __name__ == "__main__":
     parser.add_argument("--weight-mu", type=float, default=10.0, help="Viscosity supervision weight")
     parser.add_argument("--weight-wss", type=float, default=10.0, help="Wall shear stress weight")
     parser.add_argument(
+        "--limit-data",
+        type=int,
+        default=None,
+        help="Max graphs to load for fast debugging.",
+    )
+    parser.add_argument(
         "--max-lbfgs-graphs",
         type=int,
         default=4,
@@ -912,4 +916,5 @@ if __name__ == "__main__":
         weight_mu=float(args.weight_mu),
         weight_wss=float(args.weight_wss),
         max_lbfgs_graphs=int(args.max_lbfgs_graphs),
+        limit_data=args.limit_data,
     )

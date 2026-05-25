@@ -28,7 +28,7 @@ class SIRENDecoder(nn.Module):
 
     def __init__(self, latent_dim: int, hidden_dim: int = 128):
         super().__init__()
-        self.w0_initial = 30.0
+        self.w0_initial = 10.0
         self.w0_hidden = 1.0
 
         self.net = nn.Sequential(

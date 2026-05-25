@@ -1,20 +1,29 @@
 # K1: K0 parity stack + train Delta-log-mu head under DATA_KINE (TF=1, no explicit gelation).
 # 4 GiB RTX 500: use default -OomSafe (TBPTT=5, workers=0, kin checkpointing).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k1_delta_mu.ps1"
+#   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k1_delta_mu.ps1" -Fresh
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k1_delta_mu.ps1" -Resume
+#
+# Prereq: outputs/kinematics/kinematics_best.pth. No biochem ckpts: -Fresh (or auto).
 #
 # Physics under test (unchanged by -OomSafe): Carreau baseline + delta_log_mu head,
 # no explicit FI/Mat gelation in mu_eff, DATA_KINE backward, TF=1, mu_encoder trainable.
 
 param(
     [switch] $Resume,
-    [switch] $OomSafe = $true
+    [switch] $OomSafe = $true,
+    [switch] $Fresh
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
+
+$KinCkpt = Join-Path $RepoRoot "outputs\kinematics\kinematics_best.pth"
+if (-not (Test-Path $KinCkpt)) {
+    Write-Host "Missing Stage-A ckpt: $KinCkpt (train kinematics first)." -ForegroundColor Red
+    exit 1
+}
 
 # --- Stage-A parity (kinematics manifest / checkpoint) ---
 $env:KINEMATICS_USE_HARD_BCS = "1"
@@ -68,10 +77,27 @@ if ($Resume) {
     Write-Host "Resume: biochem_latest_checkpoint.pth (if present)" -ForegroundColor DarkGray
 } else {
     $env:BIOCHEM_RESUME = "0"
-    $env:BIOCHEM_SKIP_PRETRAIN = "1"
-    $env:BIOCHEM_REUSE_LAST_PRETRAIN = "1"
-    $env:BIOCHEM_INIT_FROM_BEST = "1"
-    $pyArgs = @("-m", "src.training.train_biochem_corrector", "--new", "--run-name", "K1_delta_mu_data_kine", "--epochs", "12", "--save-best")
+    $runName = "K1_delta_mu_data_kine"
+    $pyArgs = @("-m", "src.training.train_biochem_corrector", "--new", "--epochs", "12", "--save-best")
+
+    $TeacherBest = Join-Path $RepoRoot "outputs\biochem\biochem_teacher_best_high_mu.pth"
+    $doFresh = $Fresh -or -not (Test-Path $TeacherBest)
+    if ($doFresh) {
+        $runName = "K1_fresh_delta_mu_data_kine"
+        $env:BIOCHEM_SKIP_PRETRAIN = "0"
+        $env:BIOCHEM_REUSE_LAST_PRETRAIN = "0"
+        Remove-Item Env:BIOCHEM_INIT_FROM_BEST -ErrorAction SilentlyContinue
+        $env:BIOCHEM_AE_EPOCHS = "14"
+        $env:BIOCHEM_ODE_RXN_EPOCHS = "12"
+        $pyArgs += "--run-name", $runName
+        Write-Host "Fresh: AE+ODE pretrain then teacher (no biochem ckpt)." -ForegroundColor Cyan
+    } else {
+        $env:BIOCHEM_SKIP_PRETRAIN = "1"
+        $env:BIOCHEM_REUSE_LAST_PRETRAIN = "0"
+        $pyArgs += "--run-name", $runName, "--skip-pretrain", "--init-from-best"
+        Write-Host "Warm-start: $TeacherBest" -ForegroundColor DarkGray
+    }
+    $env:BIOCHEM_RUN_NOTE = $runName
 }
 
 python @pyArgs

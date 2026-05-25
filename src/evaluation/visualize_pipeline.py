@@ -14,6 +14,11 @@ from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.gnode_biochem import (
+    apply_biochem_forward_policy_from_checkpoint_meta,
+    biochem_forward_policy_from_checkpoint_meta,
+    format_biochem_forward_policy_summary,
+)
 from src.architecture.kinematics_model_config import (
     build_gino_deq_from_ctor,
     kinematics_checkpoint_tensors,
@@ -1187,6 +1192,15 @@ def run_phase_comparison(
     biochem_ckpt = biochem_choice.path
     biochem_meta, biochem_state = _checkpoint_state_dict(_load_torch_checkpoint(biochem_ckpt))
     _print_biochem_checkpoint_banner(biochem_choice, biochem_meta)
+    fp = biochem_forward_policy_from_checkpoint_meta(biochem_meta)
+    if fp is not None:
+        apply_biochem_forward_policy_from_checkpoint_meta(biochem_meta, quiet=True)
+    else:
+        print(
+            "   ⚠️ No forward_policy in checkpoint — μ rollout uses current shell env. "
+            "Re-train/save teacher to embed policy, or set BIOCHEM_* manually.",
+            flush=True,
+        )
 
     model_kine_base = None
     kin_ckpt = _try_resolve_kinematics_checkpoint()
@@ -1238,7 +1252,13 @@ def run_phase_comparison(
         max_inner_iters_default=biochem_inner_iters,
     )
     if biochem_meta.get("model_config"):
-        print("   ↳ biochem GNODE from checkpoint model_config (saved by train_biochem_corrector).")
+        fp_note = format_biochem_forward_policy_summary(fp)
+        if fp_note:
+            print(
+                f"   ↳ biochem GNODE from checkpoint model_config + forward_policy ({fp_note})."
+            )
+        else:
+            print("   ↳ biochem GNODE from checkpoint model_config (saved by train_biochem_corrector).")
     else:
         print(
             f"   ↳ biochem GNODE from weight inference (legacy ckpt): "
