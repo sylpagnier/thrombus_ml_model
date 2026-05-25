@@ -349,6 +349,19 @@ def apply_biochem_forward_policy(
             continue
         os.environ[env_key] = str(raw).strip()
         applied.append(env_key)
+    for field, env_key in (
+        ("k10e_d_peak_nd", "BIOCHEM_K10E_D_PEAK_ND"),
+        ("k10e_sigma_nd", "BIOCHEM_K10E_SIGMA_ND"),
+        ("k10e_sdf_max_nd", "BIOCHEM_K10E_SDF_MAX_ND"),
+        ("k10e_mu_delta_nd_max", "BIOCHEM_K10E_MU_DELTA_ND_MAX"),
+    ):
+        if field not in policy:
+            continue
+        raw = policy.get(field)
+        if raw is None or str(raw).strip() == "":
+            continue
+        os.environ[env_key] = str(raw).strip()
+        applied.append(env_key)
     if not quiet:
         summary = format_biochem_forward_policy_summary(policy)
         if summary:
