@@ -36,6 +36,14 @@ from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.paths import kinematics_dir
 from src.utils.training_diary import TrainingDiary
 from src.utils.channel_schema import KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
+from src.utils.kinematics_geometry import (
+    GeometryCurriculumConfig,
+    attach_geometry_metadata,
+    cohort_level_counts,
+    geometry_sample_weight,
+    split_anchor_physics_stratified,
+    warn_if_single_level_cohort,
+)
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
@@ -95,7 +103,13 @@ def get_stage_physics(epoch: int, s1_end: int, s2_end: int):
 # -------------------------------------------------------------------------
 # Data Loading & Management
 # -------------------------------------------------------------------------
-def load_dataset(phase: str, rheology: str | None = None, limit: int | None = None):
+def load_dataset(
+    phase: str,
+    rheology: str | None = None,
+    limit: int | None = None,
+    *,
+    attach_geometry: bool = True,
+):
     cfg = VesselConfig(phase=phase)
     data_dir = cfg.graph_output_dir
     if rheology:
@@ -122,7 +136,15 @@ def load_dataset(phase: str, rheology: str | None = None, limit: int | None = No
         data = torch.load(f, weights_only=False)
         data = infer_missing_schema(data, phase_hint=phase)
         assert_graph_schema(data, expected_y_schema=(KINE_Y_SCHEMA,))
+        if attach_geometry:
+            data.graph_stem = f.stem
+            attach_geometry_metadata(data, mesh_input_dir=cfg.mesh_input_dir, stem=f.stem)
         dataset.append(data)
+    counts = cohort_level_counts(dataset)
+    print(
+        f"   Geometry levels: L0={counts.get(0, 0)}, L1={counts.get(1, 0)}, "
+        f"L2={counts.get(2, 0)}, unknown={counts.get(-1, 0)}"
+    )
     return dataset
 
 
@@ -380,8 +402,11 @@ def train_kinematics(
     weight_wss: float = 10.0,
     max_lbfgs_graphs: int = 4,
     limit_data: int | None = None,
+    geometry_curriculum: GeometryCurriculumConfig | None = None,
+    finetune_lr: float | None = None,
     require_cuda: bool = True,
 ):
+    geometry_cfg = geometry_curriculum or GeometryCurriculumConfig()
     device = resolve_kinematics_device(require_cuda=require_cuda)
     # Handoff to L-BFGS in late Stage 3 by default.
 
@@ -400,6 +425,15 @@ def train_kinematics(
         "weight_wss": float(weight_wss),
         "max_lbfgs_graphs": int(max_lbfgs_graphs),
         "limit_data": limit_data,
+        "geometry_curriculum": {
+            "enabled": bool(geometry_cfg.enabled),
+            "phase": str(geometry_cfg.phase),
+            "foundation_mix": list(geometry_cfg.foundation_mix),
+            "ramp_end_mix": list(geometry_cfg.ramp_end_mix),
+            "l2_heavy_mix": list(geometry_cfg.l2_heavy_mix),
+            "hard_mining_start_epoch": int(geometry_cfg.hard_mining_start_epoch),
+        },
+        "finetune_lr": finetune_lr,
         "model_config": snapshot_gino_deq_model_config(model),
     }
 
@@ -474,6 +508,11 @@ def train_kinematics(
                 start_epoch = int(m.group(1))
             print(f"✅ Loaded model-only checkpoint (next epoch: {start_epoch})")
 
+    if finetune_lr is not None and finetune_lr > 0:
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(finetune_lr)
+        print(f"🎯 Finetune LR set to {float(finetune_lr):.2e}")
+
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
         epochs=int(epochs),
@@ -499,18 +538,25 @@ def train_kinematics(
     except OSError:
         pass
 
-    def make_loader(data_split, n_anchors, n_physics):
+    def make_loader(data_split, n_anchors, n_physics, epoch: int, stage: int):
         # 50/50 Weighted Random Sampler logic extracted from Kinematics
+        level_weights = geometry_cfg.level_weights(
+            epoch,
+            stage,
+            stage1_end=int(stage1_end_epoch),
+            stage2_end=int(stage2_end_epoch),
+        )
         if n_anchors > 0 and n_physics > 0:
             w_anchor = 0.5 / n_anchors
             w_phys = 0.5 / n_physics
             weights = []
             for d in data_split:
+                geo = geometry_sample_weight(d, level_weights) if geometry_cfg.enabled else 1.0
                 if graph_has_anchor(d):
                     gkey = int(getattr(d, "config_id", 0))
-                    weights.append(w_anchor * hard_anchor_multiplier.get(gkey, 1.0))
+                    weights.append(w_anchor * geo * hard_anchor_multiplier.get(gkey, 1.0))
                 else:
-                    weights.append(w_phys)
+                    weights.append(w_phys * geo)
             sampler = torch.utils.data.WeightedRandomSampler(weights, len(data_split), replacement=True)
             return DataLoader(data_split, batch_size=1, sampler=sampler)
         return DataLoader(data_split, batch_size=1, shuffle=True)
@@ -556,10 +602,21 @@ def train_kinematics(
                 f"(n={current_n:.3f}, μ0={current_mu_0:.4f})"
             )
             dataset = load_dataset(target_phase, target_rheology, limit=limit_data)
-            splits = split_anchor_physics(dataset)
+            if geometry_cfg.enabled:
+                splits = split_anchor_physics_stratified(dataset)
+            else:
+                splits = split_anchor_physics(dataset)
             train_data, val_data = splits["train"], splits["val"]
             n_anchors, n_physics = splits["n_anchors"], splits["n_physics"]
             current_phase_loaded = target_rheology
+            warn_if_single_level_cohort(
+                dataset,
+                curriculum=geometry_cfg,
+                epoch=epoch,
+                stage=stage,
+                stage1_end=int(stage1_end_epoch),
+                stage2_end=int(stage2_end_epoch),
+            )
 
             # Reset hard mining when swapping datasets
             hard_anchor_multiplier.clear()
@@ -567,11 +624,25 @@ def train_kinematics(
                 print("🧹 Resetting AdamW momentum buffers for Stage 3 Target Phase...")
                 optimizer.state.clear()
 
+        mining_interval = int(geometry_cfg.hard_mining_interval)
+        mining_start = (
+            int(geometry_cfg.hard_mining_start_epoch) if geometry_cfg.enabled else 4
+        )
+        if geometry_cfg.enabled:
+            print(
+                f"📐 {geometry_cfg.describe(epoch, stage, stage1_end=int(stage1_end_epoch), stage2_end=int(stage2_end_epoch))}"
+            )
+
         # 2. Hard Mining Management
-        if stage in (1, 3) and epoch % 4 == 0 and not lbfgs_initialized:
+        if (
+            stage in (1, 3)
+            and epoch >= mining_start
+            and epoch % mining_interval == 0
+            and not lbfgs_initialized
+        ):
             print("⛏️ Refreshing Hard Negative Anchor Weights...")
             refresh_hard_mining(epoch, train_data)
-        elif epoch % 4 == 0 and not lbfgs_initialized:
+        elif epoch >= mining_start and epoch % mining_interval == 0 and not lbfgs_initialized:
             # During ramp/no-anchor phases, anchor rel-L2 is not informative.
             flow_diag = evaluate_mass_flow_health(model, train_data, device)
             if flow_diag is None:
@@ -585,7 +656,7 @@ def train_kinematics(
                     f"imbalance={flow_diag['imbalance']:.3f}, "
                     f"collapse={flow_diag['collapse_score']:.3f}"
                 )
-        loader = make_loader(train_data, n_anchors, n_physics)
+        loader = make_loader(train_data, n_anchors, n_physics, epoch, stage)
 
         # 3. L-BFGS Handoff (Kinematics preservation)
         if epoch >= adam_epochs and not lbfgs_initialized:
@@ -756,9 +827,16 @@ def train_kinematics(
             rel_l2 = float(scores.get("rel_l2", float("nan")))
             continuity = float(scores.get("continuity", float("nan")))
             val_comp = rel_l2 + 100.0 * continuity
+            level_bits = []
+            for lvl in (0, 1, 2):
+                key = f"rel_l2_level_{lvl}"
+                val = scores.get(key)
+                if val is not None and val == val:
+                    level_bits.append(f"L{lvl}={float(val):.3f}")
+            level_msg = f" | {' '.join(level_bits)}" if level_bits else ""
             print(
                 f"📊 [Validation] Rel L2: {rel_l2:.4f} | "
-                f"|∇·u| mean: {continuity:.3e} | composite: {val_comp:.4f}"
+                f"|∇·u| mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
             )
             if stage == 3 and val_comp < best_val_composite_loss:
                 best_val_composite_loss = val_comp
@@ -872,7 +950,30 @@ if __name__ == "__main__":
         "--limit-data",
         type=int,
         default=None,
-        help="Max graphs to load for fast debugging.",
+        help="Max graphs to load for fast debugging (not for production runs).",
+    )
+    parser.add_argument(
+        "--no-geometry-curriculum",
+        action="store_true",
+        help="Disable L0/L1/L2 weighted sampling and stratified val split.",
+    )
+    parser.add_argument(
+        "--geometry-phase",
+        choices=("auto", "foundation", "ramp", "l2_heavy", "off"),
+        default="auto",
+        help="Geometry curriculum: auto=foundation→ramp→l2_heavy by stage; off=uniform.",
+    )
+    parser.add_argument(
+        "--hard-mining-start-epoch",
+        type=int,
+        default=16,
+        help="First epoch for hard-negative anchor mining (with geometry curriculum).",
+    )
+    parser.add_argument(
+        "--finetune-lr",
+        type=float,
+        default=None,
+        help="Override AdamW LR after resume (L2-heavy finetune, e.g. 1e-5).",
     )
     parser.add_argument(
         "--max-lbfgs-graphs",
@@ -930,6 +1031,14 @@ if __name__ == "__main__":
             if choice in ("", "y", "yes"):
                 resume_from = str(latest)
 
+    geom_enabled = not args.no_geometry_curriculum
+    geom_phase = "off" if args.no_geometry_curriculum else str(args.geometry_phase)
+    geometry_curriculum = GeometryCurriculumConfig(
+        enabled=geom_enabled,
+        phase=geom_phase,
+        hard_mining_start_epoch=int(args.hard_mining_start_epoch),
+    )
+
     train_kinematics(
         epochs=int(args.epochs),
         adam_epochs=int(args.adam_epochs),
@@ -942,4 +1051,6 @@ if __name__ == "__main__":
         weight_wss=float(args.weight_wss),
         max_lbfgs_graphs=int(args.max_lbfgs_graphs),
         limit_data=args.limit_data,
+        geometry_curriculum=geometry_curriculum,
+        finetune_lr=args.finetune_lr,
     )

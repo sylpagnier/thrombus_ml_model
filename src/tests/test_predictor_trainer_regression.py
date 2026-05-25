@@ -222,6 +222,7 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
     monkeypatch.setattr(kin_mod, "DynamicLossWeighter", _FakeLossWeighter)
     monkeypatch.setattr(kin_mod, "load_dataset", _fake_load_dataset)
     monkeypatch.setattr(kin_mod, "split_anchor_physics", _fake_split)
+    monkeypatch.setattr(kin_mod, "split_anchor_physics_stratified", lambda ds, **kw: _fake_split(ds))
     monkeypatch.setattr(kin_mod, "compute_step_loss", _fake_compute_step_loss)
     monkeypatch.setattr(
         kin_mod,
@@ -243,6 +244,7 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
         stage1_end_epoch=1,
         stage2_end_epoch=2,
         require_cuda=False,
+        geometry_curriculum=kin_mod.GeometryCurriculumConfig(enabled=False),
     )
 
     assert [s for s, _, _ in stage_calls] == [1, 1, 2, 2, 3, 3]

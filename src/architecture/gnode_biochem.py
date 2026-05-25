@@ -100,12 +100,26 @@ def _biochem_mu_ic_steady_kin_enabled() -> bool:
 
 def _biochem_mu_k10d_simple_enabled() -> bool:
     """K10d proof: ``μ_eff = μ_ss + softplus(learned_Δμ_SI)``; overrides Carreau/exp path each step."""
-    return _biochem_env_truthy("BIOCHEM_MU_K10D_SIMPLE") and not _biochem_mu_k10e_simple_enabled()
+    return (
+        _biochem_env_truthy("BIOCHEM_MU_K10D_SIMPLE")
+        and not _biochem_mu_k10e_simple_enabled()
+        and not _biochem_mu_k11_clot_gate_enabled()
+    )
+
+
+def _biochem_mu_k11_clot_gate_enabled() -> bool:
+    """K11: ``μ_eff = μ_ss + p_clot * (μ_clot − μ_ss)`` with ``p_clot = σ(head) × region_mask``."""
+    return _biochem_env_truthy("BIOCHEM_MU_K11_CLOT_GATE")
 
 
 def _biochem_mu_k10e_simple_enabled() -> bool:
     """K10e: ``μ_eff = μ_ss + adj_mask * softplus(Δμ_nd)*scale``; clots only in wall-adjacent band."""
-    return _biochem_env_truthy("BIOCHEM_MU_K10E_SIMPLE")
+    return _biochem_env_truthy("BIOCHEM_MU_K10E_SIMPLE") and not _biochem_mu_k11_clot_gate_enabled()
+
+
+def _biochem_k10g_oracle_clots_enabled() -> bool:
+    """Sanity: in the wall-adjacent band, set ``μ_eff`` from GT excess over ``μ_ss`` (needs ``y_true_trajectory``)."""
+    return _biochem_env_truthy("BIOCHEM_K10G_ORACLE_CLOTS")
 
 
 def _k10e_env_float(name: str, default: float) -> float:
@@ -141,6 +155,58 @@ def k10e_wall_adjacent_mask(
     if sdf_cap > 0.0:
         band = band * (d <= sdf_cap).to(dtype=d.dtype)
     return (band * off_wall).clamp(0.0, 1.0)
+
+
+def _k11_env_float(name: str, fallback: str, default: float) -> float:
+    raw = (os.environ.get(name) or os.environ.get(fallback) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def k11_clot_region_mask(
+    sdf_nd: torch.Tensor,
+    wall_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Wall-adjacent band (K11 env, else K10e defaults)."""
+    d_peak = _k11_env_float("BIOCHEM_K11_D_PEAK_ND", "BIOCHEM_K10E_D_PEAK_ND", 0.008)
+    sigma = max(_k11_env_float("BIOCHEM_K11_SIGMA_ND", "BIOCHEM_K10E_SIGMA_ND", 0.008), 1e-6)
+    sdf_cap = _k11_env_float("BIOCHEM_K11_SDF_MAX_ND", "BIOCHEM_K10E_SDF_MAX_ND", 0.04)
+    return k10e_wall_adjacent_mask(
+        sdf_nd,
+        wall_mask,
+        d_peak_nd=d_peak,
+        sigma_nd=sigma,
+        sdf_max_nd=sdf_cap,
+    )
+
+
+def k11_mu_clot_si(phys_cfg) -> float:
+    """Fixed clot-branch viscosity [Pa·s] (COMSOL wall patches ~0.10)."""
+    raw = (os.environ.get("BIOCHEM_K11_MU_CLOT_SI") or "").strip()
+    if raw:
+        return max(float(raw), float(phys_cfg.mu_inf) * 1.01)
+    return max(0.10, float(phys_cfg.mu_inf) * 2.5)
+
+
+def _k11_dilate_clot_prob(
+    p_clot: torch.Tensor,
+    edge_index: torch.Tensor,
+) -> torch.Tensor:
+    """Spread clot probability to neighbors (clot-on-clot / corona)."""
+    if edge_index is None or edge_index.numel() < 2:
+        return p_clot
+    mix_val = _k11_env_float("BIOCHEM_K11_CLOT_GROWTH_MIX", "BIOCHEM_K10E_CORONA_MIX", 0.45)
+    if mix_val <= 0.0:
+        return p_clot
+    row, col = edge_index[0], edge_index[1]
+    neigh = torch.zeros_like(p_clot.reshape(-1))
+    neigh.scatter_reduce_(0, row, p_clot.reshape(-1)[col], reduce="amax", include_self=False)
+    grown = p_clot.reshape(-1) + (mix_val * neigh)
+    return grown.reshape_as(p_clot).clamp(0.0, 1.0)
 
 
 def _k10e_dilate_adjacent_mask(
@@ -231,6 +297,8 @@ _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
     ("use_bio_gate_suppressor", "BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
     ("mu_k10d_simple", "BIOCHEM_MU_K10D_SIMPLE"),
     ("mu_k10e_simple", "BIOCHEM_MU_K10E_SIMPLE"),
+    ("mu_k10g_oracle_clots", "BIOCHEM_K10G_ORACLE_CLOTS"),
+    ("mu_k11_clot_gate", "BIOCHEM_MU_K11_CLOT_GATE"),
 )
 
 _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
@@ -260,7 +328,13 @@ def snapshot_biochem_forward_policy() -> dict[str, Any]:
         "use_bio_gate_suppressor": _biochem_env_truthy("BIOCHEM_USE_BIO_GATE_SUPPRESSOR"),
         "mu_k10d_simple": _biochem_mu_k10d_simple_enabled(),
         "mu_k10e_simple": _biochem_mu_k10e_simple_enabled(),
+        "mu_k10g_oracle_clots": _biochem_k10g_oracle_clots_enabled(),
+        "mu_k11_clot_gate": _biochem_mu_k11_clot_gate_enabled(),
     }
+    if policy["mu_k11_clot_gate"]:
+        raw_clot = (os.environ.get("BIOCHEM_K11_MU_CLOT_SI") or "").strip()
+        if raw_clot:
+            policy["k11_mu_clot_si"] = raw_clot
     if policy["mu_k10d_simple"]:
         raw_max = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
         if raw_max:
@@ -320,6 +394,10 @@ def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> s
         tags.append("k10d_mu_ss_plus_learned")
     if policy.get("mu_k10e_simple"):
         tags.append("k10e_wall_adjacent_mu")
+    if policy.get("mu_k10g_oracle_clots"):
+        tags.append("k10g_oracle_clots")
+    if policy.get("mu_k11_clot_gate"):
+        tags.append("k11_clot_gate")
     if policy.get("mu_gemini_fix"):
         tags.append("gemini_fix")
     if policy.get("gelation_prior_gate") is False:
@@ -354,6 +432,7 @@ def apply_biochem_forward_policy(
         ("k10e_sigma_nd", "BIOCHEM_K10E_SIGMA_ND"),
         ("k10e_sdf_max_nd", "BIOCHEM_K10E_SDF_MAX_ND"),
         ("k10e_mu_delta_nd_max", "BIOCHEM_K10E_MU_DELTA_ND_MAX"),
+        ("k11_mu_clot_si", "BIOCHEM_K11_MU_CLOT_SI"),
     ):
         if field not in policy:
             continue
@@ -1206,6 +1285,8 @@ class GNODE_Phase3(nn.Module):
 
     def _init_mu_delta_head_near_zero(self) -> None:
         """Keep residual μ correction neutral at startup (factor ~= 1)."""
+        bias_nd_raw = (os.environ.get("BIOCHEM_K10E_DELTA_BIAS_ND") or "").strip()
+        bias_nd = float(bias_nd_raw) if bias_nd_raw else 0.0
         with torch.no_grad():
             for head in (
                 self.mu_delta_head,
@@ -1218,6 +1299,20 @@ class GNODE_Phase3(nn.Module):
                         m.weight.uniform_(-1e-4, 1e-4)
                         if m.bias is not None:
                             m.bias.zero_()
+            if bias_nd > 0.0 and isinstance(self.mu_delta_head, nn.Sequential):
+                last_lin = self.mu_delta_head[-1]
+                if isinstance(last_lin, nn.Linear) and last_lin.bias is not None:
+                    target = max(float(bias_nd), 1e-4)
+                    last_lin.bias.fill_(float(torch.log(torch.expm1(torch.tensor(target))).item()))
+            elif _biochem_mu_k11_clot_gate_enabled() and isinstance(self.mu_delta_head, nn.Sequential):
+                last_lin = self.mu_delta_head[-1]
+                if isinstance(last_lin, nn.Linear) and last_lin.bias is not None:
+                    logit_bias = _k11_env_float(
+                        "BIOCHEM_K11_CLOT_LOGIT_BIAS",
+                        "BIOCHEM_K11_CLOT_LOGIT_BIAS",
+                        -2.0,
+                    )
+                    last_lin.bias.fill_(logit_bias)
             for gate_head in (self.mu_trigger_gate_head, self.mu_nucleation_gate_head, self.mu_growth_gate_head):
                 for m in gate_head.modules():
                     if isinstance(m, nn.Linear):
@@ -1329,6 +1424,7 @@ class GNODE_Phase3(nn.Module):
         self._last_log_mu_before_wall = None
         self._last_mu_nucleation_prob = None
         self._last_mu_growth_prob = None
+        self._k11_p_clot_steps: list[torch.Tensor] = []
         self._last_mu_nucleation_cue = None
 
         truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
@@ -1366,8 +1462,10 @@ class GNODE_Phase3(nn.Module):
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
         mu_ic_steady_kin = _biochem_mu_ic_steady_kin_enabled()
+        mu_k11_clot_gate = _biochem_mu_k11_clot_gate_enabled()
         mu_k10d_simple = _biochem_mu_k10d_simple_enabled()
         mu_k10e_simple = _biochem_mu_k10e_simple_enabled()
+        self._k11_p_clot_steps = []
         current_mu_eff = self._initial_mu_eff_si(batch)
         mu_eff_ic_steady_si: torch.Tensor | None = None
         mu_ss_const: torch.Tensor | None = None
@@ -1726,7 +1824,39 @@ class GNODE_Phase3(nn.Module):
                     current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
             elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
                 current_mu_eff = mu_eff_ic_steady_si.clone()
-            if mu_k10d_simple or mu_k10e_simple:
+            if mu_k11_clot_gate:
+                sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
+                if mu_ss_const is None:
+                    mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
+                        batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
+                    )
+                if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                    current_mu_eff = mu_eff_ic_steady_si.clone()
+                    p_clot = torch.zeros_like(mu_eff_ic_steady_si)
+                    self._last_k10e_adj_mask = torch.zeros_like(mu_eff_ic_steady_si)
+                else:
+                    clot_logits = self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
+                    p_raw = torch.sigmoid(torch.clamp(clot_logits, min=-50.0, max=50.0))
+                    sdf_nd = kin_in[:, NodeFeat.SDF]
+                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=p_raw.dtype)
+                    region_mask = k11_clot_region_mask(sdf_nd, wall_mask)
+                    p_clot = (p_raw * region_mask).clamp(0.0, 1.0)
+                    if _biochem_env_truthy("BIOCHEM_K11_CLOT_GROWTH", default=True):
+                        p_clot = _k11_dilate_clot_prob(p_clot, batch.edge_index.to(device=p_clot.device))
+                        p_clot = (p_clot * region_mask).clamp(0.0, 1.0)
+                    mu_clot_si = torch.tensor(
+                        k11_mu_clot_si(self.phys_cfg),
+                        device=mu_ss_const.device,
+                        dtype=mu_ss_const.dtype,
+                    ).reshape(1, 1)
+                    current_mu_eff = mu_ss_const + (p_clot * (mu_clot_si - mu_ss_const))
+                    self._last_k10e_adj_mask = region_mask.detach()
+                self._last_mu_delta_bulk = p_clot.detach()
+                self._last_mu_delta_tail = torch.zeros_like(p_clot)
+                self._last_mu_trigger_gate = p_clot.detach()
+                if self.training:
+                    self._k11_p_clot_steps.append(p_clot)
+            elif mu_k10d_simple or mu_k10e_simple:
                 sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
                 if mu_ss_const is None:
                     mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
@@ -1736,21 +1866,39 @@ class GNODE_Phase3(nn.Module):
                     self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
                 )
                 if mu_k10e_simple:
-                    learned_delta_nd = torch.clamp(
-                        learned_delta_raw,
-                        max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
-                    )
-                    sdf_nd = kin_in[:, NodeFeat.SDF]
-                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=learned_delta_nd.dtype)
-                    adj_mask = k10e_wall_adjacent_mask(sdf_nd, wall_mask)
-                    if _biochem_env_truthy("BIOCHEM_K10E_CORONA_GROWTH", default=True):
-                        adj_mask = _k10e_dilate_adjacent_mask(
-                            adj_mask, batch.edge_index.to(device=adj_mask.device)
+                    if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                        current_mu_eff = mu_eff_ic_steady_si.clone()
+                        self._last_k10e_adj_mask = torch.zeros_like(mu_eff_ic_steady_si)
+                        self._last_mu_delta_bulk = torch.zeros_like(mu_eff_ic_steady_si)
+                    else:
+                        learned_delta_nd = torch.clamp(
+                            learned_delta_raw,
+                            max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
                         )
-                    learned_delta_si = learned_delta_nd * mu_nd_scale
-                    current_mu_eff = mu_ss_const + (adj_mask * learned_delta_si)
-                    self._last_k10e_adj_mask = adj_mask.detach()
-                    self._last_mu_delta_bulk = learned_delta_nd.detach()
+                        sdf_nd = kin_in[:, NodeFeat.SDF]
+                        wall_mask = batch.mask_wall.view(-1, 1).to(dtype=learned_delta_nd.dtype)
+                        adj_mask = k10e_wall_adjacent_mask(sdf_nd, wall_mask)
+                        if _biochem_env_truthy("BIOCHEM_K10E_CORONA_GROWTH", default=True):
+                            adj_mask = _k10e_dilate_adjacent_mask(
+                                adj_mask, batch.edge_index.to(device=adj_mask.device)
+                            )
+                        learned_delta_si = learned_delta_nd * mu_nd_scale
+                        if (
+                            _biochem_k10g_oracle_clots_enabled()
+                            and y_true_trajectory is not None
+                            and int(y_true_trajectory.shape[0]) > i
+                            and int(y_true_trajectory.shape[-1]) > PredChannels.MU_EFF_ND
+                        ):
+                            mu_gt_si = self.phys_cfg.viscosity_nd_to_si(
+                                y_true_trajectory[i, :, PredChannels.MU_EFF_ND : PredChannels.MU_EFF_ND + 1]
+                            ).to(device=mu_ss_const.device, dtype=mu_ss_const.dtype)
+                            clot_boost = (mu_gt_si - mu_ss_const).clamp(min=0.0)
+                            current_mu_eff = mu_ss_const + (adj_mask * clot_boost)
+                            self._last_mu_delta_bulk = (clot_boost / mu_nd_scale).detach()
+                        else:
+                            current_mu_eff = mu_ss_const + (adj_mask * learned_delta_si)
+                            self._last_mu_delta_bulk = learned_delta_nd.detach()
+                        self._last_k10e_adj_mask = adj_mask.detach()
                 else:
                     learned_delta = learned_delta_raw
                     max_delta_raw = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()

@@ -1385,9 +1385,31 @@ def run_phase_comparison(
                 flush=True,
             )
 
+        y_oracle = None
+        if (os.environ.get("BIOCHEM_K10G_ORACLE_CLOTS") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            if hasattr(data_biochem, "y") and data_biochem.y is not None and data_biochem.y.shape[0] >= 2:
+                n_oracle = min(int(rollout_times.numel()), int(data_biochem.y.shape[0]))
+                y_oracle = data_biochem.y[:n_oracle].to(device=device)
+                rollout_times = rollout_times[:n_oracle]
+                print(
+                    f"   ↳ K10g oracle clots: μ_eff in wall-adjacent band from GT (n_steps={n_oracle})",
+                    flush=True,
+                )
+            else:
+                print("   ⚠️ BIOCHEM_K10G_ORACLE_CLOTS=1 but data.y missing; open-loop rollout.", flush=True)
+
         t_b0 = time.perf_counter()
         with _viz_biochem_ode_speedups():
-            pred_biochem_series_dense = model_biochem(data_biochem, rollout_times)
+            pred_biochem_series_dense = model_biochem(
+                data_biochem,
+                rollout_times,
+                y_true_trajectory=y_oracle,
+            )
         _cuda_sync()
         print(f"   ↳ Biochem trajectory done in {time.perf_counter() - t_b0:.1f}s", flush=True)
 

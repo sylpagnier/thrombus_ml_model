@@ -34,6 +34,23 @@ Override the reference JSON with `KINEMATICS_MODEL_CONFIG_REF=/path/to/manifest.
 
 Code: `snapshot_gino_deq_model_config` / `resolve_gino_deq_ctor_kwargs` in [src/architecture/kinematics_model_config.py](../architecture/kinematics_model_config.py).
 
+## Geometry curriculum (L0 / L1 / L2)
+
+Stage-A training supports **geometry-level weighted sampling** and **stratified validation** (default **on**).
+
+| Phase | Epochs (default) | Sampling intent |
+|-------|------------------|-----------------|
+| `foundation` | Stage 1 (0–39) | 45% L0, 45% L1, 10% L2 — easy hot start |
+| `ramp` | Stage 2 (40–59) | Blend → 30/30/40 |
+| `l2_heavy` | Stage 3 (60+) | 15/15/70 — thrombus-target geometry |
+
+- **Foundation train**: `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_kinematics_foundation.ps1 -Fresh`
+- **L2 finetune** (after foundation ckpt): `.\scripts\go_kinematics_l2_finetune.ps1`
+- **Backfill** `geometry_level` on existing `.pt` (no COMSOL): `python -m src.data_gen.backfill_kinematics_geometry_level`
+- Disable: `--no-geometry-curriculum`
+
+**Data:** Mixed cohort needs L0+L1 meshes (`pipeline_kinematics --mixed-levels`). L2-only disks cannot run `foundation`; use finetune-only or regen mixed vessels.
+
 ## Agents / biochem
 
 `train_biochem_corrector.py` reads Stage-A shape from, in order: `model_config` inside `kinematics_best.pth` (if any), then **`data/reference/kinematics_best_20260426T184600Z.json`**, then tensor-shape inference. For this project, the reference JSON is enough—you do not need LadHyX weights in `outputs/kinematics/`.

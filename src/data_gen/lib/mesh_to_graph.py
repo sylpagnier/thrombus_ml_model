@@ -41,6 +41,7 @@ from src.utils.channel_schema import (
     attach_channel_metadata,
 )
 from src.utils.units import MESH_UNIT_M, assert_mesh_unit
+from src.utils.kinematics_geometry import attach_geometry_metadata, vessel_index_from_stem
 
 
 def _clip_wss_magnitude_quantile(
@@ -546,6 +547,14 @@ class MeshToGraph(MeshToGraphComplete):
             G_x=G_x,
             G_y=G_y,
         )
+        data.graph_stem = stem
+        if meta is not None and meta.get("level") is not None:
+            data.geometry_level = torch.tensor([int(meta["level"])], dtype=torch.int8)
+        else:
+            attach_geometry_metadata(data, mesh_input_dir=self.raw_dir, stem=stem)
+        idx = vessel_index_from_stem(stem)
+        if idx is not None:
+            data.config_id = int(idx)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
 

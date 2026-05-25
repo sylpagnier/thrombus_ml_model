@@ -3490,6 +3490,68 @@ def _biochem_mu_k10e_simple_enabled() -> bool:
     )
 
 
+def _biochem_mu_k11_clot_gate_enabled() -> bool:
+    return (os.environ.get("BIOCHEM_MU_K11_CLOT_GATE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _anchor_k11_clot_bce_loss(
+    model,
+    y_true: torch.Tensor,
+    truth_mask: torch.Tensor,
+    data,
+    cfg_mu,
+    mu_ch: int,
+) -> torch.Tensor:
+    """BCE on clot probability vs GT high-μ label in wall-adjacent (+ optional growth) region."""
+    from src.architecture.gnode_biochem import k11_clot_region_mask, k11_mu_clot_si
+
+    device = y_true.device
+    dtype = y_true.dtype
+    z = torch.tensor(0.0, device=device, dtype=dtype)
+    steps = getattr(model, "_k11_p_clot_steps", None)
+    if not steps:
+        return z
+    ma = truth_mask.view(-1).bool()
+    if not ma.any():
+        return z
+    if not hasattr(data, "x") or data.x is None or data.x.shape[1] < 3:
+        return z
+    sdf_nd = data.x[:, 2].to(device=device, dtype=torch.float32)
+    wall_mask = (
+        data.mask_wall.view(-1).to(device=device)
+        if hasattr(data, "mask_wall") and data.mask_wall is not None
+        else torch.zeros(sdf_nd.shape[0], device=device, dtype=torch.bool)
+    )
+    region = k11_clot_region_mask(sdf_nd, wall_mask).reshape(-1)
+    m = ma & (region > 0.05)
+    if not bool(m.any()):
+        return z
+    mu_clot = float(k11_mu_clot_si(cfg_mu))
+    ratio = max(float(os.environ.get("BIOCHEM_K11_CLOT_GT_RATIO", "1.20")), 1.01)
+    mu_floor = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_SI_MIN", "0.055")), float(cfg_mu.mu_inf))
+    t_cap = min(len(steps), int(y_true.shape[0]))
+    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
+    terms: List[torch.Tensor] = []
+    pos_weight_raw = (os.environ.get("BIOCHEM_K11_CLOT_POS_WEIGHT") or "").strip()
+    pos_weight = float(pos_weight_raw) if pos_weight_raw else None
+    for t in range(t_cap):
+        p = steps[t].reshape(-1)[m].clamp(1e-6, 1.0 - 1e-6)
+        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch]).reshape(-1)[m].float()
+        y_clot = ((mu_g >= mu_floor) | (mu_g >= ratio * float(cfg_mu.mu_inf))).float()
+        if pos_weight is not None and pos_weight > 1.0:
+            weight = torch.where(y_clot > 0.5, pos_weight, 1.0)
+            bce = F.binary_cross_entropy(p, y_clot, weight=weight)
+        else:
+            bce = F.binary_cross_entropy(p, y_clot)
+        terms.append(bce.to(dtype=dtype) * tw[t])
+    return torch.stack(terms).sum() if terms else z
+
+
 def _anchor_mu_adjacent_log_loss(
     pred_series: torch.Tensor,
     y_true: torch.Tensor,
@@ -3719,6 +3781,7 @@ def _biochem_resolve_isolated_loss(
     w_mu_wall_bypass: float,
     l_mu_log_adjacent: torch.Tensor,
     l_k10e_bulk_delta: torch.Tensor,
+    l_k11_clot_bce: torch.Tensor,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -3807,6 +3870,13 @@ def _biochem_resolve_isolated_loss(
             + _biochem_scale_for_isolate(w_bulk) * l_k10e_bulk_delta
             + _biochem_scale_for_isolate(w_dk) * l_data_kine
         )
+    if k == "K11":
+        w_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "1.0")), 0.0)
+        w_dk = max(float(os.environ.get("BIOCHEM_K11_DATA_KINE_WEIGHT", "1.0")), 0.0)
+        return (
+            _biochem_scale_for_isolate(w_bce) * l_k11_clot_bce
+            + _biochem_scale_for_isolate(w_dk) * l_data_kine
+        )
     if k in ("FI_GATE", "FI_GATE_START"):
         return _biochem_scale_for_isolate(w_fi_gate_start_eff) * l_fi_gate_start
     if k in ("RES_SPARSE", "RESIDUAL_SPARSE"):
@@ -3814,7 +3884,7 @@ def _biochem_resolve_isolated_loss(
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
         "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, MU_MSE, MU_DATA, "
-        "K10E, FI_GATE, RES_SPARSE"
+        "K10E, K11, FI_GATE, RES_SPARSE"
     )
     raise ValueError(f"Unknown BIOCHEM_LOSS_ISOLATE={key!r}; expected one of: {valid}")
 
@@ -4258,6 +4328,9 @@ def compute_biochem_loss(
     l_mu_log_high = torch.tensor(0.0, device=device)
     l_mu_mse_anchor = torch.tensor(0.0, device=device)
     l_mu_wall_bypass = torch.tensor(0.0, device=device)
+    l_mu_log_adjacent = torch.tensor(0.0, device=device)
+    l_k10e_bulk_delta = torch.tensor(0.0, device=device)
+    l_k11_clot_bce = torch.tensor(0.0, device=device)
     l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
@@ -4314,12 +4387,18 @@ def compute_biochem_loss(
         "MU_MSE",
         "MU_DATA",
     )
+    _k10e_isolate = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper() == "K10E"
+    _k11_isolate = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper() == "K11"
+    _k10e_loss_active = _biochem_mu_k10e_simple_enabled() or _k10e_isolate
+    _k11_loss_active = _biochem_mu_k11_clot_gate_enabled() or _k11_isolate
     if model.training and has_anchor_supervision and (
         w_mu_aux > 0.0
         or w_mu_log > 0.0
         or w_mu_log_wall > 0.0
         or w_mu_log_high > 0.0
         or _mu_mse_isolate
+        or _k10e_isolate
+        or _k11_isolate
     ):
         cfg_mu = kernels.core.cfg
         ma = truth_mask
@@ -4333,9 +4412,9 @@ def compute_biochem_loss(
                 mu_ch,
                 d_mu=d_mu,
                 multi_step=_mu_si_multi_step,
-                include_log=(w_mu_log > 0.0),
+                include_log=(w_mu_log > 0.0 or _k10e_isolate),
             )
-            if w_mu_log_wall > 0.0 or w_mu_log_high > 0.0:
+            if w_mu_log_wall > 0.0 or w_mu_log_high > 0.0 or _k10e_isolate:
                 l_mu_log_wall, l_mu_log_high = _anchor_mu_subset_log_losses(
                     pred_series_data_freq,
                     target_series,
@@ -4397,6 +4476,34 @@ def compute_biochem_loss(
                     cfg_mu=kernels.core.cfg,
                     mu_ch=mu_ch,
                 )
+            if _k10e_loss_active:
+                w_mu_log_adjacent = max(
+                    float(os.environ.get("BIOCHEM_MU_LOG_ADJACENT_WEIGHT", "0.0")),
+                    0.0,
+                )
+                w_k10e_bulk = max(float(os.environ.get("BIOCHEM_K10E_BULK_DELTA_WEIGHT", "0.0")), 0.0)
+                if _k10e_isolate or w_mu_log_adjacent > 0.0:
+                    l_mu_log_adjacent = _anchor_mu_adjacent_log_loss(
+                        pred_series_data_freq,
+                        target_series,
+                        ma,
+                        data,
+                        cfg_mu,
+                        mu_ch,
+                    )
+                if _k10e_isolate or w_k10e_bulk > 0.0:
+                    l_k10e_bulk_delta = _k10e_bulk_delta_penalty(model, data)
+            if _k11_loss_active:
+                w_k11_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "0.0")), 0.0)
+                if _k11_isolate or w_k11_bce > 0.0:
+                    l_k11_clot_bce = _anchor_k11_clot_bce_loss(
+                        model,
+                        target_series,
+                        ma,
+                        data,
+                        kernels.core.cfg,
+                        mu_ch,
+                    )
 
     mu_dbg = _compute_mu_flow_debug_metrics(
         model=model,
@@ -4591,6 +4698,9 @@ def compute_biochem_loss(
             l_mu_mse_anchor=l_mu_mse_anchor,
             l_mu_wall_bypass=l_mu_wall_bypass,
             w_mu_wall_bypass=float(w_mu_wall_bypass),
+            l_mu_log_adjacent=l_mu_log_adjacent,
+            l_k10e_bulk_delta=l_k10e_bulk_delta,
+            l_k11_clot_bce=l_k11_clot_bce,
             l_fi_gate_start=l_fi_gate_start,
             w_fi_gate_start_eff=float(w_fi_gate_start_eff),
             l_residual_sparse=l_residual_sparse,
@@ -6444,6 +6554,18 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         print(
             "ℹ️ BIOCHEM_MU_K10D_SIMPLE=1: μ_eff = μ_ss (steady kin DEQ) + softplus(mu_delta_head); "
             "use BIOCHEM_LOSS_ISOLATE=MU_MSE for proof training.",
+            flush=True,
+        )
+    if (os.environ.get("BIOCHEM_MU_K10E_SIMPLE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        print(
+            "ℹ️ BIOCHEM_MU_K10E_SIMPLE=1: μ_eff = μ_ss + adj_mask×Δμ (wall-adjacent band, not on wall); "
+            "use BIOCHEM_LOSS_ISOLATE=K10E (log + high-μ + adjacent + bulk penalty + light DATA_KINE).",
+            flush=True,
+        )
+    if (os.environ.get("BIOCHEM_MU_K11_CLOT_GATE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        print(
+            "ℹ️ BIOCHEM_MU_K11_CLOT_GATE=1: μ_eff = μ_ss + p_clot×(μ_clot−μ_ss); "
+            "p_clot=σ(head)×wall-adjacent mask; use BIOCHEM_LOSS_ISOLATE=K11 (BCE + DATA_KINE).",
             flush=True,
         )
     epochs = max(1, int(os.environ.get("BIOCHEM_EPOCHS", str(epochs))))

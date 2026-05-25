@@ -230,6 +230,9 @@ def quantify_performance(
         "rel_l2_p": [],
         "rel_l2_near_wall": [],
         "rel_l2_high_sdf_grad": [],
+        "rel_l2_level_0": [],
+        "rel_l2_level_1": [],
+        "rel_l2_level_2": [],
         "continuity": [],
         "wall_slip": [],
         "shear_mse": [],
@@ -267,7 +270,16 @@ def quantify_performance(
                     p_a = pred[node_mask, :3]
                     diff_norm = torch.norm(p_a - y_a, p=2)
                     target_norm = torch.norm(y_a, p=2)
-                    metrics["rel_l2"].append((diff_norm / (target_norm + 1e-8)).item())
+                    rel_l2_item = (diff_norm / (target_norm + 1e-8)).item()
+                    metrics["rel_l2"].append(rel_l2_item)
+                    try:
+                        from src.utils.kinematics_geometry import graph_geometry_level
+
+                        lvl = graph_geometry_level(data, default=-1)
+                        if lvl in (0, 1, 2):
+                            metrics[f"rel_l2_level_{lvl}"].append(rel_l2_item)
+                    except Exception:
+                        pass
                     for j, key in enumerate(("rel_l2_u", "rel_l2_v", "rel_l2_p")):
                         num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
                         den = torch.norm(y_a[:, j], p=2) + 1e-8
