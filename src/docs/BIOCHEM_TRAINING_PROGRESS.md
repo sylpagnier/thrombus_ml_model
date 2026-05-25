@@ -995,6 +995,13 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Fix (code)**: `src/core_physics/clot_kinematics_fields.py` — **`comsol_hybrid`** = max(stream sep, **dγ/dx gate**), **adjacent p95** norm; K11e sets `BIOCHEM_PRIOR_COMSOL_ALIGNED=1`, drops mech quantile; `test_clot_node_pattern.py` compares clot vs non-clot on anchor (t0 + t_final).
 - **Next**: Re-run **`go_k11e_clot_gate.ps1 -Fresh`**; check diagnostic clot vs non-clot **dγ/dx** means and mech precision on adjacent band.
 
+### 110. K11e + COMSOL prior (20260525T192853Z): sign OK, scale wrong, gate still dies
+
+- **Symptom**: Train `gate_all` **1.7e-3 @ep0 → ~3e-6 @ep6**; viz `clot_frac=0`; diagnostic **mech/comsol prior mean≈0.0025**, **0%** nodes ≥0.25; yet **dγ/dx clot mean −9 vs non-clot +3.6** (correct sign).
+- **Cause**: Graph **`dγ/dx` ~ O(10)** vs COMSOL plot threshold **800** → `flux_path_dx≈0`; diagnostic shell **without** `BIOCHEM_PRIOR_COMSOL_ALIGNED=1` still reports legacy-scale mech line; **trigger-suppress + tiny gate** wins over BCE after ep0.
+- **Status**: **Partial** — ckpt **ep0** synced to `teacher_best_high_mu`; bulk logMAE **0.494 @ep3**; high-μ **0.852 @ep11** (worse than ep0 **0.988** for k11 pick).
+- **Next**: Auto-calibrate **`BIOCHEM_PRIOR_DGAMMA_DX_THRESH`** (~10–50 from adjacent-band p5); run diag with same env as K11e; try **`LOGIT_BIAS=0`**, lower **trigger-suppress**, or **`GATE_TARGET_WEIGHT=8`**; viz ep0 ckpt before retrain.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -1381,6 +1388,7 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **K11c_clot_gate_sparse** (`20260525T173456Z`, 12ep) | **0.503** (ep00 best-all) | **2.69** ep11 | **0.498** bulk ep11 | high **0.788** (ep11) | **§105–106**: viz **flat** (ckpt bug); train **`gate_wall→1`**; **K11d** trigger+adjacent pending |
 | 2026-05-25 | **K11d_trigger_localized** (`LOSS_ISOLATE=K11`, `APPLY=adjacent`, `GROWTH=0`, trigger BCE/suppress, fresh, `20260525T181453Z`) | **0.496** (ep00) | **1.83** wall ep11 | **0.275** bulk ep11 | high **1.05** (ep11); r≈0.04 all | **§107**: val **flat ~0.50**; train `gate_wall=0`, `gate_all≈0.005`; viz **still red wall band** (μ₁/μ₂ species path + weak t0 flow); **K11 GT label bug** (`ratio×μ_inf`); prior overlap poor |
 | 2026-05-25 | **K11e_localized_best_practice** (`20260525T183843Z`, first K11e script) | **0.502** (ep00 k11) | **1.89** wall ep11 | **0.514** bulk ep11 | high **0.856** (ep11) | **§108**: `gate_all≈2e-5` → **flat μ_eff** (no clots); `teacher_best_high_mu` saved **ep11** not k11-best ep0; **fix**: bias −0.5, gate-target loss, sync high_mu ckpt |
+| 2026-05-25 | **K11e_COMSOL_prior** (`20260525T192853Z`, `PRIOR_COMSOL_ALIGNED=1`, `DX_THRESH=800`, ckpt sync ep0) | **0.510** (ep00 k11) | **1.78** wall ep00 | **0.436** bulk ep03 | high **0.988** ep00; ep11 **0.852** | **§109–110**: `gate_all` **1.7e-3→~3e-6** by ep6; `clot_frac=0`; diag **dγ/dx sign OK** (−9 vs +3.6) but **\|dγ/dx\|≪800** → prior **~0**; `high_mu` ckpt **ep0** ✓; viz still flat until threshold calibrated |
 
 ---
 
