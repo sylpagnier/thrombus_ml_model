@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,6 +108,11 @@ class MultiHeadPhysicsGATConv(MessagePassing):
 
         self.temperature = temperature
         self.edge_proj = _spectral_or_plain_linear(edge_dim, latent_dim, True, use_spectral_norm)
+        # Candidate toggle: multiply edge projection into logits before additive log-modulators.
+        # Env: KINEMATICS_PHYS_GAT_PRIORS_MULTIPLY_BEFORE_ADDITIVE=1
+        self.priors_multiply_before_add = bool(
+            int(os.environ.get("KINEMATICS_PHYS_GAT_PRIORS_MULTIPLY_BEFORE_ADDITIVE", "0"))
+        )
 
         self.lin_src = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
         self.lin_dst = _spectral_or_plain_linear(latent_dim, latent_dim, True, use_spectral_norm)
@@ -146,8 +152,13 @@ class MultiHeadPhysicsGATConv(MessagePassing):
                 index: Tensor, ptr: Optional[Tensor], size_i: Optional[int]) -> Tensor:
         alpha = (alpha_j + alpha_i) / self.temperature
         # Bias pre-softmax logits with flow-wall directional modulators and curvature.
-        alpha = alpha + mod_adv + mod_rheo + mod_curve
-        alpha = alpha * self.edge_proj(edge_attr)
+        if self.priors_multiply_before_add:
+            alpha = alpha * self.edge_proj(edge_attr)
+            alpha = alpha + mod_adv + mod_rheo + mod_curve
+        else:
+            # Historical order (kept as default): add additive log-modulators, then scale.
+            alpha = alpha + mod_adv + mod_rheo + mod_curve
+            alpha = alpha * self.edge_proj(edge_attr)
         alpha = softmax(alpha, index, ptr, size_i)
         return x_j * alpha
 
@@ -224,18 +235,37 @@ class GINO_DEQ(nn.Module):
         self.activation_fn = (activation_fn or "silu").strip().lower()
         self.fourier_base = float(fourier_base)
 
-        self.wss_decoder = nn.Sequential(
-            SpectralLinear(latent_dim, latent_dim),
-            _make_activation(self.activation_fn),
-            nn.Linear(latent_dim, 1)  # Non-recurrent output projection
-        )
         self.use_hard_bcs = bool(use_hard_bcs)
+
+        # Candidate toggles (kept env-based so we can run A/B without changing ctor call sites).
+        self.bc_envelope = bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0")))
+        self.bc_lambda = float(os.environ.get("KINEMATICS_BC_LAMBDA", "10.0"))
+        self.wss_fuse = bool(int(os.environ.get("KINEMATICS_WSS_FUSE", "0")))
+        self.fourier_learnable = bool(int(os.environ.get("KINEMATICS_FOURIER_LEARNABLE", "0")))
+
+        # WSS decoder: either z-only (legacy) or fused with (u,v,p) and mu.
+        if self.wss_fuse:
+            # Input: z + uvp + mu
+            self.wss_decoder = nn.Sequential(
+                SpectralLinear(latent_dim + 4, latent_dim),
+                _make_activation(self.activation_fn),
+                nn.Linear(latent_dim, 1),
+            )
+        else:
+            self.wss_decoder = nn.Sequential(
+                SpectralLinear(latent_dim, latent_dim),
+                _make_activation(self.activation_fn),
+                nn.Linear(latent_dim, 1),  # Non-recurrent output projection
+            )
         self.use_siren_decoder = bool(use_siren_decoder)
         self.use_width_priors = bool(use_width_priors)
         self.decouple_rheology = False
 
         freqs = (self.fourier_base ** torch.arange(num_fourier_freqs)) * torch.pi
-        self.register_buffer("fourier_freqs", freqs)
+        if self.fourier_learnable:
+            self.fourier_freqs = nn.Parameter(freqs)
+        else:
+            self.register_buffer("fourier_freqs", freqs)
 
         fourier_channels = 5 * num_fourier_freqs * 2
         width_extra = 3 if self.use_width_priors else 0
@@ -417,10 +447,18 @@ class GINO_DEQ(nn.Module):
             # SDF is already [N, 1]; do not add another singleton (would break broadcast with [N, 2]).
             sdf = data.x[:, NodeFeat.SDF]
             uv_prior = data.x[:, NodeFeat.UV_PRIOR]
-            u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
+            if self.bc_envelope:
+                # Soft-envelope hard-BC: exact at sdf=0, but keeps derivatives closer to wall.
+                envelope = 1.0 - torch.exp(-self.bc_lambda * sdf)
+                u_v_constrained = uv_prior + envelope * u_v_p[:, :2]
+            else:
+                u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
             u_v_p = torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
 
-        wss_pred = self.wss_decoder(z)
+        if self.wss_fuse:
+            wss_pred = self.wss_decoder(torch.cat([z, u_v_p, mu], dim=1))
+        else:
+            wss_pred = self.wss_decoder(z)
         pred = torch.cat([u_v_p, mu, wss_pred], dim=1)
 
         return (pred, jac_loss) if self.training else pred

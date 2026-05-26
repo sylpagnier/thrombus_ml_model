@@ -811,7 +811,10 @@ class GNODE_Phase3(nn.Module):
 
         self.num_fourier_freqs = max(1, int(num_fourier_freqs))
         freqs = (2.0 ** torch.arange(self.num_fourier_freqs)) * torch.pi
-        self.register_buffer("fourier_freqs", freqs)
+        if bool(int(os.environ.get("KINEMATICS_FOURIER_LEARNABLE", "0"))):
+            self.fourier_freqs = nn.Parameter(freqs)
+        else:
+            self.register_buffer("fourier_freqs", freqs)
         self.use_siren_decoder = bool(use_siren_decoder)
         self.gnode_layers = max(1, int(gnode_layers))
 
@@ -1113,7 +1116,12 @@ class GNODE_Phase3(nn.Module):
         if self.use_hard_bcs:
             sdf = kin_in[:, NodeFeat.SDF]
             uv_prior = kin_in[:, NodeFeat.UV_PRIOR]
-            u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
+            if bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0"))):
+                bc_lambda = float(os.environ.get("KINEMATICS_BC_LAMBDA", "10.0"))
+                envelope = 1.0 - torch.exp(-bc_lambda * sdf)
+                u_v_constrained = uv_prior + envelope * u_v_p[:, :2]
+            else:
+                u_v_constrained = uv_prior + sdf * u_v_p[:, :2]
             return torch.cat([u_v_constrained, u_v_p[:, 2:3]], dim=1)
         return u_v_p
 
