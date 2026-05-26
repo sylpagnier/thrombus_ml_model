@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from src.config import BiochemNodeFeat, PhysicsConfig
+from src.utils.channel_schema import biochem_encoder_x
 from src.utils.metrics import poiseuille_2d_planar_volume_flux_nd
 
 
@@ -305,7 +306,7 @@ def flux_debug_from_graph_data(
             mask_outlet=torch.zeros(0, dtype=torch.bool),
         )
 
-    pos = data.x[:, BiochemNodeFeat.XY].to(device=velocity.device)
+    pos = biochem_encoder_x(data)[:, BiochemNodeFeat.XY].to(device=velocity.device)
     u_ref_nd = None
     if hasattr(data, "u_ref") and data.u_ref is not None:
         u_ref_nd = _as_scalar_float(data.u_ref)

@@ -12,7 +12,11 @@ import glob
 import re
 from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig
 from src.utils.paths import get_project_root
-from src.utils.channel_schema import BIO_X_SCHEMA, BIO_Y_SCHEMA, attach_channel_metadata
+from src.data_gen.lib.node_feature_assembly import (
+    build_biochem_bc_x_tensor,
+    build_kinematics_node_x_tensor,
+)
+from src.utils.channel_schema import BIO_Y_SCHEMA, attach_patient_anchor_graph_metadata
 from src.utils.units import MESH_UNIT_CM, assert_mesh_unit
 
 
@@ -621,47 +625,55 @@ class PatientDataExtractor:
             edge_index, mask_outlet, pos_tensor, num_nodes
         )
 
-        # Boundary Masks
-        m_in = mask_inlet.float().unsqueeze(1)
-        m_out = mask_outlet.float().unsqueeze(1)
-        m_wall = mask_wall.float().unsqueeze(1)
-
-        # Velocity BCs
         u_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
         v_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
-        u_bc[ mask_inlet, 0 ] = u_nd_0[ mask_inlet ]  # FIX: Was u_nd
-        v_bc[ mask_inlet, 0 ] = v_nd_0[ mask_inlet ]  # FIX: Was v_nd
-
-        # Pressure BC
+        u_bc[mask_inlet, 0] = u_nd_0[mask_inlet]
+        v_bc[mask_inlet, 0] = v_nd_0[mask_inlet]
         p_bc = torch.zeros((num_nodes, 1), dtype=torch.float32)
 
-        # Active BC Masks
-        uv_mask = (mask_inlet | mask_wall).float().unsqueeze(1)
-        p_mask = mask_outlet.float().unsqueeze(1)
+        mu_bc = mu_nd_0
 
-        # Viscosity BC & Mask
-        mu_bc = mu_nd_0.unsqueeze(1)  # FIX: Was mu_nd
-        mu_mask = torch.ones((num_nodes, 1), dtype=torch.float32)
+        x_biochem = build_biochem_bc_x_tensor(
+            pos_nd=nodes_nd,
+            sdf_nd=sdf,
+            wall_normal=normals_unit,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            u_bc=u_bc,
+            v_bc=v_bc,
+            p_bc=p_bc,
+            mu_bc_nd=mu_bc,
+        )
 
-        # Assuming you had 3 initial guess channels of zeros to make 15 total, like Kinematics
-        zero_init = torch.zeros((num_nodes, 3), dtype=torch.float32)
+        centerline_pts_nd = None
+        centerline_tangents_nd = None
+        if sidecar_meta:
+            cl = sidecar_meta.get("centerline_pts")
+            ct = sidecar_meta.get("centerline_tangents")
+            if cl is not None and ct is not None:
+                centerline_pts_nd = np.asarray(cl, dtype=np.float64)
+                centerline_tangents_nd = np.asarray(ct, dtype=np.float64)
 
-        # --- FIX: Ensure x_tensor follows the Kinematics foundational layout ---
-        x_tensor = torch.cat([
-            nodes_nd,  # [0:2] - MUST be here for Fourier Encoding
-            sdf,  # [2:3]
-            normals_unit,  # [3:5]
-            m_in,  #
-            m_out,  #
-            m_wall,  #
-            u_bc,  #
-            v_bc,  #
-            p_bc,  #
-            uv_mask,  #
-            p_mask,  #
-            mu_bc,  #
-            mu_mask  #
-        ], dim=1)
+        wall_tree = cKDTree(wall_coords) if len(wall_coords) > 0 else cKDTree(mesh_nodes)
+        x_kine, u_prior, mu_prior = build_kinematics_node_x_tensor(
+            pos_nd=nodes_nd,
+            sdf_nd=sdf,
+            wall_normal=normals_unit,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            d_bar_si=d_bar,
+            u_ref=u_ref_actual,
+            phys_cfg=self.phys_cfg,
+            wall_tree=wall_tree,
+            edge_index=edge_index,
+            G_x=G_x,
+            G_y=G_y,
+            centerline_pts_nd=centerline_pts_nd,
+            centerline_tangents_nd=centerline_tangents_nd,
+            mu_nd_scale=self.phys_cfg.mu_viscosity_nd_scale,
+        )
 
         # --- Use index assignment for the tensor ---
         inlet_species_si = torch.zeros(9, dtype=torch.float32)
@@ -710,7 +722,7 @@ class PatientDataExtractor:
             json.dump(metadata, f, indent=4)
 
         # 11. Final PyG Data Save
-        uv_inlet_bc = torch.cat([ u_nd_0.unsqueeze(1), v_nd_0.unsqueeze(1) ], dim=1)
+        uv_inlet_bc = torch.cat([u_nd_0.unsqueeze(1), v_nd_0.unsqueeze(1)], dim=1)
         mu_inlet_bc = self._compute_analytic_inlet_mu_nd(
             mask_inlet=mask_inlet,
             mesh_nodes=mesh_nodes,
@@ -718,30 +730,36 @@ class PatientDataExtractor:
             v_raw_si=v_raw_list[0],
         )
         data = Data(
-            x=x_tensor,
+            x=x_kine,
+            x_biochem=x_biochem,
             y=y_tensor_series,
             t=eval_times_tensor,
-            edge_index=edge_index, edge_attr=edge_attr,
-            mask_inlet=mask_inlet, mask_outlet=mask_outlet, mask_wall=mask_wall,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
             is_anchor=is_anchor,
-            d_bar=torch.tensor([ d_bar ], dtype=torch.float32),
-            u_ref=torch.tensor([ u_ref_actual ], dtype=torch.float32),
-            re_actual=torch.tensor([ re_actual ], dtype=torch.float32),
-            G_x=G_x, G_y=G_y, Laplacian=Laplacian, V=V, W=W, M_inv=M_inv,
+            d_bar=torch.tensor([d_bar], dtype=torch.float32),
+            u_ref=torch.tensor([u_ref_actual], dtype=torch.float32),
+            re_actual=torch.tensor([re_actual], dtype=torch.float32),
+            G_x=G_x,
+            G_y=G_y,
+            Laplacian=Laplacian,
+            V=V,
+            W=W,
+            M_inv=M_inv,
             u_inlet_bc=uv_inlet_bc,
             mu_inlet_bc=mu_inlet_bc,
             bio_inlet_bc=bio_inlet_bc,
             outlet_normal=outlet_normals,
+            u_prior=u_prior,
+            mu_prior=mu_prior,
         )
-        data = attach_channel_metadata(
-            data,
-            x_schema=BIO_X_SCHEMA,
-            y_schema=BIO_Y_SCHEMA,
-            mask_wall=mask_wall,
-        )
+        data = attach_patient_anchor_graph_metadata(data, mask_wall=mask_wall)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
-        print(f"✅ Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | Imbal={avg_flux_imbalance:.2%}")
+        print(f"[OK] Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | Imbal={avg_flux_imbalance:.2%}")
 
     def run(self):
         # Look for the .nas files now!

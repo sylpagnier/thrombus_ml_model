@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,6 @@ from src.core_physics.clot_kinematics_fields import (
     score_clot_risk_from_fields,
 )
 from src.core_physics.kinematics_clot_prior import clot_prior_score_flat
-from src.training.train_biochem_corrector import _k11_clot_gt_label
 
 REPO = Path(__file__).resolve().parents[2]
 ANCHOR = REPO / "data" / "processed" / "graphs_biochem_anchors" / "patient007.pt"
@@ -127,7 +127,11 @@ def test_clot_vs_nonclot_pattern_at_t0_and_tfinal(patient007, monkeypatch):
     for label, ti in slices:
         y = data.y[ti]
         mu_si = phys.viscosity_nd_to_si(y[:, STATE_CHANNEL_MU_EFF_ND]).reshape(-1)
-        clot_strict = _k11_clot_gt_label(mu_si, phys).bool()
+        mu_floor = max(
+            float(os.environ.get("BIOCHEM_K11_CLOT_MU_SI_MIN", "0.055")),
+            float(phys.mu_inf),
+        )
+        clot_strict = mu_si >= mu_floor
         mu_cut = torch.quantile(mu_si, 0.9)
         clot_p90 = mu_si >= mu_cut
 

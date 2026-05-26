@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import BULK_SPECIES_ORDER, SPECIES_GROUPS, BulkSpecies, BiochemNodeFeat, WallSpecies
+from src.utils.channel_schema import biochem_encoder_x
 from src.utils.rheology import compute_shear_rate
 from src.utils.nondim import time_ratio_global_to_convective
 from src.utils.tensor_utils import as_tensor_like
@@ -367,13 +368,13 @@ class BiochemPhysicsKernels:
                 mag = torch.sqrt(nx * nx + ny * ny + 1e-12)
                 weak = mag < 1e-5
                 if weak.any():
-                    normals_fb = data.x[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
+                    normals_fb = biochem_encoder_x(data)[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
                     nx_fb = normals_fb[:, 0]
                     ny_fb = normals_fb[:, 1]
                     nx = torch.where(weak, nx_fb, nx)
                     ny = torch.where(weak, ny_fb, ny)
             else:
-                normals_fb = data.x[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
+                normals_fb = biochem_encoder_x(data)[mask_outlet, BiochemNodeFeat.WALL_NORMAL]
                 nx = normals_fb[:, 0]
                 ny = normals_fb[:, 1]
 
@@ -568,7 +569,7 @@ class BiochemPhysicsKernels:
             BulkSpecies.T: J_in_T,
         }
 
-        wall_normals = data.x[mask_wall, BiochemNodeFeat.WALL_NORMAL]
+        wall_normals = biochem_encoder_x(data)[mask_wall, BiochemNodeFeat.WALL_NORMAL]
         nx = wall_normals[:, 0]
         ny = wall_normals[:, 1]
         # ``u_ref_wall`` is hoisted above near ``conv_time`` so it can be shared by

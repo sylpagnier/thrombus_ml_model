@@ -2,8 +2,8 @@
 
 Default training env (when keys are unset) is tuned for **fast iteration** plus **supervised step 2**
 (still no Kendall PDE sum in ``backward()``). ``_apply_pycharm_biochem_optimal_defaults`` sets
-``BIOCHEM_LOSS_DATA_ONLY=1``, **μ SI anchor** (``BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT``; optional **multi-step**
-Huber via ``BIOCHEM_MU_SI_MULTI_STEP``, default on), optional **val-aligned log-MAE** on SI μ
+``BIOCHEM_LOSS_DATA_ONLY=1``, **mu SI anchor** (``BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT``; optional **multi-step**
+Huber via ``BIOCHEM_MU_SI_MULTI_STEP``, default on), optional **val-aligned log-MAE** on SI mu
 (``BIOCHEM_MU_LOG_ANCHOR_WEIGHT``), **TBPTT cap 12**
 with ``BIOCHEM_TBPTT_WINDOW_CURRICULUM=1`` epoch ramp, **shorter AE / ODE-RXN / teacher** epoch budgets,
 **ODE-RXN patience ignores early epochs** (``BIOCHEM_ODE_RXN_MIN_EPOCHS_BEFORE_PLATEAU``), **less frequent teacher validation**, and ``BIOCHEM_COMPLEXITY_STEP=2`` for clarity in logs.
@@ -23,31 +23,31 @@ knobs (e.g. raise ``BIOCHEM_TEACHER_EPOCHS``, ``BIOCHEM_AE_EPOCHS``, ``BIOCHEM_D
 - **Compact step 2.5** (same budgets as fast defaults, add temporal anchor loss only):
   ``BIOCHEM_PRESET=step2p5`` (aliases ``phys_temp_only``, ``compact_step2p5``). Sets
   ``BIOCHEM_DATA_ONLY_PHYS_TEMP=1`` and default ``BIOCHEM_COMSOL_TEMPORAL_WEIGHT`` when unset —
-  best next step when step-2 μ is flat but you are not ready for full Kendall backprop.
+  best next step when step-2 mu is flat but you are not ready for full Kendall backprop.
 
 - **Thrombus corona (experimental / unvalidated)**:
   ``BIOCHEM_PRESET=thrombus_corona`` (aliases ``corona_thrombus``, ``biochem_thrombus_corona``).
   Bundles gelation prior gate, **3-hop** prior dilation, ``L_PhysTemp``, and corrector
-  (``BIOCHEM_STOP_AFTER_TEACHER=0``). **Not recommended** for current μ work — one logged run
-  (2026-05-16) had flat teacher μ (~1.48) with confounded settings; not rerun post-A0.
+  (``BIOCHEM_STOP_AFTER_TEACHER=0``). **Not recommended** for current mu work — one logged run
+  (2026-05-16) had flat teacher mu (~1.48) with confounded settings; not rerun post-A0.
   See ``scripts/run_biochem_thrombus_corona.ps1`` and ``src/docs/BIOCHEM_TRAINING_PROGRESS.md``.
 
-- **Comprehensive μ (experimental / unvalidated)**:
+- **Comprehensive mu (experimental / unvalidated)**:
   ``BIOCHEM_PRESET=comprehensive_mu`` (aliases ``mu_comprehensive``, ``step2_comprehensive``).
-  Corona bundle + longer schedules + μ best-practice env. Same validation status as corona.
+  Corona bundle + longer schedules + mu best-practice env. Same validation status as corona.
   See ``scripts/run_biochem_comprehensive_mu.ps1``.
 
 - **Teacher viscosity baseline (recommended new base for incremental loss studies)**:
   ``BIOCHEM_PRESET=teacher_visc_baseline`` (aliases ``visc_teacher_baseline``,
   ``teacher_mu_base``). Keeps teacher-only step-2 data-loss optimization while emphasizing
-  all-time SI log-μ fit (global + wall + high-μ_gt tail) and preserving flow/species via
+  all-time SI log-mu fit (global + wall + high-mu_gt tail) and preserving flow/species via
   ``L_Data_Kine`` + ``L_Data_Bio``.
 
 - **Teacher max-complexity (recommended for robust viscosity teacher runs)**:
   ``BIOCHEM_PRESET=teacher_max_complexity`` (aliases ``max_complexity_teacher``,
   ``teacher_step3_robust``). Forces **complexity step 3** (full multitask backward),
   clears single-term isolate state, keeps ``BIOCHEM_STOP_AFTER_TEACHER=1``, and
-  enables μ-focused defaults (`MU_LOG` + `MU_SI` anchors, μ-path, high μ cap).
+  enables mu-focused defaults (`MU_LOG` + `MU_SI` anchors, mu-path, high mu cap).
   Use this when your goal is robust teacher-only viscosity fitting before re-enabling
   the corrector.
 
@@ -163,7 +163,11 @@ def _biochem_stop_after_teacher() -> bool:
 
 
 def _biochem_teacher_mu_ratio_max(bio_cfg) -> float:
-    """Rheology saturation scale for teacher / preflight (COMSOL high-μ), not Newtonian-only."""
+    """μ₁/μ₂ step ceiling written to ``teacher.mu_ratio_max`` (COMSOL step cap, default 80).
+
+    This is **not** clot ``mu_eff`` / bulk ``mu_eff`` (~2–3× on anchors). Teacher μ success
+    uses val ``mu_log_mae`` on GT channel 3. See PROJECT_CONTEXT.md § ``mu_ratio_max`` vs ``mu_eff``.
+    """
     raw = (os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX") or "").strip()
     if raw:
         return max(float(raw), 1.0)
@@ -197,7 +201,7 @@ def _resolve_tbptt_anchor_start_idx(
 
 
 def _tbptt_mu_time_weights(t_cap: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Per-time weights for μ anchor losses inside a TBPTT window (emphasize late steps when enabled)."""
+    """Per-time weights for mu anchor losses inside a TBPTT window (emphasize late steps when enabled)."""
     if t_cap < 1:
         return torch.ones(1, device=device, dtype=dtype)
     if not _biochem_env_truthy("BIOCHEM_MU_ANCHOR_LATE_TIME_WEIGHT", default=True):
@@ -208,7 +212,7 @@ def _tbptt_mu_time_weights(t_cap: int, device: torch.device, dtype: torch.dtype)
 
 
 def _apply_biochem_mu_best_practice_env(*, only_if_missing: bool = True) -> None:
-    """Defaults for COMSOL-aligned μ: late TBPTT, high-μ rheology cap, log+SI losses, stable ODE."""
+    """Defaults for COMSOL-aligned mu: late TBPTT, high-mu rheology cap, log+SI losses, stable ODE."""
     def _put(k: str, v: str) -> None:
         if only_if_missing and k in os.environ:
             return
@@ -264,7 +268,7 @@ def _apply_biochem_matmul_precision() -> None:
         return
     try:
         torch.set_float32_matmul_precision(mode)
-        print(f"⚡ torch.set_float32_matmul_precision('{mode}') (BIOCHEM_MATMUL_PRECISION=highest|high|medium).")
+        print(f" torch.set_float32_matmul_precision('{mode}') (BIOCHEM_MATMUL_PRECISION=highest|high|medium).")
     except Exception:
         pass
 
@@ -286,7 +290,7 @@ def _apply_biochem_sparse_invariant_mode() -> None:
         if _biochem_env_truthy("BIOCHEM_SPARSE_INVARIANT_CHECKS"):
             ctrl.enable()
             print(
-                "🔎 torch.sparse.check_sparse_tensor_invariants enabled "
+                " torch.sparse.check_sparse_tensor_invariants enabled "
                 "(BIOCHEM_SPARSE_INVARIANT_CHECKS=1; slower)."
             )
         else:
@@ -374,6 +378,14 @@ def _biochem_set_run_log(logger: Optional[BiochemRunLogger]) -> None:
     _active_biochem_run_log = logger
 
 
+def _teacher_val_selection_score(val_stats: Mapping[str, Any]) -> float:
+    """Teacher checkpoint score: higher is better (-val logMAE)."""
+    mae = val_stats.get("mu_log_mae")
+    if mae is None:
+        return -float("inf")
+    return -float(mae)
+
+
 def _biochem_log_teacher_val(epoch: int, val_stats: Mapping[str, Any], **extra: Any) -> None:
     """Append a compact teacher validation row to the active run log."""
     log = _active_biochem_run_log
@@ -393,8 +405,6 @@ def _biochem_log_teacher_val(epoch: int, val_stats: Mapping[str, Any], **extra: 
         "viz_final_mu1_mean",
         "viz_final_mu2_mean",
         "viz_final_mu2_p90",
-        "viz_final_clot_frac",
-        "viz_final_gate_mean_all",
         "viz_final_delta_bulk_mean",
         "viz_bulk_mu_log_mae",
     ):
@@ -431,7 +441,7 @@ class BiochemTrainingConfig:
 
 
 def _apply_biochem_complexity_step2_env() -> None:
-    """Set-if-missing defaults for **complexity step 2** (μ SI + wider TBPTT ramp).
+    """Set-if-missing defaults for **complexity step 2** (mu SI + wider TBPTT ramp).
 
     Activates when ``BIOCHEM_COMPLEXITY_STEP`` is one of: ``2``, ``2.0``, ``phase2``, ``teacher_v2``.
     Skipped when ``BIOCHEM_STOCK_DEFAULTS=1``. The main ``_apply_pycharm_biochem_optimal_defaults`` preset
@@ -440,7 +450,7 @@ def _apply_biochem_complexity_step2_env() -> None:
 
     Effects (each key only set if missing — explicit Run Configuration still wins):
 
-    - **μ SI anchor** in data-only backprop via ``BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT`` (direct Huber on
+    - **mu SI anchor** in data-only backprop via ``BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT`` (direct Huber on
       effective viscosity in SI on COMSOL anchors; complements variance-normalized ``L_Data_Kine``).
     - **TBPTT:** higher ``BIOCHEM_TBPTT_MAX_WINDOW`` cap and ``BIOCHEM_TBPTT_WINDOW_CURRICULUM=1`` so
       the temporal slice grows with epoch (still VRAM-bounded). **Late clot:** ``BIOCHEM_TBPTT_ANCHOR_END_BIAS=1``
@@ -472,7 +482,7 @@ def _apply_biochem_complexity_step3_env() -> None:
     ``3``, ``3.0``, ``phase3``, ``full_multitask``, ``corrector_full``.
 
     When active, **always** sets ``BIOCHEM_LOSS_DATA_ONLY=0`` (overrides the fast-iterate default).
-    Other keys are set-if-missing: slightly tighter TBPTT cap, milder μ SI duplicate penalty vs full PDE,
+    Other keys are set-if-missing: slightly tighter TBPTT cap, milder mu SI duplicate penalty vs full PDE,
     and ``BIOCHEM_DATA_ONLY_PHYS_TEMP=0`` so logs do not imply a data-only-only temporal path.
 
     Skipped when ``BIOCHEM_STOCK_DEFAULTS=1``.
@@ -494,7 +504,7 @@ def _apply_biochem_complexity_step3_env() -> None:
     _s("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.35")
 
 
-# Opt-in overnight / diagnostic run at **same supervised tier** as default step-2 (data-only + μ SI +
+# Opt-in overnight / diagnostic run at **same supervised tier** as default step-2 (data-only + mu SI +
 # TBPTT ramp; still no Kendall PDE sum). Set ``BIOCHEM_PRESET=overnight_step2`` (aliases below); these
 # keys **override** the fast-iterate defaults from ``_apply_pycharm_biochem_optimal_defaults``.
 _OVERNIGHT_STEP2_PRESET_ALIASES = frozenset({"overnight_step2", "comprehensive_step2", "step2_overnight"})
@@ -561,9 +571,9 @@ _COMPREHENSIVE_MU_PRESET_ALIASES = frozenset({
 
 
 def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
-    """Experimental preset: corona bundle + longer teacher/corrector + μ env defaults.
+    """Experimental preset: corona bundle + longer teacher/corrector + mu env defaults.
 
-    **Unvalidated** for μ improvement (see training progress log). Still ``BIOCHEM_LOSS_DATA_ONLY=1``.
+    **Unvalidated** for mu improvement (see training progress log). Still ``BIOCHEM_LOSS_DATA_ONLY=1``.
     Prefer ``run_biochem_mu_formulation_study.ps1`` until step-2 teacher is stable on patient007.
     On 4 GiB GPUs, lower ``BIOCHEM_TBPTT_MAX_WINDOW`` / ``BIOCHEM_ADJOINT_RK4_SUBSTEPS``.
     """
@@ -610,7 +620,7 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
     os.environ["BIOCHEM_ODE_REACTION_EPOCHS"] = os.environ["BIOCHEM_ODE_RXN_EPOCHS"]
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
     print(
-        "⚠️ BIOCHEM_PRESET=comprehensive_mu is experimental/unvalidated "
+        "[WARN]  BIOCHEM_PRESET=comprehensive_mu is experimental/unvalidated "
         "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md).",
         flush=True,
     )
@@ -626,7 +636,7 @@ _TEACHER_VISC_BASELINE_PRESET_ALIASES = frozenset({
 def _apply_biochem_preset_teacher_visc_baseline_if_requested() -> None:
     """Teacher-only viscosity baseline for incremental loss ablations.
 
-    Goal: stable core objective for viscosity fidelity over time (global + wall + high-μ),
+    Goal: stable core objective for viscosity fidelity over time (global + wall + high-mu),
     while retaining essential flow/species supervision via ``L_Data_Kine`` + ``L_Data_Bio``.
     """
     preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
@@ -672,8 +682,8 @@ def _apply_biochem_preset_teacher_visc_baseline_if_requested() -> None:
     os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
     print(
-        "✅ BIOCHEM_PRESET=teacher_visc_baseline: teacher-only step-2 baseline "
-        "(Data_Kine/Data_Bio + μ log global/wall/high + μ SI) enabled.",
+        "[OK]  BIOCHEM_PRESET=teacher_visc_baseline: teacher-only step-2 baseline "
+        "(Data_Kine/Data_Bio + mu log global/wall/high + mu SI) enabled.",
         flush=True,
     )
 
@@ -686,7 +696,7 @@ _TEACHER_MAX_COMPLEXITY_PRESET_ALIASES = frozenset({
 
 
 def _apply_biochem_preset_teacher_max_complexity_if_requested() -> None:
-    """Robust teacher-only preset: full multitask (step 3) + viscosity-focused μ supervision.
+    """Robust teacher-only preset: full multitask (step 3) + viscosity-focused mu supervision.
 
     Intended for the teacher stage only (keeps ``BIOCHEM_STOP_AFTER_TEACHER=1``).
     This preset is for "all important losses active" runs where viscosity fidelity is
@@ -729,12 +739,104 @@ def _apply_biochem_preset_teacher_max_complexity_if_requested() -> None:
     os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
     print(
-        "✅ BIOCHEM_PRESET=teacher_max_complexity: teacher-only step-3 multitask + μ-focused supervision enabled.",
+        "[OK]  BIOCHEM_PRESET=teacher_max_complexity: teacher-only step-3 multitask + mu-focused supervision enabled.",
         flush=True,
     )
 
 
 _STEP2P5_PRESET_ALIASES = frozenset({"step2p5", "phys_temp_only", "compact_step2p5"})
+
+_PASSIVE_TRANSPORT_PRESET_ALIASES = frozenset({
+    "passive_transport",
+    "passive_biochem",
+    "one_way_transport",
+    "step2_passive",
+    "one_way",
+})
+
+_PASSIVE_TRANSPORT_LOSS_ALIASES = frozenset({
+    "PASSIVE",
+    "PASSIVE_TRANSPORT",
+    "ONE_WAY",
+    "ONE_WAY_TRANSPORT",
+})
+
+
+def _passive_transport_loss_weights() -> tuple[float, float]:
+    """(DATA_KINE leash, DATA_BIO) weights for ``BIOCHEM_LOSS_ISOLATE=PASSIVE``."""
+    w_kine = max(float(os.environ.get("BIOCHEM_PASSIVE_DATA_KINE_WEIGHT", "0.0")), 0.0)
+    w_bio = max(float(os.environ.get("BIOCHEM_PASSIVE_DATA_BIO_WEIGHT", "1.0")), 0.0)
+    return w_kine, w_bio
+
+
+def _passive_transport_adr_in_backprop() -> bool:
+    """Include ADR_F/S in PASSIVE ``backward`` (off by default).
+
+    Full TBPTT + ADR backprop often yields bio grad L2 >> ``BIOCHEM_TEACHER_MAX_RAW_GRAD_L2``
+    (skipped optimizer steps, flat ``L_Data_Bio``). Enable only after species loss is
+    clearly falling — see ``src/docs/BIOCHEM_TRAINING_PROGRESS.md`` passive-transport / §113.
+    """
+    return _biochem_env_truthy("BIOCHEM_PASSIVE_ADR_BACKPROP", default=False)
+
+
+def _apply_biochem_preset_passive_transport_if_requested() -> None:
+    """``BIOCHEM_PRESET=passive_transport`` (or alias): 1-way biochem on frozen / GT flow.
+
+    Decouples rheology from species transport:
+
+    - ``BIOCHEM_TEACHER_MU_RATIO_MAX=1`` (no clot viscosity feedback)
+    - ``BIOCHEM_MU_DISABLE_EXPLICIT_GELATION=1`` and mu heads off
+    - ``BIOCHEM_TEACHER_FORCE_MIN=1`` (COMSOL kinematics on anchors)
+    - ``BIOCHEM_LOSS_ISOLATE=PASSIVE``: ``L_ADR_F + L_ADR_S + w_bio*L_Data_Bio + w_kine*L_Data_Kine``
+
+    Train bio encoder/decoder + ODE; freeze kinematic LoRA and mu encoder. Teacher-only by default.
+    """
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _PASSIVE_TRANSPORT_PRESET_ALIASES:
+        return
+    if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+
+    bundle: Dict[str, str] = {
+        "BIOCHEM_LOSS_ISOLATE": "PASSIVE",
+        "BIOCHEM_LOSS_DATA_ONLY": "0",
+        "BIOCHEM_DATA_ONLY_PHYS_TEMP": "0",
+        "BIOCHEM_STOP_AFTER_TEACHER": "1",
+        "BIOCHEM_TEACHER_MU_RATIO_MAX": "1.0",
+        "BIOCHEM_MU_DISABLE_EXPLICIT_GELATION": "1",
+        "BIOCHEM_GELATION_PRIOR_GATE": "0",
+        "BIOCHEM_USE_DELTA_MU_HEAD": "0",
+        "BIOCHEM_USE_SPLIT_MU_HEAD": "0",
+        "BIOCHEM_USE_WALL_DELTA_HEAD": "0",
+        "BIOCHEM_TRAIN_MU_ENCODER": "0",
+        "BIOCHEM_TRAIN_KIN_LORA": "0",
+        "BIOCHEM_TEACHER_FORCE_MIN": "1.0",
+        "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT": "0.0",
+        "BIOCHEM_MU_LOG_ANCHOR_WEIGHT": "0.0",
+        "BIOCHEM_MU_LOG_WALL_WEIGHT": "0.0",
+        "BIOCHEM_MU_LOG_HIGH_WEIGHT": "0.0",
+        "BIOCHEM_PASSIVE_DATA_KINE_WEIGHT": "0.0",
+        "BIOCHEM_PASSIVE_DATA_BIO_WEIGHT": "1.0",
+        "BIOCHEM_PASSIVE_ADR_BACKPROP": "0",
+        "BIOCHEM_TEACHER_LR": "5e-4",
+        "BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP": "1",
+        "BIOCHEM_TRAIN_BIO_ENCODER": "1",
+        "BIOCHEM_TRAIN_BIO_DECODER": "1",
+        "BIOCHEM_TRAIN_ODE": "1",
+        "BIOCHEM_NO_TEACHER_DEFAULTS": "1",
+        "BIOCHEM_GT_KINE_VEL": "1",
+        "BIOCHEM_GT_KINE_SKIP_DEQ": "1",
+        # Full TBPTT graph for L_Data_Bio / ODE (set 1 only if 4GB OOM).
+        "BIOCHEM_DETACH_MACRO_STATE": "0",
+    }
+    for k, v in bundle.items():
+        os.environ[k] = v
+    print(
+        "[i]  BIOCHEM_PRESET=passive_transport: 1-way ADR + species (Mat/FI via L_Data_Bio); "
+        "mu_ratio_max=1, TF=1, kin/mu frozen; COMSOL GT [u,v,p] (DEQ skipped); "
+        "DETACH_MACRO=0; backward=Data_Bio (+ADR metrics only unless PASSIVE_ADR_BACKPROP=1).",
+        flush=True,
+    )
 
 
 def _apply_biochem_preset_step2p5_phys_temp_if_requested() -> None:
@@ -764,8 +866,8 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
     data-only step 2, ``BIOCHEM_DATA_ONLY_PHYS_TEMP=1``, ``BIOCHEM_STOP_AFTER_TEACHER=0`` (corrector on).
     Slightly widens ``BIOCHEM_PRIOR_WALL_DECAY_ND`` when unset.
 
-    Evidence: one 2026-05-16 run — teacher μ flat ~1.48, corrector 1.57→1.55; μ cap/TBPTT/TF confounds.
-    Not rerun after MU_LOG + μ-path A0 (patient007 ~0.44). Test corona components individually later.
+    Evidence: one 2026-05-16 run — teacher mu flat ~1.48, corrector 1.57->1.55; mu cap/TBPTT/TF confounds.
+    Not rerun after MU_LOG + mu-path A0 (patient007 ~0.44). Test corona components individually later.
 
     Skipped when ``BIOCHEM_STOCK_DEFAULTS=1``. Conflicts with ``overnight_step2`` if both set — pick one preset.
     """
@@ -789,8 +891,8 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
         os.environ["BIOCHEM_PRIOR_WALL_DECAY_ND"] = "0.01"
     _apply_biochem_mu_best_practice_env(only_if_missing=True)
     print(
-        "⚠️ BIOCHEM_PRESET=thrombus_corona is experimental/unvalidated "
-        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md). Prefer mu formulation study for μ work.",
+        "[WARN]  BIOCHEM_PRESET=thrombus_corona is experimental/unvalidated "
+        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md). Prefer mu formulation study for mu work.",
         flush=True,
     )
 
@@ -836,7 +938,7 @@ def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_sentinel: Step-2 MU isolate + split μ architecture (fast probe).", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_wall_sentinel: Step-2 MU isolate + split mu architecture (fast probe).", flush=True)
 
 
 _SWEEP_GEMINI_ALIASES = frozenset({"sweep_gemini", "gemini"})
@@ -860,7 +962,7 @@ def _apply_biochem_preset_sweep_gemini_if_requested() -> None:
     for k, v in bundle.items():
         os.environ[k] = v
     print(
-        "✅ BIOCHEM_PRESET=sweep_gemini: additive Δlogμ + symmetric bulk clip + nonnegative wall clip.",
+        "[OK]  BIOCHEM_PRESET=sweep_gemini: additive dlogmu + symmetric bulk clip + nonnegative wall clip.",
         flush=True,
     )
 
@@ -914,7 +1016,7 @@ def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_bio_suppressor: Step-2 MU isolate + bio suppressor (fast probe).", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_bio_suppressor: Step-2 MU isolate + bio suppressor (fast probe).", flush=True)
 
 
 _SWEEP_WALL_OVERCOMP_ALIASES = frozenset({"sweep_wall_overcomp", "sweep_wall_overcompensate"})
@@ -962,7 +1064,7 @@ def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_wall_overcomp: MU_LOG_WALL overcomp proof probe active.", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_wall_overcomp: MU_LOG_WALL overcomp proof probe active.", flush=True)
 
 
 _SWEEP_CLOT_NUC_GROWTH_ALIASES = frozenset({"sweep_clot_nuc_growth", "sweep_clot_nucleation_growth"})
@@ -1018,7 +1120,7 @@ def _apply_biochem_preset_sweep_clot_nuc_growth_if_requested() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_clot_nuc_growth: sparse nucleation + growth gate probe active.", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_clot_nuc_growth: sparse nucleation + growth gate probe active.", flush=True)
 
 
 _SWEEP_FREE_WALL_ALIASES = frozenset({"sweep_free_wall_a"})
@@ -1057,7 +1159,7 @@ def _apply_biochem_preset_sweep_free_wall_a() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_free_wall_a: Free Wall Gate + Split Clipping active.", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_free_wall_a: Free Wall Gate + Split Clipping active.", flush=True)
 
 
 _SWEEP_FREE_WALL_B_ALIASES = frozenset({"sweep_free_wall_b"})
@@ -1096,7 +1198,7 @@ def _apply_biochem_preset_sweep_free_wall_b() -> None:
     }
     for k, v in bundle.items():
         os.environ[k] = v
-    print("✅ BIOCHEM_PRESET=sweep_free_wall_b: High Clot Penalty + Split Clipping active.", flush=True)
+    print("[OK]  BIOCHEM_PRESET=sweep_free_wall_b: High Clot Penalty + Split Clipping active.", flush=True)
 
 
 def _apply_pycharm_biochem_optimal_defaults() -> None:
@@ -1105,7 +1207,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     Skipped if ``BIOCHEM_STOCK_DEFAULTS=1``. Any key can still be overridden in the OS
     environment or IDE Run Configuration (after this runs, for keys we only ``pop``).
 
-    **Backward** uses supervised anchors (``BIOCHEM_LOSS_DATA_ONLY=1`` → ``L_Data_Kine+L_Data_Bio``,
+    **Backward** uses supervised anchors (``BIOCHEM_LOSS_DATA_ONLY=1`` -> ``L_Data_Kine+L_Data_Bio``,
     plus ``W_MuSI*L_MuSI`` when ``BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT>0``, defaulted >0 here).
     With ``BIOCHEM_DATA_ONLY_PHYS_TEMP=1`` and ``BIOCHEM_COMSOL_TEMPORAL_WEIGHT>0``, add
     ``w_pt * L_PhysTemp`` to that same backprop sum (overnight preset enables this).
@@ -1182,7 +1284,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     # propagate through the rollout (detach=1 trades OOM safety for nearly frozen L_Data_* on TBPTT).
     # If you still OOM, set BIOCHEM_DETACH_MACRO_STATE=1 and/or lower BIOCHEM_TBPTT_MAX_WINDOW further.
     _s("BIOCHEM_DETACH_MACRO_STATE", "0")
-    # Gelation (FI/Mat + learned head) × kinematic clot-risk prior so μ stays Carreau-like in bulk lumen.
+    # Gelation (FI/Mat + learned head) x kinematic clot-risk prior so mu stays Carreau-like in bulk lumen.
     _s("BIOCHEM_GELATION_PRIOR_GATE", "1")
     # Step-2 footing: wider cap + epoch ramp (lower cap if 4 GiB OOM).
     _apply_biochem_mu_best_practice_env(only_if_missing=True)
@@ -1209,6 +1311,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _s("BIOCHEM_MU_SI_ANCHOR_AUX_EARLY_MULT", "1.5")
     _apply_biochem_complexity_step2_env()
     _apply_biochem_preset_overnight_step2_if_requested()
+    _apply_biochem_preset_passive_transport_if_requested()
     _apply_biochem_preset_step2p5_phys_temp_if_requested()
     _apply_biochem_preset_thrombus_corona_if_requested()
     _apply_biochem_preset_comprehensive_mu_if_requested()
@@ -1289,7 +1392,7 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     _setdef("BIOCHEM_FI_GATE_START_EPOCHS", "6")
     _setdef("BIOCHEM_FI_GATE_START_WEIGHT", "0.0")
     _setdef("BIOCHEM_TEACHER_MU_RATIO_MAX", "80.0")
-    # Compare against μ₂ magnitude (~mu_ratio_max when FI saturates); keep ε visible on [0, mu_ratio_max].
+    # Compare against mu₂ magnitude (~mu_ratio_max when FI saturates); keep ε visible on [0, mu_ratio_max].
     _setdef("BIOCHEM_FI_GATE_START_EPS", "0.15")
     _setdef("BIOCHEM_TEACHER_ODE_FREEZE_EPOCHS", "3")
     # Overfit-debug default: start Data_Bio with stronger magnitude so biology
@@ -1297,7 +1400,7 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     _setdef("BIOCHEM_RAW_BIO_MAGNITUDE", "0.01")
     # Fail fast when the first teacher forward is pathological vs GT (scale/ODE blow-up).
     _setdef("BIOCHEM_ABORT_BAD_TEACHER_INIT", "1")
-    # Preflight uses continuous μ error on COMSOL truth nodes (t0→t1, TF=1), not threshold fractions.
+    # Preflight uses continuous mu error on COMSOL truth nodes (t0->t1, TF=1), not threshold fractions.
     _setdef("BIOCHEM_PREFLIGHT_ABORT_MEDIAN_LOG_MAE", "2.5")
     _setdef("BIOCHEM_PREFLIGHT_ABORT_WORST_LOG_MAE", "4.0")
     _setdef("BIOCHEM_MICRO_HEAD_ZERO_INIT", "1")
@@ -1305,7 +1408,7 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     _setdef("BIOCHEM_RESIDUAL_SPARSE_LAMBDA_END", "0.5")
     _setdef("BIOCHEM_RESIDUAL_SPARSE_RAMP_EPOCHS", str(max(8, max_epochs // 2)))
     print(
-        "🧷 Teacher-stage defaults applied (COMSOL forcing + PDE cap + μ regression). "
+        "🧷 Teacher-stage defaults applied (COMSOL forcing + PDE cap + mu regression). "
         "Unset any var to inherit; skip entirely with BIOCHEM_NO_TEACHER_DEFAULTS=1 "
         "(default from PyCharm/simplest preset)."
     )
@@ -1388,7 +1491,7 @@ def _biochem_warn_trivial_flow_if_needed(
         where += f" batch {batch_idx}"
     if mean_over_epoch:
         where += " (epoch mean)"
-    msg = f"⚠️ TRIVIAL FLOW FIELD — {where}: flow_trivial_score={score:.3f} (warn if ≥ {thr:.2f})"
+    msg = f"[WARN]  TRIVIAL FLOW FIELD — {where}: flow_trivial_score={score:.3f} (warn if >= {thr:.2f})"
     if metrics is not None:
         q_pred = float(metrics.get("DBG_Q_pred_inlet", float("nan")))
         q_ref = float(metrics.get("DBG_Q_ref_re", metrics.get("DBG_Q_ref_bc", float("nan"))))
@@ -1431,7 +1534,7 @@ def _per_node_mean_abs_edge_diff(
     edge_index: torch.Tensor,
     num_nodes: int,
 ) -> torch.Tensor:
-    """Graph ``Δ`` proxy: per-node mean |f_i - f_j| over incident edges (undirected ok)."""
+    """Graph ``d`` proxy: per-node mean |f_i - f_j| over incident edges (undirected ok)."""
     row = edge_index[0]
     col = edge_index[1]
     ediff = (nodal[row] - nodal[col]).abs()
@@ -1494,11 +1597,11 @@ def _emit_clot_batch_trace(
     l1_reg = (df * w_slow).mean().item()
 
     lines = [
-        "📊 [BIOCHEM_TRACE_CLOT_BATCH] one anchor batch (first hit):",
+        " [BIOCHEM_TRACE_CLOT_BATCH] one anchor batch (first hit):",
         f"   anchors={int(m.sum().item())}",
-        f"   |ΔFI| (edge-mean abs increment, SI): {_stat1d(delta_fi)}",
+        f"   |dFI| (edge-mean abs increment, SI): {_stat1d(delta_fi)}",
         f"   kinematics_prior: {_stat1d(prior)}",
-        f"   Pearson(|ΔFI|,prior|anchors)={float(corr):.4f}  mean(|ΔFI|⊙(1-prior))={l1_reg:.4e}",
+        f"   Pearson(|dFI|,prior|anchors)={float(corr):.4f}  mean(|dFI|*(1-prior))={l1_reg:.4e}",
         f"   mu_pred_si(anchors): mean={mu_p.mean().item():.4e} p90={torch.quantile(mu_p, 0.9).item():.4e}",
         f"   mu_gt_si(anchors):   mean={mu_g.mean().item():.4e} p90={torch.quantile(mu_g, 0.9).item():.4e}",
     ]
@@ -1516,7 +1619,7 @@ def _compute_mu_flow_debug_metrics(
     truth_mask: torch.Tensor,
     mu_ch: int,
 ) -> Dict[str, float]:
-    """Strong μ diagnostics + simple inlet/outlet flow sanity (non-destructive debug only)."""
+    """Strong mu diagnostics + simple inlet/outlet flow sanity (non-destructive debug only)."""
     out: Dict[str, float] = {}
     species_log = torch.clamp(pred_final[:, 4:16], min=-10.0, max=8.0)
     species_si = model.species_log_nd_to_si(species_log)
@@ -1592,14 +1695,6 @@ def _compute_mu_flow_debug_metrics(
                 out["DBG_gate_mean_clot"] = float("nan")
         else:
             out["DBG_gate_mean_clot"] = float("nan")
-    if hasattr(model, "_last_p_clot_raw") and model._last_p_clot_raw is not None:
-        raw = model._last_p_clot_raw.view(-1).float()
-        out["DBG_gate_raw_mean_all"] = _masked_mean(raw, m_all)
-        out["DBG_gate_raw_mean_wall"] = _masked_mean(raw, m_truth & m_wall)
-    if hasattr(model, "_last_k11_trigger_mask") and model._last_k11_trigger_mask is not None:
-        tr = model._last_k11_trigger_mask.view(-1).float()
-        out["DBG_k11_trigger_mean_all"] = _masked_mean(tr, m_all)
-        out["DBG_k11_trigger_mean_wall"] = _masked_mean(tr, m_truth & m_wall)
     if hasattr(model, "_last_mu_nucleation_prob") and model._last_mu_nucleation_prob is not None:
         nuc = model._last_mu_nucleation_prob.view(-1).float()
         out["DBG_gate_nucleation_all"] = _masked_mean(nuc, m_all)
@@ -1609,7 +1704,7 @@ def _compute_mu_flow_debug_metrics(
         out["DBG_gate_growth_all"] = _masked_mean(grow, m_all)
         out["DBG_gate_growth_wall"] = _masked_mean(grow, m_truth & m_wall)
 
-    # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref × width).
+    # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref x width).
     u = pred_final[:, 0].float()
     v = pred_final[:, 1].float()
     speed = torch.sqrt(u * u + v * v + 1e-20)
@@ -1623,8 +1718,8 @@ def _compute_mu_flow_debug_metrics(
         out["DBG_flux_debug_error"] = 1.0
         if _biochem_env_truthy("BIOCHEM_ZERO_LOSS_WARN", default=False):
             print(
-                f"⚠️ flux_debug_from_graph_data failed ({type(exc).__name__}: {exc}); "
-                "μ training continues.",
+                f"[WARN]  flux_debug_from_graph_data failed ({type(exc).__name__}: {exc}); "
+                "mu training continues.",
                 flush=True,
             )
     return out
@@ -1745,7 +1840,7 @@ def _debug_biochem_batch(
         mu_note = (
             f"+ {w_mu_dbg:g}*L_MuSI_anchor + {w_mul_dbg:g}*L_MuLog_anchor"
             if (w_mu_dbg > 0.0 or w_mul_dbg > 0.0)
-            else "(no μ anchor aux: SI+LOG weights both 0)"
+            else "(no mu anchor aux: SI+LOG weights both 0)"
         )
         w_pt_dbg = float(metrics.get("W_DataOnlyPhysTemp_eff") or 0.0)
         pt_note = (
@@ -1770,7 +1865,7 @@ def _debug_biochem_batch(
         ]
         if "t_si_start" in tbptt_info and "t_si_end" in tbptt_info:
             parts.append(
-                f"data.t_si≈[{tbptt_info['t_si_start']:.5g},{tbptt_info['t_si_end']:.5g}]s "
+                f"data.t_si~[{tbptt_info['t_si_start']:.5g},{tbptt_info['t_si_end']:.5g}]s "
                 f"(window endpoints)"
             )
         _biochem_dbg_line("   " + " | ".join(parts))
@@ -1781,7 +1876,7 @@ def _debug_biochem_batch(
         )
     else:
         _biochem_dbg_line(
-            f"   TBPTT: n/a (training, T_y≤2 or no slice); eval_times len={n_times}"
+            f"   TBPTT: n/a (training, T_y<=2 or no slice); eval_times len={n_times}"
         )
     _biochem_dbg_line(
         f"   scales: u_ref={data.u_ref!r} d_bar={data.d_bar!r} "
@@ -1795,10 +1890,10 @@ def _debug_biochem_batch(
     te = evaluation_times.detach().cpu()
     dt = te[1:] - te[:-1] if te.numel() > 1 else te
     t_ref = float(getattr(bio_cfg, "t_final", float("nan"))) if bio_cfg is not None else float("nan")
-    dt_note = f"Δ_nd_min={(dt.min().item() if dt.numel() else float('nan')):.6g}"
+    dt_note = f"d_nd_min={(dt.min().item() if dt.numel() else float('nan')):.6g}"
     if math.isfinite(t_ref) and t_ref > 0:
         span_si = (te.max().item() - te.min().item()) * t_ref
-        dt_note += f" | approx_Δt_si_min={(dt.min().item() * t_ref if dt.numel() else float('nan')):.6g}s window_span_si≈{span_si:.5g}s"
+        dt_note += f" | approx_dt_si_min={(dt.min().item() * t_ref if dt.numel() else float('nan')):.6g}s window_span_si~{span_si:.5g}s"
     _biochem_dbg_line(
         f"   eval_times_nd: min={te.min().item():.6g} max={te.max().item():.6g} {dt_note}"
     )
@@ -1949,7 +2044,7 @@ BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME = "biochem_teacher_best_high_mu.pth"
 BIOCHEM_TEACHER_LAST_CKPT_NAME = "biochem_teacher_last.pth"
 # Legacy all-truth global best (optional; not written unless BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL=1).
 BIOCHEM_TEACHER_BEST_CKPT_NAME = "biochem_teacher_best.pth"
-# Corrector-phase global high-μ (teacher runs use TEACHER_BEST_HIGH_MU instead).
+# Corrector-phase global high-mu (teacher runs use TEACHER_BEST_HIGH_MU instead).
 BIOCHEM_BEST_HIGH_MU_CKPT_NAME = "biochem_best_high_mu.pth"
 BIOCHEM_BEST_BIO_LEGACY_CKPT_NAME = "biochem_best_bio.pth"
 
@@ -2014,10 +2109,10 @@ def _save_biochem_checkpoint_file(
     ep_note = f" epoch={best_epoch:02d}" if best_epoch >= 0 else ""
     high_note = ""
     if math.isfinite(float(val_mu_log_mae_high_mu)):
-        high_note = f", high-μ logMAE≈{float(val_mu_log_mae_high_mu):.4f}"
+        high_note = f", high-mu logMAE~{float(val_mu_log_mae_high_mu):.4f}"
     print(
-        f"💾 Saved {checkpoint_role} -> {path.name} "
-        f"(all logMAE≈{float(val_mu_log_mae):.4f}{high_note}{ep_note})",
+        f"[save]  Saved {checkpoint_role} -> {path.name} "
+        f"(all logMAE~{float(val_mu_log_mae):.4f}{high_note}{ep_note})",
         flush=True,
     )
 
@@ -2110,9 +2205,9 @@ def _maybe_update_global_checkpoint(
     prev_note = (prev_meta.get("run_note") or "").strip()
     print(
         f"🏆 {kept_label} kept -> {global_path.name} "
-        f"({metric_key}≈{prev_val:.4f}"
+        f"({metric_key}~{prev_val:.4f}"
         + (f", run_note={prev_note!r}" if prev_note else "")
-        + f"); this run ≈{cand:.4f} did not beat it.",
+        + f"); this run ~{cand:.4f} did not beat it.",
         flush=True,
     )
 
@@ -2128,9 +2223,9 @@ def _maybe_update_global_best_high_mu(
     teacher_best_mu_score: Optional[float] = None,
     ckpt_name: str = BIOCHEM_BEST_HIGH_MU_CKPT_NAME,
     checkpoint_role: str = "best_high_mu",
-    kept_label: str = "Global high-μ best",
+    kept_label: str = "Global high-mu best",
 ) -> None:
-    """Corrector (or legacy) high-μ checkpoint — teacher runs use ``biochem_teacher_best_high_mu.pth``."""
+    """Corrector (or legacy) high-mu checkpoint — teacher runs use ``biochem_teacher_best_high_mu.pth``."""
     _maybe_update_global_checkpoint(
         model_dir,
         ckpt_name,
@@ -2161,7 +2256,7 @@ def _persist_biochem_teacher_checkpoints(
     last_state: Optional[Dict[str, torch.Tensor]] = None,
     last_epoch: int = -1,
 ) -> None:
-    """Write ``biochem_teacher_last.pth`` (final-epoch weights); update high-μ / all-truth bests."""
+    """Write ``biochem_teacher_last.pth`` (final-epoch weights); update high-mu / all-truth bests."""
     model_dir = Path(model_dir)
     run_note = (run_note or "").strip()
     val_log_mae = _teacher_val_log_mae_from_score(teacher_best_mu_score)
@@ -2196,7 +2291,7 @@ def _persist_biochem_teacher_checkpoints(
         teacher_best_mu_score=teacher_best_mu_score,
         model_config=model_config,
         keep_global=_biochem_env_truthy("BIOCHEM_TEACHER_KEEP_GLOBAL_BEST", default=True),
-        kept_label="Global teacher high-μ best",
+        kept_label="Global teacher high-mu best",
     )
 
     if _biochem_env_truthy("BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL", default=False):
@@ -2243,7 +2338,7 @@ def _persist_biochem_teacher_checkpoints(
             teacher_best_mu_score=teacher_best_mu_score,
             model_config=model_config,
         )
-        print(f"💾 Archived teacher checkpoints -> {arch}", flush=True)
+        print(f"[save]  Archived teacher checkpoints -> {arch}", flush=True)
 
 
 def _save_biochem_teacher_best_checkpoint(
@@ -2279,11 +2374,11 @@ def _try_load_biochem_post_pretrain(model: torch.nn.Module, path: Path, device: 
         state = raw
     compatible, skipped = _filter_compatible_state_dict(state, model.state_dict())
     if not compatible:
-        print(f"⚠️ Post-pretrain checkpoint {path.name} had no compatible parameter keys.")
+        print(f"[WARN]  Post-pretrain checkpoint {path.name} had no compatible parameter keys.")
         return False
     model.load_state_dict(compatible, strict=False)
     if skipped:
-        print(f"   ℹ️ Post-pretrain load: skipped {len(skipped)} incompatible/shape-mismatch keys.")
+        print(f"   [i]  Post-pretrain load: skipped {len(skipped)} incompatible/shape-mismatch keys.")
     return True
 
 
@@ -2323,11 +2418,11 @@ def load_dataset():
                 rng.shuffle(file_list)
             file_list = file_list[:max_load]
             print(
-                f"✂️ Pre-load cap active (BIOCHEM_MAX_LOAD_VESSELS={max_load}): "
+                f" Pre-load cap active (BIOCHEM_MAX_LOAD_VESSELS={max_load}): "
                 f"using {len(file_list)} graph files before split."
             )
     print(
-        f"📂 Found {len(anchor_files)} Biochem anchor graphs + "
+        f" Found {len(anchor_files)} Biochem anchor graphs + "
         f"{len(synthetic_files)} Biochem synthetic graphs for lazy loading..."
     )
 
@@ -2349,30 +2444,30 @@ def _print_biochem_anchor_file_split(train_anchors: List[Any], val_anchors: List
         return ", ".join(names[:cap]) + f", ... +{len(names) - cap} more"
 
     print(
-        f"📂 Anchor train/val file lists: train_n={len(ta)} [{_fmt(ta)}] | "
+        f" Anchor train/val file lists: train_n={len(ta)} [{_fmt(ta)}] | "
         f"val_n={len(va)} [{_fmt(va)}] | overlap_basenames={len(overlap)}"
     )
     # ``ta`` is sorted for readability; DataLoader uses ``train_anchors`` list order (shuffle split).
     try:
         tr_paths = [Path(p) for p in train_anchors]
         order = ", ".join(f"{i}:{p.name}" for i, p in enumerate(tr_paths))
-        print(f"   🧭 Teacher/DataLoader anchor order (batch_idx → file): {order}")
+        print(f"    Teacher/DataLoader anchor order (batch_idx -> file): {order}")
     except (TypeError, ValueError):
         pass
     if ta == va and ta:
         print(
-            "   ⚠️ Train and val anchor **file lists are identical** (same .pt paths in both splits). "
+            "   [WARN]  Train and val anchor **file lists are identical** (same .pt paths in both splits). "
             "Common with a single anchor graph or low-anchor mode — validation is not an independent holdout."
         )
     elif overlap:
         print(
-            f"   ℹ️ Overlap (names appearing in both splits): {_fmt(overlap, 12)} — unusual unless "
+            f"   [i]  Overlap (names appearing in both splits): {_fmt(overlap, 12)} — unusual unless "
             "paths are duplicated or the split logic was overridden."
         )
 
 
 def initialize_biochem_priors(model):
-    print("🧬 Injecting physical priors into biochemistry decoder biases...")
+    print(" Injecting physical priors into biochemistry decoder biases...")
     target_layer = model.biochem_decoder.linear if hasattr(model.biochem_decoder, 'linear') else model.biochem_decoder
 
     # Micro-head init: default is small random weights (gradients flow); set
@@ -2403,7 +2498,7 @@ def initialize_biochem_priors(model):
     else:
         print("   micro-head init: near-zero random weights + COMSOL resting-state bias vector.")
 
-    print("🛑 Initializing ODE function to near-zero derivative...")
+    print(" Initializing ODE function to near-zero derivative...")
 
     def _init_linear_like_near_zero(module, eps=1e-3):
         linear = module.linear if hasattr(module, 'linear') else module
@@ -2468,10 +2563,10 @@ def make_biochem_dynamic_loss_weighter(curriculum: CurriculumConfig, device) -> 
         data_max_lv,       # Data_Bio
     ]
     print(
-        f"⚖️ Biochem loss weighter: physics prec ≤ {phys_ceiling:g} (log_var ≥ {phys_min_lv:.3f}), "
-        f"ADR_S prec ≥ {adr_s_floor:g} (log_var ≤ {adr_s_max_lv:.3f}), "
-        f"W_Phys prec ≥ {w_phys_floor:g} (log_var ≤ {w_phys_max_lv:.3f}), "
-        f"data prec ≥ {data_floor:g} (log_var ≤ {data_max_lv:.3f}), "
+        f" Biochem loss weighter: physics prec <= {phys_ceiling:g} (log_var >= {phys_min_lv:.3f}), "
+        f"ADR_S prec >= {adr_s_floor:g} (log_var <= {adr_s_max_lv:.3f}), "
+        f"W_Phys prec >= {w_phys_floor:g} (log_var <= {w_phys_max_lv:.3f}), "
+        f"data prec >= {data_floor:g} (log_var <= {data_max_lv:.3f}), "
         f"freeze_in_warmup={curriculum.biochem_weighter_freeze_during_warmup}"
     )
     return DynamicLossWeighter(num_losses=8, min_log_var=min_lv, max_log_var=max_lv).to(device)
@@ -2557,7 +2652,7 @@ def inject_biochem_kinematic_lora(model: GNODE_Phase3, rank: int = 4, alpha: flo
     if getattr(model, "kinematics_decoder", None) is not None:
         n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
     print(
-        f"💉 LoRA injected (SpectralLinear count): kin_encoder={n_enc}, "
+        f" LoRA injected (SpectralLinear count): kin_encoder={n_enc}, "
         f"kin_processor={n_proc + n_proc_extra}, kinematics_decoder={n_dec} "
         f"(rank={rank}, alpha={alpha}); plain nn.Linear modules contribute 0."
     )
@@ -2597,7 +2692,7 @@ class SplitBiochemOptimizers:
         return self.weighter_optimizer.param_groups
 
     def lr_scheduler_target(self) -> optim.Optimizer:
-        """Optimizer for ``CosineAnnealingWarmRestarts`` (μ-only runs have no bio group)."""
+        """Optimizer for ``CosineAnnealingWarmRestarts`` (mu-only runs have no bio group)."""
         if self.bio_optimizer is not None:
             return self.bio_optimizer
         if self.mu_optimizer is not None:
@@ -2666,7 +2761,7 @@ class SplitBiochemOptimizers:
             self.weighter_optimizer.load_state_dict(state_dict["weighter"])
             return
         print(
-            "⚠️ Legacy single-optimizer checkpoint detected; optimizer state is not shape-compatible "
+            "[WARN]  Legacy single-optimizer checkpoint detected; optimizer state is not shape-compatible "
             "with split optimizers, so optimizer moments are reinitialized."
         )
 
@@ -2675,11 +2770,11 @@ def _try_load_biochem_split_optimizer(optimizer: SplitBiochemOptimizers, state_d
     """Load split-optimizer moments when checkpoint matches current param groups.
 
     Returns False when the checkpoint was built with a different trainable split (e.g. teacher stage
-    uses ``freeze_lora=True`` → no physics Adam group, different bio tensor count vs corrector).
+    uses ``freeze_lora=True`` -> no physics Adam group, different bio tensor count vs corrector).
     """
     if not isinstance(state_dict, dict) or state_dict.get("type") != "SplitBiochemOptimizers":
         print(
-            "⚠️ Checkpoint optimizer_state_dict is missing SplitBiochemOptimizers metadata; "
+            "[WARN]  Checkpoint optimizer_state_dict is missing SplitBiochemOptimizers metadata; "
             "keeping freshly initialized optimizer moments."
         )
         return False
@@ -2688,7 +2783,7 @@ def _try_load_biochem_split_optimizer(optimizer: SplitBiochemOptimizers, state_d
         return True
     except Exception as exc:
         print(
-            "⚠️ Could not load optimizer state from checkpoint (Adam param groups / tensors differ from "
+            "[WARN]  Could not load optimizer state from checkpoint (Adam param groups / tensors differ from "
             f"this run: {type(exc).__name__}: {exc}). Common when resuming after teacher-only training "
             "(``freeze_lora=True``) into the corrector (LoRA in a separate AdamW). "
             "Continuing with reinitialized optimizer moments."
@@ -2755,6 +2850,18 @@ def _biochem_bio_grad_global_l2(split: SplitBiochemOptimizers) -> float:
     return math.sqrt(sq) if sq > 0.0 else 0.0
 
 
+def _biochem_scale_bio_grads_to_l2(split: SplitBiochemOptimizers, target_l2: float) -> float:
+    """Scale bio + mu-path grads so global L2 norm equals ``target_l2`` (returns pre-scale norm)."""
+    raw = _biochem_bio_grad_global_l2(split)
+    if not math.isfinite(raw) or raw <= 0.0 or raw <= target_l2:
+        return raw
+    scale = float(target_l2) / raw
+    for p in list(split.bio_params) + list(split.mu_params):
+        if p.grad is not None:
+            p.grad.mul_(scale)
+    return raw
+
+
 def _biochem_teacher_ode_freeze_epochs(max_epochs: int) -> int:
     """Epochs to keep ``ode_func`` frozen at teacher start (0 = train ODE from ep0).
 
@@ -2772,7 +2879,7 @@ def _biochem_teacher_ode_freeze_epochs(max_epochs: int) -> int:
 
 
 def _biochem_will_run_ae_ode_pretrain(model_dir: Path) -> bool:
-    """True when Phase 3a / 3a.5 will run (strict μ-freeze must not apply yet)."""
+    """True when Phase 3a / 3a.5 will run (strict mu-freeze must not apply yet)."""
     if _biochem_env_truthy("BIOCHEM_SKIP_PRETRAIN", default=False):
         return False
     if _biochem_env_truthy("BIOCHEM_REUSE_LAST_PRETRAIN", default=False):
@@ -2789,8 +2896,8 @@ def setup_biochem_optimization(
     *,
     for_pretrain: bool = False,
 ):
-    print("❄️  Verifying Kinematic Backbone is Frozen.")
-    print("🔥 Activating split optimizers: kinematic LoRA isolated from biochemistry.")
+    print("  Verifying Kinematic Backbone is Frozen.")
+    print(" Activating split optimizers: kinematic LoRA isolated from biochemistry.")
 
     if for_pretrain:
         train_kin_lora = False
@@ -2799,7 +2906,7 @@ def setup_biochem_optimization(
         train_bio_decoder = not _biochem_env_truthy("BIOCHEM_FREEZE_DECODER_PRETRAIN", default=False)
         freeze_lora = True
         print(
-            "   ℹ️ Pretrain optimizer: bio_encoder + decoder trainable; ODE/LoRA off "
+            "   [i]  Pretrain optimizer: bio_encoder + decoder trainable; ODE/LoRA off "
             "(BIOCHEM_TRAIN_* freeze flags apply at teacher stage only)."
         )
     else:
@@ -2890,8 +2997,14 @@ def setup_biochem_optimization(
             if hasattr(model, "mu_encoder"):
                 for param in model.mu_encoder.parameters():
                     param.requires_grad = False
+        if train_clot_only and _biochem_env_truthy("_FREEZE_DELTA_HEAD"):
+            if hasattr(model, "mu_delta_head"):
+                for param in model.mu_delta_head.parameters():
+                    param.requires_grad = False
         label = "wall-only" if train_wall_only else "clot-only (split tail/gate; wall frozen)"
-        print(f"   🎯 BIOCHEM μ staged train scope: {label}", flush=True)
+        if train_clot_only and _biochem_env_truthy("_GATE"):
+            label = "clot-only geom gate ()"
+        print(f"   [scope]  BIOCHEM mu staged train scope: {label}", flush=True)
 
     physics_params: List[torch.nn.Parameter] = []
     mu_params: List[torch.nn.Parameter] = []
@@ -2904,6 +3017,7 @@ def setup_biochem_optimization(
         "mu_encoder.",
         "learned_clot_penalty.",
         "mu_delta_head.",
+        ".",
         "mu_delta_bulk_head.",
         "mu_delta_tail_head.",
         "mu_trigger_gate_head.",
@@ -2938,7 +3052,7 @@ def setup_biochem_optimization(
     mu_gate_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_GATE_LR_MULT", "1.0"))
     mu_wall_lr = mu_lr * float(os.environ.get("BIOCHEM_MU_WALL_LR_MULT", "1.0"))
     print(
-        f"   μ trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
+        f"   mu trainability: BIOCHEM_TRAIN_MU_ENCODER={int(train_mu_encoder)} "
         f"BIOCHEM_USE_MU_PATH_GROUP={int(use_mu_path_group)} | "
         f"TRAIN_KIN_LORA={int(train_kin_lora)} TRAIN_BIO_ENC={int(train_bio_encoder)} "
         f"TRAIN_ODE={int(train_ode)} TRAIN_BIO_DEC={int(train_bio_decoder)}"
@@ -2990,7 +3104,7 @@ def setup_biochem_optimization(
             if mu_group_wall:
                 mu_param_groups.append({"params": mu_group_wall, "lr": mu_wall_lr})
             print(
-                f"   μ split-head lrs: base={mu_lr:.3e}, bulk={mu_bulk_lr:.3e}, "
+                f"   mu split-head lrs: base={mu_lr:.3e}, bulk={mu_bulk_lr:.3e}, "
                 f"tail={mu_tail_lr:.3e}, gate={mu_gate_lr:.3e}, wall={mu_wall_lr:.3e}"
             )
             opt_mu = optim.AdamW(mu_param_groups, weight_decay=1e-5)
@@ -3039,7 +3153,7 @@ def pretrain_autoencoder(
                 p.requires_grad = False
         if not (skip_ae and skip_ode_rxn):
             print(
-                "   🔒 Decoder freeze: biochem_decoder + learned_clot_penalty fixed during AE + ODE-RXN "
+                "    Decoder freeze: biochem_decoder + learned_clot_penalty fixed during AE + ODE-RXN "
                 "(BIOCHEM_FREEZE_DECODER_PRETRAIN=1)."
             )
 
@@ -3056,11 +3170,11 @@ def pretrain_autoencoder(
 
     if skip_ae:
         print(
-            "\n⏭️  Phase 3a AE skipped (BIOCHEM_SKIP_AE_PRETRAIN=1 or BIOCHEM_SKIP_PRETRAIN=1). "
+            "\n[skip]   Phase 3a AE skipped (BIOCHEM_SKIP_AE_PRETRAIN=1 or BIOCHEM_SKIP_PRETRAIN=1). "
             "Encoder/decoder weights unchanged from load."
         )
     else:
-        print("\n🚀 --- Phase 3a: Autoencoder Pre-Training (Freezing ODE) ---")
+        print("\n --- Phase 3a: Autoencoder Pre-Training (Freezing ODE) ---")
         for param in model.bio_encoder.parameters():
             param.requires_grad = True
         if not freeze_decoder:
@@ -3127,21 +3241,21 @@ def pretrain_autoencoder(
                 print(f"AE Epoch {epoch:02d}: Recon Loss = {avg_loss:.4e}")
             if will_early_stop:
                 print(
-                    f"🛑 AE early stop at epoch {epoch:02d}: no improvement > {ae_min_delta:.1e} "
+                    f" AE early stop at epoch {epoch:02d}: no improvement > {ae_min_delta:.1e} "
                     f"for {ae_bad_epochs} epoch(s) after min_epochs={ae_min_epochs}."
                 )
                 break
 
     if skip_ode_rxn:
         print(
-            "\n⏭️  Phase 3a.5 ODE-RXN skipped (BIOCHEM_SKIP_ODE_RXN_PRETRAIN=1 or BIOCHEM_SKIP_PRETRAIN=1). "
+            "\n[skip]   Phase 3a.5 ODE-RXN skipped (BIOCHEM_SKIP_ODE_RXN_PRETRAIN=1 or BIOCHEM_SKIP_PRETRAIN=1). "
             "ODE/decoder snapshot restore skipped; restoring parameter requires_grad."
         )
         for name, param in model.named_parameters():
             param.requires_grad = prior_requires_grad.get(name, True)
         return
 
-    print("\n🧪 --- Phase 3a.5: ODE Reaction-Rate Imitation Pre-Training ---")
+    print("\n --- Phase 3a.5: ODE Reaction-Rate Imitation Pre-Training ---")
     for _, param in model.named_parameters():
         param.requires_grad = False
     for param in model.ode_func.parameters():
@@ -3185,8 +3299,8 @@ def pretrain_autoencoder(
         # (avoids "best stays epoch 0" plateau exits after a handful of steps).
         ode_rxn_min_before_plateau = max(ode_min_epochs, 8)
     print(
-        f"🧪 ODE-RXN optimizer: lr={ode_rxn_lr:.3e} (base_lr x1.0) | "
-        f"on-manifold COMSOL species frac ≈ {on_frac:.2f} (BIOCHEM_ODE_MANIFOLD_FRAC) | "
+        f" ODE-RXN optimizer: lr={ode_rxn_lr:.3e} (base_lr x1.0) | "
+        f"on-manifold COMSOL species frac ~ {on_frac:.2f} (BIOCHEM_ODE_MANIFOLD_FRAC) | "
         f"symlog_scale={symlog_scale:g} | rate_clip={rate_clip:g} | "
         f"patience_counts_after_epoch={ode_rxn_min_before_plateau} (BIOCHEM_ODE_RXN_MIN_EPOCHS_BEFORE_PLATEAU)"
     )
@@ -3331,7 +3445,7 @@ def pretrain_autoencoder(
                 plateau_streak = 0
             if plateau_streak >= 1:
                 print(
-                    f"⚠️ ODE-RXN plateau signal (EMA): rel_change={rel_change:.2e} "
+                    f"[WARN]  ODE-RXN plateau signal (EMA): rel_change={rel_change:.2e} "
                     f"(streak={plateau_streak + 1} epochs)"
                 )
         prev_rxn_avg = ema_rxn_loss
@@ -3364,7 +3478,7 @@ def pretrain_autoencoder(
 
         if will_early_stop:
             print(
-                f"🛑 ODE-RXN early stop at epoch {epoch:02d}: no EMA improvement > {ode_min_delta:.1e} "
+                f" ODE-RXN early stop at epoch {epoch:02d}: no EMA improvement > {ode_min_delta:.1e} "
                 f"for {ode_bad_epochs} epoch(s) after min_epochs={ode_min_epochs}."
             )
             break
@@ -3381,7 +3495,7 @@ def pretrain_autoencoder(
         best_ode_state = last_ode_state
         used_last_over_best = True
         print(
-            f"ℹ️ ODE-RXN: using last epoch weights (raw={last_raw_rxn:.4e}) over best-EMA epoch "
+            f"[i]  ODE-RXN: using last epoch weights (raw={last_raw_rxn:.4e}) over best-EMA epoch "
             f"{best_epoch_idx:02d} (raw={best_raw_rxn:.4e}). "
             "Set BIOCHEM_ODE_RXN_PREFER_LAST_IF_RAW_BETTER=0 to always restore the best-EMA snapshot.",
             flush=True,
@@ -3390,15 +3504,15 @@ def pretrain_autoencoder(
     model.ode_func.load_state_dict(best_ode_state["ode_func"])
     model.biochem_decoder.load_state_dict(best_ode_state["biochem_decoder"])
     if used_last_over_best:
-        print(f"✅ Restored ODE-RXN weights from last epoch (raw-improvement policy; raw={last_raw_rxn:.4e}).")
+        print(f"[OK]  Restored ODE-RXN weights from last epoch (raw-improvement policy; raw={last_raw_rxn:.4e}).")
     elif best_epoch_idx >= 0:
         print(
-            f"✅ Restored best ODE-RXN weights from epoch {best_epoch_idx:02d} "
+            f"[OK]  Restored best ODE-RXN weights from epoch {best_epoch_idx:02d} "
             f"(raw={best_raw_rxn:.4e}, ema={best_ema_rxn:.4e})."
         )
     else:
         print(
-            "ℹ️ ODE-RXN: no epoch improved the EMA best (or every epoch had zero batches); "
+            "[i]  ODE-RXN: no epoch improved the EMA best (or every epoch had zero batches); "
             "keeping the initial ODE/decoder snapshot loaded at phase start.",
             flush=True,
         )
@@ -3407,7 +3521,7 @@ def pretrain_autoencoder(
         pp = Path(post_pretrain_save_path)
         pp.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), pp)
-        print(f"💾 Saved post-pretrain warm-start for next run -> {pp}")
+        print(f"[save]  Saved post-pretrain warm-start for next run -> {pp}")
 
     for name, param in model.named_parameters():
         param.requires_grad = prior_requires_grad.get(name, True)
@@ -3454,9 +3568,9 @@ def _anchor_mu_si_and_log_losses(
     multi_step: bool,
     include_log: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """SI μ supervision on COMSOL truth nodes over the TBPTT window.
+    """SI mu supervision on COMSOL truth nodes over the TBPTT window.
 
-    Returns Huber-on-SI (``l_mu_si``) and mean |log μ_pred − log μ_gt| in SI (``l_mu_log``), the
+    Returns Huber-on-SI (``l_mu_si``) and mean |log mu_pred - log mu_gt| in SI (``l_mu_log``), the
     same construction as val ``mu_log_mae``. When ``multi_step`` is False, only the **last**
     time index is used for Huber (legacy). Optional late-time weights via
     ``BIOCHEM_MU_ANCHOR_LATE_TIME_WEIGHT``.
@@ -3505,354 +3619,6 @@ def _biochem_mu_k10e_simple_enabled() -> bool:
     )
 
 
-def _biochem_mu_k11_clot_gate_enabled() -> bool:
-    return (os.environ.get("BIOCHEM_MU_K11_CLOT_GATE") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _k11_clot_gt_label(
-    mu_g_si: torch.Tensor,
-    cfg_mu,
-) -> torch.Tensor:
-    """Binary clot label from GT ``μ_eff`` (all truth nodes, not only off-wall band).
-
-    Uses an absolute SI floor only. The legacy ``ratio * mu_inf`` branch used plasma
-    ``mu_inf`` (~0.0035 Pa·s) and marked essentially every anchor node positive.
-    """
-    mu_floor = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_SI_MIN", "0.055")), float(cfg_mu.mu_inf))
-    return (mu_g_si >= mu_floor).float()
-
-
-def _k11_bce_support_mode() -> str:
-    return (os.environ.get("BIOCHEM_K11_BCE_SUPPORT") or "adjacent_trigger").strip().lower()
-
-
-def _k11_bce_trig_threshold() -> float:
-    return max(float(os.environ.get("BIOCHEM_K11_BCE_TRIG_THRESH", "0.25")), 0.05)
-
-
-def _k11_bce_node_mask(
-    data,
-    truth_mask: torch.Tensor,
-    y_clot: torch.Tensor,
-    trig: Optional[torch.Tensor],
-    device: torch.device,
-) -> torch.Tensor:
-    """Nodes included in K11 BCE (default: adjacent band ∪ GT clot ∪ high COMSOL trigger)."""
-    ma = truth_mask.view(-1).bool()
-    mode = _k11_bce_support_mode()
-    if mode in ("all", "off", "none", "full"):
-        return ma
-    from src.architecture.gnode_biochem import k11_clot_apply_mask
-
-    sdf = data.x[:, 2].to(device=device, dtype=torch.float32)
-    wall = (
-        data.mask_wall.view(-1, 1).to(device=device, dtype=torch.float32)
-        if hasattr(data, "mask_wall") and data.mask_wall is not None
-        else torch.zeros(ma.shape[0], 1, device=device)
-    )
-    apply_hi = k11_clot_apply_mask(sdf, wall).reshape(-1) > 0.05
-    if mode in ("adjacent", "adjacent_only"):
-        return ma & apply_hi
-    clot_pos = y_clot.view(-1).bool() > 0.5
-    if trig is None:
-        return ma & (apply_hi | clot_pos)
-    thr = _k11_bce_trig_threshold()
-    return ma & (apply_hi | clot_pos | (trig.reshape(-1) >= thr))
-
-
-def _k11_teacher_checkpoint_score(val_stats: Mapping[str, Any]) -> float:
-    """Higher is better — balances logMAE with localized gate (not global wall halo)."""
-    base = -float(val_stats.get("mu_log_mae", float("inf")))
-    gate = float(val_stats.get("viz_final_gate_mean_all", float("nan")))
-    clot_frac = float(val_stats.get("viz_final_clot_frac", float("nan")))
-    score = base
-    if math.isfinite(gate):
-        # Penalize collapsed gates (flat μ_eff ≈ μ_ss everywhere).
-        score -= 80.0 * max(0.0, 0.002 - gate)
-        score -= 20.0 * max(0.0, gate - 0.03)
-    if math.isfinite(clot_frac):
-        score -= 15.0 * max(0.0, clot_frac - 0.05)
-        score -= 12.0 * max(0.0, 0.002 - clot_frac)
-    return score
-
-
-def _teacher_val_selection_score(val_stats: Mapping[str, Any]) -> float:
-    """Score used for teacher ``take_ckpt`` (higher = better)."""
-    if _biochem_mu_k11_clot_gate_enabled() and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True):
-        return _k11_teacher_checkpoint_score(val_stats)
-    return -float(val_stats.get("mu_log_mae", float("inf")))
-
-
-def _k11_bce_use_raw_prob() -> bool:
-    return (os.environ.get("BIOCHEM_K11_BCE_ON_RAW") or "1").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _k11_trigger_loss_enabled() -> bool:
-    raw = (os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT") or "").strip()
-    if raw:
-        return float(raw) > 0.0
-    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_LOSS", default=False)
-
-
-def _k11_trigger_time_index(t: int, t_cap: int) -> int:
-    """GT trigger time: ``sync`` = same macro step as μ; ``ic`` = COMSOL t0 only."""
-    mode = (os.environ.get("BIOCHEM_K11_TRIGGER_TIME") or "sync").strip().lower()
-    if mode in ("ic", "t0", "0"):
-        return 0
-    return int(max(0, min(t, t_cap - 1)))
-
-
-def _k11_graph_scale_props(data, device: torch.device, dtype: torch.dtype) -> dict:
-    """Per-graph ``u_ref`` / ``d_bar`` for clot-prior triggers (from batch, not ``BiochemConfig``)."""
-    if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == data.num_nodes:
-        u_ref = data.u_ref.to(device=device, dtype=dtype).reshape(-1)[:1]
-        d_bar = data.d_bar.to(device=device, dtype=dtype).reshape(-1)[:1]
-    else:
-        u_ref = torch.as_tensor(data.u_ref, device=device, dtype=dtype).reshape(1)
-        d_bar = torch.as_tensor(data.d_bar, device=device, dtype=dtype).reshape(1)
-    return {"u_ref": u_ref, "d_bar": d_bar}
-
-
-def _k11_gt_trigger_mask(
-    model,
-    y_true: torch.Tensor,
-    data,
-    bio_cfg,
-    t: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Detached COMSOL trigger score ``[N]`` from GT species + velocity at chosen time."""
-    from src.architecture.gnode_biochem import k11_clot_trigger_score
-
-    t_cap = int(y_true.shape[0])
-    t_src = _k11_trigger_time_index(t, t_cap)
-    species_log = y_true[t_src, :, 4:16].to(device=device, dtype=dtype)
-    u_nd = y_true[t_src, :, 0].to(device=device, dtype=dtype)
-    v_nd = y_true[t_src, :, 1].to(device=device, dtype=dtype)
-    props = _k11_graph_scale_props(data, device, dtype)
-    trig = k11_clot_trigger_score(model, species_log, u_nd, v_nd, data, bio_cfg, props)
-    return trig.reshape(-1).detach()
-
-
-def _k11_trigger_sample_weights(
-    trig: torch.Tensor,
-    y: torch.Tensor,
-    base_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Up-weight nodes where COMSOL triggers support clot; down-weight off-trigger negatives."""
-    scale = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT", "1.0")), 0.0)
-    if scale <= 0.0:
-        return base_weight
-    eps = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_MIN_WEIGHT", "0.12")), 0.02)
-    trig_w = eps + (1.0 - eps) * trig.clamp(0.0, 1.0)
-    w = base_weight * (0.5 + 0.5 * scale * trig_w)
-    pos_boost = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_POS_BOOST", "1.5")), 1.0)
-    w = torch.where(y > 0.5, w * pos_boost, w)
-    low_trig = trig < max(float(os.environ.get("BIOCHEM_K11_TRIGGER_NEG_THRESH", "0.20")), 0.05)
-    neg_extra = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_NEG_MULT", "3.0")), 1.0)
-    w = torch.where((y < 0.5) & low_trig, w * neg_extra, w)
-    return w
-
-
-def _anchor_k11_clot_bce_loss(
-    model,
-    y_true: torch.Tensor,
-    truth_mask: torch.Tensor,
-    data,
-    cfg_mu,
-    mu_ch: int,
-) -> torch.Tensor:
-    """BCE on ``p_raw`` (default) or ``p_clot`` vs GT high-μ; asymmetric neg weights on clean wall."""
-    device = y_true.device
-    dtype = y_true.dtype
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    if _k11_bce_use_raw_prob():
-        steps = getattr(model, "_k11_p_clot_raw_steps", None)
-    else:
-        steps = getattr(model, "_k11_p_clot_steps", None)
-    if not steps:
-        return z
-    ma = truth_mask.view(-1).bool()
-    if not ma.any():
-        return z
-    wall = (
-        data.mask_wall.view(-1).bool().to(device=device)
-        if hasattr(data, "mask_wall") and data.mask_wall is not None
-        else torch.zeros(ma.shape[0], device=device, dtype=torch.bool)
-    )
-    t_cap = min(len(steps), int(y_true.shape[0]))
-    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
-    terms: List[torch.Tensor] = []
-    pos_weight_raw = (os.environ.get("BIOCHEM_K11_CLOT_POS_WEIGHT") or "").strip()
-    pos_weight = float(pos_weight_raw) if pos_weight_raw else 8.0
-    neg_weight_raw = (os.environ.get("BIOCHEM_K11_CLOT_NEG_WEIGHT") or "").strip()
-    neg_weight = float(neg_weight_raw) if neg_weight_raw else 2.0
-    wall_neg_raw = (os.environ.get("BIOCHEM_K11_WALL_NEG_WEIGHT") or "").strip()
-    wall_neg_mult = float(wall_neg_raw) if wall_neg_raw else 4.0
-    bio_cfg = getattr(model, "_bio_cfg", None)
-    for t in range(t_cap):
-        p_all = steps[t].reshape(-1).clamp(1e-6, 1.0 - 1e-6)
-        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch]).reshape(-1).float()
-        y_clot = _k11_clot_gt_label(mu_g, cfg_mu)
-        trig_t = None
-        if bio_cfg is not None:
-            trig_t = _k11_gt_trigger_mask(model, y_true, data, bio_cfg, t, device, dtype)
-        sup = _k11_bce_node_mask(data, ma, y_clot, trig_t, device)
-        if not bool(sup.any().item()):
-            continue
-        p = p_all[sup]
-        y = y_clot[sup]
-        w = torch.full_like(y, neg_weight)
-        w = torch.where(y > 0.5, torch.full_like(y, pos_weight), w)
-        w = torch.where((y < 0.5) & wall[sup], w * wall_neg_mult, w)
-        if _k11_trigger_loss_enabled() and trig_t is not None:
-            w = _k11_trigger_sample_weights(trig_t[sup], y, w)
-        bce = F.binary_cross_entropy(p, y, weight=w)
-        terms.append(bce.to(dtype=dtype) * tw[t])
-    return torch.stack(terms).sum() if terms else z
-
-
-def _anchor_k11_trigger_suppress_loss(
-    model,
-    y_true: torch.Tensor,
-    truth_mask: torch.Tensor,
-    data,
-    cfg_mu,
-    mu_ch: int,
-) -> torch.Tensor:
-    """Penalize ``p_clot`` where COMSOL mechanical/biological triggers are low (off-clot regions)."""
-    device = y_true.device
-    dtype = y_true.dtype
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    if not _k11_trigger_loss_enabled():
-        return z
-    steps = getattr(model, "_k11_p_clot_steps", None)
-    if not steps:
-        return z
-    ma = truth_mask.view(-1).bool()
-    if not ma.any():
-        return z
-    bio_cfg = getattr(model, "_bio_cfg", None)
-    if bio_cfg is None:
-        return z
-    thr = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_THRESH", "0.25")), 0.05)
-    t_cap = min(len(steps), int(y_true.shape[0]))
-    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
-    terms: List[torch.Tensor] = []
-    for t in range(t_cap):
-        p_all = steps[t].reshape(-1).clamp(0.0, 1.0)
-        trig = _k11_gt_trigger_mask(model, y_true, data, bio_cfg, t, device, dtype)
-        m = ma & (trig < thr)
-        if bool(m.any()):
-            terms.append((p_all[m] ** 2).mean().to(dtype=dtype) * tw[t])
-    return torch.stack(terms).sum() if terms else z
-
-
-def _anchor_k11_gate_mean_target_loss(
-    model,
-    truth_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Hinge on mean ``p_clot`` (truth nodes) so the gate does not collapse to ~0."""
-    device = truth_mask.device
-    dtype = truth_mask.dtype
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    w = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0)
-    if w <= 0.0:
-        return z
-    target = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_MEAN", "0.006")), 1e-5)
-    steps = getattr(model, "_k11_p_clot_steps", None)
-    if not steps:
-        return z
-    ma = truth_mask.view(-1).bool()
-    if not ma.any():
-        return z
-    terms: List[torch.Tensor] = []
-    for p_step in steps:
-        p_mean = p_step.reshape(-1)[ma].mean()
-        terms.append(F.relu(target - p_mean).pow(2) * w)
-    return torch.stack(terms).mean() if terms else z
-
-
-def _anchor_k11_wall_fp_penalty(
-    model,
-    y_true: torch.Tensor,
-    truth_mask: torch.Tensor,
-    data,
-    cfg_mu,
-    mu_ch: int,
-) -> torch.Tensor:
-    """Penalize raised ``p_clot`` on truth wall nodes where GT is not clot (stops perimeter halo)."""
-    device = y_true.device
-    dtype = y_true.dtype
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    steps = getattr(model, "_k11_p_clot_steps", None)
-    if not steps:
-        return z
-    ma = truth_mask.view(-1).bool()
-    if not ma.any():
-        return z
-    wall = (
-        data.mask_wall.view(-1).bool().to(device=device)
-        if hasattr(data, "mask_wall") and data.mask_wall is not None
-        else torch.zeros(ma.shape[0], device=device, dtype=torch.bool)
-    )
-    if not bool(wall.any().item()):
-        return z
-    t_cap = min(len(steps), int(y_true.shape[0]))
-    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
-    terms: List[torch.Tensor] = []
-    for t in range(t_cap):
-        p_all = steps[t].reshape(-1).clamp(0.0, 1.0)
-        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch]).reshape(-1).float()
-        y_clot = _k11_clot_gt_label(mu_g, cfg_mu).bool()
-        m = ma & wall & (~y_clot)
-        if bool(m.any()):
-            terms.append((p_all[m] ** 2).mean().to(dtype=dtype) * tw[t])
-    return torch.stack(terms).sum() if terms else z
-
-
-def _anchor_k11_clot_mu_huber_loss(
-    pred_series: torch.Tensor,
-    y_true: torch.Tensor,
-    truth_mask: torch.Tensor,
-    cfg_mu,
-    mu_ch: int,
-    *,
-    delta_si: float = 0.02,
-) -> torch.Tensor:
-    """Direct ``μ_eff`` fit on GT-clot nodes (amplitude), complements BCE gate."""
-    device = pred_series.device
-    dtype = pred_series.dtype
-    ma = truth_mask.view(-1).bool()
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    if not ma.any() or pred_series.shape[0] < 1:
-        return z
-    t_cap = min(int(pred_series.shape[0]), int(y_true.shape[0]))
-    tw = _tbptt_mu_time_weights(t_cap, device, dtype)
-    terms: List[torch.Tensor] = []
-    d_si = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_HUBER_DELTA_SI", str(delta_si))), 1e-6)
-    for t in range(t_cap):
-        mu_p = cfg_mu.viscosity_nd_to_si(pred_series[t, :, mu_ch]).reshape(-1).float()
-        mu_g = cfg_mu.viscosity_nd_to_si(y_true[t, :, mu_ch]).reshape(-1).float()
-        y_clot = _k11_clot_gt_label(mu_g, cfg_mu).bool()
-        m = ma & y_clot
-        if bool(m.any()):
-            terms.append(
-                F.huber_loss(mu_p[m], mu_g[m], reduction="mean", delta=d_si).to(dtype=dtype) * tw[t]
-            )
-    return torch.stack(terms).sum() if terms else z
-
 
 def _anchor_mu_adjacent_log_loss(
     pred_series: torch.Tensor,
@@ -3862,7 +3628,7 @@ def _anchor_mu_adjacent_log_loss(
     cfg_mu,
     mu_ch: int,
 ) -> torch.Tensor:
-    """Log-μ on truth nodes in the K10e wall-adjacent band (excludes solid wall nodes)."""
+    """Log-mu on truth nodes in the K10e wall-adjacent band (excludes solid wall nodes)."""
     from src.architecture.gnode_biochem import k10e_wall_adjacent_mask
 
     device = pred_series.device
@@ -3898,7 +3664,7 @@ def _anchor_mu_adjacent_log_loss(
 
 
 def _k10e_bulk_delta_penalty(model, data) -> torch.Tensor:
-    """Penalize learned Δμ outside the wall-adjacent band (prevents lumen uniform clot)."""
+    """Penalize learned dmu outside the wall-adjacent band (prevents lumen uniform clot)."""
     from src.architecture.gnode_biochem import k10e_wall_adjacent_mask
 
     device = next(model.parameters()).device
@@ -3929,7 +3695,7 @@ def _anchor_mu_mse_loss(
     *,
     multi_step: bool = True,
 ) -> torch.Tensor:
-    """Mean squared error on SI ``μ_eff`` at COMSOL truth nodes (K10d proof loss)."""
+    """Mean squared error on SI ``mu_eff`` at COMSOL truth nodes (K10d proof loss)."""
     device = pred_series.device
     dtype = pred_series.dtype
     z = torch.tensor(0.0, device=device, dtype=dtype)
@@ -3958,11 +3724,11 @@ def _anchor_mu_subset_log_losses(
     cfg_mu,
     mu_ch: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extra SI log-μ anchor losses on clinically important subsets.
+    """Extra SI log-mu anchor losses on clinically important subsets.
 
     Returns:
-    - ``l_mu_log_wall``: mean |log μ_pred − log μ_gt| on truth ∩ wall nodes
-    - ``l_mu_log_high``: mean |log μ_pred − log μ_gt| on high-μ_gt tail nodes (per-step quantile)
+    - ``l_mu_log_wall``: mean |log mu_pred - log mu_gt| on truth & wall nodes
+    - ``l_mu_log_high``: mean |log mu_pred - log mu_gt| on high-mu_gt tail nodes (per-step quantile)
     """
     device = pred_series.device
     dtype = pred_series.dtype
@@ -4019,7 +3785,7 @@ def _anchor_mu_wall_head_bypass_log_loss(
     cfg_mu,
     mu_ch: int,
 ) -> torch.Tensor:
-    """Fix B: supervise raw wall-head log-μ contribution on wall nodes (ungated)."""
+    """Fix B: supervise raw wall-head log-mu contribution on wall nodes (ungated)."""
     device = target_final_mu_nd.device
     dtype = target_final_mu_nd.dtype
     z = torch.tensor(0.0, device=device, dtype=dtype)
@@ -4083,11 +3849,6 @@ def _biochem_resolve_isolated_loss(
     w_mu_wall_bypass: float,
     l_mu_log_adjacent: torch.Tensor,
     l_k10e_bulk_delta: torch.Tensor,
-    l_k11_clot_bce: torch.Tensor,
-    l_k11_clot_mu: torch.Tensor,
-    l_k11_wall_fp: torch.Tensor,
-    l_k11_trigger_suppress: torch.Tensor,
-    l_k11_gate_target: torch.Tensor,
     l_fi_gate_start: torch.Tensor,
     w_fi_gate_start_eff: float,
     l_residual_sparse: torch.Tensor,
@@ -4176,29 +3937,22 @@ def _biochem_resolve_isolated_loss(
             + _biochem_scale_for_isolate(w_bulk) * l_k10e_bulk_delta
             + _biochem_scale_for_isolate(w_dk) * l_data_kine
         )
-    if k == "K11":
-        w_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "1.0")), 0.0)
-        w_mu = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_HUBER_WEIGHT", "0.5")), 0.0)
-        w_fp = max(float(os.environ.get("BIOCHEM_K11_WALL_FP_WEIGHT", "2.0")), 0.0)
-        w_ts = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_WEIGHT", "3.0")), 0.0)
-        w_gt = max(float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0)
-        w_dk = max(float(os.environ.get("BIOCHEM_K11_DATA_KINE_WEIGHT", "0.25")), 0.0)
-        return (
-            _biochem_scale_for_isolate(w_bce) * l_k11_clot_bce
-            + _biochem_scale_for_isolate(w_mu) * l_k11_clot_mu
-            + _biochem_scale_for_isolate(w_fp) * l_k11_wall_fp
-            + _biochem_scale_for_isolate(w_ts) * l_k11_trigger_suppress
-            + _biochem_scale_for_isolate(w_gt) * l_k11_gate_target
-            + _biochem_scale_for_isolate(w_dk) * l_data_kine
-        )
     if k in ("FI_GATE", "FI_GATE_START"):
         return _biochem_scale_for_isolate(w_fi_gate_start_eff) * l_fi_gate_start
     if k in ("RES_SPARSE", "RESIDUAL_SPARSE"):
         return _biochem_scale_for_isolate(lambda_residual_sparse) * l_residual_sparse
+    if k in _PASSIVE_TRANSPORT_LOSS_ALIASES:
+        w_kine, w_bio = _passive_transport_loss_weights()
+        # Do not use ``_biochem_scale_for_isolate`` here: zero weight must mean zero contribution
+        # (that helper maps w=0 -> 1.0 for legacy single-term isolates).
+        data_terms = w_bio * l_data_bio + w_kine * l_data_kine
+        if _passive_transport_adr_in_backprop():
+            return l_adr_fast + l_adr_slow + data_terms
+        return data_terms
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
         "VISC, KINE_PRIOR, PHYS_TEMP, MU_SI, MU_LOG, MU_LOG_WALL, MU_LOG_HIGH, MU_MSE, MU_DATA, "
-        "K10E, K11, FI_GATE, RES_SPARSE"
+        "K10E, FI_GATE, RES_SPARSE, PASSIVE, ONE_WAY"
     )
     raise ValueError(f"Unknown BIOCHEM_LOSS_ISOLATE={key!r}; expected one of: {valid}")
 
@@ -4248,7 +4002,7 @@ def compute_biochem_loss(
         raise ValueError(
             "Invalid Reynolds number for Navier–Stokes residual (1/Re blows up). "
             f"PhysicsConfig.re_target={phys_cfg_ns.re_target} only defines scaling when graphs are built; "
-            f"runtime Re is get_re(u_ref, d_bar) unless overridden by data.re_actual → re_ref. "
+            f"runtime Re is get_re(u_ref, d_bar) unless overridden by data.re_actual -> re_ref. "
             f"Effective Re={Re_effective}, re_ref={re_ref!r}, get_re(u_ref,d_bar) in [{r_lo}, {r_hi}], "
             f"u_ref={data.u_ref!r}, d_bar={data.d_bar!r}, re_actual={getattr(data, 're_actual', None)!r}"
         )
@@ -4444,7 +4198,7 @@ def compute_biochem_loss(
         base_huber = F.huber_loss(pred_bio, targ_bio, reduction="none", delta=1.0)
 
         raw_bio_magnitude = max(float(os.environ.get("BIOCHEM_RAW_BIO_MAGNITUDE", "0.01")), 1e-12)
-        # Time-normalized supervised bio loss: sum over (time × anchor nodes × channels),
+        # Time-normalized supervised bio loss: sum over (time x anchor nodes x channels),
         # scaled by 1/T_eval so TBPTT windows of different lengths stay comparable (per-step scale).
         t_eval = max(int(pred_bio.shape[0]), 1)
         n_anc = max(int(pred_bio.shape[1]), 1)
@@ -4495,6 +4249,20 @@ def compute_biochem_loss(
             d_dt_t = d_pred_dt[t_idx]
 
             vel_t = pred_t[:, 0:2]
+            if _biochem_env_truthy("BIOCHEM_GT_KINE_VEL", default=False) and int(target_series.shape[0]) > t_idx + 1:
+                from src.architecture.gnode_biochem import resolve_gt_kine_uvp_at_step
+
+                gt_uvp = resolve_gt_kine_uvp_at_step(
+                    data,
+                    target_series,
+                    t_idx + 1,
+                    truth_mask,
+                    device,
+                    vel_t.dtype,
+                    fallback_uvp=pred_t[:, 0:3],
+                )
+                if gt_uvp is not None:
+                    vel_t = gt_uvp[:, 0:2]
             # Relax upper bound so FI can exceed clot threshold while still
             # preventing unbounded autoregressive blow-ups.
             biochem_t = torch.clamp(pred_t[:, 4:13], min=-10.0, max=8.0)
@@ -4635,7 +4403,7 @@ def compute_biochem_loss(
 
     # Direct SI effective-viscosity fit on COMSOL anchors (primary high-viscosity supervision).
     # Multi-step: mean Huber over the TBPTT window (not only the final state). Optional ``l_mu_log``
-    # matches validation ``mu_log_mae`` (mean |log μ_pred − log μ_gt| in SI on truth nodes).
+    # matches validation ``mu_log_mae`` (mean |log mu_pred - log mu_gt| in SI on truth nodes).
     l_mu_si_anchor = torch.tensor(0.0, device=device)
     l_mu_log_anchor = torch.tensor(0.0, device=device)
     l_mu_log_wall = torch.tensor(0.0, device=device)
@@ -4644,11 +4412,6 @@ def compute_biochem_loss(
     l_mu_wall_bypass = torch.tensor(0.0, device=device)
     l_mu_log_adjacent = torch.tensor(0.0, device=device)
     l_k10e_bulk_delta = torch.tensor(0.0, device=device)
-    l_k11_clot_bce = torch.tensor(0.0, device=device)
-    l_k11_clot_mu = torch.tensor(0.0, device=device)
-    l_k11_wall_fp = torch.tensor(0.0, device=device)
-    l_k11_trigger_suppress = torch.tensor(0.0, device=device)
-    l_k11_gate_target = torch.tensor(0.0, device=device)
     l_mu_log_boundary = torch.tensor(0.0, device=device)
     w_mu_aux = max(float(os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.0")), 0.0)
     w_mu_log = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
@@ -4706,9 +4469,6 @@ def compute_biochem_loss(
         "MU_DATA",
     )
     _k10e_isolate = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper() == "K10E"
-    _k11_isolate = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper() == "K11"
-    _k10e_loss_active = _biochem_mu_k10e_simple_enabled() or _k10e_isolate
-    _k11_loss_active = _biochem_mu_k11_clot_gate_enabled() or _k11_isolate
     if model.training and has_anchor_supervision and (
         w_mu_aux > 0.0
         or w_mu_log > 0.0
@@ -4716,7 +4476,6 @@ def compute_biochem_loss(
         or w_mu_log_high > 0.0
         or _mu_mse_isolate
         or _k10e_isolate
-        or _k11_isolate
     ):
         cfg_mu = kernels.core.cfg
         ma = truth_mask
@@ -4811,51 +4570,6 @@ def compute_biochem_loss(
                     )
                 if _k10e_isolate or w_k10e_bulk > 0.0:
                     l_k10e_bulk_delta = _k10e_bulk_delta_penalty(model, data)
-            if _k11_loss_active:
-                w_k11_bce = max(float(os.environ.get("BIOCHEM_K11_CLOT_BCE_WEIGHT", "0.0")), 0.0)
-                w_k11_mu = max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_HUBER_WEIGHT", "0.0")), 0.0)
-                w_k11_fp = max(float(os.environ.get("BIOCHEM_K11_WALL_FP_WEIGHT", "0.0")), 0.0)
-                w_k11_ts = max(float(os.environ.get("BIOCHEM_K11_TRIGGER_SUPPRESS_WEIGHT", "0.0")), 0.0)
-                if _k11_isolate or w_k11_bce > 0.0:
-                    l_k11_clot_bce = _anchor_k11_clot_bce_loss(
-                        model,
-                        target_series,
-                        ma,
-                        data,
-                        kernels.core.cfg,
-                        mu_ch,
-                    )
-                if _k11_isolate or w_k11_mu > 0.0:
-                    l_k11_clot_mu = _anchor_k11_clot_mu_huber_loss(
-                        pred_series_data_freq,
-                        target_series,
-                        ma,
-                        kernels.core.cfg,
-                        mu_ch,
-                    )
-                if _k11_isolate or w_k11_fp > 0.0:
-                    l_k11_wall_fp = _anchor_k11_wall_fp_penalty(
-                        model,
-                        target_series,
-                        ma,
-                        data,
-                        kernels.core.cfg,
-                        mu_ch,
-                    )
-                if _k11_isolate or w_k11_ts > 0.0:
-                    l_k11_trigger_suppress = _anchor_k11_trigger_suppress_loss(
-                        model,
-                        target_series,
-                        ma,
-                        data,
-                        kernels.core.cfg,
-                        mu_ch,
-                    )
-                if _k11_isolate or max(
-                    float(os.environ.get("BIOCHEM_K11_GATE_TARGET_WEIGHT", "0.0")), 0.0
-                ) > 0.0:
-                    l_k11_gate_target = _anchor_k11_gate_mean_target_loss(model, ma)
-
     mu_dbg = _compute_mu_flow_debug_metrics(
         model=model,
         data=data,
@@ -4888,7 +4602,7 @@ def compute_biochem_loss(
             t_scale = max(float(getattr(model, "T_scale", 1.0)), 1e-5)
             fi_temp = max(float(bio_cfg.viscosity_gnode_temp_fi) * t_scale, 1e-8)
             fi_logits = torch.clamp((fi_si_last - float(bio_cfg.viscosity_fi_crit)) / fi_temp, min=-50.0, max=50.0)
-            # Must track ``model.mu_ratio_max`` (teacher forces μ₂ saturation scale to 1).
+            # Must track ``model.mu_ratio_max`` (teacher forces mu₂ saturation scale to 1).
             mu_ratio_eff = float(getattr(model, "mu_ratio_max", bio_cfg.mu_ratio_max))
             mu2_fi = mu_ratio_eff * torch.sigmoid(fi_logits)
             if has_anchor_supervision:
@@ -4923,7 +4637,7 @@ def compute_biochem_loss(
             l_residual_sparse = torch.mean(residual_excess.pow(2))
 
     # Trigger anti-collapse priors (opt-in):
-    # keep tail trigger/gelation pathway alive on high-μ anchor nodes even when
+    # keep tail trigger/gelation pathway alive on high-mu anchor nodes even when
     # global losses favor collapsing back to near-pure Carreau.
     l_trigger_gate_floor = torch.tensor(0.0, device=device)
     l_trigger_learned_floor = torch.tensor(0.0, device=device)
@@ -5051,11 +4765,6 @@ def compute_biochem_loss(
             w_mu_wall_bypass=float(w_mu_wall_bypass),
             l_mu_log_adjacent=l_mu_log_adjacent,
             l_k10e_bulk_delta=l_k10e_bulk_delta,
-            l_k11_clot_bce=l_k11_clot_bce,
-            l_k11_clot_mu=l_k11_clot_mu,
-            l_k11_wall_fp=l_k11_wall_fp,
-            l_k11_trigger_suppress=l_k11_trigger_suppress,
-            l_k11_gate_target=l_k11_gate_target,
             l_fi_gate_start=l_fi_gate_start,
             w_fi_gate_start_eff=float(w_fi_gate_start_eff),
             l_residual_sparse=l_residual_sparse,
@@ -5082,7 +4791,7 @@ def compute_biochem_loss(
             loss = pred_final.sum() * 0.0
             if model.training and _biochem_env_truthy("BIOCHEM_ZERO_LOSS_WARN", default=False):
                 print(
-                    "⚠️ BIOCHEM_LOSS_DATA_ONLY=1: no anchor supervision and no pseudo targets on this batch; "
+                    "[WARN]  BIOCHEM_LOSS_DATA_ONLY=1: no anchor supervision and no pseudo targets on this batch; "
                     "scalar loss is 0 (grad tether may still attach). Use anchors, raise pseudo weight, or "
                     "unset BIOCHEM_LOSS_DATA_ONLY. (Per-batch prints: BIOCHEM_ZERO_LOSS_WARN=1.)",
                     flush=True,
@@ -5220,7 +4929,7 @@ def compute_biochem_loss(
 
 
 def _biochem_anchor_basename(data) -> str:
-    """Short graph label for per-anchor μ tables (``patient007.pt``, etc.)."""
+    """Short graph label for per-anchor mu tables (``patient007.pt``, etc.)."""
     src = _biochem_src_for_log(data)
     if src == "<unknown>":
         return src
@@ -5236,7 +4945,7 @@ def _mu_val_high_quantile() -> float:
 
 
 def _mu_pair_metrics(mu_p: torch.Tensor, mu_g: torch.Tensor) -> Dict[str, float]:
-    """Continuous μ errors on a masked subset (SI viscosity)."""
+    """Continuous mu errors on a masked subset (SI viscosity)."""
     empty = {
         "n": 0,
         "mu_mae_si": float("nan"),
@@ -5283,7 +4992,7 @@ def _mu_debug_masks(
     truth_mask: torch.Tensor,
     mu_gt_si: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
-    """Subsets for μ diagnostics: all COMSOL truth, wall band, high-μ (gelation) tail."""
+    """Subsets for mu diagnostics: all COMSOL truth, wall band, high-mu (gelation) tail."""
     device = truth_mask.device
     all_m = truth_mask
     wall_m = truth_mask.clone()
@@ -5306,7 +5015,7 @@ def _compute_mu_debug_metrics(
     kernels,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Per-graph μ metrics on truth / wall / high-μ_gt subsets (final time slice)."""
+    """Per-graph mu metrics on truth / wall / high-mu_gt subsets (final time slice)."""
     num_nodes = int(data.num_nodes)
     truth_mask = biochem_truth_node_mask(data, num_nodes, device)
     mu_ch = STATE_CHANNEL_MU_EFF_ND
@@ -5358,8 +5067,8 @@ def _format_mu_subset_line(label: str, m: Dict[str, float]) -> str:
     log_m = m.get("mu_log_mae", float("nan"))
     mae = m.get("mu_mae_si", float("nan"))
     if not math.isfinite(float(log_m)):
-        return f"   📐 {label}:{n_s} (no nodes)"
-    return f"   📐 {label}:{n_s} logMAE={log_m:.4f} MAE_si={mae:.3e}{r_s}"
+        return f"    {label}:{n_s} (no nodes)"
+    return f"    {label}:{n_s} logMAE={log_m:.4f} MAE_si={mae:.3e}{r_s}"
 
 
 def _log_mu_validation_report(
@@ -5371,7 +5080,7 @@ def _log_mu_validation_report(
 ) -> Dict[str, float]:
     """Console + return flat aggregate dict (``all`` subset) for checkpoint scoring."""
     if not per_graph:
-        print(f"   📐 [{stage} ep {epoch:02d}] μ validation: no evaluable graphs.")
+        print(f"    [{stage} ep {epoch:02d}] mu validation: no evaluable graphs.")
         return {
             "mu_mae_si": float("inf"),
             "mu_rmse_si": float("inf"),
@@ -5384,12 +5093,12 @@ def _log_mu_validation_report(
     agg_high = _aggregate_mu_subset_metrics(per_graph, "high_mu")
     agg_bulk = _aggregate_mu_subset_metrics(per_graph, "bulk")
     q = _mu_val_high_quantile()
-    print(f"   📐 [{stage} ep {epoch:02d}] μ subsets (SI; high_μ = GT ≥ p{q:.2f} on truth nodes):")
+    print(f"    [{stage} ep {epoch:02d}] mu subsets (SI; high_mu = GT >= p{q:.2f} on truth nodes):")
     print(_format_mu_subset_line("all truth", {**agg_all, "n": sum(
         int((g.get("subsets") or {}).get("all", {}).get("n", 0)) for g in per_graph
     )}))
-    print(_format_mu_subset_line("wall ∩ truth", agg_wall))
-    print(_format_mu_subset_line("high-μ_gt tail", agg_high))
+    print(_format_mu_subset_line("wall & truth", agg_wall))
+    print(_format_mu_subset_line("high-mu_gt tail", agg_high))
     print(_format_mu_subset_line("bulk (rest)", agg_bulk))
     rows: List[Tuple[str, float, float, float]] = []
     for g in per_graph:
@@ -5401,7 +5110,7 @@ def _log_mu_validation_report(
         if math.isfinite(log_m):
             rows.append((name, log_m, log_w, log_h))
     if rows:
-        print("   Per-anchor logMAE (all | wall | high-μ_gt):")
+        print("   Per-anchor logMAE (all | wall | high-mu_gt):")
         for name, la, lw, lh in sorted(rows, key=lambda t: t[1], reverse=True):
             lw_s = f"{lw:.4f}" if math.isfinite(lw) else "n/a"
             lh_s = f"{lh:.4f}" if math.isfinite(lh) else "n/a"
@@ -5426,11 +5135,11 @@ def _format_viz_health_val_line(val_bundle: Mapping[str, Any]) -> Optional[str]:
         return f"{v:.3f}" if math.isfinite(v) else "n/a"
 
     return (
-        "   🩺 Viz health (lower=better): "
-        f"score={_f('viz_health_score')} t0|u|={_f('viz_t0_speed_mean')} t0_logμ={_f('viz_t0_mu_log_mae')} "
-        f"μ1={_f('viz_final_mu1_mean')} μ2={_f('viz_final_mu2_mean')} "
-        f"μ2_p90={_f('viz_final_mu2_p90')} clot_frac={_f('viz_final_clot_frac')} "
-        f"gate={_f('viz_final_gate_mean_all')} Δbulk={_f('viz_final_delta_bulk_mean')}"
+        "    Viz health (lower=better): "
+        f"score={_f('viz_health_score')} t0|u|={_f('viz_t0_speed_mean')} t0_logmu={_f('viz_t0_mu_log_mae')} "
+        f"mu1={_f('viz_final_mu1_mean')} mu2={_f('viz_final_mu2_mean')} "
+        f"mu2_p90={_f('viz_final_mu2_p90')} clot_frac={_f('viz_final_clot_frac')} "
+        f"gate={_f('viz_final_gate_mean_all')} dbulk={_f('viz_final_delta_bulk_mean')}"
     )
 
 
@@ -5670,21 +5379,19 @@ def _biochem_save_val_debug_plot(
     lo = float(min(float(g_mu.min()), float(p_mu.min())))
     hi = float(max(float(g_mu.max()), float(p_mu.max())))
     ax.plot([lo, hi], [lo, hi], "r--", lw=1, alpha=0.8)
-    ax.set_xlabel("COMSOL μ (SI)")
-    ax.set_ylabel("Pred μ (SI)")
-    ax.set_title(f"Val μ (truth nodes) epoch {epoch}")
+    ax.set_xlabel("COMSOL mu (SI)")
+    ax.set_ylabel("Pred mu (SI)")
+    ax.set_title(f"Val mu (truth nodes) epoch {epoch}")
     fig.tight_layout()
     fig.savefig(out_dir / f"biochem_val_mu_epoch_{epoch:04d}.png", dpi=120)
     plt.close(fig)
 
 
 def _viz_clot_threshold_si(phys_cfg) -> float:
-    """SI viscosity above which a rollout node counts as clot in viz health (``μ_eff`` channel)."""
+    """SI viscosity above which a rollout node counts as clot in viz health (``mu_eff`` channel)."""
     raw = (os.environ.get("BIOCHEM_VIZ_CLOT_MU_SI_THRESH") or "").strip()
     if raw:
         return max(float(raw), 0.0)
-    if _biochem_mu_k11_clot_gate_enabled():
-        return max(float(os.environ.get("BIOCHEM_K11_CLOT_MU_SI_MIN", "0.055")), float(phys_cfg.mu_inf) * 1.15)
     ratio_max = max(float(os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX", "20.0")), 1.0)
     return float(phys_cfg.mu_inf) * ratio_max
 
@@ -5695,7 +5402,7 @@ def _viz_clot_fraction_from_rollout(
     *,
     mu_ch: int = STATE_CHANNEL_MU_EFF_ND,
 ) -> float:
-    """Fraction of nodes with high **stored** ``μ_eff`` (same channel as ``visualize_pipeline`` dynamic μ)."""
+    """Fraction of nodes with high **stored** ``mu_eff`` (same channel as ``visualize_pipeline`` dynamic mu)."""
     mu_eff_si = phys_cfg.viscosity_nd_to_si(pred_slice[:, mu_ch]).view(-1).float()
     thr = _viz_clot_threshold_si(phys_cfg)
     return float((mu_eff_si >= thr).float().mean().item())
@@ -5709,7 +5416,7 @@ def _compute_slice_viz_health_metrics(
     kernels,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Metrics aligned with ``visualize_pipeline`` failure modes (t=0 flow, μ₁/μ₂ triggers)."""
+    """Metrics aligned with ``visualize_pipeline`` failure modes (t=0 flow, mu₁/mu₂ triggers)."""
     num_nodes = int(data.num_nodes)
     truth_mask = biochem_truth_node_mask(data, num_nodes, device)
     mu_ch = STATE_CHANNEL_MU_EFF_ND
@@ -5736,8 +5443,8 @@ def _compute_slice_viz_health_metrics(
     out["mu1_mean"] = float(mu1.mean().item())
     out["mu2_mean"] = float(mu2.mean().item())
     out["mu2_p90"] = float(torch.quantile(mu2.view(-1), 0.9).item())
-    # ``clot_frac`` always uses rollout μ_eff (gated path in forward), not raw μ₂ sigmoid(FI).
-    # Legacy raw-μ₂ rule: BIOCHEM_VIZ_CLOT_FRAC_USE_MU2=1 (misleading when GELATION_PRIOR_GATE masks bulk).
+    # ``clot_frac`` always uses rollout mu_eff (gated path in forward), not raw mu₂ sigmoid(FI).
+    # Legacy raw-mu₂ rule: BIOCHEM_VIZ_CLOT_FRAC_USE_MU2=1 (misleading when GELATION_PRIOR_GATE masks bulk).
     if _biochem_env_truthy("BIOCHEM_VIZ_CLOT_FRAC_USE_MU2") and not _biochem_mu_disable_explicit_gelation():
         mu2_thr = max(float(os.environ.get("BIOCHEM_VIZ_MU2_FLOOD_THRESH", "10.0")), 0.0)
         out["clot_frac"] = float((mu2.view(-1) >= mu2_thr).float().mean().item())
@@ -5768,7 +5475,7 @@ def _aggregate_viz_health(per_graph_health: List[Dict[str, float]]) -> Dict[str,
 
 
 def _viz_health_score(agg: Mapping[str, float], *, mu_log_mae_final: float) -> float:
-    """Lower is healthier for morning viz triage (penalize weak t=0 flow and μ₂ flood)."""
+    """Lower is healthier for morning viz triage (penalize weak t=0 flow and mu₂ flood)."""
     score = float(mu_log_mae_final) if math.isfinite(mu_log_mae_final) else 10.0
     t0_speed = float(agg.get("t0_speed_mean", float("nan")))
     if math.isfinite(t0_speed):
@@ -5779,12 +5486,6 @@ def _viz_health_score(agg: Mapping[str, float], *, mu_log_mae_final: float) -> f
     mu2_mean = float(agg.get("final_mu2_mean", float("nan")))
     if math.isfinite(mu2_mean):
         score += 0.08 * min(mu2_mean, 80.0)
-    clot_frac = float(agg.get("final_clot_frac", float("nan")))
-    if math.isfinite(clot_frac):
-        score += 6.0 * clot_frac
-    gate_all = float(agg.get("final_gate_mean_all", float("nan")))
-    if math.isfinite(gate_all):
-        score += 2.0 * max(0.0, gate_all - 0.55)
     mu1_mean = float(agg.get("final_mu1_mean", float("nan")))
     if math.isfinite(mu1_mean) and mu1_mean < 0.05:
         score += 0.35
@@ -5799,7 +5500,7 @@ def _compute_anchor_mu_metrics(
     device,
     non_blocking: bool = False,
 ) -> Dict[str, Any]:
-    """Anchor validation μ metrics: aggregate ``all`` subset + per-graph debug bundles."""
+    """Anchor validation mu metrics: aggregate ``all`` subset + per-graph debug bundles."""
     empty: Dict[str, Any] = {
         "mu_mae_si": float("inf"),
         "mu_rmse_si": float("inf"),
@@ -5887,7 +5588,7 @@ def _compute_anchor_mu_metrics(
 
 def _teacher_anchor_preflight_metrics(teacher, data, kernels, bio_cfg, device) -> Optional[Dict[str, float]]:
     """
-    One macro-step forward aligned with loss: GT species at t0, TF=1, compare μ/FI at t1 vs ``y[1]``.
+    One macro-step forward aligned with loss: GT species at t0, TF=1, compare mu/FI at t1 vs ``y[1]``.
     Returns None if this graph cannot be evaluated (missing y, too-short time grid, no truth nodes).
     """
     if not hasattr(data, "y") or data.y is None or data.y.dim() != 3:
@@ -5969,7 +5670,7 @@ def _teacher_run_train_anchor_preflight(
     bio_cfg,
     device,
 ) -> None:
-    """Run t0→t1 sanity on every training anchor; abort uses continuous μ_log_MAE on truth nodes."""
+    """Run t0->t1 sanity on every training anchor; abort uses continuous mu_log_MAE on truth nodes."""
     lim_med = max(float(os.environ.get("BIOCHEM_PREFLIGHT_ABORT_MEDIAN_LOG_MAE", "2.5")), 1e-6)
     lim_worst = max(float(os.environ.get("BIOCHEM_PREFLIGHT_ABORT_WORST_LOG_MAE", "4.0")), lim_med)
     policy = (os.environ.get("BIOCHEM_PREFLIGHT_POLICY", "median") or "median").strip().lower()
@@ -5997,7 +5698,7 @@ def _teacher_run_train_anchor_preflight(
 
     if not log_maes:
         print(
-            "   🔎 Teacher preflight: skipped (no evaluable train anchors with y, time grid, truth nodes)."
+            "    Teacher preflight: skipped (no evaluable train anchors with y, time grid, truth nodes)."
         )
         return
 
@@ -6005,30 +5706,30 @@ def _teacher_run_train_anchor_preflight(
     med_mae = _median(mae_sis)
     worst_log = max(log_maes)
     worst_mae = max(mae_sis)
-    dt_note = f"Δt_nd≈{dt0:.4e}" if dt0 is not None else "Δt_nd=n/a"
+    dt_note = f"dt_nd~{dt0:.4e}" if dt0 is not None else "dt_nd=n/a"
 
     hard_cap_raw = (os.environ.get("BIOCHEM_PREFLIGHT_ABORT_MAX_LOG_MAE") or "").strip()
     hard_cap: Optional[float] = float(hard_cap_raw) if hard_cap_raw else None
     hard_note = (
-        f" | hard cap: worst μ_log_MAE > {hard_cap:.4f} (BIOCHEM_PREFLIGHT_ABORT_MAX_LOG_MAE)"
+        f" | hard cap: worst mu_log_MAE > {hard_cap:.4f} (BIOCHEM_PREFLIGHT_ABORT_MAX_LOG_MAE)"
         if hard_cap is not None
         else ""
     )
 
     pol_note = (
-        f"median μ_log_MAE > {lim_med:.4f}"
+        f"median mu_log_MAE > {lim_med:.4f}"
         if policy != "max"
-        else f"worst μ_log_MAE > {lim_worst:.4f}"
+        else f"worst mu_log_MAE > {lim_worst:.4f}"
     )
     print(
-        f"   🔎 Teacher preflight ({len(log_maes)} train anchor(s), IC=GT t0→t1, {dt_note}): "
-        f"μ_log_MAE median={med_log:.4f} worst={worst_log:.4f} | "
-        f"μ_MAE_si median={med_mae:.3e} worst={worst_mae:.3e} | policy={policy!r} "
+        f"    Teacher preflight ({len(log_maes)} train anchor(s), IC=GT t0->t1, {dt_note}): "
+        f"mu_log_MAE median={med_log:.4f} worst={worst_log:.4f} | "
+        f"mu_MAE_si median={med_mae:.3e} worst={worst_mae:.3e} | policy={policy!r} "
         f"(abort if {pol_note}{hard_note})"
     )
     if _biochem_env_truthy("BIOCHEM_PREFLIGHT_VERBOSE", default=False):
         for idx, lm, ma in sorted(per_idx, key=lambda t: -t[1]):
-            print(f"      anchor[{idx}] μ_log_MAE={lm:.4f}  μ_MAE_si={ma:.3e}")
+            print(f"      anchor[{idx}] mu_log_MAE={lm:.4f}  mu_MAE_si={ma:.3e}")
 
     if not _biochem_env_truthy("BIOCHEM_ABORT_BAD_TEACHER_INIT", default=False):
         return
@@ -6036,7 +5737,7 @@ def _teacher_run_train_anchor_preflight(
     if hard_cap is not None and worst_log > hard_cap:
         raise RuntimeError(
             "BIOCHEM_ABORT_BAD_TEACHER_INIT: at least one anchor exceeds BIOCHEM_PREFLIGHT_ABORT_MAX_LOG_MAE "
-            f"(worst μ_log_MAE={worst_log:.4f} > {hard_cap:.4f}). "
+            f"(worst mu_log_MAE={worst_log:.4f} > {hard_cap:.4f}). "
             "Raise the cap, fix ODE/init/scale, or set BIOCHEM_ABORT_BAD_TEACHER_INIT=0."
         )
 
@@ -6049,15 +5750,15 @@ def _teacher_run_train_anchor_preflight(
 
     if stat > lim_cmp:
         raise RuntimeError(
-            "BIOCHEM_ABORT_BAD_TEACHER_INIT: μ_log_MAE preflight threshold exceeded "
+            "BIOCHEM_ABORT_BAD_TEACHER_INIT: mu_log_MAE preflight threshold exceeded "
             f"(policy={policy!r}, stat={stat:.4f} > {lim_cmp:.4f}). "
             "Tune BIOCHEM_PREFLIGHT_ABORT_MEDIAN_LOG_MAE / BIOCHEM_PREFLIGHT_ABORT_WORST_LOG_MAE, "
             "or set BIOCHEM_ABORT_BAD_TEACHER_INIT=0 to skip."
         )
 
     # Mean-FI ratio: use median over anchors so one outlier graph does not dominate.
-    # At t0→t₁ preflight, COMSOL FI on truth nodes is often tiny-but-nonzero; dividing by ~1e-12
-    # SI yields meaningless ×1000 "ratios" that are not ODE scale blow-ups. Only compare when
+    # At t0->t₁ preflight, COMSOL FI on truth nodes is often tiny-but-nonzero; dividing by ~1e-12
+    # SI yields meaningless x1000 "ratios" that are not ODE scale blow-ups. Only compare when
     # GT mean FI clears a species-scale floor (override with BIOCHEM_PREFLIGHT_FI_GT_MIN_SI).
     raw_fi_floor = (os.environ.get("BIOCHEM_PREFLIGHT_FI_GT_MIN_SI") or "").strip()
     if raw_fi_floor:
@@ -6077,8 +5778,8 @@ def _teacher_run_train_anchor_preflight(
         med_ratio = _median(ratios)
         if med_ratio > fi_ratio_lim:
             raise RuntimeError(
-                f"BIOCHEM_ABORT_BAD_TEACHER_INIT: median FI_pred/FI_gt ({med_ratio:.1f}×) > "
-                f"{fi_ratio_lim:.0f}× (among anchors with mean GT FI ≥ {fi_floor_si:.3e} SI). "
+                f"BIOCHEM_ABORT_BAD_TEACHER_INIT: median FI_pred/FI_gt ({med_ratio:.1f}x) > "
+                f"{fi_ratio_lim:.0f}x (among anchors with mean GT FI >= {fi_floor_si:.3e} SI). "
                 "Lower BIOCHEM_ABORT_FI_GT_RATIO, set BIOCHEM_PREFLIGHT_FI_GT_MIN_SI / "
                 "BIOCHEM_PREFLIGHT_FI_GT_MIN_FRAC_OF_SCALE, or set BIOCHEM_ABORT_BAD_TEACHER_INIT=0 to skip."
             )
@@ -6097,7 +5798,7 @@ def train_teacher_on_anchors(
 ):
     """Train a teacher only on anchor graphs for pseudo-label distillation."""
     if len(train_anchor_dataset) == 0:
-        print("⚠️ Teacher stage skipped: no anchor graphs in training split.")
+        print("[WARN]  Teacher stage skipped: no anchor graphs in training split.")
         return None, 0.0, -1, float("inf"), -1, None, None, -1
 
     teacher = copy.deepcopy(student_model).to(device)
@@ -6107,7 +5808,7 @@ def train_teacher_on_anchors(
         teacher_val_every = max(1, int(os.environ.get("BIOCHEM_TEACHER_VAL_EVERY", "5")))
     except ValueError:
         teacher_val_every = 2
-    # Deterministic order: preflight scans all anchors; the guard uses median(μ_log_MAE),
+    # Deterministic order: preflight scans all anchors; the guard uses median(mu_log_MAE),
     # not one random batch from shuffle=True (which falsely aborted on a single hard graph).
     teacher_loader = DataLoader(train_anchor_dataset, batch_size=1, shuffle=False, **dl_kw)
     teacher_val_loader = DataLoader(val_anchor_dataset, batch_size=1, shuffle=False, **dl_kw)
@@ -6120,12 +5821,12 @@ def train_teacher_on_anchors(
     )
     if len(train_anchor_keys) == 1 and train_anchor_keys == val_anchor_keys:
         print(
-            "⚠️ One-anchor regime: teacher train/val use the same anchor file. "
-            "Treat teacher val μ metrics as pipeline-health signals, not generalization."
+            "[WARN]  One-anchor regime: teacher train/val use the same anchor file. "
+            "Treat teacher val mu metrics as pipeline-health signals, not generalization."
         )
     elif overlap_ratio > 0.0:
         print(
-            f"⚠️ Teacher anchor split overlap: {len(overlap)}/{max(1, len(val_anchor_keys))} "
+            f"[WARN]  Teacher anchor split overlap: {len(overlap)}/{max(1, len(val_anchor_keys))} "
             f"({overlap_ratio:.1%}) shared between train and val."
         )
 
@@ -6191,26 +5892,26 @@ def train_teacher_on_anchors(
         else "early_stop=off (set BIOCHEM_TEACHER_TARGET_MU_LOG_MAE to enable)"
     )
     print(
-        f"\n👩‍🏫 --- Teacher Stage (anchors only): max_epochs={max_epochs}, "
+        f"\n --- Teacher Stage (anchors only): max_epochs={max_epochs}, "
         f"{_early_stop_note}, teacher_lr={teacher_lr:.3e}, "
         f"accum={accumulation_steps}, bio_clip={clip_teacher:.2f}, phys_clip={clip_teacher_phys:.2f}, "
         f"tf_warmup_epochs={teacher_curriculum.biochem_warmup_epochs} ---"
     )
     if pareto_ckpt:
         print(
-            "   🧭 Pareto checkpointing enabled: accept checkpoints only when "
-            "all/high-μ tradeoff improves within configured tolerances."
+            "    Pareto checkpointing enabled: accept checkpoints only when "
+            "all/high-mu tradeoff improves within configured tolerances."
         )
     if _biochem_env_truthy("BIOCHEM_LOSS_DATA_ONLY") and _biochem_env_truthy(
         "BIOCHEM_DETACH_MACRO_STATE", default=False
     ):
         print(
-            "   ⚠️ BIOCHEM_DETACH_MACRO_STATE=1 with BIOCHEM_LOSS_DATA_ONLY=1: species state is detached "
+            "   [WARN]  BIOCHEM_DETACH_MACRO_STATE=1 with BIOCHEM_LOSS_DATA_ONLY=1: species state is detached "
             "each macro ODE step, so TBPTT gradients to bio_encoder/ODE/decoder are truncated — expect "
             "L_Data_Kine/L_Data_Bio to move slowly vs BIOCHEM_DETACH_MACRO_STATE=0 (VRAM trade-off)."
         )
     # Preflight must see the same rheology caps as epoch 0 training (the loop sets these each epoch).
-    # Otherwise ``mu_ratio_max`` stays at ``bio_cfg.mu_ratio_max`` (~80) and μ blows up on every anchor.
+    # Otherwise ``mu_ratio_max`` stays at ``bio_cfg.mu_ratio_max`` (~80) and mu blows up on every anchor.
     decay0 = 0.0
     t_scale0 = curriculum.biochem_t_scale_warmup_initial - decay0 * (
         curriculum.biochem_t_scale_warmup_initial - curriculum.biochem_t_scale_warmup_final
@@ -6222,10 +5923,10 @@ def train_teacher_on_anchors(
     _teacher_run_train_anchor_preflight(teacher, train_anchor_dataset, kernels, bio_cfg, device)
     early_stop_allowed = not low_anchor_mode and overlap_ratio == 0.0
     if not early_stop_allowed:
-        print("   ℹ️ Low-anchor mode: disabling teacher μ early-stop to avoid misleading stop signals.")
+        print("   [i]  Low-anchor mode: disabling teacher mu early-stop to avoid misleading stop signals.")
 
     # TBPTT random anchor starts (default in ``compute_biochem_loss``) trigger a no_grad warmup
-    # rollout from t0→start_idx on almost every batch — often tens of ODE macro-steps with no
+    # rollout from t0->start_idx on almost every batch — often tens of ODE macro-steps with no
     # console output until the first epoch ends. Teacher anchors rarely need that exploration;
     # opt back in with ``BIOCHEM_TEACHER_TBPTT_RANDOM_ANCHOR=1``.
     _prev_tbptt_anchor_rand = os.environ.get("BIOCHEM_TBPTT_ANCHOR_RANDOM_START")
@@ -6249,11 +5950,11 @@ def train_teacher_on_anchors(
                 p.requires_grad = not ode_frozen and train_ode
             if epoch == 0 and freeze_ode_epochs > 0:
                 if train_ode:
-                    print(f"   🧊 Teacher startup: freezing ODE reaction path for first {freeze_ode_epochs} epoch(s).")
+                    print(f"    Teacher startup: freezing ODE reaction path for first {freeze_ode_epochs} epoch(s).")
                 else:
-                    print("   🧊 Teacher: ODE reaction path frozen (BIOCHEM_TRAIN_ODE=0).")
+                    print("    Teacher: ODE reaction path frozen (BIOCHEM_TRAIN_ODE=0).")
             if train_ode and epoch == freeze_ode_epochs and freeze_ode_epochs > 0:
-                print("   🔓 Teacher startup: unfreezing ODE reaction path.")
+                print("    Teacher startup: unfreezing ODE reaction path.")
             # Decay softened kinetics across teacher stage to progressively sharpen boundaries.
             decay_progress = epoch / float(max(1, max_epochs - 1))
             current_T_scale = curriculum.biochem_t_scale_warmup_initial - decay_progress * (
@@ -6261,7 +5962,7 @@ def train_teacher_on_anchors(
             )
             teacher.T_scale = current_T_scale
             kernels.kinetics.T_scale = current_T_scale
-            # Optional explicit trigger-gate sharpening schedule for split μ heads.
+            # Optional explicit trigger-gate sharpening schedule for split mu heads.
             gate_t_start = float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP_START", "0.20"))
             gate_t_end = float(os.environ.get("BIOCHEM_MU_TRIGGER_GATE_TEMP_END", "0.08"))
             if hasattr(teacher, "mu_trigger_gate_temp"):
@@ -6333,7 +6034,7 @@ def train_teacher_on_anchors(
                 if not bool(torch.isfinite(loss.detach()).all().item()):
                     src = _biochem_src_for_log(data)
                     print(
-                        f"   ⚠️ Teacher ep={epoch} batch={batch_idx}: non-finite loss; skipping backward/step "
+                        f"   [WARN]  Teacher ep={epoch} batch={batch_idx}: non-finite loss; skipping backward/step "
                         f"(src={src!r}). Try lower BIOCHEM_TEACHER_LR / BIOCHEM_TEACHER_CLIP_NORM, shorter "
                         f"BIOCHEM_TBPTT_MAX_WINDOW, or BIOCHEM_DETACH_MACRO_STATE=1 (VRAM trade-off).",
                         flush=True,
@@ -6406,7 +6107,7 @@ def train_teacher_on_anchors(
                         detail = _biochem_nonfinite_grad_detail(teacher, teacher_optimizer)
                         tail = f" nonfinite_params={detail!r}" if detail else ""
                         print(
-                            f"   ⚠️ Teacher ep={epoch} batch={batch_idx} src={src!r}: non-finite gradients "
+                            f"   [WARN]  Teacher ep={epoch} batch={batch_idx} src={src!r}: non-finite gradients "
                             f"after backward.{tail} "
                             "Try BIOCHEM_ADJOINT_RK4_SUBSTEPS=24–32, BIOCHEM_ODEINT_USE_ADJOINT=0 (dense backward, "
                             "more VRAM), or BIOCHEM_TBPTT_MAX_WINDOW=4. Skipping optimizer step (weights unchanged).",
@@ -6416,14 +6117,28 @@ def train_teacher_on_anchors(
                     else:
                         raw_gn = _biochem_bio_grad_global_l2(teacher_optimizer)
                         max_raw = float(os.environ.get("BIOCHEM_TEACHER_MAX_RAW_GRAD_L2", "5000.0"))
-                        if not math.isfinite(raw_gn) or raw_gn > max_raw:
+                        if not math.isfinite(raw_gn):
                             print(
-                                f"   ⚠️ Teacher ep={epoch} batch={batch_idx}: bio grad L2={raw_gn:.3e} "
-                                f"exceeds cap {max_raw:g} or non-finite; skipping optimizer step. "
-                                "Lower BIOCHEM_TEACHER_LR or raise cap if this fires too often.",
+                                f"   [WARN]  Teacher ep={epoch} batch={batch_idx}: non-finite bio grad; "
+                                "skipping optimizer step.",
                                 flush=True,
                             )
                             teacher_optimizer.zero_grad()
+                        elif raw_gn > max_raw:
+                            if _biochem_env_truthy("BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP", default=False):
+                                _biochem_scale_bio_grads_to_l2(teacher_optimizer, max_raw)
+                                teacher_optimizer.clip_and_step(
+                                    physics_clip=clip_teacher_phys,
+                                    bio_clip=clip_teacher,
+                                )
+                            else:
+                                print(
+                                    f"   [WARN]  Teacher ep={epoch} batch={batch_idx}: bio grad L2={raw_gn:.3e} "
+                                    f"exceeds cap {max_raw:g}; skipping optimizer step. "
+                                    "Set BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP=1 or lower BIOCHEM_TEACHER_LR.",
+                                    flush=True,
+                                )
+                                teacher_optimizer.zero_grad()
                         else:
                             teacher_optimizer.clip_and_step(
                                 physics_clip=clip_teacher_phys,
@@ -6432,7 +6147,7 @@ def train_teacher_on_anchors(
 
             if n_batches == 0:
                 print(
-                    "   🛑 Teacher epoch had zero finite-loss batches (all skipped or empty loader); "
+                    "    Teacher epoch had zero finite-loss batches (all skipped or empty loader); "
                     "aborting teacher stage.",
                     flush=True,
                 )
@@ -6457,7 +6172,7 @@ def train_teacher_on_anchors(
                 w_mu = os.environ.get("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0")
                 w_mul = os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0")
                 print(
-                    f"   ⏳ Teacher Ep {epoch:02d} val (stride={v_stride}, TBPTT_cap={tbptt_cap}, "
+                    f"    Teacher Ep {epoch:02d} val (stride={v_stride}, TBPTT_cap={tbptt_cap}, "
                     f"DETACH_MACRO={detach_m}, W_MuSI={w_mu}, W_MuLog={w_mul})..."
                 )
                 val_bundle = _compute_anchor_mu_metrics(
@@ -6502,14 +6217,14 @@ def train_teacher_on_anchors(
                     f"   Train Ep {epoch:02d}: L_tot={avg_tot:.3e} L_kine={avg_kine:.3e} "
                     f"L_bio(avg)={avg_bio:.3e} L_bio(ema)={ema_bio_str} | Pceil={teacher_phys_ceiling:.2g}",
                     (
-                        f"   μ weighted terms (anchor batches={epoch_mu_batches}): "
-                        f"W·L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
-                        f"W·L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}, "
-                        f"W·L_MuLogWall={epoch_mu_log_wall_w / max(1, epoch_mu_batches):.3e}, "
-                        f"W·L_MuLogHigh={epoch_mu_log_high_w / max(1, epoch_mu_batches):.3e}"
+                        f"   mu weighted terms (anchor batches={epoch_mu_batches}): "
+                        f"W*L_MuSI={epoch_mu_si_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W*L_MuLog={epoch_mu_log_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W*L_MuLogWall={epoch_mu_log_wall_w / max(1, epoch_mu_batches):.3e}, "
+                        f"W*L_MuLogHigh={epoch_mu_log_high_w / max(1, epoch_mu_batches):.3e}"
                     ),
                     (
-                        f"   μ debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
+                        f"   mu debug (batch-mean): mu1={dbg_mu1_e:.3e} mu2={dbg_mu2_e:.3e} "
                         f"learned={dbg_mlearn_e:.3e} "
                         f"final_anchor_logMAE={dbg_mu_log_e:.3e} Q_imb={dbg_flow_imb_e:.3e} "
                         f"Q_rel_err={dbg_q_rel_e:.3e} flow_trivial="
@@ -6533,22 +6248,15 @@ def train_teacher_on_anchors(
                     "viz_final_mu1_mean",
                     "viz_final_mu2_mean",
                     "viz_final_mu2_p90",
-                    "viz_final_clot_frac",
-                    "viz_final_gate_mean_all",
                     "viz_final_delta_bulk_mean",
                     "viz_bulk_mu_log_mae",
                 ):
                     if hk in val_bundle:
                         val_stats[hk] = val_bundle[hk]
                 val_mu_score = _teacher_val_selection_score(val_stats)
-                ckpt_score_label = (
-                    "k11_score"
-                    if _biochem_mu_k11_clot_gate_enabled()
-                    and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True)
-                    else "mu_score"
-                )
+                ckpt_score_label = "mu_score"
                 print(
-                    f"   ✅ Teacher Ep {epoch:02d} validation complete "
+                    f"   [OK]  Teacher Ep {epoch:02d} validation complete "
                     f"({time.perf_counter() - val_t0:.2f}s) | {ckpt_score_label}={val_mu_score:.4f} "
                     f"(best running {best_mu_score:.4f}, logMAE={float(val_stats['mu_log_mae']):.4f})."
                 )
@@ -6583,7 +6291,7 @@ def train_teacher_on_anchors(
                     best_state = copy.deepcopy(teacher.state_dict())
                     best_epoch = int(epoch)
                     print(
-                        f"   💾 Teacher checkpoint updated ({ckpt_reason}) | "
+                        f"   [save]  Teacher checkpoint updated ({ckpt_reason}) | "
                         f"all={best_mu_log_all:.4f}, high={best_mu_log_high:.4f}"
                     )
                 if (
@@ -6592,7 +6300,7 @@ def train_teacher_on_anchors(
                     and float(val_stats["mu_log_mae"]) <= target_mu_log_mae
                 ):
                     print(
-                        f"   ✅ Teacher reached BIOCHEM_TEACHER_TARGET_MU_LOG_MAE "
+                        f"   [OK]  Teacher reached BIOCHEM_TEACHER_TARGET_MU_LOG_MAE "
                         f"({float(val_stats['mu_log_mae']):.4f} <= {target_mu_log_mae:.4f}); stopping early."
                     )
                     break
@@ -6630,7 +6338,7 @@ def train_teacher_on_anchors(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
                     f"L_Bio (Avg): {avg_bio:.3e}] | "
-                    f"μdbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
+                    f"mudbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
                     f"logMAE_f={dbg_mu_log_e:.2e},Q_imb={dbg_flow_imb_e:.2e},"
                     f"Q_rel={dbg_q_rel_e:.2e},trivial={dbg_triv_e:.3f},"
                     f"gate_all={dbg_gate_all_e:.2e},gate_wall={dbg_gate_wall_e:.2e},"
@@ -6730,25 +6438,18 @@ def train_teacher_on_anchors(
 
     last_state = copy.deepcopy(teacher.state_dict())
     last_epoch = int(epoch) if max_epochs > 0 else -1
-    if (
-        best_state is not None
-        and _biochem_mu_k11_clot_gate_enabled()
-        and _biochem_env_truthy("BIOCHEM_K11_CKPT_SCORE", default=True)
-    ):
-        best_high_state = copy.deepcopy(best_state)
-        best_high_epoch = int(best_epoch)
     if best_state is not None:
         teacher.load_state_dict(best_state, strict=False)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
     if _biochem_env_truthy("BIOCHEM_TEACHER_SKIP_VAL", default=False) and best_state is None:
-        print("✅ Teacher frozen. Validation skipped (BIOCHEM_TEACHER_SKIP_VAL=1); using last training weights.")
+        print("[OK]  Teacher frozen. Validation skipped (BIOCHEM_TEACHER_SKIP_VAL=1); using last training weights.")
     else:
-        print(f"✅ Teacher frozen. Best anchor validation mu_score (-log_MAE): {best_mu_score:.4f}")
+        print(f"[OK]  Teacher frozen. Best anchor validation mu_score (-log_MAE): {best_mu_score:.4f}")
     if last_epoch >= 0 and int(best_epoch) != last_epoch:
         print(
-            f"   ℹ️ teacher_last checkpoint uses final epoch {last_epoch} weights; "
+            f"   [i]  teacher_last checkpoint uses final epoch {last_epoch} weights; "
             f"in-memory teacher restored to all-truth-best epoch {int(best_epoch)} for pseudo-labels."
         )
     return (
@@ -6773,7 +6474,7 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
     dl_kw = _biochem_dataloader_kw(device)
     nb_xfer = _biochem_non_blocking_transfer(device, dl_kw)
     synth_loader = DataLoader(synthetic_dataset, batch_size=1, shuffle=False, **dl_kw)
-    print(f"🧾 Building pseudo-label bank for {len(synthetic_dataset)} synthetic graphs...")
+    print(f" Building pseudo-label bank for {len(synthetic_dataset)} synthetic graphs...")
     with torch.no_grad():
         for data in synth_loader:
             src = _biochem_data_source_key(data)
@@ -6785,7 +6486,7 @@ def build_synthetic_pseudo_labels(teacher, synthetic_dataset, bio_cfg, device):
             if isinstance(pred, tuple):
                 pred = pred[0]
             pseudo[src] = pred.detach().cpu()
-    print(f"✅ Pseudo-label bank ready: {len(pseudo)} synthetic trajectories.")
+    print(f"[OK]  Pseudo-label bank ready: {len(pseudo)} synthetic trajectories.")
     return pseudo
 
 
@@ -6811,7 +6512,7 @@ def _apply_biochem_supervised_data_leash_after_presets() -> None:
     """Middle-ground supervised fix after MU-isolate presets (e.g. ``sweep_wall_sentinel``).
 
     When ``BIOCHEM_SUPERVISED_DATA_LEASH=1``, clears single-term isolate, keeps physics off
-    (``BIOCHEM_LOSS_DATA_ONLY=1``), reconnects temporal gradients, and enables μ SI anchor weight.
+    (``BIOCHEM_LOSS_DATA_ONLY=1``), reconnects temporal gradients, and enables mu SI anchor weight.
     Shell/CLI can still override individual keys *before* Python starts by setting them in the
     environment; this hook only runs when the leash flag is set.
     """
@@ -6820,12 +6521,12 @@ def _apply_biochem_supervised_data_leash_after_presets() -> None:
     os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
     os.environ["BIOCHEM_LOSS_DATA_ONLY"] = "1"
     os.environ["BIOCHEM_DETACH_MACRO_STATE"] = "0"
-    # MU-isolate presets often zero this; leash re-enables SI anchor for peak μ.
+    # MU-isolate presets often zero this; leash re-enables SI anchor for peak mu.
     w_mu_si = (os.environ.get("BIOCHEM_SUPERVISED_DATA_LEASH_MU_SI_WEIGHT") or "2.0").strip() or "2.0"
     os.environ["BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT"] = w_mu_si
     print(
-        "✅ BIOCHEM_SUPERVISED_DATA_LEASH=1: backward uses L_Data_Kine+L_Data_Bio "
-        f"(data-only) + μ anchors (W_MuSI={os.environ.get('BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT', '?')}); "
+        "[OK]  BIOCHEM_SUPERVISED_DATA_LEASH=1: backward uses L_Data_Kine+L_Data_Bio "
+        f"(data-only) + mu anchors (W_MuSI={os.environ.get('BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT', '?')}); "
         f"DETACH_MACRO={os.environ.get('BIOCHEM_DETACH_MACRO_STATE', '?')}; "
         "BIOCHEM_LOSS_ISOLATE cleared.",
         flush=True,
@@ -6846,14 +6547,14 @@ def _apply_biochem_bulk_fluid_surgical_fix_after_presets() -> None:
     os.environ["BIOCHEM_USE_BIO_GATE_SUPPRESSOR"] = "1"
     os.environ["BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR"] = gate_floor
     print(
-        "✅ BIOCHEM_BULK_FLUID_SURGICAL_FIX=1: bulk Δlogμ clip="
+        "[OK]  BIOCHEM_BULK_FLUID_SURGICAL_FIX=1: bulk dlogmu clip="
         f"{clip_bulk}, bio gate suppressor on (floor={gate_floor}).",
         flush=True,
     )
 
 
 def _apply_biochem_mu_gate_hard_threshold_after_presets() -> None:
-    """Sever wall-Δlogμ bleed into bulk lumen (survives sentinel gate-floor preset)."""
+    """Sever wall-dlogmu bleed into bulk lumen (survives sentinel gate-floor preset)."""
     raw = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH") or "").strip()
     if not raw:
         return
@@ -6871,7 +6572,7 @@ def _apply_biochem_mu_gate_hard_threshold_after_presets() -> None:
     steep = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_STEEPNESS") or "10.0").strip() or "10.0"
     steep_note = "learned softplus(temp)" if learned else f"steepness={steep}"
     print(
-        f"✅ BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH={thresh}: soft gate ({steep_note}) "
+        f"[OK]  BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH={thresh}: soft gate ({steep_note}) "
         f"scope={scope}; TRIGGER_GATE_MIN and WALL_GATE_MIN cleared.",
         flush=True,
     )
@@ -6889,19 +6590,19 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         print(
             "🌙 BIOCHEM_PRESET overnight-step2: long AE/ODE/teacher, val every "
             f"{os.environ.get('BIOCHEM_TEACHER_VAL_EVERY', '?')} ep, TBPTT cap "
-            f"{os.environ.get('BIOCHEM_TBPTT_MAX_WINDOW', '?')}, μ SI + COMSOL temporal "
+            f"{os.environ.get('BIOCHEM_TBPTT_MAX_WINDOW', '?')}, mu SI + COMSOL temporal "
             f"(w_pt={os.environ.get('BIOCHEM_COMSOL_TEMPORAL_WEIGHT', '?')}) in data-only backprop. "
             "BIOCHEM_STOCK_DEFAULTS=1 skips presets. Lower TBPTT cap if OOM."
         )
     else:
         print(
-            "⚡ Default preset: fast-iterate (shorter pretrain/teacher, val every "
+            " Default preset: fast-iterate (shorter pretrain/teacher, val every "
             f"{os.environ.get('BIOCHEM_TEACHER_VAL_EVERY', '?')} ep) + step-2 data-only "
-            f"(μ SI w={os.environ.get('BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT', '?')}, TBPTT cap="
+            f"(mu SI w={os.environ.get('BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT', '?')}, TBPTT cap="
             f"{os.environ.get('BIOCHEM_TBPTT_MAX_WINDOW', '?')}, curriculum="
             f"{os.environ.get('BIOCHEM_TBPTT_WINDOW_CURRICULUM', '?')}). "
             "BIOCHEM_STOCK_DEFAULTS=1 for long-run stock env; BIOCHEM_DEBUG=1 for batch logs. "
-            "Lower TBPTT cap or μ weight if OOM. Overnight same tier: BIOCHEM_PRESET=overnight_step2."
+            "Lower TBPTT cap or mu weight if OOM. Overnight same tier: BIOCHEM_PRESET=overnight_step2."
         )
     _preset_raw = (os.environ.get("BIOCHEM_PRESET") or "").strip()
     _win_ps = ""
@@ -6920,36 +6621,55 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     _iso = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip()
     if _iso:
         print(
-            f"ℹ️ BIOCHEM_LOSS_ISOLATE={_iso!r} — backward uses only that term. "
+            f"[i]  BIOCHEM_LOSS_ISOLATE={_iso!r} — backward uses only that term. "
             "Unset it to use BIOCHEM_LOSS_DATA_ONLY (default) or full multitask loss."
         )
     if (os.environ.get("BIOCHEM_MU_IC_STEADY_KIN") or "").strip().lower() in ("1", "true", "yes", "on"):
         print(
-            "ℹ️ BIOCHEM_MU_IC_STEADY_KIN=1: macro step 0 μ_eff from steady frozen-kin DEQ (mu_decoder); "
-            "no exp(Δlogμ) on step 0.",
+            "[i]  BIOCHEM_MU_IC_STEADY_KIN=1: macro step 0 mu_eff from steady frozen-kin DEQ (mu_decoder); "
+            "no exp(dlogmu) on step 0.",
             flush=True,
         )
     if (os.environ.get("BIOCHEM_MU_K10D_SIMPLE") or "").strip().lower() in ("1", "true", "yes", "on"):
         print(
-            "ℹ️ BIOCHEM_MU_K10D_SIMPLE=1: μ_eff = μ_ss (steady kin DEQ) + softplus(mu_delta_head); "
+            "[i]  BIOCHEM_MU_K10D_SIMPLE=1: mu_eff = mu_ss (steady kin DEQ) + softplus(mu_delta_head); "
             "use BIOCHEM_LOSS_ISOLATE=MU_MSE for proof training.",
             flush=True,
         )
     if (os.environ.get("BIOCHEM_MU_K10E_SIMPLE") or "").strip().lower() in ("1", "true", "yes", "on"):
         print(
-            "ℹ️ BIOCHEM_MU_K10E_SIMPLE=1: μ_eff = μ_ss + adj_mask×Δμ (wall-adjacent band, not on wall); "
-            "use BIOCHEM_LOSS_ISOLATE=K10E (log + high-μ + adjacent + bulk penalty + light DATA_KINE).",
+            "[i]  BIOCHEM_MU_K10E_SIMPLE=1: mu_eff = mu_ss + adj_maskxdmu (wall-adjacent band, not on wall); "
+            "use BIOCHEM_LOSS_ISOLATE=K10E (log + high-mu + adjacent + bulk penalty + light DATA_KINE).",
             flush=True,
         )
-    if (os.environ.get("BIOCHEM_MU_K11_CLOT_GATE") or "").strip().lower() in ("1", "true", "yes", "on"):
-        trig_note = (
-            "p_clot=σ(head)×apply (no trigger apply)"
-            if not _biochem_env_truthy("BIOCHEM_K11_TRIGGER_APPLY")
-            else "p_clot=σ(head)×apply×trigger"
+    _iso_up = (_iso or "").strip().upper()
+    if _iso_up in _PASSIVE_TRANSPORT_LOSS_ALIASES or (
+        (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() in _PASSIVE_TRANSPORT_PRESET_ALIASES
+    ):
+        w_k, w_b = _passive_transport_loss_weights()
+        gt_note = ""
+        if _biochem_env_truthy("BIOCHEM_GT_KINE_VEL", default=False):
+            gt_note = " GT[u,v,p] for ADR/ODE;"
+            if _biochem_env_truthy("BIOCHEM_GT_KINE_SKIP_DEQ", default=True):
+                gt_note += " DEQ skipped."
+        adr_note = (
+            " L_ADR_F+L_ADR_S in backward."
+            if _passive_transport_adr_in_backprop()
+            else " ADR logged only (PASSIVE_ADR_BACKPROP=0)."
         )
         print(
-            "ℹ️ BIOCHEM_MU_K11_CLOT_GATE=1: μ_eff = μ_ss + p_clot×(μ_clot−μ_ss); "
-            f"{trig_note}; LOSS_ISOLATE=K11 (BCE + μ Huber + wall-FP + trigger-suppress + gate-target + DATA_KINE).",
+            "[i]  Passive 1-way transport: backward = "
+            f"{w_b:g}*L_Data_Bio + {w_k:g}*L_Data_Kine;{adr_note} "
+            f"mu_ratio_max=1 (no clot feedback).{gt_note}",
+            flush=True,
+        )
+    if _biochem_env_truthy("BIOCHEM_GT_KINE_VEL", default=False) and not (
+        _iso_up in _PASSIVE_TRANSPORT_LOSS_ALIASES
+        or (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() in _PASSIVE_TRANSPORT_PRESET_ALIASES
+    ):
+        print(
+            "[i]  BIOCHEM_GT_KINE_VEL=1: macro [u,v,p] from COMSOL y on truth nodes "
+            "(BIOCHEM_GT_KINE_SKIP_DEQ=1 skips Anderson DEQ).",
             flush=True,
         )
     epochs = max(1, int(os.environ.get("BIOCHEM_EPOCHS", str(epochs))))
@@ -7001,19 +6721,19 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     kin_meta, kin_state_for_ctor = kinematics_checkpoint_tensors(kin_raw)
     kin_ctor = resolve_kinematics_gino_ctor_kwargs(kin_meta, kin_state_for_ctor)
     if kin_meta.get("model_config"):
-        print("🧩 Stage-A GINO_DEQ architecture from kinematics checkpoint model_config.")
+        print(" Stage-A GINO_DEQ architecture from kinematics checkpoint model_config.")
     elif load_kinematics_reference_record():
         print(
-            "🧩 Stage-A GINO_DEQ architecture from data/reference kinematics manifest "
+            " Stage-A GINO_DEQ architecture from data/reference kinematics manifest "
             "(legacy flat checkpoint)."
         )
     else:
         print(
-            "🧩 Stage-A GINO_DEQ architecture from weight/env inference "
+            " Stage-A GINO_DEQ architecture from weight/env inference "
             "(embed model_config by re-saving kinematics_best.pth)."
         )
     print(
-        f"   ↳ kin backbone: latent={int(kin_ctor['latent_dim'])} "
+        f"   ->  kin backbone: latent={int(kin_ctor['latent_dim'])} "
         f"fourier={int(kin_ctor['num_fourier_freqs'])} "
         f"siren={int(kin_ctor['use_siren_decoder'])} "
         f"hard_bcs={int(kin_ctor['use_hard_bcs'])} "
@@ -7040,13 +6760,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         applied_fp = apply_biochem_forward_policy_from_checkpoint_meta(ckpt_meta_for_ctor)
         if applied_fp:
             print(
-                f"🧩 μ/rollout forward_policy from checkpoint ({len(applied_fp)} env knob(s)); "
+                f" mu/rollout forward_policy from checkpoint ({len(applied_fp)} env knob(s)); "
                 "shell BIOCHEM_* overrides before load are replaced.",
                 flush=True,
             )
         elif load_biochem_best_weights or will_resume_from_latest:
             print(
-                "⚠️ Checkpoint has no forward_policy (legacy ckpt); μ rollout uses current shell env. "
+                "[WARN]  Checkpoint has no forward_policy (legacy ckpt); mu rollout uses current shell env. "
                 "Re-save teacher after training to embed policy.",
                 flush=True,
             )
@@ -7085,25 +6805,25 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     ).to(device)
     if ckpt_meta_for_ctor.get("model_config"):
         print(
-            "🧩 GNODE architecture from checkpoint model_config "
+            " GNODE architecture from checkpoint model_config "
             "(forward_policy restored when present)."
         )
     else:
         print(
-            f"🧩 GNODE architecture: siren={int(ctor['use_siren_decoder'])} "
+            f" GNODE architecture: siren={int(ctor['use_siren_decoder'])} "
             f"fourier={int(ctor['num_fourier_freqs'])} hard_bcs={int(ctor['use_hard_bcs'])} "
             f"(env/weight inference; re-save teacher ckpt to embed model_config)."
         )
     if int(ctor["bio_encoder_prior_dim"]) > 0:
         print(
-            f"🧭 bio_encoder kinematics prior: {int(ctor['bio_encoder_prior_dim'])} extra channel(s)."
+            f" bio_encoder kinematics prior: {int(ctor['bio_encoder_prior_dim'])} extra channel(s)."
         )
-    print(f"🧠 Biochem latent_dim={int(ctor['latent_dim'])}.")
+    print(f" Biochem latent_dim={int(ctor['latent_dim'])}.")
 
     loaded_biochem_best_backbone = False
     if will_resume_from_latest:
         print(
-            "ℹ️ BIOCHEM_RESUME: will restore full training state from biochem_latest_checkpoint.pth "
+            "[i]  BIOCHEM_RESUME: will restore full training state from biochem_latest_checkpoint.pth "
             "(skipping backbone load here)."
         )
     elif load_biochem_best_weights:
@@ -7112,13 +6832,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         )
         model.load_state_dict(compatible_resume, strict=False)
         loaded_biochem_best_backbone = True
-        print(f"🔁 Initialized Biochem weights from {biochem_resume_path.name}")
+        print(f" Initialized Biochem weights from {biochem_resume_path.name}")
         if skipped_resume:
             print(
-                f"⚠️ Skipped {len(skipped_resume)} incompatible/missing tensor(s) from {biochem_resume_path.name}."
+                f"[WARN]  Skipped {len(skipped_resume)} incompatible/missing tensor(s) from {biochem_resume_path.name}."
             )
     else:
-        print(f"🔁 Initializing Biochem kinematics backbone from {kinematics_path.name}")
+        print(f" Initializing Biochem kinematics backbone from {kinematics_path.name}")
         state_dict = kin_state_for_ctor
 
         mapped_state_dict = {}
@@ -7144,7 +6864,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             kinematics_weight = mapped_state_dict['kin_encoder.0.weight']
             model_weight = model.kin_encoder[0].weight
             if kinematics_weight.shape[1] != model_weight.shape[1]:
-                print(f"🔧 Adapting Kinematics encoder weights ({kinematics_weight.shape[1]} -> {model_weight.shape[1]})...")
+                print(f" Adapting Kinematics encoder weights ({kinematics_weight.shape[1]} -> {model_weight.shape[1]})...")
                 new_weight = remap_stage_a_encoder_to_corrector(kinematics_weight, model_weight)
                 mapped_state_dict['kin_encoder.0.weight'] = new_weight
         # ------------------------------------------------------------
@@ -7154,17 +6874,17 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             model.state_dict(),
         )
         model.load_state_dict(compatible_backbone, strict=False)
-        print("✅ Successfully loaded Kinematics kinematic weights into Biochem backbone.")
+        print("[OK]  Successfully loaded Kinematics kinematic weights into Biochem backbone.")
         if skipped_backbone:
             print(
-                f"⚠️ Skipped {len(skipped_backbone)} incompatible/missing kinematics tensor(s) "
+                f"[WARN]  Skipped {len(skipped_backbone)} incompatible/missing kinematics tensor(s) "
                 "(expected when hidden widths differ)."
             )
 
     if will_resume_from_latest:
         pass  # biochem + kinematics come from biochem_latest_checkpoint.pth
     elif loaded_biochem_best_backbone:
-        print("⏭️ Skipping biochem prior initialization because Biochem best checkpoint was loaded.")
+        print("[skip]  Skipping biochem prior initialization because Biochem best checkpoint was loaded.")
     else:
         initialize_biochem_priors(model)
     loss_weighter = make_biochem_dynamic_loss_weighter(curriculum, device)
@@ -7172,10 +6892,10 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     lora_rank = max(0, int(os.environ.get("BIOCHEM_LORA_RANK", "4")))
     lora_alpha = max(1e-6, float(os.environ.get("BIOCHEM_LORA_ALPHA", "1.0")))
     if lora_rank > 0:
-        print("💉 Injecting LoRA into kinematic modules (SpectralLinear layers)...")
+        print(" Injecting LoRA into kinematic modules (SpectralLinear layers)...")
         inject_biochem_kinematic_lora(model, rank=lora_rank, alpha=lora_alpha)
     else:
-        print("💉 LoRA injection skipped (BIOCHEM_LORA_RANK=0).")
+        print(" LoRA injection skipped (BIOCHEM_LORA_RANK=0).")
 
     if _biochem_debug_enabled():
         cap = _biochem_debug_batches_cap()
@@ -7198,7 +6918,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     # Keep loading lazy: split by file path metadata instead of materializing all graphs.
     all_files = list(dataset.file_list)
     anchors, physics = [], []
-    print("🔎 Indexing Biochem files by anchor flag (lazy split)...")
+    print(" Indexing Biochem files by anchor flag (lazy split)...")
     for graph_path in all_files:
         graph = torch.load(graph_path, map_location="cpu", weights_only=False)
         graph = infer_missing_schema(graph, phase_hint="biochem")
@@ -7226,7 +6946,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     low_anchor_mode = force_low_anchor_mode or (0 < n_anchors_total < low_anchor_threshold)
     if low_anchor_mode:
         print(
-            f"🧪 Low-anchor mode enabled: anchors={n_anchors_total} (<{low_anchor_threshold}). "
+            f" Low-anchor mode enabled: anchors={n_anchors_total} (<{low_anchor_threshold}). "
             "Training emphasizes pipeline health/debug over generalization."
         )
 
@@ -7234,7 +6954,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     metrics_trustworthy = n_anchors_total >= min_trust
     if not metrics_trustworthy:
         print(
-            f"⚠️ Validation high-μ overlap / WSS are **not** reliable generalization metrics with "
+            f"[WARN]  Validation high-mu overlap / WSS are **not** reliable generalization metrics with "
             f"{n_anchors_total} anchor graph(s) (< {min_trust}). Interpret as pipeline health only."
         )
 
@@ -7242,7 +6962,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     train_anchors, val_anchors = [], []
     train_physics, val_physics = [], []
     if len(dataset) == 1:
-        print("⚠️ Only one graph found. Using it for both Training and Validation.")
+        print("[WARN]  Only one graph found. Using it for both Training and Validation.")
         only = [all_files[0]]
         if len(anchors) == 1:
             train_anchors = only[:]
@@ -7296,7 +7016,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     nw_dl = int(dl_kw.get("num_workers", 0))
     if nw_dl > 0 or bool(dl_kw.get("pin_memory")):
         print(
-            f"⚡ DataLoader throughput: num_workers={nw_dl}, pin_memory={dl_kw.get('pin_memory')} "
+            f" DataLoader throughput: num_workers={nw_dl}, pin_memory={dl_kw.get('pin_memory')} "
             "(override with BIOCHEM_DATALOADER_WORKERS / BIOCHEM_PIN_MEMORY)"
         )
 
@@ -7309,7 +7029,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     # Use simple loaders with batch_size=1 to preserve [T, N, 16] integrity.
     train_anchor_count = len(train_anchors) if len(dataset) > 1 else 1
     if train_anchor_count == 0:
-        print("⚠️ No anchors in training split; running physics-only updates.")
+        print("[WARN]  No anchors in training split; running physics-only updates.")
 
     # Anchor oversampling for sparse-anchor phases (especially 1-anchor runs).
     # Target a minimum anchor sampling fraction without changing graph contents.
@@ -7329,7 +7049,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             replacement=True,
         )
         print(
-            f"🎯 Weighted sampling enabled (anchor frac target ~{target_anchor_fraction:.2f}; "
+            f"[scope]  Weighted sampling enabled (anchor frac target ~{target_anchor_fraction:.2f}; "
             f"anchors={len(anchor_set)}, physics={train_physics_count})."
         )
         loader = DataLoader(
@@ -7380,7 +7100,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             return
         run_log_end_emitted = True
         if interrupted:
-            print("\n⚠️ Training interrupted; appending biochem run log end row.")
+            print("\n[WARN]  Training interrupted; appending biochem run log end row.")
         run_log.log_end(
             run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
             stop_after_teacher=bool(stop_after_teacher),
@@ -7407,7 +7127,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     )
 
     if resume_enabled and latest_ckpt_path.exists():
-        print(f"🔄 Resuming Biochem from checkpoint: {latest_ckpt_path}")
+        print(f" Resuming Biochem from checkpoint: {latest_ckpt_path}")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         opt_ok = _try_load_biochem_split_optimizer(optimizer, ckpt.get("optimizer_state_dict"))
@@ -7418,14 +7138,14 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                     scheduler.load_state_dict(scheduler_state)
                 except Exception as exc:
                     print(
-                        f"⚠️ Could not load LR scheduler state ({type(exc).__name__}: {exc}); "
+                        f"[WARN]  Could not load LR scheduler state ({type(exc).__name__}: {exc}); "
                         "scheduler left at default init."
                     )
         try:
             loss_weighter.load_state_dict(ckpt["loss_weighter_state_dict"])
         except Exception as exc:
             print(
-                f"⚠️ Could not load loss weighter state ({type(exc).__name__}: {exc}); "
+                f"[WARN]  Could not load loss weighter state ({type(exc).__name__}: {exc}); "
                 "using freshly constructed weighter state."
             )
         start_epoch = int(ckpt.get("epoch", -1)) + 1
@@ -7439,11 +7159,11 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         if stop_after_teacher:
             pseudo_bank = {}
             print(
-                "ℹ️ Skipping pseudo-label bank rebuild "
+                "[i]  Skipping pseudo-label bank rebuild "
                 "(BIOCHEM_STOP_AFTER_TEACHER=1; corrector not run)."
             )
         else:
-            print("🧾 Rebuilding pseudo-label bank from resumed Biochem weights...")
+            print(" Rebuilding pseudo-label bank from resumed Biochem weights...")
             temp_teacher = copy.deepcopy(model).to(device)
             temp_teacher.eval()
             for p in temp_teacher.parameters():
@@ -7458,12 +7178,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
             if len(train_physics) > 0:
                 print(
-                    f"🧾 Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
+                    f" Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
                     f"({pseudo_cov:.1%}) synthetic graphs."
                 )
-        print(f"✅ Biochem resume complete at epoch {start_epoch}.")
+        print(f"[OK]  Biochem resume complete at epoch {start_epoch}.")
     elif resume_enabled:
-        print(f"ℹ️ BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
+        print(f"[i]  BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
     else:
         post_pt = model_dir / "biochem_post_pretrain.pth"
         reused_post_pretrain = False
@@ -7471,12 +7191,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             reused_post_pretrain = _try_load_biochem_post_pretrain(model, post_pt, device)
             if reused_post_pretrain:
                 print(
-                    f"🔁 Reused AE+ODE-RXN warm-start from {post_pt.name} (skipping Phase 3a / 3a.5). "
+                    f" Reused AE+ODE-RXN warm-start from {post_pt.name} (skipping Phase 3a / 3a.5). "
                     "Unset BIOCHEM_REUSE_LAST_PRETRAIN or delete the file to run pretrain again."
                 )
             else:
                 print(
-                    f"⚠️ BIOCHEM_REUSE_LAST_PRETRAIN set but {post_pt.name} is missing or incompatible; "
+                    f"[WARN]  BIOCHEM_REUSE_LAST_PRETRAIN set but {post_pt.name} is missing or incompatible; "
                     "running Phase 3a + 3a.5 from scratch."
                 )
         save_post_pt: Optional[Path] = None
@@ -7543,7 +7263,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             pseudo_bank = {}
             pseudo_w = 0.0
             print(
-                "ℹ️ Skipping synthetic pseudo-label bank "
+                "[i]  Skipping synthetic pseudo-label bank "
                 "(BIOCHEM_STOP_AFTER_TEACHER=1; corrector not run)."
             )
         else:
@@ -7556,7 +7276,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
             if len(train_physics) > 0:
                 print(
-                    f"🧾 Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
+                    f" Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
                     f"({pseudo_cov:.1%}) synthetic graphs."
                 )
             pseudo_w_base = float(os.environ.get("BIOCHEM_SYNTH_PSEUDO_WEIGHT", "0.5"))
@@ -7593,7 +7313,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 else " (teacher-only run; corrector skipped)."
             )
             print(
-                "🔁 Merged teacher weights into student" + merge_note
+                " Merged teacher weights into student" + merge_note
                 + (f" Skipped {n_tm} incompatible/missing key(s)." if n_tm else "")
             )
 
@@ -7605,7 +7325,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 int(teacher_last_epoch) if teacher_last_epoch >= 0 else int(teacher_best_epoch)
             ),
         )
-        print("🛑 BIOCHEM_STOP_AFTER_TEACHER enabled: stopping after teacher stage.")
+        print(" BIOCHEM_STOP_AFTER_TEACHER enabled: stopping after teacher stage.")
         return
 
     train_cfg = BiochemTrainingConfig.from_env()
@@ -7619,11 +7339,11 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         if resume_ema_state is not None:
             try:
                 ema_model.load_state_dict(resume_ema_state, strict=False)
-                print(f"🫧 EMA model restored from checkpoint (decay={ema_decay:.4f}).")
+                print(f" EMA model restored from checkpoint (decay={ema_decay:.4f}).")
             except Exception as exc:
-                print(f"⚠️ Could not restore EMA state ({exc}); starting EMA from current model.")
+                print(f"[WARN]  Could not restore EMA state ({exc}); starting EMA from current model.")
         else:
-            print(f"🫧 EMA model enabled for validation/checkpoints (decay={ema_decay:.4f}).")
+            print(f" EMA model enabled for validation/checkpoints (decay={ema_decay:.4f}).")
 
     mu_score_ema_beta = float(os.environ.get("BIOCHEM_VAL_MU_SCORE_EMA", "0.25"))
     ckpt_pearson_w = float(os.environ.get("BIOCHEM_CKPT_WSS_PEARSON_WEIGHT", "0.02"))
@@ -7641,13 +7361,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
 
     atexit.register(lambda: _emit_corrector_run_end(True))
 
-    print("\n🚀 --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
+    print("\n --- Starting Phase 3: Segregated Bio-Fluid Coupling ---")
 
     if start_epoch >= epochs:
         extra = max(1, int(os.environ.get("BIOCHEM_RESUME_EXTRA_EPOCHS", "30")))
         new_total = max(epochs, start_epoch + extra)
         print(
-            f"⚠️ Resume start_epoch={start_epoch} is ≥ configured BIOCHEM_EPOCHS={epochs}; "
+            f"[WARN]  Resume start_epoch={start_epoch} is >= configured BIOCHEM_EPOCHS={epochs}; "
             f"Phase 3 would run 0 iterations. Extending total epochs to {new_total} "
             f"(raise BIOCHEM_EPOCHS explicitly or set BIOCHEM_RESUME_EXTRA_EPOCHS, default +{extra})."
         )
@@ -7659,7 +7379,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         os.environ.get("BIOCHEM_LORA_UNLOCK_EPOCH", str(default_lora_unlock_epoch))
     )
     lora_unlock_epoch = max(1, min(lora_unlock_epoch, max(1, epochs - 1)))
-    print(f"🔐 LoRA unlock schedule: frozen until epoch {lora_unlock_epoch}, then enabled for co-adaptation.")
+    print(f" LoRA unlock schedule: frozen until epoch {lora_unlock_epoch}, then enabled for co-adaptation.")
 
     for epoch in range(start_epoch, epochs):
         last_epoch_completed = epoch
@@ -7677,7 +7397,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
 
             # Keep macro LoRA frozen during early training; let micro head learn first.
             if epoch == 0:
-                print("🔒 Kine phase (Predictor): Freezing LoRA layers; training micro residual head first.")
+                print(" Kine phase (Predictor): Freezing LoRA layers; training micro residual head first.")
             for _name, param in model.named_parameters():
                 if "lora" in _name.lower():
                     param.requires_grad = False
@@ -7694,7 +7414,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
 
             # Macro LoRA unfreezes on its own schedule (typically later than warmup).
             if epoch == lora_unlock_epoch:
-                print("🔥 Macro LoRA unlock: enabling kinematic co-adaptation / rheological feedback.")
+                print(" Macro LoRA unlock: enabling kinematic co-adaptation / rheological feedback.")
             lo_ra_on = epoch >= lora_unlock_epoch
             for _name, param in model.named_parameters():
                 if "lora" in _name.lower():
@@ -7710,7 +7430,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         # FIX: Capitalized 'T' here as well
         huber_delta_epoch = _scheduled_biochem_huber_delta(bio_cfg, epoch)
         print(
-            f"\n⏳ Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | "
+            f"\n Epoch {epoch:02d} | mu_ratio: {current_mu_ratio:.1f}x | "
             f"T_scale: {current_T_scale:.2f} | huber_delta: {huber_delta_epoch:.4f} | "
             f"res_sparse_w: {_scheduled_residual_sparse_lambda(epoch, epochs):.3f}"
         )
@@ -7724,13 +7444,13 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 loss_weighter.log_vars[6:].requires_grad_(True)
                 if epoch == wu:
                     print(
-                        "⚖️  Biochem warmup done: unfreezing **data** Kendall log_vars "
+                        "  Biochem warmup done: unfreezing **data** Kendall log_vars "
                         f"(indices 6–7); physics log_vars frozen until epoch {phys_start}."
                     )
             else:
                 loss_weighter.log_vars.requires_grad_(True)
                 if epoch == phys_start:
-                    print("⚖️  Unfreezing **physics** Kendall log_vars after grace period.")
+                    print("  Unfreezing **physics** Kendall log_vars after grace period.")
         else:
             loss_weighter.log_vars.requires_grad_(True)
 
@@ -7810,14 +7530,14 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             loss = loss / accumulation_steps
 
             if torch.isnan(loss):
-                print(f"\n⚠️ NaN detected in loss at epoch {epoch}! Skipping micro-batch.")
+                print(f"\n[WARN]  NaN detected in loss at epoch {epoch}! Skipping micro-batch.")
                 continue
 
             if not loss.requires_grad:
                 src = getattr(data, "_biochem_path", "<unknown>")
                 no_grad_skipped_batches += 1
                 _biochem_dbg_line(
-                    "⚠️ Phase3 loss has no grad_fn before backward(); skipping micro-batch. "
+                    "[WARN]  Phase3 loss has no grad_fn before backward(); skipping micro-batch. "
                     f"epoch={epoch} batch={batch_idx} src={src} "
                     f"TF_eff={metrics.get('TF_eff')} "
                     f"Has_Anchor_Supervision={metrics.get('Has_Anchor_Supervision')} "
@@ -7857,7 +7577,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             batch_dt = time.perf_counter() - batch_t0
             if batch_dt > watchdog_sec:
                 _biochem_dbg_line(
-                    f"⏱️ [Watchdog] slow batch epoch={epoch} batch={batch_idx} "
+                    f" [Watchdog] slow batch epoch={epoch} batch={batch_idx} "
                     f"dt={batch_dt:.2f}s ODE_evals={int(metrics.get('ODE_Evals', 0))}"
                 )
 
@@ -7926,26 +7646,26 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             )
             pfrac = pseudo_supervised_batches / float(total_batches)
             print(
-                f"🧾 Pseudo-supervised batches: {pseudo_supervised_batches}/{total_batches} "
+                f" Pseudo-supervised batches: {pseudo_supervised_batches}/{total_batches} "
                 f"({pfrac:.1%})"
             )
             if l_musi_anchor_batch_count > 0:
                 mean_lm = l_musi_anchor_sum / float(l_musi_anchor_batch_count)
                 mean_wlm = l_musi_weighted_sum / float(l_musi_anchor_batch_count)
                 print(
-                    f"📐 μ SI anchor (anchor-supervised batches only): mean L_MuSI_aux={mean_lm:.4e}, "
-                    f"mean (W_eff·L_MuSI)={mean_wlm:.4e} over {l_musi_anchor_batch_count} batch(es)"
+                    f" mu SI anchor (anchor-supervised batches only): mean L_MuSI_aux={mean_lm:.4e}, "
+                    f"mean (W_eff*L_MuSI)={mean_wlm:.4e} over {l_musi_anchor_batch_count} batch(es)"
                 )
             if w_mu_log_ep > 0.0 and l_musi_anchor_batch_count > 0:
                 mean_ll = l_mulog_anchor_sum / float(l_musi_anchor_batch_count)
                 mean_wll = l_mulog_weighted_sum / float(l_musi_anchor_batch_count)
                 print(
-                    f"📐 μ log anchor (val-aligned |log pred−gt| in SI): mean L_MuLog_aux={mean_ll:.4e}, "
-                    f"mean (W_eff·L_MuLog)={mean_wll:.4e} over {l_musi_anchor_batch_count} batch(es)"
+                    f" mu log anchor (val-aligned |log pred-gt| in SI): mean L_MuLog_aux={mean_ll:.4e}, "
+                    f"mean (W_eff*L_MuLog)={mean_wll:.4e} over {l_musi_anchor_batch_count} batch(es)"
                 )
             if low_anchor_mode:
                 print(
-                    f"🩺 Low-anchor health: anchor_frac={frac:.1%}, pseudo_frac={pfrac:.1%}, "
+                    f" Low-anchor health: anchor_frac={frac:.1%}, pseudo_frac={pfrac:.1%}, "
                     f"pseudo_graph_cov={len(pseudo_bank)}/{max(1, len(train_physics))} ({pseudo_cov:.1%})"
                 )
             if no_grad_skipped_batches > 0:
@@ -7955,7 +7675,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 )
             if total_batches > 0 and ode_zero_batches / float(total_batches) > 0.5:
                 print(
-                    f"⚠️ Sanity: ODE_Evals==0 on {ode_zero_batches}/{total_batches} batches "
+                    f"[WARN]  Sanity: ODE_Evals==0 on {ode_zero_batches}/{total_batches} batches "
                     "despite PDE_Steps>0 — check TBPTT windows / synthetic batches."
                 )
 
@@ -7986,9 +7706,9 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             and not _iso_ep
         ):
             print(
-                f"📊 Ep {epoch:02d} data-only (EMA α={ema_alpha:g}): "
-                f"L_tot≈{ema_metrics['L_tot']:.3e} L_Data_Kine≈{ema_metrics['L_Data_Kine']:.3e} "
-                f"L_Data_Bio≈{ema_metrics['L_Data_Bio']:.3e} | mean L_tot/μbatch {train_loss_mean:.3e}"
+                f" Ep {epoch:02d} data-only (EMA α={ema_alpha:g}): "
+                f"L_tot~{ema_metrics['L_tot']:.3e} L_Data_Kine~{ema_metrics['L_Data_Kine']:.3e} "
+                f"L_Data_Bio~{ema_metrics['L_Data_Bio']:.3e} | mean L_tot/mubatch {train_loss_mean:.3e}"
             )
 
         # Validation & Metrics
@@ -8014,7 +7734,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 weights = torch.exp(-safe_vars)
 
                 print(
-                    f"⚖️ Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | "
+                    f" Learned Weights -> ADR_F: {weights[0]:.2f} | ADR_S: {weights[1]:.2f} | "
                     f"W_Bio: {weights[2]:.2f} | W_Phys: {weights[3]:.2f} | Bio_IO: {weights[4]:.2f} | "
                     f"NS_mom: {weights[5]:.2f} | Data_Kine: {weights[6]:.2f} | Data_Bio: {weights[7]:.2f}"
                 )
@@ -8091,7 +7811,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
 
             v_stride = os.environ.get("BIOCHEM_VAL_TIME_STRIDE", "1")
             print(
-                f"📊 [Validation]{trust_tag} (val_stride={v_stride}, graphs={n_val}, "
+                f" [Validation]{trust_tag} (val_stride={v_stride}, graphs={n_val}, "
                 f"anchors={n_val_anchor})"
             )
             mu_agg = _log_mu_validation_report(
@@ -8100,7 +7820,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 per_graph=val_mu_per_graph,
                 extra_lines=[
                     f"   Legacy mean over all val graphs: logMAE={legacy_mu_log_mae:.4f} "
-                    f"μPearson={avg_mu_pearson:.4f} (includes non-anchor graphs with empty μ)",
+                    f"muPearson={avg_mu_pearson:.4f} (includes non-anchor graphs with empty mu)",
                     f"   Patent WSS Pearson: {avg_pearson:.4f} | Max Fibrin (SI): {avg_fibrin:.2e}",
                     f"   Fluid Physics: Continuity Err={val_cont_total/n_val:.2e} | "
                     f"Wall Slip Err={val_wall_slip_total/n_val:.2e} | "
@@ -8193,7 +7913,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 "ema_decay": ema_decay,
             }
             torch.save(checkpoint, latest_ckpt_save)
-            print(f"💾 Saved Biochem checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
+            print(f"[save]  Saved Biochem checkpoint -> {latest_ckpt_save.name} (every {ckpt_every} epoch(s))")
 
     _emit_corrector_run_end(interrupted=False)
 
@@ -8304,9 +8024,9 @@ if __name__ == "__main__":
             os.environ["BIOCHEM_SKIP_ODE_RXN_PRETRAIN"] = "1"
 
     if resume_enabled:
-        banner = "🔄 Resuming Biochem from latest checkpoint."
+        banner = " Resuming Biochem from latest checkpoint."
     else:
-        banner = "🆕 Starting a new Biochem run."
+        banner = "[NEW]  Starting a new Biochem run."
     print(banner)
     if getattr(args, "run_name", ""):
         os.environ["BIOCHEM_RUN_NOTE"] = str(args.run_name).strip()
@@ -8321,11 +8041,11 @@ if __name__ == "__main__":
     try:
         train_biochem_corrector()
     except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user (KeyboardInterrupt).")
+        print("\n Training interrupted by user (KeyboardInterrupt).")
         raise
     except torch.cuda.OutOfMemoryError as e:
-        print(f"\n💥 CUDA out of memory during Biochem training: {e}")
+        print(f"\n[ERR]  CUDA out of memory during Biochem training: {e}")
         raise
     except Exception as e:
-        print(f"\n💥 Unhandled exception during Biochem training: {type(e).__name__}: {e}")
+        print(f"\n[ERR]  Unhandled exception during Biochem training: {type(e).__name__}: {e}")
         raise

@@ -14,6 +14,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 |-------|--------|---------------|----------|----------------------|
 | **0** | Pretrain | AE recon; ODE reaction mimic | AE → ODE-RXN → … | Default fast budgets |
 | **1** | Teacher (anchors) | Supervised COMSOL on anchors only | Same script, teacher loop | `BIOCHEM_STOP_AFTER_TEACHER=1` |
+| **2a** | **Passive transport** (1-way biochem) | **`L_Data_Bio` only** in backward (ADR logged); optional `L_Data_Kine` leash | Teacher, GT `[u,v,p]`, `μ_ratio=1` | `BIOCHEM_PRESET=passive_transport`, `LOSS_ISOLATE=PASSIVE`, `GT_KINE_VEL=1`, `PASSIVE_ADR_BACKPROP=0` |
 | **2** | **Step 2** (current target) | `L_Data_Kine + L_Data_Bio + W_MuSI·L_MuSI` (+ optional `L_PhysTemp`) | Teacher (+ optional early stop) | `BIOCHEM_LOSS_DATA_ONLY=1`, `BIOCHEM_COMPLEXITY_STEP=2` |
 | **2.5** | Step 2 + temporal | Step 2 + `w_pt·L_PhysTemp` on anchor trajectories | Teacher / short corrector | `BIOCHEM_PRESET=step2p5` or `DATA_ONLY_PHYS_TEMP=1` |
 | **2+** | Thrombus corona bundle (**experimental / unvalidated**) | Step 2 + gelation prior gate + 3-hop corona + phys temp | **Teacher + full corrector** (mixed graphs, pseudo labels) | `BIOCHEM_PRESET=thrombus_corona`, `STOP_AFTER_TEACHER=0` — **not recommended yet** |
@@ -23,6 +24,28 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 **“All losses”** in code terms = **complexity step 3** (`BIOCHEM_LOSS_DATA_ONLY=0`): physics Kendall terms enter `backward()`, not only metrics.
 
 **“Full run”** (aspirational) = teacher + corrector to completion with stable μ/species on val anchors — **after** step-2 teacher is healthy, then optional step 2.5 / spatial priors / step 3. The **`thrombus_corona` preset** is one *unvalidated* bundle for that path; do not treat it as the default iteration entry point.
+
+### Passive transport (Step 2a — species before coupled PDE)
+
+**Goal:** Fit **Mat / FI** (and bulk species) with **fixed COMSOL flow** — biochemistry must not move the velocity field yet (`BIOCHEM_TEACHER_MU_RATIO_MAX=1`, no clot → μ feedback).
+
+**Launcher:** [`scripts/go_passive_transport.ps1`](../../scripts/go_passive_transport.ps1) → `BIOCHEM_PRESET=passive_transport`.
+
+| Stage | Env / behavior | Status (2026-05-26) |
+|-------|----------------|---------------------|
+| Frozen bad flow | Default kinematics DEQ only | **Fail** — `flow_trivial=1`, `L_kine≈2.99`, stagnant viz |
+| GT kinematics | `BIOCHEM_GT_KINE_VEL=1`, `GT_KINE_SKIP_DEQ=1` | **Pass** — `flow_trivial=0`, `t0\|u\|≈0.96`, `L_kine≈0.25` |
+| Species + `DETACH=1` | Same GT flow, TBPTT detached | **Fail** — `L_bio≈410` flat 12 ep (weak/no TBPTT grad to bio) |
+| Species + `DETACH=0` + ADR in backward | `PASSIVE` = ADR_F + ADR_S + Data_Bio | **Fail** — bio grad L2 **10⁴–10¹³**, optimizer steps **skipped** (`TEACHER_MAX_RAW_GRAD_L2=5000`); `L_tot` spike **~10⁴**; `L_bio` still flat |
+| Species + `DETACH=0`, ADR **metrics only** | `BIOCHEM_PASSIVE_ADR_BACKPROP=0`, `TEACHER_LR=5e-4`, `TEACHER_GRAD_SCALE_ON_CAP=1` | **In progress** — default preset after ADR lesson; re-run pending |
+
+**ADR policy (do not skip):**
+
+1. **`BIOCHEM_PASSIVE_ADR_BACKPROP=0`** (preset default) — ADR residuals still print in logs / `run.jsonl`; they are **not** in `backward()` until species supervision works.
+2. Only set **`BIOCHEM_PASSIVE_ADR_BACKPROP=1`** after **`L_Data_Bio` (train EMA) falls clearly** over several epochs on anchors (e.g. patient007 val species panels improving, not only flat ~400+).
+3. If ADR backprop is re-enabled and grads explode again: lower `BIOCHEM_TEACHER_LR` (e.g. `2e-4`), keep `GRAD_SCALE_ON_CAP=1`, or shorten `TBPTT_MAX_WINDOW` — treat as **ADR coupling broken or unscaled**, not as “train longer.”
+
+**Metrics for this stage:** ignore `mu_log_mae` (μ pinned / Newtonian). Watch **`L_Data_Bio`**, FI/Mat viz vs COMSOL, and `L_ADR_F` / `L_ADR_S` as **diagnostics only** until ADR backprop is intentionally enabled.
 
 ---
 
@@ -52,7 +75,8 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | Preflight μ (train anchors, t0→t1) | median logMAE ≲ 2.5 | **Partial** | **K1/K0** ~1.45; **K2** explicit gelation **5.77** (§91) — triggers flood IC |
 | Val μ (held-out anchor, e.g. patient007) | improve / stabilize logMAE | **Partial** | **K1** Δμ+`DATA_KINE` **0.464** (§90); **K2** step-3 multitask+gelation **4.22** ep9 (§91, **regress**); sentinel **0.294**; visc3h **0.408** |
 | Val spatial correlation `r` | ≳ 0.5+ stable | **Partial** | Marathon T2 ep6 **r≈0.40**; bulk **r** often negative; high-μ **r** can be positive while all-truth **r** low |
-| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Partial** | **K11d** (§107): red band persists on **μ₁/μ₂** inspector rows; **`gate_wall=0`** (adjacent apply); **K11b** wall halo; **K10e** no clots |
+| Viz rollout health (t0 \|u\|, clot channel) | t0 \|u\| ≳ 1.0; localized clot | **Fail** (K11) | **clot6h** (§112): all legs **~0.033** `clot_frac` @ep0 viz; **O0 oracle** viz still **faint wall halo** (~0.05–0.06 Pa·s), not COMSOL **0.10** patches; **G1** frozen loss |
+| K11 gate / clot_frac (val viz health) | `gate_all` ≳ 0.02–0.05 @ep0; stable `clot_frac` | **Fail** | **clot6h**: `gate_all` **→10⁻³–10⁻⁶** by ep3+; `clot_frac=0` on val; **high_mu ckpt = ep0** (or G6 ep06) for all legs |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
@@ -60,7 +84,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 ### Distance to full run (honest)
 
-- **Step-2 teacher “done”**: **Interim pass on patient007** — **K1/K8/K10e** (§90/§96/§103): **~0.47–0.49** all; **K10e** adds wall-adjacent mask + log/K10E loss but **still no viz clots** (`learned` flat). **K7** split+wall **~0.52** all but wall **~5.4**. **Caveat**: good logMAE ≠ COMSOL-qualitative wall bands. **Do not** stack step-3 multitask + raw explicit gelation on K1 ckpt without stabilization — **K2** (§91) **4.22** val / **clot_frac=1**. Sentinel **0.294**; visc3h **0.408**; health10h **S0** **0.451**. Corrector not started.
+- **Step-2 teacher “done”**: **Interim pass on patient007** — **K1/K8/K10e** (§90/§96/§103): **~0.47–0.49** all; **K10e** adds wall-adjacent mask + log/K10E loss but **still no viz clots** (`learned` flat). **clot6h sweep** (§112): 8 legs × ~4m, **K11** isolate — **no** leg beats **K11f** viz goal; **O0** oracle-at-train does **not** reproduce COMSOL red clots in **viz** (inference uses learned head). **K7** split+wall **~0.52** all but wall **~5.4**. **Caveat**: good logMAE ≠ COMSOL-qualitative wall bands. Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (multitask backward)**: **In progress** — **K2** `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0`, explicit gelation, OomSafe **12ep complete** on RTX 500 4GB (no OOM); val all **5.58→4.22** (still **>> K1 0.464**); train **`L_tot` ~700–1700** (Kendall dominates); preflight **5.77**. Next: `GELATION_PRIOR_GATE=1` and/or cap μ₂ / staged re-enable gelation; keep **DATA_KINE** or **MU_LOG** until val **<1.0** before full PDE sum.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
@@ -1002,6 +1026,28 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Status**: **Partial** — ckpt **ep0** synced to `teacher_best_high_mu`; bulk logMAE **0.494 @ep3**; high-μ **0.852 @ep11** (worse than ep0 **0.988** for k11 pick).
 - **Next**: Auto-calibrate **`BIOCHEM_PRIOR_DGAMMA_DX_THRESH`** (~10–50 from adjacent-band p5); run diag with same env as K11e; try **`LOGIT_BIAS=0`**, lower **trigger-suppress**, or **`GATE_TARGET_WEIGHT=8`**; viz ep0 ckpt before retrain.
 
+### 111. **K11f** anchor-survey bundle (wall_prox + calibrated prior)
+
+- **Symptom**: K11e **adjacent** apply missed **~95%** of GT clots on wall mesh; **dx thresh 800** zeroed mech prior; gate collapsed.
+- **Fix (script)**: `go_k11e_clot_gate.ps1` → **K11f**: `APPLY_MODE=wall_prox`, auto `suggest_prior_dx_threshold()`, `PRIOR_NORM_MASK=wall`, `LOGIT_BIAS=0`, `GATE_TARGET_WEIGHT=10`, milder suppress, mech-heavy triggers; default dx **35** when COMSOL-aligned in code.
+- **Next**: Fresh K11f run; val `gate_all` ~0.004–0.02, `clot_frac>0`; viz localized red on wall.
+
+### 112. **clot6h** localization sweep (8 legs, K11 isolate, ~32m total, `sweep_clot_localization_6h`)
+
+- **Setup**: `scripts/go_clot_sweep_6h.ps1` — shared warm pretrain, `LOSS_ISOLATE=K11`, `MU_IC_STEADY_KIN=1`, `MU_K11_CLOT_GATE=1`, `STOP_AFTER_TEACHER=1`, val every 3 ep, `DETACH_MACRO=1`, `W_MuSI=8`, `W_MuLog=2`; per-leg ckpt under `outputs/biochem/sweep_clot_localization_6h/<leg>/`.
+- **Symptom**: Every leg saves **`teacher_best_high_mu` @ ep0** (k11 best); after ep1–3 **`gate_all` → 10⁻³–10⁻⁶**, val **`clot_frac=0`**; manifest **`viz_final_clot_frac≈0.0335`** and **`gate≈0.026`** — nearly identical across legs (triage by clot_frac does not separate winners).
+- **Metrics (patient007 val @ best ckpt)**: Best **all** logMAE **O0 0.478** / **G3 0.510** / **G0/G4 ~0.496**; best **high-μ** **G1 0.752** / **G5 0.785** @ ep0; **G5** blows up **all→0.93** @ ep3+ (masked-BCE path). **G1** geom-only: train **`L_tot≈37.15` flat** all epochs (12 tensors, no encoder) — no learning signal.
+- **O0 oracle**: Train forward uses **GT clot mask** for `p_clot`; **viz** on `biochem_teacher_best_high_mu.pth` (ep0) still shows **uniform ~0.04 bulk + faint wall rim (~0.05–0.06 Pa·s)**, not COMSOL **~0.10** wall patches — so failure is **not** “classifier can’t find nodes” alone; either **(a)** oracle off at inference, **(b)** **`μ_clot−μ_ss` too small** with soft `p_clot~0.02–0.05`, or **(c)** rollout/viz path. Check **`p_clot`** slider row; try **`VIZ_K11_HARD_GATE_THRESH=0.35`** for display-only crispness.
+- **Status**: **Fail** on localized COMSOL-like clots; **partial** on logMAE vs K11g baseline band (~0.50–0.54 @ ep0).
+- **Next**: Oracle **inference** mode for viz sanity; freeze **ep0-only** training or stronger **gate-target** / stop gate collapse; calibrate **`μ_clot` head** amplitude; **G1** debug frozen `L_tot`; longer ep or **`DETACH=0`** only after gate holds; do not trust manifest clot_frac alone until val gate stays **>0.01**.
+
+### 113. **Passive transport** (`passive_transport`, GT flow + ADR backprop) — ADR not ready for full TBPTT
+
+- **Symptom**: After **`BIOCHEM_GT_KINE_VEL=1`** (DEQ skipped): `flow_trivial=0`, `t0|u|≈0.96`, `L_kine≈0.25` (mostly μ channel mismatch). With **`BIOCHEM_DETACH_MACRO_STATE=0`** and default **`PASSIVE`** backward (**ADR_F + ADR_S + Data_Bio**): every teacher batch logs **`bio grad L2` 10⁴–10¹³** vs cap **5000** → **optimizer step skipped**; train **`L_tot` ~1.6e3** (detach=1) → **~1.8e4** (detach=0+ADR); **`L_bio≈4.1e2` flat** all 12 ep; val **`mu_log_mae` frozen ~1.37** (expected — not the gate metric).
+- **Cause**: Full TBPTT adjoint through **ADR + ODE** with GT `[u,v,p]` is still **stiff / poorly scaled** relative to `L_Data_Bio`; raw-grad cap **aborts** updates so weights never move; prior marathon **I6 `ADR_F` isolate** already showed **μ does not improve** from ADR-only backward alone.
+- **Fix (preset, 2026-05-26)**: `BIOCHEM_PASSIVE_ADR_BACKPROP=0` (backward = **`L_Data_Bio` only**), keep **`DETACH_MACRO=0`**, `TEACHER_LR=5e-4`, `TEACHER_GRAD_SCALE_ON_CAP=1`, `PASSIVE_DATA_KINE_WEIGHT=0` (GT flow already injected).
+- **Lesson**: Treat **ADR in `backward()` as broken or premature** for this stage until **`L_Data_Bio` is clearly falling** on held-out anchors; use **`L_ADR_F` / `L_ADR_S` as logged diagnostics** only. Re-enable with `BIOCHEM_PASSIVE_ADR_BACKPROP=1` only after a stable data-bio descent, then re-check grad caps.
+
 ---
 
 ## Lessons learned — μ formulation (2026-05-18)
@@ -1032,6 +1078,7 @@ Consolidated principles before re-introducing step-2 / corona / multitask losses
 
 | Knob / observation | Why it fails |
 |--------------------|--------------|
+| **`PASSIVE` + `PASSIVE_ADR_BACKPROP=1` + `DETACH=0`** (before `L_Data_Bio` drops) | ADR–TBPTT grads **explode** (10⁴–10¹³); steps **skipped** at cap 5000; species stay flat (~410) |
 | `L_Data_Bio` + `L_Data_Kine` in backward | Bio collapses; steals step from rheology path |
 | `MU_SI` isolate alone | Val logMAE flat despite train Huber movement |
 | Step-2 joint + `W_MuLog=2` **without** isolate | Still ~1.51 on patient007 (RTX500 sweep) |
@@ -1389,6 +1436,18 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-25 | **K11d_trigger_localized** (`LOSS_ISOLATE=K11`, `APPLY=adjacent`, `GROWTH=0`, trigger BCE/suppress, fresh, `20260525T181453Z`) | **0.496** (ep00) | **1.83** wall ep11 | **0.275** bulk ep11 | high **1.05** (ep11); r≈0.04 all | **§107**: val **flat ~0.50**; train `gate_wall=0`, `gate_all≈0.005`; viz **still red wall band** (μ₁/μ₂ species path + weak t0 flow); **K11 GT label bug** (`ratio×μ_inf`); prior overlap poor |
 | 2026-05-25 | **K11e_localized_best_practice** (`20260525T183843Z`, first K11e script) | **0.502** (ep00 k11) | **1.89** wall ep11 | **0.514** bulk ep11 | high **0.856** (ep11) | **§108**: `gate_all≈2e-5` → **flat μ_eff** (no clots); `teacher_best_high_mu` saved **ep11** not k11-best ep0; **fix**: bias −0.5, gate-target loss, sync high_mu ckpt |
 | 2026-05-25 | **K11e_COMSOL_prior** (`20260525T192853Z`, `PRIOR_COMSOL_ALIGNED=1`, `DX_THRESH=800`, ckpt sync ep0) | **0.510** (ep00 k11) | **1.78** wall ep00 | **0.436** bulk ep03 | high **0.988** ep00; ep11 **0.852** | **§109–110**: `gate_all` **1.7e-3→~3e-6** by ep6; `clot_frac=0`; diag **dγ/dx sign OK** (−9 vs +3.6) but **\|dγ/dx\|≪800** → prior **~0**; `high_mu` ckpt **ep0** ✓; viz still flat until threshold calibrated |
+| 2026-05-25 | **clot6h** batch (`go_clot_sweep_6h.ps1`, 8 legs, K11, 10ep except O0=6, ~4m/leg, `manifest.jsonl`) | see legs | — | — | **§112**: gate collapse all legs; O0 viz ≠ COMSOL clots |
+| 2026-05-25 | clot6h **G0_k11g_baseline** (`20260525T210440Z`, K11g wall_prox+calibrated prior) | **0.537** (ep00; ckpt high_mu ep00) | **2.53** ep00 | **0.340** ep00 | high **0.779** | `gate_all` **3.0e-2→3e-3** ep3; `clot_frac` **0.033→0**; manifest all **0.496** |
+| 2026-05-25 | clot6h **O0_oracle_gt_upper_bound** (`20260525T210904Z`, 6ep, train GT `p_clot`) | **0.528** (ep00) | **2.53** ep00 | **0.344** | high **0.770** | Oracle **train** only; **viz** faint halo not red patches; manifest all **0.478** |
+| 2026-05-25 | clot6h **G1_geom_wall_head** (`20260525T211157Z`, `k11_geom_clot_head`, 12 tensors) | **0.546** (ep00 flat) | **2.56** | **0.346** | high **0.752** | **`L_tot=37.15` frozen**; gate **~0.03** constant |
+| 2026-05-25 | clot6h **G2_sharp_high_pos_bce** (`20260525T211605Z`, sharp σ + heavy pos BCE) | **0.542** (ep00) | **2.56** ep00 | **0.348** | high **0.770** | Gate collapse ep3; manifest all **0.511** |
+| 2026-05-25 | clot6h **G3_union_apply_growth** (`20260525T212022Z`, union apply + 1-hop growth) | **0.524** (ep00) | **2.59** ep00 | **0.349** | high **0.779** | Top manifest **`clot_frac=0.0349`** (marginal); manifest all **0.510** |
+| 2026-05-25 | clot6h **G4_clot_only_mech_prior** (`20260525T212441Z`, clot-only + mech prior ch.) | **0.537** (ep00) | **2.53** | **0.340** | high **0.779** | ≈G0; `clot_frac→0` after ep0 |
+| 2026-05-25 | clot6h **G5_train_masked_pclot** (`20260525T212857Z`, BCE on masked `p_clot`) | **0.538** (ep00) | **2.51** | **0.336** | high **0.785** | **Regress** ep3 val all **0.926**; avoid masked-BCE as-is |
+| 2026-05-25 | clot6h **G6_low_tf_geom** (`20260525T213315Z`, geom + low TF, 4ep warmup) | **0.530** (ep06 ckpt) | **2.56** ep00 | **0.349** | high **0.775** | Only leg with **high_mu @ ep06**; `gate~0.03` through train |
+| 2026-05-26 | **passive_transport** GT vel (`20260526T061017Z`, `DETACH=1`, ADR in backward) | n/a (μ) | — | — | **§113**: `flow_trivial=0`, `L_bio≈410` flat; `L_tot~1.6e3` |
+| 2026-05-26 | **passive_transport** + `DETACH=0` + ADR backprop (`20260526T062646Z`) | n/a (μ) | — | — | **§113**: grad skip storm; `L_tot~1.8e4`; `L_bio` flat; preset → `PASSIVE_ADR_BACKPROP=0` |
+| 2026-05-26 | **passive_transport** data-bio TBPTT (`PASSIVE_ADR_BACKPROP=0`, pending re-run) | — | — | — | Target: falling `L_Data_Bio`; ADR log-only until stable |
 
 ---
 

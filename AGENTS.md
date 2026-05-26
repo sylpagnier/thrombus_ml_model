@@ -2,6 +2,7 @@
 
 ## Biochem training progress
 
+- **`mu_ratio_max`**: step ceiling for COMSOL μ₁/μ₂ gelation steps (default 80), **not** clot `μ_eff`/bulk. GT clots are ~2–3× in `mu_eff_si`; fit channel 3 / `mu_log_mae`. See [src/docs/PROJECT_CONTEXT.md](src/docs/PROJECT_CONTEXT.md) § `mu_ratio_max` vs `mu_eff`.
 - Living log: [src/docs/BIOCHEM_TRAINING_PROGRESS.md](src/docs/BIOCHEM_TRAINING_PROGRESS.md)
 - ~3h viscosity/velocity architecture sweep (per-leg teacher ckpts for viz): one line `powershell -NoProfile -ExecutionPolicy Bypass -File "…/scripts/go_visc3h.ps1"` → [scripts/go_visc3h.ps1](scripts/go_visc3h.ps1), [scripts/run_biochem_visc_velocity_arch_sweep_3h.ps1](scripts/run_biochem_visc_velocity_arch_sweep_3h.ps1) → `outputs/biochem/sweep_visc_velocity_3h/`
 - Cursor rule: [.cursor/rules/biochem-training-progress.mdc](.cursor/rules/biochem-training-progress.mdc) — agents should update the log when the user discusses biochem teacher/corrector run results (unless they opt out).
@@ -15,7 +16,9 @@
 - **K10f** (K10e wide band: `D_PEAK/SIGMA=0.008`, `SDF_MAX=0.04`, `Δμ_nd_max=30`, adjacent w=6, bulk w=0.5): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k10f_wide_adjacent_band.ps1" -Fresh`
 - **K10g oracle viz** (GT clots in wall-adjacent band, no train): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k10g_oracle_clots_viz.ps1"`
 - **K10g bias sanity** (init `Δμ` bias ~17 ND + `DATA_KINE` w=1, 6ep): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k10g_bias_clot_sanity.ps1" -Fresh`
-- **K11f** (localized clot gate, current best-practice): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k11e_clot_gate.ps1" -Fresh` (alias: `go_k11_clot_gate.ps1`). **wall_prox** apply (GT clots on wall nodes), auto-calibrated **dγ/dx** thresh from anchor survey, COMSOL hybrid prior, strong gate-target. **Train + viz one-liner**: `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k11e_clot_gate.ps1" -Fresh; python -m src.evaluation.visualize_pipeline --teacher-only --biochem-checkpoint outputs/biochem/biochem_teacher_best_high_mu.pth --anchor patient007`. Survey: `python scripts/survey_clot_anchor_patterns.py`; tests: `pytest src/tests/test_clot_anchor_survey.py -q`.
+- **Clot anchor survey** (GT μ floor + kinematic priors, regression diagnostics): `python scripts/survey_clot_anchor_patterns.py`.
+- **Simple clot φ** (wall-local probe): [src/docs/CLOT_PHI_BASELINE.md](src/docs/CLOT_PHI_BASELINE.md). Default train: `go_clot_phi_simple.ps1 -Fresh` (joint_blend_gtsp). Ladders: `go_clot_phi_biology_ladder.ps1`, `go_clot_phi_biology_round2.ps1`. Best val patient007: F1~0.48, rec~0.42, pred+~0.24, score~0.58.
+- **Passive transport (Step 2a, 1-way)**: Mat/FI on **COMSOL GT `[u,v,p]`** (`BIOCHEM_GT_KINE_VEL=1`), `mu_ratio_max=1`, `DETACH_MACRO=0`, **`BIOCHEM_PASSIVE_ADR_BACKPROP=0`** (ADR log-only until `L_Data_Bio` falls) — `.\scripts\go_passive_transport.ps1 -Fresh`. Doc: [src/docs/BIOCHEM_TRAINING_PROGRESS.md](src/docs/BIOCHEM_TRAINING_PROGRESS.md) (passive-transport table + chronicle §113).
 - Teacher checkpoints: `biochem_teacher_best_high_mu.pth` (global best teacher by high-μ val), `biochem_teacher_last.pth` (latest run backup). Viz default: best high-μ teacher → last teacher. Optional legacy all-truth: `biochem_teacher_best.pth` if `BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL=1`.
 - **K4→K5 split-head staged** (wall head first, then clot + gelation): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k4k5_split_head_staged.ps1"` — or stepwise `go_k4_wall_head_only.ps1` then `go_k5_clot_head_physics.ps1`. Env: `BIOCHEM_MU_TRAIN_WALL_ONLY` / `BIOCHEM_MU_TRAIN_CLOT_ONLY` (not `TRAIN_WALL_HEAD`; `BIOCHEM_MU_CARREAU_ONLY` / `BIOCHEM_USE_SIREN` are ignored).
 - **K6 unified kitchen-sink** (~0.47 leash recipe, both heads together): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_k6_unified_kitchen_sink.ps1" -Fresh` — `SUPERVISED_DATA_LEASH` forces step-2 data backward (not step-3); use `-Multitask` only if intentionally skipping the leash.
@@ -36,6 +39,15 @@
 - Code: `snapshot_gino_deq_model_config` / `resolve_gino_deq_ctor_kwargs` in [src/architecture/kinematics_model_config.py](src/architecture/kinematics_model_config.py).
 - `train_kinematics_predictor.py` embeds `model_config` in `kinematics_best.pth` and writes `outputs/kinematics/kinematics_architecture.json`.
 - `train_biochem_corrector.py` reads Stage-A `model_config` (checkpoint → reference JSON → shape inference).
+
+## Console output (PowerShell)
+
+- Do not use emoji or decorative Unicode in training/script `print` output — Windows PowerShell often renders them as mojibake. Use ASCII tags (`[OK]`, `[WARN]`, `[i]`). See [.cursor/rules/powershell-console-ascii.mdc](.cursor/rules/powershell-console-ascii.mdc).
+
+## Scripts layout
+
+- Active launchers and utilities: [scripts/README.md](scripts/README.md).
+- Historical sweep names in `BIOCHEM_TRAINING_PROGRESS.md` referred to one-off runners since removed; use current `go_*` scripts instead.
 
 ## Project orientation
 

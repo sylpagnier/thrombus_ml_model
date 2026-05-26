@@ -404,8 +404,12 @@ class BiochemConfig:
     surface_time_gate_slope: float = 10.0  # sigmoid steepness for smooth step2t
 
     # Curriculum Learning Bounds (Predictor-Corrector Architecture)
-    mu_ratio_init: float = 1.0  # Kine phase: Rheologically neutral flow field
-    mu_ratio_max: float = 80.0  # COMSOL mu1 and mu2 step functions max out at 80
+    mu_ratio_init: float = 1.0  # Kine phase: rheologically neutral flow field (corrector curriculum start).
+    # Ceiling for COMSOL gelation step outputs mu1(Mat) and mu2(FI) in the forward
+    # (1 + mu1 + mu2) branch — NOT clot mu_eff / bulk mu_eff. Anchor GT clots are
+    # typically ~2-3x in mu_eff_si (~0.10 vs ~0.04 Pa*s); species only partially
+    # activate the steps. See PROJECT_CONTEXT.md "mu_ratio_max vs mu_eff".
+    mu_ratio_max: float = 80.0
 
     # Dual-trigger effective viscosity (COMSOL step proxies; shared by GNODE_Phase3 + penalty loss)
     viscosity_mat_crit: float = 2e7

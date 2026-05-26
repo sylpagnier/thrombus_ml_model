@@ -89,6 +89,42 @@ def _biochem_mu_disable_explicit_gelation() -> bool:
     )
 
 
+def _biochem_gt_kine_vel_enabled() -> bool:
+    """Use COMSOL ``y`` channels ``[u,v,p]`` for macro kinematics instead of the frozen GINO-DEQ solve."""
+    return _biochem_env_truthy("BIOCHEM_GT_KINE_VEL")
+
+
+def _biochem_gt_kine_skip_deq() -> bool:
+    """When GT kinematics are on, skip Anderson DEQ (default on — saves time and avoids bad frozen flow)."""
+    return _biochem_env_truthy("BIOCHEM_GT_KINE_SKIP_DEQ", default=True)
+
+
+def resolve_gt_kine_uvp_at_step(
+    batch,
+    y_true_trajectory: torch.Tensor | None,
+    time_index: int,
+    truth_mask: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    fallback_uvp: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Return COMSOL ND ``[u,v,p]`` at ``time_index``, blended with ``fallback_uvp`` off truth nodes."""
+    yt = None
+    if y_true_trajectory is not None and y_true_trajectory.ndim == 3 and int(y_true_trajectory.shape[-1]) >= 3:
+        yt = y_true_trajectory
+    elif hasattr(batch, "y") and batch.y is not None and batch.y.ndim == 3 and int(batch.y.shape[-1]) >= 3:
+        yt = batch.y
+    if yt is None:
+        return None
+    ti = min(max(int(time_index), 0), int(yt.shape[0]) - 1)
+    gt = yt[ti, :, 0:3].to(device=device, dtype=dtype)
+    if fallback_uvp is not None and truth_mask.any():
+        fb = fallback_uvp.to(device=device, dtype=dtype)
+        return torch.where(truth_mask.unsqueeze(-1), gt, fb)
+    return gt
+
+
 def _biochem_mu_ic_steady_kin_enabled() -> bool:
     """Bootstrap rollout ``μ_eff`` at macro step 0 from one-shot frozen-kin DEQ (viz steady panel).
 
@@ -103,18 +139,12 @@ def _biochem_mu_k10d_simple_enabled() -> bool:
     return (
         _biochem_env_truthy("BIOCHEM_MU_K10D_SIMPLE")
         and not _biochem_mu_k10e_simple_enabled()
-        and not _biochem_mu_k11_clot_gate_enabled()
     )
-
-
-def _biochem_mu_k11_clot_gate_enabled() -> bool:
-    """K11: ``μ_eff = μ_ss + p_clot * (μ_clot − μ_ss)`` with ``p_clot = σ(head) × region_mask``."""
-    return _biochem_env_truthy("BIOCHEM_MU_K11_CLOT_GATE")
 
 
 def _biochem_mu_k10e_simple_enabled() -> bool:
     """K10e: ``μ_eff = μ_ss + adj_mask * softplus(Δμ_nd)*scale``; clots only in wall-adjacent band."""
-    return _biochem_env_truthy("BIOCHEM_MU_K10E_SIMPLE") and not _biochem_mu_k11_clot_gate_enabled()
+    return _biochem_env_truthy("BIOCHEM_MU_K10E_SIMPLE")
 
 
 def _biochem_k10g_oracle_clots_enabled() -> bool:
@@ -156,200 +186,6 @@ def k10e_wall_adjacent_mask(
         band = band * (d <= sdf_cap).to(dtype=d.dtype)
     return (band * off_wall).clamp(0.0, 1.0)
 
-
-def _k11_env_float(name: str, fallback: str, default: float) -> float:
-    raw = (os.environ.get(name) or os.environ.get(fallback) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def k11_clot_region_mask(
-    sdf_nd: torch.Tensor,
-    wall_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Wall-adjacent band (K11 env, else K10e defaults). Zero on ``mask_wall`` nodes."""
-    d_peak = _k11_env_float("BIOCHEM_K11_D_PEAK_ND", "BIOCHEM_K10E_D_PEAK_ND", 0.008)
-    sigma = max(_k11_env_float("BIOCHEM_K11_SIGMA_ND", "BIOCHEM_K10E_SIGMA_ND", 0.008), 1e-6)
-    sdf_cap = _k11_env_float("BIOCHEM_K11_SDF_MAX_ND", "BIOCHEM_K10E_SDF_MAX_ND", 0.04)
-    return k10e_wall_adjacent_mask(
-        sdf_nd,
-        wall_mask,
-        d_peak_nd=d_peak,
-        sigma_nd=sigma,
-        sdf_max_nd=sdf_cap,
-    )
-
-
-def k11_clot_apply_mask(
-    sdf_nd: torch.Tensor,
-    wall_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Where ``p_clot`` may raise ``μ_eff`` (forward). Default: wall proximity (COMSOL clots sit on wall mesh nodes).
-
-    Modes (``BIOCHEM_K11_APPLY_MODE``):
-    - ``wall_prox`` (default): ``exp(-|sdf|/λ)`` — peaks at wall, decays into lumen.
-    - ``adjacent``: off-wall Gaussian band only (legacy K11).
-    - ``union``: ``max(adjacent, wall_prox)``.
-    """
-    mode = (os.environ.get("BIOCHEM_K11_APPLY_MODE") or "wall_prox").strip().lower()
-    sdf = sdf_nd.reshape(-1, 1).to(dtype=torch.float32).clamp(min=0.0)
-    wm = wall_mask.reshape(-1, 1).to(dtype=sdf.dtype)
-    lambda_w = max(_k11_env_float("BIOCHEM_K11_WALL_PROX_LAMBDA_ND", "BIOCHEM_PRIOR_WALL_DECAY_ND", 0.008), 1e-5)
-    wall_prox = torch.exp(-sdf / lambda_w).clamp(0.0, 1.0)
-    adj = k11_clot_region_mask(sdf_nd, wall_mask)
-    if mode in ("adjacent", "adj", "off_wall"):
-        return adj
-    if mode in ("union", "max", "both"):
-        return torch.maximum(adj, wall_prox).clamp(0.0, 1.0)
-    # wall_prox: COMSOL high-μ labels often lie on wall nodes; do not zero them out.
-    return wall_prox
-
-
-def k11_mu_clot_si(phys_cfg) -> float:
-    """Fixed clot-branch viscosity [Pa·s] (COMSOL wall patches ~0.10)."""
-    raw = (os.environ.get("BIOCHEM_K11_MU_CLOT_SI") or "").strip()
-    if raw:
-        return max(float(raw), float(phys_cfg.mu_inf) * 1.01)
-    return max(0.10, float(phys_cfg.mu_inf) * 2.5)
-
-
-def _k11_trigger_apply_enabled() -> bool:
-    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_APPLY")
-
-
-def _k11_trigger_loss_enabled() -> bool:
-    raw = (os.environ.get("BIOCHEM_K11_TRIGGER_WEIGHT") or "").strip()
-    if raw:
-        return float(raw) > 0.0
-    return _biochem_env_truthy("BIOCHEM_K11_TRIGGER_LOSS", default=False)
-
-
-def k11_bio_trigger_score(
-    model: "GNODE_Phase3",
-    species_log: torch.Tensor,
-) -> torch.Tensor:
-    """Soft biological clot readiness from FI/Mat (SI), in ``[0, 1]``."""
-    sp = torch.clamp(species_log, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
-    species_si = model.species_log_nd_to_si(sp)
-    fi_si = species_si[:, 8:9]
-    mat_si = species_si[:, 11:12]
-    fi_thr = max(
-        _k11_env_float("BIOCHEM_K11_FI_THRESH_SI", "BIOCHEM_K11_FI_THRESH_SI", float(model.fi_crit) * 0.02),
-        1e-12,
-    )
-    mat_thr = max(
-        _k11_env_float("BIOCHEM_K11_MAT_THRESH_SI", "BIOCHEM_K11_MAT_THRESH_SI", float(model.mat_crit) * 0.02),
-        1e-12,
-    )
-    fi_s = torch.clamp(fi_si / fi_thr, 0.0, 4.0)
-    mat_s = torch.clamp(mat_si / mat_thr, 0.0, 4.0)
-    power = max(_k11_env_float("BIOCHEM_K11_BIO_TRIGGER_POWER", "BIOCHEM_K11_BIO_TRIGGER_POWER", 1.0), 0.25)
-    mode = (os.environ.get("BIOCHEM_K11_BIO_TRIGGER_MODE") or "or").strip().lower()
-    if mode in ("and", "both"):
-        bio = (fi_s * mat_s).pow(power)
-    else:
-        bio = torch.maximum(fi_s, mat_s).pow(power)
-    return bio.clamp(0.0, 1.0)
-
-
-def k11_mech_trigger_score(
-    data,
-    u_nd: torch.Tensor,
-    v_nd: torch.Tensor,
-    bio_cfg,
-    props: dict,
-) -> torch.Tensor:
-    """Wall-local kinematic clot-risk prior (COMSOL-aligned or legacy), ``[N, 1]``."""
-    from src.core_physics.clot_kinematics_fields import (
-        clot_prior_score_mode,
-        compute_clot_kinematics_fields,
-        score_clot_risk_from_fields,
-    )
-    from src.core_physics.kinematics_clot_prior import clot_prior_score_flat
-
-    u_flat = u_nd.reshape(-1).to(dtype=torch.float32)
-    v_flat = v_nd.reshape(-1).to(dtype=torch.float32)
-    if clot_prior_score_mode() == "legacy":
-        score = clot_prior_score_flat(data, u_flat, v_flat, bio_cfg, props)
-    else:
-        fields = compute_clot_kinematics_fields(data, u_flat, v_flat, bio_cfg, props)
-        score, _, _ = score_clot_risk_from_fields(fields, bio_cfg)
-    q_raw = (os.environ.get("BIOCHEM_K11_MECH_QUANTILE") or "").strip()
-    if q_raw and clot_prior_score_mode() == "legacy":
-        q = min(max(float(q_raw), 0.5), 0.999)
-        flat = score.reshape(-1)
-        thr = torch.quantile(flat, q)
-        score = torch.where(flat >= thr, flat, torch.zeros_like(flat))
-    return score.reshape(-1, 1).clamp(0.0, 1.0)
-
-
-def k11_clot_trigger_score(
-    model: "GNODE_Phase3",
-    species_log: torch.Tensor,
-    u_nd: torch.Tensor,
-    v_nd: torch.Tensor,
-    data,
-    bio_cfg,
-    props: dict,
-) -> torch.Tensor:
-    """Combine COMSOL-aligned biological + mechanical triggers, ``[N, 1]`` in ``[floor, 1]``."""
-    w_bio = max(_k11_env_float("BIOCHEM_K11_TRIGGER_W_BIO", "BIOCHEM_K11_TRIGGER_W_BIO", 0.45), 0.0)
-    w_mech = max(_k11_env_float("BIOCHEM_K11_TRIGGER_W_MECH", "BIOCHEM_K11_TRIGGER_W_MECH", 0.55), 0.0)
-    bio = k11_bio_trigger_score(model, species_log)
-    mech = k11_mech_trigger_score(data, u_nd, v_nd, bio_cfg, props)
-    combine = (os.environ.get("BIOCHEM_K11_TRIGGER_COMBINE") or "or").strip().lower()
-    if w_bio <= 0.0 and w_mech <= 0.0:
-        union = torch.ones_like(bio)
-    elif w_bio <= 0.0:
-        union = mech
-    elif w_mech <= 0.0:
-        union = bio
-    elif combine in ("avg", "mean", "weighted"):
-        union = (w_bio * bio + w_mech * mech) / (w_bio + w_mech)
-    else:
-        union = 1.0 - (1.0 - bio) * (1.0 - mech)
-    floor = max(_k11_env_float("BIOCHEM_K11_TRIGGER_FLOOR", "BIOCHEM_K11_TRIGGER_FLOOR", 0.02), 0.0)
-    return union.clamp(floor, 1.0)
-
-
-def _k11_dilate_clot_prob(
-    p_clot: torch.Tensor,
-    edge_index: torch.Tensor,
-) -> torch.Tensor:
-    """Spread clot probability to neighbors (clot-on-clot / corona)."""
-    if edge_index is None or edge_index.numel() < 2:
-        return p_clot
-    mix_val = _k11_env_float("BIOCHEM_K11_CLOT_GROWTH_MIX", "BIOCHEM_K10E_CORONA_MIX", 0.45)
-    if mix_val <= 0.0:
-        return p_clot
-    row, col = edge_index[0], edge_index[1]
-    neigh = torch.zeros_like(p_clot.reshape(-1))
-    neigh.scatter_reduce_(0, row, p_clot.reshape(-1)[col], reduce="amax", include_self=False)
-    grown = p_clot.reshape(-1) + (mix_val * neigh)
-    return grown.reshape_as(p_clot).clamp(0.0, 1.0)
-
-
-def _k10e_dilate_adjacent_mask(
-    mask: torch.Tensor,
-    edge_index: torch.Tensor,
-    *,
-    mix: float | None = None,
-) -> torch.Tensor:
-    """One-hop corona: clots can grow from wall-adjacent seeds or neighboring high-μ nodes."""
-    if edge_index is None or edge_index.numel() < 2:
-        return mask
-    mix_val = _k10e_env_float("BIOCHEM_K10E_CORONA_MIX", 0.4) if mix is None else mix
-    if mix_val <= 0.0:
-        return mask
-    row, col = edge_index[0], edge_index[1]
-    neigh = torch.zeros_like(mask.reshape(-1))
-    neigh.scatter_reduce_(0, row, mask.reshape(-1)[col], reduce="amax", include_self=False)
-    grown = mask.reshape(-1) + (mix_val * neigh)
-    return grown.reshape_as(mask).clamp(0.0, 1.0)
 
 
 def _biochem_mu_disable_mu1() -> bool:
@@ -422,9 +258,6 @@ _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
     ("mu_k10d_simple", "BIOCHEM_MU_K10D_SIMPLE"),
     ("mu_k10e_simple", "BIOCHEM_MU_K10E_SIMPLE"),
     ("mu_k10g_oracle_clots", "BIOCHEM_K10G_ORACLE_CLOTS"),
-    ("mu_k11_clot_gate", "BIOCHEM_MU_K11_CLOT_GATE"),
-    ("k11_trigger_apply", "BIOCHEM_K11_TRIGGER_APPLY"),
-    ("k11_clot_growth", "BIOCHEM_K11_CLOT_GROWTH"),
 )
 
 _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
@@ -455,15 +288,7 @@ def snapshot_biochem_forward_policy() -> dict[str, Any]:
         "mu_k10d_simple": _biochem_mu_k10d_simple_enabled(),
         "mu_k10e_simple": _biochem_mu_k10e_simple_enabled(),
         "mu_k10g_oracle_clots": _biochem_k10g_oracle_clots_enabled(),
-        "mu_k11_clot_gate": _biochem_mu_k11_clot_gate_enabled(),
     }
-    if policy["mu_k11_clot_gate"]:
-        raw_clot = (os.environ.get("BIOCHEM_K11_MU_CLOT_SI") or "").strip()
-        if raw_clot:
-            policy["k11_mu_clot_si"] = raw_clot
-        policy["k11_trigger_apply"] = _k11_trigger_apply_enabled()
-        policy["k11_apply_mode"] = (os.environ.get("BIOCHEM_K11_APPLY_MODE") or "wall_prox").strip()
-        policy["k11_clot_growth"] = _biochem_env_truthy("BIOCHEM_K11_CLOT_GROWTH", default=False)
     if policy["mu_k10d_simple"]:
         raw_max = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
         if raw_max:
@@ -525,13 +350,6 @@ def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> s
         tags.append("k10e_wall_adjacent_mu")
     if policy.get("mu_k10g_oracle_clots"):
         tags.append("k10g_oracle_clots")
-    if policy.get("mu_k11_clot_gate"):
-        tags.append("k11_clot_gate")
-        if policy.get("k11_trigger_apply") is False:
-            tags.append("no_trigger_apply")
-        mode = (policy.get("k11_apply_mode") or "").strip()
-        if mode and mode not in ("wall_prox",):
-            tags.append(f"apply_{mode}")
     if policy.get("mu_gemini_fix"):
         tags.append("gemini_fix")
     if policy.get("gelation_prior_gate") is False:
@@ -566,8 +384,6 @@ def apply_biochem_forward_policy(
         ("k10e_sigma_nd", "BIOCHEM_K10E_SIGMA_ND"),
         ("k10e_sdf_max_nd", "BIOCHEM_K10E_SDF_MAX_ND"),
         ("k10e_mu_delta_nd_max", "BIOCHEM_K10E_MU_DELTA_ND_MAX"),
-        ("k11_mu_clot_si", "BIOCHEM_K11_MU_CLOT_SI"),
-        ("k11_apply_mode", "BIOCHEM_K11_APPLY_MODE"),
     ):
         if field not in policy:
             continue
@@ -975,7 +791,7 @@ class GNODE_Phase3(nn.Module):
         # Match kinematics_best.pth encoder width (178 = 175 + 3 width priors when bands=16).
         self.use_width_priors = bool(int(os.environ.get("KINEMATICS_USE_WIDTH_PRIORS", "1")))
 
-        # COMSOL Step Function Approximations (Dual-Trigger)
+        # COMSOL step ceilings for mu1_sigmoid / mu2_sigmoid (not clot mu_eff/bulk ratio).
         self.mu_ratio_max = mu_ratio_max
         self.mat_crit = mat_crit
         self.fi_crit = fi_crit
@@ -1439,15 +1255,6 @@ class GNODE_Phase3(nn.Module):
                 if isinstance(last_lin, nn.Linear) and last_lin.bias is not None:
                     target = max(float(bias_nd), 1e-4)
                     last_lin.bias.fill_(float(torch.log(torch.expm1(torch.tensor(target))).item()))
-            elif _biochem_mu_k11_clot_gate_enabled() and isinstance(self.mu_delta_head, nn.Sequential):
-                last_lin = self.mu_delta_head[-1]
-                if isinstance(last_lin, nn.Linear) and last_lin.bias is not None:
-                    logit_bias = _k11_env_float(
-                        "BIOCHEM_K11_CLOT_LOGIT_BIAS",
-                        "BIOCHEM_K11_CLOT_LOGIT_BIAS",
-                        -2.0,
-                    )
-                    last_lin.bias.fill_(logit_bias)
             for gate_head in (self.mu_trigger_gate_head, self.mu_nucleation_gate_head, self.mu_growth_gate_head):
                 for m in gate_head.modules():
                     if isinstance(m, nn.Linear):
@@ -1456,14 +1263,14 @@ class GNODE_Phase3(nn.Module):
                             m.bias.zero_()
 
     def mu1_sigmoid(self, mat):
-        """Soft logic for Platelet-driven viscosity multiplier with numerical safeguards."""
+        """Platelet step μ₁(Mat) in [0, mu_ratio_max - 1] (COMSOL step ceiling, not mu_eff ratio)."""
         safe_t_scale = max(self.T_scale, 1e-5)
         norm_val = (mat - self.mat_crit) / (self.temp_mat * safe_t_scale)
         safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
         return (self.mu_ratio_max - 1.0) * torch.sigmoid(safe_val)
 
     def mu2_sigmoid(self, fi):
-        """Soft logic for Fibrin-driven viscosity multiplier with numerical safeguards."""
+        """Fibrin step μ₂(FI) in [0, mu_ratio_max] (COMSOL step ceiling, not mu_eff ratio)."""
         safe_t_scale = max(self.T_scale, 1e-5)
         norm_val = (fi - self.fi_crit) / (self.temp_fi * safe_t_scale)
         safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
@@ -1559,8 +1366,6 @@ class GNODE_Phase3(nn.Module):
         self._last_log_mu_before_wall = None
         self._last_mu_nucleation_prob = None
         self._last_mu_growth_prob = None
-        self._k11_p_clot_steps: list[torch.Tensor] = []
-        self._k11_p_clot_raw_steps: list[torch.Tensor] = []
         self._last_mu_nucleation_cue = None
 
         truth_mask = biochem_truth_node_mask(batch, num_nodes, device)
@@ -1598,11 +1403,8 @@ class GNODE_Phase3(nn.Module):
         mu_nd_scale = self.phys_cfg.mu_viscosity_nd_scale
 
         mu_ic_steady_kin = _biochem_mu_ic_steady_kin_enabled()
-        mu_k11_clot_gate = _biochem_mu_k11_clot_gate_enabled()
         mu_k10d_simple = _biochem_mu_k10d_simple_enabled()
         mu_k10e_simple = _biochem_mu_k10e_simple_enabled()
-        self._k11_p_clot_steps = []
-        self._k11_p_clot_raw_steps = []
         current_mu_eff = self._initial_mu_eff_si(batch)
         mu_eff_ic_steady_si: torch.Tensor | None = None
         mu_ss_const: torch.Tensor | None = None
@@ -1631,6 +1433,9 @@ class GNODE_Phase3(nn.Module):
         # ==========================================
         # 2. MACRO-MICRO STEPPING (Two-Way Coupling)
         # ==========================================
+        use_gt_kine = _biochem_gt_kine_vel_enabled()
+        skip_deq_for_gt = use_gt_kine and _biochem_gt_kine_skip_deq()
+
         for i in range(num_times):
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = self._slice_kinematics_input(batch, clone=True)
@@ -1639,17 +1444,42 @@ class GNODE_Phase3(nn.Module):
             kin_in[:, NodeFeat.MU_PRIOR] = current_mu_eff / mu_nd_scale
             kin_encoded = self._apply_fourier_encoding(kin_in)
 
-            z_kin, u_v_p, z_kin_ws = self._solve_kinematics_macro(
-                kin_encoded,
-                kin_in,
-                batch,
-                mod_adv,
-                mod_rheo,
-                mod_curve,
-                z_kin_ws,
-                use_mu_decoder=(i == 0),
-                current_mu_eff=current_mu_eff,
-            )
+            u_v_p = None
+            if skip_deq_for_gt:
+                u_v_p = resolve_gt_kine_uvp_at_step(
+                    batch,
+                    y_true_trajectory,
+                    i,
+                    truth_mask,
+                    device,
+                    kin_encoded.dtype,
+                )
+            if u_v_p is None:
+                z_kin, u_v_p, z_kin_ws = self._solve_kinematics_macro(
+                    kin_encoded,
+                    kin_in,
+                    batch,
+                    mod_adv,
+                    mod_rheo,
+                    mod_curve,
+                    z_kin_ws,
+                    use_mu_decoder=(i == 0),
+                    current_mu_eff=current_mu_eff,
+                )
+            else:
+                z_kin = z_kin_ws
+            if use_gt_kine and not skip_deq_for_gt:
+                gt_uvp = resolve_gt_kine_uvp_at_step(
+                    batch,
+                    y_true_trajectory,
+                    i,
+                    truth_mask,
+                    device,
+                    u_v_p.dtype,
+                    fallback_uvp=u_v_p,
+                )
+                if gt_uvp is not None:
+                    u_v_p = gt_uvp
 
             # --- B. UPDATE DYNAMIC RHEOLOGY FOR CURRENT TIME ---
             u_nd = u_v_p[:, 0:1]
@@ -1961,64 +1791,6 @@ class GNODE_Phase3(nn.Module):
                     current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
             elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
                 current_mu_eff = mu_eff_ic_steady_si.clone()
-            if mu_k11_clot_gate:
-                sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
-                if mu_ss_const is None:
-                    mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
-                        batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
-                    )
-                if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
-                    current_mu_eff = mu_eff_ic_steady_si.clone()
-                    p_raw = torch.zeros_like(mu_eff_ic_steady_si)
-                    p_clot = p_raw
-                    self._last_p_clot_raw = p_raw.detach()
-                    self._last_k10e_adj_mask = torch.zeros_like(mu_eff_ic_steady_si)
-                else:
-                    clot_logits = self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
-                    logit_temp = max(
-                        _k11_env_float("BIOCHEM_K11_LOGIT_TEMP", "BIOCHEM_K11_LOGIT_TEMP", 1.0),
-                        1e-3,
-                    )
-                    p_raw = torch.sigmoid(torch.clamp(clot_logits / logit_temp, min=-50.0, max=50.0))
-                    sdf_nd = kin_in[:, NodeFeat.SDF]
-                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=p_raw.dtype)
-                    apply_mask = k11_clot_apply_mask(sdf_nd, wall_mask)
-                    if _k11_trigger_apply_enabled():
-                        props_g = {
-                            "u_ref": u_ref.to(dtype=p_raw.dtype),
-                            "d_bar": d_bar.to(dtype=p_raw.dtype),
-                        }
-                        trig = k11_clot_trigger_score(
-                            self,
-                            sp_safe,
-                            u_nd,
-                            v_nd,
-                            batch,
-                            self._bio_cfg,
-                            props_g,
-                        )
-                        apply_mask = (apply_mask * trig).clamp(0.0, 1.0)
-                        self._last_k11_trigger_mask = trig.detach()
-                    else:
-                        self._last_k11_trigger_mask = None
-                    p_clot = (p_raw * apply_mask).clamp(0.0, 1.0)
-                    if _biochem_env_truthy("BIOCHEM_K11_CLOT_GROWTH", default=False):
-                        p_clot = _k11_dilate_clot_prob(p_clot, batch.edge_index.to(device=p_clot.device))
-                        p_clot = (p_clot * apply_mask).clamp(0.0, 1.0)
-                    self._last_p_clot_raw = p_raw.detach()
-                    mu_clot_si = torch.tensor(
-                        k11_mu_clot_si(self.phys_cfg),
-                        device=mu_ss_const.device,
-                        dtype=mu_ss_const.dtype,
-                    ).reshape(1, 1)
-                    current_mu_eff = mu_ss_const + (p_clot * (mu_clot_si - mu_ss_const))
-                    self._last_k10e_adj_mask = apply_mask.detach()
-                self._last_mu_delta_bulk = p_clot.detach()
-                self._last_mu_delta_tail = torch.zeros_like(p_clot)
-                self._last_mu_trigger_gate = p_clot.detach()
-                if self.training:
-                    self._k11_p_clot_steps.append(p_clot)
-                    self._k11_p_clot_raw_steps.append(p_raw)
             elif mu_k10d_simple or mu_k10e_simple:
                 sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
                 if mu_ss_const is None:

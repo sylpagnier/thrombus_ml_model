@@ -137,7 +137,8 @@ def compute_clot_kinematics_fields(
     sgt_ref = max(abs(float(bio_cfg.sgt)), 1e-6)
     flux_path_stream = (is_separation_stream * (torch.abs(dshear_ds_phys) / sgt_ref)).clamp(0.0, 5.0)
 
-    dx_thr = max(_env_float("BIOCHEM_PRIOR_DGAMMA_DX_THRESH", 800.0), 1e-6)
+    dx_default = 800.0 if clot_prior_score_mode() == "legacy" else 35.0
+    dx_thr = max(_env_float("BIOCHEM_PRIOR_DGAMMA_DX_THRESH", dx_default), 1e-6)
     dy_thr = max(_env_float("BIOCHEM_PRIOR_DGAMMA_DY_THRESH", dx_thr), 1e-6)
     w_dx = max(_env_float("BIOCHEM_PRIOR_W_DGAMMA_DX", 1.0), 0.0)
     w_dy = max(_env_float("BIOCHEM_PRIOR_W_DGAMMA_DY", 0.35), 0.0)

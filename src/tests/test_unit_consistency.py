@@ -30,6 +30,9 @@ from src.utils.units import (
     MeshUnitMismatchError,
     SUPPORTED_MESH_UNITS,
     assert_mesh_unit,
+    d_bar_si_from_sidecar,
+    length_in_meters,
+    read_mesh_length_unit,
 )
 
 
@@ -97,6 +100,41 @@ def test_assert_mesh_unit_unsupported_expected_raises_value_error():
 
 def test_supported_mesh_units_match_expected_set():
     assert set(SUPPORTED_MESH_UNITS) == {"m", "cm"}
+
+
+def test_read_mesh_length_unit_cm_and_m():
+    assert read_mesh_length_unit(
+        {"unit": "m"}, stem="vessel_0", builder="UnitTest"
+    ) == "m"
+    assert read_mesh_length_unit(
+        {"unit": "cm"}, stem="vessel_0", builder="UnitTest"
+    ) == "cm"
+
+
+def test_length_in_meters_cm_to_si():
+    assert length_in_meters(1.2, "cm") == pytest.approx(0.012)
+    assert length_in_meters(0.012, "m") == pytest.approx(0.012)
+
+
+def test_d_bar_si_from_sidecar_cm():
+    d_si, unit = d_bar_si_from_sidecar(
+        {"unit": "cm", "d_bar": 1.2}, stem="vessel_0", builder="UnitTest"
+    )
+    assert unit == "cm"
+    assert d_si == pytest.approx(0.012)
+
+
+def test_d_bar_si_from_sidecar_m():
+    d_si, unit = d_bar_si_from_sidecar(
+        {"unit": "m", "d_bar": 0.012}, stem="vessel_0", builder="UnitTest"
+    )
+    assert unit == "m"
+    assert d_si == pytest.approx(0.012)
+
+
+def test_d_bar_si_from_sidecar_missing_d_bar_raises():
+    with pytest.raises(KeyError, match="d_bar"):
+        d_bar_si_from_sidecar({"unit": "m"}, stem="vessel_0", builder="UnitTest")
 
 
 # --- CGS_to_SI vs PhysicsConfig coherence --------------------------------------

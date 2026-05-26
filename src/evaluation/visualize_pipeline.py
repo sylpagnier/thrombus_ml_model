@@ -29,7 +29,6 @@ from src.architecture.gnode_biochem import (
     _SPECIES_LOG1P_MAX,
     _SPECIES_LOG1P_MIN,
     _biochem_mu_disable_explicit_gelation,
-    _biochem_mu_k11_clot_gate_enabled,
     _biochem_mu_simple_log_residual_enabled,
     biochem_explicit_gelation_terms,
     resolve_gnode_phase3_ctor_kwargs,
@@ -38,6 +37,7 @@ from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
 from src.utils.nondim import to_t_nd
 from src.utils.channel_schema import infer_missing_schema
+from src.utils.kinematics_paths import kinematics_graph_rheology_dir
 
 # Standard channel indices across all models for kinematics
 _CHANNEL = dict(u=0, v=1, p=2, mu_eff=STATE_CHANNEL_MU_EFF_ND)
@@ -70,8 +70,8 @@ _DEFAULT_VAL_ANCHOR_STEM = "patient007"
 # Legacy COMSOL display (species sigmoids); biochem rollout uses stored ``mu_eff`` when ablated.
 _MU_DYNAMIC_SI_LABEL = r"$\mu_b \times (\mu_1(\mathrm{Mat}) + \mu_2(\mathrm{FI}))$ [Pa·s]"
 _MU1_PRODUCT_SI_LABEL = r"$\mu_{blood}\times\mu_1$(Mat) [Pa·s]"
-_MU2_TRIGGER_LABEL = r"$\mu_2$ trigger (FI) [−]"
-# COMSOL Surface default "WaveLightClassic" ≈ matplotlib blue–white–red (``bwr``).
+_MU2_TRIGGER_LABEL = r"$\mu_2$ trigger (FI) [-]"
+# COMSOL Surface default "WaveLightClassic" ~ matplotlib blue–white–red (``bwr``).
 _MU_VIZ_CMAP_DEFAULT = "bwr"
 # COMSOL WaveLightClassic legend on ``mu_b*(mu2+mu1)`` exports (patient007 t_final reference).
 _MU_VIZ_VMIN_DEFAULT = 0.04
@@ -129,65 +129,16 @@ def _biochem_mu_viz_labels() -> Dict[str, str]:
     return {
         "mu_dynamic": mu_dyn,
         "mu1_product": r"$\mu_{\mathrm{blood}}\times\mu_1$ (effective) [Pa·s]",
-        "mu2_trigger": r"$\mu_2$ (effective in forward) [−]",
+        "mu2_trigger": r"$\mu_2$ (effective in forward) [-]",
         "gelation_suffix": gel_suffix,
     }
 
 
 def _rollout_mu_eff_si_numpy(phys_cfg: PhysicsConfig, pred_np: np.ndarray) -> np.ndarray:
-    """Stored rollout viscosity channel (ND → SI); matches kinematic coupling in forward."""
+    """Stored rollout viscosity channel (ND -> SI); matches kinematic coupling in forward."""
     mu_ch = STATE_CHANNEL_MU_EFF_ND
     mu_nd = torch.from_numpy(pred_np[:, mu_ch]).float().view(-1, 1)
     return phys_cfg.viscosity_nd_to_si(mu_nd).detach().cpu().numpy().reshape(-1)
-
-
-def _k11_p_clot_series_numpy(
-    model: GNODE_Phase3,
-    frame_indices: List[int],
-) -> Optional[np.ndarray]:
-    """Per-keyframe K11 ``p_clot`` from the last dense rollout (macro steps)."""
-    steps = getattr(model, "_k11_p_clot_steps", None)
-    if not steps:
-        return None
-    stacked = torch.stack([s.reshape(-1).float() for s in steps], dim=0).detach().cpu().numpy()
-    out = np.zeros((len(frame_indices), stacked.shape[1]), dtype=np.float32)
-    for fi, idx in enumerate(frame_indices):
-        out[fi] = stacked[min(int(idx), stacked.shape[0] - 1)]
-    return out
-
-
-def _carreau_mu_blood_torch(
-    model: GNODE_Phase3,
-    data,
-    pred_t: torch.Tensor,
-) -> torch.Tensor:
-    """Shear-thinning baseline ``μ_b`` from decoded ``u,v`` (SI)."""
-    device = pred_t.device
-    dtype = pred_t.dtype
-    u_nd = pred_t[:, 0:1]
-    v_nd = pred_t[:, 1:2]
-    mu_inf = model.phys_cfg.mu_inf
-    mu_0 = model.phys_cfg.mu_0
-    lam = model.phys_cfg.lam
-    n_idx = model.phys_cfg.n
-    u_ref = data.u_ref.view(-1, 1).to(device=device, dtype=dtype)
-    d_bar = data.d_bar.view(-1, 1).to(device=device, dtype=dtype)
-
-    du_dx_nd = torch.sparse.mm(data.G_x, u_nd)
-    du_dy_nd = torch.sparse.mm(data.G_y, u_nd)
-    dv_dx_nd = torch.sparse.mm(data.G_x, v_nd)
-    dv_dy_nd = torch.sparse.mm(data.G_y, v_nd)
-
-    scale_grad = u_ref / d_bar
-    gamma_dot = torch.sqrt(
-        2 * ((du_dx_nd * scale_grad) ** 2 + (dv_dy_nd * scale_grad) ** 2)
-        + ((du_dy_nd * scale_grad) + (dv_dx_nd * scale_grad)) ** 2
-        + 1e-8
-    )
-    mu_blood = mu_inf + (mu_0 - mu_inf) * torch.pow(
-        1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0
-    )
-    return mu_blood.squeeze(-1)
 
 
 @dataclass(frozen=True)
@@ -229,45 +180,45 @@ def _print_biochem_checkpoint_banner(choice: BiochemCheckpointChoice, meta: Dict
         "teacher_best_high_mu": "global-best teacher (lowest val mu_log_mae_high_mu)",
         "teacher_last": "most recent teacher run (backup)",
         "teacher_best_all_legacy": "legacy global teacher all-truth (biochem_teacher_best.pth)",
-        "corrector_best_high_mu": "corrector global high-μ (legacy filename)",
+        "corrector_best_high_mu": "corrector global high-mu (legacy filename)",
         "corrector_best_bio_legacy": "legacy corrector best (composite; deprecated)",
         "corrector_latest": "full corrector — latest resume snapshot",
         "custom": "user-specified path",
     }
-    print("\n📦 Biochem checkpoint selection (from train_biochem_corrector.py):")
-    print(f"   ↳ file: {choice.path.resolve()}")
-    print(f"   ↳ role: {role} — {role_labels.get(role, role_labels['custom'])}")
+    print("\n[i]  Biochem checkpoint selection (from train_biochem_corrector.py):")
+    print(f"   ->  file: {choice.path.resolve()}")
+    print(f"   ->  role: {role} — {role_labels.get(role, role_labels['custom'])}")
     if choice.explicit:
-        print("   ↳ source: --biochem-checkpoint or VIZ_BIOCHEM_CHECKPOINT")
+        print("   ->  source: --biochem-checkpoint or VIZ_BIOCHEM_CHECKPOINT")
     elif role in _BIOCHEM_TEACHER_CKPT_ROLES:
         print(
-            "   ↳ source: teacher checkpoint preference "
-            f"({' → '.join(_BIOCHEM_TEACHER_CKPT_CANDIDATES)})"
+            "   ->  source: teacher checkpoint preference "
+            f"({' -> '.join(_BIOCHEM_TEACHER_CKPT_CANDIDATES)})"
         )
     else:
         print(
-            "   ↳ source: default preference order "
-            f"({' → '.join(_BIOCHEM_CKPT_CANDIDATES)}) — first existing file wins"
+            "   ->  source: default preference order "
+            f"({' -> '.join(_BIOCHEM_CKPT_CANDIDATES)}) — first existing file wins"
         )
     t_ep = meta.get("best_epoch", -1)
     t_mae = meta.get("val_mu_log_mae")
     t_high = meta.get("val_mu_log_mae_high_mu")
     run_note = (meta.get("run_note") or "").strip()
     if isinstance(t_ep, int) and t_ep >= 0:
-        print(f"   ↳ saved at teacher/corrector epoch: {int(t_ep)}")
+        print(f"   ->  saved at teacher/corrector epoch: {int(t_ep)}")
     if t_mae is not None:
         try:
-            print(f"   ↳ val mu_log_mae all (stored in ckpt): {float(t_mae):.4f}")
+            print(f"   ->  val mu_log_mae all (stored in ckpt): {float(t_mae):.4f}")
         except (TypeError, ValueError):
             pass
     if t_high is not None:
         try:
-            print(f"   ↳ val mu_log_mae high-μ (stored in ckpt): {float(t_high):.4f}")
+            print(f"   ->  val mu_log_mae high-mu (stored in ckpt): {float(t_high):.4f}")
         except (TypeError, ValueError):
             pass
     if run_note:
-        print(f"   ↳ run_note: {run_note}")
-    print("   ↳ on-disk inventory:")
+        print(f"   ->  run_note: {run_note}")
+    print("   ->  on-disk inventory:")
     for line in _format_biochem_ckpt_inventory().splitlines():
         print(line)
 
@@ -276,63 +227,176 @@ def _anchor_graph_dir() -> Path:
     return Path(VesselConfig(phase="biochem_anchors").graph_output_dir)
 
 
-def _list_anchor_graph_paths() -> List[Path]:
-    anchor_dir = _anchor_graph_dir()
-    if not anchor_dir.exists():
-        return []
-    return sorted(anchor_dir.glob("*.pt"))
-
-
 def _list_anchor_stems() -> List[str]:
-    return [p.stem for p in _list_anchor_graph_paths()]
+    anchor_dir = _anchor_graph_dir()
+    if not anchor_dir.is_dir():
+        return []
+    return sorted(p.stem for p in anchor_dir.glob("*.pt"))
 
 
 def _default_val_anchor_stem(stems: List[str]) -> str:
-    if not stems:
-        raise FileNotFoundError(
-            f"No anchor graphs found under {_anchor_graph_dir()}. "
-            "Export COMSOL anchors first (see src/data_gen/pipeline_biochem.py) "
-            "or pass --synthetic to visualize a generated vessel."
-        )
+    env = (os.environ.get("VIZ_ANCHOR_STEM") or "").strip()
+    if env and env in stems:
+        return env
     if _DEFAULT_VAL_ANCHOR_STEM in stems:
         return _DEFAULT_VAL_ANCHOR_STEM
-    n = len(stems)
-    split_idx = int(0.9 * n)
-    split_idx = max(1, min(split_idx, n - 1))
-    return stems[split_idx]
+    return stems[0] if stems else ""
 
 
-def _resolve_anchor_stem(explicit: Optional[str] = None) -> str:
-    env_stem = (os.environ.get("VIZ_ANCHOR_STEM") or "").strip()
-    stem = (explicit or env_stem or "").strip()
+def _resolve_anchor_stem(explicit: Optional[str]) -> str:
     stems = _list_anchor_stems()
-    if stem:
-        if stem.endswith(".pt"):
-            stem = Path(stem).stem
-        if stem not in stems:
-            raise FileNotFoundError(
-                f"Anchor graph '{stem}' not found under {_anchor_graph_dir()}. "
-                f"Available: {', '.join(stems) or '(none)'}"
-            )
-        return stem
+    if not stems:
+        raise FileNotFoundError(f"No anchor graphs under {_anchor_graph_dir()}")
+    if explicit:
+        stem = Path(explicit).stem if str(explicit).endswith(".pt") else str(explicit).strip()
+        if stem in stems:
+            return stem
+        raise FileNotFoundError(f"Anchor stem '{stem}' not found under {_anchor_graph_dir()}")
     return _default_val_anchor_stem(stems)
+
+
+def _load_graph_pt(path: Path, device: torch.device, *, phase_hint: str):
+    if not path.is_file():
+        raise FileNotFoundError(f"Graph not found: {path}")
+    data = torch.load(path, map_location=device, weights_only=False)
+    return infer_missing_schema(data, phase_hint=phase_hint)
 
 
 def _load_anchor_graph(stem: str, device: torch.device):
     path = _anchor_graph_dir() / f"{stem}.pt"
-    if not path.is_file():
-        raise FileNotFoundError(f"Anchor graph not found: {path}")
-    data = torch.load(path, weights_only=False)
-    data = infer_missing_schema(data, phase_hint="biochem")
-    return data.to(device), path
+    return _load_graph_pt(path, device, phase_hint="biochem"), path
 
 
 def _graph_has_comsol_trajectory(data) -> bool:
-    if not hasattr(data, "y") or data.y is None or not torch.is_tensor(data.y):
+    if not hasattr(data, "y") or data.y is None:
         return False
-    if data.y.dim() == 3 and data.y.shape[0] >= 1 and data.y.shape[-1] >= 16:
-        return True
-    return data.y.dim() == 2 and data.y.shape[-1] >= 16
+    y = data.y
+    if y.dim() == 2 and y.shape[1] >= 3:
+        return float(y[:, :3].norm().item()) > 1e-6
+    if y.dim() == 3 and y.shape[2] >= 3:
+        return float(y[:, :3].norm().item()) > 1e-6
+    return False
+
+
+def _kinematics_graph_dir(rheology: str = "newtonian") -> Path:
+    return kinematics_graph_rheology_dir(rheology)
+
+
+def _load_kinematics_gino_deq(device: torch.device) -> GINO_DEQ:
+    kin_ckpt = _resolve_kinematics_checkpoint()
+    print(f"   ->  Kinematics checkpoint: {kin_ckpt}")
+    kin_raw = torch.load(kin_ckpt, map_location=device, weights_only=False)
+    kin_meta, kin_state = kinematics_checkpoint_tensors(kin_raw)
+    ctor = resolve_gino_deq_ctor_kwargs(kin_meta, kin_state)
+    phys_cfg_kine = PhysicsConfig(phase="kinematics")
+    model = build_gino_deq_from_ctor(phys_cfg_kine, ctor).to(device)
+    model.load_state_dict(kin_state, strict=False)
+    model.eval()
+    return model
+
+
+def _steady_kine_target_tensor(data, time_index: int = -1) -> Optional[torch.Tensor]:
+    if not hasattr(data, "y") or data.y is None:
+        return None
+    y = data.y
+    if y.dim() == 3:
+        t = int(time_index) if time_index >= 0 else int(y.shape[0]) + int(time_index)
+        t = max(0, min(t, y.shape[0] - 1))
+        return y[t, :, :5]
+    if y.dim() == 2 and y.shape[1] >= 5:
+        return y[:, :5]
+    return None
+
+
+def _fields_from_kine_state(state_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    u = state_np[:, _CHANNEL["u"]]
+    v = state_np[:, _CHANNEL["v"]]
+    vel = np.sqrt(u ** 2 + v ** 2)
+    pressure = state_np[:, _CHANNEL["p"]]
+    viscosity = state_np[:, _CHANNEL["mu_eff"]]
+    return vel, pressure, viscosity
+
+
+def _rel_l2_uvp(pred: np.ndarray, tgt: np.ndarray) -> float:
+    diff = pred[:, :3] - tgt[:, :3]
+    return float(np.linalg.norm(diff) / (np.linalg.norm(tgt[:, :3]) + 1e-8))
+
+
+def _show_steady_kinematics_pred_vs_gt(
+    pos: np.ndarray,
+    pred_np: np.ndarray,
+    gt_np: Optional[np.ndarray],
+    *,
+    case_label: str,
+    cohort: str,
+    rel_l2: Optional[float] = None,
+) -> None:
+    """Steady GINO-DEQ: model prediction vs labels (when available)."""
+    vel_p, p_p, mu_p = _fields_from_kine_state(pred_np)
+    has_gt = gt_np is not None and gt_np.shape[0] == pred_np.shape[0]
+    nrows = 2 if has_gt else 1
+    xlo, xhi, ylo, yhi = _mesh_axis_limits(pos)
+    xspan = max(xhi - xlo, 1e-9)
+    yspan = max(yhi - ylo, 1e-9)
+    panel_aspect = yspan / xspan
+    panel_h = 3.8
+    panel_w = min(panel_h * panel_aspect, 5.2)
+    fig, axes = plt.subplots(nrows, 3, figsize=(panel_w * 3.35, panel_h * nrows + 0.7))
+    axes = np.atleast_2d(axes)
+
+    rel_note = f" | rel_L2(uvp)={rel_l2:.3f}" if rel_l2 is not None else ""
+    title = f"Steady kinematics — {cohort} / {case_label}{rel_note}"
+
+    row_specs = [(vel_p, p_p, mu_p, "GINO-DEQ pred")]
+    if has_gt:
+        vel_g, p_g, mu_g = _fields_from_kine_state(gt_np)
+        row_specs.append((vel_g, p_g, mu_g, "labels (GT)"))
+
+    col_titles = ("|u| (ND)", "p (ND)", r"$\mu_{eff}$ (ND)")
+    cmaps = ("jet", "coolwarm", "viridis")
+    for row_i, (vel, pres, mu, row_lbl) in enumerate(row_specs):
+        for col_i, (values, col_lbl, cmap) in enumerate(zip((vel, pres, mu), col_titles, cmaps)):
+            _plot_field(
+                fig,
+                axes[row_i, col_i],
+                pos,
+                values,
+                f"{row_lbl}: {col_lbl}",
+                cmap,
+                tight_axes=True,
+                xlim=(xlo, xhi),
+                ylim=(ylo, yhi),
+            )
+    fig.subplots_adjust(left=0.02, right=0.99, bottom=0.06, top=0.88, wspace=0.14, hspace=0.28)
+    _set_figure_suptitle(fig, title, fontsize=14, subplot_top=0.84, title_y=0.96)
+
+
+def run_steady_kinematics_viz(
+    *,
+    cases: List[Tuple[str, str, Path]],
+    time_index: int = -1,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Run steady GINO-DEQ on one or more graphs; matplotlib pred vs GT per case."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[i] Steady kinematics-only viz on {device}")
+    model = _load_kinematics_gino_deq(device)
+    for cohort, label, graph_path in cases:
+        data = _load_graph_pt(graph_path, device, phase_hint="biochem" if cohort == "patient" else "kinematics")
+        with torch.no_grad():
+            pred = _run_model_once(model, data)
+        pred_np = pred.detach().cpu().numpy()
+        tgt = _steady_kine_target_tensor(data, time_index=time_index)
+        gt_np = tgt.detach().cpu().numpy() if tgt is not None else None
+        rel = _rel_l2_uvp(pred_np, gt_np) if gt_np is not None else None
+        if rel is not None:
+            print(f"   {label}: rel_L2(uvp)={rel:.4f} (time_index={time_index})")
+        pos = data.x[:, :2].detach().cpu().numpy()
+        _show_steady_kinematics_pred_vs_gt(
+            pos, pred_np, gt_np, case_label=label, cohort=cohort, rel_l2=rel
+        )
+    print("[i] Close each figure window to exit (or advance if your backend is interactive).")
+    plt.show()
 
 
 def _nearest_time_indices(times_si: torch.Tensor, query_times: List[float]) -> List[int]:
@@ -453,7 +517,7 @@ def _inject_biochem_kinematic_lora(model, rank=4, alpha=1.0):
     if getattr(model, "kinematics_decoder", None) is not None:
         n_dec = inject_lora_to_spectral_linears(model.kinematics_decoder, rank=rank, alpha=alpha)
     print(
-        f"   ↳ LoRA injected: kin_encoder={n_enc}, kin_processor={n_proc + n_proc_extra}, "
+        f"   ->  LoRA injected: kin_encoder={n_enc}, kin_processor={n_proc + n_proc_extra}, "
         f"kinematics_decoder={n_dec} (rank={rank}, alpha={alpha}; SIREN ckpts use decoder=0)"
     )
 
@@ -572,7 +636,7 @@ def _comsol_style_rheology_fields(
     data,
     pred_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """COMSOL reference display: Carreau ``μ_b`` × ``(1+μ₁+μ₂)`` from species sigmoids."""
+    """COMSOL reference display: Carreau ``μ_b`` x ``(1+μ₁+μ₂)`` from species sigmoids."""
     device = pred_t.device
     dtype = pred_t.dtype
     mu_blood = _carreau_mu_blood_torch(model, data, pred_t)
@@ -629,7 +693,7 @@ def _rheology_series_numpy(
     *,
     biochem_rollout: bool = True,
 ) -> np.ndarray:
-    """``pred_series_np`` ``[T,N,C]`` → ``μ_eff`` in SI ``[T,N]`` (rollout channel or COMSOL-style)."""
+    """``pred_series_np`` ``[T,N,C]`` -> ``μ_eff`` in SI ``[T,N]`` (rollout channel or COMSOL-style)."""
     device = data.x.device
     dtype = torch.float32
     t_steps = int(pred_series_np.shape[0])
@@ -653,7 +717,7 @@ def _rheology_trigger_series_numpy(
     *,
     biochem_rollout: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """``[T,N,C]`` → ``(μ_blood×μ_1, μ_2)`` effective (biochem) or COMSOL-style sigmoids."""
+    """``[T,N,C]`` -> ``(μ_bloodxμ_1, μ_2)`` effective (biochem) or COMSOL-style sigmoids."""
     device = data.x.device
     dtype = torch.float32
     t_steps = int(pred_series_np.shape[0])
@@ -677,7 +741,7 @@ def _trigger_fields_numpy(
     *,
     biochem_rollout: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Single-frame ``[N,C]`` → ``(μ_blood×μ_1, μ_2)`` for gelation comparison figure."""
+    """Single-frame ``[N,C]`` -> ``(μ_bloodxμ_1, μ_2)`` for gelation comparison figure."""
     device = data.x.device
     pred_t = torch.from_numpy(pred_np).to(device=device, dtype=torch.float32)
     fields_fn = _biochem_rollout_rheology_fields if biochem_rollout else _comsol_style_rheology_fields
@@ -701,7 +765,7 @@ def _show_mu_trigger_comparison_figure(
     mu2_comsol: Optional[np.ndarray] = None,
     mu_labels: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Static gelation triggers at final rollout time; optional COMSOL vs ML 2×2 grid."""
+    """Static gelation triggers at final rollout time; optional COMSOL vs ML 2x2 grid."""
     when = f" at {time_label}" if time_label else " at final time"
     labels = mu_labels or _biochem_mu_viz_labels()
     mu1_lbl = labels["mu1_product"]
@@ -886,9 +950,7 @@ def _show_biochem_temporal_slider(
     on_refresh=None,
     comsol_series_np: Optional[np.ndarray] = None,
     title_prefix: str = "Biochem Temporal Inspector",
-    refresh_label: str = "Refresh",
-    k11_p_clot_series: Optional[np.ndarray] = None,
-):
+    refresh_label: str = "Refresh",):
     vel_all, _ = _vel_pressure_from_series(pred_biochem_series_np)
     bio_cfg = BiochemConfig(phase="biochem")
     mu_labels = _biochem_mu_viz_labels()
@@ -901,8 +963,7 @@ def _show_biochem_temporal_slider(
         model_biochem, data_biochem, pred_biochem_series_np, biochem_rollout=True
     )
     mu2_cap = float(model_biochem.mu_ratio_max)
-    show_k11_gate = k11_p_clot_series is not None and k11_p_clot_series.ndim == 2
-    show_legacy_gel = not _biochem_mu_disable_explicit_gelation() and not show_k11_gate
+    show_legacy_gel = not _biochem_mu_disable_explicit_gelation()
 
     show_comsol = comsol_series_np is not None
     ncols = 2 if show_comsol else 1
@@ -980,7 +1041,7 @@ def _show_biochem_temporal_slider(
             mat_vmax,
         )
 
-    # --- Main: flow + effective viscosity + (K11 p_clot or legacy μ₁/μ₂) ---
+    # --- Main: flow + effective viscosity + optional legacy μ₁/μ₂ ---
     nrows_main = 4
     fig, axs = plt.subplots(nrows_main, ncols, figsize=(7 * ncols, 15))
     if ncols == 1:
@@ -997,26 +1058,7 @@ def _show_biochem_temporal_slider(
     scatters["mu_b"] = _init_scatter(
         fig, axs[1, col_b], mu_dyn_all, f"Biochem: {mu_labels['mu_dynamic']}", _viz_mu_cmap(), mu_vmin, mu_vmax
     )
-    if show_k11_gate:
-        scatters["pclot_b"] = _init_scatter(
-            fig,
-            axs[2, col_b],
-            k11_p_clot_series,
-            r"Biochem: $p_{\mathrm{clot}}$ (K11 gate) [−]",
-            "Reds",
-            0.0,
-            1.0,
-        )
-        scatters["m2_b"] = _init_scatter(
-            fig,
-            axs[3, col_b],
-            mu2_all,
-            f"Biochem: {mu_labels['mu2_trigger']} (legacy)",
-            "Reds",
-            0.0,
-            mu2_cap,
-        )
-    elif show_legacy_gel:
+    if show_legacy_gel:
         scatters["m1_b"] = _init_scatter(
             fig, axs[2, col_b], mb_mu1_all, f"Biochem: {mu_labels['mu1_product']}", _viz_mu_cmap(), m1_vmin, m1_vmax
         )
@@ -1086,8 +1128,6 @@ def _show_biochem_temporal_slider(
         t_lbl = f"t={custom_times[idx]:.1f}s"
         scatters["vel_b"].set_array(vel_all[idx])
         scatters["mu_b"].set_array(mu_dyn_all[idx])
-        if "pclot_b" in scatters:
-            scatters["pclot_b"].set_array(k11_p_clot_series[idx])
         if "m1_b" in scatters:
             scatters["m1_b"].set_array(mb_mu1_all[idx])
         scatters["m2_b"].set_array(mu2_all[idx])
@@ -1127,13 +1167,13 @@ def _show_biochem_temporal_slider(
 
     if n_frames <= 1:
         print(
-            "   ⚠️ Temporal slider: only one keyframe in this rollout "
+            "   [WARN]  Temporal slider: only one keyframe in this rollout "
             f"(n={n_frames}); use --full-viz or VIZ_BIOCHEM_MACRO_STEPS=full for more steps."
         )
     else:
         t_end = custom_times[-1]
         print(
-            f"   ↳ Temporal slider: {n_frames} keyframes (0…{n_frames - 1}), "
+            f"   ->  Temporal slider: {n_frames} keyframes (0…{n_frames - 1}), "
             f"t ∈ [0, {t_end:.1f}] s — bottom of Species or Flow & rheology window."
         )
     plt.show()
@@ -1151,14 +1191,14 @@ def run_phase_comparison(
     root = get_project_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_anchor = source != "synthetic"
-    print(f"🖥️ Using device: {device}")
+    print(f" Using device: {device}")
     if use_anchor:
         print(f"📍 Data source: COMSOL anchor graph")
     else:
         print(f"🎲 Geometry seed: {seed}")
     fast_mode = _viz_fast_enabled(fast_viz)
     print(
-        f"⚡ Fast visualization mode: {'ON' if fast_mode else 'OFF'} "
+        f" Fast visualization mode: {'ON' if fast_mode else 'OFF'} "
         f"(dense COMSOL-spaced rollout; use --full-viz or VIZ_FAST=0 for high-fidelity)"
     )
     refresh_state = {"requested": False}
@@ -1170,15 +1210,15 @@ def run_phase_comparison(
     if use_anchor:
         stem = _resolve_anchor_stem(anchor_stem)
         case_label = stem
-        print(f"   ↳ Anchor stem: {stem} ({_anchor_graph_dir()})")
+        print(f"   ->  Anchor stem: {stem} ({_anchor_graph_dir()})")
         try:
             data_biochem, anchor_path = _load_anchor_graph(stem, device)
         except FileNotFoundError as exc:
-            print(f"⚠️ {exc}")
+            print(f"[WARN]  {exc}")
             return False
         if not _graph_has_comsol_trajectory(data_biochem):
             print(
-                f"⚠️ Anchor graph '{stem}' has no usable COMSOL labels in data.y. "
+                f"[WARN]  Anchor graph '{stem}' has no usable COMSOL labels in data.y. "
                 "Re-export with extract_biochem_comsol_data.py or pick another stem."
             )
             return False
@@ -1202,7 +1242,7 @@ def run_phase_comparison(
                 and any(graph_biochem_dir.glob("*.pt"))
             )
             if not has_ready_data:
-                print("⚠️ No existing cached synthetic data found. Regenerating now...")
+                print("[WARN]  No existing cached synthetic data found. Regenerating now...")
                 need_regen = True
 
         if need_regen:
@@ -1211,11 +1251,11 @@ def run_phase_comparison(
                     if f.is_file():
                         f.unlink()
 
-            print("\n📐 Generating 1 complex synthetic vessel for the comparison...")
+            print("\n Generating 1 complex synthetic vessel for the comparison...")
             vg = VesselGeneratorPhase3(output_dir=raw_dir)
             vg.run_pipeline(n=1, level=1, num_workers=1, seed=seed)
 
-            print("\n🕸️ Converting mesh to graphs for each phase's specific channel requirements...")
+            print("\n Converting mesh to graphs for each phase's specific channel requirements...")
             mg1 = MeshToGraphComplete(
                 phase="kinematics", raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_kine_base_dir
             )
@@ -1223,25 +1263,25 @@ def run_phase_comparison(
             mg3 = MeshToGraphPhase3(raw_dir=raw_dir, label_dir=raw_dir, proc_dir=graph_biochem_dir)
             mg3.run(max_files=1)
         else:
-            print("\n♻️ Reusing existing single-case synthetic data.")
+            print("\n Reusing existing single-case synthetic data.")
 
         try:
             data_kine_base = _load_single_graph(graph_kine_base_dir, device, "kinematics")
             data_biochem = _load_single_graph(graph_biochem_dir, device, "biochem")
             case_label = "synthetic"
         except FileNotFoundError as exc:
-            print(f"⚠️ Failed to generate or load graph files: {exc}")
+            print(f"[WARN]  Failed to generate or load graph files: {exc}")
             return False
 
     pos = data_biochem.x[:, :2].cpu().numpy()
     n_nodes = int(data_biochem.x.shape[0])
     n_edges = int(data_biochem.edge_index.shape[1])
-    print(f"   ↳ Graph: {n_nodes} nodes, {n_edges} edges", flush=True)
+    print(f"   ->  Graph: {n_nodes} nodes, {n_edges} edges", flush=True)
 
     # ------------------------------------------------------------------
     # 4. Load Models
     # ------------------------------------------------------------------
-    print("\n🧠 Loading trained models...")
+    print("\n Loading trained models...")
     biochem_choice = _resolve_biochem_checkpoint(biochem_checkpoint, teacher_only=teacher_only)
     biochem_ckpt = biochem_choice.path
     biochem_meta, biochem_state = _checkpoint_state_dict(_load_torch_checkpoint(biochem_ckpt))
@@ -1251,7 +1291,7 @@ def run_phase_comparison(
         apply_biochem_forward_policy_from_checkpoint_meta(biochem_meta, quiet=True)
     else:
         print(
-            "   ⚠️ No forward_policy in checkpoint — μ rollout uses current shell env. "
+            "   [WARN]  No forward_policy in checkpoint — μ rollout uses current shell env. "
             "Re-train/save teacher to embed policy, or set BIOCHEM_* manually.",
             flush=True,
         )
@@ -1259,7 +1299,7 @@ def run_phase_comparison(
     model_kine_base = None
     kin_ckpt = _try_resolve_kinematics_checkpoint()
     if kin_ckpt is not None:
-        print(f"   ↳ Using kinematics checkpoint: {kin_ckpt.name}")
+        print(f"   ->  Using kinematics checkpoint: {kin_ckpt.name}")
         kin_default_iters = "12" if fast_mode else "25"
         kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", kin_default_iters))
         kin_max_iters = max(5, min(80, kin_max_iters))
@@ -1270,17 +1310,17 @@ def run_phase_comparison(
         kin_ctor = dict(kin_ctor)
         kin_ctor["max_iters"] = kin_max_iters
         if kin_meta.get("model_config"):
-            print("   ↳ kinematics GINO_DEQ from checkpoint model_config.")
+            print("   ->  kinematics GINO_DEQ from checkpoint model_config.")
         else:
             print(
-                "   ↳ kinematics GINO_DEQ from weight/reference inference "
+                "   ->  kinematics GINO_DEQ from weight/reference inference "
                 "(re-save kinematics_best.pth to embed model_config)."
             )
         model_kine_base = build_gino_deq_from_ctor(phys_cfg_kine, kin_ctor).to(device)
         model_kine_base.load_state_dict(kin_state, strict=False)
         model_kine_base.eval()
     elif not use_anchor:
-        print("   ↳ No kinematics checkpoint found; skipping GINO-DEQ column.", flush=True)
+        print("   ->  No kinematics checkpoint found; skipping GINO-DEQ column.", flush=True)
 
     # Biochem Setup (same PhysicsConfig defaults as train_biochem_corrector.py / config.py)
     phys_cfg_biochem = PhysicsConfig(phase="biochem")
@@ -1293,8 +1333,8 @@ def run_phase_comparison(
         latent_dim = max(8, int(latent_env))
     else:
         latent_dim = _infer_latent_dim_from_state_dict(biochem_state) or 256
-    print(f"   ↳ bio_encoder prior dim: {bio_enc_prior}")
-    print(f"   ↳ latent_dim: {latent_dim}")
+    print(f"   ->  bio_encoder prior dim: {bio_enc_prior}")
+    print(f"   ->  latent_dim: {latent_dim}")
     _viz_inner = os.environ.get("VIZ_BIOCHEM_MAX_INNER_ITERS", "").strip()
     biochem_inner_iters = int(_viz_inner) if _viz_inner else (6 if fast_mode else 10)
     biochem_inner_iters = max(3, min(25, biochem_inner_iters))
@@ -1309,13 +1349,13 @@ def run_phase_comparison(
         fp_note = format_biochem_forward_policy_summary(fp)
         if fp_note:
             print(
-                f"   ↳ biochem GNODE from checkpoint model_config + forward_policy ({fp_note})."
+                f"   ->  biochem GNODE from checkpoint model_config + forward_policy ({fp_note})."
             )
         else:
-            print("   ↳ biochem GNODE from checkpoint model_config (saved by train_biochem_corrector).")
+            print("   ->  biochem GNODE from checkpoint model_config (saved by train_biochem_corrector).")
     else:
         print(
-            f"   ↳ biochem GNODE from weight inference (legacy ckpt): "
+            f"   ->  biochem GNODE from weight inference (legacy ckpt): "
             f"siren={int(ctor['use_siren_decoder'])} fourier={int(ctor['num_fourier_freqs'])} "
             f"hard_bcs={int(ctor['use_hard_bcs'])} — re-run teacher save to embed model_config."
         )
@@ -1340,11 +1380,11 @@ def run_phase_comparison(
     compatible_bio, skipped_bio = _filter_compatible_state_dict(biochem_state, model_biochem.state_dict())
     model_biochem.load_state_dict(compatible_bio, strict=False)
     if skipped_bio:
-        print(f"   ↳ Skipped {len(skipped_bio)} checkpoint key(s) (no target or shape mismatch).")
+        print(f"   ->  Skipped {len(skipped_bio)} checkpoint key(s) (no target or shape mismatch).")
         siren_skipped = [k for k in skipped_bio if k.startswith("siren_decoder.")]
         if siren_skipped and ctor["use_siren_decoder"]:
             print(
-                f"   ⚠️ siren_decoder not loaded ({len(siren_skipped)} keys) — biochem |u| will look wrong. "
+                f"   [WARN]  siren_decoder not loaded ({len(siren_skipped)} keys) — biochem |u| will look wrong. "
                 "Set BIOCHEM_USE_SIREN=1 and re-run, or use a checkpoint trained with SIREN."
             )
     model_biochem.eval()
@@ -1352,7 +1392,7 @@ def run_phase_comparison(
     # ------------------------------------------------------------------
     # 5. Inference
     # ------------------------------------------------------------------
-    print("\n🔮 Running inference...", flush=True)
+    print("\n Running inference...", flush=True)
 
     def _cuda_sync() -> None:
         if device.type == "cuda":
@@ -1360,17 +1400,15 @@ def run_phase_comparison(
 
     comsol_series_np: Optional[np.ndarray] = None
     comsol_final_np: Optional[np.ndarray] = None
-    k11_p_clot_slider: Optional[np.ndarray] = None
-
     pred_kine_on_biochem_mesh = None
     with torch.no_grad():
         if model_kine_base is not None:
             t_k0 = time.perf_counter()
             kine_data = data_kine_base if data_kine_base is not None else data_biochem
-            print("   ↳ Kinematics (GINO-DEQ) on visualization mesh…", flush=True)
+            print("   ->  Kinematics (GINO-DEQ) on visualization mesh…", flush=True)
             pred_kine_on_biochem_mesh = _run_model_once(model_kine_base, kine_data)
             _cuda_sync()
-            print(f"   ↳ Kinematics done in {time.perf_counter() - t_k0:.1f}s", flush=True)
+            print(f"   ->  Kinematics done in {time.perf_counter() - t_k0:.1f}s", flush=True)
         pred_kine_base = pred_kine_on_biochem_mesh
 
         # ``GNODE_Phase3`` expects non-dimensional times (same as training: ``to_t_nd(..., bio_cfg.t_final)``).
@@ -1394,7 +1432,7 @@ def run_phase_comparison(
             rollout_times_si = torch.tensor(custom_times, device=device, dtype=torch.float32)
             rollout_times = to_t_nd(rollout_times_si, t_ref)
             print(
-                f"   ↳ Biochem rollout: {rollout_times.numel()} keyframes "
+                f"   ->  Biochem rollout: {rollout_times.numel()} keyframes "
                 f"(mode={time_mode}; set VIZ_BIOCHEM_TIME_MODE=dense for higher fidelity)",
                 flush=True,
             )
@@ -1435,7 +1473,7 @@ def run_phase_comparison(
                 dense_times[-1] + dt_nd * torch.arange(1, num_extra + 1, device=device, dtype=dense_times.dtype),
             ])
             print(
-                f"   ↳ Biochem rollout: {rollout_times.numel()} macro knots "
+                f"   ->  Biochem rollout: {rollout_times.numel()} macro knots "
                 f"(mode={time_mode}; using {n_macro_use}/{n_full} base samples)",
                 flush=True,
             )
@@ -1452,11 +1490,11 @@ def run_phase_comparison(
                 y_oracle = data_biochem.y[:n_oracle].to(device=device)
                 rollout_times = rollout_times[:n_oracle]
                 print(
-                    f"   ↳ K10g oracle clots: μ_eff in wall-adjacent band from GT (n_steps={n_oracle})",
+                    f"   ->  K10g oracle clots: μ_eff in wall-adjacent band from GT (n_steps={n_oracle})",
                     flush=True,
                 )
             else:
-                print("   ⚠️ BIOCHEM_K10G_ORACLE_CLOTS=1 but data.y missing; open-loop rollout.", flush=True)
+                print("   [WARN]  BIOCHEM_K10G_ORACLE_CLOTS=1 but data.y missing; open-loop rollout.", flush=True)
 
         t_b0 = time.perf_counter()
         with _viz_biochem_ode_speedups():
@@ -1466,15 +1504,12 @@ def run_phase_comparison(
                 y_true_trajectory=y_oracle,
             )
         _cuda_sync()
-        print(f"   ↳ Biochem trajectory done in {time.perf_counter() - t_b0:.1f}s", flush=True)
+        print(f"   ->  Biochem trajectory done in {time.perf_counter() - t_b0:.1f}s", flush=True)
 
         # Extract the keyframes used by the temporal slider (labels stay in SI seconds for the UI).
         custom_times_nd = [t / t_ref for t in custom_times]
         frame_indices = [torch.argmin(torch.abs(rollout_times - t_nd)).item() for t_nd in custom_times_nd]
         pred_biochem_series = pred_biochem_series_dense[frame_indices]
-        if _biochem_mu_k11_clot_gate_enabled():
-            k11_p_clot_slider = _k11_p_clot_series_numpy(model_biochem, frame_indices)
-
         # Extract the final *trained* time step for static Fig 1 comparison.
         idx_t_final = torch.argmin(torch.abs(rollout_times - (t_final_si / t_ref))).item()
         pred_biochem = pred_biochem_series_dense[idx_t_final]
@@ -1489,7 +1524,7 @@ def run_phase_comparison(
             else:
                 comsol_final_np = data_biochem.y.detach().cpu().numpy()
             print(
-                f"   ↳ COMSOL reference: {int(comsol_times_si.numel())} export steps; "
+                f"   ->  COMSOL reference: {int(comsol_times_si.numel())} export steps; "
                 f"slider aligned to model keyframes",
                 flush=True,
             )
@@ -1528,8 +1563,8 @@ def run_phase_comparison(
     # 6. Plotting
     # ------------------------------------------------------------------
     t_final_si = float(bio_cfg.resolve_biochem_times(data_biochem, device)[-1].item())
-    time_label = f"t_final≈{t_final_si:.0f}s (last COMSOL export step)"
-    print("🎨 Generating comparison plots...")
+    time_label = f"t_final~{t_final_si:.0f}s (last COMSOL export step)"
+    print(" Generating comparison plots...")
     print(
         "   Figure guide (matplotlib order):\n"
         "     • Steady GINO-DEQ — time-independent Stage-A snapshot (not biochem rollout t_final)\n"
@@ -1611,7 +1646,7 @@ def run_phase_comparison(
         plt.close("all")
 
     slider_refresh_label = "Next Anchor" if use_anchor else "Refresh geometry"
-    print("⏳ Opening interactive Biochem temporal slider...")
+    print(" Opening interactive Biochem temporal slider...")
     _show_biochem_temporal_slider(
         pos,
         pred_biochem_series_np,
@@ -1621,9 +1656,7 @@ def run_phase_comparison(
         on_refresh=_request_refresh,
         comsol_series_np=comsol_series_np,
         title_prefix=f"Biochem Temporal Inspector ({case_label})",
-        refresh_label=slider_refresh_label,
-        k11_p_clot_series=k11_p_clot_slider,
-    )
+        refresh_label=slider_refresh_label,    )
     return refresh_state["requested"]
 
 
@@ -1677,7 +1710,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help=(
-            "Biochem weights file. Default: biochem_teacher_best_high_mu.pth → "
+            "Biochem weights file. Default: biochem_teacher_best_high_mu.pth -> "
             "biochem_teacher_last.pth (then legacy fallbacks). Override via path or VIZ_BIOCHEM_CHECKPOINT."
         ),
     )
@@ -1685,7 +1718,7 @@ if __name__ == "__main__":
         "--teacher-only",
         action="store_true",
         help=(
-            "Teacher checkpoints only: biochem_teacher_best_high_mu.pth → biochem_teacher_last.pth. "
+            "Teacher checkpoints only: biochem_teacher_best_high_mu.pth -> biochem_teacher_last.pth. "
             "Same as VIZ_BIOCHEM_REQUIRE_TEACHER=1."
         ),
     )
@@ -1693,6 +1726,41 @@ if __name__ == "__main__":
         "--full-viz",
         action="store_true",
         help="Disable fast viz (dense rollout up to 16+ macro steps, finer ODE; sets VIZ_FAST=0).",
+    )
+    parser.add_argument(
+        "--steady-kin-only",
+        action="store_true",
+        help=(
+            "Skip biochem rollout; only steady GINO-DEQ on the given graph(s). "
+            "Shows prediction vs labels when y is present."
+        ),
+    )
+    parser.add_argument(
+        "--steady-kin-compare",
+        action="store_true",
+        help=(
+            "With --steady-kin-only: one patient anchor (see --anchor) and one kinematics "
+            "synthetic graph (--kine-vessel or --kine-graph)."
+        ),
+    )
+    parser.add_argument(
+        "--kine-graph",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Processed kinematics or patient .pt for steady-kin-only mode.",
+    )
+    parser.add_argument(
+        "--kine-vessel",
+        type=int,
+        default=0,
+        help="With --steady-kin-compare: vessel index under graphs_kinematics/newtonian (default 0).",
+    )
+    parser.add_argument(
+        "--time-index",
+        type=int,
+        default=-1,
+        help="Biochem anchor label time index for GT row (default -1 = last export step).",
     )
     args = parser.parse_args()
 
@@ -1710,6 +1778,40 @@ if __name__ == "__main__":
             for stem in stems:
                 mark = " (default)" if stem == default_stem else ""
                 print(f"  - {stem}{mark}")
+        raise SystemExit(0)
+
+    if args.steady_kin_only:
+        cases: List[Tuple[str, str, Path]] = []
+        if args.steady_kin_compare:
+            anchor_stem = _resolve_anchor_stem(args.anchor)
+            cases.append(
+                ("patient", anchor_stem, _anchor_graph_dir() / f"{anchor_stem}.pt")
+            )
+            if args.kine_graph:
+                kpath = Path(args.kine_graph)
+                if not kpath.is_absolute():
+                    kpath = get_project_root() / kpath
+                cases.append(("kinematics", kpath.stem, kpath))
+            else:
+                kdir = _kinematics_graph_dir("newtonian")
+                kpath = kdir / f"vessel_{int(args.kine_vessel)}.pt"
+                cases.append(("kinematics", f"vessel_{int(args.kine_vessel)}", kpath))
+        elif args.kine_graph:
+            kpath = Path(args.kine_graph)
+            if not kpath.is_absolute():
+                kpath = get_project_root() / kpath
+            cohort = "patient" if "biochem_anchors" in kpath.as_posix() else "kinematics"
+            cases.append((cohort, kpath.stem, kpath))
+        elif args.anchor or not args.synthetic:
+            anchor_stem = _resolve_anchor_stem(args.anchor)
+            cases.append(
+                ("patient", anchor_stem, _anchor_graph_dir() / f"{anchor_stem}.pt")
+            )
+        else:
+            raise ValueError(
+                "Use --steady-kin-compare, --kine-graph PATH, or --anchor STEM with --steady-kin-only."
+            )
+        run_steady_kinematics_viz(cases=cases, time_index=int(args.time_index))
         raise SystemExit(0)
 
     if args.regenerate and args.reuse:
@@ -1753,8 +1855,8 @@ if __name__ == "__main__":
             if not anchor_stems:
                 break
             anchor_idx = (anchor_idx + 1) % len(anchor_stems)
-            print(f"🔁 Next anchor: {anchor_stems[anchor_idx]}")
+            print(f" Next anchor: {anchor_stems[anchor_idx]}")
         else:
             regenerate = True
             seed = int(np.random.default_rng().integers(0, 2**31 - 1))
-            print(f"🔁 Refresh requested. Regenerating synthetic vessel with new seed: {seed}")
+            print(f" Refresh requested. Regenerating synthetic vessel with new seed: {seed}")

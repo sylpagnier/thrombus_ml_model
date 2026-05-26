@@ -901,9 +901,10 @@ class TestPhase3Physics(unittest.TestCase):
 
         encoded = self.model._apply_fourier_encoding(x)
         self.assertEqual(encoded.shape[1], self.model.kin_encoder[0].in_features)
-        self.assertTrue(torch.allclose(encoded[:, -4:-2], x[:, 11:13]))
-        self.assertTrue(torch.allclose(encoded[:, -2:-1], x[:, 13:14]))
-        self.assertTrue(torch.allclose(encoded[:, -1:], x[:, 14:15]))
+        # Tail order: rest(5), uv_prior(2), mu_prior(1), wss_prior(1) [+ width(3) after wss when enabled].
+        self.assertTrue(torch.allclose(encoded[:, -7:-5], x[:, 11:13]))
+        self.assertTrue(torch.allclose(encoded[:, -5:-4], x[:, 13:14]))
+        self.assertTrue(torch.allclose(encoded[:, -4:-3], x[:, 14:15]))
 
     def test_comsol_trajectory_kernel_matches_linear_rate_finite_difference(self):
         """

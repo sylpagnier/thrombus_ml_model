@@ -29,6 +29,10 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 - **Node features (Kinematics/2)** — `NodeFeat` slices: positions, SDF, wall normals, priors, optional hydraulic width `D(x)` and derivatives for geometric priors.
 - **Biochem node features** — `BiochemNodeFeat` for clot/chemistry graphs.
 
+### Clot-phi simple baseline (wall-local probe)
+
+Separate from the full GNODE biochem stack: a **tiny hybrid head** on GT kinematics + capped `mu_eff` with a dgamma-sliced neighbor mask. Use it to validate masks/features before multitask biochem. Record and metrics: [CLOT_PHI_BASELINE.md](CLOT_PHI_BASELINE.md). Entry: `scripts/go_clot_phi_simple.ps1`.
+
 ### Biochem "Clot" Semantics
 
 In this repository, a "clot" is not a discrete model class. It is an interpretive
@@ -38,6 +42,21 @@ Training therefore treats `mu_eff_si` as a regression target on COMSOL anchor
 nodes. Thresholded views such as `mu_eff_si > 20 * mu_inf` may be logged as
 `HighMuDice@thr` diagnostics for quick sanity checks, but they should not be
 used as classifier metrics (for example AUPRC) or primary checkpoint objectives.
+
+### `mu_ratio_max` vs `mu_eff` (do not conflate)
+
+`BiochemConfig.mu_ratio_max` (default **80**) and `BIOCHEM_TEACHER_MU_RATIO_MAX` cap the
+**dimensionless COMSOL step outputs** μ₁(Mat) ∈ [0, max−1] and μ₂(FI) ∈ [0, max] used in the
+gelation multiplier `(1 + μ₁ + μ₂ + …)` on top of Carreau — they are **step ceilings**, not
+**clot μ / bulk μ**.
+
+| Quantity | Meaning | Typical clot-scale value |
+|----------|---------|---------------------------|
+| `mu_ratio_max` | Max μ₁/μ₂ step height in the surrogate forward | **80** (headroom) |
+| `mu_eff_si` (GT channel 3) | COMSOL export `mu_effective` [Pa·s] | bulk ~**0.04**, patches ~**0.10** (~**2.5×**) |
+
+Training objectives and checkpoints should use **`mu_log_mae` / `mu_eff_si`**, not “μ₂ → 80” or
+`viz_final_mu2_mean` alone. Open-loop μ₂ can saturate while rollout `mu_eff` stays near bulk.
 
 Preferred validation quantities for Biochem high-viscosity behavior are:
 

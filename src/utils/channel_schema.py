@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 
+from src.config import BiochemNodeFeat, NodeFeat
+
 
 SCHEMA_VERSION = 1
 
@@ -223,6 +225,73 @@ def migrate_tensor_last_dim(
         dtype=t.dtype,
     )
     return torch.cat([t, pad], dim=-1).contiguous()
+
+
+def biochem_encoder_x(data) -> torch.Tensor:
+    """Biochem-model node features (15ch ``BIO_X_SCHEMA``), never the kinematics ``data.x`` layout."""
+    if hasattr(data, "x_biochem") and data.x_biochem is not None:
+        xb = data.x_biochem
+        if int(xb.shape[-1]) != X_SCHEMAS[BIO_X_SCHEMA].width:
+            raise ValueError(
+                f"x_biochem width {int(xb.shape[-1])} != {X_SCHEMAS[BIO_X_SCHEMA].width} for {BIO_X_SCHEMA}."
+            )
+        return xb
+    schema = str(getattr(data, "x_schema", "") or "")
+    if schema == BIO_X_SCHEMA:
+        return data.x
+    if schema == KINE_X_SCHEMA:
+        raise ValueError(
+            "Graph has kinematics x_schema on data.x but no x_biochem; "
+            "re-run PatientDataExtractor or migrate anchor graphs."
+        )
+    raise ValueError(
+        f"Cannot resolve biochem encoder features (x_schema={schema!r}, "
+        f"x.shape={tuple(data.x.shape)}, x_biochem missing)."
+    )
+
+
+def attach_patient_anchor_graph_metadata(data, *, mask_wall: Optional[torch.Tensor] = None):
+    """Attach schemas for anchor graphs: ``data.x`` = kine 18ch, ``data.x_biochem`` = biochem 15ch."""
+    if not hasattr(data, "x_biochem") or data.x_biochem is None:
+        raise ValueError("attach_patient_anchor_graph_metadata requires data.x_biochem.")
+    attach_channel_metadata(
+        data,
+        x_schema=KINE_X_SCHEMA,
+        y_schema=BIO_Y_SCHEMA,
+        mask_wall=mask_wall,
+    )
+    data.x_biochem_schema = BIO_X_SCHEMA
+    assert_anchor_dual_x_aligned(data)
+    return data
+
+
+def assert_anchor_dual_x_aligned(data, *, atol: float = 1e-5) -> None:
+    """Guard: shared geometry channels must agree between kine and biochem tensors."""
+    xk = data.x
+    xb = biochem_encoder_x(data)
+    if int(xk.shape[0]) != int(xb.shape[0]):
+        raise ValueError(f"node count mismatch: x {xk.shape[0]} vs x_biochem {xb.shape[0]}")
+    for sl_k, sl_b in (
+        (NodeFeat.XY, BiochemNodeFeat.XY),
+        (NodeFeat.SDF, BiochemNodeFeat.SDF),
+    ):
+        if not torch.allclose(xk[:, sl_k], xb[:, sl_b], atol=atol, rtol=0.0):
+            raise ValueError(f"anchor graph mismatch on slice {sl_k} vs {sl_b}")
+    if not torch.allclose(
+        xk[:, NodeFeat.WALL_NORMAL],
+        xb[:, BiochemNodeFeat.WALL_NORMAL],
+        atol=atol,
+        rtol=0.0,
+    ):
+        raise ValueError(
+            "anchor graph wall_normal mismatch between data.x (kine layout) and data.x_biochem."
+        )
+    if getattr(data, "x_schema", None) != KINE_X_SCHEMA:
+        raise ValueError(f"expected data.x_schema={KINE_X_SCHEMA!r}, got {getattr(data, 'x_schema', None)!r}")
+    if getattr(data, "x_biochem_schema", None) != BIO_X_SCHEMA:
+        raise ValueError(
+            f"expected data.x_biochem_schema={BIO_X_SCHEMA!r}, got {getattr(data, 'x_biochem_schema', None)!r}"
+        )
 
 
 def migrate_graph_schema(

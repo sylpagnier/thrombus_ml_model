@@ -113,3 +113,67 @@ def assert_mesh_unit(
             "regenerate the mesh with the right unit."
         )
     return actual
+
+
+def read_mesh_length_unit(
+    meta: Optional[Mapping[str, object]],
+    *,
+    stem: str,
+    builder: str,
+    default: str = MESH_UNIT_M,
+) -> str:
+    """Return the mesh length unit declared in a sidecar (``m`` or ``cm``).
+
+    Unlike :func:`assert_mesh_unit`, this does not require a specific track unit;
+    use it when the caller will convert lengths to SI (e.g. COMSOL ``D_eff``).
+    """
+    if default not in SUPPORTED_MESH_UNITS:
+        raise ValueError(
+            f"read_mesh_length_unit: unsupported default={default!r}; "
+            f"supported: {SUPPORTED_MESH_UNITS}."
+        )
+    if meta is None:
+        return default
+    if "unit" not in meta:
+        warnings.warn(
+            f"{builder}: {stem} sidecar JSON has no 'unit' field; assuming {default!r}. "
+            "Regenerate with the current vessel_generator to attach a unit declaration.",
+            stacklevel=2,
+        )
+        return default
+    actual = str(meta["unit"]).lower()
+    if actual not in SUPPORTED_MESH_UNITS:
+        raise MeshUnitMismatchError(
+            f"{builder}: {stem} sidecar JSON declares unsupported unit={actual!r}; "
+            f"supported: {SUPPORTED_MESH_UNITS}."
+        )
+    return actual
+
+
+def length_in_meters(value: float, unit: str) -> float:
+    """Convert a scalar length from mesh units to SI meters."""
+    u = str(unit).lower()
+    v = float(value)
+    if u == MESH_UNIT_M:
+        return v
+    if u == MESH_UNIT_CM:
+        return v * CGS_to_SI.LENGTH
+    raise ValueError(
+        f"length_in_meters: unsupported unit={unit!r}; supported: {SUPPORTED_MESH_UNITS}."
+    )
+
+
+def d_bar_si_from_sidecar(
+    meta: Mapping[str, object],
+    *,
+    stem: str,
+    builder: str,
+) -> tuple[float, str]:
+    """Return ``(d_bar [m], mesh_unit)`` from a vessel sidecar JSON mapping."""
+    if "d_bar" not in meta:
+        raise KeyError(f"{builder}: {stem} sidecar JSON missing required 'd_bar'.")
+    unit = read_mesh_length_unit(meta, stem=stem, builder=builder)
+    d_si = length_in_meters(float(meta["d_bar"]), unit)
+    if d_si <= 0.0:
+        raise ValueError(f"{builder}: {stem} sidecar d_bar={d_si} m is not positive.")
+    return d_si, unit

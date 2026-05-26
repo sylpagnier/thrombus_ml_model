@@ -13,6 +13,7 @@ from src.utils.paths import (
     migrate_legacy_final_n_subdir,
     migrate_legacy_vessel_meshes,
 )
+from src.utils.units import MESH_UNIT_CM, d_bar_si_from_sidecar
 from scipy.interpolate import NearestNDInterpolator
 
 # Configure logging
@@ -283,12 +284,20 @@ class AnchorGenerator:
             for tag in self.model.java.sol().tags():
                 self.model.java.sol(tag).clearSolutionData()
 
-            with open(json_file, "r") as f:
+            with open(json_file, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                d_bar = meta["d_bar"]
+            d_bar_si, mesh_unit = d_bar_si_from_sidecar(
+                meta, stem=file_stem, builder="AnchorGenerator"
+            )
+            if mesh_unit == MESH_UNIT_CM:
+                logger.warning(
+                    f"[{i}] Sidecar unit=cm: D_eff and U_inlet use SI (d_bar={d_bar_si:.6f} m); "
+                    "mesh/NAS coordinates stay in cm. Prefer kinematics meshes (unit=m) for "
+                    "this automated COMSOL step, or use PatientDataExtractor on biochem anchors."
+                )
 
-            self.model.parameter("D_eff", f"{d_bar:.8f} [m]")
-            u_ref = self.phys_cfg.get_u_ref(d_bar)
+            self.model.parameter("D_eff", f"{d_bar_si:.8f} [m]")
+            u_ref = self.phys_cfg.get_u_ref(d_bar_si)
             self.model.parameter("U_inlet", f"{u_ref:.8f} [m/s]")
 
             feat = mesh_j.feature(import_tag)
@@ -436,7 +445,8 @@ class AnchorGenerator:
                     v=v,
                     p=p,
                     mu=mu,
-                    d_bar=d_bar,
+                    d_bar=d_bar_si,
+                    mesh_unit=mesh_unit,
                     config_id=i,
                     carreau_n=n_val  # Crucial for your dataloader later
                 )
