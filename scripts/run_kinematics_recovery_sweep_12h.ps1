@@ -27,6 +27,8 @@ $env:KINEMATICS_GRAPH_CAP = "2000"
 $env:KINEMATICS_QUIET = "1"
 $env:KINEMATICS_VAL_PROGRESS = "0"
 $env:KINEMATICS_TQDM = "0"
+$env:KINEMATICS_SKIP_LBFGS = "1"
+$env:KINEMATICS_VAL_EVERY = "1"
 
 $hostName = $env:COMPUTERNAME
 $SweepDir = Join-Path $RepoRoot "outputs\kinematics\sweep_recovery_12h"
@@ -77,6 +79,7 @@ function Get-BestValFromJsonl {
         $stage = 0
         if ($null -ne $row.stage) { $stage = [int]$row.stage }
         if ($stage -lt 3) { continue }
+        if ([double]::IsNaN($relD)) { continue }
         if ($relD -lt $bestRel) {
             $bestRel = $relD
             $best = $row
@@ -87,6 +90,7 @@ function Get-BestValFromJsonl {
             if (-not $line.Trim()) { continue }
             $row = $line | ConvertFrom-Json
             $relD = [double]$row.rel_l2
+            if ([double]::IsNaN($relD)) { continue }
             if ($relD -lt $bestRel) {
                 $bestRel = $relD
                 $best = $row
@@ -94,6 +98,22 @@ function Get-BestValFromJsonl {
         }
     }
     return $best
+}
+
+function Resolve-LegCheckpoint {
+    param([string]$OutDir)
+    $best = Join-Path $OutDir "kinematics_best.pth"
+    if (Test-Path $best) { return $best }
+    $latest = Join-Path $OutDir "kinematics_ckpt_latest.pth"
+    if (Test-Path $latest) {
+        Write-Host "  WARN: no kinematics_best.pth; using ckpt_latest" -ForegroundColor Yellow
+        return $latest
+    }
+    $numbered = Get-ChildItem (Join-Path $OutDir "kinematics_ckpt_*.pth") -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "kinematics_ckpt_latest.pth" } |
+        Sort-Object { [int]($_.BaseName -replace 'kinematics_ckpt_', '') } -Descending
+    if ($numbered) { return $numbered[0].FullName }
+    throw "No checkpoint under $OutDir"
 }
 
 function Save-LegArtifacts {
@@ -105,10 +125,7 @@ function Save-LegArtifacts {
     )
     $legDir = Join-Path $SweepDir $LegId
     $outDir = Join-Path $legDir "kinematics_out"
-    $srcBest = Join-Path $outDir "kinematics_best.pth"
-    if (-not (Test-Path $srcBest)) {
-        throw "Missing $srcBest after leg $LegId"
-    }
+    $srcBest = Resolve-LegCheckpoint -OutDir $outDir
     Copy-Item $srcBest (Join-Path $legDir "kinematics_best.pth") -Force
     foreach ($name in @("kinematics_architecture.json", "kinematics_validation.jsonl")) {
         $src = Join-Path $outDir $name
@@ -153,7 +170,11 @@ function Get-ScaledLegSchedule {
     $base = [int]$Def.Epochs
     if ($base -lt 1) { $base = 1 }
     $epochs = [int][math]::Max(4, $LegEpochs)
+    # Sweep uses Adam-only (SKIP_LBFGS); use all epochs for Adam.
     $adam = [int][math]::Min($epochs - 1, [math]::Max(2, [math]::Round($Def.Adam * $epochs / $base)))
+    if ($env:KINEMATICS_SKIP_LBFGS -eq "1") {
+        $adam = $epochs - 1
+    }
     $s1 = [int][math]::Max(1, [math]::Round($Def.S1 * $epochs / $base))
     $s2 = [int][math]::Max($s1 + 1, [math]::Round($Def.S2 * $epochs / $base))
     if ($s2 -ge $epochs) { $s2 = $epochs - 1 }
@@ -296,6 +317,8 @@ foreach ($legId in $Legs) {
     $env:KINEMATICS_QUIET = "1"
     $env:KINEMATICS_VAL_PROGRESS = "0"
     $env:KINEMATICS_TQDM = "0"
+    $env:KINEMATICS_SKIP_LBFGS = "1"
+    $env:KINEMATICS_VAL_EVERY = "1"
     $outDir = Join-Path $legDir "kinematics_out"
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     $env:KINEMATICS_OUTPUT_DIR = $outDir

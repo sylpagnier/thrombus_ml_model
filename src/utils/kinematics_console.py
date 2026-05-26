@@ -27,3 +27,23 @@ def kinematics_val_progress_enabled() -> bool:
         return False
     raw = os.environ.get("KINEMATICS_VAL_PROGRESS", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def kinematics_val_every(total_epochs: int) -> int:
+    """Validate every N epochs (every epoch when total_epochs <= 12 or VAL_EVERY=1)."""
+    raw = os.environ.get("KINEMATICS_VAL_EVERY", "").strip()
+    if raw:
+        return max(1, int(raw))
+    if total_epochs <= 12:
+        return 1
+    return 2
+
+
+def kinematics_skip_lbfgs() -> bool:
+    """Recovery sweeps: Adam-only (Apr best was pre-L-BFGS; LBFGS often NaNs on short runs)."""
+    return os.environ.get("KINEMATICS_SKIP_LBFGS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )

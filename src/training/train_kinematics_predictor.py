@@ -5,10 +5,12 @@ and curriculum-based loss isolation.
 """
 import argparse
 import json
+import math
 import os
-import sys
 import random
 import re
+import shutil
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -36,7 +38,11 @@ from src.utils.metrics import DynamicLossWeighter, quantify_performance
 from src.utils.paths import kinematics_dir
 from src.utils.training_diary import TrainingDiary
 from src.utils.channel_schema import KINE_Y_SCHEMA, assert_graph_schema, infer_missing_schema
-from src.utils.kinematics_console import kinematics_tqdm_enabled
+from src.utils.kinematics_console import (
+    kinematics_skip_lbfgs,
+    kinematics_tqdm_enabled,
+    kinematics_val_every,
+)
 from src.utils.kinematics_geometry import (
     GeometryCurriculumConfig,
     attach_geometry_metadata,
@@ -558,6 +564,7 @@ def train_kinematics(
         device=str(device),
         model_config=training_manifest.get("model_config"),
     )
+    val_every = kinematics_val_every(int(epochs))
     try:
         arch_path = diary.run_dir / "kinematics_architecture.json"
         with open(arch_path, "w", encoding="utf-8") as f:
@@ -716,7 +723,7 @@ def train_kinematics(
         loader = make_loader(train_epoch_data, n_anchors_ep, n_physics_ep, epoch, stage)
 
         # 3. L-BFGS Handoff (Kinematics preservation)
-        if epoch >= adam_epochs and not lbfgs_initialized:
+        if epoch >= adam_epochs and not lbfgs_initialized and not kinematics_skip_lbfgs():
             print("\n[kin] Switching to L-BFGS optimizer for final refinement...")
             lbfgs_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.LBFGS(
@@ -891,7 +898,12 @@ def train_kinematics(
             torch.save(state_payload, kinematics_dir() / "kinematics_state_latest.pth")
             _prune_kine_training_artifacts(kinematics_dir(), keep=3)
 
-        if epoch % 2 == 0 and len(val_data) > 0:
+        run_val = len(val_data) > 0 and (
+            epoch % val_every == 0
+            or epoch == epochs - 1
+            or (epoch == adam_epochs - 1 and not lbfgs_initialized)
+        )
+        if run_val:
             val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
             scores = quantify_performance(model, val_loader, kernels, device, phase="kinematics")
             rel_l2 = float(scores.get("rel_l2", float("nan")))
@@ -904,11 +916,17 @@ def train_kinematics(
                 if val is not None and val == val:
                     level_bits.append(f"L{lvl}={float(val):.3f}")
             level_msg = f" | {' '.join(level_bits)}" if level_bits else ""
-            print(
-                f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
-                f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
-            )
-            if stage == 3 and val_comp < best_val_composite_loss:
+            if math.isfinite(rel_l2) and math.isfinite(continuity):
+                print(
+                    f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
+                    f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
+                )
+            else:
+                print(
+                    f"[kin] [Validation] non-finite metrics "
+                    f"(rel_l2={rel_l2}, continuity={continuity}); best ckpt unchanged"
+                )
+            if stage == 3 and math.isfinite(val_comp) and val_comp < best_val_composite_loss:
                 best_val_composite_loss = val_comp
                 save_kinematics_checkpoint_file(
                     kinematics_dir() / "kinematics_best.pth",
@@ -1003,6 +1021,14 @@ def train_kinematics(
                 else float("nan")
             ),
         )
+
+    best_path = kinematics_dir() / "kinematics_best.pth"
+    if not best_path.exists():
+        latest = kinematics_dir() / "kinematics_ckpt_latest.pth"
+        if latest.exists():
+            shutil.copy2(latest, best_path)
+            print(f"[kin] WARN no Carreau best saved; copied {latest.name} -> kinematics_best.pth")
+
     diary.log_run_end(best_val_composite_loss=float(best_val_composite_loss))
 
 
