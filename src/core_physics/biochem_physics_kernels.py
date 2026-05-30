@@ -229,8 +229,35 @@ class BiochemPhysicsKernels:
         pseudo_huber_loss = torch.mean((delta ** 2) * (torch.sqrt(1 + grad_mu_sq / (delta ** 2)) - 1))
         return pseudo_huber_loss
 
-    def biochem_adr_residual(self, species_preds, velocity_field, spatial_props, data, d_pred_dt=None):
-        """Computes Advection-Diffusion-Reaction (L_ADR) residuals with Transient Time Derivatives."""
+    def biochem_adr_residual(
+        self,
+        species_preds,
+        velocity_field,
+        spatial_props,
+        data,
+        d_pred_dt=None,
+        *,
+        node_mask: torch.Tensor | None = None,
+        fast_transient: bool = False,
+        residual_mode: str = "convective_nd",
+        species_scope: str = "all",
+    ):
+        """Computes Advection-Diffusion-Reaction (L_ADR) residuals with Transient Time Derivatives.
+
+        When ``node_mask`` is set (bool [N]), species losses use mean(residual^2) on masked nodes only.
+        ``fast_transient=True`` applies finite-difference dC/dt to fast species (COMSOL-like transient tds).
+
+        ``residual_mode`` (env ``BIOCHEM_ADR_RESIDUAL_MODE``):
+          - ``convective_nd``: default convective-time ND residual
+          - ``log``: residual on log1p-ND field (same coords as L_Data_Bio)
+          - ``relative_nd``: (residual / (|C_nd| + eps))^2 mean
+          - ``transport_only`` / ``reaction_only``: ablation terms
+        ``species_scope``: ``all`` | ``fi`` | ``fast`` | ``slow`` (``fi_mat`` alias -> ``fi``)
+        """
+        residual_mode = (residual_mode or "convective_nd").strip().lower()
+        species_scope = (species_scope or "all").strip().lower()
+        if species_scope == "fi_mat":
+            species_scope = "fi"
         u, v = velocity_field[..., 0], velocity_field[..., 1]
 
         # Pass `data` down into the shear computation
@@ -268,24 +295,45 @@ class BiochemPhysicsKernels:
         reaction_terms = self.kinetics.compute_species_reactions(species_dict, shear_rate)
         keller_species = SPECIES_GROUPS["keller"]
 
+        rel_eps = 1e-3
+        use_log_field = residual_mode == "log"
+
         for sp in fast_species + slow_species:
             key = sp.name
+            is_fast_sp = sp in fast_species
+            if species_scope not in ("all", ""):
+                if species_scope == "fi" and key != "FI":
+                    continue
+                if species_scope == "fast" and not is_fast_sp:
+                    continue
+                if species_scope == "slow" and is_fast_sp:
+                    continue
+
             scale_idx = sp.value
             scale_c = scales[scale_idx]
 
             # Global reference time for chain rule scaling
             t_ref_global = self.cfg.t_final
 
-            # Fast chemistry is treated as quasi-steady over coarse macro timesteps.
-            # Only slow species receive explicit transient dC/dt_nd supervision.
-            if d_pred_dt is not None and sp in slow_species:
+            # Default: fast species quasi-steady (no dC/dt). Set fast_transient=True to match COMSOL tds.
+            use_transient = d_pred_dt is not None and (
+                sp in slow_species or (fast_transient and sp in fast_species)
+            )
+            if use_log_field:
+                C_nd = species_preds_safe[:, scale_idx]
+                if use_transient:
+                    dC_dt_nd = d_pred_dt[:, scale_idx]
+                else:
+                    dC_dt_nd = C_nd * 0.0
+            elif use_transient:
                 exp_pred = torch.exp(species_preds_safe[:, scale_idx])
                 # d_pred_dt is now d(logC)/dt_nd
                 dC_dt_nd = exp_pred * d_pred_dt[:, scale_idx]
+                C_nd = nd_species_preds[:, scale_idx]
             else:
                 dC_dt_nd = species_preds_safe[:, scale_idx] * 0.0
+                C_nd = nd_species_preds[:, scale_idx]
 
-            C_nd = nd_species_preds[:, scale_idx]
             C = species_dict[key]
             base_D = self.D_coeff[key]
             D = base_D + D_s if sp in keller_species else base_D
@@ -298,7 +346,6 @@ class BiochemPhysicsKernels:
             advection_nd = u * dC_dx_nd + v * dC_dy_nd
 
             # Diffusion in dimensionless form: div((1/Pe) grad(C_nd)).
-            # Even with constant base D, 1/Pe is spatially varying because u_ref and d_bar vary.
             laplacian_C_nd = torch.sparse.mm(data.Laplacian, C_col_nd).squeeze(1)
             inv_pe = as_tensor_like(D, like=u_ref_safe) / (u_ref_safe * d_bar_safe)
             inv_pe_col = inv_pe.unsqueeze(1)
@@ -310,25 +357,36 @@ class BiochemPhysicsKernels:
             reaction_nd = (d_bar_safe / u_ref_safe) * (R / torch.clamp(scale_c, min=1e-12))
 
             if sp in SPECIES_GROUPS["solid"]:
-                # Polymerized fibrin is a solid matrix; it does not advect or diffuse.
                 advection_nd = torch.zeros_like(advection_nd)
                 diffusion_nd = torch.zeros_like(diffusion_nd)
 
-            # Scale convective ND terms into global ND time using chain rule.
             time_ratio = time_ratio_global_to_convective(
                 t_ref_global=t_ref_global,
                 d_bar=d_bar_safe,
                 u_ref=u_ref_safe,
             )
 
-            # Fully non-dimensional ADR residual scaled to Convective Time (O(1)).
-            # Dividing the temporal term by ``time_ratio`` (instead of multiplying the
-            # spatial terms by it) collapses advection / diffusion / reaction onto the
-            # same magnitude scale as the chemistry, so the optimizer can "see" the
-            # reaction equations alongside transport instead of being dominated by
-            # O(1e6) convective gradients.
+            if residual_mode == "transport_only":
+                reaction_nd = reaction_nd * 0.0
+            elif residual_mode == "reaction_only":
+                advection_nd = advection_nd * 0.0
+                diffusion_nd = diffusion_nd * 0.0
+                dC_dt_nd = dC_dt_nd * 0.0
+
             residual_nd = (dC_dt_nd / time_ratio) + advection_nd - diffusion_nd - reaction_nd
-            loss_c = torch.mean(residual_nd ** 2)
+            if residual_mode == "relative_nd":
+                denom = C_nd.abs() + rel_eps
+                residual_nd = residual_nd / denom
+
+            res_sq = residual_nd ** 2
+            if node_mask is not None:
+                m = node_mask.view(-1).bool()
+                if bool(m.any().item()):
+                    loss_c = res_sq[m].mean()
+                else:
+                    loss_c = species_preds.sum() * 0.0
+            else:
+                loss_c = res_sq.mean()
 
             if sp in fast_species:
                 adr_losses_fast += loss_c

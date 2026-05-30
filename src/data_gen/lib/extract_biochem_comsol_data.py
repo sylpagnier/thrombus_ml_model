@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 import glob
 import re
-from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig
+from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
 from src.utils.paths import get_project_root
 from src.data_gen.lib.node_feature_assembly import (
     build_biochem_bc_x_tensor,
@@ -358,21 +358,29 @@ class PatientDataExtractor:
             if t_val not in times:
                 times.append(t_val)
 
-        # TEMP DEBUG: drop late-time columns before building per-step blocks so disk tensors
-        # never store redundant horizons (see ``src.config.BIOCHEM_T_MAX``).
         times_arr = np.asarray(times, dtype=np.float64)
-        valid_time_indices = times_arr <= float(BIOCHEM_T_MAX)
-        n_kept = int(valid_time_indices.sum())
-        if n_kept == 0:
-            raise ValueError(
-                f"No COMSOL export time steps <= BIOCHEM_T_MAX={BIOCHEM_T_MAX} s in {filepath.name!r}."
-            )
-        if n_kept < int(times_arr.size):
+        t_cap = biochem_comsol_time_cap_s()
+        if t_cap is None:
+            times = [float(x) for x in times_arr]
             print(
-                f"[TEMP DEBUG] {filepath.name}: truncating COMSOL trajectory to "
-                f"t <= {BIOCHEM_T_MAX} s (kept {n_kept}/{int(times_arr.size)} steps)."
+                f"[i]  {filepath.name}: keeping full COMSOL horizon "
+                f"({len(times)} steps, t_max={float(times_arr.max()):.1f} s).",
+                flush=True,
             )
-        times = [float(x) for x in times_arr[valid_time_indices]]
+        else:
+            valid_time_indices = times_arr <= float(t_cap)
+            n_kept = int(valid_time_indices.sum())
+            if n_kept == 0:
+                raise ValueError(
+                    f"No COMSOL export time steps <= t_cap={t_cap} s in {filepath.name!r}."
+                )
+            if n_kept < int(times_arr.size):
+                print(
+                    f"[i]  {filepath.name}: truncating COMSOL trajectory to "
+                    f"t <= {t_cap} s (kept {n_kept}/{int(times_arr.size)} steps).",
+                    flush=True,
+                )
+            times = [float(x) for x in times_arr[valid_time_indices]]
 
         # 2. Load the numeric data (skipping comment lines)
         df_full = pd.read_csv(filepath, comment='%', sep=r'\s+', header=None)
@@ -409,7 +417,7 @@ class PatientDataExtractor:
         msh_path = msh_path_nas if msh_path_nas.exists() else msh_path_msh
 
         if not msh_path.exists():
-            print(f"❌ Skipping {stem}: Mesh file (.nas/.msh) not found.")
+            print(f"[ERR] Skipping {stem}: Mesh file (.nas/.msh) not found.", flush=True)
             return
 
         sidecar_path = self.raw_dir / f"{stem}.json"

@@ -46,7 +46,7 @@ from src.core_physics.clot_phi_simple import (
     physics_phi_from_mu,
     rule_phi_from_mu_cap,
 )
-from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
+from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
 from src.utils.paths import get_project_root
 
 
@@ -147,12 +147,21 @@ def _clot_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) 
 
 def _checkpoint_score(va: dict[str, float]) -> float:
     """Prefer non-collapsed val F1; penalize predict-none / predict-all / memorization."""
+    if _env_bool("CLOT_PHI_REGRESSION_ONLY", False):
+        return -float(va.get("mu_log_mae", 99.0))
     f1 = float(va.get("clot_f1", 0.0))
     pp = float(va.get("pred_pos_frac", 0.0))
     gt = float(va.get("gt_pos_frac", 0.0))
     rec = float(va.get("clot_rec", 0.0))
     prec = float(va.get("clot_prec", 0.0))
     mae = float(va.get("mu_log_mae", 99.0))
+    # Near-zero positive anchors: allow low pp when gt itself is tiny; score mainly from mu/logMAE.
+    if gt < 0.04:
+        # Treat blatant overprediction as failure.
+        if pp > 0.25:
+            return -1.0
+        mae_bonus = max(0.0, 0.9 - mae) * 0.3
+        return max(0.0, f1 * 0.5) + mae_bonus
     if pp < 0.05 or pp > 0.92:
         return -1.0
     if rec > 0.92:
@@ -173,6 +182,34 @@ def _physics_blend_alpha() -> float:
     return max(0.0, min(float(os.environ.get("CLOT_PHI_PHYSICS_BLEND_ALPHA", "0.5") or "0.5"), 1.0))
 
 
+def _regression_only() -> bool:
+    return _env_bool("CLOT_PHI_REGRESSION_ONLY", False)
+
+
+def _freeze_mu_branch(model: torch.nn.Module) -> None:
+    """Stage-B: train phi head only; keep learned mu branch fixed."""
+    if not _env_bool("CLOT_PHI_FREEZE_MU_BRANCH", False):
+        return
+    if hasattr(model, "dlog_fc"):
+        for p in model.dlog_fc.parameters():
+            p.requires_grad = False
+    for name, p in model.named_parameters():
+        if "phi_fc" not in name:
+            p.requires_grad = False
+
+
+def _load_init_checkpoint(
+    model: torch.nn.Module,
+    species_head: torch.nn.Module | None,
+    path: Path,
+    device: torch.device,
+) -> None:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if species_head is not None and "species_head_state_dict" in ckpt:
+        species_head.load_state_dict(ckpt["species_head_state_dict"], strict=False)
+
+
 def _species_hidden() -> int:
     return max(int(os.environ.get("CLOT_PHI_SPECIES_HIDDEN", "32")), 8)
 
@@ -184,11 +221,17 @@ def _species_data_mse(
     bio_cfg: BiochemConfig,
 ) -> torch.Tensor:
     """SI-scaled species fit (same spirit as biochem ``L_Data_Bio`` on anchors)."""
-    scales = bio_cfg.get_species_scales(device=pred_log.device)[:12].view(1, -1)
     p_log = pred_log[idx].clamp(-10.0, 8.0)
     t_log = tgt_log[idx].clamp(-10.0, 8.0)
-    # Log1p-ND MSE (stable); SI MSE can explode when the head is poorly initialized.
-    return F.mse_loss(p_log, t_log)
+    # Log1p-ND MSE (stable); optionally upweight FI/Mat channels in-band.
+    fi_w = max(float(os.environ.get("CLOT_PHI_BIO_FI_WEIGHT", "1.0") or "1.0"), 0.0)
+    mat_w = max(float(os.environ.get("CLOT_PHI_BIO_MAT_WEIGHT", "1.0") or "1.0"), 0.0)
+    if abs(fi_w - 1.0) < 1e-8 and abs(mat_w - 1.0) < 1e-8:
+        return F.mse_loss(p_log, t_log)
+    w = torch.ones((1, 12), device=p_log.device, dtype=p_log.dtype)
+    w[:, 8] = fi_w
+    w[:, 11] = mat_w
+    return torch.mean(((p_log - t_log) ** 2) * w)
 
 
 def _run_epoch(
@@ -228,6 +271,7 @@ def _run_epoch(
     bio_lambda = _bio_lambda()
     joint_bio = species_head is not None
     use_soft = _env_bool("CLOT_PHI_SOFT_LABELS", False)
+    regression_only = _regression_only()
     metric_sums = {
         "clot_prec": 0.0,
         "clot_rec": 0.0,
@@ -238,11 +282,30 @@ def _run_epoch(
     n_steps = 0
     n_graphs = 0
     dice_lambda = max(float(os.environ.get("CLOT_PHI_DICE_LAMBDA", "0") or "0"), 0.0)
+    anchor_balanced = _env_bool("CLOT_PHI_ANCHOR_BALANCED", False)
+    path_step_scale: dict[str, float] = {}
+    if train and anchor_balanced and paths:
+        approx_steps = []
+        for p in paths:
+            d = torch.load(p, map_location="cpu", weights_only=False)
+            if hasattr(d, "y") and torch.is_tensor(d.y) and d.y.dim() == 3:
+                approx_steps.append(max(int(d.y.shape[0] // max(1, time_stride)), 1))
+            else:
+                approx_steps.append(1)
+        target = float(sum(approx_steps)) / float(max(len(approx_steps), 1))
+        for p, n in zip(paths, approx_steps):
+            path_step_scale[p] = float(target / float(max(n, 1)))
 
     with torch.set_grad_enabled(train):
         for path in paths:
             data = torch.load(path, weights_only=False).to(device)
             data = infer_missing_schema(data, phase_hint="biochem")
+            if hasattr(data, "y") and torch.is_tensor(data.y):
+                if hasattr(data, "y_valid_mask") and torch.is_tensor(data.y_valid_mask):
+                    if tuple(data.y_valid_mask.shape) != tuple(data.y.shape):
+                        data.y_valid_mask = build_y_valid_mask(
+                            data.y, data.y_schema, getattr(data, "mask_wall", None)
+                        )
             assert_graph_schema(data, expected_y_schema=(BIO_Y_SCHEMA,))
             if not hasattr(data, "y") or data.y.dim() != 3:
                 continue
@@ -337,10 +400,13 @@ def _run_epoch(
                             mu_phys, step.mu_c_si, step.region, phys_cfg, soft=use_soft
                         )
                         phi_mix = (alpha * phi_ml + (1.0 - alpha) * phi_phys).clamp(1e-6, 1.0 - 1e-6)
-                        pm = phi_mix[idx]
-                        bce_n = F.binary_cross_entropy(pm, tm, reduction="none")
-                        w = torch.where(tm > 0.5, pw, torch.ones_like(tm))
-                        bce = (bce_n * w).mean()
+                        if regression_only:
+                            bce = torch.tensor(0.0, device=device)
+                        else:
+                            pm = phi_mix[idx]
+                            bce_n = F.binary_cross_entropy(pm, tm, reduction="none")
+                            w = torch.where(tm > 0.5, pw, torch.ones_like(tm))
+                            bce = (bce_n * w).mean()
                         if mu_log_lambda > 0.0:
                             log_mu_p = (
                                 alpha * torch.log(mu_ml.clamp(min=1e-8))
@@ -352,21 +418,28 @@ def _run_epoch(
                         mu_pred = alpha * mu_ml + (1.0 - alpha) * mu_phys
                     else:
                         lm = logits[idx]
-                        bce = F.binary_cross_entropy_with_logits(lm, tm, pos_weight=pw)
+                        if regression_only:
+                            bce = torch.tensor(0.0, device=device)
+                        else:
+                            bce = F.binary_cross_entropy_with_logits(lm, tm, pos_weight=pw)
                         if hybrid and mu_log_lambda > 0.0:
                             log_mu_p = torch.log(step.mu_c_si.clamp(min=1e-8)) + dlog
                             log_mu_t = torch.log(step.mu_gt_cap.clamp(min=1e-8))
                             mu_mse = F.mse_loss(log_mu_p[idx], log_mu_t[idx])
                         phi_pred = phi_ml
                         mu_pred = mu_ml
-                    if train and dice_lambda > 0.0:
+                    if train and (not regression_only) and dice_lambda > 0.0:
                         pm = phi_pred[idx].clamp(1e-6, 1.0 - 1e-6)
                         inter = (pm * tm).sum()
                         dice_loss = 1.0 - (2.0 * inter + 1e-6) / (pm.sum() + tm.sum() + 1e-6)
                         loss = bce + dice_lambda * dice_loss + mu_log_lambda * mu_mse + bio_lambda * bio_mse
                     else:
-                        loss = bce + mu_log_lambda * mu_mse + bio_lambda * bio_mse
+                        if regression_only:
+                            loss = mu_log_lambda * mu_mse + bio_lambda * bio_mse
+                        else:
+                            loss = bce + mu_log_lambda * mu_mse + bio_lambda * bio_mse
                     if train:
+                        loss = loss * float(path_step_scale.get(path, 1.0))
                         loss.backward()
                         optimizer.step()
                 with torch.no_grad():
@@ -415,6 +488,17 @@ def main() -> None:
     epochs = max(int(os.environ.get("CLOT_PHI_EPOCHS", "40")), 1)
     lr = float(os.environ.get("CLOT_PHI_LR", "3e-3"))
     time_stride = max(int(os.environ.get("CLOT_PHI_TIME_STRIDE", "2")), 1)
+    auto_time_stride = _env_bool("CLOT_PHI_TIME_STRIDE_AUTO", True)
+    if auto_time_stride and train_paths:
+        min_t = None
+        for p in train_paths:
+            d = torch.load(p, map_location="cpu", weights_only=False)
+            t_steps = int(getattr(d, "y").shape[0]) if hasattr(d, "y") else 0
+            min_t = t_steps if min_t is None else min(min_t, t_steps)
+        # Short-anchor safeguard: avoid skipping informative snapshots when
+        # any train anchor is short after cache subsampling.
+        if min_t is not None and min_t <= 8:
+            time_stride = 1
     hidden = max(int(os.environ.get("CLOT_PHI_HIDDEN", "64")), 4)
     rule_baseline = _env_bool("CLOT_PHI_RULE_BASELINE", False)
     physics_oracle = clot_phi_physics_oracle_enabled()
@@ -469,10 +553,19 @@ def main() -> None:
     species_head = None
     if joint_bio:
         species_head = ClotPhiSpeciesHead(in_dim=in_dim, hidden=_species_hidden()).to(device)
+    init_raw = (os.environ.get("CLOT_PHI_INIT_CHECKPOINT") or "").strip()
+    if init_raw:
+        init_path = Path(init_raw)
+        if not init_path.is_absolute():
+            init_path = root / init_path
+        if init_path.is_file():
+            _load_init_checkpoint(model, species_head, init_path, device)
+            print(f"[i]  loaded init checkpoint {init_path}", flush=True)
+    _freeze_mu_branch(model)
     wd = float(os.environ.get("CLOT_PHI_WEIGHT_DECAY", "0.0") or "0.0")
-    params = list(model.parameters())
+    params = [p for p in model.parameters() if p.requires_grad]
     if species_head is not None:
-        params += list(species_head.parameters())
+        params += [p for p in species_head.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
 
     # pos_weight from a quick pass on train set
@@ -601,6 +694,10 @@ def main() -> None:
                     "weight_decay": wd,
                     "mu_log_lambda": mu_log_lambda,
                     "bio_lambda": _bio_lambda(),
+                    "regression_only": _regression_only(),
+                    "anchor_dir": str(anchor_dir),
+                    "physics_blend": _env_bool("CLOT_PHI_PHYSICS_BLEND", False),
+                    "physics_blend_alpha": _physics_blend_alpha(),
                 },
             }
             if species_head is not None:

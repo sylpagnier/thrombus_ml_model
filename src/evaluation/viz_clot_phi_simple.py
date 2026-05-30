@@ -64,6 +64,10 @@ def main() -> None:
     in_dim = int(cfg.get("in_dim", 6))
     oracle_mu = bool(cfg.get("oracle_mu", False))
     os.environ["CLOT_PHI_ORACLE_MU"] = "1" if oracle_mu else "0"
+    if "species_features" in cfg:
+        os.environ["CLOT_PHI_SPECIES_FEATURES"] = "1" if bool(cfg.get("species_features")) else "0"
+    if "joint_bio" in cfg:
+        os.environ["CLOT_PHI_JOINT_BIO"] = "1" if bool(cfg.get("joint_bio")) else "0"
     if "use_prior_features" in cfg:
         use_prior = bool(cfg.get("use_prior_features"))
         prior_n = int(cfg.get("prior_n", 2))
@@ -78,6 +82,10 @@ def main() -> None:
         os.environ["CLOT_PHI_MINIMAL_FEATURES"] = "1" if bool(cfg.get("minimal_features")) else "0"
     if "hybrid" in cfg:
         os.environ["CLOT_PHI_HYBRID"] = "1" if bool(cfg.get("hybrid")) else "0"
+    if "mlp_depth" in cfg:
+        os.environ["CLOT_PHI_MLP_DEPTH"] = str(int(cfg.get("mlp_depth") or 1))
+    if "dropout" in cfg:
+        os.environ["CLOT_PHI_DROPOUT"] = str(float(cfg.get("dropout") or 0.0))
     model = build_clot_phi_model(in_dim=in_dim, hidden=hidden).to(device)
     model.load_state_dict(raw["model_state_dict"])
     model.eval()

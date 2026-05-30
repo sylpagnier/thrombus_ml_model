@@ -350,6 +350,8 @@ from src.architecture.gnode_biochem import (
     biochem_truth_node_mask,
     resolve_gnode_phase3_ctor_kwargs,
     apply_biochem_forward_policy_from_checkpoint_meta,
+    restore_passive_mu_unlock_shell_env,
+    snapshot_passive_mu_unlock_shell_env,
     snapshot_biochem_model_config,
 )
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
@@ -407,12 +409,42 @@ def _biochem_log_teacher_val(epoch: int, val_stats: Mapping[str, Any], **extra: 
         "viz_final_mu2_p90",
         "viz_final_delta_bulk_mean",
         "viz_bulk_mu_log_mae",
+        "val_species_fi_log_mae",
+        "val_species_mat_log_mae",
+        "val_species_mask_n",
     ):
         v = val_stats.get(key)
         if v is not None:
             metrics[key] = v
     log.log_val("teacher", epoch, metrics, **extra)
 from src.training.physics_curriculum import ease01 as _ease01
+from src.training.adr_residual_config import adr_residual_mode, adr_species_scope
+from src.training.biochem_loss_policy import (
+    approved_backward_summary,
+    biochem_legacy_aux_losses_enabled,
+    biochem_legacy_losses_enabled,
+    check_deprecated_preset,
+    validate_isolate_key,
+    warn_step3_multitask_if_disabled,
+)
+from src.training.biochem_supervision_masks import (
+    adr_fast_transient_enabled,
+    adr_mask_use_per_timestep,
+    align_target_trajectory_to_eval_times,
+    compute_supervised_species_log_mae,
+    passive_adr_backprop_weight,
+    passive_mu_unlock_enabled,
+    passive_mu_unlock_finetune_enabled,
+    passive_mu_unlock_freeze_bio_train,
+    passive_species_train_eval_enabled,
+    passive_species_val_enabled,
+    passive_species_val_only_enabled,
+    passive_step2_bridge_enabled,
+    passive_wall_in_backprop,
+    resolve_adr_node_mask,
+    resolve_data_bio_supervision_mask,
+    supervision_mask_times_mode,
+)
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 from src.utils.nondim import to_t_nd
 
@@ -580,6 +612,8 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
     preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if preset not in _COMPREHENSIVE_MU_PRESET_ALIASES:
         return
+    if not check_deprecated_preset(preset):
+        return
     if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
         return
 
@@ -678,7 +712,9 @@ def _apply_biochem_preset_teacher_visc_baseline_if_requested() -> None:
         "BIOCHEM_ABORT_BAD_TEACHER_INIT": "1",
     }
     for k, v in bundle.items():
-        os.environ[k] = v
+        # Respect explicit user overrides from shell/launcher.
+        if k not in os.environ:
+            os.environ[k] = v
     os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
     print(
@@ -734,7 +770,9 @@ def _apply_biochem_preset_teacher_max_complexity_if_requested() -> None:
         "BIOCHEM_ABORT_BAD_TEACHER_INIT": "1",
     }
     for k, v in bundle.items():
-        os.environ[k] = v
+        # Respect explicit shell/launcher overrides for passive sweeps.
+        if k not in os.environ:
+            os.environ[k] = v
     # Avoid accidental single-term smoke settings leaking into full-complexity runs.
     os.environ.pop("BIOCHEM_LOSS_ISOLATE", None)
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
@@ -779,6 +817,77 @@ def _passive_transport_adr_in_backprop() -> bool:
     return _biochem_env_truthy("BIOCHEM_PASSIVE_ADR_BACKPROP", default=False)
 
 
+def _apply_passive_mu_unlock_trainability_env() -> None:
+    """Re-assert mu-only train flags after presets / checkpoint forward_policy."""
+    if not passive_mu_unlock_enabled():
+        return
+    os.environ["BIOCHEM_LOSS_ISOLATE"] = "MU_LOG"
+    os.environ["BIOCHEM_LOSS_DATA_ONLY"] = "0"
+    os.environ["BIOCHEM_USE_DELTA_MU_HEAD"] = "1"
+    os.environ["BIOCHEM_TRAIN_MU_ENCODER"] = "1"
+    os.environ["BIOCHEM_TRAIN_KIN_LORA"] = "0"
+    if passive_mu_unlock_freeze_bio_train():
+        os.environ["BIOCHEM_TRAIN_BIO_ENCODER"] = "0"
+        os.environ["BIOCHEM_TRAIN_BIO_DECODER"] = "0"
+        os.environ["BIOCHEM_TRAIN_ODE"] = "0"
+    if passive_mu_unlock_finetune_enabled():
+        # Mu-unlock probe leaves wall/high at 0; finetune must not keep those via setdefault.
+        for _k, _v in (
+            ("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.5"),
+            ("BIOCHEM_MU_LOG_WALL_WEIGHT", "0.75"),
+            ("BIOCHEM_MU_LOG_HIGH_WEIGHT", "1.5"),
+            ("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", "0.15"),
+        ):
+            _cur = (os.environ.get(_k) or "").strip()
+            if _cur in ("", "0", "0.0"):
+                os.environ[_k] = _v
+        tag = "PASSIVE_MU_UNLOCK_FINETUNE"
+    else:
+        tag = "PASSIVE_MU_UNLOCK"
+    print(
+        f"[i]  {tag}=1: backward=MU_LOG "
+        f"(W_log={os.environ.get('BIOCHEM_MU_LOG_ANCHOR_WEIGHT', '?')} "
+        f"W_wall={os.environ.get('BIOCHEM_MU_LOG_WALL_WEIGHT', '?')} "
+        f"W_high={os.environ.get('BIOCHEM_MU_LOG_HIGH_WEIGHT', '?')}); "
+        f"TRAIN_MU=1 bio_frozen={int(passive_mu_unlock_freeze_bio_train())}; "
+        f"mu_ratio_max={os.environ.get('BIOCHEM_TEACHER_MU_RATIO_MAX', '?')}.",
+        flush=True,
+    )
+
+
+def _save_passive_mu_unlock_best_checkpoint(
+    model_dir: Path,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    best_epoch: int,
+    run_note: str,
+    val_mu_log_mae: float,
+    val_mu_log_mae_high_mu: float,
+    teacher_best_mu_score: float,
+    model_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Canonical all-truth-best weights from mu-unlock probe (for finetune init)."""
+    if passive_mu_unlock_finetune_enabled():
+        return
+    path = Path(model_dir) / BIOCHEM_PASSIVE_MU_UNLOCK_BEST_CKPT_NAME
+    _save_biochem_checkpoint_file(
+        path,
+        state_dict,
+        checkpoint_role="passive_mu_unlock_best",
+        run_note=run_note,
+        best_epoch=int(best_epoch),
+        val_mu_log_mae=float(val_mu_log_mae),
+        val_mu_log_mae_high_mu=float(val_mu_log_mae_high_mu),
+        teacher_best_mu_score=float(teacher_best_mu_score),
+        model_config=model_config,
+    )
+    print(
+        f"[save]  Passive mu-unlock best (all-truth ep {int(best_epoch):02d}, "
+        f"logMAE={float(val_mu_log_mae):.4f}) -> {path.name}",
+        flush=True,
+    )
+
+
 def _apply_biochem_preset_passive_transport_if_requested() -> None:
     """``BIOCHEM_PRESET=passive_transport`` (or alias): 1-way biochem on frozen / GT flow.
 
@@ -791,6 +900,8 @@ def _apply_biochem_preset_passive_transport_if_requested() -> None:
 
     Train bio encoder/decoder + ODE; freeze kinematic LoRA and mu encoder. Teacher-only by default.
     """
+    if passive_mu_unlock_enabled():
+        return
     preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if preset not in _PASSIVE_TRANSPORT_PRESET_ALIASES:
         return
@@ -830,11 +941,14 @@ def _apply_biochem_preset_passive_transport_if_requested() -> None:
         "BIOCHEM_DETACH_MACRO_STATE": "0",
     }
     for k, v in bundle.items():
-        os.environ[k] = v
+        if k not in os.environ:
+            os.environ[k] = v
     print(
         "[i]  BIOCHEM_PRESET=passive_transport: 1-way ADR + species (Mat/FI via L_Data_Bio); "
         "mu_ratio_max=1, TF=1, kin/mu frozen; COMSOL GT [u,v,p] (DEQ skipped); "
-        "DETACH_MACRO=0; backward=Data_Bio (+ADR metrics only unless PASSIVE_ADR_BACKPROP=1).",
+        "DETACH_MACRO=0; backward=Data_Bio (+ADR metrics only unless PASSIVE_ADR_BACKPROP=1). "
+        f"DataBio channel boosts FI={os.environ.get('BIOCHEM_DATA_BIO_FI_WEIGHT', '1.0')} "
+        f"Mat={os.environ.get('BIOCHEM_DATA_BIO_MAT_WEIGHT', '1.0')}.",
         flush=True,
     )
 
@@ -874,6 +988,8 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
     preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if preset not in _THROMBUS_CORONA_PRESET_ALIASES:
         return
+    if not check_deprecated_preset(preset):
+        return
     if (os.environ.get("BIOCHEM_STOCK_DEFAULTS", "") or "").strip().lower() in ("1", "true", "yes", "on"):
         return
     bundle: Dict[str, str] = {
@@ -901,7 +1017,10 @@ _SWEEP_WALL_SENTINEL_ALIASES = frozenset({"sweep_wall_sentinel"})
 
 
 def _apply_biochem_preset_sweep_wall_sentinel_if_requested() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_WALL_SENTINEL_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_WALL_SENTINEL_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
@@ -945,7 +1064,10 @@ _SWEEP_GEMINI_ALIASES = frozenset({"sweep_gemini", "gemini"})
 
 
 def _apply_biochem_preset_sweep_gemini_if_requested() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_GEMINI_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_GEMINI_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_MU_GEMINI_FIX": "1",
@@ -971,7 +1093,10 @@ _SWEEP_BIO_SUPPRESSOR_ALIASES = frozenset({"sweep_bio_suppressor"})
 
 
 def _apply_biochem_preset_sweep_bio_suppressor_if_requested() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_BIO_SUPPRESSOR_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_BIO_SUPPRESSOR_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
@@ -1023,7 +1148,10 @@ _SWEEP_WALL_OVERCOMP_ALIASES = frozenset({"sweep_wall_overcomp", "sweep_wall_ove
 
 
 def _apply_biochem_preset_sweep_wall_overcomp_if_requested() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_WALL_OVERCOMP_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_WALL_OVERCOMP_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
@@ -1071,7 +1199,10 @@ _SWEEP_CLOT_NUC_GROWTH_ALIASES = frozenset({"sweep_clot_nuc_growth", "sweep_clot
 
 
 def _apply_biochem_preset_sweep_clot_nuc_growth_if_requested() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_CLOT_NUC_GROWTH_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_CLOT_NUC_GROWTH_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         # Teacher-only step-2 probe.
@@ -1127,7 +1258,10 @@ _SWEEP_FREE_WALL_ALIASES = frozenset({"sweep_free_wall_a"})
 
 
 def _apply_biochem_preset_sweep_free_wall_a() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_FREE_WALL_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_FREE_WALL_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
@@ -1166,7 +1300,10 @@ _SWEEP_FREE_WALL_B_ALIASES = frozenset({"sweep_free_wall_b"})
 
 
 def _apply_biochem_preset_sweep_free_wall_b() -> None:
-    if (os.environ.get("BIOCHEM_PRESET") or "").strip().lower() not in _SWEEP_FREE_WALL_B_ALIASES:
+    preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
+    if preset not in _SWEEP_FREE_WALL_B_ALIASES:
+        return
+    if not check_deprecated_preset(preset):
         return
     bundle: Dict[str, str] = {
         "BIOCHEM_COMPLEXITY_STEP": "2",
@@ -1312,6 +1449,7 @@ def _apply_pycharm_biochem_optimal_defaults() -> None:
     _apply_biochem_complexity_step2_env()
     _apply_biochem_preset_overnight_step2_if_requested()
     _apply_biochem_preset_passive_transport_if_requested()
+    _apply_passive_mu_unlock_trainability_env()
     _apply_biochem_preset_step2p5_phys_temp_if_requested()
     _apply_biochem_preset_thrombus_corona_if_requested()
     _apply_biochem_preset_comprehensive_mu_if_requested()
@@ -1707,6 +1845,17 @@ def _compute_mu_flow_debug_metrics(
     # Inlet volume flux vs FD prescription (Re = phys_cfg.re_target, Uav = u_ref x width).
     u = pred_final[:, 0].float()
     v = pred_final[:, 1].float()
+    if _biochem_env_truthy("BIOCHEM_GT_KINE_VEL", default=False):
+        # Match ADR advection: on anchors, flux sanity uses COMSOL [u,v], not DEQ prediction.
+        yt = None
+        if hasattr(data, "y") and data.y is not None and data.y.ndim == 3 and int(data.y.shape[-1]) >= 2:
+            yt = data.y
+        if yt is not None:
+            gt_uv = yt[-1, :, 0:2].to(device=u.device, dtype=u.dtype)
+            m = truth_mask.view(-1).bool()
+            if m.any():
+                u = torch.where(m, gt_uv[:, 0], u)
+                v = torch.where(m, gt_uv[:, 1], v)
     speed = torch.sqrt(u * u + v * v + 1e-20)
     out["DBG_speed_mean"] = float(speed.mean().item())
     vel_xy = torch.stack([u, v], dim=1)
@@ -2041,6 +2190,7 @@ def _filter_compatible_state_dict(
 
 
 BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME = "biochem_teacher_best_high_mu.pth"
+BIOCHEM_PASSIVE_MU_UNLOCK_BEST_CKPT_NAME = "biochem_teacher_passive_mu_unlock_best.pth"
 BIOCHEM_TEACHER_LAST_CKPT_NAME = "biochem_teacher_last.pth"
 # Legacy all-truth global best (optional; not written unless BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL=1).
 BIOCHEM_TEACHER_BEST_CKPT_NAME = "biochem_teacher_best.pth"
@@ -2204,7 +2354,7 @@ def _maybe_update_global_checkpoint(
 
     prev_note = (prev_meta.get("run_note") or "").strip()
     print(
-        f"🏆 {kept_label} kept -> {global_path.name} "
+        f"[OK] {kept_label} kept -> {global_path.name} "
         f"({metric_key}~{prev_val:.4f}"
         + (f", run_note={prev_note!r}" if prev_note else "")
         + f"); this run ~{cand:.4f} did not beat it.",
@@ -3855,6 +4005,7 @@ def _biochem_resolve_isolated_loss(
     lambda_residual_sparse: float,
 ) -> torch.Tensor:
     """Single-term backprop scalar for ``BIOCHEM_LOSS_ISOLATE`` smoke tests."""
+    validate_isolate_key(key)
     k = (key or "").strip().upper()
     aliases = {
         "ADR_FAST": "ADR_F",
@@ -3947,7 +4098,12 @@ def _biochem_resolve_isolated_loss(
         # (that helper maps w=0 -> 1.0 for legacy single-term isolates).
         data_terms = w_bio * l_data_bio + w_kine * l_data_kine
         if _passive_transport_adr_in_backprop():
-            return l_adr_fast + l_adr_slow + data_terms
+            adr_w = max(float(os.environ.get("BIOCHEM_PASSIVE_ADR_WEIGHT", "1.0")), 0.0)
+            phys_terms = adr_w * (l_adr_fast + l_adr_slow)
+            if passive_wall_in_backprop():
+                wall_w = max(float(os.environ.get("BIOCHEM_PASSIVE_WALL_WEIGHT", "1.0")), 0.0)
+                phys_terms = phys_terms + wall_w * (l_wall_bio + l_wall_phys)
+            return phys_terms + data_terms
         return data_terms
     valid = (
         "ADR_F, ADR_S, W_BIO, W_PHY, BIO_IO, NS_MOM, DATA_KINE, DATA_BIO, PSEUDO, LATENT, "
@@ -4160,6 +4316,7 @@ def compute_biochem_loss(
     l_data_kine = torch.tensor(0.0, device=device)
     l_data_bio = torch.tensor(0.0, device=device)
     t_eval_bio_for_metrics = 0.0
+    data_bio_mask_n = 0.0
     has_anchor_supervision = bool(truth_mask.any().item())
 
     # FIX: Since we removed the 3x dense multiplier, the prediction frequency
@@ -4180,8 +4337,32 @@ def compute_biochem_loss(
         # ---------------------------------------------------------
         # Native log1p Huber loss to prevent exponential gradient crushing.
         # ---------------------------------------------------------
-        pred_bio = pred_series_data_freq[:, node_is_anchor, 4:16]
-        targ_bio = target_series[:, node_is_anchor, 4:16]
+        bio_mask_mode = (os.environ.get("BIOCHEM_DATA_BIO_MASK_MODE") or "global").strip().lower()
+        node_is_bio_target = resolve_data_bio_supervision_mask(
+            data=data,
+            device=device,
+            truth_mask=node_is_anchor,
+            target_series=target_series,
+            bio_cfg=bio_cfg,
+            kernels=kernels,
+        )
+        data_bio_mask_n = int(node_is_bio_target.sum().item())
+        if (
+            bio_mask_mode in ("clot_band", "clotdec_band", "wall_clot_band", "decision_band")
+            and data_bio_mask_n < 32
+            and model.training
+            and _biochem_env_truthy("BIOCHEM_WARN_SMALL_SUPERVISION_MASK", default=True)
+        ):
+            print(
+                f"[WARN] BIOCHEM_DATA_BIO_MASK_MODE={bio_mask_mode}: "
+                f"only {data_bio_mask_n} supervised nodes "
+                f"(times={supervision_mask_times_mode()}); "
+                "try BIOCHEM_SUPERVISION_MASK_TIMES=union or ADR_MASK_MODE=interior",
+                flush=True,
+            )
+
+        pred_bio = pred_series_data_freq[:, node_is_bio_target, 4:16]
+        targ_bio = target_series[:, node_is_bio_target, 4:16]
 
         scales = bio_cfg.get_species_scales(device=device)
         target_ranges = scales.clone()
@@ -4193,6 +4374,12 @@ def compute_biochem_loss(
         # Relative channel weighting without expm1-space amplification.
         channel_weights = (scales / target_ranges).view(1, 1, 12)
         channel_weights = torch.clamp(channel_weights, min=1.0, max=100.0)
+        # Optional teacher-side species emphasis for clot-driving channels.
+        # Keep defaults at 1.0 to preserve existing behavior unless explicitly requested.
+        fi_w = max(float(os.environ.get("BIOCHEM_DATA_BIO_FI_WEIGHT", "1.0")), 0.0)
+        mat_w = max(float(os.environ.get("BIOCHEM_DATA_BIO_MAT_WEIGHT", "1.0")), 0.0)
+        channel_weights[..., 8] = channel_weights[..., 8] * fi_w
+        channel_weights[..., 11] = channel_weights[..., 11] * mat_w
 
         # Huber directly in bounded log1p output space.
         base_huber = F.huber_loss(pred_bio, targ_bio, reduction="none", delta=1.0)
@@ -4227,6 +4414,24 @@ def compute_biochem_loss(
     def _zero_loss():
         return pred_final.sum() * 0.0
 
+    adr_mask_times = supervision_mask_times_mode()
+    adr_per_step = adr_mask_use_per_timestep()
+    adr_node_mask = resolve_adr_node_mask(
+        data=data,
+        device=device,
+        truth_mask=truth_mask,
+        target_series=target_series,
+        bio_cfg=bio_cfg,
+        kernels=kernels,
+    )
+    adr_fast_transient = adr_fast_transient_enabled()
+    adr_mask_mode = (os.environ.get("BIOCHEM_ADR_MASK_MODE") or "global").strip().lower()
+    adr_res_mode = adr_residual_mode()
+    adr_sp_scope = adr_species_scope()
+    adr_mask_n_steps: list[int] = []
+    l_adr_fast_global = _zero_loss()
+    l_adr_slow_global = _zero_loss()
+
     if num_steps <= 0:
         l_adr_fast = _zero_loss()
         l_adr_slow = _zero_loss()
@@ -4242,6 +4447,8 @@ def compute_biochem_loss(
         l_wall_bio = _zero_loss()
         l_wall_phys = _zero_loss()
         l_bio_io = _zero_loss()
+        l_adr_fast_global = _zero_loss()
+        l_adr_slow_global = _zero_loss()
 
         for t_idx in range(num_steps):
             # Evaluate physics at step t+1 using finite difference gradient
@@ -4276,7 +4483,58 @@ def compute_biochem_loss(
             else:
                 setattr(data, "t_global", evaluation_times[t_idx + 1])
 
-            l_af, l_as = kernels.biochem_adr_residual(biochem_t, vel_t, props, data, d_pred_dt=dC_dt_t)
+            step_adr_mask = adr_node_mask
+            if adr_per_step:
+                step_adr_mask = resolve_adr_node_mask(
+                    data=data,
+                    device=device,
+                    truth_mask=truth_mask,
+                    target_series=target_series,
+                    bio_cfg=bio_cfg,
+                    kernels=kernels,
+                    step_idx=t_idx + 1,
+                )
+            if step_adr_mask is not None:
+                adr_mask_n_steps.append(int(step_adr_mask.sum().item()))
+                l_af, l_as = kernels.biochem_adr_residual(
+                    biochem_t,
+                    vel_t,
+                    props,
+                    data,
+                    d_pred_dt=dC_dt_t,
+                    node_mask=step_adr_mask,
+                    fast_transient=adr_fast_transient,
+                    residual_mode=adr_res_mode,
+                    species_scope=adr_sp_scope,
+                )
+                with torch.no_grad():
+                    l_af_g, l_as_g = kernels.biochem_adr_residual(
+                        biochem_t,
+                        vel_t,
+                        props,
+                        data,
+                        d_pred_dt=dC_dt_t,
+                        node_mask=None,
+                        fast_transient=adr_fast_transient,
+                        residual_mode=adr_res_mode,
+                        species_scope=adr_sp_scope,
+                    )
+                l_adr_fast_global = l_adr_fast_global + l_af_g
+                l_adr_slow_global = l_adr_slow_global + l_as_g
+            else:
+                l_af, l_as = kernels.biochem_adr_residual(
+                    biochem_t,
+                    vel_t,
+                    props,
+                    data,
+                    d_pred_dt=dC_dt_t,
+                    node_mask=None,
+                    fast_transient=adr_fast_transient,
+                    residual_mode=adr_res_mode,
+                    species_scope=adr_sp_scope,
+                )
+                l_adr_fast_global = l_adr_fast_global + l_af
+                l_adr_slow_global = l_adr_slow_global + l_as
             l_wb, l_wp = kernels.biochem_wall_residual(biochem_t, wall_t, vel_t, props, data, dM_dt_t)
             l_bi, l_bo = kernels.biochem_inlet_outlet_residual(biochem_t, props, data)
 
@@ -4289,6 +4547,8 @@ def compute_biochem_loss(
         inv = 1.0 / float(num_steps)
         l_adr_fast = l_adr_fast * inv
         l_adr_slow = l_adr_slow * inv
+        l_adr_fast_global = l_adr_fast_global * inv
+        l_adr_slow_global = l_adr_slow_global * inv
         l_wall_bio = l_wall_bio * inv
         l_wall_phys = l_wall_phys * inv
         l_bio_io = l_bio_io * inv
@@ -4553,12 +4813,12 @@ def compute_biochem_loss(
                     cfg_mu=kernels.core.cfg,
                     mu_ch=mu_ch,
                 )
-            if _k10e_loss_active:
-                w_mu_log_adjacent = max(
-                    float(os.environ.get("BIOCHEM_MU_LOG_ADJACENT_WEIGHT", "0.0")),
-                    0.0,
-                )
-                w_k10e_bulk = max(float(os.environ.get("BIOCHEM_K10E_BULK_DELTA_WEIGHT", "0.0")), 0.0)
+            w_mu_log_adjacent = max(
+                float(os.environ.get("BIOCHEM_MU_LOG_ADJACENT_WEIGHT", "0.0")),
+                0.0,
+            )
+            w_k10e_bulk = max(float(os.environ.get("BIOCHEM_K10E_BULK_DELTA_WEIGHT", "0.0")), 0.0)
+            if _k10e_isolate or w_mu_log_adjacent > 0.0 or w_k10e_bulk > 0.0:
                 if _k10e_isolate or w_mu_log_adjacent > 0.0:
                     l_mu_log_adjacent = _anchor_mu_adjacent_log_loss(
                         pred_series_data_freq,
@@ -4580,11 +4840,11 @@ def compute_biochem_loss(
         mu_ch=mu_ch,
     )
 
-    # Teacher-start FI gate suppression: prevents inherited broad FI activation from
-    # immediately doubling viscosity before anchor supervision can pull states back.
+    # Teacher-start FI gate suppression (legacy aux; see biochem_loss_policy).
     l_fi_gate_start = torch.tensor(0.0, device=device)
     w_fi_gate_start_eff = 0.0
-    if model.training:
+    _legacy_aux = biochem_legacy_aux_losses_enabled()
+    if _legacy_aux and model.training:
         fi_gate_epochs = max(0, int(os.environ.get("BIOCHEM_FI_GATE_START_EPOCHS", "0")))
         fi_gate_w = max(0.0, float(os.environ.get("BIOCHEM_FI_GATE_START_WEIGHT", "0.0")))
         fi_gate_eps = max(0.0, float(os.environ.get("BIOCHEM_FI_GATE_START_EPS", "0.03")))
@@ -4609,11 +4869,10 @@ def compute_biochem_loss(
                 mu2_fi = mu2_fi[truth_mask]
             l_fi_gate_start = torch.mean(torch.relu(mu2_fi - fi_gate_eps).pow(2))
 
-    # Residual sparsity prior (best-practice macro->micro decomposition):
-    # penalize positive high-viscosity residual away from anchor-evidenced / prior-supported regions.
+    # Residual sparsity prior (legacy aux).
     l_residual_sparse = torch.tensor(0.0, device=device)
     lambda_residual_sparse = 0.0
-    if model.training:
+    if _legacy_aux and model.training:
         lambda_residual_sparse = _scheduled_residual_sparse_lambda(epoch, total_epochs)
         if lambda_residual_sparse > 0.0:
             if mu_excess_all is None:
@@ -4636,14 +4895,12 @@ def compute_biochem_loss(
             residual_excess = torch.relu(mu_excess_all - guide)
             l_residual_sparse = torch.mean(residual_excess.pow(2))
 
-    # Trigger anti-collapse priors (opt-in):
-    # keep tail trigger/gelation pathway alive on high-mu anchor nodes even when
-    # global losses favor collapsing back to near-pure Carreau.
+    # Trigger anti-collapse priors (legacy aux; clot6h era — gate collapse).
     l_trigger_gate_floor = torch.tensor(0.0, device=device)
     l_trigger_learned_floor = torch.tensor(0.0, device=device)
     w_trigger_gate_floor = 0.0
     w_trigger_learned_floor = 0.0
-    if model.training and has_anchor_supervision:
+    if _legacy_aux and model.training and has_anchor_supervision:
         w_trigger_gate_floor = max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_FLOOR_WEIGHT", "0.0")), 0.0)
         w_trigger_learned_floor = max(float(os.environ.get("BIOCHEM_TRIGGER_LEARNED_FLOOR_WEIGHT", "0.0")), 0.0)
         if w_trigger_gate_floor > 0.0 or w_trigger_learned_floor > 0.0:
@@ -4682,7 +4939,9 @@ def compute_biochem_loss(
     w_trigger_sparse = max(float(os.environ.get("BIOCHEM_CLOT_TRIGGER_SPARSITY_WEIGHT", "0.0")), 0.0)
     w_trigger_nonwall = max(float(os.environ.get("BIOCHEM_CLOT_TRIGGER_NONWALL_WEIGHT", "0.0")), 0.0)
     w_trigger_nuc_align = max(float(os.environ.get("BIOCHEM_CLOT_NUCLEATION_ALIGN_WEIGHT", "0.0")), 0.0)
-    if model.training and (w_trigger_sparse > 0.0 or w_trigger_nonwall > 0.0 or w_trigger_nuc_align > 0.0):
+    if _legacy_aux and model.training and (
+        w_trigger_sparse > 0.0 or w_trigger_nonwall > 0.0 or w_trigger_nuc_align > 0.0
+    ):
         gate = getattr(model, "_last_mu_trigger_gate", None)
         if torch.is_tensor(gate):
             gate_flat = gate.reshape(-1)
@@ -4785,6 +5044,9 @@ def compute_biochem_loss(
             )
             if model.training and data_only_phys_temp_wanted:
                 loss = loss + (w_pt * l_phys_temp)
+            adr_w_step2 = passive_adr_backprop_weight()
+            if model.training and passive_step2_bridge_enabled() and adr_w_step2 > 0.0:
+                loss = loss + adr_w_step2 * (l_adr_fast + l_adr_slow)
         elif has_pseudo_supervision and float(pseudo_loss_weight) > 0.0:
             loss = float(pseudo_loss_weight) * l_pseudo
         else:
@@ -4810,10 +5072,12 @@ def compute_biochem_loss(
             + (w_mu_log_high * l_mu_log_high)
             + (w_mu_wall_bypass * l_mu_wall_bypass)
             + (max(float(os.environ.get("BIOCHEM_MU_LOG_BOUNDARY_WEIGHT", "0.0")), 0.0) * l_mu_log_boundary)
-            + (w_fi_gate_start_eff * l_fi_gate_start)
-            + (lambda_residual_sparse * l_residual_sparse)
         )
-    if model.training and (
+        if _legacy_aux:
+            loss = loss + (w_fi_gate_start_eff * l_fi_gate_start) + (
+                lambda_residual_sparse * l_residual_sparse
+            )
+    if _legacy_aux and model.training and (
         w_trigger_gate_floor > 0.0
         or w_trigger_learned_floor > 0.0
         or w_trigger_sparse > 0.0
@@ -4845,6 +5109,33 @@ def compute_biochem_loss(
         "L_mom": l_mom.item(),
         "L_ADR_F": l_adr_fast.item(),
         "L_ADR_S": l_adr_slow.item(),
+        "L_ADR_F_global": float(l_adr_fast_global.item()) if num_steps > 0 else float(l_adr_fast.item()),
+        "L_ADR_S_global": float(l_adr_slow_global.item()) if num_steps > 0 else float(l_adr_slow.item()),
+        "ADR_mask_mode": adr_mask_mode,
+        "ADR_mask_times": adr_mask_times,
+        "ADR_residual_mode": adr_res_mode,
+        "ADR_species_scope": adr_sp_scope,
+        "ADR_fast_transient": float(adr_fast_transient),
+        "data_bio_mask_n": float(data_bio_mask_n) if has_anchor_supervision else 0.0,
+        "ADR_mask_n": (
+            float(sum(adr_mask_n_steps) / max(len(adr_mask_n_steps), 1))
+            if adr_mask_n_steps
+            else (
+                float(int(adr_node_mask.sum().item()))
+                if adr_node_mask is not None
+                else float(data.num_nodes)
+            )
+        ),
+        "ADR_mask_n_min": (
+            float(min(adr_mask_n_steps)) if adr_mask_n_steps else float("nan")
+        ),
+        "ADR_mask_n_max": (
+            float(max(adr_mask_n_steps)) if adr_mask_n_steps else float("nan")
+        ),
+        "passive_adr_weight": float(os.environ.get("BIOCHEM_PASSIVE_ADR_WEIGHT", "1.0") or "1.0"),
+        "passive_step2_bridge": float(passive_step2_bridge_enabled()),
+        "passive_mu_unlock": float(passive_mu_unlock_enabled()),
+        "passive_mu_unlock_finetune": float(passive_mu_unlock_finetune_enabled()),
         "L_W_Bio": l_wall_bio.item(),
         "L_W_Phy": l_wall_phys.item(),
         "L_B_IO": l_bio_io.item(),
@@ -5492,6 +5783,139 @@ def _viz_health_score(agg: Mapping[str, float], *, mu_log_mae_final: float) -> f
     return score
 
 
+def _species_metrics_from_rollout(
+    v_data,
+    v_pred,
+    val_eval_times,
+    *,
+    bio_cfg,
+    device,
+    kernels,
+) -> Optional[Dict[str, Any]]:
+    """FI/Mat on supervision mask from an existing rollout (no second forward)."""
+    n_nodes = int(v_data.num_nodes)
+    truth_m = biochem_truth_node_mask(v_data, n_nodes, device)
+    y_on_eval = align_target_trajectory_to_eval_times(v_data, val_eval_times, bio_cfg, device)
+    sup_mask = resolve_data_bio_supervision_mask(
+        data=v_data,
+        device=device,
+        truth_mask=truth_m,
+        target_series=y_on_eval,
+        bio_cfg=bio_cfg,
+        kernels=kernels,
+    )
+    sp = compute_supervised_species_log_mae(
+        pred_series=v_pred,
+        target_series=y_on_eval,
+        node_mask=sup_mask,
+    )
+    if not math.isfinite(sp["species_fi_log_mae"]):
+        return None
+    return {
+        "anchor": _biochem_anchor_basename(v_data),
+        "species_fi_log_mae": float(sp["species_fi_log_mae"]),
+        "species_mat_log_mae": float(sp["species_mat_log_mae"]),
+        "species_mask_n": float(sp["species_mask_n"]),
+    }
+
+
+def _bundle_passive_species_rows(per_anchor: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not per_anchor:
+        return {
+            "per_anchor": [],
+            "species_fi_log_mae_mean": float("nan"),
+            "species_mat_log_mae_mean": float("nan"),
+            "species_mask_n_mean": float("nan"),
+        }
+    fi_vals = [float(r["species_fi_log_mae"]) for r in per_anchor]
+    mat_vals = [float(r["species_mat_log_mae"]) for r in per_anchor]
+    mask_vals = [float(r["species_mask_n"]) for r in per_anchor]
+    return {
+        "per_anchor": per_anchor,
+        "species_fi_log_mae_mean": float(sum(fi_vals) / len(fi_vals)),
+        "species_mat_log_mae_mean": float(sum(mat_vals) / len(mat_vals)),
+        "species_mask_n_mean": float(sum(mask_vals) / len(mask_vals)),
+    }
+
+
+def _compute_passive_species_on_loader(
+    model,
+    loader,
+    kernels,
+    bio_cfg,
+    device,
+    *,
+    non_blocking: bool = False,
+) -> Dict[str, Any]:
+    """Per-anchor FI/Mat logMAE on clot-band supervision mask (eval-time grid)."""
+    model.eval()
+    per_anchor: List[Dict[str, Any]] = []
+    with torch.no_grad():
+        for v_data in loader:
+            v_data = v_data.to(device, non_blocking=non_blocking)
+            val_eval_times = _validation_eval_times(v_data, bio_cfg, device)
+            v_pred = model(v_data, val_eval_times)
+            if isinstance(v_pred, tuple):
+                v_pred = v_pred[0]
+            row = _species_metrics_from_rollout(
+                v_data, v_pred, val_eval_times, bio_cfg=bio_cfg, device=device, kernels=kernels
+            )
+            if row is not None:
+                per_anchor.append(row)
+    return _bundle_passive_species_rows(per_anchor)
+
+
+def _compute_passive_species_val_only_bundle(
+    model,
+    loader,
+    kernels,
+    bio_cfg,
+    device,
+    *,
+    non_blocking: bool = False,
+) -> Dict[str, Any]:
+    """Fast teacher val for I.1 X probes: species + t0 flow only (one rollout per anchor)."""
+    per_anchor: List[Dict[str, Any]] = []
+    t0_speeds: List[float] = []
+    model.eval()
+    with torch.no_grad():
+        for v_data in loader:
+            v_data = v_data.to(device, non_blocking=non_blocking)
+            val_eval_times = _validation_eval_times(v_data, bio_cfg, device)
+            v_pred = model(v_data, val_eval_times)
+            if isinstance(v_pred, tuple):
+                v_pred = v_pred[0]
+            row = _species_metrics_from_rollout(
+                v_data, v_pred, val_eval_times, bio_cfg=bio_cfg, device=device, kernels=kernels
+            )
+            if row is not None:
+                per_anchor.append(row)
+            pred_t0 = v_pred[0]
+            y_t0 = v_data.y[0].to(device)
+            health = _compute_slice_viz_health_metrics(
+                pred_t0, y_t0, v_data, model, kernels, device
+            )
+            spd = float(health.get("speed_mean", float("nan")))
+            if math.isfinite(spd):
+                t0_speeds.append(spd)
+    sp_bundle = _bundle_passive_species_rows(per_anchor)
+    t0_speed = float(sum(t0_speeds) / len(t0_speeds)) if t0_speeds else float("nan")
+    out: Dict[str, Any] = {
+        "mu_log_mae": float("nan"),
+        "mu_pearson": 0.0,
+        "per_graph": [],
+        "viz_t0_speed_mean": t0_speed,
+        "viz_health_score": float("nan"),
+    }
+    fi_mean = float(sp_bundle.get("species_fi_log_mae_mean", float("nan")))
+    if math.isfinite(fi_mean):
+        out["val_species_fi_log_mae"] = fi_mean
+        out["val_species_mat_log_mae"] = float(sp_bundle["species_mat_log_mae_mean"])
+        out["val_species_mask_n"] = float(sp_bundle.get("species_mask_n_mean", float("nan")))
+        out["val_species_per_anchor"] = sp_bundle.get("per_anchor") or []
+    return out
+
+
 def _compute_anchor_mu_metrics(
     model,
     loader,
@@ -5513,6 +5937,7 @@ def _compute_anchor_mu_metrics(
         return empty
     model.eval()
     per_graph: List[Dict[str, Any]] = []
+    species_inline: List[Dict[str, Any]] = []
     t0_health_rows: List[Dict[str, float]] = []
     final_health_rows: List[Dict[str, float]] = []
 
@@ -5523,6 +5948,12 @@ def _compute_anchor_mu_metrics(
             v_pred = model(v_data, val_eval_times)
             if isinstance(v_pred, tuple):
                 v_pred = v_pred[0]
+            if passive_species_val_enabled():
+                row = _species_metrics_from_rollout(
+                    v_data, v_pred, val_eval_times, bio_cfg=bio_cfg, device=device, kernels=kernels
+                )
+                if row is not None:
+                    species_inline.append(row)
             pred_last = v_pred[-1]
             y_last = v_data.y[-1].to(device)
             mu_dbg = _compute_mu_debug_metrics(pred_last, y_last, v_data, kernels, device)
@@ -5583,6 +6014,13 @@ def _compute_anchor_mu_metrics(
             health_for_score, mu_log_mae_final=float(agg["mu_log_mae"])
         ),
     }
+    if passive_species_val_enabled() and species_inline:
+        sp_bundle = _bundle_passive_species_rows(species_inline)
+        if math.isfinite(float(sp_bundle.get("species_fi_log_mae_mean", float("nan")))):
+            out["val_species_fi_log_mae"] = float(sp_bundle["species_fi_log_mae_mean"])
+            out["val_species_mat_log_mae"] = float(sp_bundle["species_mat_log_mae_mean"])
+            out["val_species_mask_n"] = float(sp_bundle["species_mask_n_mean"])
+            out["val_species_per_anchor"] = sp_bundle.get("per_anchor") or []
     return out
 
 
@@ -5942,6 +6380,8 @@ def train_teacher_on_anchors(
         ema_beta = float(os.environ.get("BIOCHEM_TEACHER_LBIO_EMA_BETA", "0.9"))
         ema_beta = min(max(ema_beta, 0.0), 0.999999)
         ema_l_bio: Optional[float] = None
+        prev_avg_bio: Optional[float] = None
+        prev_avg_adr_sum: Optional[float] = None
         for epoch in range(max_epochs):
             freeze_ode_epochs = _biochem_teacher_ode_freeze_epochs(max_epochs)
             train_ode = _biochem_env_truthy("BIOCHEM_TRAIN_ODE", default=True)
@@ -5985,6 +6425,10 @@ def train_teacher_on_anchors(
             teacher_optimizer.zero_grad()
             epoch_l_tot, epoch_l_bio = 0.0, 0.0
             epoch_l_kine, epoch_l_back = 0.0, 0.0
+            epoch_l_adr_fast, epoch_l_adr_slow = 0.0, 0.0
+            epoch_l_adr_fast_global, epoch_l_adr_slow_global = 0.0, 0.0
+            epoch_l_wall_bio, epoch_l_wall_phys = 0.0, 0.0
+            epoch_l_bio_io = 0.0
             epoch_mu_si_w, epoch_mu_log_w = 0.0, 0.0
             epoch_mu_log_wall_w, epoch_mu_log_high_w = 0.0, 0.0
             epoch_mu_batches = 0
@@ -6001,6 +6445,9 @@ def train_teacher_on_anchors(
             epoch_dbg_gate_clot_sum = 0.0
             epoch_dbg_gate_n = 0
             epoch_dbg_n = 0
+            epoch_data_bio_mask_n_sum = 0.0
+            epoch_adr_mask_n_sum = 0.0
+            epoch_mask_metric_batches = 0
             epoch_trivial_flow_warned = False
             warn_trivial_every_batch = _biochem_env_truthy(
                 "BIOCHEM_FLOW_TRIVIAL_WARN_EVERY_BATCH", default=False
@@ -6046,6 +6493,17 @@ def train_teacher_on_anchors(
                 epoch_l_bio += current_l_bio
                 epoch_l_kine += float(metrics.get("L_Data_Kine", 0.0))
                 epoch_l_back += float(metrics.get("L_Backprop", float(loss.detach().item())))
+                epoch_l_adr_fast += float(metrics.get("L_ADR_F", 0.0))
+                epoch_l_adr_slow += float(metrics.get("L_ADR_S", 0.0))
+                epoch_l_adr_fast_global += float(metrics.get("L_ADR_F_global", metrics.get("L_ADR_F", 0.0)))
+                epoch_l_adr_slow_global += float(metrics.get("L_ADR_S_global", metrics.get("L_ADR_S", 0.0)))
+                epoch_l_wall_bio += float(metrics.get("L_W_Bio", 0.0))
+                epoch_l_wall_phys += float(metrics.get("L_W_Phy", 0.0))
+                epoch_l_bio_io += float(metrics.get("L_B_IO", 0.0))
+                if metrics.get("data_bio_mask_n", 0.0) > 0.0 or metrics.get("ADR_mask_n", 0.0) > 0.0:
+                    epoch_data_bio_mask_n_sum += float(metrics.get("data_bio_mask_n", 0.0))
+                    epoch_adr_mask_n_sum += float(metrics.get("ADR_mask_n", 0.0))
+                    epoch_mask_metric_batches += 1
                 if metrics.get("Has_Anchor_Supervision", 0.0) > 0.5:
                     epoch_mu_si_w += float(metrics.get("W_MuSI_aux_eff", 0.0)) * float(metrics.get("L_MuSI_aux", 0.0))
                     epoch_mu_log_w += float(metrics.get("W_MuLog_aux_eff", 0.0)) * float(metrics.get("L_MuLog_aux", 0.0))
@@ -6157,13 +6615,64 @@ def train_teacher_on_anchors(
             avg_bio = epoch_l_bio / max(1, n_batches)
             avg_kine = epoch_l_kine / max(1, n_batches)
             avg_back = epoch_l_back / max(1, n_batches)
+            avg_adr_fast = epoch_l_adr_fast / max(1, n_batches)
+            avg_adr_slow = epoch_l_adr_slow / max(1, n_batches)
+            avg_adr_fast_global = epoch_l_adr_fast_global / max(1, n_batches)
+            avg_adr_slow_global = epoch_l_adr_slow_global / max(1, n_batches)
+            avg_wall_bio = epoch_l_wall_bio / max(1, n_batches)
+            avg_wall_phys = epoch_l_wall_phys / max(1, n_batches)
+            avg_bio_io = epoch_l_bio_io / max(1, n_batches)
             ema_bio_str = f"{ema_l_bio:.3e}" if ema_l_bio is not None else "n/a"
+            isolate_key = (os.environ.get("BIOCHEM_LOSS_ISOLATE") or "").strip().upper()
+            passive_isolate = isolate_key in _PASSIVE_TRANSPORT_LOSS_ALIASES
+            passive_adr_on = passive_isolate and _passive_transport_adr_in_backprop()
+            passive_adr_tag = (
+                "on" if passive_adr_on else ("off" if passive_isolate else "n/a")
+            )
+            passive_adr_w = (
+                max(float(os.environ.get("BIOCHEM_PASSIVE_ADR_WEIGHT", "1.0")), 0.0)
+                if passive_adr_on
+                else 0.0
+            )
+            passive_back_adr = (
+                passive_adr_w * (avg_adr_fast + avg_adr_slow) if passive_adr_on else 0.0
+            )
+            passive_back_data = 0.0
+            if passive_isolate:
+                w_kine, w_bio = _passive_transport_loss_weights()
+                passive_back_data = (w_bio * avg_bio) + (w_kine * avg_kine)
+            if passive_isolate:
+                eps_adr = max(float(os.environ.get("BIOCHEM_PASSIVE_ADR_ZERO_WARN_EPS", "1e-10")), 0.0)
+                if passive_adr_on and (avg_adr_fast + avg_adr_slow) <= eps_adr:
+                    print(
+                        f"   [WARN]  Passive isolate with ADR backprop on, but ADR residual avg <= {eps_adr:.1e} "
+                        f"(ADR_F={avg_adr_fast:.3e}, ADR_S={avg_adr_slow:.3e}).",
+                        flush=True,
+                    )
+                if (
+                    passive_adr_on
+                    and prev_avg_bio is not None
+                    and prev_avg_adr_sum is not None
+                    and prev_avg_bio > 0.0
+                    and prev_avg_adr_sum > 0.0
+                ):
+                    bio_drop = (prev_avg_bio - avg_bio) / max(prev_avg_bio, 1e-12)
+                    adr_now = avg_adr_fast + avg_adr_slow
+                    adr_drop = (prev_avg_adr_sum - adr_now) / max(prev_avg_adr_sum, 1e-12)
+                    if bio_drop > 0.02 and adr_drop < -0.05:
+                        print(
+                            "   [WARN]  Passive mismatch: L_Data_Bio improved while ADR residuals worsened "
+                            f"(bio_drop={bio_drop:.2%}, adr_drop={adr_drop:.2%}).",
+                            flush=True,
+                        )
             skip_teacher_val = _biochem_env_truthy("BIOCHEM_TEACHER_SKIP_VAL", default=False)
             if skip_teacher_val:
                 run_teacher_val = False
             else:
                 run_teacher_val = (epoch % teacher_val_every == 0) or (epoch == max_epochs - 1)
             val_stats = None
+            val_bundle: Dict[str, Any] = {}
+            train_sp_bundle = None
             if run_teacher_val:
                 val_t0 = time.perf_counter()
                 v_stride = os.environ.get("BIOCHEM_VAL_TIME_STRIDE", "1")
@@ -6175,9 +6684,14 @@ def train_teacher_on_anchors(
                     f"    Teacher Ep {epoch:02d} val (stride={v_stride}, TBPTT_cap={tbptt_cap}, "
                     f"DETACH_MACRO={detach_m}, W_MuSI={w_mu}, W_MuLog={w_mul})..."
                 )
-                val_bundle = _compute_anchor_mu_metrics(
-                    teacher, teacher_val_loader, kernels, bio_cfg, device, non_blocking=nb_xfer
-                )
+                if passive_species_val_only_enabled():
+                    val_bundle = _compute_passive_species_val_only_bundle(
+                        teacher, teacher_val_loader, kernels, bio_cfg, device, non_blocking=nb_xfer
+                    )
+                else:
+                    val_bundle = _compute_anchor_mu_metrics(
+                        teacher, teacher_val_loader, kernels, bio_cfg, device, non_blocking=nb_xfer
+                    )
                 dbg_mu1_e = (epoch_dbg_mu1_sum / float(max(1, epoch_dbg_n)))
                 dbg_mu2_e = (epoch_dbg_mu2_sum / float(max(1, epoch_dbg_n)))
                 dbg_mlearn_e = (epoch_dbg_mu_learned_sum / float(max(1, epoch_dbg_n)))
@@ -6235,12 +6749,49 @@ def train_teacher_on_anchors(
                 ]
                 if viz_extra:
                     val_extra_lines.append(viz_extra)
-                val_stats = _log_mu_validation_report(
-                    stage="teacher",
-                    epoch=epoch,
-                    per_graph=list(val_bundle.get("per_graph") or []),
-                    extra_lines=val_extra_lines,
-                )
+                if val_bundle.get("val_species_fi_log_mae") is not None:
+                    val_extra_lines.append(
+                        f"   Species val (supervision mask): FI logMAE={float(val_bundle['val_species_fi_log_mae']):.4f} "
+                        f"Mat logMAE={float(val_bundle['val_species_mat_log_mae']):.4f} "
+                        f"mask_n~{float(val_bundle.get('val_species_mask_n', 0.0)):.0f}"
+                    )
+                if passive_species_train_eval_enabled():
+                    train_sp_bundle = _compute_passive_species_on_loader(
+                        teacher, teacher_loader, kernels, bio_cfg, device, non_blocking=nb_xfer
+                    )
+                    if math.isfinite(float(train_sp_bundle.get("species_fi_log_mae_mean", float("nan")))):
+                        val_extra_lines.append(
+                            f"   Species train anchors (mean): FI logMAE={float(train_sp_bundle['species_fi_log_mae_mean']):.4f} "
+                            f"Mat logMAE={float(train_sp_bundle['species_mat_log_mae_mean']):.4f} "
+                            f"mask_n~{float(train_sp_bundle.get('species_mask_n_mean', 0.0)):.0f}"
+                        )
+                        for row in train_sp_bundle.get("per_anchor") or []:
+                            val_extra_lines.append(
+                                f"      {row['anchor']:24s}  FI={float(row['species_fi_log_mae']):.4f}  "
+                                f"Mat={float(row['species_mat_log_mae']):.4f}  n={int(row['species_mask_n'])}"
+                            )
+                if passive_species_val_only_enabled():
+                    for line in val_extra_lines:
+                        print(line, flush=True)
+                    val_stats = {
+                        "mu_mae_si": float("inf"),
+                        "mu_rmse_si": float("inf"),
+                        "mu_log_mae": float("inf"),
+                        "mu_log_mae_wall": float("nan"),
+                        "mu_log_mae_high_mu": float("nan"),
+                        "mu_log_mae_bulk": float("nan"),
+                        "mu_pearson": 0.0,
+                        "mu_r2": 0.0,
+                    }
+                    if val_bundle.get("val_species_fi_log_mae") is not None:
+                        val_stats["val_species_fi_log_mae"] = float(val_bundle["val_species_fi_log_mae"])
+                else:
+                    val_stats = _log_mu_validation_report(
+                        stage="teacher",
+                        epoch=epoch,
+                        per_graph=list(val_bundle.get("per_graph") or []),
+                        extra_lines=val_extra_lines,
+                    )
                 for hk in (
                     "viz_health_score",
                     "viz_t0_speed_mean",
@@ -6253,13 +6804,23 @@ def train_teacher_on_anchors(
                 ):
                     if hk in val_bundle:
                         val_stats[hk] = val_bundle[hk]
-                val_mu_score = _teacher_val_selection_score(val_stats)
-                ckpt_score_label = "mu_score"
-                print(
-                    f"   [OK]  Teacher Ep {epoch:02d} validation complete "
-                    f"({time.perf_counter() - val_t0:.2f}s) | {ckpt_score_label}={val_mu_score:.4f} "
-                    f"(best running {best_mu_score:.4f}, logMAE={float(val_stats['mu_log_mae']):.4f})."
-                )
+                if passive_species_val_only_enabled() and val_stats.get("val_species_fi_log_mae") is not None:
+                    val_mu_score = -float(val_stats["val_species_fi_log_mae"])
+                    ckpt_score_label = "species_fi"
+                    print(
+                        f"   [OK]  Teacher Ep {epoch:02d} validation complete "
+                        f"({time.perf_counter() - val_t0:.2f}s) | {ckpt_score_label}="
+                        f"{float(val_stats['val_species_fi_log_mae']):.4f} "
+                        f"(best running {-best_mu_score:.4f} FI)."
+                    )
+                else:
+                    val_mu_score = _teacher_val_selection_score(val_stats)
+                    ckpt_score_label = "mu_score"
+                    print(
+                        f"   [OK]  Teacher Ep {epoch:02d} validation complete "
+                        f"({time.perf_counter() - val_t0:.2f}s) | {ckpt_score_label}={val_mu_score:.4f} "
+                        f"(best running {best_mu_score:.4f}, logMAE={float(val_stats['mu_log_mae']):.4f})."
+                    )
                 cand_all = float(val_stats["mu_log_mae"])
                 cand_high = float(val_stats.get("mu_log_mae_high_mu", float("inf")))
                 take_ckpt = False
@@ -6294,6 +6855,17 @@ def train_teacher_on_anchors(
                         f"   [save]  Teacher checkpoint updated ({ckpt_reason}) | "
                         f"all={best_mu_log_all:.4f}, high={best_mu_log_high:.4f}"
                     )
+                    if passive_mu_unlock_enabled() and not passive_mu_unlock_finetune_enabled():
+                        _save_passive_mu_unlock_best_checkpoint(
+                            stage_b_dir(),
+                            best_state,
+                            best_epoch=int(best_epoch),
+                            run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+                            val_mu_log_mae=float(cand_all),
+                            val_mu_log_mae_high_mu=float(cand_high),
+                            teacher_best_mu_score=float(best_mu_score),
+                            model_config=snapshot_biochem_model_config(teacher),
+                        )
                 if (
                     early_stop_allowed
                     and target_mu_log_mae is not None
@@ -6338,6 +6910,9 @@ def train_teacher_on_anchors(
                     f"   Teacher Ep {epoch:02d} | Train [L_tot: {avg_tot:.3e}, L_Back: {avg_back:.3e}, "
                     f"L_Kine(Avg): {avg_kine:.3e}, L_Bio (EMA β={ema_beta:.2f}): {ema_bio_str}, "
                     f"L_Bio (Avg): {avg_bio:.3e}] | "
+                    f"pde[ADR_F={avg_adr_fast:.3e},ADR_S={avg_adr_slow:.3e},"
+                    f"W_Bio={avg_wall_bio:.3e},W_Phy={avg_wall_phys:.3e},B_IO={avg_bio_io:.3e},"
+                    f"passive_ADR={passive_adr_tag},passive_Back(Data={passive_back_data:.3e},ADR={passive_back_adr:.3e})] | "
                     f"mudbg[mu1={dbg_mu1_e:.2e},mu2={dbg_mu2_e:.2e},learned={dbg_mlearn_e:.2e},"
                     f"logMAE_f={dbg_mu_log_e:.2e},Q_imb={dbg_flow_imb_e:.2e},"
                     f"Q_rel={dbg_q_rel_e:.2e},trivial={dbg_triv_e:.3f},"
@@ -6353,6 +6928,33 @@ def train_teacher_on_anchors(
                 "train_L_bio_avg": float(avg_bio),
                 "train_L_kine_avg": float(avg_kine),
                 "train_L_back_avg": float(avg_back),
+                "train_L_ADR_F_avg": float(avg_adr_fast),
+                "train_L_ADR_S_avg": float(avg_adr_slow),
+                "train_L_ADR_F_global_avg": float(avg_adr_fast_global),
+                "train_L_ADR_S_global_avg": float(avg_adr_slow_global),
+                "ADR_mask_mode": (os.environ.get("BIOCHEM_ADR_MASK_MODE") or "global").strip().lower(),
+                "ADR_mask_times": supervision_mask_times_mode(),
+                "ADR_residual_mode": adr_residual_mode(),
+                "ADR_species_scope": adr_species_scope(),
+                "data_bio_mask_n": (
+                    epoch_data_bio_mask_n_sum / float(max(1, epoch_mask_metric_batches))
+                    if epoch_mask_metric_batches > 0
+                    else None
+                ),
+                "ADR_mask_n": (
+                    epoch_adr_mask_n_sum / float(max(1, epoch_mask_metric_batches))
+                    if epoch_mask_metric_batches > 0
+                    else None
+                ),
+                "train_L_W_Bio_avg": float(avg_wall_bio),
+                "train_L_W_Phy_avg": float(avg_wall_phys),
+                "train_L_B_IO_avg": float(avg_bio_io),
+                "passive_adr_in_backprop": bool(passive_adr_on),
+                "passive_step2_bridge": float(passive_step2_bridge_enabled()),
+                "passive_mu_unlock": float(passive_mu_unlock_enabled()),
+                "passive_mu_unlock_finetune": float(passive_mu_unlock_finetune_enabled()),
+                "passive_back_data_avg": float(passive_back_data) if passive_isolate else None,
+                "passive_back_adr_avg": float(passive_back_adr) if passive_isolate else None,
                 "ema_l_bio": float(ema_l_bio) if ema_l_bio is not None else None,
                 "teacher_val_ran": bool(run_teacher_val),
                 "teacher_val_every": int(teacher_val_every),
@@ -6391,28 +6993,78 @@ def train_teacher_on_anchors(
                 "val_mu_rmse_si": float(val_stats["mu_rmse_si"]) if val_stats is not None else None,
                 "val_mu_log_mae": float(val_stats["mu_log_mae"]) if val_stats is not None else None,
                 "val_mu_log_mae_wall": (
-                    float(val_stats["mu_log_mae_wall"]) if val_stats is not None else None
+                    float(val_stats["mu_log_mae_wall"])
+                    if val_stats is not None and val_stats.get("mu_log_mae_wall") is not None
+                    else None
                 ),
                 "val_mu_log_mae_high_mu": (
-                    float(val_stats["mu_log_mae_high_mu"]) if val_stats is not None else None
+                    float(val_stats["mu_log_mae_high_mu"])
+                    if val_stats is not None and val_stats.get("mu_log_mae_high_mu") is not None
+                    else None
                 ),
                 "val_mu_pearson": float(val_stats["mu_pearson"]) if val_stats is not None else None,
                 "val_mu_r2": float(val_stats["mu_r2"]) if val_stats is not None else None,
-                "val_mu_score": (-float(val_stats["mu_log_mae"])) if val_stats is not None else None,
+                "val_mu_score": (
+                    -float(val_stats["val_species_fi_log_mae"])
+                    if val_stats is not None and val_stats.get("val_species_fi_log_mae") is not None
+                    else (-float(val_stats["mu_log_mae"]) if val_stats is not None else None)
+                ),
+                "val_species_fi_log_mae": (
+                    float(val_bundle["val_species_fi_log_mae"])
+                    if val_stats is not None and val_bundle.get("val_species_fi_log_mae") is not None
+                    else None
+                ),
+                "val_species_mat_log_mae": (
+                    float(val_bundle["val_species_mat_log_mae"])
+                    if val_stats is not None and val_bundle.get("val_species_mat_log_mae") is not None
+                    else None
+                ),
+                "val_species_mask_n": (
+                    float(val_bundle["val_species_mask_n"])
+                    if val_stats is not None and val_bundle.get("val_species_mask_n") is not None
+                    else None
+                ),
+                "train_species_fi_log_mae_mean": (
+                    float(train_sp_bundle["species_fi_log_mae_mean"])
+                    if train_sp_bundle is not None
+                    and math.isfinite(float(train_sp_bundle.get("species_fi_log_mae_mean", float("nan"))))
+                    else None
+                ),
+                "train_species_mat_log_mae_mean": (
+                    float(train_sp_bundle["species_mat_log_mae_mean"])
+                    if train_sp_bundle is not None
+                    and math.isfinite(float(train_sp_bundle.get("species_mat_log_mae_mean", float("nan"))))
+                    else None
+                ),
+                "train_species_mask_n_mean": (
+                    float(train_sp_bundle["species_mask_n_mean"])
+                    if train_sp_bundle is not None
+                    else None
+                ),
                 "val_time_stride": int(os.environ.get("BIOCHEM_VAL_TIME_STRIDE", "1") or "1"),
                 "tbptt_max_window": int(os.environ.get("BIOCHEM_TBPTT_MAX_WINDOW", "0") or "0"),
             }
+            prev_avg_bio = float(avg_bio)
+            prev_avg_adr_sum = float(avg_adr_fast + avg_adr_slow)
             if val_stats is not None and run_teacher_val:
                 per_anchor = _biochem_env_truthy("BIOCHEM_LOG_PER_ANCHOR", default=False)
                 dbg_extra = {
                     k: teacher_metrics_row[k]
-                    for k in (
-                        "dbg_gate_mean_wall",
-                        "dbg_gate_mean_all",
-                        "train_L_back_avg",
-                        "train_L_tot",
+                    for k in teacher_metrics_row
+                    if (
+                        k.startswith(
+                            (
+                                "train_L_",
+                                "ADR_",
+                                "passive_",
+                                "ema_l_bio",
+                                "data_bio_mask",
+                                "val_species_",
+                                "train_species_",
+                            )
+                        )
                     )
-                    if teacher_metrics_row.get(k) is not None
+                    and teacher_metrics_row.get(k) is not None
                 }
                 if per_anchor:
                     for g in val_bundle.get("per_graph") or []:
@@ -6580,6 +7232,9 @@ def _apply_biochem_mu_gate_hard_threshold_after_presets() -> None:
 
 def train_biochem_corrector(epochs=60, lr=1e-3):
     _apply_biochem_env_aliases()
+    warn_step3_multitask_if_disabled()
+    if not biochem_legacy_losses_enabled():
+        print(f"[i]  {approved_backward_summary()}", flush=True)
     _apply_pycharm_biochem_optimal_defaults()
     _restore_cli_teacher_epoch_override_after_presets()
     _apply_biochem_supervised_data_leash_after_presets()
@@ -6756,8 +7411,19 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             torch.load(biochem_resume_path, map_location=device, weights_only=True)
         )
 
+    mu_unlock_shell: Dict[str, str] = {}
+    if passive_mu_unlock_enabled() and (load_biochem_best_weights or will_resume_from_latest):
+        mu_unlock_shell = snapshot_passive_mu_unlock_shell_env()
+
     if ckpt_meta_for_ctor:
         applied_fp = apply_biochem_forward_policy_from_checkpoint_meta(ckpt_meta_for_ctor)
+        if mu_unlock_shell:
+            restored = restore_passive_mu_unlock_shell_env(mu_unlock_shell)
+            _apply_passive_mu_unlock_trainability_env()
+            print(
+                f" [i] passive mu-unlock: restored {len(restored)} shell env key(s) after forward_policy.",
+                flush=True,
+            )
         if applied_fp:
             print(
                 f" mu/rollout forward_policy from checkpoint ({len(applied_fp)} env knob(s)); "
@@ -7082,6 +7748,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     resume_ema_state = None
     stop_after_teacher = _biochem_stop_after_teacher()
     teacher_best_epoch = -1
+    teacher_last_epoch = -1
+    teacher_best_high_mu = float("inf")
+    teacher_best_high_epoch = -1
+    teacher_best_high_state: Optional[Dict[str, torch.Tensor]] = None
+    teacher_last_state: Optional[Dict[str, torch.Tensor]] = None
+    teacher: Optional[torch.nn.Module] = None
 
     run_log = BiochemRunLogger()
     _biochem_set_run_log(run_log)
@@ -7126,7 +7798,9 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
     )
 
+    resumed_from_latest = False
     if resume_enabled and latest_ckpt_path.exists():
+        resumed_from_latest = True
         print(f" Resuming Biochem from checkpoint: {latest_ckpt_path}")
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
@@ -7154,6 +7828,8 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         if mu_score_ema is not None:
             mu_score_ema = float(mu_score_ema)
         teacher_best_mu_score = float(ckpt.get("teacher_best_mu_score", 0.0))
+        teacher_last_epoch = int(ckpt.get("epoch", -1))
+        teacher_best_epoch = int(ckpt.get("teacher_best_epoch", teacher_last_epoch))
         pseudo_w = float(ckpt.get("pseudo_w", 0.0))
         resume_ema_state = ckpt.get("ema_model_state_dict")
         if stop_after_teacher:
@@ -7183,8 +7859,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 )
         print(f"[OK]  Biochem resume complete at epoch {start_epoch}.")
     elif resume_enabled:
-        print(f"[i]  BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. Continuing fresh.")
-    else:
+        print(
+            f"[i]  BIOCHEM_RESUME is enabled but no checkpoint found at {latest_ckpt_path}. "
+            "Continuing fresh (teacher stage will run)."
+        )
+
+    if not resumed_from_latest:
         post_pt = model_dir / "biochem_post_pretrain.pth"
         reused_post_pretrain = False
         if _biochem_env_truthy("BIOCHEM_REUSE_LAST_PRETRAIN", default=False):
@@ -7316,6 +7996,32 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 " Merged teacher weights into student" + merge_note
                 + (f" Skipped {n_tm} incompatible/missing key(s)." if n_tm else "")
             )
+
+        if stop_after_teacher:
+            try:
+                torch.save(
+                    {
+                        "epoch": int(teacher_last_epoch),
+                        "teacher_best_epoch": int(teacher_best_epoch),
+                        "teacher_best_mu_score": float(teacher_best_mu_score),
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss_weighter_state_dict": loss_weighter.state_dict(),
+                        "run_note": (os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+                    },
+                    latest_ckpt_save,
+                )
+                print(
+                    f"[save]  Saved Biochem checkpoint -> {latest_ckpt_save.name} "
+                    "(teacher-only; enables BIOCHEM_RESUME for ramp leg 2).",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN]  Could not save {latest_ckpt_save.name} after teacher stage "
+                    f"({type(exc).__name__}: {exc}).",
+                    flush=True,
+                )
 
     if stop_after_teacher:
         _emit_biochem_run_log_end(

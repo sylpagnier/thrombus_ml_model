@@ -12,6 +12,7 @@ def test_supervised_leash_clears_isolate_after_sentinel_preset(monkeypatch: pyte
         _apply_biochem_supervised_data_leash_after_presets,
     )
 
+    monkeypatch.setenv("BIOCHEM_LEGACY_LOSSES", "1")
     monkeypatch.setenv("BIOCHEM_PRESET", "sweep_wall_sentinel")
     monkeypatch.setenv("BIOCHEM_SUPERVISED_DATA_LEASH", "1")
     monkeypatch.delenv("BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT", raising=False)
@@ -34,6 +35,7 @@ def test_bulk_fluid_surgical_fix_after_sentinel_preset(monkeypatch: pytest.Monke
         _apply_biochem_preset_sweep_wall_sentinel_if_requested,
     )
 
+    monkeypatch.setenv("BIOCHEM_LEGACY_LOSSES", "1")
     monkeypatch.setenv("BIOCHEM_PRESET", "sweep_wall_sentinel")
     monkeypatch.setenv("BIOCHEM_BULK_FLUID_SURGICAL_FIX", "1")
     monkeypatch.setenv("BIOCHEM_DELTA_MU_LOG_CLIP_BULK", "0.05")
@@ -55,6 +57,7 @@ def test_mu_gate_hard_threshold_after_sentinel_preset(monkeypatch: pytest.Monkey
         _apply_biochem_preset_sweep_wall_sentinel_if_requested,
     )
 
+    monkeypatch.setenv("BIOCHEM_LEGACY_LOSSES", "1")
     monkeypatch.setenv("BIOCHEM_PRESET", "sweep_wall_sentinel")
     monkeypatch.setenv("BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH", "0.15")
 

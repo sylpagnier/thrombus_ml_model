@@ -1,6 +1,7 @@
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 from src.utils.paths import comsol_models_dir, data_root, get_project_root
 from pathlib import Path
 
@@ -105,6 +106,24 @@ SPECIES_GROUPS = {
 # fallback timelines. **Not for production:** raise or remove this cap (or set it
 # well above your COMSOL ``t_end``) before full-horizon training and evaluation.
 BIOCHEM_T_MAX: float = 8000.0
+
+
+def biochem_comsol_time_cap_s() -> Optional[float]:
+    """Max physical time [s] kept when parsing wide COMSOL anchor exports.
+
+    Set ``BIOCHEM_EXTRACT_FULL_TIME=1`` to keep the full COMSOL time horizon (no cap).
+    Optional override: ``BIOCHEM_EXTRACT_T_MAX_S`` (float, or ``none``/``full`` for uncapped).
+    """
+    raw_full = (os.environ.get("BIOCHEM_EXTRACT_FULL_TIME") or "").strip().lower()
+    if raw_full in ("1", "true", "yes", "on"):
+        return None
+    raw_cap = (os.environ.get("BIOCHEM_EXTRACT_T_MAX_S") or "").strip().lower()
+    if raw_cap in ("none", "inf", "full"):
+        return None
+    if raw_cap and raw_cap not in ("default",):
+        return float(raw_cap)
+    return float(BIOCHEM_T_MAX)
+
 
 PHASE_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
     "kinematics": 0.75,

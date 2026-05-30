@@ -28,7 +28,7 @@ if ($Model -eq "linear") {
     $env:CLOT_PHI_LR = "5e-3"
     $env:CLOT_PHI_WEIGHT_DECAY = "1e-5"
 } else {
-    # MLP default (round-2 winner joint_blend_gtsp): h32/d2 + species + joint bio + physics blend.
+    # MLP default (finalize winner for deployment-like use): no GT species features; use predicted species in physics blend.
     $env:CLOT_PHI_HIDDEN = "32"
     $env:CLOT_PHI_MLP_DEPTH = "2"
     $env:CLOT_PHI_DROPOUT = "0.15"
@@ -37,12 +37,12 @@ if ($Model -eq "linear") {
     $env:CLOT_PHI_EPOCHS = "60"
     $env:CLOT_PHI_LR = "1e-3"
     $env:CLOT_PHI_WEIGHT_DECAY = "1e-4"
-    $env:CLOT_PHI_SPECIES_FEATURES = "1"
+    $env:CLOT_PHI_SPECIES_FEATURES = "0"
     $env:CLOT_PHI_JOINT_BIO = "1"
     $env:CLOT_PHI_BIO_LAMBDA = "0.25"
-    $env:CLOT_PHI_JOINT_USE_PRED_SPECIES = "0"
+    $env:CLOT_PHI_JOINT_USE_PRED_SPECIES = "1"
     $env:CLOT_PHI_PHYSICS_BLEND = "1"
-    $env:CLOT_PHI_PHYSICS_BLEND_ALPHA = "0.55"
+    $env:CLOT_PHI_PHYSICS_BLEND_ALPHA = "0.75"
     $env:CLOT_PHI_PHYSICS_MU_RATIO_MAX = "4"
     $env:CLOT_PHI_PHYSICS_GELATION_GATE = "1"
     $env:CLOT_PHI_SPECIES_HIDDEN = "32"

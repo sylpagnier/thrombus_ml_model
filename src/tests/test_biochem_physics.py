@@ -13,6 +13,7 @@ from src.core_physics.physics_kernels import PhysicsKernels
 from src.training.train_biochem_corrector import remap_stage_a_encoder_to_corrector
 from src.data_gen import PatientDataExtractor
 from src.utils.paths import get_project_root
+from src.utils.channel_schema import BIO_X_SCHEMA
 
 class DummyCoreKernels:
     """Mocks the base CFD physics kernels strictly for testing ADR scaling."""
@@ -426,11 +427,14 @@ class TestPhase3Physics(unittest.TestCase):
             mask_inlet=torch.tensor([True, False]),
             mask_outlet=torch.tensor([False, False]),
             x=torch.zeros((n, 6), dtype=torch.float32),
+            x_schema=BIO_X_SCHEMA,
+            x_biochem=torch.zeros((n, 15), dtype=torch.float32),
             G_x=zeros_sparse,
             G_y=zeros_sparse,
             bio_inlet_bc=torch.zeros((n, 9), dtype=torch.float32),
             outlet_normal=torch.zeros((n, 2), dtype=torch.float32),
         )
+        data_io.x_biochem[:, 3] = 1.0
         spatial_props = {
             "d_bar": torch.ones(n, dtype=torch.float32),
             "u_ref": torch.ones(n, dtype=torch.float32),
@@ -444,9 +448,12 @@ class TestPhase3Physics(unittest.TestCase):
         data_wall = SimpleNamespace(
             mask_wall=torch.tensor([True, False]),
             x=torch.zeros((n, 6), dtype=torch.float32),
+            x_schema=BIO_X_SCHEMA,
+            x_biochem=torch.zeros((n, 15), dtype=torch.float32),
             G_x=zeros_sparse,
             G_y=zeros_sparse,
         )
+        data_wall.x_biochem[:, 3] = 1.0
         vel = torch.zeros((n, 2), dtype=torch.float32)
         wall_preds = torch.zeros((n, 3), dtype=torch.float32)
         # Use real core kernels here since wall residual needs core physics config for unit conversion.
@@ -882,10 +889,14 @@ class TestPhase3Physics(unittest.TestCase):
             mask_inlet=torch.tensor([False]),
             mask_outlet=torch.tensor([True]),
             x=x,
+            x_schema=BIO_X_SCHEMA,
+            x_biochem=torch.zeros((n, 15), dtype=torch.float32),
             G_x=gx,
             G_y=gy,
             outlet_normal=torch.zeros((n, 2), dtype=torch.float32),
         )
+        data.x_biochem[:, 3] = x[:, 3]
+        data.x_biochem[:, 4] = x[:, 4]
         spatial_props = {"d_bar": torch.tensor([1.0], dtype=torch.float32)}
 
         _, loss_outlet = self.biochem_kernels.biochem_inlet_outlet_residual(biochem_preds, spatial_props, data)
@@ -1230,6 +1241,10 @@ class TestPhase3Physics(unittest.TestCase):
                 self.x = torch.zeros((num_nodes, 10), dtype=torch.float32)
                 self.x[:, 3] = 1.0
                 self.x[:, 4] = 0.0
+                self.x_schema = BIO_X_SCHEMA
+                self.x_biochem = torch.zeros((num_nodes, 15), dtype=torch.float32)
+                self.x_biochem[:, 3] = self.x[:, 3]
+                self.x_biochem[:, 4] = self.x[:, 4]
 
         data = MockDataFlux()
         biochem_preds = torch.ones((num_nodes, 9), dtype=torch.float32, requires_grad=True)

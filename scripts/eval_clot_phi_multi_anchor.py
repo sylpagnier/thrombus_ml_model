@@ -26,12 +26,14 @@ from src.training.train_clot_phi_simple import (
     _list_anchor_paths,
     _run_epoch,
 )
+from src.evaluation.clot_phi_checkpoint_env import apply_clot_phi_config_from_checkpoint
 from src.utils.paths import get_project_root
 
 
 def _load_models(ckpt_path: Path, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt.get("config") or {}
+    apply_clot_phi_config_from_checkpoint(cfg)
     in_dim = int(cfg.get("in_dim", clot_phi_feature_dim()))
     hidden = int(cfg.get("hidden", 32))
     model = build_clot_phi_model(in_dim=in_dim, hidden=hidden).to(device)
@@ -63,10 +65,15 @@ def main() -> None:
     paths = _list_anchor_paths(anchor_dir)
 
     model, species_head, cfg = _load_models(ckpt_path, device)
-  # env from checkpoint config
-    os.environ["CLOT_PHI_JOINT_BIO"] = "1" if cfg.get("joint_bio") else os.environ.get("CLOT_PHI_JOINT_BIO", "0")
-    if cfg.get("species_features"):
-        os.environ["CLOT_PHI_SPECIES_FEATURES"] = "1"
+
+    raw_anchor = (os.environ.get("CLOT_PHI_ANCHOR_DIR") or "").strip()
+    if raw_anchor:
+        anchor_dir = Path(raw_anchor)
+        if not anchor_dir.is_absolute():
+            anchor_dir = root / anchor_dir
+        paths = _list_anchor_paths(anchor_dir.resolve())
+    else:
+        paths = _list_anchor_paths(anchor_dir)
 
     rows: list[dict] = []
     for val_path in paths:
@@ -115,9 +122,18 @@ def main() -> None:
     with out_path.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
-    mean_f1 = sum(r["val"]["clot_f1"] for r in rows) / max(len(rows), 1)
-    mean_score = sum(r["val_score"] for r in rows) / max(len(rows), 1)
-    print(f"[OK]  mean_f1={mean_f1:.3f} mean_score={mean_score:.3f} -> {out_path}")
+    f1s = [r["val"]["clot_f1"] for r in rows]
+    maes = [r["val"]["mu_log_mae"] for r in rows]
+    scores = [r["val_score"] for r in rows]
+    mean_f1 = sum(f1s) / max(len(f1s), 1)
+    min_f1 = min(f1s) if f1s else 0.0
+    mean_mae = sum(maes) / max(len(maes), 1)
+    min_mae = min(maes) if maes else 0.0
+    mean_score = sum(scores) / max(len(scores), 1)
+    print(
+        f"[OK]  n={len(rows)} mean_f1={mean_f1:.3f} min_f1={min_f1:.3f} "
+        f"mean_logMAE={mean_mae:.3f} min_logMAE={min_mae:.3f} mean_score={mean_score:.3f} -> {out_path}"
+    )
 
 
 if __name__ == "__main__":
