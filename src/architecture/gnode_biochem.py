@@ -410,55 +410,6 @@ def apply_biochem_forward_policy_from_checkpoint_meta(
     return apply_biochem_forward_policy(policy, quiet=quiet)
 
 
-# Shell knobs for passive mu-unlock that must survive checkpoint forward_policy restore.
-PASSIVE_MU_UNLOCK_SHELL_ENV_KEYS: tuple[str, ...] = (
-    "BIOCHEM_PASSIVE_MU_UNLOCK",
-    "BIOCHEM_LOSS_ISOLATE",
-    "BIOCHEM_LOSS_DATA_ONLY",
-    "BIOCHEM_COMPLEXITY_STEP",
-    "BIOCHEM_TEACHER_MU_RATIO_MAX",
-    "BIOCHEM_TRAIN_MU_ENCODER",
-    "BIOCHEM_TRAIN_BIO_ENCODER",
-    "BIOCHEM_TRAIN_BIO_DECODER",
-    "BIOCHEM_TRAIN_ODE",
-    "BIOCHEM_TRAIN_KIN_LORA",
-    "BIOCHEM_MU_LOG_ANCHOR_WEIGHT",
-    "BIOCHEM_MU_SI_ANCHOR_AUX_WEIGHT",
-    "BIOCHEM_MU_LOG_WALL_WEIGHT",
-    "BIOCHEM_MU_LOG_HIGH_WEIGHT",
-    "BIOCHEM_TEACHER_TARGET_MU_LOG_MAE",
-    "BIOCHEM_PASSIVE_ADR_BACKPROP",
-    "BIOCHEM_GT_KINE_VEL",
-    "BIOCHEM_GT_KINE_SKIP_DEQ",
-    "BIOCHEM_PASSIVE_SPECIES_VAL",
-    "BIOCHEM_PASSIVE_SPECIES_TRAIN_EVAL",
-    "BIOCHEM_PASSIVE_MU_UNLOCK_FREEZE_BIO",
-    "BIOCHEM_PASSIVE_MU_UNLOCK_FINETUNE",
-    "BIOCHEM_USE_DELTA_MU_HEAD",
-    "BIOCHEM_USE_SPLIT_MU_HEAD",
-    "BIOCHEM_USE_WALL_DELTA_HEAD",
-)
-
-
-def snapshot_passive_mu_unlock_shell_env() -> dict[str, str]:
-    """Capture shell env before checkpoint ``forward_policy`` overwrites training knobs."""
-    out: dict[str, str] = {}
-    for key in PASSIVE_MU_UNLOCK_SHELL_ENV_KEYS:
-        raw = os.environ.get(key)
-        if raw is not None and str(raw).strip() != "":
-            out[key] = str(raw).strip()
-    return out
-
-
-def restore_passive_mu_unlock_shell_env(snapshot: Mapping[str, str]) -> list[str]:
-    """Re-apply shell snapshot after ``apply_biochem_forward_policy``."""
-    restored: list[str] = []
-    for key, val in snapshot.items():
-        os.environ[key] = str(val)
-        restored.append(key)
-    return restored
-
-
 def _mu_trigger_gate_hard_threshold() -> float:
     """Cutoff center for bulk/tail and wall μ gates; 0 disables (continuous gate)."""
     raw = (os.environ.get("BIOCHEM_MU_TRIGGER_GATE_HARD_THRESH") or "").strip()

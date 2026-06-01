@@ -121,13 +121,26 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | μ_eff coupling sanity (gelation on) | With explicit gelation enabled, μ terms respond to FI/Mat changes and remain stable | **Pending** | Add dedicated smoke: disable GT μ shortcuts, enable `MU_DISABLE_EXPLICIT_GELATION=0`, verify `mu1/mu2` and μ subsets move in the expected direction without collapse |
 | Wall μ logMAE | ≲ 1.5 | **Partial** | Fair sweep (2026-05-23): **`sweep_wall_sentinel` ep17 all **0.3185** / wall **1.5479** with **`gate_wall=1.0`** (train); fair baseline ep24 wall **1.6753** / all **0.4951** but **`gate_wall=0`**; `sweep_free_wall_a` ep33 all **0.3422** best-all, wall still **~1.9–2.3** |
 | `L_bio` on anchors | Decrease without μ stall | **Pass** | **I3** `DATA_BIO` isolate: train `L_bio`↓, val μ **flat ~1.47** |
-| **M3** ADR/data co-descent (passive, ADR in backward) | `L_Data_Bio` + masked `ADR_S` co-descent on supervision band | **Pass** | **20ep** (§126) + **6ep minpass** (§132): init `phaseB_ramp1` after I.1; `check_m3_align_gate` **PASS**; val FI **2.01->0.25** @6ep (not full 0.03 cal yet) |
+| **M3** ADR/data co-descent (passive, ADR in backward) | **Viability** vs **optimization** | **Pass (viability)** / **Optimize later** | **Proved:** union + `transport_only` + masked ADR + species ~0.03 (§126, §132, `check_m3_viability_pass.py`). **Not done:** global ramp2 raw ADR, full narrow/sweep, `passive_m3_locked` production tuning, bridge co-descent from saturated init (§133) |
 | Species accuracy in supervision mask | Clot-band FI/Mat on train+val anchors | **Pass (passive)** | **20ep** (§126): val FI **2.01->0.029**; **I.1 X block** (§131): turbo probe matrix + promote dump `anchors_stride36_m6` (6 graphs); `biochem_teacher_passive_species_locked.pth` |
 | Passive canonical ckpt | Locked teacher for ramps/bridge | **Pass** | `biochem_teacher_passive_align_locked.pth` + manifest; copied to `biochem_teacher_best_high_mu.pth` for init |
 | **Step-2 bridge** (data-only + modest `MU_LOG`/`MU_SI`, species+ADR kept) | Species/ADR gates pass; val mu stable or improves | **Pass (gate)** / **mu flat** | **§127** 12ep `passive_step2_bridge`, init locked; `W_MuLog=0.75` `W_MuSI=0.15` in logs; val mu **1.3966** flat; species FI **2.01->0.027**; gate PASS — joint mu not unlocked yet (`mu_ratio_max=1`) |
 | **Mu-unlock probe** (`MU_LOG` isolate, `TRAIN_MU=1`, bio frozen) | Val mu drops; species FI stays ~0.03 | **Pass** | **§129** `0.804 @ ep5`; **§130** explore `expl6h_XY_mu_unlock` reproduces |
 | **Explore 6h** (X/Y/XY isolation, kin-blocked) | Rank components; fix false gates | **Done** | **§130** — clot-band X legs **species OK**, m3 gate **false FAIL** (init saturated); **X_mask_global** only m3 pass; **mu_unlock** clear win |
 | **I.1 X block** (probe matrix + promote dump) | `check_passive_x_block_pass.py --require-promote` | **Pass** | **§131** 2026-05-30: probe OK X3/X4/X5/m3; promote dump **6** anchors @ stride36/m6; `passive_species_locked` from align locked |
+| **I.3 XY bridge** (step-2 hold + learn) | `go_passive_xy_block_pass.ps1`; species + masked ADR + `bridge_ok` | **Pass (viability)** | **§134**: hold 3ep + learn 6ep, `GRAD_SCALE_ON_CAP=1`; both gates **PASS**; val FI **~0.013**; mu flat **1.3966** |
+| **M5.3** mu-unlock finetune (wall/high weights) | `go_passive_mu_unlock_finetune.ps1` 12ep | **Fail** | **§135**: best all **0.797 @ ep2** then bulk **regress ->1.17**; wall/high improve; species OK; `clot_frac=0` |
+| **M5.4** step-2 bridge from unlock | `passive_m5_bridge` 12ep, `GRAD_SCALE_ON_CAP` | **Pass (gate)** | **§135**: all **0.781**; wall **2.09**; FI **0.019**; mu still no spatial clots |
+| **M5.5–M5.6** K10 explore + lock | `go_m5_block_pass.ps1` | **Fail (viz)** | **§135**: K10 ran with `LEGACY_LOSSES=1`; best mu **0.794** wide ep8; **species FI 3.26**; `clot_frac=0`; promote **bridge** not K10 |
+| **Ladder R0** (mask + physics oracle, clot-phi) | patient007 val F1 ~0.48; healthy `pred+` | **Pass** | **§138**: mask patches @ t=200; oracle val F1 **0.599** `pred+=0.331`; prior MLP ckpt viz matches GT |
+| **Ladder R1** (linear hybrid, `-Fresh`) | Within ~0.02 F1 of MLP; viz patches | **Pass** | **§139**: val F1 **0.712** ep49; `pred+=0.435` `gt+=0.652`; beats R0 oracle **0.599** on p007 metrics |
+| **Ladder R2** (MLP h32/d2, `-Fresh`) | F1 >= 0.47; recall >= 0.40 | **Pass** | **§140**: val F1 **0.767**; superseded for time by **§142** 3b |
+| **Ladder R3b** (`DGAMMA_FEATURE_TIME=current`) | Localized patches; t=0 sane | **Pass** | **§142**: F1 **0.774**; t=200 `region_n=303`; t=0 `mean_pred_phi=0.176` `frac>=0.5=0.11` |
+| **Ladder R4a** (`oracle_gt` ceiling) | min F1 >= 0.35 | **Fail** | **§143**: mean **0.558** min **0.206**; p007 **0.733** |
+| **Ladder R4b** (`joint_blend_gtsp`) | min F1 >= 0.35 | **Partial** | **§144**: p007 val F1 **0.778** `pred+=0.535`; viz localized; **4c min 0.234** (p004) |
+| **Ladder R5** (clot-band passive dump -> clot-phi) | min F1 >= 0.26 | **Pass** | **§145**: min **0.288** (p003); p007 **0.692** `rec=0.585`; dump slow (GNODE rollout) |
+| **Ladder R6a** (rollout GT vel + carry) | p007 F1 ~rung4; temporal viz | **Pass (p007)** | **§146**: val F1 **0.780** `rec=0.711` `pred+=0.538`; min **0.234**; viz needs rollout env |
+| **Ladder R3a** (frozen dgamma features) | t=0 no false wall flood | **Fail** | **§141**: `mean_pred_phi=0.788` @ t=0; viz env bug inflated `region_n` |
 | Phase A: `MU_SI` isolate, TF≈1 | Val logMAE drops | **Fail** | Flat ~1.59 (old config, no μ-path / high TF) |
 | Phase B: `MU_SI` + low TF + μ-path | Val logMAE drops | **Pass** | Marathon **I2** best **0.44** ep3 (same recipe as MU_LOG) |
 
@@ -138,7 +151,11 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 - **Mu-unlock probe**: **Done** (`20260529T200500Z`, best all **0.804 @ ep5**); **§130** explore confirms on `expl6h_XY_mu_unlock` / `expl6h_Y_MU_LOG`. **Next**: `go_passive_mu_unlock_finetune.ps1`; redo **step-2 bridge** from unlock ckpt on explore base (not `passive_transport` preset).
 - **Explore 6h**: **Done** (§130) — clot-band X WARN = **saturated-init false negative** on m3 gate, not species failure; **`expl6h_X_mask_global`** shows mask scope still matters for short runs.
 - **I.1 X block**: **Done** (§131) — turbo probe + promote; clot-phi can use `anchors_stride36_m6`.
-- **M3 minpass (6ep)**: **Gate PASS** (§132) from `phaseB_ramp1` + `union`/`transport_only`; species FI **0.25** @ep5 — run **12ep** or lock `biochem_teacher_last.pth` before promote; narrowing/sweep still optional for formulation winner.
+- **M3**: **Viable path proved** (§132); **optimize later** (global ADR, sweeps).
+- **I.3 XY bridge**: **Pass (viability)** (§134) — `go_passive_xy_block_pass.ps1` hold+learn both gates OK; optional **XY3** mu-unlock chain not run.
+- **M5 block** (`go_m5_block_pass.ps1`, 2026-05-30/31): **M5.3 FAIL**; **M5.4 PASS** (`passive_m5_bridge` all **0.781**, FI **0.019**); **K10 wide/narrow/bias** ran on resume — mu **0.794** best but **species destroyed (FI 3.26)**; **no clot viz**. **Promote bridge** (`20260531T080809Z`); do not use post-K10 `biochem_teacher_last.pth` for species (§135).
+- **Viscosity ladder R0** (2026-05-31): **Pass** — mask + GT @ t=200 localized; physics oracle **F1 0.599** (§138).
+- **Ladder R1–2** (2026-05-31): **Pass** (§139–§140). **Rung 3b PASS** (§142): `DGAMMA_FEATURE_TIME=current`, localized clots on p007 @ t=200. **Next:** scatter @ t=0 on 3b ckpt; lock env; cross-anchor (rung 4).
 - **Step-2 teacher “done” (μ)**: **Interim pass on patient007** — **K1/K8/K10e** (§90/§96/§103): **~0.47–0.49** all; **K10e** adds wall-adjacent mask + log/K10E loss but **still no viz clots** (`learned` flat). **clot6h sweep** (§112): 8 legs × ~4m, **K11** isolate — **no** leg beats **K11f** viz goal; **O0** oracle-at-train does **not** reproduce COMSOL red clots in **viz** (inference uses learned head). **K7** split+wall **~0.52** all but wall **~5.4**. **Caveat**: good logMAE ≠ COMSOL-qualitative wall bands. Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (multitask backward)**: **In progress** — **K2** `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0`, explicit gelation, OomSafe **12ep complete** on RTX 500 4GB (no OOM); val all **5.58→4.22** (still **>> K1 0.464**); train **`L_tot` ~700–1700** (Kendall dominates); preflight **5.77**. Next: `GELATION_PRIOR_GATE=1` and/or cap μ₂ / staged re-enable gelation; keep **DATA_KINE** or **MU_LOG** until val **<1.0** before full PDE sum.
@@ -1224,22 +1241,156 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Tooling**: `explore_log.jsonl` BOM broke summarize — fixed **utf-8-sig** reader + **UTF8 no-BOM** append in launcher.
 - **Next**: (1) **mu-unlock finetune** from `expl6h_XY_mu_unlock_last.pth` or `passive_mu_unlock_best`; (2) **step-2 bridge** on explore base from unlock-best, not locked-only; (3) optional **explore v2** — X legs from `phaseB_XY_ramp1` init or relax m3 gate when `species_ok` + ep0 `L_bio<500`; (4) clot-phi dump from best X or unlock ckpt.
 
-### 133. M3 resume pitfall (`minpass_resume`, copy `last` -> `best`, 2026-05-30)
+### 135. M5 block pass (`go_m5_block_pass.ps1`, 2026-05-30/31) — bridge wins; K10 mu-only, species dead
 
-- **Attempt**: +6ep from `biochem_teacher_last.pth` (ep5 minpass) via `go_m3_align_probe.ps1 -RunNote m3_align_transport_union_minpass_resume`.
-- **Outcome**: **Duplicate** of first minpass — ep0 val FI **2.01** again, ep5 FI **0.246** (not **~0.03**); train `L_bio` ep0 **16590** (not **~2680**).
-- **Cause**: Launcher uses `--new` (fresh run index) + **`[WARN] Skipped 24 incompatible/missing tensor(s)`** on `init-from-best` — species/ADR heads not fully restored; effective cold restart on M3 recipe.
-- **Fix for true continue**: (1) one-shot **12ep** from `phaseB_ramp1_last.pth`; or (2) `train_biochem_corrector --resume` from `biochem_latest_checkpoint.pth` after minpass (same `run_note` or explicit resume path), not `last` -> `best` + `--new`.
+- **Launcher**: `go_m5_block_pass.ps1` (12+12+18+18+18 ep); init `biochem_teacher_passive_mu_unlock_best.pth`; `GT_KINE_VEL=1`.
+- **M5.3** (`passive_mu_unlock_finetune`, `20260530T214354Z`): **Gate FAIL** — best all **0.797 @ ep2**, then **1.165 @ ep11**; wall/high improve; species **~0.013**; **`clot_frac=0`**. Use **<=6ep** or early-stop at ep2.
+- **M5.4** (`passive_m5_bridge`, `20260531T080809Z`, resume duplicate `052328Z` identical):
+  - **Gate PASS**: val all **0.802 -> 0.781 @ ep11**; wall **2.73 -> 2.09**; FI **0.081 -> 0.019**; `L_bio` **440 -> 2.6**.
+  - **Best M5 biochem teacher for joint species+mu** (still **no** spatial clot bands in viz).
+  - **Repro** (`20260531T121153Z`, `-GradScaleOnCap`, init `passive_mu_unlock_best`): ep0–4 **match** first bridge (all **0.781 @ ep4**); **5 val rows only** in `run.jsonl` (interrupted or in-flight at handoff) — finish 12ep or promote from `080809Z`.
+  - **Anti-pattern** (`20260531T115116Z`, **no** `-GradScaleOnCap`): **all bio grad steps skipped** (L2 > cap); mu **flat 0.8042** x7ep; §137.
+- **Resume** (`-SkipFinetune`, `BIOCHEM_LEGACY_LOSSES=1` on K10 env):
+  - **M5.6a wide** (`m5_k10f_wide_from_passive`, `20260531T084401Z`, 18ep): best all **0.794 @ ep8**; wall **2.48**; high **0.98 @ ep2**; FI **3.26** flat; **`clot_frac=0`**; `DETACH_MACRO=1`, bio frozen.
+  - **M5.6b narrow** (`m5_k10e_narrow_from_passive`, `20260531T085558Z`): best all **0.968 @ ep17** — worse than bridge.
+  - **M5.6c bias** (`m5_k10g_bias_from_passive`, `20260531T090957Z`): through ep10 in log; best seen **0.805 @ ep6**; FI **3.26**; incomplete vs 18ep budget.
+- **Ckpt hygiene**: K10 legs **overwrite** `outputs/biochem/biochem_teacher_last.pth` / `biochem_teacher_best_high_mu.pth` with **species-broken** weights. Bridge end state was **0.781** — re-run `go_passive_step2_bridge.ps1` or copy immediately after bridge before K10.
+- **M5.5 viz goal**: **not met** on biochem teacher (`clot_frac=0`, flat `learned`). Use **clot-phi** or oracle for mask viz; bridge for FI/Mat + bulk mu under GT vel.
+- **Next**: lock bridge ckpt to `biochem_teacher_passive_m5_bridge_best.pth`; skip further K10E from bridge; clot-phi hardening from bridge dump.
 
-### 132. M3 align minpass 6ep (`m3_align_transport_union_minpass`, init `phaseB_ramp1`, 2026-05-30)
+### 148. GNODE **9.2** pretrain refresh + **9.3** clot-band teacher (2026-05-31)
 
-- **Path**: After I.1 probe (`-Probe` 3ep trends OK), user ran align-only **6ep** from `biochem_teacher_phaseB_ramp1_last.pth` (`go_m3_align_probe.ps1`, `PASSIVE_ADR_WEIGHT=1e-4`, `union` + `match_data_bio` + `transport_only`).
-- **Run**: `20260530T133402Z` | gate **`ok: true`** (`n_epochs=6`).
-- **Train**: `L_bio` **16590->2680** (ratio **0.16**); masked `L_ADR_S` **0.0072->0.00157** (ratio **0.22**, small rebound ep3-5); `mask_n~622`, `ADR_mask_n~70`.
-- **Species val**: FI **2.01->0.25** (ratio **0.12**); Mat **1.20->0.14** — strong descent, still above **~0.03** @12ep/20ep cal (§125/§126).
-- **Mu**: val logMAE **1.3966** flat (expected); ignore for M3.
-- **vs 3ep probe** (`m3_align_transport_union_probe`): same ep0-2 trajectory; ep3-5 add **FI 0.56->0.25**, `L_bio` **4692->2680**.
-- **Next**: optional **12ep** resume same recipe for FI **~0.03**; then `go_m3_narrowing_90m.ps1` / lock `passive_m3_locked`; global/raw ADR in generic Phase B ramp2 still not the pass metric.
+- **9.2** `20260531T193845Z` (`gnode92_pretrain_refresh`): AE **14.4 -> 8.55** (early stop ep5); ODE-RXN **0.074 -> 0.047** (best ep5); new `biochem_post_pretrain.pth`. Teacher ep0 `L_bio=284` (vs 9.1 **363**); val mu flat **1.397** (expected).
+- **9.3** `20260531T194456Z` (`passive_transport_clotband_focus`, 3ep, `DATA_BIO_MASK_MODE=clot_band`, init `biochem_teacher_best_high_mu`): train `L_bio` **3463 -> 2399 -> 1834** (clear descent); `data_bio_mask_n~137` (clot band); val mu flat; `viz_clot_frac=1` (misleading raw mu2 — ignore). **Dump OK** `anchors_clotband_72` T=4-5/anchor (~30min+ rollout). **Clot-phi skipped** (`-ClotEpochs 0` + `-SkipViz:$SkipViz` PS bug — fixed in launcher).
+- **Clot-phi wrap** (`clotband_focus_gnode93`, 20ep on `anchors_clotband_72`): p007 val F1 **0.624** `rec=0.515` `pred+=0.378`; multi-anchor **mean 0.527** **min 0.338** -> **gate >=0.26 PASS**. Viz t=4: localized phi/mu bands; under-call (`mean_pred_phi=0.52` vs GT **0.74**). Teacher snapshot: |u| matches GT; **Mat/FI ~0** on full mesh (species teacher weak for spatial clots).
+- **Next:** see **9.4** `go_gnode_8h_ladder` results (§149).
+
+### 149. GNODE **8h ladder** `go_gnode_8h_ladder.ps1` — 9.4-9.6 complete (2026-05-31 / 2026-06-01)
+
+- **9.4 teacher 8ep** (`gnode_8h_teacher`): `L_bio` **3463 -> 1382**; clot-band species val ep7 **FI logMAE ~0.004** Mat ~0.056. Val mu still flat **1.397** (passive).
+- **9.5** dump `anchors_stride_72` (~14 min); clot-phi **35ep** `gnode_8h_clotphi`: p007 F1 **0.627** rec **0.519**; multi-anchor **mean 0.519** **min 0.341** -> **gate >=0.26 PASS**. Promoted `gnode_8h_ladder/clot_phi_best_promoted.pth`.
+- **9.6 ADR probe:** resume hit epoch 8 cap (no extra train ep logged); post-ADR clot-band viz **worse** (`mean_pred_phi` **0.41** vs **0.56** pre-ADR) — **do not promote ADR ckpt** without fixed resume epoch budget.
+- **Artifacts:** `outputs/biochem/gnode_8h_ladder/` (viz flow, clot-band raw/dump, clot-phi scatter, manifest).
+- **Next:** optional longer teacher (12ep) for species; **9.7** mu unlock only if spatial gate still OK; fix ADR leg to run fresh 6ep not instant resume exit.
+
+### 147. GNODE rung **9.1** smoke PASS — GT vel, DEQ skipped (2026-05-31)
+
+- **Run** `20260531T192101Z`: manual 1ep `passive_transport`, `GT_KINE_VEL=1`, `SKIP_DEQ=1`, `PASSIVE_ADR_BACKPROP=0`, `SKIP_PRETRAIN=1`, reuse `biochem_post_pretrain.pth`.
+- **Gate (smoke):** no crash; `flow_trivial=0`; `val_viz_t0_speed_mean=0.957`; `val_viz_health_score=2.415` (mu pinned — score not clot proof); `val_mu_log_mae=1.397` flat (expected under passive mu_ratio=1).
+- **Train:** `L_tot=3.63e2` ep0 (mostly `L_bio`); `L_kine=9.6e-3`; ADR logged only.
+- **Tooling:** `go_gnode91_smoke.ps1`, `scripts/snapshot_biochem_teacher.py`, `_gnode_viz_helpers.ps1`; clotband/passive launchers auto-PNG unless `-SkipViz`.
+- **Next:** 9.3 probe or shortened 9.5; snapshot PNG after each teacher leg; clot-phi for spatial gate.
+
+### 146. Rung 6a PASS (p007) — rollout GT vel + carry (2026-05-31)
+
+- **Train** (`rollout_gt_rung6a`, 60ep): `in_dim=7` `rollout=1 vel=gt`; best p007 val F1 **0.780** (ep53) `rec=0.711` `pred+=0.538` score **0.866** — matches rung **4** (**0.778**).
+- **4c** multi-anchor: mean **0.511** min **0.234** (same weak p003/p004 as rung4/5).
+- **Carry helps p007** without hurting cross-anchor min; true temporal coupling still needs **6b** (kine) + temporal viz sweep.
+- **Viz bug:** standalone `viz_clot_phi_simple` omitted rollout carry (5 vs 7 feats) — fixed: checkpoint embeds rollout flags + viz replays `t=0..ti`.
+
+### 145. Rung 5 PASS — clot-band passive dump + clot-phi (2026-05-31)
+
+- **Teacher** (12ep, `BIOCHEM_DATA_BIO_MASK_MODE=clot_band`, `passive_transport`): val all logMAE **~0.804** plateau ep6+; `clot_frac~0.78` (bulk mu, not spatial clots).
+- **Dump** (`anchors_clotband_36`, stride36): **~hours** — GNODE rollout per anchor (p007 **~18min**); dominates wall time vs 60ep MLP.
+- **Clot-phi** (`clotband_focus`, pred species on dumped graphs, `in_dim=3`): p007 val F1 **0.692** `rec=0.585` `pred+=0.425`; multi-anchor mean **0.510** **min 0.288** -> **gate >=0.26 PASS**.
+- **Viz** (p007 t=6): localized main band OK; **misses GT double-layer** growth; `mean_pred_phi=0.588` vs GT **0.779** (under-call). Rung4 GT-species **0.778** still stronger on p007.
+- **Next:** rung **6/7** (graph/temporal) or temporal viz sweep; faster dump = higher stride / cache GT species ablation.
+
+### 144. Rung 4b/c — `joint_blend_gtsp_rung4` PASS on p007; 4c gate miss weak anchors (2026-05-31)
+
+- **4b** (`go_rung4_joint_blend_gtsp.ps1 -Fresh`, 60ep): banner `hybrid=1 minimal=1 in_dim=5`; best p007 val F1 **0.778** `rec=0.710` `pred+=0.535` score **0.863** -> `clot_phi_ladder/joint_blend_gtsp_rung4/clot_phi_best.pth`.
+- **4c** multi-anchor: mean F1 **0.512** **min 0.234** (p004); p007 **0.778** p006 **0.706** p001 **0.579**; p003 **0.295** — **gate min>=0.35 not met** (up from oracle min **0.206**).
+- **4d viz** (p007 t=200): `region_n=303` `mean_pred_phi=0.640` `frac>=0.5=0.624`; pred phi/mu bands align GT (scatter OK).
+- **Promote** rung4 ckpt for p007 / species-blend stack; **do not** treat rung 4 ladder gate closed until weak-anchor F1 improves.
+
+### 143. Rung 4a PASS / 4b FAIL — env drift (`oracle_gt` OK; manual 4b missing `HYBRID`) (2026-05-31)
+
+- **4a** (`go_clot_phi_quick_iterate.ps1 -Legs oracle_gt`, 25ep): multi-anchor **mean F1 0.558**, **min F1 0.206** (patient004); patient007 **0.733**. Ceiling shows GT-species physics can generalize on some anchors; **min 0.35 not met** on oracle alone (expected — learned head still needed).
+- **4b manual env (broken):** train banner showed **`hybrid=0` `minimal=0` `balanced=0` `in_dim=6`** — user set blend flags but **not** `dot-source _clot_phi_shared_env.ps1` or `CLOT_PHI_HYBRID=1`. Val F1 **stuck ~0.10**, `pred+~0.006` (predict-none); **no ckpt saved** (`best score=-1`) -> `FileNotFoundError` on eval.
+- **Fix:** `scripts/go_rung4_joint_blend_gtsp.ps1` (shared env + `DGAMMA_FEATURE_TIME=current` + full `joint_blend_gtsp` recipe).
+
+### 142. Rung 3b PASS — `DGAMMA_FEATURE_TIME=current` (MLP `-Fresh`, 2026-05-31)
+
+- **Env:** `CLOT_PHI_DGAMMA_FEATURE_TIME=current` (+ shared mask); same h32/d2 MLP + `joint_bio=1`.
+- **Best val (ep55, patient007):** F1 **0.774**, dice **0.774**, score **0.872**, `pred+=0.532` (ep46 also F1 **0.773**).
+- **Viz @ t=200 (scatter):** `region_n=303`; `mean_pred_phi=0.626` vs `mean_gt_phi=0.779`; **localized patches** on correct wall sections — not full-wall rim.
+- **Viz @ t=0 (scatter, fair mask):** `region_n=83`; `gt_pos_n=7` (soft labels / threshold — not pure zero IC in band); `mean_pred_phi=0.176` vs `mean_gt_phi=0.021`; `frac_pred_phi>=0.5=0.108` (~9 nodes) — **localized** false positives, not wall flood (vs 3a **`mean_pred_phi=0.788`** on wrong `region_n=592`).
+- **Temporal gate:** **Pass (practical)** — t=0 no longer catastrophic; optional tighten via early-time loss weight later.
+- **Vs 3a frozen-dgamma ckpt:** see §141.
+- **Promote:** `clot_phi_best_mlp_dgamma_current.pth`; train/viz with **`CLOT_PHI_DGAMMA_FEATURE_TIME=current`**.
+
+### 141. Rung 3a wall-rim — frozen dgamma + viz env mismatch (2026-05-31)
+
+- **Symptom:** At **t=0**, scatter stats **`region_n=592` `mean_pred_phi=0.788`** (3a ckpt); full-wall red in plots. At **t=200**, `region_n=833`, `mean_pred_phi=0.712`, wall halo.
+- **Cause (model):** **`-dgamma/dx` in features fixed @ t=0** while labels vary in time — wall feature fingerprint at all `ti`.
+- **Cause (viz, important):** Standalone `viz_clot_phi_simple` **did not** set `CLOT_PHI_DGAMMA_SLICE=1` (default off) -> region = **full neighbor wall band (~592)** not dgamma-tight **~83/303**. Training used shared env (slice on). **Fixed:** `_ensure_training_mask_env()` in `viz_clot_phi_simple.py`.
+- **Rung 3a gate:** **Fail** on temporal sanity for frozen-dgamma ckpt. Re-viz 3a ckpt after env fix for apples-to-apples `region_n`.
+
+### 140. Viscosity ladder R2 pass — MLP fresh (`go_clot_phi_simple -Model mlp -Fresh`, 2026-05-31)
+
+- **Config:** h32/d2, dropout 0.15, 60ep, **`joint_bio=1`** (default in `go_clot_phi_simple.ps1` for mlp), minimal 3-feat.
+- **Best val (ep41–43, patient007):** F1 **0.767**, prec **0.869**, rec **0.693**, dice **0.767**, logMAE **0.538**, `pred+=0.524` vs `gt+=0.652`, score **0.866**.
+- **Vs R1 linear:** F1 **0.712** -> **0.767** (+0.055); MLP closer to `gt+` (less under-call). Not within strict 0.02 — **small MLP edge**, not required for localization proof.
+- **Viz:** `clot_phi_viz_patient007.png` — pred phi/mu match GT patches (user confirm).
+- **Artifacts:** `clot_phi_best.pth`, `clot_phi_best_mlp.pth`.
+- **Tooling:** `viz_clot_phi_simple` now sets `CLOT_PHI_MODEL` from ckpt `config.model_kind` (fixes linear ckpt load).
+- **Next:** R3a time-index viz on `clot_phi_best_linear.pth` / `clot_phi_best_mlp.pth`; optional fair MLP with `joint_bio=0` ablation.
+
+### 139. Viscosity ladder R1 pass — linear hybrid beats depth gate (`go_clot_phi_simple -Model linear -Fresh`, 2026-05-31)
+
+- **Config:** `hidden=16`, depth=1, `lr=5e-3`, 50ep, minimal 3-feat, dgamma neighbor mask (shared env).
+- **Best val (ep49, patient007):** F1 **0.712**, prec **0.885**, rec **0.597**, dice **0.821**, logMAE **0.730**, `pred+=0.435` vs `gt+=0.652`, score **0.782**.
+- **Vs R0 oracle:** val F1 **0.599** -> **0.712** on same val anchor (trained head + soft labels + balanced BCE; not apples-to-apples with analytic oracle).
+- **Vs prior MLP baseline (CLOT_PHI_BASELINE h32/d2):** F1 **~0.469** — linear **far above** 0.02 margin; **depth is not the bottleneck** on p007.
+- **Viz:** `clot_phi_viz_patient007.png` — localized phi/mu patches match GT (user confirm).
+- **Caveat:** val is **single anchor** (patient007); cross-anchor still required before rung 4–5 promote. `pred+` **&lt; gt+** — mild under-call, not predict-all.
+- **Artifacts:** `outputs/biochem/clot_phi_best.pth`, `clot_phi_best_linear.pth`.
+- **Next:** R2 MLP `-Fresh`; R3a time-index viz; optional patient004 mask sanity.
+
+### 138. Viscosity ladder R0 pass — mask viz + physics oracle (`patient007`, 2026-05-31)
+
+- **0a** (`viz_clot_phi_masks`): **t=0** neighbor **592** -> dgamma **83** (GT phi/mu flat — no clot IC, expected). **t=200** neighbor **833** -> **303** loss nodes; GT phi/mu **red patches** align with loss region (not lumen flood).
+- **0b** (`CLOT_PHI_PHYSICS_ORACLE=1`, `mu_ratio_max=4`, gate on): val **F1 0.599** prec **0.884** rec **0.454** `pred+=0.331` dice **0.708** score **0.656**; train F1 **0.520** `pred+=0.289`. **Beats** R0 gate (F1 ~0.48); healthy precision (not predict-all).
+- **0c** (`viz_clot_phi_simple`, `clot_phi_best.pth` @ t=200): prior **MLP** ckpt — pred phi/mu **match GT** visually on p007 (rung **2** preview, not oracle ckpt).
+- **Readout:** Mask/labels and analytic rheology ceiling are **sound** on p007; biochem GNODE mu path was failing a **different** problem (bulk logMAE without spatial patches). **Next:** `go_clot_phi_simple.ps1 -Model linear -Fresh` then `-Model mlp -Fresh`; R3a viz at t=0/mid/final.
+
+### 137. Step-2 bridge without `GRAD_SCALE_ON_CAP` is a no-op (`20260531T115116Z`, 2026-05-31)
+
+- **Symptom**: `go_passive_step2_bridge.ps1` 12ep budget; console **skipped** every anchor bio backward (grad L2 > **5000** cap); val all **0.8042** flat ep0–6; `L_bio` ~**440** flat; species OK ep0 (**FI 0.08**) but no improvement.
+- **Cause**: Same saturated-init pattern as §134 m3 bridge without grad scale — large `L_Data_Bio` spikes trip **skip** path when `BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP=0`.
+- **Fix**: Always pass **`-GradScaleOnCap`** on `go_passive_step2_bridge.ps1` (scales clipped grads instead of skip). Good repro: `20260531T121153Z` ep0–4 tracks `080809Z`.
+
+### 136. K10E after passive bridge destroys species (`m5_k10*`, 2026-05-31)
+
+- **Symptom**: Starting K10 from `biochem_teacher_last.pth` (post-bridge) gives val FI **3.26** every epoch while mu logMAE moves (**1.38 -> ~0.79**).
+- **Cause**: `LOSS_ISOLATE=K10E` trains **mu path only** (`TRAIN_BIO_*=0`, `DETACH_MACRO=1`); no `L_Data_Bio` in backward — species head drifts / is not evaluated on bridge recipe.
+- **Fix**: Do **not** promote K10 ckpts for combined teacher; keep **passive_m5_bridge** weights. For wall-band mu, use approved stack (MU_LOG unlock + short finetune) without dropping species backward.
+
+### 134. I.3 XY block pass (`go_passive_xy_block_pass.ps1`, 2026-05-30)
+
+- **Launcher**: `go_passive_xy_block_pass.ps1` (default: XY2-hold 3ep + XY2-learn 6ep, `GradScaleOnCap=1`, no XY3 mu-unlock).
+- **XY2-hold** (`passive_step2_bridge_m3_hold`, init `passive_m3_locked`, run `20260530T173756Z`):
+  - Gate **PASS** (full bridge + `--saturated` viability).
+  - Val FI **0.199 -> 0.057 -> 0.018** (ep0 dip from bridge/mu-aux stack, recovered ep2); train FI **~0.020** @ep2.
+  - `L_bio` **3432 -> 602** (r=0.18); masked `L_ADR_S` r=0.80; mu **1.3966** flat.
+- **XY2-learn** (`passive_step2_bridge_align_learn`, init `passive_align_locked`, run `20260530T174721Z`):
+  - Gate **PASS** (`ok=true`).
+  - Val FI **0.197 -> 0.013** @ep5 (ep3 wobble **0.069**); train FI **~0.011** @ep5.
+  - `L_bio` **3430 -> 77** (r=0.023); masked `L_ADR_S` r=0.40; mu flat.
+- **Lesson**: With **`GRAD_SCALE_ON_CAP=1`**, bridge **trains** from both inits; ep0 species blip ~0.2 then ~0.01-0.02 by ep2-5 is expected when adding `W_MuLog`/`W_MuSI` on a calibrated ckpt. **Mu unlock** still separate (XY3).
+- **Status**: **I.3 XY viable path proved**; use `biochem_teacher_last.pth` from learn leg or re-lock for downstream.
+
+### 133. Step-2 bridge from M3 locked (`passive_step2_bridge_m3_6ep`, 2026-05-30) — superseded
+
+- **6ep, no grad scale**: all optimizer steps **skipped**; species held at **0.027** but gate FAIL (flat losses). Superseded by **§134** hold leg with `GRAD_SCALE_ON_CAP=1`.
+
+### 132. M3 align 12ep from Phase B ramp1 (`m3_align_transport_union_12ep`, 2026-05-30)
+
+- **Init**: `biochem_teacher_phaseB_ramp1_last.pth` -> `best_high_mu` (after `-Probe` phaseB); recipe: `union` mask, `transport_only` ADR, `match_data_bio`+`exclude_wall`, `PASSIVE_ADR_WEIGHT=1e-4`; run `20260530T141430Z`.
+- **Gate** (`check_m3_align_gate.py`): **PASS** — `L_bio` **16590->2302** (ratio **0.139**); masked `L_ADR_S` **0.0072->0.00064** (ratio **0.089**); val FI **2.01->0.027** (ep11); `mask_n~622`, `ADR_mask_n~70`.
+- **Train plateau**: `L_bio` ~**2350** ep8-10 then **2302** ep11; species FI ep9 **0.080** slight rebound then **0.027** ep11 — same band as §125/§126.
+- **Mu**: val logMAE **1.3966** flat (expected); global `biochem_teacher_best_high_mu.pth` label unchanged (`phaseB_ramp1_data`) — use **`biochem_teacher_last.pth`** or lock explicitly.
+- **Viability**: **PASS** — `python scripts/check_m3_viability_pass.py`. **Further optimization required:** global ramp2 raw ADR, formulation sweeps, grad-cap/LR for bridge from saturated ckpt, production lock naming — not blocking I.3 XY viability.
 
 ### 131. I.1 X block fast probe + promote (`go_passive_x_probe.ps1`, `go_passive_x_block_pass.ps1`, 2026-05-30)
 
@@ -1774,9 +1925,32 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-30 | **expl6h_XY_bridge** (10ep, step-2 bridge recipe) | **1.3966** (flat) | **2.2500** (flat) | **-0.056** | `bridge_ok`; species OK; mu flat; bio gate FAIL (saturated) |
 | 2026-05-30 | **I.1 X block** turbo probe (2ep, `PASSIVE_SPECIES_VAL_ONLY`, stride 50) | probe FI **0.018** (X3) / **0.065** (X4,X5,m3) | — | **r~0** | Cal teacher **~0.03**; probe = wiring/trends only; gate **PASS** after backfill §131 |
 | 2026-05-30 | **I.1 X promote** (`align_locked` -> `species_locked`, dump m6) | **~0.03** (20ep cal) | — | — | `anchors_stride36_m6` **6** graphs; manifest `passive_species_locked_manifest.json`; `check_passive_x_block_pass.py --require-promote` **PASS** |
-| 2026-05-30 | **M3 probe** `m3_align_transport_union_probe` (3ep, ramp1 init) | **1.3966** (flat) | **2.25** | **-0.056** | Gate trends OK @`--min-epochs 3`; `L_bio` 0.32, ADR 0.21; FI **0.67** |
-| 2026-05-30 | **M3 minpass** `m3_align_transport_union_minpass` (6ep, ramp1 init) | **1.3966** (flat) | **2.25** | **-0.056** | **`check_m3_align_gate` PASS**; `L_bio` 0.16, ADR 0.22; val FI **2.01->0.25**, Mat **0.14**; run `20260530T133402Z` |
-| 2026-05-30 | **M3 minpass_resume** (6ep, `last`->`best` + `--new`) | **1.3966** (flat) | **2.25** | **-0.056** | Gate PASS but **duplicate** of minpass (FI **0.246**); 24 tensors skipped on load — use 12ep one-shot or `--resume` §133 |
+| 2026-05-30 | **M3 align 12ep** (`m3_align_transport_union_12ep`, init phaseB ramp1) | **1.3966** (flat) | **2.2500** (flat) | **-0.056** | **Viability PASS** (§132); optimize later |
+| 2026-05-30 | **step2 bridge m3 6ep** (no grad scale) | **1.3966** (flat) | **2.2500** (flat) | **-0.056** | Species held; no train steps; superseded §134 |
+| 2026-05-30 | **I.3 XY2-hold** (`passive_step2_bridge_m3_hold`, 3ep, m3_locked) | **1.3966** (flat) | **2.2500** (flat) | **-0.056** | Gate **PASS**; val FI **0.018** ep2; `L_bio` r=0.18; §134 |
+| 2026-05-30 | **I.3 XY2-learn** (`passive_step2_bridge_align_learn`, 6ep) | **1.3966** (flat) | **2.2500** (flat) | **-0.056** | Gate **PASS**; val FI **0.013** ep5; `L_bio` r=0.023, ADR r=0.40; §134 |
+| 2026-05-30 | **passive_mu_unlock_finetune** (12ep, M5.3, wall/high weights) | **0.797** (ep2) / **1.165** (ep11) | **2.090** (ep11) | **~-0.11** ep11 | Gate **FAIL** (bulk regressed); species **0.013**; `clot_frac=0`; §135 |
+| 2026-05-31 | **passive_m5_bridge** (12ep, init unlock_best, grad scale) | **0.781** (ep11) | **2.095** (ep11) | **~0** ep11 | Gate **PASS**; FI **0.019**; not spatial clot viz; §135 |
+| 2026-05-31 | **passive_m5_bridge** (resume, `20260531T080809Z`) | **0.781** (ep11) | **2.095** (ep11) | **~0** ep11 | Duplicate of `052328Z`; **promote** for viz; §135 |
+| 2026-05-31 | **m5_k10f_wide_from_passive** (18ep, `20260531T084401Z`) | **0.794** (ep8) | **2.478** (ep8) | **~0.32** ep8 | FI **3.26**; `clot_frac=0`; mu-only; §135 |
+| 2026-05-31 | **m5_k10e_narrow_from_passive** (18ep, `20260531T085558Z`) | **0.968** (ep17) | **2.581** (ep17) | **~0.32** ep17 | Worse than bridge; §135 |
+| 2026-05-31 | **m5_k10g_bias_from_passive** (18ep budget, `20260531T090957Z`) | **0.805** (ep6) | **2.605** (ep6) | **~0.32** ep6 | FI **3.26**; run may be incomplete; §135 |
+| 2026-05-31 | **passive_m5_bridge** (no `-GradScaleOnCap`, `20260531T115116Z`) | **0.804** (flat ep0–6) | **2.80** (flat) | **~-0.06** | No train steps; gate **FAIL**; §137 |
+| 2026-05-31 | **passive_m5_bridge** (repro, `-GradScaleOnCap`, `20260531T121153Z`, 5ep logged) | **0.781** (ep4) | **2.11** (ep4) | **~0** ep4 | On-track vs `080809Z`; **incomplete** (no `end`); FI **0.059** ep4 |
+| 2026-05-31 | **ladder R0a** mask viz (`patient007`, t=0 / t=200) | n/a | — | — | final **303** loss nodes; GT patches @ t=200; §138 |
+| 2026-05-31 | **ladder R0b** physics oracle (`mu_ratio=4`, gate) | n/a | — | — | val F1 **0.599** `pred+=0.331` score **0.656**; gate **PASS**; §138 |
+| 2026-05-31 | **ladder R0c** viz prior MLP (`clot_phi_best.pth`, t=200) | n/a | — | — | pred matches GT on p007; confirms rung 2 path; §138 |
+| 2026-05-31 | **ladder R1** linear `-Fresh` (50ep, h16) | n/a | — | — | val F1 **0.712** `pred+=0.435`; ckpt `clot_phi_best_linear.pth`; §139 |
+| 2026-05-31 | **ladder R2** MLP `-Fresh` (60ep, h32/d2, joint_bio) | n/a | — | — | val F1 **0.767** `pred+=0.524` `rec=0.693`; `clot_phi_best_mlp.pth`; §140 |
+| 2026-05-31 | **ladder R3b** MLP `DGAMMA_FEATURE_TIME=current` | n/a | — | — | val F1 **0.774**; t=200 `region_n=303` localized viz; **promote**; §142 |
+| 2026-05-31 | **ladder R4a** `oracle_gt` 25ep | n/a | — | — | multi-anchor mean **0.558** min **0.206**; p007 **0.733**; §143 |
+| 2026-05-31 | **ladder R4b** `joint_blend_gtsp` manual (bad env) | n/a | — | — | hybrid=0; val F1 **~0.10**; no ckpt; retry `go_rung4_joint_blend_gtsp.ps1`; §143 |
+| 2026-05-31 | **ladder R4b/c** `go_rung4_joint_blend_gtsp` 60ep | n/a | — | — | p007 F1 **0.778**; 4c min **0.234**; viz localized; §144 |
+| 2026-05-31 | **GNODE 9.1** smoke 1ep GT vel (`20260531T192101Z`, `PASSIVE`, ADR log-only) | **1.397** (flat) | **2.250** wall | **-0.056** | `viz_t0\|u\|=0.957` `viz_health=2.42` `flow_trivial=0`; smoke **PASS**; §147 |
+| 2026-05-31 | **GNODE 9.2** AE6+ODE6 refresh (`20260531T193845Z`) | **1.397** (flat) | **2.250** | **-0.056** | AE/ODE down; `L_bio` ep0 **284**; §148 |
+| 2026-05-31 | **GNODE 9.3** clot-band 3ep (`20260531T194456Z`) | **1.397** (flat) | **2.250** | **-0.056** | `L_bio` **3463->1834**; dump `anchors_clotband_72` OK; clot-phi pending; §148 |
+| 2026-05-31 | **GNODE 9.3** clot-phi `clotband_focus_gnode93` 20ep | n/a | — | **0.634** p007 | p007 F1 **0.624**; min F1 **0.338**; teacher viz Mat~0; clot-phi patches OK; §148 |
+| 2026-06-01 | **GNODE 8h** `go_gnode_8h_ladder` 9.4-9.6 | **1.397** flat | **2.25** | **-0.056** | species FI **~0.004**; clot-phi min F1 **0.341** p007 **0.627**; §149 |
 
 ---
 

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
+from src.core_physics.clot_phi_rollout import ClotPhiRolloutState, clot_phi_rollout_enabled
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_model,
     build_clot_phi_step,
@@ -22,8 +23,27 @@ from src.core_physics.clot_phi_simple import (
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
 )
+from src.evaluation.clot_phi_checkpoint_env import apply_clot_phi_config_from_checkpoint
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 from src.utils.paths import get_project_root
+
+
+def _ensure_training_mask_env() -> None:
+    """Match scripts/_clot_phi_shared_env.ps1 so viz uses the same region as train."""
+    defaults = {
+        "CLOT_PHI_MASK_MODE": "neighbor",
+        "CLOT_PHI_CENTER_EXCLUDE_FRAC": "0.10",
+        "CLOT_PHI_CLOT_TOUCH_HOPS": "1",
+        "CLOT_PHI_DGAMMA_SLICE": "1",
+        "CLOT_PHI_DGAMMA_REF_TIME": "0",
+        "CLOT_PHI_DGAMMA_WALL_MIN_SI": "100",
+        "CLOT_PHI_DGAMMA_OFFWALL_PCT": "80",
+        "CLOT_PHI_MINIMAL_FEATURES": "1",
+        "CLOT_PHI_HYBRID": "1",
+        "CLOT_PHI_SOFT_LABELS": "1",
+    }
+    for key, val in defaults.items():
+        os.environ.setdefault(key, val)
 
 
 def main() -> None:
@@ -35,8 +55,15 @@ def main() -> None:
         help="Path to clot_phi_best.pth",
     )
     parser.add_argument("--time-index", type=int, default=-1, help="Time index (-1 = final)")
+    parser.add_argument(
+        "--plot-mode",
+        choices=("tri", "scatter"),
+        default="tri",
+        help="tri=gouraud tripcolor (can look like full-wall rim); scatter=points in region only",
+    )
     parser.add_argument("--out", default="", help="Output PNG path (default auto)")
     args = parser.parse_args()
+    _ensure_training_mask_env()
 
     root = get_project_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,6 +113,10 @@ def main() -> None:
         os.environ["CLOT_PHI_MLP_DEPTH"] = str(int(cfg.get("mlp_depth") or 1))
     if "dropout" in cfg:
         os.environ["CLOT_PHI_DROPOUT"] = str(float(cfg.get("dropout") or 0.0))
+    if "model_kind" in cfg:
+        os.environ["CLOT_PHI_MODEL"] = str(cfg.get("model_kind") or "mlp")
+    apply_clot_phi_config_from_checkpoint(cfg)
+    os.environ.setdefault("CLOT_PHI_DGAMMA_FEATURE_TIME", "current")
     model = build_clot_phi_model(in_dim=in_dim, hidden=hidden).to(device)
     model.load_state_dict(raw["model_state_dict"])
     model.eval()
@@ -95,8 +126,26 @@ def main() -> None:
     assert_graph_schema(data, expected_y_schema=(BIO_Y_SCHEMA,))
 
     ti = args.time_index if args.time_index >= 0 else int(data.y.shape[0]) - 1
-    step = build_clot_phi_step(data, ti, phys_cfg, bio_cfg, device)
+    rollout_state = ClotPhiRolloutState() if clot_phi_rollout_enabled() else None
     with torch.no_grad():
+        step = build_clot_phi_step(data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state)
+        if rollout_state is not None and ti > 0:
+            rollout_state = ClotPhiRolloutState()
+            for t_run in range(0, ti):
+                step_run = build_clot_phi_step(
+                    data, t_run, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+                )
+                phi_r = model(step_run.features)
+                if clot_phi_hybrid_enabled() and hasattr(model, "forward_delta_log_mu"):
+                    mu_r = mu_eff_from_delta_log_si(
+                        step_run.mu_c_si, model.forward_delta_log_mu(step_run.features)
+                    )
+                else:
+                    mu_r = log_blend_mu_eff_si(step_run.mu_c_si, phi_r)
+                rollout_state.update_from_pred(phi_r, mu_r, detach=True)
+            step = build_clot_phi_step(
+                data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+            )
         phi_pred = model(step.features)
         if clot_phi_hybrid_enabled() and hasattr(model, "forward_delta_log_mu"):
             mu_pred = mu_eff_from_delta_log_si(step.mu_c_si, model.forward_delta_log_mu(step.features))
@@ -110,19 +159,41 @@ def main() -> None:
     mu_gt = step.mu_gt_cap.detach().cpu().numpy()
     mu_pr = mu_pred.detach().cpu().numpy()
 
-    def _tri_scatter(vals, title, vmin=None, vmax=None, cmap="hot"):
+    idx = np.where(m)[0]
+    gt_pos = int((phi_gt[m] > 0.05).sum())
+    print(
+        f"[i]  t={ti} region_n={int(m.sum())} gt_pos_n={gt_pos} "
+        f"mean_pred_phi={float(phi_pr[m].mean()):.3f} mean_gt_phi={float(phi_gt[m].mean()):.3f} "
+        f"frac_pred_phi>=0.5={float((phi_pr[m] >= 0.5).mean()):.3f}",
+        flush=True,
+    )
+
+    def _plot_panel(vals, title, vmin=None, vmax=None, cmap="hot"):
         ax = fig.add_subplot(2, 2, plot_i[0])
         plot_i[0] += 1
-        v = np.where(m, vals, np.nan)
-        triang = mtri.Triangulation(pos[:, 0], pos[:, 1])
-        tri_pts = pos[triang.triangles]
-        d1 = np.sum((tri_pts[:, 0, :] - tri_pts[:, 1, :]) ** 2, axis=1)
-        d2 = np.sum((tri_pts[:, 1, :] - tri_pts[:, 2, :]) ** 2, axis=1)
-        d3 = np.sum((tri_pts[:, 2, :] - tri_pts[:, 0, :]) ** 2, axis=1)
-        max_edge_sq = np.max(np.vstack([d1, d2, d3]), axis=0)
-        triang.set_mask(max_edge_sq > (np.median(max_edge_sq) * 10.0))
-        tc = ax.tripcolor(triang, v, cmap=cmap, vmin=vmin, vmax=vmax, shading="gouraud")
-        fig.colorbar(tc, ax=ax, fraction=0.046)
+        if args.plot_mode == "scatter":
+            sc = ax.scatter(
+                pos[idx, 0],
+                pos[idx, 1],
+                c=vals[idx],
+                s=14,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                linewidths=0,
+            )
+            fig.colorbar(sc, ax=ax, fraction=0.046)
+        else:
+            v = np.where(m, vals, np.nan)
+            triang = mtri.Triangulation(pos[:, 0], pos[:, 1])
+            tri_pts = pos[triang.triangles]
+            d1 = np.sum((tri_pts[:, 0, :] - tri_pts[:, 1, :]) ** 2, axis=1)
+            d2 = np.sum((tri_pts[:, 1, :] - tri_pts[:, 2, :]) ** 2, axis=1)
+            d3 = np.sum((tri_pts[:, 2, :] - tri_pts[:, 0, :]) ** 2, axis=1)
+            max_edge_sq = np.max(np.vstack([d1, d2, d3]), axis=0)
+            triang.set_mask(max_edge_sq > (np.median(max_edge_sq) * 10.0))
+            tc = ax.tripcolor(triang, v, cmap=cmap, vmin=vmin, vmax=vmax, shading="gouraud")
+            fig.colorbar(tc, ax=ax, fraction=0.046)
         ax.set_title(title)
         ax.set_aspect("equal")
         ax.axis("off")
@@ -130,11 +201,11 @@ def main() -> None:
     fig = plt.figure(figsize=(12, 10))
     plot_i = [1]
     band = clot_phi_mask_mode()
-    _tri_scatter(phi_gt, f"GT phi (t={ti}) {band} band", 0.0, 1.0, "Reds")
-    _tri_scatter(phi_pr, f"Pred phi", 0.0, 1.0, "Reds")
+    _plot_panel(phi_gt, f"GT phi (t={ti}) {band} band", 0.0, 1.0, "Reds")
+    _plot_panel(phi_pr, f"Pred phi", 0.0, 1.0, "Reds")
     cap = float(os.environ.get("CLOT_PHI_MU_CAP_SI", "0.10"))
-    _tri_scatter(mu_gt, f"GT mu cap {cap:.2f} Pa*s", 0.0, cap, "bwr")
-    _tri_scatter(mu_pr, f"Pred mu blend", 0.0, cap, "bwr")
+    _plot_panel(mu_gt, f"GT mu cap {cap:.2f} Pa*s", 0.0, cap, "bwr")
+    _plot_panel(mu_pr, f"Pred mu eff", 0.0, cap, "bwr")
     fig.suptitle(f"clot_phi_simple — {args.anchor} (ckpt {ckpt_path.name})", fontsize=14)
     fig.tight_layout()
 

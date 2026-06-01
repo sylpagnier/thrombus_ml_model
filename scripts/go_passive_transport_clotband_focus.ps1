@@ -13,7 +13,8 @@ param(
     [int] $TeacherEpochs = 8,
     [int] $ClotEpochs = 20,
     [int] $DumpStride = 36,
-    [int] $DumpMinSteps = 4
+    [int] $DumpMinSteps = 4,
+    [switch] $SkipViz
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 . (Join-Path $PSScriptRoot "_clot_phi_shared_env.ps1")
+. (Join-Path $PSScriptRoot "_gnode_viz_helpers.ps1")
 
 $OutRoot = "outputs\biochem\passive_species_clotband_focus"
 if ($Fresh) {
@@ -65,6 +67,10 @@ python -m src.training.train_biochem_corrector --new --skip-pretrain --init-from
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $Teacher = "outputs\biochem\biochem_teacher_last.pth"
+if (-not $SkipViz) {
+    Invoke-BiochemTeacherSnapshot -Checkpoint $Teacher -Anchor patient007 -Label "passive_clotband_teacher"
+    Invoke-BiochemTeacherClotbandViz -Checkpoint $Teacher -Anchor patient007 -TimeIndex -1 -Label "passive_clotband_teacher_raw"
+}
 if (-not (Test-Path $Teacher)) {
     Write-Host "[ERR] Missing teacher ckpt: $Teacher" -ForegroundColor Red
     exit 1
@@ -81,15 +87,46 @@ python scripts/dump_teacher_species_to_anchors.py `
     --force
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+if (-not $SkipViz) {
+    Invoke-ClotPhiMaskViz -Anchor patient007 -TimeIndex 0 -Out (Join-Path $OutRoot "viz_mask_p007_t0.png")
+    Invoke-ClotPhiMaskViz -Anchor patient007 -TimeIndex -1 -Out (Join-Path $OutRoot "viz_mask_p007_tfinal.png")
+    Invoke-BiochemTeacherClotbandViz `
+        -Checkpoint $Teacher `
+        -Anchor patient007 `
+        -AnchorDir $AnchorDir `
+        -TimeIndex 4 `
+        -Out (Join-Path $OutRoot "viz_teacher_clotband_p007_t4.png")
+}
+
 $LegName = "clotband_focus"
 $LegDir = Join-Path $OutRoot $LegName
 New-Item -ItemType Directory -Force -Path $LegDir | Out-Null
-Write-Host "[NEW] Train clot-phi on clotband anchors ($ClotEpochs ep)" -ForegroundColor Cyan
 
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_clot_phi_from_anchor_dir.ps1" `
-    -AnchorDir $AnchorDir `
-    -LegName $LegName `
-    -Epochs $ClotEpochs
+if ($ClotEpochs -le 0) {
+    Write-Host "[skip] ClotEpochs=$ClotEpochs: teacher + dump only (use -ClotEpochs 20 for clot-phi)." -ForegroundColor Yellow
+} else {
+    Write-Host "[NEW] Train clot-phi on clotband anchors ($ClotEpochs ep)" -ForegroundColor Cyan
+    $clotArgs = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", ".\scripts\go_clot_phi_from_anchor_dir.ps1",
+        "-AnchorDir", $AnchorDir,
+        "-LegName", $LegName,
+        "-Epochs", $ClotEpochs
+    )
+    if ($SkipViz) { $clotArgs += "-SkipViz" }
+    & powershell @clotArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-exit $LASTEXITCODE
+    if (-not $SkipViz) {
+        $ClotCkpt = "outputs\biochem\passive_species_focus_compare\$LegName\clot_phi_best.pth"
+        if (Test-Path $ClotCkpt) {
+            $env:CLOT_PHI_ANCHOR_DIR = $AnchorDir
+            Invoke-ClotPhiScatterViz -Checkpoint $ClotCkpt -Anchor patient007 -TimeIndex -1 `
+                -Out (Join-Path $OutRoot "viz_clot_phi_p007_tfinal.png")
+            Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+exit 0
 

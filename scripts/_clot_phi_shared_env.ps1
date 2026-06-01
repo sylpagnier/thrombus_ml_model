@@ -10,6 +10,8 @@ $env:CLOT_PHI_CLOT_TOUCH_HOPS = "1"
 $env:CLOT_PHI_CENTER_EXCLUDE_FRAC = "0.10"
 $env:CLOT_PHI_DGAMMA_SLICE = "1"
 $env:CLOT_PHI_DGAMMA_REF_TIME = "0"
+# Node features: "ref" = dgamma @ REF_TIME only; "current" = dgamma @ each slice ti (Rung 3b).
+if (-not $env:CLOT_PHI_DGAMMA_FEATURE_TIME) { $env:CLOT_PHI_DGAMMA_FEATURE_TIME = "ref" }
 $env:CLOT_PHI_DGAMMA_WALL_MIN_SI = "100"
 $env:CLOT_PHI_DGAMMA_OFFWALL_PCT = "80"
 $env:CLOT_PHI_SHEAR_MIN_FRAC = "0"

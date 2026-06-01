@@ -46,6 +46,14 @@ from src.core_physics.clot_phi_simple import (
     physics_phi_from_mu,
     rule_phi_from_mu_cap,
 )
+from src.core_physics.clot_phi_rollout import (
+    ClotPhiRolloutState,
+    clot_phi_carry_log_mu_enabled,
+    clot_phi_carry_phi_enabled,
+    clot_phi_rollout_detach_carry,
+    clot_phi_rollout_enabled,
+    clot_phi_vel_source,
+)
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
 from src.utils.paths import get_project_root
 
@@ -311,8 +319,12 @@ def _run_epoch(
                 continue
             n_graphs += 1
             t_steps = data.y.shape[0]
+            rollout_on = clot_phi_rollout_enabled() and not rule_baseline and not physics_oracle
+            rollout_state = ClotPhiRolloutState() if rollout_on else None
             for ti in range(0, t_steps, max(1, time_stride)):
-                step = build_clot_phi_step(data, ti, phys_cfg, bio_cfg, device)
+                step = build_clot_phi_step(
+                    data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+                )
                 m = step.loss_mask
                 if not bool(m.any().item()):
                     continue
@@ -369,8 +381,7 @@ def _run_epoch(
                         )
                         if _env_bool("CLOT_PHI_JOINT_USE_PRED_SPECIES", True):
                             sp_for_physics = sp_pred
-                    y_sl = data.y[ti].to(device=device)
-                    u_sl, v_sl = y_sl[:, 0], y_sl[:, 1]
+                    u_sl, v_sl = step.u_flow_nd, step.v_flow_nd
                     logits = model.forward_logits(feats)
                     idx = _loss_indices(logits, tgt, m, balanced=balanced and train)
                     tm = tgt[idx]
@@ -452,6 +463,12 @@ def _run_epoch(
                     for k, v in _clot_metrics(phi_pred, tgt, m).items():
                         metric_sums[k] += v
                     n_steps += 1
+                    if rollout_state is not None:
+                        rollout_state.update_from_pred(
+                            phi_pred,
+                            mu_pred,
+                            detach=clot_phi_rollout_detach_carry() or not train,
+                        )
 
     denom = max(n_steps, 1)
     out = {
@@ -605,6 +622,7 @@ def main() -> None:
         f"hidden={hidden} depth={clot_phi_mlp_depth()} dropout={clot_phi_dropout():.2f} "
         f"minimal={int(clot_phi_minimal_features_enabled())} species_feat={int(clot_phi_species_features_enabled())} "
         f"joint_bio={int(joint_bio)} in_dim={in_dim} "
+        f"rollout={int(clot_phi_rollout_enabled())} vel={clot_phi_vel_source()} "
         f"train={len(train_paths)} val={len(val_paths)} "
         f"prior={prior:.3f} pos_weight={pos_weight:.2f} mu_log_w={mu_log_lambda:.2f} "
         f"bio_w={_bio_lambda():.2f}",
@@ -698,6 +716,14 @@ def main() -> None:
                     "anchor_dir": str(anchor_dir),
                     "physics_blend": _env_bool("CLOT_PHI_PHYSICS_BLEND", False),
                     "physics_blend_alpha": _physics_blend_alpha(),
+                    "rollout": clot_phi_rollout_enabled(),
+                    "rollout_vel_source": clot_phi_vel_source(),
+                    "rollout_carry_phi": clot_phi_rollout_enabled()
+                    and clot_phi_carry_phi_enabled(),
+                    "rollout_carry_log_mu": clot_phi_rollout_enabled()
+                    and clot_phi_carry_log_mu_enabled(),
+                    "rollout_detach": clot_phi_rollout_detach_carry(),
+                    "dgamma_feature_time": (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "ref").strip(),
                 },
             }
             if species_head is not None:

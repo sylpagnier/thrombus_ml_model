@@ -35,6 +35,7 @@ from src.architecture.gnode_biochem import (
 )
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
+from src.core_physics.clot_phi_simple import carreau_mu_si_from_uv
 from src.utils.nondim import to_t_nd
 from src.utils.channel_schema import infer_missing_schema
 from src.utils.kinematics_paths import kinematics_graph_rheology_dir
@@ -53,6 +54,14 @@ _BIOCHEM_TEACHER_CKPT_CANDIDATES = (
     "biochem_teacher_best_high_mu.pth",
     "biochem_teacher_last.pth",
 )
+# Locked passive / step-2 teacher artifacts (STOP_AFTER_TEACHER=1 saves).
+_BIOCHEM_PASSIVE_TEACHER_CKPT_NAMES: Dict[str, str] = {
+    "biochem_teacher_passive_mu_unlock_best.pth": "passive_mu_unlock_best",
+    "biochem_teacher_passive_xy_locked.pth": "passive_xy_locked",
+    "biochem_teacher_passive_align_locked.pth": "passive_align_locked",
+    "biochem_teacher_passive_species_locked.pth": "passive_species_locked",
+    "biochem_teacher_passive_m3_locked.pth": "passive_m3_locked",
+}
 # Names written by ``train_biochem_corrector.py``.
 _BIOCHEM_CKPT_ROLE_BY_NAME: Dict[str, str] = {
     "biochem_teacher_best_high_mu.pth": "teacher_best_high_mu",
@@ -61,11 +70,15 @@ _BIOCHEM_CKPT_ROLE_BY_NAME: Dict[str, str] = {
     "biochem_best_high_mu.pth": "corrector_best_high_mu",
     "biochem_best_bio.pth": "corrector_best_bio_legacy",
     "biochem_latest_checkpoint.pth": "corrector_latest",
+    **_BIOCHEM_PASSIVE_TEACHER_CKPT_NAMES,
 }
 _BIOCHEM_TEACHER_CKPT_ROLES = frozenset(
     {"teacher_best_high_mu", "teacher_last", "teacher_best", "teacher_best_all_legacy"}
 )
-_BIOCHEM_CKPT_INVENTORY_EXTRA = ("biochem_best_bio.pth",)
+_BIOCHEM_CORRECTOR_CKPT_ROLES = frozenset(
+    {"corrector_best_high_mu", "corrector_best_bio_legacy", "corrector_latest", "corrector_best"}
+)
+_BIOCHEM_CKPT_INVENTORY_EXTRA = ("biochem_best_bio.pth",) + tuple(_BIOCHEM_PASSIVE_TEACHER_CKPT_NAMES)
 _DEFAULT_VAL_ANCHOR_STEM = "patient007"
 # Legacy COMSOL display (species sigmoids); biochem rollout uses stored ``mu_eff`` when ablated.
 _MU_DYNAMIC_SI_LABEL = r"$\mu_b \times (\mu_1(\mathrm{Mat}) + \mu_2(\mathrm{FI}))$ [Pa·s]"
@@ -171,6 +184,30 @@ def _infer_role_from_meta(meta: Dict[str, Any], filename: str) -> str:
     if role:
         return role
     return _BIOCHEM_CKPT_ROLE_BY_NAME.get(filename, "custom")
+
+
+def _is_teacher_checkpoint_role(role: str) -> bool:
+    """True for teacher-only artifacts (including passive locked ckpts), not corrector snapshots."""
+    if role in _BIOCHEM_CORRECTOR_CKPT_ROLES:
+        return False
+    if role in _BIOCHEM_TEACHER_CKPT_ROLES:
+        return True
+    if role.startswith("teacher_"):
+        return True
+    if role.startswith("passive_"):
+        return True
+    return False
+
+
+def _resolve_checkpoint_role(path: Path) -> str:
+    role = _BIOCHEM_CKPT_ROLE_BY_NAME.get(path.name, "custom")
+    if role != "custom":
+        return role
+    try:
+        meta, _ = _checkpoint_state_dict(_load_torch_checkpoint(path))
+        return _infer_role_from_meta(meta, path.name)
+    except (OSError, TypeError, ValueError):
+        return "custom"
 
 
 def _print_biochem_checkpoint_banner(choice: BiochemCheckpointChoice, meta: Dict[str, Any]) -> None:
@@ -578,11 +615,11 @@ def _resolve_biochem_checkpoint(
             resolved = resolve_checkpoint("b", name)
             if not resolved.exists():
                 raise FileNotFoundError(f"Biochem checkpoint not found: {name}")
-        role = _BIOCHEM_CKPT_ROLE_BY_NAME.get(resolved.name, "custom")
-        if require_teacher and role not in _BIOCHEM_TEACHER_CKPT_ROLES:
+        role = _resolve_checkpoint_role(resolved)
+        if require_teacher and not _is_teacher_checkpoint_role(role):
             raise FileNotFoundError(
                 f"--teacher-only but checkpoint '{resolved.name}' (role={role}) is not a teacher artifact. "
-                f"Use one of: {', '.join(_BIOCHEM_TEACHER_CKPT_CANDIDATES)}."
+                f"Use one of: {', '.join(_BIOCHEM_TEACHER_CKPT_CANDIDATES + tuple(_BIOCHEM_PASSIVE_TEACHER_CKPT_NAMES))}."
             )
         return BiochemCheckpointChoice(
             path=resolved,
@@ -629,6 +666,17 @@ def _load_single_graph(proc_dir, device, label):
 def _run_model_once(model, data):
     pred = model(data)
     return pred[0] if isinstance(pred, tuple) else pred
+
+
+def _carreau_mu_blood_torch(
+    model: GNODE_Phase3,
+    data,
+    pred_t: torch.Tensor,
+) -> torch.Tensor:
+    """Carreau shear-thinning blood viscosity [Pa*s] from ND ``u,v`` on the biochem mesh."""
+    u_nd = pred_t[:, _CHANNEL["u"]]
+    v_nd = pred_t[:, _CHANNEL["v"]]
+    return carreau_mu_si_from_uv(data, u_nd, v_nd, model.phys_cfg)
 
 
 def _comsol_style_rheology_fields(

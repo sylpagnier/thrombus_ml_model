@@ -3,7 +3,8 @@ param(
     [string] $LegName = "tmp_leg",
     [int] $Epochs = 20,
     [double] $BioFiWeight = 2.0,
-    [double] $BioMatWeight = 2.0
+    [double] $BioMatWeight = 2.0,
+    [switch] $SkipViz
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,8 @@ if (-not $AnchorDir) {
 }
 
 . (Join-Path $PSScriptRoot "_clot_phi_shared_env.ps1")
+. (Join-Path $PSScriptRoot "_gnode_viz_helpers.ps1")
+$env:CLOT_PHI_DGAMMA_FEATURE_TIME = "current"
 
 $env:CLOT_PHI_ANCHOR_DIR = $AnchorDir
 $env:CLOT_PHI_MODEL = "mlp"
@@ -56,4 +59,13 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $ckpt = "outputs/biochem/passive_species_focus_compare/$LegName/clot_phi_best.pth"
 $out = "outputs/biochem/passive_species_focus_compare/$LegName/multi_anchor.jsonl"
 python scripts/eval_clot_phi_multi_anchor.py --checkpoint $ckpt --out $out
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+if (-not $SkipViz) {
+    $env:CLOT_PHI_ANCHOR_DIR = $AnchorDir
+    Invoke-ClotPhiScatterViz -Checkpoint $ckpt -Anchor patient007 -TimeIndex -1 `
+        -Out "outputs/biochem/viz/clot_phi_${LegName}_p007_tfinal.png"
+    Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
+}
+
+exit 0

@@ -53,7 +53,7 @@ $unlockBest = Join-Path $RepoRoot "outputs\biochem\biochem_teacher_passive_mu_un
 if (Test-Path $unlockBest) {
     & (Join-Path $PSScriptRoot "go_passive_lock_mu_unlock_best.ps1")
 } else {
-    Write-Host "[WARN] $unlockBest not written (re-run probe on updated trainer) — finetune may use -UseLastFallback" -ForegroundColor Yellow
+    Write-Host "[WARN] $unlockBest not written (re-run probe on updated trainer); finetune may need UseLastFallback on go_passive_mu_unlock_finetune.ps1" -ForegroundColor Yellow
 }
 
 Write-Host "[NEW] Species check (post-train)" -ForegroundColor Cyan

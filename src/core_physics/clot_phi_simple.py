@@ -120,6 +120,15 @@ def clot_phi_dgamma_ref_time_index(data) -> int:
     return max(0, min(ti, t_last))
 
 
+def clot_phi_dgamma_feature_time_index(data, time_index: int) -> int:
+    """Time index for ``-dgamma/dx`` in node features (mask slice still uses ``DGAMMA_REF_TIME``)."""
+    raw = (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "ref").strip().lower()
+    if raw in ("current", "slice", "same", "match"):
+        t_last = int(data.y.shape[0]) - 1
+        return max(0, min(int(time_index), t_last))
+    return clot_phi_dgamma_ref_time_index(data)
+
+
 def clot_phi_dgamma_wall_min_si() -> float:
     """Wall nodes: keep GT clot seeds or ``-d(gamma)/dx >=`` this [1/(m*s)] (COMSOL adhesion band)."""
     return max(_env_float("CLOT_PHI_DGAMMA_WALL_MIN_SI", 100.0), 0.0)
@@ -525,13 +534,16 @@ def clot_phi_mlp_depth() -> int:
 
 
 def clot_phi_feature_dim() -> int:
+    from src.core_physics.clot_phi_rollout import clot_phi_rollout_extra_feature_dim
+
     extra_sp = 2 if clot_phi_species_features_enabled() else 0
     if clot_phi_minimal_features_enabled():
-        return 3 + extra_sp
-    dim = 7 if clot_phi_oracle_mu_enabled() else 6
-    if clot_phi_use_prior_features():
-        dim += clot_phi_prior_feature_count()
-    return dim
+        base = 3 + extra_sp
+    else:
+        base = 7 if clot_phi_oracle_mu_enabled() else 6
+        if clot_phi_use_prior_features():
+            base += clot_phi_prior_feature_count()
+    return base + clot_phi_rollout_extra_feature_dim()
 
 
 def rule_phi_from_mu_cap(
@@ -593,6 +605,9 @@ def node_features_from_gt(
     *,
     device: torch.device,
     mu_cap_si: torch.Tensor | None = None,
+    time_index: int | None = None,
+    u_nd_override: torch.Tensor | None = None,
+    v_nd_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-node features for phi head.
 
@@ -604,8 +619,16 @@ def node_features_from_gt(
     """
     n = int(data.num_nodes)
     sdf = sdf_nd_from_data(data, device, n)
-    u = y_slice[:, 0].to(device=device, dtype=torch.float32)
-    v = y_slice[:, 1].to(device=device, dtype=torch.float32)
+    u = (
+        u_nd_override.to(device=device, dtype=torch.float32)
+        if u_nd_override is not None
+        else y_slice[:, 0].to(device=device, dtype=torch.float32)
+    )
+    v = (
+        v_nd_override.to(device=device, dtype=torch.float32)
+        if v_nd_override is not None
+        else y_slice[:, 1].to(device=device, dtype=torch.float32)
+    )
   # BIO_Y: FI=12, Mat=15
     fi = y_slice[:, 12].to(device=device, dtype=torch.float32)
     mat = y_slice[:, 15].to(device=device, dtype=torch.float32)
@@ -617,8 +640,12 @@ def node_features_from_gt(
     gamma = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).clamp(min=1e-8)
     log_g = torch.log10(gamma)
     if clot_phi_minimal_features_enabled():
-        ti_ref = clot_phi_dgamma_ref_time_index(data)
-        neg_dx = gt_neg_dgamma_dx_phys(data, ti_ref, bio_cfg, device)
+        ti_dg = (
+            clot_phi_dgamma_feature_time_index(data, int(time_index))
+            if time_index is not None
+            else clot_phi_dgamma_ref_time_index(data)
+        )
+        neg_dx = gt_neg_dgamma_dx_phys(data, ti_dg, bio_cfg, device)
         cols = [sdf, log_g, torch.log1p(neg_dx)]
         if clot_phi_species_features_enabled():
             cols.extend([fi, mat])
@@ -748,6 +775,8 @@ class ClotPhiStepBatch:
     region: torch.Tensor
     loss_mask: torch.Tensor
     species_log_gt: torch.Tensor
+    u_flow_nd: torch.Tensor
+    v_flow_nd: torch.Tensor
 
 
 def build_clot_phi_step(
@@ -756,11 +785,33 @@ def build_clot_phi_step(
     phys_cfg: PhysicsConfig,
     bio_cfg: BiochemConfig,
     device: torch.device,
+    *,
+    u_nd_override: torch.Tensor | None = None,
+    v_nd_override: torch.Tensor | None = None,
+    rollout_state: "ClotPhiRolloutState | None" = None,
 ) -> ClotPhiStepBatch:
     """One time slice: labels and features on wall-adjacent nodes."""
+    from src.core_physics.clot_phi_rollout import (
+        ClotPhiRolloutState,
+        append_rollout_carry_features,
+        clot_phi_rollout_enabled,
+        resolve_uv_for_rollout_step,
+    )
+
     y = data.y[time_index].to(device)
-    u = y[:, 0]
-    v = y[:, 1]
+    u_gt = y[:, 0]
+    v_gt = y[:, 1]
+    if clot_phi_rollout_enabled():
+        mu_for_kine = None
+        if rollout_state is not None and rollout_state.log_mu_prev is not None:
+            mu_for_kine = torch.exp(rollout_state.log_mu_prev.clamp(max=20.0))
+        u, v, _, _ = resolve_uv_for_rollout_step(
+            data, time_index, mu_for_kine, device
+        )
+    elif u_nd_override is not None and v_nd_override is not None:
+        u, v = u_nd_override, v_nd_override
+    else:
+        u, v = u_gt, v_gt
     mu_gt = phys_cfg.viscosity_nd_to_si(y[:, STATE_CHANNEL_MU_EFF_ND])
     mu_cap = cap_mu_eff_si(mu_gt)
     region = supervision_region_mask(data, device, mu_cap, phys_cfg)
@@ -770,7 +821,26 @@ def build_clot_phi_step(
         phi_gt = phi_gt_soft(mu_cap, mu_c, region)
     else:
         phi_gt = phi_gt_binary(mu_cap, region, phys_cfg)
-    feats = node_features_from_gt(data, y, phys_cfg, bio_cfg, device=device, mu_cap_si=mu_cap)
+    feats = node_features_from_gt(
+        data,
+        y,
+        phys_cfg,
+        bio_cfg,
+        device=device,
+        mu_cap_si=mu_cap,
+        time_index=time_index,
+        u_nd_override=u,
+        v_nd_override=v,
+    )
+    if clot_phi_rollout_enabled() and rollout_state is not None:
+        feats = append_rollout_carry_features(
+            feats,
+            phi_prev=rollout_state.phi_prev,
+            log_mu_prev=rollout_state.log_mu_prev,
+            n_nodes=int(data.num_nodes),
+            device=device,
+            dtype=feats.dtype,
+        )
     loss_mask = region.bool()
     species_log = y[:, 4:16].to(device=device, dtype=torch.float32)
     return ClotPhiStepBatch(
@@ -781,4 +851,6 @@ def build_clot_phi_step(
         region=region,
         loss_mask=loss_mask,
         species_log_gt=species_log,
+        u_flow_nd=u,
+        v_flow_nd=v,
     )

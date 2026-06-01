@@ -2,7 +2,8 @@
 # Prereq: locked or 20ep passive teacher.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_passive_step2_bridge.ps1"
-#   powershell ... -Epochs 12 -InitCkpt outputs/biochem/biochem_teacher_passive_align_locked.pth
+#   powershell ... -Epochs 6 -InitCkpt outputs/biochem/biochem_teacher_passive_m3_locked.pth -GradScaleOnCap
+#   powershell ... -Probe   # 3ep + saturated viability gate
 
 param(
     [int] $Epochs = 12,
@@ -11,6 +12,8 @@ param(
     [string] $AdrWeight = "1e-4",
     [string] $MuLogWeight = "0.75",
     [string] $MuSiWeight = "0.15",
+    [switch] $Probe,
+    [switch] $GradScaleOnCap,
     [switch] $SkipAudit
 )
 
@@ -27,6 +30,11 @@ $env:BIOCHEM_SUPERVISION_MASK_TIMES = "union"
 $env:BIOCHEM_ADR_MASK_MODE = "match_data_bio"
 $env:BIOCHEM_ADR_EXCLUDE_WALL = "1"
 $env:BIOCHEM_ADR_RESIDUAL_MODE = "transport_only"
+
+if ($Probe) {
+    $Epochs = 3
+    $GradScaleOnCap = $true
+}
 
 $initPath = Join-Path $RepoRoot $InitCkpt
 if (-not (Test-Path $initPath)) {
@@ -45,6 +53,10 @@ if (-not $SkipAudit) {
 
 Set-PassiveStep2BridgeEnv -RunNote $RunNote -Epochs $Epochs -AdrWeight $AdrWeight `
     -MuLogWeight $MuLogWeight -MuSiWeight $MuSiWeight
+if ($GradScaleOnCap) {
+    $env:BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP = "1"
+    Write-Host "[i]  BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP=1 (scale clipped bio grads instead of skip)" -ForegroundColor Cyan
+}
 Copy-Item $initPath (Join-Path $RepoRoot "outputs\biochem\biochem_teacher_best_high_mu.pth") -Force
 
 $rc = Invoke-PythonRc -m src.training.train_biochem_corrector --new --skip-pretrain --init-from-best `
@@ -54,7 +66,14 @@ if ($rc -ne 0) {
     exit $rc
 }
 
-$gateRc = Invoke-PythonRc scripts/check_passive_step2_bridge_gate.py --run-note $RunNote
+if ($Probe) {
+    $sat = $InitCkpt -match "m3_locked|m3_align"
+    $vArgs = @("scripts/check_passive_xy_viability_pass.py", "--run-note", $RunNote, "--min-epochs", "$Epochs")
+    if ($sat) { $vArgs += "--saturated" }
+    $gateRc = Invoke-PythonRc @vArgs
+} else {
+    $gateRc = Invoke-PythonRc scripts/check_passive_step2_bridge_gate.py --run-note $RunNote --min-epochs $Epochs
+}
 if ($gateRc -eq 0) {
     Write-Host "[OK] Step-2 bridge gate passed" -ForegroundColor Green
 } else {

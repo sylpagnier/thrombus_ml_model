@@ -13,6 +13,8 @@ Wall-local **clot phase** probe: capped GT `mu_eff`, GT kinematics for Carreau b
 
 Use clot-phi results to **lock the supervision mask and kinematic features** before betting on full multitask biochem. Promote configs here only when val metrics are stable (no predict-none / predict-all).
 
+**Roadmap:** full viscosity/clot ladder (rungs 0–11, gates, launchers) — [BIOCHEM_TRAINING_PLAN.md](BIOCHEM_TRAINING_PLAN.md#viscosity--clot-localization-ladder-rungs-011).
+
 ## Data and mask (patient007-centric today)
 
 - **Graphs**: `data/processed/graphs_biochem_anchors/*.pt` (default); val anchor `patient007`.

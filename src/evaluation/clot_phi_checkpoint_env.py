@@ -41,3 +41,18 @@ def apply_clot_phi_config_from_checkpoint(cfg: dict[str, Any]) -> None:
         os.environ["CLOT_PHI_PHYSICS_BLEND"] = "1"
     elif "physics_blend" in cfg:
         os.environ["CLOT_PHI_PHYSICS_BLEND"] = "0"
+    if "rollout" in cfg:
+        os.environ["CLOT_PHI_ROLLOUT"] = "1" if cfg["rollout"] else "0"
+    if cfg.get("rollout_vel_source"):
+        os.environ["CLOT_PHI_VEL_SOURCE"] = str(cfg["rollout_vel_source"])
+    if "rollout_carry_phi" in cfg:
+        os.environ["CLOT_PHI_CARRY_PHI"] = "1" if cfg["rollout_carry_phi"] else "0"
+    if "rollout_carry_log_mu" in cfg:
+        os.environ["CLOT_PHI_CARRY_LOG_MU"] = "1" if cfg["rollout_carry_log_mu"] else "0"
+    if "rollout_detach" in cfg:
+        os.environ["CLOT_PHI_ROLLOUT_DETACH"] = "1" if cfg["rollout_detach"] else "0"
+    if cfg.get("dgamma_feature_time"):
+        os.environ["CLOT_PHI_DGAMMA_FEATURE_TIME"] = str(cfg["dgamma_feature_time"])
+    from src.core_physics.clot_phi_rollout import sync_rollout_env_from_checkpoint
+
+    sync_rollout_env_from_checkpoint(cfg)

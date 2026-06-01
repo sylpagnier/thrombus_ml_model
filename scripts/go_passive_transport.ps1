@@ -6,7 +6,8 @@
 
 param(
     [switch] $Fresh,
-    [switch] $OomSafe = $true
+    [switch] $OomSafe = $true,
+    [switch] $SkipViz
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,3 +65,11 @@ Write-Host "[i] PASSIVE: Data_Bio TBPTT + GT [u,v,p]; ADR metrics only; LR=5e-4;
 
 python @pyArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+if (-not $SkipViz) {
+    . (Join-Path $PSScriptRoot "_gnode_viz_helpers.ps1")
+    $Teacher = Join-Path $RepoRoot "outputs\biochem\biochem_teacher_last.pth"
+    if (Test-Path $Teacher) {
+        Invoke-GnodeRungVizCheckup -RungLabel "passive_transport" -TeacherCheckpoint $Teacher
+    }
+}
