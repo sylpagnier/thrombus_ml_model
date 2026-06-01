@@ -30,7 +30,7 @@
 - **Backfill** `geometry_level` on existing graphs from mesh JSON (no COMSOL): `python -m src.data_gen.backfill_kinematics_geometry_level`
 - **Bend-sign A/B** (down-only vs bidirectional, isolated graph dirs): `powershell -File .\scripts\go_kinematics_bend_ab.ps1 -Arm both -NumVessels 120 -AnchorMax 0`
 - **Recovery sweep ~10h** (main `graphs_kinematics/newtonian`, 8 scaled recipes, quiet logs): `powershell -File .\scripts\go_kinematics_recovery12h.ps1` (optional `-TargetHours 10`)
-- **Production allfix** (100 ep, full graphs, LBFGS, allfix toggles; optional L2 finetune): `go_kinematics_production_allfix.ps1 -Fresh` then `go_kinematics_production_allfix_finetune.ps1`
+- **Production allfix** (100 ep, auto-resume/retry; re-run same line after crash): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"` (`-Fresh` to restart)
 - **A0 shuffle smokes** (30 ep, cap 2000): `go_kinematics_a0_shuffle.ps1` / `go_kinematics_a0_shuffle_allfix.ps1`
 - Doc: [src/docs/KINEMATICS_BEST_ARCHITECTURE.md](src/docs/KINEMATICS_BEST_ARCHITECTURE.md) (geometry table)
 
