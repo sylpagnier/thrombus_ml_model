@@ -218,13 +218,6 @@ def kinematics_checkpoint_tensors(raw: Any) -> tuple[dict[str, Any], dict[str, t
 
 
 def build_gino_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> GINO_DEQ:
-    """Instantiate ``GINO_DEQ``; optional toggle keys set env vars (``GINO_DEQ`` reads env at init)."""
-    if "wss_fuse" in ctor and ctor["wss_fuse"] is not None:
-        os.environ["KINEMATICS_WSS_FUSE"] = "1" if bool(ctor["wss_fuse"]) else "0"
-    if "bc_envelope" in ctor and ctor["bc_envelope"] is not None:
-        os.environ["KINEMATICS_BC_ENVELOPE"] = "1" if bool(ctor["bc_envelope"]) else "0"
-    if "fourier_learnable" in ctor and ctor["fourier_learnable"] is not None:
-        os.environ["KINEMATICS_FOURIER_LEARNABLE"] = "1" if bool(ctor["fourier_learnable"]) else "0"
     return GINO_DEQ(
         in_channels=int(ctor["in_channels"]),
         out_channels=int(ctor["out_channels"]),
@@ -239,6 +232,9 @@ def build_gino_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> GINO_DEQ
         num_global_tokens=int(ctor.get("num_global_tokens", 16)),
         use_siren_decoder=bool(ctor.get("use_siren_decoder", True)),
         use_width_priors=bool(ctor.get("use_width_priors", True)),
+        wss_fuse=bool(ctor["wss_fuse"]) if "wss_fuse" in ctor else None,
+        bc_envelope=bool(ctor["bc_envelope"]) if "bc_envelope" in ctor else None,
+        fourier_learnable=bool(ctor["fourier_learnable"]) if "fourier_learnable" in ctor else None,
     )
 
 
@@ -262,9 +258,11 @@ def save_kinematics_checkpoint_file(
         "model_state_dict": model.state_dict(),
         "checkpoint_role": checkpoint_role,
         "best_epoch": int(best_epoch),
+        "epoch": int(best_epoch),
         "rel_l2": float(rel_l2),
         "continuity": float(continuity),
         "composite": float(composite),
+        "best_val_composite_loss": float(composite),
         "run_id": (run_id or "").strip(),
         "run_note": (run_note or "").strip(),
     }

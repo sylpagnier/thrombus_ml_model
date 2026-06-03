@@ -16,7 +16,7 @@ param(
   [string]$Resume = "best",
   [double]$FinetuneLr = 5e-6,
   [int]$FinetuneEpochs = 40,
-  [int]$HardMiningStart = 0,
+  [int]$HardMiningStart = 20,
   [switch]$ContinuityFocus,
   [switch]$TryLbfgs,
   [switch]$Quiet
@@ -37,11 +37,8 @@ $env:KINEMATICS_OUTPUT_DIR = "outputs/kinematics/production_allfix"
 $env:KINEMATICS_VAL_EVERY = "1"
 Remove-Item Env:KINEMATICS_GRAPH_CAP -ErrorAction SilentlyContinue
 
-if ($ContinuityFocus) {
-  $env:KINEMATICS_BC_LAMBDA = "25.0"
-} else {
-  $env:KINEMATICS_BC_LAMBDA = "15.0"
-}
+# Keep BC lambda at production (10) unless user overrides; large jumps hurt finetune.
+$env:KINEMATICS_BC_LAMBDA = if ($ContinuityFocus) { "12.0" } else { "10.0" }
 
 $outDir = Join-Path $RepoRoot "outputs/kinematics/production_allfix"
 $bestCkpt = Join-Path $outDir "kinematics_best.pth"
@@ -98,8 +95,8 @@ if ($Quiet) {
   $env:KINEMATICS_TQDM = "0"
 }
 
-$weightData = if ($ContinuityFocus) { "350.0" } else { "500.0" }
-$focusLabel = if ($ContinuityFocus) { "continuity+BC" } else { "balanced" }
+$weightData = "500.0"
+$focusLabel = if ($ContinuityFocus) { "continuity-mild" } else { "balanced" }
 Write-Host ("[kin-prod-ft] resume={0} start_ep={1} total_epochs={2} lr={3} focus={4} BC_lambda={5}" -f `
   $resumePath, ($startEp + 1), $totalEpochs, $FinetuneLr, $focusLabel, $env:KINEMATICS_BC_LAMBDA)
 

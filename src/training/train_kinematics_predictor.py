@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import ConstantLR, LinearLR, CosineAnnealingLR, SequentialLR
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -182,6 +182,21 @@ def load_dataset(
         f"   Geometry levels: L0={counts.get(0, 0)}, L1={counts.get(1, 0)}, "
         f"L2={counts.get(2, 0)}, unknown={counts.get(-1, 0)}"
     )
+    if os.environ.get("KINEMATICS_INCLUDE_PATIENT_ANCHORS", "").strip() in ("1", "true", "yes"):
+        from src.utils.kinematics_paths import load_patient_kine_anchor_graphs
+
+        patient_graphs = load_patient_kine_anchor_graphs(
+            rheology=rheology or "carreau",
+            attach_geometry=attach_geometry,
+        )
+        if patient_graphs:
+            existing = {getattr(d, "graph_stem", "") for d in dataset}
+            added = [g for g in patient_graphs if getattr(g, "graph_stem", "") not in existing]
+            dataset.extend(added)
+            print(
+                f"[kin] Merged {len(added)} clinical patient kine anchors "
+                f"(KINEMATICS_INCLUDE_PATIENT_ANCHORS=1)."
+            )
     return dataset
 
 
@@ -539,7 +554,10 @@ def train_kinematics(
                 except (ValueError, RuntimeError):
                     print("[kin] WARN could not restore scheduler state; fresh scheduler.")
             start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
-            best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
+            if math.isfinite(float(ckpt.get("composite", float("nan")))):
+                best_val_composite_loss = float(ckpt["composite"])
+            elif "best_val_composite_loss" in ckpt:
+                best_val_composite_loss = float(ckpt["best_val_composite_loss"])
             # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
             lbfgs_initialized = False
             print(f"[kin] Loaded full training state (next epoch: {start_epoch})")
@@ -551,9 +569,17 @@ def train_kinematics(
             print(f"[kin] Loaded model-only checkpoint (next epoch: {start_epoch})")
 
     if finetune_lr is not None and finetune_lr > 0:
+        ft_lr = float(finetune_lr)
         for pg in optimizer.param_groups:
-            pg["lr"] = float(finetune_lr)
-        print(f"[kin] Finetune LR set to {float(finetune_lr):.2e}")
+            pg["lr"] = ft_lr
+        # Schedulers snapshot base_lrs at construction (1e-4). Without a reset, the first
+        # scheduler.step() snaps LR back toward the production schedule (~1e-4).
+        ft_steps = max(1, int(epochs) - int(start_epoch))
+        scheduler = ConstantLR(optimizer, factor=1.0, total_iters=ft_steps)
+        print(
+            f"[kin] Finetune LR set to {ft_lr:.2e} "
+            f"(constant for {ft_steps} epochs; scheduler reset)"
+        )
 
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
@@ -592,12 +618,14 @@ def train_kinematics(
         if n_anchors > 0 and n_physics > 0:
             w_anchor = 0.5 / n_anchors
             w_phys = 0.5 / n_physics
+            clinical_boost = float(os.environ.get("KINEMATICS_CLINICAL_ANCHOR_BOOST", "1.0"))
             weights = []
             for d in data_split:
                 geo = geometry_sample_weight(d, level_weights) if geometry_cfg.enabled else 1.0
                 if graph_has_anchor(d):
                     gkey = int(getattr(d, "config_id", 0))
-                    weights.append(w_anchor * geo * hard_anchor_multiplier.get(gkey, 1.0))
+                    boost = clinical_boost if getattr(d, "is_clinical_anchor", False) else 1.0
+                    weights.append(w_anchor * geo * hard_anchor_multiplier.get(gkey, 1.0) * boost)
                 else:
                     weights.append(w_phys * geo)
             sampler = torch.utils.data.WeightedRandomSampler(weights, len(data_split), replacement=True)
