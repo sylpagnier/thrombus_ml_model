@@ -11,7 +11,7 @@ One-liners from repo root (see `AGENTS.md` for full ladder):
 | GT flow (no kin model) | **I.1 X:** `go_passive_x_block_pass.ps1`; **I.3 XY:** `go_passive_xy_block_pass.ps1`, `go_passive_lock_xy_ckpt.ps1`; **M3 ADR:** `go_m3_block_pass.ps1` (`-Turbo`); **M5 clot (~8h):** `go_m5_block_pass.ps1` (M5.3-M5.6 finetune+bridge+K10 wide/narrow/bias, GT vel); `go_passive_explore_6h.ps1` (scale only) (**6h** X/Y/XY ladder), `go_phase_a_xy_iterate.ps1`, `go_phaseB_xy_passive.ps1`, `go_m3_align_probe.ps1`, `go_passive_lock_align_ckpt.ps1`, `go_passive_align_20ep.ps1`, `go_passive_step2_bridge.ps1`, `go_passive_mu_unlock_probe.ps1`, `go_passive_mu_unlock_finetune.ps1`, `go_m3_adr_alignment_sweep.ps1`, `go_m3_narrowing_90m.ps1`, `go_gt_flow_species_ladder_6h.ps1`, `go_gt_flow_round2_4h.ps1`, ... |
 | GNODE 9.x (GT vel) | `go_gnode91_smoke.ps1` (9.1); `go_gnode_8h_ladder.ps1` (9.4-9.6 ~8h); `snapshot_biochem_teacher*.py`; `_gnode_viz_helpers.ps1` — [GNODE_ODE_LADDER.md](../src/docs/GNODE_ODE_LADDER.md) |
 | Sweeps | `go_health10h`, `go_visc3h` |
-| Kinematics | `go_kinematics_foundation`, `go_kinematics_l2_finetune`, `go_kinematics_bend_ab`, `go_kinematics_recovery12h`, `go_kinematics_a0_shuffle`, `go_kinematics_a0_shuffle_allfix`, **`go_kinematics_production_allfix`** |
+| Kinematics | `go_kinematics_foundation`, `go_kinematics_l2_finetune`, `go_kinematics_bend_ab`, `go_kinematics_recovery12h` |
 
 `go_*` scripts set env vars and call `python -m src.training.train_biochem_corrector` or kinematics training directly, except:
 

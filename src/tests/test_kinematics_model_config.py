@@ -6,6 +6,8 @@ import json
 from src.architecture.ginodeq import GINO_DEQ
 from src.architecture.kinematics_model_config import (
     KINEMATICS_MODEL_CONFIG_SCHEMA,
+    build_gino_deq_from_ctor,
+    infer_wss_fuse_from_state_dict,
     kinematics_reference_path,
     load_kinematics_reference_record,
     resolve_gino_deq_ctor_kwargs,
@@ -42,6 +44,36 @@ def test_reference_json_loads_and_resolves():
     assert ctor["num_fourier_freqs"] == 16
     mc = ref["model_config"]
     assert mc["use_hard_bcs"] is True
+
+
+def test_infer_wss_fuse_from_wss_decoder_input_width():
+    import torch
+
+    fused = {"wss_decoder.0.linear.parametrizations.weight.original": torch.zeros(256, 260)}
+    assert infer_wss_fuse_from_state_dict(fused, latent_dim=256) is True
+    legacy = {"wss_decoder.0.linear.parametrizations.weight.original": torch.zeros(256, 256)}
+    assert infer_wss_fuse_from_state_dict(legacy, latent_dim=256) is False
+
+
+def test_resolve_wss_fuse_from_state_dict_when_not_in_model_config():
+    import torch
+
+    meta = {
+        "model_config": {
+            "schema": KINEMATICS_MODEL_CONFIG_SCHEMA,
+            "latent_dim": 256,
+            "num_fourier_freqs": 16,
+            "use_siren_decoder": True,
+            "use_width_priors": True,
+            "use_hard_bcs": True,
+        }
+    }
+    state = {"wss_decoder.0.linear.parametrizations.weight.original": torch.zeros(256, 260)}
+    ctor = resolve_gino_deq_ctor_kwargs(meta, state)
+    assert ctor["wss_fuse"] is True
+    phys = PhysicsConfig(phase="kinematics")
+    model = build_gino_deq_from_ctor(phys, ctor)
+    assert model.wss_fuse is True
 
 
 def test_reference_json_is_valid_document():

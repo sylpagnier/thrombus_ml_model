@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from src.data_gen.lib.centerline_utils import enrich_anchor_sidecar_json, resolve_anchor_mesh_path
 from src.utils.paths import data_root
 from src.utils.units import SUPPORTED_MESH_UNITS
 
@@ -203,6 +204,45 @@ def scaffold_anchor_sidecars(
 _scaffold_sidecars = scaffold_anchor_sidecars
 
 
+def enrich_anchor_meshes(
+    root: Path,
+    *,
+    level: int = 2,
+    unit: str = "cm",
+    overwrite: bool = False,
+    dry_run: bool = False,
+    stems: Iterable[str] | None = None,
+) -> int:
+    """Write ``d_bar``, centerline, and ``level`` into each anchor ``<stem>.json``."""
+    n = 0
+    iter_stems = list(stems) if stems is not None else stems_in_dir(root)
+    for stem in iter_stems:
+        mesh_path = resolve_anchor_mesh_path(root, stem)
+        if mesh_path is None:
+            print(f"  [skip] {stem}: no .msh/.nas")
+            continue
+        if dry_run:
+            print(f"  [enrich] {stem}.json (dry-run)")
+            n += 1
+            continue
+        try:
+            if enrich_anchor_sidecar_json(
+                mesh_path,
+                stem=stem,
+                level=level,
+                unit=unit,
+                overwrite=overwrite,
+            ):
+                print(f"  [enrich] {stem}.json (from {mesh_path.name})")
+                n += 1
+        except Exception as exc:
+            print(
+                f"  [warn] {stem}: Gmsh-tag enrich failed ({exc}). "
+                "Run reextract_anchor_comsol_graphs.py to write sidecar from COMSOL boundaries."
+            )
+    return n
+
+
 def _default_anchor_dir() -> Path:
     return data_root() / "raw" / "biochem_anchors"
 
@@ -232,6 +272,17 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--no-sidecars",
         action="store_true",
         help="Skip the JSON sidecar scaffolding step.",
+    )
+    p.add_argument(
+        "--enrich-sidecars",
+        action="store_true",
+        help="Add d_bar, centerline_pts/tangents, and level to each sidecar (requires .msh).",
+    )
+    p.add_argument(
+        "--level",
+        type=int,
+        default=2,
+        help="Geometry level written by --enrich-sidecars (default: 2).",
     )
     p.add_argument(
         "--force",
@@ -285,6 +336,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"  created {created} sidecar(s); updated {updated}; conflicts {conflicts}.")
         if conflicts and not args.force:
             print("Re-run with --force to overwrite conflicting sidecar units.")
+
+    if args.enrich_sidecars:
+        print("\n--- Enriching sidecars (centerline, d_bar, level) ---")
+        n_enriched = enrich_anchor_meshes(
+            target_dir,
+            level=int(args.level),
+            unit=args.unit,
+            overwrite=bool(args.force),
+            dry_run=args.dry_run,
+        )
+        print(f"  enriched {n_enriched} sidecar(s).")
 
     print("\nDone.")
     return 0

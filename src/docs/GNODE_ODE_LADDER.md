@@ -59,9 +59,9 @@ We peel the onion:
 | **9.3** | Teacher **DATA_BIO only** | **20–40 min** | Val FI trending down (target **< 0.15** on 3ep) | X-probe matrix + teacher snapshot per leg |
 | **9.4** | **Passive transport** (full 9) | **1–2 h** | Val FI **< 0.05**; train anchors ~0.03 | `go_passive_transport.ps1` (auto PNG; `-SkipViz` off) |
 | **9.5** | **Species dump -> clot-phi** | dump **1–2h** + train **30 min** | min F1 **>= 0.26**; p007 patches in viz | `go_passive_transport_clotband_focus.ps1` (teacher + mask + clot PNGs) |
-| **9.6** | **ADR backprop** on | **+8ep** | `L_bio` stable; masked ADR not exploding | Same + `Invoke-GnodeRungVizCheckup` after promote |
-| **9.7** | **Mu unlock** (probe) | **~1 h** | Val all logMAE **< ~0.85** trend | `go_passive_mu_unlock_probe.ps1` + teacher snapshot |
-| **9.8** | **Step-2 bridge** | **~1 h** | Species held; mu not worse | `go_passive_step2_bridge.ps1` + teacher snapshot |
+| **9.6** | **ADR backprop** on | **~12ep** | `check_m3_align_gate.py` PASS; clot-band phi not worse than 9.4 | `go_m3_align_probe.ps1` from `after_94` ckpt (`gnode96_adr_union`); §150 — **M3 PASS**, spatial phi **degraded** |
+| **9.7** | **Mu unlock** (probe) | **~1 h** | Val all logMAE **< ~0.85** with species guard | `go_passive_mu_unlock_probe.ps1` + teacher snapshot (**PASS** on `20260601T201352Z`, best **0.804**, species FI ~0.027; wall/high worsen) |
+| **9.8** | **Step-2 bridge** | **~1 h** | Species held; mu not worse; `L_bio`/ADR must descend | `go_passive_step2_bridge.ps1 -GradScaleOnCap` (**PASS** `20260602T145236Z`: mu **0.781**, FI **~0.01**; §153; no GSC = no-op §152) |
 | **9.9** | **Full teacher** (clot_band, TBPTT) | **2–4 h** | Clot-phi on dump beats 9.5; viz bands | Long teacher + full clotband_focus viz stack |
 
 **Rung 10 (plan):** replace GT vel with **GINO-DEQ** each step (same as ladder **6b** + full GNODE species). **Rung 11:** corrector / synthetics (Phase II).

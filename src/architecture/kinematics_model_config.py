@@ -55,6 +55,9 @@ def snapshot_gino_deq_model_config(model: GINO_DEQ) -> dict[str, Any]:
         "use_hard_bcs": bool(model.use_hard_bcs),
         "use_siren_decoder": bool(model.use_siren_decoder),
         "use_width_priors": bool(model.use_width_priors),
+        "wss_fuse": bool(getattr(model, "wss_fuse", False)),
+        "bc_envelope": bool(getattr(model, "bc_envelope", False)),
+        "fourier_learnable": bool(getattr(model, "fourier_learnable", False)),
         "num_global_tokens": 16,
         "phase": "kinematics",
     }
@@ -76,6 +79,29 @@ def infer_latent_dim_from_state_dict(state_dict: Mapping[str, Any]) -> int | Non
         if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
             return int(w.shape[0])
     return None
+
+
+def infer_wss_fuse_from_state_dict(
+    state_dict: Mapping[str, Any],
+    *,
+    latent_dim: int,
+) -> bool | None:
+    """True when WSS head was trained with ``z + (u,v,p,mu)`` (``latent_dim + 4`` inputs)."""
+    w = state_dict.get("wss_decoder.0.linear.parametrizations.weight.original")
+    if w is None or not hasattr(w, "shape") or len(w.shape) != 2:
+        w = state_dict.get("wss_decoder.0.weight")
+    if w is None or not hasattr(w, "shape") or len(w.shape) != 2:
+        return None
+    in_features = int(w.shape[1])
+    if in_features == int(latent_dim) + 4:
+        return True
+    if in_features == int(latent_dim):
+        return False
+    return None
+
+
+def infer_fourier_learnable_from_state_dict(state_dict: Mapping[str, Any]) -> bool | None:
+    return True if "fourier_freqs" in state_dict else None
 
 
 def infer_num_fourier_freqs_from_state_dict(
@@ -115,8 +141,28 @@ def resolve_gino_deq_ctor_kwargs(
         if ref:
             saved = dict(ref.get("model_config") or saved)
 
+    def _merge_kinematics_toggle_flags(ctor: dict[str, Any]) -> dict[str, Any]:
+        latent = int(ctor["latent_dim"])
+        if "wss_fuse" not in ctor or ctor.get("wss_fuse") is None:
+            inferred_wss = infer_wss_fuse_from_state_dict(state_dict, latent_dim=latent)
+            ctor["wss_fuse"] = (
+                inferred_wss
+                if inferred_wss is not None
+                else bool(int(os.environ.get("KINEMATICS_WSS_FUSE", "0")))
+            )
+        if "fourier_learnable" not in ctor or ctor.get("fourier_learnable") is None:
+            inferred_fl = infer_fourier_learnable_from_state_dict(state_dict)
+            ctor["fourier_learnable"] = (
+                inferred_fl
+                if inferred_fl is not None
+                else bool(int(os.environ.get("KINEMATICS_FOURIER_LEARNABLE", "0")))
+            )
+        if "bc_envelope" not in ctor or ctor.get("bc_envelope") is None:
+            ctor["bc_envelope"] = bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0")))
+        return ctor
+
     if int(saved.get("schema", 0)) == KINEMATICS_MODEL_CONFIG_SCHEMA:
-        return {
+        ctor = {
             "in_channels": int(saved.get("in_channels", 15)),
             "out_channels": int(saved.get("out_channels", 5)),
             "latent_dim": max(8, int(saved.get("latent_dim", latent_dim_default))),
@@ -130,24 +176,33 @@ def resolve_gino_deq_ctor_kwargs(
             "use_width_priors": bool(saved.get("use_width_priors", use_width_priors_default)),
             "num_global_tokens": max(1, int(saved.get("num_global_tokens", 16))),
         }
+        if "wss_fuse" in saved:
+            ctor["wss_fuse"] = bool(saved["wss_fuse"])
+        if "bc_envelope" in saved:
+            ctor["bc_envelope"] = bool(saved["bc_envelope"])
+        if "fourier_learnable" in saved:
+            ctor["fourier_learnable"] = bool(saved["fourier_learnable"])
+        return _merge_kinematics_toggle_flags(ctor)
 
     inferred_siren = infer_use_siren_decoder_from_state_dict(state_dict)
     inferred_latent = infer_latent_dim_from_state_dict(state_dict)
     inferred_fourier = infer_num_fourier_freqs_from_state_dict(state_dict)
-    return {
-        "in_channels": 15,
-        "out_channels": 5,
-        "latent_dim": inferred_latent if inferred_latent is not None else latent_dim_default,
-        "max_iters": max_iters_default,
-        "outer_iters": 3,
-        "num_fourier_freqs": inferred_fourier if inferred_fourier is not None else num_fourier_freqs_default,
-        "activation_fn": activation_fn_default,
-        "fourier_base": fourier_base_default,
-        "use_hard_bcs": use_hard_bcs_default,
-        "use_siren_decoder": inferred_siren if inferred_siren is not None else use_siren_default,
-        "use_width_priors": use_width_priors_default,
-        "num_global_tokens": 16,
-    }
+    return _merge_kinematics_toggle_flags(
+        {
+            "in_channels": 15,
+            "out_channels": 5,
+            "latent_dim": inferred_latent if inferred_latent is not None else latent_dim_default,
+            "max_iters": max_iters_default,
+            "outer_iters": 3,
+            "num_fourier_freqs": inferred_fourier if inferred_fourier is not None else num_fourier_freqs_default,
+            "activation_fn": activation_fn_default,
+            "fourier_base": fourier_base_default,
+            "use_hard_bcs": use_hard_bcs_default,
+            "use_siren_decoder": inferred_siren if inferred_siren is not None else use_siren_default,
+            "use_width_priors": use_width_priors_default,
+            "num_global_tokens": 16,
+        }
+    )
 
 
 def kinematics_checkpoint_tensors(raw: Any) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
@@ -177,6 +232,9 @@ def build_gino_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> GINO_DEQ
         num_global_tokens=int(ctor.get("num_global_tokens", 16)),
         use_siren_decoder=bool(ctor.get("use_siren_decoder", True)),
         use_width_priors=bool(ctor.get("use_width_priors", True)),
+        wss_fuse=bool(ctor["wss_fuse"]) if "wss_fuse" in ctor else None,
+        bc_envelope=bool(ctor["bc_envelope"]) if "bc_envelope" in ctor else None,
+        fourier_learnable=bool(ctor["fourier_learnable"]) if "fourier_learnable" in ctor else None,
     )
 
 

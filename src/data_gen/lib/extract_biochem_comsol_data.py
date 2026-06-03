@@ -10,13 +10,15 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 import glob
 import re
-from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
+from src.config import BIOCHEM_T_MAX, NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
 from src.utils.paths import get_project_root
-from src.data_gen.lib.node_feature_assembly import (
-    build_biochem_bc_x_tensor,
-    build_kinematics_node_x_tensor,
-)
+from src.data_gen.lib.node_feature_assembly import build_biochem_bc_x_tensor
 from src.utils.channel_schema import BIO_Y_SCHEMA, attach_patient_anchor_graph_metadata
+from src.data_gen.lib.centerline_utils import write_anchor_sidecar_from_masks
+from src.data_gen.lib.kinematics_graph_builder import (
+    build_kinematics_graph_from_comsol_steady,
+    resolve_d_bar_si_from_sidecar_or_inlet,
+)
 from src.utils.units import MESH_UNIT_CM, assert_mesh_unit
 
 
@@ -54,6 +56,8 @@ class PatientDataExtractor:
         self.label_dir = Path(label_dir) if label_dir else self.root / self.vessel_cfg.output_dir
         self.proc_dir = Path(proc_dir) if proc_dir else self.root / self.vessel_cfg.graph_output_dir
         self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.kine_anchor_dir = self.root / "data/processed/graphs_kinematics_anchors/newtonian"
+        self.kine_anchor_dir.mkdir(parents=True, exist_ok=True)
 
         # Dictionary mapping exact COMSOL export names to standardized internal names
         self.species_map = {
@@ -433,7 +437,7 @@ class PatientDataExtractor:
         wall_path = self.label_dir / f"{stem}_wall.txt"
 
         if not txt_path.exists():
-            print(f"❌ Skipping {stem}: COMSOL domain data (.txt) missing.")
+            print(f"[ERR] Skipping {stem}: COMSOL domain data (.txt) missing.", flush=True)
             return
 
         # 2. Topology & Enhanced Boundary Mapping
@@ -461,13 +465,12 @@ class PatientDataExtractor:
             wall_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
         )
 
-        # 3. AUTO-DETECT SCALE (d_bar) FROM INLET BOUNDARY
-        inlet_coords = mesh_nodes[ mask_inlet.numpy() ]
-        if len(inlet_coords) > 1:
-            # Calculate max distance between any two nodes on the inlet
-            d_bar = float(np.max(np.linalg.norm(inlet_coords[ :, None ] - inlet_coords, axis=-1)))
-        else:
-            d_bar = 0.0198  # Fallback to your COMSOL D_eff if mapping fails
+        d_bar = resolve_d_bar_si_from_sidecar_or_inlet(
+            sidecar_meta,
+            stem=stem,
+            mesh_nodes_si=mesh_nodes,
+            mask_inlet=mask_inlet,
+        )
 
         # 4. Connectivity and Edge Construction
         if "triangle" in mesh.cells_dict:
@@ -475,7 +478,7 @@ class PatientDataExtractor:
         elif "triangle6" in mesh.cells_dict:
             all_tris = mesh.cells_dict[ "triangle6" ][ :, :3 ]
         else:
-            print(f"⚠️ {stem}: Unsupported cell type.")
+            print(f"[WARN] {stem}: Unsupported cell type.", flush=True)
             return
 
         edges = np.unique(np.sort(np.vstack([
@@ -484,11 +487,42 @@ class PatientDataExtractor:
         edge_index = torch.tensor(np.hstack([ edges.T, edges[ :, [ 1, 0 ] ].T ]), dtype=torch.long)
         row, col = edge_index
 
+        needs_sidecar = (
+            sidecar_meta is None
+            or sidecar_meta.get("centerline_pts") is None
+            or sidecar_meta.get("centerline_tangents") is None
+            or sidecar_meta.get("d_bar") is None
+        )
+        if needs_sidecar:
+            level_hint = int((sidecar_meta or {}).get("level", 2))
+            write_anchor_sidecar_from_masks(
+                sidecar_path,
+                mesh_nodes_si=mesh_nodes,
+                mask_inlet=mask_inlet,
+                mask_outlet=mask_outlet,
+                mask_wall=mask_wall,
+                edge_index=edge_index,
+                d_bar_si=d_bar,
+                stem=stem,
+                unit="cm",
+                level=level_hint,
+                existing=sidecar_meta,
+            )
+            with open(sidecar_path, encoding="utf-8") as _f:
+                sidecar_meta = json.load(_f)
+            d_bar = resolve_d_bar_si_from_sidecar_or_inlet(
+                sidecar_meta,
+                stem=stem,
+                mesh_nodes_si=mesh_nodes,
+                mask_inlet=mask_inlet,
+            )
+            print(f"[i] {stem}: wrote sidecar (d_bar, centerline) from COMSOL boundary masks", flush=True)
+
         # --- 5. DYNAMIC EULERIAN FIELD MAPPING (TRAJECTORY EXTRACTION) ---
         trajectory_file = self.label_dir / f"{stem}.txt"
 
         if not trajectory_file.exists():
-            print(f"❌ Skipping {stem}: Trajectory file not found.")
+            print(f"[ERR] Skipping {stem}: Trajectory file not found.", flush=True)
             return
 
         print(f"Parsing transient trajectory for {stem}...")
@@ -519,8 +553,9 @@ class PatientDataExtractor:
         is_anchor = torch.tensor(match_distances < tol_m, dtype=torch.bool)
         if int(is_anchor.sum()) == 0:
             print(
-                f"⚠️ {stem}: no nodes within comsol_spatial_match_tol_m={tol_m} m of COMSOL export; "
-                f"raise PhysicsConfig.comsol_spatial_match_tol_m or verify mesh/CSV alignment."
+                f"[WARN] {stem}: no nodes within comsol_spatial_match_tol_m={tol_m} m of COMSOL export; "
+                f"raise PhysicsConfig.comsol_spatial_match_tol_m or verify mesh/CSV alignment.",
+                flush=True,
             )
 
         # --- Pre-Compute Normals and initialize accumulator ---
@@ -594,6 +629,7 @@ class PatientDataExtractor:
                 u_nd_0 = u_nd
                 v_nd_0 = v_nd
                 mu_nd_0 = mu_nd
+                p_nd_0 = p_nd
 
         # Stack into shape: [Time, Nodes, 16]
         y_tensor_series = torch.stack(y_trajectory, dim=0)
@@ -617,18 +653,7 @@ class PatientDataExtractor:
         bio_cfg = BiochemConfig(phase=self.vessel_cfg.phase)
         scales = bio_cfg.get_species_scales(device='cpu')
 
-        # 9. SDF and Normals
-        wall_coords = mesh_nodes[ mask_wall.numpy() ]
-        if len(wall_coords) > 0:
-            wall_tree = KDTree(wall_coords)
-            dist, idx = wall_tree.query(mesh_nodes)
-            sdf = torch.tensor(dist / d_bar, dtype=torch.float32).unsqueeze(1)
-            normals_unit = self._compute_boundary_normals(edge_index, mask_wall, pos_tensor, num_nodes)
-        else:
-            sdf = torch.zeros((num_nodes, 1))
-            normals_unit = torch.zeros((num_nodes, 2))
-
-        # Geometric outlet normals for ∂C/∂n (Bio_IO); x[:,3:5] are wall-based, not outlet face normals.
+        # Outlet normals for species BCs (Bio_IO); distinct from wall normals in x.
         outlet_normals = self._compute_boundary_normals(
             edge_index, mask_outlet, pos_tensor, num_nodes
         )
@@ -641,10 +666,45 @@ class PatientDataExtractor:
 
         mu_bc = mu_nd_0
 
+        geometry_level = None
+        if sidecar_meta is not None and sidecar_meta.get("level") is not None:
+            geometry_level = int(sidecar_meta["level"])
+        kine_phys = PhysicsConfig(phase="kinematics", rheology="newtonian")
+        kine_data = build_kinematics_graph_from_comsol_steady(
+            mesh=mesh,
+            mesh_nodes_si=mesh_nodes,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            u_nd=u_nd_0,
+            v_nd=v_nd_0,
+            p_nd=p_nd_0,
+            mu_nd=mu_nd_0,
+            d_bar_si=d_bar,
+            u_ref=u_ref_actual,
+            sidecar_meta=sidecar_meta,
+            stem=stem,
+            G_x=G_x,
+            G_y=G_y,
+            V=V,
+            W=W,
+            M_inv=M_inv,
+            phys_cfg=kine_phys,
+            raw_sidecar_dir=self.raw_dir,
+            geometry_level=geometry_level,
+        )
+        x_kine = kine_data.x
+        u_prior = kine_data.u_prior
+        mu_prior = kine_data.mu_prior
+        centerline_source = str(getattr(kine_data, "centerline_source", ""))
+        torch.save(kine_data, self.kine_anchor_dir / f"{stem}.pt")
+
         x_biochem = build_biochem_bc_x_tensor(
-            pos_nd=nodes_nd,
-            sdf_nd=sdf,
-            wall_normal=normals_unit,
+            pos_nd=x_kine[:, NodeFeat.XY],
+            sdf_nd=x_kine[:, NodeFeat.SDF],
+            wall_normal=x_kine[:, NodeFeat.WALL_NORMAL],
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
@@ -652,35 +712,6 @@ class PatientDataExtractor:
             v_bc=v_bc,
             p_bc=p_bc,
             mu_bc_nd=mu_bc,
-        )
-
-        centerline_pts_nd = None
-        centerline_tangents_nd = None
-        if sidecar_meta:
-            cl = sidecar_meta.get("centerline_pts")
-            ct = sidecar_meta.get("centerline_tangents")
-            if cl is not None and ct is not None:
-                centerline_pts_nd = np.asarray(cl, dtype=np.float64)
-                centerline_tangents_nd = np.asarray(ct, dtype=np.float64)
-
-        wall_tree = cKDTree(wall_coords) if len(wall_coords) > 0 else cKDTree(mesh_nodes)
-        x_kine, u_prior, mu_prior = build_kinematics_node_x_tensor(
-            pos_nd=nodes_nd,
-            sdf_nd=sdf,
-            wall_normal=normals_unit,
-            mask_inlet=mask_inlet,
-            mask_outlet=mask_outlet,
-            mask_wall=mask_wall,
-            d_bar_si=d_bar,
-            u_ref=u_ref_actual,
-            phys_cfg=self.phys_cfg,
-            wall_tree=wall_tree,
-            edge_index=edge_index,
-            G_x=G_x,
-            G_y=G_y,
-            centerline_pts_nd=centerline_pts_nd,
-            centerline_tangents_nd=centerline_tangents_nd,
-            mu_nd_scale=self.phys_cfg.mu_viscosity_nd_scale,
         )
 
         # --- Use index assignment for the tensor ---
@@ -765,9 +796,14 @@ class PatientDataExtractor:
             mu_prior=mu_prior,
         )
         data = attach_patient_anchor_graph_metadata(data, mask_wall=mask_wall)
+        data.centerline_source = centerline_source
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
-        print(f"[OK] Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | Imbal={avg_flux_imbalance:.2%}")
+        print(
+            f"[OK] Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | "
+            f"Imbal={avg_flux_imbalance:.2%} | centerline={centerline_source} | "
+            f"uv_prior_max={float(x_kine[:, 11:13].abs().max()):.3f}"
+        )
 
     def run(self):
         # Look for the .nas files now!

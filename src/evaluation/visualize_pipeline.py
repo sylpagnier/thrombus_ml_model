@@ -296,7 +296,44 @@ def _load_graph_pt(path: Path, device: torch.device, *, phase_hint: str):
     if not path.is_file():
         raise FileNotFoundError(f"Graph not found: {path}")
     data = torch.load(path, map_location=device, weights_only=False)
-    return infer_missing_schema(data, phase_hint=phase_hint)
+    data = infer_missing_schema(data, phase_hint=phase_hint)
+    if _should_refresh_kinematics_node_x(data, path=path, phase_hint=phase_hint):
+        from src.data_gen.lib.node_feature_assembly import (
+            kinematics_uv_prior_max,
+            refresh_kinematics_node_x_on_graph,
+        )
+
+        stem = path.stem
+        refreshed = refresh_kinematics_node_x_on_graph(
+            data,
+            stem=stem,
+            y_time_index=int(os.environ.get("KINEMATICS_PRIOR_Y_TIME_INDEX", "0")),
+        )
+        if refreshed:
+            prior_max = kinematics_uv_prior_max(data.x)
+            print(
+                f"   ->  Refreshed kine priors on {stem} "
+                f"(uv_prior max={prior_max:.4f}; centerline Poiseuille + inlet BC)"
+            )
+    return data
+
+
+def _should_refresh_kinematics_node_x(data, *, path: Path, phase_hint: str) -> bool:
+    if os.environ.get("KINEMATICS_SKIP_PRIOR_REFRESH", "0").strip() in ("1", "true", "yes"):
+        return False
+    if os.environ.get("KINEMATICS_FORCE_PRIOR_REFRESH", "0").strip() in ("1", "true", "yes"):
+        return True
+    hint = (phase_hint or "").lower()
+    is_anchor = "biochem" in hint or "biochem_anchors" in path.as_posix()
+    if not is_anchor:
+        return False
+    if not hasattr(data, "x") or data.x is None:
+        return False
+    if int(data.x.shape[1]) < 18:
+        return False
+    from src.data_gen.lib.node_feature_assembly import kinematics_uv_prior_max
+
+    return kinematics_uv_prior_max(data.x) <= 1e-3
 
 
 def _load_anchor_graph(stem: str, device: torch.device):
@@ -319,14 +356,23 @@ def _kinematics_graph_dir(rheology: str = "newtonian") -> Path:
     return kinematics_graph_rheology_dir(rheology)
 
 
+def _kinematics_anchor_graph_path(stem: str, rheology: str = "newtonian") -> Path:
+    return get_project_root() / f"data/processed/graphs_kinematics_anchors/{rheology}/{stem}.pt"
+
+
 def _load_kinematics_gino_deq(device: torch.device) -> GINO_DEQ:
     kin_ckpt = _resolve_kinematics_checkpoint()
     print(f"   ->  Kinematics checkpoint: {kin_ckpt}")
     kin_raw = torch.load(kin_ckpt, map_location=device, weights_only=False)
     kin_meta, kin_state = kinematics_checkpoint_tensors(kin_raw)
     ctor = resolve_gino_deq_ctor_kwargs(kin_meta, kin_state)
+    kin_default_iters = int(ctor.get("max_iters", 25))
+    kin_max_iters = int(os.environ.get("VIZ_KIN_MAX_ITERS", kin_default_iters))
+    kin_max_iters = max(5, min(80, kin_max_iters))
+    ctor["max_iters"] = kin_max_iters
     phys_cfg_kine = PhysicsConfig(phase="kinematics")
     model = build_gino_deq_from_ctor(phys_cfg_kine, ctor).to(device)
+    print(f"   ->  GINO-DEQ max_iters={kin_max_iters} solver={os.environ.get('VIZ_KIN_SOLVER', 'anderson')}")
     model.load_state_dict(kin_state, strict=False)
     model.eval()
     return model
@@ -385,14 +431,30 @@ def _show_steady_kinematics_pred_vs_gt(
     title = f"Steady kinematics — {cohort} / {case_label}{rel_note}"
 
     row_specs = [(vel_p, p_p, mu_p, "GINO-DEQ pred")]
+    vel_g = p_g = mu_g = None
     if has_gt:
         vel_g, p_g, mu_g = _fields_from_kine_state(gt_np)
         row_specs.append((vel_g, p_g, mu_g, "labels (GT)"))
 
     col_titles = ("|u| (ND)", "p (ND)", r"$\mu_{eff}$ (ND)")
     cmaps = ("jet", "coolwarm", "viridis")
+    if has_gt and vel_g is not None:
+        vel_lo, vel_hi = 0.0, float(np.percentile(vel_g, 99.5))
+        if vel_hi <= vel_lo:
+            vel_hi = float(vel_g.max()) + 1e-12
+        p_lo, p_hi = float(np.percentile(p_g, 1.0)), float(np.percentile(p_g, 99.0))
+        if p_hi <= p_lo:
+            p_lo, p_hi = float(p_g.min()), float(p_g.max()) + 1e-12
+        mu_lo, mu_hi = float(np.percentile(mu_g, 1.0)), float(np.percentile(mu_g, 99.0))
+        if mu_hi <= mu_lo:
+            mu_lo, mu_hi = float(mu_g.min()), float(mu_g.max()) + 1e-12
+        col_clims = [(vel_lo, vel_hi), (p_lo, p_hi), (mu_lo, mu_hi)]
+    else:
+        col_clims = [(None, None), (None, None), (None, None)]
+
     for row_i, (vel, pres, mu, row_lbl) in enumerate(row_specs):
         for col_i, (values, col_lbl, cmap) in enumerate(zip((vel, pres, mu), col_titles, cmaps)):
+            vmin, vmax = col_clims[col_i]
             _plot_field(
                 fig,
                 axes[row_i, col_i],
@@ -403,6 +465,8 @@ def _show_steady_kinematics_pred_vs_gt(
                 tight_axes=True,
                 xlim=(xlo, xhi),
                 ylim=(ylo, yhi),
+                vmin=vmin,
+                vmax=vmax,
             )
     fig.subplots_adjust(left=0.02, right=0.99, bottom=0.06, top=0.88, wspace=0.14, hspace=0.28)
     _set_figure_suptitle(fig, title, fontsize=14, subplot_top=0.84, title_y=0.96)
@@ -419,7 +483,8 @@ def run_steady_kinematics_viz(
     print(f"[i] Steady kinematics-only viz on {device}")
     model = _load_kinematics_gino_deq(device)
     for cohort, label, graph_path in cases:
-        data = _load_graph_pt(graph_path, device, phase_hint="biochem" if cohort == "patient" else "kinematics")
+        phase_hint = "biochem" if cohort == "patient" else "kinematics"
+        data = _load_graph_pt(graph_path, device, phase_hint=phase_hint)
         with torch.no_grad():
             pred = _run_model_once(model, data)
         pred_np = pred.detach().cpu().numpy()
@@ -664,7 +729,15 @@ def _load_single_graph(proc_dir, device, label):
 
 
 def _run_model_once(model, data):
-    pred = model(data)
+    solver = os.environ.get("VIZ_KIN_SOLVER", "anderson").strip().lower() or "anderson"
+    beta = float(os.environ.get("VIZ_KIN_ANDERSON_BETA", "0.8"))
+    warmup = int(os.environ.get("VIZ_KIN_ANDERSON_WARMUP", "5"))
+    pred = model(
+        data,
+        solver=solver,
+        anderson_beta=beta,
+        anderson_warmup_iters=max(0, warmup),
+    )
     return pred[0] if isinstance(pred, tuple) else pred
 
 
@@ -1832,9 +1905,13 @@ if __name__ == "__main__":
         cases: List[Tuple[str, str, Path]] = []
         if args.steady_kin_compare:
             anchor_stem = _resolve_anchor_stem(args.anchor)
-            cases.append(
-                ("patient", anchor_stem, _anchor_graph_dir() / f"{anchor_stem}.pt")
-            )
+            k_anchor = _kinematics_anchor_graph_path(anchor_stem, "newtonian")
+            if k_anchor.is_file():
+                cases.append(("patient", anchor_stem, k_anchor))
+            else:
+                cases.append(
+                    ("patient", anchor_stem, _anchor_graph_dir() / f"{anchor_stem}.pt")
+                )
             if args.kine_graph:
                 kpath = Path(args.kine_graph)
                 if not kpath.is_absolute():

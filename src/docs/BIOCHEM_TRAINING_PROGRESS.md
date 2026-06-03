@@ -129,6 +129,9 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | **Explore 6h** (X/Y/XY isolation, kin-blocked) | Rank components; fix false gates | **Done** | **§130** — clot-band X legs **species OK**, m3 gate **false FAIL** (init saturated); **X_mask_global** only m3 pass; **mu_unlock** clear win |
 | **I.1 X block** (probe matrix + promote dump) | `check_passive_x_block_pass.py --require-promote` | **Pass** | **§131** 2026-05-30: probe OK X3/X4/X5/m3; promote dump **6** anchors @ stride36/m6; `passive_species_locked` from align locked |
 | **I.3 XY bridge** (step-2 hold + learn) | `go_passive_xy_block_pass.ps1`; species + masked ADR + `bridge_ok` | **Pass (viability)** | **§134**: hold 3ep + learn 6ep, `GRAD_SCALE_ON_CAP=1`; both gates **PASS**; val FI **~0.013**; mu flat **1.3966** |
+| **GNODE 9.6** (masked ADR, init after_94) | `check_m3_align_gate.py` + clot-band phi @ t=200 | **Partial** | **§150**: M3 **PASS** (FI **0.018**); rollout phi **0.41** vs GT **0.78** — spatial **fail**; use **after_94** for dump/clot-phi |
+| **GNODE 9.8** (step-2 bridge from 9.7 unlock) | `check_passive_step2_bridge_gate.py` | **Pass (gate)** | **§153**: `-GradScaleOnCap`; val mu **0.800 -> 0.781**; FI **0.197 -> 0.010**; `L_bio` ratio **0.001**; spatial clot viz not re-checked |
+| **GNODE 9.9** (12ep clot_band teacher + dump + clot-phi 35ep) | min F1 **>= 0.26**; beat 9.5 on dump | **Partial / fail clot** | **§154**: teacher all logMAE **0.766** (best ep5); clot-phi p007 **0.464** min **0.246** — **below** 9.5 (**0.627** / **0.341**); ladder min **0.26** missed on p004 |
 | **M5.3** mu-unlock finetune (wall/high weights) | `go_passive_mu_unlock_finetune.ps1` 12ep | **Fail** | **§135**: best all **0.797 @ ep2** then bulk **regress ->1.17**; wall/high improve; species OK; `clot_frac=0` |
 | **M5.4** step-2 bridge from unlock | `passive_m5_bridge` 12ep, `GRAD_SCALE_ON_CAP` | **Pass (gate)** | **§135**: all **0.781**; wall **2.09**; FI **0.019**; mu still no spatial clots |
 | **M5.5–M5.6** K10 explore + lock | `go_m5_block_pass.ps1` | **Fail (viz)** | **§135**: K10 ran with `LEGACY_LOSSES=1`; best mu **0.794** wide ep8; **species FI 3.26**; `clot_frac=0`; promote **bridge** not K10 |
@@ -156,6 +159,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 - **M5 block** (`go_m5_block_pass.ps1`, 2026-05-30/31): **M5.3 FAIL**; **M5.4 PASS** (`passive_m5_bridge` all **0.781**, FI **0.019**); **K10 wide/narrow/bias** ran on resume — mu **0.794** best but **species destroyed (FI 3.26)**; **no clot viz**. **Promote bridge** (`20260531T080809Z`); do not use post-K10 `biochem_teacher_last.pth` for species (§135).
 - **Viscosity ladder R0** (2026-05-31): **Pass** — mask + GT @ t=200 localized; physics oracle **F1 0.599** (§138).
 - **Ladder R1–2** (2026-05-31): **Pass** (§139–§140). **Rung 3b PASS** (§142): `DGAMMA_FEATURE_TIME=current`, localized clots on p007 @ t=200. **Next:** scatter @ t=0 on 3b ckpt; lock env; cross-anchor (rung 4).
+- **GNODE 9.4–9.5** (§149): species + clot-phi gate **PASS**; **9.6** (§150): M3 ADR **PASS**, spatial clot-band phi **FAIL** vs after_94 — promote **after_94** for dump/clot-phi; **9.7** mu unlock **PASS** (§151); **9.8** bridge **PASS** with `-GradScaleOnCap` (§153); **9.9** ran (§154): teacher **L_bio** OK, clot-phi **regressed** vs 9.5 — do **not** promote over `after_94` / `gnode95` dump without A/B.
 - **Step-2 teacher “done” (μ)**: **Interim pass on patient007** — **K1/K8/K10e** (§90/§96/§103): **~0.47–0.49** all; **K10e** adds wall-adjacent mask + log/K10E loss but **still no viz clots** (`learned` flat). **clot6h sweep** (§112): 8 legs × ~4m, **K11** isolate — **no** leg beats **K11f** viz goal; **O0** oracle-at-train does **not** reproduce COMSOL red clots in **viz** (inference uses learned head). **K7** split+wall **~0.52** all but wall **~5.4**. **Caveat**: good logMAE ≠ COMSOL-qualitative wall bands. Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
 - **Step 3 (multitask backward)**: **In progress** — **K2** `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0`, explicit gelation, OomSafe **12ep complete** on RTX 500 4GB (no OOM); val all **5.58→4.22** (still **>> K1 0.464**); train **`L_tot` ~700–1700** (Kendall dominates); preflight **5.77**. Next: `GELATION_PRIOR_GATE=1` and/or cap μ₂ / staged re-enable gelation; keep **DATA_KINE** or **MU_LOG** until val **<1.0** before full PDE sum.
@@ -1269,9 +1273,63 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 
 - **9.4 teacher 8ep** (`gnode_8h_teacher`): `L_bio` **3463 -> 1382**; clot-band species val ep7 **FI logMAE ~0.004** Mat ~0.056. Val mu still flat **1.397** (passive).
 - **9.5** dump `anchors_stride_72` (~14 min); clot-phi **35ep** `gnode_8h_clotphi`: p007 F1 **0.627** rec **0.519**; multi-anchor **mean 0.519** **min 0.341** -> **gate >=0.26 PASS**. Promoted `gnode_8h_ladder/clot_phi_best_promoted.pth`.
-- **9.6 ADR probe:** resume hit epoch 8 cap (no extra train ep logged); post-ADR clot-band viz **worse** (`mean_pred_phi` **0.41** vs **0.56** pre-ADR) — **do not promote ADR ckpt** without fixed resume epoch budget.
+- **9.6 (8h queue):** broken — resume no-op; see **§150** for proper rerun.
 - **Artifacts:** `outputs/biochem/gnode_8h_ladder/` (viz flow, clot-band raw/dump, clot-phi scatter, manifest).
-- **Next:** optional longer teacher (12ep) for species; **9.7** mu unlock only if spatial gate still OK; fix ADR leg to run fresh 6ep not instant resume exit.
+- **Next:** use **after_94** ckpt for spatial/clot-phi; **9.7** mu unlock from after_94 or post-9.6 species-only ckpt per goal.
+
+### 150. GNODE rung **9.6** — `gnode96_adr_union` M3 ADR co-train (2026-06-01)
+
+- **Setup:** `go_m3_align_probe.ps1` **12ep**, init `gnode_8h_ladder/checkpoints/after_94_biochem_teacher_last.pth`, `PASSIVE_ADR_BACKPROP=1`, `PASSIVE_ADR_WEIGHT=1e-4`, `SUPERVISION_MASK_TIMES=union`, `ADR_MASK=match_data_bio+exclude_wall`, `ADR_RESIDUAL_MODE=transport_only`, `GT_KINE_VEL=1`, `TEACHER_LR=1e-3`.
+- **Run** `20260601T181511Z` (`run_note=gnode96_adr_union`).
+- **M3 gate:** **PASS** — train `L_bio` **11338 -> 22.7** (ratio **0.0020**); masked `L_ADR_S` **0.0147 -> 0.00013** (ratio **0.0091**); `data_bio_mask_n~622`; species val FI logMAE **0.899 -> 0.0175** (ep11), Mat **2.57 -> 0.017**; val mu flat **1.3966** (passive, ignore).
+- **Flow:** `flow_trivial=0`, `viz_t0|u|=0.957` (unchanged).
+- **Spatial clot-band (t=200, p007):** `mean_pred_phi=0.412` vs GT **0.779** (`frac_pred_phi>=0.5=0.409`) — **worse** than pre-ADR **9.4** raw viz (~**0.56** pred phi); PNG `gnode_8h_ladder/viz_teacher_clotband_gnode96_p007_t200.png`.
+- **Lesson:** Masked ADR + species co-descent can **pass M3 scalars** while **under-calling** rollout clot phi — do **not** replace `after_94` for clot-band / dump / clot-phi promotion without re-gate (re-dump + min F1).
+- **Promote:** `biochem_teacher_last.pth` = ep11 weights for **species/ADR viability** only; keep `after_94_*` archived for spatial stack.
+- **Next:** **9.7** `go_passive_mu_unlock_probe.ps1` from **after_94** (not gnode96) if mu is the variable; optional **9.5 re-check** (dump + clot-phi) on gnode96 vs after_94 A/B.
+
+### 151. GNODE rung **9.7** mu-unlock PASS + **9.5 after_94 recheck** (2026-06-01)
+
+- **9.7 run** `20260601T201352Z` (`run_note=passive_mu_unlock_probe`, command used default init `biochem_teacher_passive_align_locked.pth`, `LOSS_ISOLATE=MU_LOG`, `PASSIVE_MU_UNLOCK=1`, `mu_ratio_max=20`, 12ep, GT vel/skip DEQ).
+- **Mu gate:** **PASS** — val all `mu_log_mae` **1.371 -> 0.804** (best ep5, then plateau), drop **0.567**; wall worsened **2.08 -> 2.80** and high-`mu` worsened **1.26 -> 1.74** (bulk-fitting tradeoff under all-truth objective).
+- **Species guard:** **PASS** — val FI **~0.027** and Mat **~0.054** stable; train-anchor species stable (`mean FI~0.0296`, `Mat~0.0649`).
+- **Flow/viz health:** `flow_trivial=0`, `t0|u|=0.957`, `viz_health 2.37 -> 1.52`; expected for mu-unlock while species path is frozen.
+- **Important setup note:** this 9.7 run **did not** initialize from `after_94`; launcher defaulted to `biochem_teacher_passive_align_locked.pth`.
+- **9.5 after_94 recheck:** you restored `after_94`, dumped `anchors_stride_72_after94`, then trained `gnode95_after94_recheck` (35ep). Multi-anchor: **mean F1 0.518**, **min F1 0.341** (p004), p007 **0.627** (`rec=0.518`, `pred+=0.380`, score **0.710**) — matches prior 9.5 gate and confirms reproducibility.
+- **Spatial p007 viz (after_94 recheck):** `mean_pred_phi=0.564` vs GT `0.744` at t=4 (`frac_pred_phi>=0.5=0.491`) — healthy localized patches with moderate under-call.
+- **Promote guidance:** keep `after_94` as canonical species->dump->clot-phi teacher; keep `passive_mu_unlock_best` for 9.7/mu experiments only.
+
+### 152. GNODE rung **9.8** step-2 bridge from 9.7 ckpt — **FAIL (no-op / skipped steps)** (2026-06-02)
+
+- **Run** `20260602T095305Z` (`run_note=gnode98_step2_bridge_from_97`, init `biochem_teacher_passive_mu_unlock_best.pth`, 12ep).
+- **Gate result:** `check_passive_step2_bridge_gate.py` **FAIL**.
+- **What happened:** every epoch logged bio grad-cap skips (`bio grad L2 ~9.7e3-1.13e4 > 5000`) so optimizer steps were skipped; training stayed effectively frozen.
+- **Evidence of no-op:** `L_bio` flat **2275.67 -> 2275.67** (ratio **1.0000**), masked `L_ADR_S` flat **~5.90e-4** (ratio **1.0000**), val mu flat **0.8042** all epochs, val FI flat **0.0270**.
+- **Interpretation:** bridge recipe itself remains viable (species/mu held), but this specific run did not learn due to grad-cap skip path (same failure mode as §137 without grad scaling).
+- **Fix for rerun:** re-run `go_passive_step2_bridge.ps1` with **`-GradScaleOnCap`** (or lower `BIOCHEM_TEACHER_LR`) so updates are scaled instead of skipped.
+
+### 154. GNODE rung **9.9** full clotband_focus (12ep + dump + clot-phi 35ep) — teacher OK, clot-phi **regressed** (2026-06-02)
+
+- **Run** `20260602T210335Z` (`passive_transport_clotband_focus`, 12ep, `DATA_BIO_MASK_MODE=clot_band`, `PASSIVE` isolate, `GT_KINE_VEL=1`, `mu_ratio_max=1`, init `biochem_teacher_best_high_mu.pth`, 24 tensors skipped).
+- **Teacher val (p007):** all logMAE **1.31 -> 0.77** ep0-3, plateau **0.7655** ep5-11; wall **~2.36**; high-mu best ep2 **0.877** then **1.33**; `r~-0.03`. Train `L_bio` **226 -> 0.40**; `L_kine~0.03`.
+- **Viz health:** `clot_frac~0.78`, `mu2=0` in rollout diagnostic (bulk channel; not spatial proof). Teacher clot-band @ t=4: `mean_pred_phi=0.578` vs GT **0.742** (`frac>=0.5` **0.58**).
+- **Dump:** `anchors_clotband_36`, T=5/anchor, stride 36 / min_steps 4 (~20+ min rollout).
+- **Clot-phi** (`clotband_focus`, 35ep, pred species): best p007 val F1 **0.464** `rec=0.381` `pred+=0.253` (ep16); multi-anchor **mean 0.473** **min 0.246** (p004) p007 score **0.562**. Viz t=4: `mean_pred_phi=0.444` vs GT **0.678**.
+- **vs 9.5 gate:** prior **p007 0.627** / **min 0.341** (`gnode95_after94_recheck`) — **9.9 does not beat 9.5**; strict ladder min **0.26** missed (**0.246** on p004). p006 F1 **0.92** (tiny clot; inflates mean).
+- **Lesson:** Longer passive teacher from **best_high_mu** (post-bridge/K10e policy) improves aggregate logMAE but **does not** improve dumped-species clot-phi vs **after_94**-era 9.5; init/policy mismatch + short dump T=5 likely factors.
+- **Next:** A/B dump from **after_94** / align-locked ckpt with same launcher; optional clot-phi **FI=3/Mat=2** on this dump; do not advance to rung **10** on this clot-phi ckpt.
+
+### 153. GNODE rung **9.8** step-2 bridge from 9.7 — **PASS** with `-GradScaleOnCap` (2026-06-02)
+
+- **Run** `20260602T145236Z` (`run_note=gnode98_step2_bridge_from_97_gsc`, init `biochem_teacher_passive_mu_unlock_best.pth`, 12ep, `LOSS_DATA_ONLY=1`, `W_MuLog=0.75`, `W_MuSI=0.15`, masked ADR `1e-4`, `BIOCHEM_TEACHER_GRAD_SCALE_ON_CAP=1`).
+- **Gate:** `check_passive_step2_bridge_gate.py` **PASS** (`bridge_ok`, `bio_ok`, `adr_ok`, `species_ok`, `mu_ok`).
+- **Train:** `L_bio` **3430 -> 3.79** (ratio **0.0011**); masked `L_ADR_S` **6.54e-4 -> 1.50e-4** (ratio **0.229**).
+- **Val mu (p007):** all logMAE **0.800 -> 0.781** (best ep11, plateau ~ep5); wall **2.67 -> 2.09**; high-mu **1.73 -> 1.65**; bulk **0.697 -> 0.684**; `r` ~0.
+- **Val species:** FI logMAE **0.197 -> 0.010** (ep11); Mat **0.058 -> 0.019**; train-anchor FI **~0.006** ep11.
+- **Flow:** `flow_trivial=0`, `t0|u|=0.957`, `clot_frac=0.794` (bulk channel, not spatial clot proof).
+- **Ckpts:** `biochem_teacher_last.pth` and `biochem_teacher_best_high_mu.pth` updated (best all **0.781** ep5).
+- **Lesson:** 9.8 requires **grad scaling on cap** when init is post-unlock saturated; without it (§152) training is a no-op.
+- **Next:** optional 9.5 re-gate on bridge ckpt dump; **9.9** full teacher; do not assume spatial clots improved without clot-band viz.
 
 ### 147. GNODE rung **9.1** smoke PASS — GT vel, DEQ skipped (2026-05-31)
 
@@ -1950,7 +2008,13 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-05-31 | **GNODE 9.2** AE6+ODE6 refresh (`20260531T193845Z`) | **1.397** (flat) | **2.250** | **-0.056** | AE/ODE down; `L_bio` ep0 **284**; §148 |
 | 2026-05-31 | **GNODE 9.3** clot-band 3ep (`20260531T194456Z`) | **1.397** (flat) | **2.250** | **-0.056** | `L_bio` **3463->1834**; dump `anchors_clotband_72` OK; clot-phi pending; §148 |
 | 2026-05-31 | **GNODE 9.3** clot-phi `clotband_focus_gnode93` 20ep | n/a | — | **0.634** p007 | p007 F1 **0.624**; min F1 **0.338**; teacher viz Mat~0; clot-phi patches OK; §148 |
-| 2026-06-01 | **GNODE 8h** `go_gnode_8h_ladder` 9.4-9.6 | **1.397** flat | **2.25** | **-0.056** | species FI **~0.004**; clot-phi min F1 **0.341** p007 **0.627**; §149 |
+| 2026-06-01 | **GNODE 8h** `go_gnode_8h_ladder` 9.4-9.5 | **1.397** flat | **2.25** | **-0.056** | species FI **~0.004**; clot-phi min F1 **0.341** p007 **0.627**; §149 |
+| 2026-06-01 | **GNODE 9.6** `gnode96_adr_union` 12ep M3 (`20260601T181511Z`) | **1.397** flat | **2.25** | **-0.056** | M3 gate **PASS**; val FI **0.018** Mat **0.017**; clot-band phi **0.41** vs GT **0.78**; §150 |
+| 2026-06-01 | **GNODE 9.7** mu-unlock (`20260601T201352Z`, `passive_mu_unlock_probe`) | **0.804** (best ep5) | **2.796** wall | **-0.055** | Mu gate **PASS** (`1.371 -> 0.804`), species guard PASS (FI **~0.027**), init was `passive_align_locked` (not after_94); §151 |
+| 2026-06-01 | **GNODE 9.5** after_94 recheck (`gnode95_after94_recheck`, 35ep) | n/a | — | — | Multi-anchor **mean F1 0.518 min 0.341**; p007 **0.627**; reproduces prior 9.5 gate on refreshed dump; §151 |
+| 2026-06-02 | **GNODE 9.8** step-2 bridge no-op (`20260602T095305Z`, no GSC) | **0.804** (flat) | **2.796** (flat) | **-0.055** | Gate **FAIL**; grad-cap skip; §152 |
+| 2026-06-02 | **GNODE 9.8** step-2 bridge (`20260602T145236Z`, `gnode98_step2_bridge_from_97_gsc`) | **0.781** (ep11) | **2.089** wall | **~0** bulk | Gate **PASS**; FI **0.010**; `L_bio` **3430->3.8**; §153 |
+| 2026-06-02 | **GNODE 9.9** clotband_focus 12ep+35ep (`20260602T210335Z`) | **0.766** (ep5) | **2.357** wall | **-0.034** | Clot-phi p007 F1 **0.464** min **0.246**; teacher phi **0.58** vs GT **0.74**; **below** 9.5; §154 |
 
 ---
 

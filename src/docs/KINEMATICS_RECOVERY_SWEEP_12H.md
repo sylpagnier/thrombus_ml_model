@@ -65,5 +65,6 @@ Replace `F0_foundation` with the best `leg_id`.
 ## Notes
 
 - **&lt; 5% Rel L2** on full mixed val may require **full graph count** (2000+) and **longer** than 10 h; this sweep finds the best *recipe* to scale next.
+- **Production allfix (2026-06-01)**: 3000 graphs, 100 ep, allfix toggles — best **Rel L2 0.1263** @ Adam ep 80; L-BFGS ep 85–99 degraded/NaN. Logged in [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md).
 - Bend-sign A/B showed **bidirectional ≥ down_only** on 120-graph smoke; sweep does not regen meshes.
 - April reference: [data/reference/kinematics_best_20260426T184600Z.json](../../data/reference/kinematics_best_20260426T184600Z.json).

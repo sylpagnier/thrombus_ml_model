@@ -103,7 +103,7 @@ $LegDir = Join-Path $OutRoot $LegName
 New-Item -ItemType Directory -Force -Path $LegDir | Out-Null
 
 if ($ClotEpochs -le 0) {
-    Write-Host "[skip] ClotEpochs=$ClotEpochs: teacher + dump only (use -ClotEpochs 20 for clot-phi)." -ForegroundColor Yellow
+    Write-Host "[skip] ClotEpochs=${ClotEpochs}: teacher + dump only (use -ClotEpochs 20 for clot-phi)." -ForegroundColor Yellow
 } else {
     Write-Host "[NEW] Train clot-phi on clotband anchors ($ClotEpochs ep)" -ForegroundColor Cyan
     $clotArgs = @(

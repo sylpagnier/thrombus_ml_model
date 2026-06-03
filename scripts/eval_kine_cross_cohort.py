@@ -38,7 +38,10 @@ from src.architecture.kinematics_model_config import (
     resolve_gino_deq_ctor_kwargs,
 )
 from src.config import NodeFeat, PhysicsConfig, PredChannels
-from src.data_gen.lib.graph_velocity_priors import mass_conserving_umax_nd, width_nd_to_radius_nd
+from src.data_gen.lib.node_feature_assembly import (
+    kinematics_uv_prior_max,
+    refresh_kinematics_node_x_on_graph,
+)
 from src.utils.kinematics_geometry import graph_geometry_level, read_geometry_level_from_mesh_json
 from src.utils.paths import data_root, resolve_checkpoint
 
@@ -161,15 +164,27 @@ def _build_kine_layout_x(data, phys: PhysicsConfig) -> torch.Tensor:
     )
 
 
-def _apply_x_mode(data, x_mode: str, phys: PhysicsConfig):
+def _apply_x_mode(data, x_mode: str, phys: PhysicsConfig, *, stem: str = ""):
     if x_mode == "native":
         if int(data.x.shape[1]) >= NodeFeat.WIDTH_D2.stop:
+            if kinematics_uv_prior_max(data.x) <= 1e-3:
+                refresh_kinematics_node_x_on_graph(
+                    data,
+                    phys_cfg=phys,
+                    stem=stem,
+                    force=False,
+                )
             return data
         raise ValueError(
             f"native x has {data.x.shape[1]} channels; re-run PatientDataExtractor for 18ch kine x."
         )
     data = data.clone()
-    data.x = _build_kine_layout_x(data, phys)
+    refresh_kinematics_node_x_on_graph(
+        data,
+        phys_cfg=phys,
+        stem=stem,
+        force=True,
+    )
     return data
 
 
@@ -229,7 +244,7 @@ def _eval_one(
     lvl = _resolve_geometry_level(stem, data, mesh_dir)
     x_schema = _read_x_schema(data)
     tgt = _steady_kine_targets(data, time_index)
-    data_eval = _apply_x_mode(data, x_mode, phys)
+    data_eval = _apply_x_mode(data, x_mode, phys, stem=path.stem)
     t_idx = time_index if data.y.dim() == 2 else (
         time_index if time_index >= 0 else data.y.shape[0] + time_index
     )

@@ -12,12 +12,61 @@ Canonical **architecture and training flags** for the production **GINO_DEQ** ru
 
 Override the reference JSON with `KINEMATICS_MODEL_CONFIG_REF=/path/to/manifest.json`.
 
-## Best run (2026-04-26)
+## Best run (2026-04-26, LadHyX reference)
 
 - **Source project**: `LadHyX_ml_cfd_thrombus_predictions`
 - **Run id**: `20260426T184600Z`
 - **Best epoch**: 84 (Stage 3 Carreau), **before** L-BFGS steps produced NaN validation
 - **Val**: Rel L2 ≈ 0.1007, \|∇·u\| mean ≈ 0.157, composite ≈ 15.80
+
+## Production run (2026-06-01, thrombus_ml_model)
+
+Script: `scripts/go_kinematics_production_allfix.ps1` — allfix toggles, **3000 graphs** (no cap), shuffle seed 42, 100 ep / Adam 85 / LBFGS 85–99.
+
+| Field | Value |
+|-------|-------|
+| **Diary run id** | `20260601T180106Z` |
+| **Checkpoint dir** | `outputs/kinematics/production_allfix/` |
+| **Best epoch (saved)** | **80** (Adam, Stage 3 Carreau) |
+| **Val Rel L2** | **0.1263** |
+| **L0 / L1 / L2** | 0.113 / **0.120** / 0.167 |
+| **div_u mean** | 0.307 |
+| **composite** | 30.85 |
+| **Graphs** | 3000 newtonian + 3000 carreau (L0=1200, L1=1200, L2=600) |
+
+**L-BFGS (epochs 85–99):** same failure mode as April — ep 85 flat, ep 86+ Rel L2 rises, ep 98–99 **NaN** val. `kinematics_best.pth` correctly kept at **ep 80** (pre-L-BFGS).
+
+### Run log (validation highlights)
+
+| Epoch | Stage | Rel L2 | L1 | div_u | Note |
+|-------|-------|--------|-----|-------|------|
+| 0 | 1 Newtonian | 0.981 | 1.011 | 1.00 | cold start |
+| 12 | 1 | **0.645** | 0.613 | 0.318 | best Newtonian |
+| 40 | 2 ramp | 0.736 | 0.737 | 0.198 | stage-2 bump |
+| 60 | 3 Carreau | 0.168 | 0.162 | 0.407 | first Carreau save |
+| 72 | 3 | 0.130 | 0.124 | 0.317 | |
+| 80 | 3 | **0.126** | **0.120** | 0.307 | **best saved** |
+| 84 | 3 | 0.126 | 0.120 | 0.308 | last Adam (April analog) |
+| 85 | 3 LBFGS | 0.127 | 0.120 | 0.309 | LBFGS start |
+| 99 | 3 LBFGS | NaN | — | NaN | |
+
+### Comparisons
+
+| Run | Graphs | Best Rel L2 | L1 | div_u | Best ep |
+|-----|--------|-------------|-----|-------|---------|
+| April reference | ~2000 | 0.101 | — | 0.157 | 84 (pre-LBFGS) |
+| 30-ep allfix smoke | 2000 cap | 0.132 | 0.135 | 0.335 | 29 |
+| **Production allfix** | **3000** | **0.126** | **0.120** | **0.307** | **80** |
+
+Full graphs + long Carreau beat the 30-ep smoke (~4% Rel L2 gain; L1 **0.120** vs 0.135). Still **~0.026** above April on Rel L2 and **~2×** on div_u — likely need L2 finetune and/or continuity-focused polish, not more LBFGS.
+
+**Promote for biochem/viz:**
+
+```powershell
+Copy-Item outputs\kinematics\production_allfix\kinematics_best.pth outputs\kinematics\kinematics_best.pth -Force
+```
+
+**Next lever:** `go_kinematics_production_allfix_finetune.ps1` from `kinematics_best.pth` (default `-ContinuityFocus`, Adam-only). Optional `-TryLbfgs` for risky 5-epoch LBFGS tail.
 
 ## GINO_DEQ constructor (must match for biochem load)
 

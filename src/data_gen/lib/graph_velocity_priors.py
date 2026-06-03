@@ -6,6 +6,9 @@ from src.config import VesselConfig
 
 R_REF_ND = 0.5
 U_MAX_BASE_ND = 1.5
+# Cap Poiseuille peak ND; training graphs stay ~<=2.0. Uncapped 1/R blow-up in tight stenosis
+# (patient anchors) reached ~8 ND and broke GINO-DEQ (pred spikes, misleading viz scales).
+U_PRIOR_PEAK_CAP_ND = 2.0
 EPSILON = 1e-5
 
 # Calculate a safe physical floor based on the generator config.
@@ -64,7 +67,8 @@ def width_nd_to_radius_nd(width_nd: torch.Tensor) -> torch.Tensor:
 def mass_conserving_umax_nd(R_nd: torch.Tensor, u_max_base: float = U_MAX_BASE_ND, r_ref: float = R_REF_ND) -> torch.Tensor:
     """Scale peak velocity ~ 1/R relative to reference radius ``r_ref`` (2D mass conservation)."""
     # We still use EPSILON here just in case, but MIN_PHYSICAL_R_ND above guarantees safety
-    return u_max_base * (r_ref / R_nd.clamp_min(EPSILON))
+    peak = u_max_base * (r_ref / R_nd.clamp_min(EPSILON))
+    return peak.clamp(max=float(U_PRIOR_PEAK_CAP_ND))
 
 
 __all__ = [
@@ -74,6 +78,7 @@ __all__ = [
     "U_MAX_BASE_ND",
     "WIDTH_PRIOR_SMOOTH_ALPHA",
     "WIDTH_PRIOR_SMOOTH_ITERS",
+    "U_PRIOR_PEAK_CAP_ND",
     "mass_conserving_umax_nd",
     "smooth_width_nd_on_edges",
     "width_nd_to_radius_nd",
