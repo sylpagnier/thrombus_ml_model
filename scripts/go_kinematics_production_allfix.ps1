@@ -33,6 +33,8 @@ $env:KINEMATICS_WSS_FUSE = "1"
 $env:KINEMATICS_FOURIER_LEARNABLE = "1"
 $env:KINEMATICS_VAL_EVERY = "1"
 $env:KINEMATICS_OUTPUT_DIR = "outputs/kinematics/production_allfix"
+# Keep more numbered ckpts so ep-80 (ckpt_81) survives long runs (default prune keep=3).
+$env:KINEMATICS_CKPT_KEEP = "15"
 # Adam-only default: 20260601 production run -- LBFGS ep 86+ hurt val; ep 98-99 NaN (April same pattern).
 $env:KINEMATICS_SKIP_LBFGS = "1"
 
