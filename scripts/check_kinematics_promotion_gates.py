@@ -28,7 +28,7 @@ from src.architecture.kinematics_model_config import (
 from src.config import PhysicsConfig
 from src.core_physics.physics_kernels import PhysicsKernels
 from src.training.train_kinematics_predictor import load_dataset
-from src.utils.kinematics_geometry import split_clinical_anchor_train_val
+from src.utils.kinematics_geometry import graph_geometry_level, split_clinical_anchor_train_val
 from src.utils.metrics import quantify_performance
 
 
@@ -47,6 +47,12 @@ def main() -> int:
     p.add_argument("--synthetic-cap", type=int, default=200)
     p.add_argument("--max-patient-rel-l2", type=float, default=0.25)
     p.add_argument("--max-synthetic-rel-l2", type=float, default=0.20)
+    p.add_argument(
+        "--max-synthetic-l2-rel-l2",
+        type=float,
+        default=0.22,
+        help="Mean rel_L2 on synthetic val graphs with geometry_level=2.",
+    )
     p.add_argument("--baseline-composite", type=float, default=float("nan"))
     args = p.parse_args()
 
@@ -78,13 +84,24 @@ def main() -> int:
 
     patient_rel = _eval_rel_l2(model, val_patients, kernels, device)
     synth_rel = _eval_rel_l2(model, val_synth, kernels, device)
+    val_synth_l2 = [d for d in val_synth if graph_geometry_level(d, default=-1) == 2]
+    synth_l2_rel = _eval_rel_l2(model, val_synth_l2, kernels, device)
 
     patient_ok = math.isfinite(patient_rel) and patient_rel <= float(args.max_patient_rel_l2)
     synth_ok = math.isfinite(synth_rel) and synth_rel <= float(args.max_synthetic_rel_l2)
+    synth_l2_ok = (
+        len(val_synth_l2) > 0
+        and math.isfinite(synth_l2_rel)
+        and synth_l2_rel <= float(args.max_synthetic_l2_rel_l2)
+    )
 
     print(f"[gates] checkpoint={ckpt_path}")
     print(f"[gates] holdout patients ({len(val_patients)}): rel_L2={patient_rel:.4f}  gate<={args.max_patient_rel_l2}  -> {'PASS' if patient_ok else 'FAIL'}")
     print(f"[gates] synthetic val ({len(val_synth)}): rel_L2={synth_rel:.4f}  gate<={args.max_synthetic_rel_l2}  -> {'PASS' if synth_ok else 'FAIL'}")
+    print(
+        f"[gates] synthetic L2 val ({len(val_synth_l2)}): rel_L2={synth_l2_rel:.4f}  "
+        f"gate<={args.max_synthetic_l2_rel_l2}  -> {'PASS' if synth_l2_ok else 'FAIL'}"
+    )
 
     baseline = float(args.baseline_composite)
     if not math.isfinite(baseline) and isinstance(raw, dict):
@@ -92,7 +109,7 @@ def main() -> int:
     if math.isfinite(baseline):
         print(f"[gates] checkpoint composite (train val metric): {baseline:.4f}")
 
-    if patient_ok and synth_ok:
+    if patient_ok and synth_ok and synth_l2_ok:
         print("[gates] PROMOTE OK")
         return 0
     print("[gates] PROMOTE BLOCKED")

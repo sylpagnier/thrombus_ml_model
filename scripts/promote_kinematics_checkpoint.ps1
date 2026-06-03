@@ -6,6 +6,7 @@ param(
   [string]$Holdout = "patient007",
   [double]$MaxPatientRelL2 = 0.25,
   [double]$MaxSyntheticRelL2 = 0.20,
+  [double]$MaxSyntheticL2RelL2 = 0.22,
   [int]$SyntheticCap = 200,
   [switch]$Force
 )
@@ -25,6 +26,7 @@ if (-not $Force) {
     --holdout $Holdout `
     --max-patient-rel-l2 $MaxPatientRelL2 `
     --max-synthetic-rel-l2 $MaxSyntheticRelL2 `
+    --max-synthetic-l2-rel-l2 $MaxSyntheticL2RelL2 `
     --synthetic-cap $SyntheticCap
   if ($LASTEXITCODE -ne 0) {
     throw "[promote] gates failed; use -Force to copy anyway."

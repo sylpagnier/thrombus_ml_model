@@ -41,6 +41,15 @@ $env:KINEMATICS_CLINICAL_ANCHOR_BOOST = "$ClinicalBoost"
 $env:KINEMATICS_OUTPUT_DIR = $OutDir
 $env:KINEMATICS_GRAPH_CAP = "$SyntheticCap"
 
+# Val: patient holdout + fixed synthetic holdout (L2 floor). Best ckpt uses dual gates.
+$env:KINEMATICS_SYNTHETIC_VAL_RATIO = "0.15"
+$env:KINEMATICS_SYNTHETIC_VAL_MIN = "20"
+$env:KINEMATICS_SYNTHETIC_VAL_MIN_L2 = "6"
+$env:KINEMATICS_DUAL_PROMOTION_GATES = "1"
+$env:KINEMATICS_GATE_MAX_PATIENT_REL_L2 = "0.25"
+$env:KINEMATICS_GATE_MAX_SYNTHETIC_REL_L2 = "0.20"
+$env:KINEMATICS_GATE_MAX_SYNTHETIC_L2_REL_L2 = "0.22"
+
 $resumePath = $Resume
 if (-not [System.IO.Path]::IsPathRooted($resumePath)) {
   $resumePath = Join-Path $RepoRoot $Resume

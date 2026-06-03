@@ -81,8 +81,9 @@ Three explicit phases. Use **production ep-80** (`outputs/kinematics/production_
 **Clinical phase details**
 
 - Data: `KINEMATICS_INCLUDE_PATIENT_ANCHORS=1` merges `patient*.pt` into Carreau load; `KINEMATICS_GRAPH_CAP` keeps ~80–120 synthetic graphs for regularization.
-- Val: `KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS` (default `patient007`) — holdout patients **never train**; synthetic still has stratified val.
+- Val (dual holdout): patient stems in `KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS` (default `patient007`) are **val-only**; synthetic holdout uses `KINEMATICS_SYNTHETIC_VAL_RATIO` / `SYNTHETIC_VAL_MIN` / `SYNTHETIC_VAL_MIN_L2` (L2 floor) so promotion catches synthetic drift.
 - Sampling: `KINEMATICS_CLINICAL_ANCHOR_BOOST=10` on train steps.
+- Best ckpt: `KINEMATICS_DUAL_PROMOTION_GATES=1` — save only when patient + synthetic + synthetic-L2 gates pass and composite improves.
 - Writes to `outputs/kinematics/clinical_anchor_finetune/` (does not overwrite global best until promoted).
 
 **Promotion gates** (before `Copy-Item` to `outputs/kinematics/kinematics_best.pth`):
@@ -92,7 +93,7 @@ python scripts/check_kinematics_promotion_gates.py --checkpoint outputs/kinemati
 powershell -File .\scripts\promote_kinematics_checkpoint.ps1 -Checkpoint outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth
 ```
 
-Default gates: mean holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**. Tune with `--max-patient-rel-l2` / `--max-synthetic-rel-l2`.
+Default gates: holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**, synthetic **L2** val **rel_L2 <= 0.22**. Orchestrator: `go_kinematics_stage_a_ladder.ps1` (`-SkipFoundation` after production).
 
 ## GINO_DEQ constructor (must match for biochem load)
 

@@ -77,20 +77,97 @@ def resolve_kinematics_train_val_split(
     return split_anchor_physics(dataset, seed=seed, train_ratio=train_ratio)
 
 
-def _mean_rel_l2_on_graphs(model, graphs, kernels, device, *, stems: set[str] | None = None):
-    """Mean anchor rel-L2 on a list of graphs (optional stem filter)."""
+def _mean_rel_l2_on_graphs(
+    model,
+    graphs,
+    kernels,
+    device,
+    *,
+    stems: set[str] | None = None,
+    clinical_only: bool = False,
+    synthetic_only: bool = False,
+    geometry_levels: set[int] | None = None,
+):
+    """Mean rel-L2 on a graph list with optional cohort filters."""
+    from src.utils.kinematics_geometry import graph_geometry_level
     from src.utils.metrics import quantify_performance
 
     if not graphs:
         return float("nan"), 0
     subset = graphs
     if stems is not None:
-        subset = [d for d in graphs if getattr(d, "graph_stem", "") in stems]
+        subset = [d for d in subset if getattr(d, "graph_stem", "") in stems]
+    if clinical_only:
+        subset = [d for d in subset if getattr(d, "is_clinical_anchor", False)]
+    if synthetic_only:
+        subset = [d for d in subset if not getattr(d, "is_clinical_anchor", False)]
+    if geometry_levels is not None:
+        subset = [
+            d for d in subset if graph_geometry_level(d, default=-1) in geometry_levels
+        ]
     if not subset:
         return float("nan"), 0
     loader = DataLoader(subset, batch_size=1, shuffle=False)
     scores = quantify_performance(model, loader, kernels, device, phase="kinematics")
     return float(scores.get("rel_l2", float("nan"))), len(subset)
+
+
+def _kinematics_dual_promotion_gates_enabled() -> bool:
+    return os.environ.get("KINEMATICS_DUAL_PROMOTION_GATES", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _kinematics_promotion_gate_limits() -> dict[str, float]:
+    def _f(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return float(default)
+        try:
+            return float(raw)
+        except ValueError:
+            return float(default)
+
+    return {
+        "max_patient": _f("KINEMATICS_GATE_MAX_PATIENT_REL_L2", 0.25),
+        "max_synthetic": _f("KINEMATICS_GATE_MAX_SYNTHETIC_REL_L2", 0.20),
+        "max_synthetic_l2": _f("KINEMATICS_GATE_MAX_SYNTHETIC_L2_REL_L2", 0.22),
+    }
+
+
+def _kinematics_promotion_gates_pass(
+    *,
+    patient_rel: float,
+    patient_n: int,
+    synthetic_rel: float,
+    synthetic_n: int,
+    synthetic_l2_rel: float,
+    synthetic_l2_n: int,
+) -> tuple[bool, dict[str, bool]]:
+    limits = _kinematics_promotion_gate_limits()
+    patient_ok = (
+        patient_n > 0
+        and math.isfinite(patient_rel)
+        and patient_rel <= limits["max_patient"]
+    )
+    synth_ok = (
+        synthetic_n > 0
+        and math.isfinite(synthetic_rel)
+        and synthetic_rel <= limits["max_synthetic"]
+    )
+    synth_l2_ok = (
+        synthetic_l2_n > 0
+        and math.isfinite(synthetic_l2_rel)
+        and synthetic_l2_rel <= limits["max_synthetic_l2"]
+    )
+    return patient_ok and synth_ok and synth_l2_ok, {
+        "patient": patient_ok,
+        "synthetic": synth_ok,
+        "synthetic_l2": synth_l2_ok,
+    }
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
@@ -973,6 +1050,9 @@ def train_kinematics(
             holdout_raw = os.environ.get("KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS", "").strip()
             patient_msg = ""
             p_rel, p_n = float("nan"), 0
+            s_rel, s_n = float("nan"), 0
+            s_l2_rel, s_l2_n = float("nan"), 0
+            dual_gates = _kinematics_dual_promotion_gates_enabled()
             if holdout_raw and os.environ.get("KINEMATICS_INCLUDE_PATIENT_ANCHORS", "").strip():
                 holdout = {s.strip() for s in holdout_raw.split(",") if s.strip()}
                 p_rel, p_n = _mean_rel_l2_on_graphs(
@@ -980,6 +1060,26 @@ def train_kinematics(
                 )
                 if p_n > 0 and math.isfinite(p_rel):
                     patient_msg = f" | patient_holdout_rel_L2={p_rel:.3f} (n={p_n})"
+                if dual_gates:
+                    s_rel, s_n = _mean_rel_l2_on_graphs(
+                        model, val_data, kernels, device, synthetic_only=True
+                    )
+                    s_l2_rel, s_l2_n = _mean_rel_l2_on_graphs(
+                        model,
+                        val_data,
+                        kernels,
+                        device,
+                        synthetic_only=True,
+                        geometry_levels={2},
+                    )
+                    if s_n > 0 and math.isfinite(s_rel):
+                        patient_msg += (
+                            f" | synthetic_val_rel_L2={s_rel:.3f} (n={s_n})"
+                        )
+                    if s_l2_n > 0 and math.isfinite(s_l2_rel):
+                        patient_msg += (
+                            f" | synthetic_L2_val_rel_L2={s_l2_rel:.3f} (n={s_l2_n})"
+                        )
             if math.isfinite(rel_l2) and math.isfinite(continuity):
                 print(
                     f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
@@ -990,7 +1090,28 @@ def train_kinematics(
                     f"[kin] [Validation] non-finite metrics "
                     f"(rel_l2={rel_l2}, continuity={continuity}); best ckpt unchanged"
                 )
-            if stage == 3 and math.isfinite(val_comp) and val_comp < best_val_composite_loss:
+            save_best = False
+            if stage == 3 and math.isfinite(val_comp):
+                if dual_gates:
+                    gates_ok, gate_bits = _kinematics_promotion_gates_pass(
+                        patient_rel=p_rel,
+                        patient_n=p_n,
+                        synthetic_rel=s_rel,
+                        synthetic_n=s_n,
+                        synthetic_l2_rel=s_l2_rel,
+                        synthetic_l2_n=s_l2_n,
+                    )
+                    if gates_ok and val_comp < best_val_composite_loss:
+                        save_best = True
+                    elif not gates_ok and patient_msg:
+                        failed = [k for k, ok in gate_bits.items() if not ok]
+                        print(
+                            f"[kin] [Validation] dual promotion gates blocked best save "
+                            f"(failed: {','.join(failed)})"
+                        )
+                elif val_comp < best_val_composite_loss:
+                    save_best = True
+            if save_best:
                 best_val_composite_loss = val_comp
                 save_kinematics_checkpoint_file(
                     kinematics_dir() / "kinematics_best.pth",
@@ -1012,7 +1133,10 @@ def train_kinematics(
                     run_id=str(getattr(diary, "run_dir", Path(".")).name),
                     extra={"training_manifest": training_manifest},
                 )
-                print("[kin] Saved new best kinematics model")
+                if dual_gates:
+                    print("[kin] Saved new best kinematics model (dual promotion gates PASS)")
+                else:
+                    print("[kin] Saved new best kinematics model")
                 print(f"[kin] Updated {manifest_path.name} in {kinematics_dir()}")
             try:
                 os.makedirs(kinematics_dir(), exist_ok=True)
@@ -1039,6 +1163,12 @@ def train_kinematics(
                 if patient_msg:
                     val_record["patient_holdout_rel_l2"] = float(p_rel)
                     val_record["patient_holdout_n"] = int(p_n)
+                if dual_gates and s_n > 0:
+                    val_record["synthetic_val_rel_l2"] = float(s_rel)
+                    val_record["synthetic_val_n"] = int(s_n)
+                if dual_gates and s_l2_n > 0:
+                    val_record["synthetic_l2_val_rel_l2"] = float(s_l2_rel)
+                    val_record["synthetic_l2_val_n"] = int(s_l2_n)
                 with open(kinematics_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(val_record) + "\n")
             except OSError:

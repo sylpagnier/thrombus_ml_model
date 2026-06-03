@@ -311,6 +311,55 @@ def split_anchor_physics_stratified(
     }
 
 
+def _env_float(name: str, default: float) -> float:
+    import os
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _ensure_min_geometry_level_in_val(
+    train: List[Any],
+    val: List[Any],
+    *,
+    level: int,
+    min_count: int,
+) -> Tuple[List[Any], List[Any]]:
+    """Move graphs at *level* from train into val until val has at least *min_count*."""
+    if min_count <= 0:
+        return train, val
+    train = list(train)
+    val = list(val)
+
+    def _lvl(d: Any) -> int:
+        return graph_geometry_level(d, default=-1)
+
+    while sum(1 for d in val if _lvl(d) == level) < min_count and train:
+        candidates = [i for i, d in enumerate(train) if _lvl(d) == level]
+        if not candidates:
+            break
+        idx = candidates[-1]
+        val.append(train.pop(idx))
+    return train, val
+
+
 def split_clinical_anchor_train_val(
     dataset: Sequence[Any],
     *,
@@ -338,9 +387,31 @@ def split_clinical_anchor_train_val(
     train_clinical = [d for d in clinical if getattr(d, "graph_stem", "") not in holdout]
 
     if other:
-        syn = split_anchor_physics_stratified(other, seed=seed, train_ratio=train_ratio)
-        train = train_clinical + syn["train"]
-        val = val_clinical + syn["val"]
+        # Dedicated synthetic val holdout (stratified by geometry level, L2 floor).
+        syn_val_ratio = _env_float("KINEMATICS_SYNTHETIC_VAL_RATIO", 0.15)
+        syn_val_ratio = min(0.5, max(0.05, syn_val_ratio))
+        syn_train_ratio = 1.0 - syn_val_ratio
+        min_syn_val = _env_int("KINEMATICS_SYNTHETIC_VAL_MIN", 20)
+        min_syn_val_l2 = _env_int("KINEMATICS_SYNTHETIC_VAL_MIN_L2", 6)
+        syn = split_anchor_physics_stratified(
+            other, seed=seed, train_ratio=syn_train_ratio, min_val_per_level=1
+        )
+        syn_train, syn_val = list(syn["train"]), list(syn["val"])
+        if len(syn_val) < min_syn_val and len(other) > min_syn_val:
+            import random
+
+            rng_mv = random.Random(seed + 17)
+            pool = syn_train + syn_val
+            rng_mv.shuffle(pool)
+            need = min(min_syn_val, len(pool) - 1) - len(syn_val)
+            if need > 0:
+                syn_val = pool[: min(len(pool) - 1, len(syn_val) + need)]
+                syn_train = pool[len(syn_val) :]
+        syn_train, syn_val = _ensure_min_geometry_level_in_val(
+            syn_train, syn_val, level=2, min_count=min_syn_val_l2
+        )
+        train = train_clinical + syn_train
+        val = val_clinical + syn_val
         n_anchors = len([d for d in train if graph_has_anchor(d)])
         n_physics = len([d for d in train if not graph_has_anchor(d)])
     else:
@@ -354,12 +425,18 @@ def split_clinical_anchor_train_val(
     rng = random.Random(seed)
     rng.shuffle(train)
     rng.shuffle(val)
-    if holdout:
+    if holdout or other:
+        syn_val_n = len(val) - len(val_clinical)
+        syn_l2_val = sum(
+            1 for d in val
+            if not getattr(d, "is_clinical_anchor", False)
+            and graph_geometry_level(d, default=-1) == 2
+        )
         print(
             f"[kin] Clinical split: holdout val stems={sorted(holdout)} "
             f"(train clinical={len(train_clinical)}, val clinical={len(val_clinical)}, "
             f"synthetic train={len(train) - len(train_clinical)}, "
-            f"synthetic val={len(val) - len(val_clinical)})"
+            f"synthetic val={syn_val_n} (L2 in syn val={syn_l2_val})"
         )
     return {
         "train": train,

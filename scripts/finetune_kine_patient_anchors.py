@@ -32,6 +32,10 @@ if str(_REPO) not in sys.path:
 os.environ.setdefault("KINEMATICS_INCLUDE_PATIENT_ANCHORS", "1")
 os.environ.setdefault("KINEMATICS_SKIP_LBFGS", "1")
 os.environ.setdefault("KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS", "patient007")
+os.environ.setdefault("KINEMATICS_DUAL_PROMOTION_GATES", "1")
+os.environ.setdefault("KINEMATICS_SYNTHETIC_VAL_RATIO", "0.15")
+os.environ.setdefault("KINEMATICS_SYNTHETIC_VAL_MIN", "20")
+os.environ.setdefault("KINEMATICS_SYNTHETIC_VAL_MIN_L2", "6")
 
 
 def main() -> int:
