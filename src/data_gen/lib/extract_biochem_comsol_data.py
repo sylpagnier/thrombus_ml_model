@@ -11,6 +11,7 @@ from tqdm import tqdm
 import glob
 import re
 from src.config import BIOCHEM_T_MAX, NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
+from src.utils.kinematics_paths import BIOCHEM_ANCHOR_KINE_RHEOLOGY, kinematics_anchor_graph_dir
 from src.utils.paths import get_project_root
 from src.data_gen.lib.node_feature_assembly import build_biochem_bc_x_tensor
 from src.utils.channel_schema import BIO_Y_SCHEMA, attach_patient_anchor_graph_metadata
@@ -56,7 +57,7 @@ class PatientDataExtractor:
         self.label_dir = Path(label_dir) if label_dir else self.root / self.vessel_cfg.output_dir
         self.proc_dir = Path(proc_dir) if proc_dir else self.root / self.vessel_cfg.graph_output_dir
         self.proc_dir.mkdir(parents=True, exist_ok=True)
-        self.kine_anchor_dir = self.root / "data/processed/graphs_kinematics_anchors/newtonian"
+        self.kine_anchor_dir = kinematics_anchor_graph_dir(rheology=BIOCHEM_ANCHOR_KINE_RHEOLOGY)
         self.kine_anchor_dir.mkdir(parents=True, exist_ok=True)
 
         # Dictionary mapping exact COMSOL export names to standardized internal names
@@ -669,7 +670,9 @@ class PatientDataExtractor:
         geometry_level = None
         if sidecar_meta is not None and sidecar_meta.get("level") is not None:
             geometry_level = int(sidecar_meta["level"])
-        kine_phys = PhysicsConfig(phase="kinematics", rheology="newtonian")
+        from src.data_gen.lib.node_feature_assembly import resolve_anchor_kine_phys_cfg
+
+        kine_phys = resolve_anchor_kine_phys_cfg()
         kine_data = build_kinematics_graph_from_comsol_steady(
             mesh=mesh,
             mesh_nodes_si=mesh_nodes,
@@ -694,6 +697,7 @@ class PatientDataExtractor:
             phys_cfg=kine_phys,
             raw_sidecar_dir=self.raw_dir,
             geometry_level=geometry_level,
+            prior_mode=os.environ.get("KINE_ANCHOR_PRIOR_MODE", "gt_flow"),
         )
         x_kine = kine_data.x
         u_prior = kine_data.u_prior

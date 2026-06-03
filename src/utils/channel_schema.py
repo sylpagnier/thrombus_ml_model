@@ -265,6 +265,21 @@ def attach_patient_anchor_graph_metadata(data, *, mask_wall: Optional[torch.Tens
     return data
 
 
+def attach_biochem_synthetic_graph_metadata(data, *, mask_wall: Optional[torch.Tensor] = None):
+    """Dual-x biochem synthetic graphs: kine ``data.x`` + biochem ``data.x_biochem``."""
+    if not hasattr(data, "x_biochem") or data.x_biochem is None:
+        raise ValueError("attach_biochem_synthetic_graph_metadata requires data.x_biochem.")
+    attach_channel_metadata(
+        data,
+        x_schema=KINE_X_SCHEMA,
+        y_schema=BIO_Y_SCHEMA,
+        mask_wall=mask_wall,
+    )
+    data.x_biochem_schema = BIO_X_SCHEMA
+    assert_anchor_dual_x_aligned(data)
+    return data
+
+
 def assert_anchor_dual_x_aligned(data, *, atol: float = 1e-5) -> None:
     """Guard: shared geometry channels must agree between kine and biochem tensors."""
     xk = data.x

@@ -210,6 +210,9 @@ class GINO_DEQ(nn.Module):
         num_global_tokens: int = 16,
         use_siren_decoder: bool = False,
         use_width_priors: bool = False,
+        wss_fuse: Optional[bool] = None,
+        bc_envelope: Optional[bool] = None,
+        fourier_learnable: Optional[bool] = None,
     ):
         super().__init__()
         self.max_iters = max_iters
@@ -237,11 +240,23 @@ class GINO_DEQ(nn.Module):
 
         self.use_hard_bcs = bool(use_hard_bcs)
 
-        # Candidate toggles (kept env-based so we can run A/B without changing ctor call sites).
-        self.bc_envelope = bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0")))
+        # Toggles: explicit ctor kwargs (checkpoint restore) override env for A/B sweeps.
+        self.bc_envelope = (
+            bool(bc_envelope)
+            if bc_envelope is not None
+            else bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0")))
+        )
         self.bc_lambda = float(os.environ.get("KINEMATICS_BC_LAMBDA", "10.0"))
-        self.wss_fuse = bool(int(os.environ.get("KINEMATICS_WSS_FUSE", "0")))
-        self.fourier_learnable = bool(int(os.environ.get("KINEMATICS_FOURIER_LEARNABLE", "0")))
+        self.wss_fuse = (
+            bool(wss_fuse)
+            if wss_fuse is not None
+            else bool(int(os.environ.get("KINEMATICS_WSS_FUSE", "0")))
+        )
+        self.fourier_learnable = (
+            bool(fourier_learnable)
+            if fourier_learnable is not None
+            else bool(int(os.environ.get("KINEMATICS_FOURIER_LEARNABLE", "0")))
+        )
 
         # WSS decoder: either z-only (legacy) or fused with (u,v,p) and mu.
         if self.wss_fuse:

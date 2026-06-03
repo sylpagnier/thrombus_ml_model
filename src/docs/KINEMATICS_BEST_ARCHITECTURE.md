@@ -68,6 +68,32 @@ Copy-Item outputs\kinematics\production_allfix\kinematics_best.pth outputs\kinem
 
 **Next lever:** `go_kinematics_production_allfix_finetune.ps1` from `kinematics_best.pth` (default `-ContinuityFocus`, Adam-only). Optional `-TryLbfgs` for risky 5-epoch LBFGS tail.
 
+## Stage-A ladder (recommended order)
+
+Three explicit phases. Use **production ep-80** (`outputs/kinematics/production_allfix/kinematics_ckpt_81.pth` or `kinematics_best.pth` if restored) as the healthy checkpoint before any finetune.
+
+| Phase | Script | Purpose |
+|-------|--------|---------|
+| **1 Foundation** | `go_kinematics_production_allfix.ps1` | 3000 graphs, allfix, 100 ep, Adam-only (LBFGS off) |
+| **2 Synthetic polish** (optional) | `go_kinematics_production_allfix_finetune.ps1 -ContinuityFocus` | Lower LR, mild BC; same synthetic corpus |
+| **3 Clinical anchors** | `go_kinematics_clinical_anchor_finetune.ps1` | `graphs_kinematics_anchors/carreau/patient*.pt` + synthetic cap |
+
+**Clinical phase details**
+
+- Data: `KINEMATICS_INCLUDE_PATIENT_ANCHORS=1` merges `patient*.pt` into Carreau load; `KINEMATICS_GRAPH_CAP` keeps ~80–120 synthetic graphs for regularization.
+- Val: `KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS` (default `patient007`) — holdout patients **never train**; synthetic still has stratified val.
+- Sampling: `KINEMATICS_CLINICAL_ANCHOR_BOOST=10` on train steps.
+- Writes to `outputs/kinematics/clinical_anchor_finetune/` (does not overwrite global best until promoted).
+
+**Promotion gates** (before `Copy-Item` to `outputs/kinematics/kinematics_best.pth`):
+
+```powershell
+python scripts/check_kinematics_promotion_gates.py --checkpoint outputs/kinematics/clinical_anchor_finetune/kinematics_best.pth
+powershell -File .\scripts\promote_kinematics_checkpoint.ps1 -Checkpoint outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth
+```
+
+Default gates: mean holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**. Tune with `--max-patient-rel-l2` / `--max-synthetic-rel-l2`.
+
 ## GINO_DEQ constructor (must match for biochem load)
 
 | Field | Value |

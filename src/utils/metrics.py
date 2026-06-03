@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.utils.paths import reports_training_dir
 from src.config import PredChannels
+from src.utils.anchor_mask import anchor_node_mask
 from src.utils.rheology import compute_shear_rate
 from torch_geometric.data import Batch
 import torch.nn as nn
@@ -259,81 +260,75 @@ def quantify_performance(
             props = kernels._get_geometric_props(data)
 
             # Resolve node mask safely for batched or unbatched data
-            if hasattr(data, "is_anchor"):
-                node_mask = (
-                    data.is_anchor[data.batch]
-                    if hasattr(data, "batch") and data.batch is not None
-                    else data.is_anchor
+            node_mask = anchor_node_mask(data)
+            if node_mask is not None and node_mask.any():
+                val_anchor_batches += 1
+                y_a = data.y[node_mask, :3]
+                p_a = pred[node_mask, :3]
+                diff_norm = torch.norm(p_a - y_a, p=2)
+                target_norm = torch.norm(y_a, p=2)
+                rel_l2_item = (diff_norm / (target_norm + 1e-8)).item()
+                metrics["rel_l2"].append(rel_l2_item)
+                try:
+                    from src.utils.kinematics_geometry import graph_geometry_level
+
+                    lvl = graph_geometry_level(data, default=-1)
+                    if lvl in (0, 1, 2):
+                        metrics[f"rel_l2_level_{lvl}"].append(rel_l2_item)
+                except Exception:
+                    pass
+                for j, key in enumerate(("rel_l2_u", "rel_l2_v", "rel_l2_p")):
+                    num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
+                    den = torch.norm(y_a[:, j], p=2) + 1e-8
+                    metrics[key].append((num / den).item())
+
+                # Area-specific relative errors on anchor nodes:
+                # near-wall region (low |SDF|) and high |∇SDF| proxy region.
+                sdf_abs = data.x[:, 2].abs()
+                sdf_anchor = sdf_abs[node_mask]
+                if sdf_anchor.numel() > 0:
+                    sdf_q25 = torch.quantile(sdf_anchor, torch.tensor(0.25, device=sdf_anchor.device))
+                    near_wall_mask = node_mask & (sdf_abs <= sdf_q25)
+                    rel_near = _masked_rel_l2(pred, data.y, near_wall_mask)
+                    if rel_near is not None:
+                        metrics["rel_l2_near_wall"].append(float(rel_near.item()))
+
+                grad_proxy = _sdf_grad_proxy(data)
+                if grad_proxy is not None:
+                    gp_anchor = grad_proxy[node_mask]
+                    if gp_anchor.numel() > 0:
+                        gp_q75 = torch.quantile(gp_anchor, torch.tensor(0.75, device=gp_anchor.device))
+                        high_grad_mask = node_mask & (grad_proxy >= gp_q75)
+                        rel_high = _masked_rel_l2(pred, data.y, high_grad_mask)
+                        if rel_high is not None:
+                            metrics["rel_l2_high_sdf_grad"].append(float(rel_high.item()))
+
+                # Explicit shear-rate MSE (anchors only; needs labeled fields)
+                u_t = data.y[:, PredChannels.U:PredChannels.U + 1]
+                v_t = data.y[:, PredChannels.V:PredChannels.V + 1]
+                c_u_t, c_v_t = kernels._compute_derivatives(u_t, props), kernels._compute_derivatives(v_t, props)
+                g_dot_t = compute_shear_rate(
+                    c_u_t[:, 0, 0], c_u_t[:, 1, 0], c_v_t[:, 0, 0], c_v_t[:, 1, 0], eps=1e-6
                 )
 
-                if node_mask.any():
-                    val_anchor_batches += 1
-                    y_a = data.y[node_mask, :3]
-                    p_a = pred[node_mask, :3]
-                    diff_norm = torch.norm(p_a - y_a, p=2)
-                    target_norm = torch.norm(y_a, p=2)
-                    rel_l2_item = (diff_norm / (target_norm + 1e-8)).item()
-                    metrics["rel_l2"].append(rel_l2_item)
-                    try:
-                        from src.utils.kinematics_geometry import graph_geometry_level
+                u_p = pred[:, PredChannels.U:PredChannels.U + 1]
+                v_p = pred[:, PredChannels.V:PredChannels.V + 1]
+                c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
+                g_dot_p = compute_shear_rate(
+                    c_u_p[:, 0, 0], c_u_p[:, 1, 0], c_v_p[:, 0, 0], c_v_p[:, 1, 0], eps=1e-6
+                )
 
-                        lvl = graph_geometry_level(data, default=-1)
-                        if lvl in (0, 1, 2):
-                            metrics[f"rel_l2_level_{lvl}"].append(rel_l2_item)
-                    except Exception:
-                        pass
-                    for j, key in enumerate(("rel_l2_u", "rel_l2_v", "rel_l2_p")):
-                        num = torch.norm(p_a[:, j] - y_a[:, j], p=2)
-                        den = torch.norm(y_a[:, j], p=2) + 1e-8
-                        metrics[key].append((num / den).item())
+                metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
-                    # Area-specific relative errors on anchor nodes:
-                    # near-wall region (low |SDF|) and high |∇SDF| proxy region.
-                    sdf_abs = data.x[:, 2].abs()
-                    sdf_anchor = sdf_abs[node_mask]
-                    if sdf_anchor.numel() > 0:
-                        sdf_q25 = torch.quantile(sdf_anchor, torch.tensor(0.25, device=sdf_anchor.device))
-                        near_wall_mask = node_mask & (sdf_abs <= sdf_q25)
-                        rel_near = _masked_rel_l2(pred, data.y, near_wall_mask)
-                        if rel_near is not None:
-                            metrics["rel_l2_near_wall"].append(float(rel_near.item()))
-
-                    grad_proxy = _sdf_grad_proxy(data)
-                    if grad_proxy is not None:
-                        gp_anchor = grad_proxy[node_mask]
-                        if gp_anchor.numel() > 0:
-                            gp_q75 = torch.quantile(gp_anchor, torch.tensor(0.75, device=gp_anchor.device))
-                            high_grad_mask = node_mask & (grad_proxy >= gp_q75)
-                            rel_high = _masked_rel_l2(pred, data.y, high_grad_mask)
-                            if rel_high is not None:
-                                metrics["rel_l2_high_sdf_grad"].append(float(rel_high.item()))
-
-                    # Explicit shear-rate MSE (anchors only; needs labeled fields)
-                    u_t = data.y[:, PredChannels.U:PredChannels.U + 1]
-                    v_t = data.y[:, PredChannels.V:PredChannels.V + 1]
-                    c_u_t, c_v_t = kernels._compute_derivatives(u_t, props), kernels._compute_derivatives(v_t, props)
-                    g_dot_t = compute_shear_rate(
-                        c_u_t[:, 0, 0], c_u_t[:, 1, 0], c_v_t[:, 0, 0], c_v_t[:, 1, 0], eps=1e-6
+                if phase == "kinematics" and data.y.shape[1] >= 4:
+                    mu_p = pred[node_mask, PredChannels.MU_EFF_ND]
+                    mu_t = data.y[node_mask, PredChannels.MU_EFF_ND]
+                    metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
+                    mu_p_safe = torch.clamp(mu_p, min=1e-6)
+                    mu_t_safe = torch.clamp(mu_t, min=1e-6)
+                    metrics["mu_log_mse"].append(
+                        F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item()
                     )
-
-                    u_p = pred[:, PredChannels.U:PredChannels.U + 1]
-                    v_p = pred[:, PredChannels.V:PredChannels.V + 1]
-                    c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
-                    g_dot_p = compute_shear_rate(
-                        c_u_p[:, 0, 0], c_u_p[:, 1, 0], c_v_p[:, 0, 0], c_v_p[:, 1, 0], eps=1e-6
-                    )
-
-                    metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
-
-                    if phase == "kinematics" and data.y.shape[1] >= 4:
-                        mu_p = pred[node_mask, PredChannels.MU_EFF_ND]
-                        mu_t = data.y[node_mask, PredChannels.MU_EFF_ND]
-                        metrics["mu_mae"].append(F.l1_loss(mu_p, mu_t).item())
-                        mu_p_safe = torch.clamp(mu_p, min=1e-6)
-                        mu_t_safe = torch.clamp(mu_t, min=1e-6)
-                        metrics["mu_log_mse"].append(
-                            F.mse_loss(torch.log(mu_p_safe), torch.log(mu_t_safe)).item()
-                        )
 
             u = pred[:, PredChannels.U:PredChannels.U + 1]
             v = pred[:, PredChannels.V:PredChannels.V + 1]

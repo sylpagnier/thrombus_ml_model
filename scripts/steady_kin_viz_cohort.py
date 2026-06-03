@@ -89,7 +89,7 @@ def main() -> None:
     if args.patients:
         stems = [s.strip() for s in args.stems.split(",") if s.strip()] or _list_anchor_stems()
         for stem in stems:
-            kpath = _kinematics_anchor_graph_path(stem, "newtonian")
+            kpath = _kinematics_anchor_graph_path(stem, str(args.rheology))
             if kpath.is_file():
                 cases.append(("patient", stem, kpath))
             else:

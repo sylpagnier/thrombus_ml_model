@@ -2,7 +2,7 @@
 
 Writes:
   - ``data/processed/graphs_biochem_anchors/<stem>.pt`` (transient biochem + 18ch ``x``)
-  - ``data/processed/graphs_kinematics_anchors/newtonian/<stem>.pt`` (steady ``KINE_Y_SCHEMA``)
+  - ``data/processed/graphs_kinematics_anchors/carreau/<stem>.pt`` (steady ``KINE_Y_SCHEMA``)
 
 Run after enriching anchor meshes (``prepare_biochem_anchors --enrich-sidecars``) and
 with COMSOL exports under ``data/processed/cfd_results_biochem/``.

@@ -181,9 +181,17 @@ def build_kinematics_graph_from_comsol_steady(
     phys_cfg: Optional[PhysicsConfig] = None,
     raw_sidecar_dir: Optional[Any] = None,
     geometry_level: Optional[int] = None,
+    prior_mode: str = "gt_flow",
 ) -> Data:
-    """Assemble a single steady-state kinematics ``Data`` object (trainer schema)."""
-    phys_cfg = phys_cfg or PhysicsConfig(phase="kinematics", rheology="newtonian")
+    """Assemble a single steady-state kinematics ``Data`` object (trainer schema).
+
+    ``prior_mode``:
+      - ``gt_flow``: COMSOL t=0 u,v,mu (+ WSS from GT) in prior channels (anchors).
+      - ``analytic``: Poiseuille/Carreau priors only (synthetic meshes).
+    """
+    from src.data_gen.lib.node_feature_assembly import apply_gt_flow_priors_to_kine_x
+
+    phys_cfg = phys_cfg or PhysicsConfig(phase="kinematics", rheology="carreau")
     ref_mu = float(phys_cfg.mu_ref)
     n = int(mesh_nodes_si.shape[0])
     nodes_nd = torch.tensor(mesh_nodes_si / float(d_bar_si), dtype=torch.float32)
@@ -237,6 +245,21 @@ def build_kinematics_graph_from_comsol_steady(
         inlet_uv_nd=(u_bc.squeeze(-1), v_bc.squeeze(-1)),
         mu_nd_scale=phys_cfg.mu_viscosity_nd_scale,
     )
+
+    mode = str(prior_mode or "analytic").strip().lower()
+    if mode in ("gt", "gt_flow", "gt_t0"):
+        x_tensor = apply_gt_flow_priors_to_kine_x(
+            x_tensor,
+            u_nd=u_nd,
+            v_nd=v_nd,
+            mu_nd=mu_nd,
+            mask_wall=mask_wall,
+            wall_normal=wall_normal_vec,
+            edge_index=edge_index,
+            M_inv=M_inv,
+            V=V,
+            W=W,
+        )
 
     u_nd = u_nd.clone()
     v_nd = v_nd.clone()

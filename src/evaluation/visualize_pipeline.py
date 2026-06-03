@@ -356,8 +356,15 @@ def _kinematics_graph_dir(rheology: str = "newtonian") -> Path:
     return kinematics_graph_rheology_dir(rheology)
 
 
-def _kinematics_anchor_graph_path(stem: str, rheology: str = "newtonian") -> Path:
-    return get_project_root() / f"data/processed/graphs_kinematics_anchors/{rheology}/{stem}.pt"
+def _kinematics_anchor_graph_path(stem: str, rheology: str = "carreau") -> Path:
+    from src.utils.kinematics_paths import resolve_kinematics_anchor_graph
+
+    resolved = resolve_kinematics_anchor_graph(stem, rheology=rheology)
+    if resolved is not None:
+        return resolved
+    from src.utils.kinematics_paths import kinematics_anchor_graph_dir
+
+    return kinematics_anchor_graph_dir(rheology=rheology) / f"{stem}.pt"
 
 
 def _load_kinematics_gino_deq(device: torch.device) -> GINO_DEQ:

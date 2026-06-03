@@ -21,8 +21,10 @@ from src.config import VesselConfig
 from src.data_gen.lib.node_feature_assembly import (
     kinematics_uv_prior_max,
     refresh_kinematics_node_x_on_graph,
+    resolve_anchor_kine_phys_cfg,
 )
 from src.utils.channel_schema import attach_patient_anchor_graph_metadata, infer_missing_schema
+from src.utils.kinematics_paths import kinematics_anchor_graph_dir
 
 
 def main() -> None:
@@ -32,12 +34,10 @@ def main() -> None:
     args = p.parse_args()
 
     anchor_dir = Path(VesselConfig(phase="biochem_anchors").graph_output_dir)
-    kine_dir = _REPO / "data/processed/graphs_kinematics_anchors/newtonian"
+    kine_dir = kinematics_anchor_graph_dir()
     stems = [args.stem.strip()] if args.stem.strip() else sorted(s.stem for s in anchor_dir.glob("*.pt"))
 
-    from src.config import PhysicsConfig
-
-    phys = PhysicsConfig(phase="kinematics", rheology="newtonian")
+    phys = resolve_anchor_kine_phys_cfg()
     n = 0
     for stem in stems:
         for path in (anchor_dir / f"{stem}.pt", kine_dir / f"{stem}.pt"):

@@ -311,6 +311,64 @@ def split_anchor_physics_stratified(
     }
 
 
+def split_clinical_anchor_train_val(
+    dataset: Sequence[Any],
+    *,
+    seed: int = 42,
+    train_ratio: float = 0.9,
+    holdout_stems: Sequence[str] | None = None,
+) -> Dict[str, Any]:
+    """Train/val split with fixed clinical patient holdout + stratified synthetic val.
+
+    Clinical graphs (``is_clinical_anchor``) with stems in *holdout_stems* are **val-only**.
+    Other clinical patients train. Non-clinical graphs use ``split_anchor_physics_stratified``.
+  """
+    import os
+
+    raw = os.environ.get("KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS", "patient007").strip()
+    if holdout_stems is None:
+        holdout = {s.strip() for s in raw.split(",") if s.strip()}
+    else:
+        holdout = {str(s).strip() for s in holdout_stems if str(s).strip()}
+
+    clinical = [d for d in dataset if getattr(d, "is_clinical_anchor", False)]
+    other = [d for d in dataset if not getattr(d, "is_clinical_anchor", False)]
+
+    val_clinical = [d for d in clinical if getattr(d, "graph_stem", "") in holdout]
+    train_clinical = [d for d in clinical if getattr(d, "graph_stem", "") not in holdout]
+
+    if other:
+        syn = split_anchor_physics_stratified(other, seed=seed, train_ratio=train_ratio)
+        train = train_clinical + syn["train"]
+        val = val_clinical + syn["val"]
+        n_anchors = len([d for d in train if graph_has_anchor(d)])
+        n_physics = len([d for d in train if not graph_has_anchor(d)])
+    else:
+        train = train_clinical
+        val = val_clinical
+        n_anchors = len(train_clinical)
+        n_physics = 0
+
+    import random
+
+    rng = random.Random(seed)
+    rng.shuffle(train)
+    rng.shuffle(val)
+    if holdout:
+        print(
+            f"[kin] Clinical split: holdout val stems={sorted(holdout)} "
+            f"(train clinical={len(train_clinical)}, val clinical={len(val_clinical)}, "
+            f"synthetic train={len(train) - len(train_clinical)}, "
+            f"synthetic val={len(val) - len(val_clinical)})"
+        )
+    return {
+        "train": train,
+        "val": val,
+        "n_anchors": n_anchors,
+        "n_physics": n_physics,
+    }
+
+
 __all__ = [
     "GeometryCurriculumConfig",
     "attach_geometry_metadata",
@@ -321,6 +379,7 @@ __all__ = [
     "graph_geometry_level",
     "read_geometry_level_from_mesh_json",
     "split_anchor_physics_stratified",
+    "split_clinical_anchor_train_val",
     "train_pool_for_epoch",
     "vessel_index_from_stem",
     "warn_if_single_level_cohort",

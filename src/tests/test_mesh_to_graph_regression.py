@@ -79,7 +79,7 @@ def test_kinematics_saved_graph_includes_wls_and_sparse_gradients_without_laplac
 
 
 def test_biochem_non_anchor_transient_graph_matches_process_file_shape(tmp_path):
-    """Biochem non-anchor: transient ``y``, time axis, biochem BCs, sparse operators (same as pipeline)."""
+    """Biochem non-anchor: transient ``y``, dual-x (18ch kine + 15ch biochem)."""
     ctx = _base_context(num_nodes=3)
     bio_cfg = BiochemConfig(phase="biochem")
     num_times = bio_cfg.num_time_steps
@@ -92,11 +92,13 @@ def test_biochem_non_anchor_transient_graph_matches_process_file_shape(tmp_path)
     v_prior = torch.tensor([0.0, 0.1, 0.0], dtype=torch.float32)
     mu_prior = torch.ones(3, dtype=torch.float32)
     uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
-    x_tensor = torch.zeros((3, 15), dtype=torch.float32)
+    x_kine = torch.zeros((3, 18), dtype=torch.float32)
+    x_biochem = torch.zeros((3, 15), dtype=torch.float32)
     bio_inlet_bc = default_biochem_bio_inlet_bc(3)
 
     data = assemble_biochem_transient_graph_data(
-        x_tensor=x_tensor,
+        x_tensor=x_kine,
+        x_biochem=x_biochem,
         y_tensor_series=y_series,
         eval_times_tensor=tvec,
         edge_index=ctx["edge_index"],
@@ -124,6 +126,10 @@ def test_biochem_non_anchor_transient_graph_matches_process_file_shape(tmp_path)
     assert data.y.shape == (num_times, 3, 16)
     assert data.t.numel() == num_times
     assert data.y.shape[0] == data.t.shape[0]
+    assert data.x.shape[1] == 18
+    assert data.x_biochem.shape[1] == 15
+    assert data.x_schema == "kine_x_v1_18ch"
+    assert data.x_biochem_schema == "biochem_x_v1_15ch"
     assert data.u_inlet_bc.shape[1] == 2
     assert data.bio_inlet_bc.shape == (3, 9)
     assert data.G_x.is_sparse and data.G_y.is_sparse and data.Laplacian.is_sparse

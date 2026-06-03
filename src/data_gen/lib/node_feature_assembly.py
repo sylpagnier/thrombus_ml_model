@@ -309,6 +309,54 @@ def kinematics_uv_prior_max(x_kine: torch.Tensor) -> float:
     return float(x_kine[:, NodeFeat.UV_PRIOR].abs().max().item())
 
 
+def apply_gt_flow_priors_to_kine_x(
+    x_kine: torch.Tensor,
+    *,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    mu_nd: torch.Tensor,
+    mask_wall: torch.Tensor,
+    wall_normal: torch.Tensor,
+    edge_index: torch.Tensor,
+    M_inv: torch.Tensor,
+    V: torch.Tensor,
+    W: torch.Tensor,
+) -> torch.Tensor:
+    """Overwrite ``uv_prior`` / ``mu_prior`` / ``wss_prior`` from COMSOL t=0 fields (anchor cheat)."""
+    from src.data_gen.lib.kinematics_graph_builder import comsol_fields_to_kinematics_y
+
+    x = x_kine.clone()
+    u1 = u_nd.reshape(-1).clone()
+    v1 = v_nd.reshape(-1).clone()
+    u1 = u1.clone()
+    v1 = v1.clone()
+    u1[mask_wall.view(-1).bool()] = 0.0
+    v1[mask_wall.view(-1).bool()] = 0.0
+    x[:, NodeFeat.UV_PRIOR] = torch.stack([u1, v1], dim=1)
+    x[:, NodeFeat.MU_PRIOR] = mu_nd.reshape(-1, 1)
+    y5 = comsol_fields_to_kinematics_y(
+        u_nd=u1,
+        v_nd=v1,
+        p_nd=torch.zeros_like(u1),
+        mu_nd=mu_nd.reshape(-1),
+        wall_normal_vec=wall_normal,
+        mask_wall=mask_wall.view(-1).bool(),
+        edge_index=edge_index,
+        M_inv=M_inv,
+        V=V,
+        W=W,
+        ref_mu=1.0,
+    )
+    x[:, NodeFeat.WSS_PRIOR] = y5[:, 4:5]
+    x[:, 10:11] = 1.0
+    return x
+
+
+def resolve_anchor_kine_phys_cfg() -> PhysicsConfig:
+    """Carreau Stage-A config for biochem COMSOL anchors (matches COMSOL rheology)."""
+    return PhysicsConfig(phase="kinematics", rheology="carreau")
+
+
 def patch_kinematics_priors_on_graph(
     data,
     *,
@@ -350,7 +398,7 @@ def patch_kinematics_priors_on_graph(
         centerline_pts_nd=cl_pts,
         centerline_tangents_nd=cl_tan,
     )
-    u_prior, v_prior, _mu_prior, wss_prior = build_poiseuille_priors(
+    u_prior, v_prior, mu_prior, wss_prior = build_poiseuille_priors(
         pos_nd=pos_nd,
         sdf_nd=sdf_nd,
         wall_normal=wall_normal,
@@ -376,6 +424,8 @@ def patch_kinematics_priors_on_graph(
         dim=1,
     )
     data.x[:, NodeFeat.WSS_PRIOR] = wss_prior.unsqueeze(1)
+    data.x[:, NodeFeat.MU_PRIOR] = mu_prior.unsqueeze(1)
+    data.x[:, 10:11] = 1.0 if phys_cfg.viscosity_model == "carreau" else 0.0
     return True
 
 

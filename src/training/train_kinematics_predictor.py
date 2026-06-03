@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import ConstantLR, LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -50,9 +50,47 @@ from src.utils.kinematics_geometry import (
     count_anchor_physics,
     geometry_sample_weight,
     split_anchor_physics_stratified,
+    split_clinical_anchor_train_val,
     train_pool_for_epoch,
     warn_if_single_level_cohort,
 )
+
+
+def resolve_kinematics_train_val_split(
+    dataset,
+    *,
+    geometry_enabled: bool,
+    seed: int = 42,
+    train_ratio: float = 0.9,
+):
+    """Clinical holdout split when patient anchors merged; else stratified default."""
+    use_clinical = os.environ.get("KINEMATICS_INCLUDE_PATIENT_ANCHORS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if use_clinical and any(getattr(d, "is_clinical_anchor", False) for d in dataset):
+        return split_clinical_anchor_train_val(dataset, seed=seed, train_ratio=train_ratio)
+    if geometry_enabled:
+        return split_anchor_physics_stratified(dataset, seed=seed, train_ratio=train_ratio)
+    return split_anchor_physics(dataset, seed=seed, train_ratio=train_ratio)
+
+
+def _mean_rel_l2_on_graphs(model, graphs, kernels, device, *, stems: set[str] | None = None):
+    """Mean anchor rel-L2 on a list of graphs (optional stem filter)."""
+    from src.utils.metrics import quantify_performance
+
+    if not graphs:
+        return float("nan"), 0
+    subset = graphs
+    if stems is not None:
+        subset = [d for d in graphs if getattr(d, "graph_stem", "") in stems]
+    if not subset:
+        return float("nan"), 0
+    loader = DataLoader(subset, batch_size=1, shuffle=False)
+    scores = quantify_performance(model, loader, kernels, device, phase="kinematics")
+    return float(scores.get("rel_l2", float("nan"))), len(subset)
 
 # Ignore known PyTorch scheduler deprecation noise in training logs.
 warnings.filterwarnings("ignore", category=UserWarning, message="The epoch parameter.*")
@@ -554,10 +592,7 @@ def train_kinematics(
                 except (ValueError, RuntimeError):
                     print("[kin] WARN could not restore scheduler state; fresh scheduler.")
             start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
-            if math.isfinite(float(ckpt.get("composite", float("nan")))):
-                best_val_composite_loss = float(ckpt["composite"])
-            elif "best_val_composite_loss" in ckpt:
-                best_val_composite_loss = float(ckpt["best_val_composite_loss"])
+            best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
             # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
             lbfgs_initialized = False
             print(f"[kin] Loaded full training state (next epoch: {start_epoch})")
@@ -569,17 +604,9 @@ def train_kinematics(
             print(f"[kin] Loaded model-only checkpoint (next epoch: {start_epoch})")
 
     if finetune_lr is not None and finetune_lr > 0:
-        ft_lr = float(finetune_lr)
         for pg in optimizer.param_groups:
-            pg["lr"] = ft_lr
-        # Schedulers snapshot base_lrs at construction (1e-4). Without a reset, the first
-        # scheduler.step() snaps LR back toward the production schedule (~1e-4).
-        ft_steps = max(1, int(epochs) - int(start_epoch))
-        scheduler = ConstantLR(optimizer, factor=1.0, total_iters=ft_steps)
-        print(
-            f"[kin] Finetune LR set to {ft_lr:.2e} "
-            f"(constant for {ft_steps} epochs; scheduler reset)"
-        )
+            pg["lr"] = float(finetune_lr)
+        print(f"[kin] Finetune LR set to {float(finetune_lr):.2e}")
 
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
@@ -679,10 +706,9 @@ def train_kinematics(
                 shuffle_graphs=shuffle_graphs,
                 graph_load_seed=graph_load_seed,
             )
-            if geometry_cfg.enabled:
-                splits = split_anchor_physics_stratified(dataset)
-            else:
-                splits = split_anchor_physics(dataset)
+            splits = resolve_kinematics_train_val_split(
+                dataset, geometry_enabled=geometry_cfg.enabled
+            )
             train_data, val_data = splits["train"], splits["val"]
             n_anchors, n_physics = splits["n_anchors"], splits["n_physics"]
             current_phase_loaded = target_rheology
@@ -944,10 +970,20 @@ def train_kinematics(
                 if val is not None and val == val:
                     level_bits.append(f"L{lvl}={float(val):.3f}")
             level_msg = f" | {' '.join(level_bits)}" if level_bits else ""
+            holdout_raw = os.environ.get("KINEMATICS_VAL_HOLDOUT_PATIENT_STEMS", "").strip()
+            patient_msg = ""
+            p_rel, p_n = float("nan"), 0
+            if holdout_raw and os.environ.get("KINEMATICS_INCLUDE_PATIENT_ANCHORS", "").strip():
+                holdout = {s.strip() for s in holdout_raw.split(",") if s.strip()}
+                p_rel, p_n = _mean_rel_l2_on_graphs(
+                    model, val_data, kernels, device, stems=holdout
+                )
+                if p_n > 0 and math.isfinite(p_rel):
+                    patient_msg = f" | patient_holdout_rel_L2={p_rel:.3f} (n={p_n})"
             if math.isfinite(rel_l2) and math.isfinite(continuity):
                 print(
                     f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
-                    f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}"
+                    f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}{patient_msg}"
                 )
             else:
                 print(
@@ -1000,6 +1036,9 @@ def train_kinematics(
                     lvl_val = scores.get(key)
                     if lvl_val is not None and lvl_val == lvl_val:
                         val_record[key] = float(lvl_val)
+                if patient_msg:
+                    val_record["patient_holdout_rel_l2"] = float(p_rel)
+                    val_record["patient_holdout_n"] = int(p_n)
                 with open(kinematics_dir() / "kinematics_validation.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(val_record) + "\n")
             except OSError:

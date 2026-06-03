@@ -18,7 +18,11 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
-from src.config import BIOCHEM_T_MAX, VesselConfig, PhysicsConfig, BiochemConfig
+from src.config import BIOCHEM_T_MAX, NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig
+from src.data_gen.lib.node_feature_assembly import (
+    build_biochem_bc_x_tensor,
+    build_kinematics_node_x_tensor,
+)
 from .mesh_wls import gmsh_line_boundary_masks, precompute_wls_operators
 from .graph_velocity_priors import (
     mass_conserving_umax_nd,
@@ -32,6 +36,7 @@ from src.utils.channel_schema import (
     BIO_X_SCHEMA,
     BIO_Y_SCHEMA,
     KINE_Y_SCHEMA,
+    attach_biochem_synthetic_graph_metadata,
     attach_channel_metadata,
 )
 from src.utils.units import MESH_UNIT_M, assert_mesh_unit
@@ -75,8 +80,9 @@ def assemble_biochem_transient_graph_data(
     mu_prior: torch.Tensor,
     bio_inlet_bc: torch.Tensor,
     outlet_normal: torch.Tensor,
+    x_biochem: torch.Tensor | None = None,
 ) -> Data:
-    """Biochem non-anchor graphs: transient ``y`` + biochemistry + serialized sparse operators."""
+    """Biochem non-anchor graphs: transient ``y`` + optional dual-x (18ch kine + 15ch biochem)."""
     num_nodes = x_tensor.shape[0]
     data = Data(
         x=x_tensor,
@@ -102,6 +108,9 @@ def assemble_biochem_transient_graph_data(
         bio_inlet_bc=bio_inlet_bc,
         outlet_normal=outlet_normal,
     )
+    if x_biochem is not None:
+        data.x_biochem = x_biochem
+        return attach_biochem_synthetic_graph_metadata(data, mask_wall=mask_wall)
     return attach_channel_metadata(
         data,
         x_schema=BIO_X_SCHEMA,
@@ -542,39 +551,52 @@ class MeshToGraphPhase3:
         # 5. WSS Prior: MASKED to wall boundary
         wss_prior = (mu_prior * gamma_dot_prior) * mask_wall.float()
 
-        # --- Final Assembly ---
-        m_in = mask_inlet.float().unsqueeze(1)
-        m_out = mask_outlet.float().unsqueeze(1)
-        m_wall = mask_wall.float().unsqueeze(1)
-
+        # --- Dual-x assembly: 18ch kine (Stage-A) + 15ch biochem BC layout ---
         u_bc = torch.zeros((len(nodes), 1), dtype=torch.float32)
         v_bc = torch.zeros((len(nodes), 1), dtype=torch.float32)
         u_bc[mask_inlet, 0] = u_prior[mask_inlet]
         v_bc[mask_inlet, 0] = v_prior[mask_inlet]
-
         p_bc = torch.zeros((len(nodes), 1), dtype=torch.float32)
-        uv_mask = (mask_inlet | mask_wall).float().unsqueeze(1)
-        p_mask = mask_outlet.float().unsqueeze(1)
-        mu_bc = mu_prior.view(-1, 1)
-        mu_mask = torch.ones((len(nodes), 1), dtype=torch.float32)
 
-        x_tensor = torch.cat([
-            pos_nd_tensor,  # [0:2]
-            sdf_tensor,  # [2:3]
-            wall_normal_vec,  # [3:5]
-            m_in,  # [5:6]
-            m_out,  # [6:7]
-            m_wall,  # [7:8]
-            u_bc,  # [8:9]
-            v_bc,  # [9:10]
-            p_bc,  # [10:11]
-            uv_mask,  # [11:12]
-            p_mask,  # [12:13]
-            mu_bc,  # [13:14]
-            mu_mask,  # [14:15]
-        ], dim=1)
+        spine_tangents_nd = meta.get("centerline_tangents")
+        if spine_tangents_nd is not None:
+            spine_tangents_nd = np.asarray(spine_tangents_nd, dtype=np.float64)
 
-
+        phys_kine = PhysicsConfig(phase="kinematics", rheology="carreau")
+        x_kine, u_prior_vec, mu_prior_vec = build_kinematics_node_x_tensor(
+            pos_nd=pos_nd_tensor,
+            sdf_nd=sdf_tensor,
+            wall_normal=wall_normal_vec,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            d_bar_si=float(d_bar),
+            u_ref=float(u_ref),
+            phys_cfg=phys_kine,
+            wall_tree=tree_wall,
+            edge_index=edge_index,
+            G_x=G_x,
+            G_y=G_y,
+            centerline_pts_nd=spine_pts_nd,
+            centerline_tangents_nd=spine_tangents_nd,
+            inlet_uv_nd=(u_prior, v_prior),
+            mu_nd_scale=mu_nd_scale,
+        )
+        x_biochem = build_biochem_bc_x_tensor(
+            pos_nd=pos_nd_tensor,
+            sdf_nd=sdf_tensor,
+            wall_normal=wall_normal_vec,
+            mask_inlet=mask_inlet,
+            mask_outlet=mask_outlet,
+            mask_wall=mask_wall,
+            u_bc=u_bc,
+            v_bc=v_bc,
+            p_bc=p_bc,
+            mu_bc_nd=mu_prior_vec.reshape(-1),
+        )
+        x_tensor = x_kine
+        u_prior = u_prior_vec
+        mu_prior = mu_prior_vec
 
         # --- PHASE 3 NON-ANCHOR FORMAT: build transient-compatible dummy trajectory ---
         if self.vessel_cfg.phase in ("biochem", "biochem_mix") and not is_anchor:
@@ -593,6 +615,7 @@ class MeshToGraphPhase3:
             uv_inlet_bc = torch.cat([u_prior.view(-1, 1), v_prior.view(-1, 1)], dim=1)
             data = assemble_biochem_transient_graph_data(
                 x_tensor=x_tensor,
+                x_biochem=x_biochem,
                 y_tensor_series=y_tensor_series,
                 eval_times_tensor=eval_times_tensor,
                 edge_index=edge_index,

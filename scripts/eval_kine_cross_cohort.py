@@ -11,6 +11,7 @@ from true geometry generalization.
 
 Example:
     python scripts/eval_kine_cross_cohort.py
+    python scripts/eval_kine_cross_cohort.py --rheology carreau --levels 0,1,2
     python scripts/eval_kine_cross_cohort.py --max-per-cohort 20 --x-mode both
 """
 
@@ -38,11 +39,13 @@ from src.architecture.kinematics_model_config import (
     resolve_gino_deq_ctor_kwargs,
 )
 from src.config import NodeFeat, PhysicsConfig, PredChannels
+from src.utils.anchor_mask import anchor_node_mask
 from src.data_gen.lib.node_feature_assembly import (
     kinematics_uv_prior_max,
     refresh_kinematics_node_x_on_graph,
 )
 from src.utils.kinematics_geometry import graph_geometry_level, read_geometry_level_from_mesh_json
+from src.utils.kinematics_paths import resolve_kinematics_anchor_graph
 from src.utils.paths import data_root, resolve_checkpoint
 
 XMode = Literal["native", "kine_layout", "both"]
@@ -71,15 +74,15 @@ class GraphMetrics:
     width_nd_max: float
 
 
-def _load_kinematics_model(device: torch.device):
-    ckpt_path = resolve_checkpoint("a", "kinematics_best.pth")
+def _load_kinematics_model(device: torch.device, *, rheology: str = "newtonian", ckpt_path: Path | None = None):
+    ckpt_path = Path(ckpt_path) if ckpt_path is not None else resolve_checkpoint("a", "kinematics_best.pth")
     raw = torch.load(ckpt_path, map_location=device, weights_only=False)
     meta, state = kinematics_checkpoint_tensors(raw)
     ref = load_kinematics_reference_record()
     if ref and not meta.get("model_config"):
         meta = {**meta, "model_config": ref.get("model_config")}
     ctor = resolve_gino_deq_ctor_kwargs(meta, state)
-    phys = PhysicsConfig(phase="kinematics", rheology="newtonian")
+    phys = PhysicsConfig(phase="kinematics", rheology=str(rheology).strip().lower())
     model = build_gino_deq_from_ctor(phys, ctor).to(device)
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -189,12 +192,10 @@ def _apply_x_mode(data, x_mode: str, phys: PhysicsConfig, *, stem: str = ""):
 
 
 def _node_mask(data) -> torch.Tensor:
-    if hasattr(data, "is_anchor"):
-        ia = data.is_anchor.view(-1).bool()
-        if ia.numel() == 1:
-            return torch.ones(data.num_nodes, dtype=torch.bool, device=ia.device)
-        return ia
-    return torch.ones(data.num_nodes, dtype=torch.bool)
+    mask = anchor_node_mask(data)
+    if mask is not None:
+        return mask
+    return torch.ones(data.num_nodes, dtype=torch.bool, device=data.x.device)
 
 
 def _metrics(pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
@@ -286,11 +287,26 @@ def _cohort_label(level: int) -> str:
     return "kine_unknown"
 
 
+def _level_for_kine_graph(pt: Path, mesh_dir: Path) -> int:
+    """Resolve L0/L1/L2 from mesh JSON, graph sidecar, or ``geometry_level`` on ``.pt``."""
+    lvl = read_geometry_level_from_mesh_json(mesh_dir, pt.stem)
+    if lvl is not None:
+        return int(lvl)
+    sidecar = pt.with_suffix(".json")
+    if sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            if meta.get("level") is not None:
+                return int(meta["level"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    data = torch.load(pt, map_location="cpu", weights_only=False)
+    return graph_geometry_level(data, default=-1)
+
+
 def _iter_kine_graphs(kine_dir: Path, levels: Optional[set[int]], mesh_dir: Path) -> Iterable[tuple[str, Path]]:
     for pt in sorted(kine_dir.glob("vessel_*.pt")):
-        lvl = read_geometry_level_from_mesh_json(mesh_dir, pt.stem)
-        if lvl is None:
-            lvl = -1
+        lvl = _level_for_kine_graph(pt, mesh_dir)
         if levels is not None and lvl not in levels:
             continue
         yield _cohort_label(lvl), pt
@@ -328,13 +344,22 @@ def main() -> int:
         help="Patient x: biochem layout vs remapped kine layout. Kine graphs always native.",
     )
     p.add_argument("--levels", type=str, default="0,1", help="Kinematics geometry levels to include (comma sep).")
+    p.add_argument(
+        "--rheology",
+        type=str,
+        default="newtonian",
+        choices=("newtonian", "carreau"),
+        help="Graph tree under data/processed/graphs_kinematics/<rheology>/ (default: newtonian).",
+    )
+    p.add_argument("--ckpt", type=Path, default=None, help="Override kinematics checkpoint path.")
     p.add_argument("--out-csv", type=Path, default=None, help="Optional CSV path for per-graph rows.")
     p.add_argument("--seed", type=int, default=0, help="Shuffle seed when subsampling.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dr = data_root()
-    kine_dir = dr / "processed/graphs_kinematics/newtonian"
+    rheology = str(args.rheology).strip().lower()
+    kine_dir = dr / "processed/graphs_kinematics" / rheology
     patient_dir = dr / "processed/graphs_biochem_anchors"
     mesh_dir = dr / "raw/kinematics/meshes"
     if not mesh_dir.is_dir():
@@ -342,11 +367,14 @@ def main() -> int:
 
     level_set = {int(x.strip()) for x in args.levels.split(",") if x.strip() != ""}
 
-    model, ckpt_path, ctor = _load_kinematics_model(device)
-    phys = PhysicsConfig(phase="kinematics", rheology="newtonian")
+    model, ckpt_path, ctor = _load_kinematics_model(device, rheology=rheology, ckpt_path=args.ckpt)
+    phys = PhysicsConfig(phase="kinematics", rheology=rheology)
     print(f"[i] checkpoint: {ckpt_path}")
-    print(f"[i] ctor: in_ch={ctor.get('in_channels')} width_priors={ctor.get('use_width_priors')} siren={ctor.get('use_siren_decoder')}")
+    print(f"[i] rheology: {rheology} | graphs: {kine_dir}")
+    print(f"[i] ctor: in_ch={ctor.get('in_channels')} width_priors={ctor.get('use_width_priors')} siren={ctor.get('use_siren_decoder')} wss_fuse={ctor.get('wss_fuse')}")
     print(f"[i] device: {device}")
+    if not kine_dir.is_dir():
+        print(f"[WARN] kinematics graph dir missing: {kine_dir}")
 
     x_modes: list[str]
     if args.x_mode == "both":
@@ -358,13 +386,16 @@ def main() -> int:
     for cohort, pt in _iter_kine_graphs(kine_dir, level_set, mesh_dir):
         jobs.append((cohort, pt, "native"))
     for pt in sorted(patient_dir.glob("*.pt")):
-        g = torch.load(pt, map_location="cpu", weights_only=False)
+        stem = pt.stem
+        kpath = resolve_kinematics_anchor_graph(stem, rheology=rheology)
+        eval_pt = kpath if kpath is not None else pt
+        g = torch.load(eval_pt, map_location="cpu", weights_only=False)
         has_kine_x = int(g.x.shape[1]) >= NodeFeat.WIDTH_D2.stop
         if has_kine_x:
-            jobs.append(("patient", pt, "native"))
+            jobs.append(("patient", eval_pt, "native"))
         else:
             for xm in x_modes:
-                jobs.append(("patient", pt, xm))
+                jobs.append(("patient", eval_pt, xm))
 
     if args.max_per_cohort > 0:
         import random

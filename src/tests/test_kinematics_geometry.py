@@ -6,11 +6,12 @@ from src.utils.kinematics_geometry import (
     cohort_level_counts,
     geometry_sample_weight,
     split_anchor_physics_stratified,
+    split_clinical_anchor_train_val,
     train_pool_for_epoch,
 )
 
 
-def _graph(level: int, anchor: bool) -> Data:
+def _graph(level: int, anchor: bool, *, stem: str = "") -> Data:
     d = Data(
         x=torch.zeros(4, 3),
         edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
@@ -19,6 +20,8 @@ def _graph(level: int, anchor: bool) -> Data:
     )
     d.geometry_level = torch.tensor([level], dtype=torch.int8)
     d.config_id = 0
+    if stem:
+        d.graph_stem = stem
     return d
 
 
@@ -63,3 +66,20 @@ def test_cohort_level_counts():
     ds = [_graph(0, False), _graph(2, True)]
     c = cohort_level_counts(ds)
     assert c[0] == 1 and c[2] == 1
+
+
+def test_clinical_holdout_split():
+    p7 = _graph(1, True, stem="patient007")
+    p7.is_clinical_anchor = True
+    p3 = _graph(1, True, stem="patient003")
+    p3.is_clinical_anchor = True
+    syn = _graph(2, False, stem="vessel_0001")
+    dataset = [p7, p3, syn, _graph(0, False, stem="vessel_0002")]
+    splits = split_clinical_anchor_train_val(
+        dataset, seed=0, holdout_stems=["patient007"]
+    )
+    val_stems = {getattr(d, "graph_stem", "") for d in splits["val"]}
+    assert "patient007" in val_stems
+    train_stems = {getattr(d, "graph_stem", "") for d in splits["train"]}
+    assert "patient007" not in train_stems
+    assert "patient003" in train_stems
