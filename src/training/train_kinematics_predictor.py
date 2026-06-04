@@ -683,9 +683,18 @@ def train_kinematics(
                 start_epoch = int(m.group(1))
             print(f"[kin] Loaded model-only checkpoint (next epoch: {start_epoch})")
 
-    if finetune_lr is not None and finetune_lr > 0:
+    finetune_lr_pinned = False
+
+    def _pin_finetune_lr() -> None:
+        nonlocal finetune_lr_pinned
+        if finetune_lr is None or finetune_lr <= 0 or lbfgs_initialized:
+            return
         for pg in optimizer.param_groups:
             pg["lr"] = float(finetune_lr)
+        finetune_lr_pinned = True
+
+    if finetune_lr is not None and finetune_lr > 0:
+        _pin_finetune_lr()
         # Do not step the production cosine schedule on finetune (ep 83+ LR ~1e-4 bug).
         scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
         print(
@@ -811,6 +820,7 @@ def train_kinematics(
             if stage == 3 and not lbfgs_initialized:
                 print("[kin] Resetting AdamW momentum buffers for stage 3...")
                 optimizer.state.clear()
+                _pin_finetune_lr()
 
         mining_interval = int(geometry_cfg.hard_mining_interval)
         mining_start = (
@@ -889,6 +899,7 @@ def train_kinematics(
         }
 
         if not lbfgs_initialized:
+            _pin_finetune_lr()
             ema_metrics: dict[str, float] | None = None
             ema_alpha = 0.1
             use_bar = kinematics_tqdm_enabled()
