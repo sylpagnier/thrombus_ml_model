@@ -179,12 +179,12 @@ $ladderParams = @{
   SkipFoundation = $true
   Holdout        = $Holdout
 }
-if ($SkipSyntheticPolish) { $ladderParams["SkipSyntheticPolish"] = $true }
-if ($SkipClinicalAnchors) { $ladderParams["SkipClinicalAnchors"] = $true }
-if ($SkipPromote) { $ladderParams["SkipPromote"] = $true }
-if ($RequireClinical) { $ladderParams["RequireClinical"] = $true }
-if (-not $NoContinuityFocus) { $ladderParams["ContinuityFocus"] = $true }
-if ($Quiet) { $ladderParams["Quiet"] = $true }
+if ($SkipSyntheticPolish) { $ladderParams.SkipSyntheticPolish = $true }
+if ($SkipClinicalAnchors) { $ladderParams.SkipClinicalAnchors = $true }
+if ($SkipPromote) { $ladderParams.SkipPromote = $true }
+if ($RequireClinical) { $ladderParams.RequireClinical = $true }
+if (-not $NoContinuityFocus) { $ladderParams.ContinuityFocus = $true }
+if ($Quiet) { $ladderParams.Quiet = $true }
 
 & (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderParams
 if ($LASTEXITCODE -ne 0) {
