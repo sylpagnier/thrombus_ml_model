@@ -840,11 +840,29 @@ class PatientDataExtractor:
     ) -> None:
         """Batch-extract all anchor meshes (optionally pull COMSOL fields first)."""
         if stems is None:
-            files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
-            if len(files) == 0:
-                print(f"CRITICAL ERROR: No .msh or .nas files found in {self.raw_dir}")
+            from src.data_gen.lib.biochem_comsol_auto_export import stems_from_phase2_nowound_mph
+
+            mesh_stems = []
+            if self.raw_dir.is_dir():
+                files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
+                mesh_stems = sorted({Path(f).stem for f in files})
+            mph_stems = stems_from_phase2_nowound_mph()
+            seen: set[str] = set()
+            stems = []
+            for s in mesh_stems + mph_stems:
+                if s not in seen:
+                    seen.add(s)
+                    stems.append(s)
+            stems.sort()
+            if not stems:
+                print(f"CRITICAL ERROR: No meshes under {self.raw_dir} and no phase2_nowound_*.mph in comsol_models/")
                 return
-            stems = sorted({Path(f).stem for f in files})
+            if mph_stems and not mesh_stems:
+                print(f"[i] Using {len(mph_stems)} stem(s) from comsol_models/phase2_nowound_*.mph only.")
+            elif mph_stems:
+                extra = [s for s in mph_stems if s not in set(mesh_stems)]
+                if extra:
+                    print(f"[i] Also found COMSOL models without mesh: {', '.join(extra)}")
 
         from src.data_gen.lib.biochem_comsol_auto_export import resolve_biochem_comsol_model_path
 

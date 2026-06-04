@@ -6,8 +6,10 @@ import numpy as np
 
 from src.data_gen.lib.biochem_comsol_auto_export import (
     DOMAIN_FIELD_NAMES,
+    patient_stem_from_phase2_mph,
     phase2_nowound_mph_name_for_stem,
     resolve_biochem_comsol_model_path,
+    stems_from_phase2_nowound_mph,
     write_boundary_txt_from_mesh,
     write_wide_domain_txt,
 )
@@ -18,6 +20,19 @@ def test_phase2_nowound_mph_name_for_patient_stem():
     assert phase2_nowound_mph_name_for_stem("patient007") == "phase2_nowound_007.mph"
     assert phase2_nowound_mph_name_for_stem("patient7") == "phase2_nowound_007.mph"
     assert phase2_nowound_mph_name_for_stem("vessel_001") is None
+
+
+def test_stems_from_phase2_nowound_mph(tmp_path, monkeypatch):
+    models = tmp_path / "comsol_models"
+    models.mkdir()
+    (models / "phase2_nowound_008.mph").write_bytes(b"a")
+    (models / "phase2_template_nowound.mph").write_bytes(b"b")
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_auto_export.comsol_models_dir",
+        lambda: models,
+    )
+    assert stems_from_phase2_nowound_mph() == ["patient008"]
+    assert patient_stem_from_phase2_mph(models / "phase2_nowound_011.mph") == "patient011"
 
 
 def test_resolve_patient_stem_to_phase2_nowound_mph(tmp_path, monkeypatch):

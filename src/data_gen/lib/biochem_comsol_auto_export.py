@@ -83,6 +83,28 @@ def _parse_expr_list(raw: str | None) -> tuple[str, ...]:
 
 
 _PATIENT_STEM_RE = re.compile(r"^patient(\d+)$", re.IGNORECASE)
+_PHASE2_NOWOUND_MPH_RE = re.compile(r"^phase2_nowound_(\d+)\.mph$", re.IGNORECASE)
+
+
+def patient_stem_from_phase2_mph(path: Path) -> str | None:
+    """Map ``phase2_nowound_008.mph`` -> ``patient008``."""
+    m = _PHASE2_NOWOUND_MPH_RE.match(path.name)
+    if not m:
+        return None
+    return f"patient{int(m.group(1)):03d}"
+
+
+def stems_from_phase2_nowound_mph(models_dir: Path | None = None) -> list[str]:
+    """Anchor stems implied by ``comsol_models/phase2_nowound_*.mph`` files."""
+    root = models_dir if models_dir is not None else comsol_models_dir()
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.glob("phase2_nowound_*.mph")):
+        stem = patient_stem_from_phase2_mph(p)
+        if stem:
+            out.append(stem)
+    return out
 
 
 def phase2_nowound_mph_name_for_stem(stem: str) -> str | None:

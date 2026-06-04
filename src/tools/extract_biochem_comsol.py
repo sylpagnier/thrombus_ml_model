@@ -27,7 +27,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.data_gen.lib.biochem_comsol_auto_export import resolve_biochem_comsol_model_path
+from src.data_gen.lib.biochem_comsol_auto_export import (
+    resolve_biochem_comsol_model_path,
+    stems_from_phase2_nowound_mph,
+)
 from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
 from src.data_gen.pipeline_biochem import _auto_scaffold_anchor_sidecars
 from src.tools.prepare_biochem_anchors import enrich_anchor_meshes, stems_in_dir
@@ -93,7 +96,11 @@ def _domain_export_stems(label_dir: Path) -> list[str]:
 def _collect_stems(raw_dir: Path, label_dir: Path) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
-    for stem in stems_in_dir(raw_dir) + _domain_export_stems(label_dir):
+    for stem in (
+        stems_in_dir(raw_dir)
+        + _domain_export_stems(label_dir)
+        + stems_from_phase2_nowound_mph()
+    ):
         if stem not in seen:
             seen.add(stem)
             out.append(stem)
@@ -149,6 +156,8 @@ def _row_tag(s: AnchorExtractStatus) -> str:
         return "[ready]"
     if s.can_extract:
         return "[ready*]"
+    if s.has_comsol_model and not s.has_mesh:
+        return "[mph only]"
     if s.has_domain_txt and not s.has_mesh:
         return "[no mesh]"
     if s.has_mesh and not s.has_domain_txt and s.has_comsol_model:
@@ -167,7 +176,11 @@ def print_status_table(
 ) -> None:
     print(f"\n[i] Mesh dir:    {raw_dir}")
     print(f"[i] COMSOL txt:  {label_dir}")
-    print(f"[i] Graph out:   {proc_dir}\n")
+    print(f"[i] Graph out:   {proc_dir}")
+    mph_only = [s.stem for s in statuses if s.has_comsol_model and not s.has_mesh]
+    if mph_only:
+        print(f"[i] COMSOL .mph without mesh yet: {', '.join(mph_only)}")
+    print()
     if not statuses:
         print("[WARN] No anchor stems found (need .msh/.nas and/or domain .txt exports).")
         return
