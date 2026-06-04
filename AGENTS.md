@@ -40,6 +40,7 @@
 - **Recovery sweep ~10h** (main `graphs_kinematics/newtonian`, 8 scaled recipes, quiet logs): `powershell -File .\scripts\go_kinematics_recovery12h.ps1` (optional `-TargetHours 10`)
 - **Production allfix (default 3-phase loop)**: `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"` — phases 1-3 + promote; `-FoundationOnly` for phase 1 only. Best finetune **20260603** ep **119**: Rel L2 **0.087** (`production_allfix/`)
 - **Synthetic polish only**: `go_kinematics_production_allfix_finetune.ps1 -ContinuityFocus`
+- **Long precision (synth 60ep + clinical 50ep + promote)**: `go_kinematics_precision_long.ps1` (needs `graphs_kinematics_anchors/carreau/patient*.pt`)
 - **Clinical geometry only**: `go_kinematics_clinical_anchor_finetune.ps1`
 - **Stage-A ladder** (orchestrator): `go_kinematics_stage_a_ladder.ps1` (`-SkipFoundation` to resume after phase 1)
 - Doc: [src/docs/KINEMATICS_BEST_ARCHITECTURE.md](src/docs/KINEMATICS_BEST_ARCHITECTURE.md) (Stage-A ladder + geometry table)

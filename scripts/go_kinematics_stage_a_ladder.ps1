@@ -15,6 +15,8 @@ param(
   [switch]$RequireClinical,
   [string]$Resume = "outputs/kinematics/production_allfix/kinematics_best.pth",
   [string]$Holdout = "patient007",
+  [int]$SyntheticFinetuneEpochs = 40,
+  [int]$ClinicalFinetuneEpochs = 25,
   [switch]$ContinuityFocus,
   [switch]$NoContinuityFocus,
   [switch]$Quiet
@@ -53,10 +55,14 @@ if (-not (Test-Path $ckpt)) {
 
 if (-not $SkipSyntheticPolish) {
   Write-Host "[ladder] === phase 2/3: synthetic polish (ContinuityFocus finetune) ==="
-  $ftArgs = @("-Resume", $ckpt)
+  $ftArgs = @(
+    "-Resume", $ckpt,
+    "-FinetuneEpochs", "$SyntheticFinetuneEpochs"
+  )
   $useContinuity = (-not $NoContinuityFocus) -or $ContinuityFocus
   if ($useContinuity) { $ftArgs += "-ContinuityFocus" }
   if ($Quiet) { $ftArgs += "-Quiet" }
+  Write-Host ("[ladder] synthetic polish epochs={0}" -f $SyntheticFinetuneEpochs)
   & (Join-Path $PSScriptRoot "go_kinematics_production_allfix_finetune.ps1") @ftArgs
   if ($LASTEXITCODE -ne 0) { throw "[ladder] phase 2 synthetic polish failed." }
   $ckpt = Join-Path $RepoRoot "outputs\kinematics\production_allfix\kinematics_best.pth"
@@ -73,8 +79,9 @@ if ($SkipClinicalAnchors) {
   Write-Host "[ladder] WARN $msg"
   Write-Host "[ladder] Add patient kine graphs and re-run with -SkipFoundation -SkipSyntheticPolish"
 } else {
-  Write-Host "[ladder] === phase 3/3: clinical geometry finetune (holdout=$Holdout) ==="
-  & (Join-Path $PSScriptRoot "go_kinematics_clinical_anchor_finetune.ps1") -Resume $ckpt -Holdout $Holdout
+  Write-Host ("[ladder] === phase 3/3: clinical geometry finetune (holdout={0}, epochs={1}) ===" -f $Holdout, $ClinicalFinetuneEpochs)
+  & (Join-Path $PSScriptRoot "go_kinematics_clinical_anchor_finetune.ps1") `
+    -Resume $ckpt -Holdout $Holdout -FinetuneEpochs $ClinicalFinetuneEpochs
   if ($LASTEXITCODE -ne 0) { throw "[ladder] phase 3 clinical anchor finetune failed." }
 
   $clinicalBest = Join-Path $RepoRoot "outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth"

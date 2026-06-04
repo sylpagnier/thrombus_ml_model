@@ -12,7 +12,7 @@ One-liners from repo root (see `AGENTS.md` for full ladder):
 | GNODE 9.x (GT vel) | `go_gnode91_smoke.ps1` (9.1); `go_gnode_8h_ladder.ps1` (9.4-9.6 ~8h); `go_gnode99.ps1` (9.9 best-practice clot_band); `snapshot_biochem_teacher*.py`; `_gnode_viz_helpers.ps1` — [GNODE_ODE_LADDER.md](../src/docs/GNODE_ODE_LADDER.md) |
 | GNODE 10-12 (predicted kine) | `go_gnode10_*`; `go_gnode11_*` (11a/11b/finish); **`go_gnode12_lane_a.ps1`** / **`go_gnode12_lane_b.ps1`** (dump + clot); `check_gnode12_lane_*_gate.py`; `_gnode12_env.ps1` |
 | Sweeps | `go_health10h`, `go_visc3h` |
-| Kinematics | **`go_kinematics_production_allfix`** (default 3-phase loop), `go_kinematics_stage_a_ladder`, `go_kinematics_production_allfix_finetune`, `go_kinematics_clinical_anchor_finetune`, `promote_kinematics_checkpoint`, `check_kinematics_promotion_gates.py` |
+| Kinematics | **`go_kinematics_precision_long`** (60+50 ep finetune+clinical), **`go_kinematics_production_allfix`** (3-phase loop), `go_kinematics_stage_a_ladder`, `go_kinematics_production_allfix_finetune`, `go_kinematics_clinical_anchor_finetune`, `promote_kinematics_checkpoint`, `check_kinematics_promotion_gates.py` |
 
 `go_*` scripts set env vars and call `python -m src.training.train_biochem_corrector` or kinematics training directly, except:
 
