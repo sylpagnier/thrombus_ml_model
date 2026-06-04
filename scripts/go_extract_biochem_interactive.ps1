@@ -6,7 +6,7 @@ param(
     [string]$Stem = "",
     [switch]$Force,
     [switch]$ListOnly,
-    [switch]$FromComsol
+    [switch]$NoFromComsol
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +17,7 @@ $pyArgs = @("-m", "src.tools.extract_biochem_comsol")
 if ($Stem) { $pyArgs += @("--stem", $Stem) }
 if ($Force) { $pyArgs += "--force" }
 if ($ListOnly) { $pyArgs += "--list-only" }
-if ($FromComsol) { $pyArgs += "--from-comsol" }
+if ($NoFromComsol) { $pyArgs += "--no-from-comsol" }
 
 Write-Host "[NEW] Biochem COMSOL interactive extract (meshes + cfd_results_biochem -> graphs)" -ForegroundColor Cyan
 python @pyArgs

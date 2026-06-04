@@ -1,10 +1,10 @@
 """Interactive biochem COMSOL -> PyG graph extraction.
 
-**Automated path (recommended):** run the study in COMSOL, save ``<stem>.mph`` next to the
-mesh under ``data/raw/biochem_anchors/``, with COMSOL saves as
-``comsol_models/phase2_nowound_XXX.mph`` (for ``patientXXX``), then::
+**Default:** COMSOL auto-pull is on. Save solves as ``comsol_models/phase2_nowound_XXX.mph``
+(for anchor ``patientXXX``), then run either entry point::
 
-    python -m src.tools.extract_biochem_comsol --stem patient007 --from-comsol
+    python -m src.data_gen.lib.extract_biochem_comsol_data
+    python -m src.tools.extract_biochem_comsol --stem patient007
 
 This samples the solved model via LiveLink (``mph``) and writes
 ``data/processed/cfd_results_biochem/*.txt`` before building graphs.
@@ -15,9 +15,9 @@ PyCharm: **Run** module ``src.tools.extract_biochem_comsol`` (working directory 
 
 CLI::
 
-    python -m src.tools.extract_biochem_comsol --from-comsol
-    python -m src.bin.main data extract-biochem -- --from-comsol --stem patient007
+    python -m src.data_gen.lib.extract_biochem_comsol_data --stem patient007
     python -m src.tools.extract_biochem_comsol --list-only
+    python -m src.data_gen.lib.extract_biochem_comsol_data --no-from-comsol
 """
 
 from __future__ import annotations
@@ -407,8 +407,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--from-comsol",
-        action="store_true",
-        help="Pull domain/boundary txt from a solved .mph via mph before graph extract.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pull domain/boundary txt from solved .mph via mph (default: on).",
     )
     parser.add_argument(
         "--model-path",

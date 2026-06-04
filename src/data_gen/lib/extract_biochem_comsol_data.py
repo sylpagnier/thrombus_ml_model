@@ -31,8 +31,9 @@ class PatientDataExtractor:
     (``STATE_CHANNEL_MU_EFF_ND`` in ``src.config``) is ``mu_effective`` via
     ``PhysicsConfig.viscosity_si_to_nd`` (canonical cross-phase ND viscosity reference).
 
-    Automated COMSOL pull (no manual Results export): ``pull_comsol_exports(stem)`` or
-    ``python -m src.tools.extract_biochem_comsol --from-comsol`` after saving ``<stem>.mph``.
+    Default entry: ``python -m src.data_gen.lib.extract_biochem_comsol_data`` pulls solved
+    ``comsol_models/phase2_nowound_XXX.mph`` (``patientXXX``) via ``pull_comsol_exports``, then
+    builds graphs. Manual COMSOL txt only with ``--no-from-comsol``.
 
     --- Manual COMSOL Export Instructions ---
     Alternatively, export the exact node-wise data from COMSOL to match the .msh topology.
@@ -830,19 +831,76 @@ class PatientDataExtractor:
             f"uv_prior_max={float(x_kine[:, 11:13].abs().max()):.3f}"
         )
 
-    def run(self):
-        # Look for the .nas files now!
-        files = [ f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh") ]
+    def run(
+        self,
+        *,
+        from_comsol: bool = True,
+        force_comsol_pull: bool = False,
+        stems: list[str] | None = None,
+    ) -> None:
+        """Batch-extract all anchor meshes (optionally pull COMSOL fields first)."""
+        if stems is None:
+            files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
+            if len(files) == 0:
+                print(f"CRITICAL ERROR: No .msh or .nas files found in {self.raw_dir}")
+                return
+            stems = sorted({Path(f).stem for f in files})
 
-        if len(files) == 0:
-            print(f"CRITICAL ERROR: No .msh or .nas files found in {self.raw_dir}")
-            return
-
-        stems = sorted(list(set([ Path(f).stem for f in files ])))
+        from src.data_gen.lib.biochem_comsol_auto_export import resolve_biochem_comsol_model_path
 
         for stem in tqdm(stems, desc="Extracting Biochem anchor data"):
+            if from_comsol:
+                domain_txt = self.label_dir / f"{stem}.txt"
+                mph_path = resolve_biochem_comsol_model_path(stem)
+                if mph_path is None:
+                    if not domain_txt.is_file():
+                        print(
+                            f"[WARN] Skipping {stem}: no domain .txt and no "
+                            f"phase2_nowound_XXX.mph for patientXXX in comsol_models/.",
+                            flush=True,
+                        )
+                        continue
+                elif force_comsol_pull or not domain_txt.is_file():
+                    print(f"[i] COMSOL pull {stem} <- {mph_path.name}", flush=True)
+                    try:
+                        self.pull_comsol_exports(stem, model_path=mph_path, force=force_comsol_pull)
+                    except Exception as exc:
+                        print(f"[ERR] COMSOL pull failed for {stem}: {exc}", flush=True)
+                        if not domain_txt.is_file():
+                            continue
             self.process_patient(stem)
 
-if __name__ == "__main__":
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract biochem anchor graphs. Default: pull solved COMSOL fields from "
+            "comsol_models/phase2_nowound_XXX.mph (patientXXX) via mph, then write .pt graphs."
+        )
+    )
+    parser.add_argument("--stem", type=str, default="", help="Only this stem (default: all meshes).")
+    parser.add_argument("--force", action="store_true", help="Re-pull COMSOL txt and overwrite graphs.")
+    parser.add_argument(
+        "--no-from-comsol",
+        action="store_true",
+        help="Require manual cfd_results_biochem/*.txt exports (legacy).",
+    )
+    args = parser.parse_args(argv)
+
+    from src.data_gen.pipeline_biochem import _auto_scaffold_anchor_sidecars
+
     extractor = PatientDataExtractor(phase="biochem_anchors")
-    extractor.run()
+    _auto_scaffold_anchor_sidecars(extractor.raw_dir)
+
+    stem_list = [args.stem.strip()] if args.stem.strip() else None
+    extractor.run(
+        from_comsol=not args.no_from_comsol,
+        force_comsol_pull=args.force,
+        stems=stem_list,
+    )
+
+
+if __name__ == "__main__":
+    main()
