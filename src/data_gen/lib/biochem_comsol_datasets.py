@@ -148,19 +148,44 @@ def resolve_solution_dataset(
     return "dset1"
 
 
+def _boundary_dataset_score(bname: str, label: str, tag: str) -> int:
+    """Higher = better match. Deprioritize edge-only datasets (``edg*``)."""
+    ll = label.lower().strip()
+    tl = tag.lower().strip()
+    if tl.startswith("edg") or ll.startswith("edge"):
+        return -100
+    if ll == bname or tl == bname:
+        return 100
+    if ll.endswith(f" {bname}") or f"_{bname}" in tl:
+        return 50
+    if bname in ll.split():
+        return 40
+    if bname in ll:
+        return 10
+    return -1
+
+
 def resolve_boundary_datasets(model_java) -> dict[str, str]:
-    """Map inlet/outlet/wall -> dataset tags (e.g. Results datasets named Inlet, Outlet, Wall)."""
+    """Map inlet/outlet/wall -> dataset tags (prefer Results ``Inlet``/``Outlet``/``Wall``)."""
     env_map = {
         "inlet": (os.environ.get("BIOCHEM_COMSOL_INLET_DATASET") or "").strip(),
         "outlet": (os.environ.get("BIOCHEM_COMSOL_OUTLET_DATASET") or "").strip(),
         "wall": (os.environ.get("BIOCHEM_COMSOL_WALL_DATASET") or "").strip(),
     }
     found: dict[str, str] = {k: v for k, v in env_map.items() if v}
+    best_score: dict[str, int] = {k: 10_000 for k in found}
 
     for row in list_comsol_datasets(model_java):
-        bname = _label_is_boundary_dataset(str(row.get("label", "")), str(row["tag"]))
-        if bname and bname not in found:
-            found[bname] = str(row["tag"])
+        label = str(row.get("label", ""))
+        tag = str(row["tag"])
+        for bname in _BOUNDARY_NAMES:
+            sc = _boundary_dataset_score(bname, label, tag)
+            if sc < 0:
+                continue
+            prev = best_score.get(bname, -10_000)
+            if sc > prev:
+                best_score[bname] = sc
+                found[bname] = tag
     return found
 
 
@@ -169,6 +194,7 @@ def sample_coords_from_dataset(
     dataset_tag: str,
     *,
     exprs: tuple[str, ...] = ("x", "y"),
+    edim: int | None = 1,
 ) -> np.ndarray:
     """Sample coordinates on a boundary dataset (Points: From dataset), like inlet_nodes export."""
     results = model_java.result()
@@ -177,10 +203,11 @@ def sample_coords_from_dataset(
         interp = results.numerical().create(tag, "Interp")
         interp.set("data", dataset_tag)
         interp.set("expr", list(exprs))
-        try:
-            interp.set("edim", 1)
-        except Exception:
-            pass
+        if edim is not None:
+            try:
+                interp.set("edim", int(edim))
+            except Exception:
+                pass
         raw = interp.getData()
         if len(raw) < 2:
             raise ValueError(f"Dataset {dataset_tag}: expected x,y from Interp, got {len(raw)} arrays.")

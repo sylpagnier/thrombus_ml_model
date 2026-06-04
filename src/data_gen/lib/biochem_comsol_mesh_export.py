@@ -9,6 +9,7 @@ from pathlib import Path
 
 import meshio
 import numpy as np
+from scipy.spatial import cKDTree
 
 from src.data_gen.lib.biochem_comsol_auto_export import _evaluate_at_coords_and_time
 from src.data_gen.lib.biochem_comsol_datasets import resolve_boundary_datasets, sample_coords_from_dataset
@@ -190,6 +191,83 @@ def mesh_has_gmsh_boundary_tags(mesh_path: Path) -> bool:
         return False
 
 
+def _boundary_snap_tol_cm(coords_cm: np.ndarray) -> float:
+    """Distance (cm) to snap volume mesh nodes onto a COMSOL boundary dataset."""
+    raw = (os.environ.get("BIOCHEM_BOUNDARY_SNAP_CM") or "").strip()
+    if raw:
+        return float(raw)
+    pts = np.asarray(coords_cm[:, :2], dtype=np.float64)
+    if pts.shape[0] < 4:
+        return 0.01
+    tree = cKDTree(pts)
+    dist, _ = tree.query(pts, k=2)
+    nn = np.asarray(dist[:, 1], dtype=np.float64)
+    return max(0.002, 0.35 * float(np.median(nn)))
+
+
+def write_boundary_txt_from_mesh_snap_to_datasets(
+    model_java,
+    coords_cm: np.ndarray,
+    label_dir: Path,
+    stem: str,
+    *,
+    boundary_datasets: dict[str, str] | None = None,
+    force: bool = False,
+) -> bool:
+    """Mark volume mesh nodes near Inlet/Outlet/Wall datasets; write their exact mesh coords.
+
+    Avoids the edg* vs NASTRAN node mismatch: boundary txt uses the same nodes as domain export.
+    """
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    bmap = boundary_datasets if boundary_datasets is not None else resolve_boundary_datasets(model_java)
+    if not all(k in bmap for k in ("inlet", "outlet", "wall")):
+        return False
+
+    pts_vol = np.asarray(coords_cm[:, :2], dtype=np.float64)
+    tol_cm = _boundary_snap_tol_cm(coords_cm)
+    ok_all = True
+
+    for bname in ("inlet", "outlet", "wall"):
+        out_path = label_dir / f"{stem}_{bname}.txt"
+        if out_path.is_file() and not force:
+            continue
+        dset_tag = bmap[bname]
+        ref: np.ndarray | None = None
+        for edim in (1, None):
+            try:
+                ref = sample_coords_from_dataset(model_java, dset_tag, edim=edim)
+                break
+            except Exception as exc:
+                logger.debug("[i] %s: dataset %s edim=%s failed: %s", stem, dset_tag, edim, exc)
+        if ref is None or ref.size == 0:
+            ok_all = False
+            continue
+
+        tree = cKDTree(ref[:, :2])
+        dist, _ = tree.query(pts_vol)
+        mask = dist <= tol_cm
+        coords = np.unique(pts_vol[mask], axis=0) if np.any(mask) else np.zeros((0, 2))
+        lines = [
+            f"% Model: mesh nodes snapped to dataset {dset_tag} (tol={tol_cm:.4g} cm)",
+            "% x  y",
+        ]
+        for x, y in coords:
+            lines.append(f"0 0 {x:.10f} {y:.10f}")
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info(
+            "[OK] %s: %s = %d mesh nodes (snap to '%s', %d ref pts, tol=%.4g cm)",
+            stem,
+            bname,
+            len(coords),
+            dset_tag,
+            ref.shape[0],
+            tol_cm,
+        )
+
+    return ok_all
+
+
 def write_boundary_txt_from_boundary_datasets(
     model_java,
     label_dir: Path,
@@ -333,6 +411,22 @@ def ensure_boundary_txt_files(
             force=force_boundary,
         )
         return
+
+    try:
+        if write_boundary_txt_from_mesh_snap_to_datasets(
+            model_java,
+            coords_cm,
+            label_dir,
+            stem,
+            force=force_boundary,
+        ):
+            return
+    except Exception as exc:
+        logger.warning(
+            "[WARN] %s: mesh snap to boundary datasets failed (%s); trying raw dataset coords.",
+            stem,
+            exc,
+        )
 
     try:
         if write_boundary_txt_from_boundary_datasets(

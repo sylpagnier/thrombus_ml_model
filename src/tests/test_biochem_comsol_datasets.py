@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from src.data_gen.lib.biochem_comsol_datasets import (
+    _boundary_dataset_score,
     list_comsol_datasets,
     resolve_boundary_datasets,
     resolve_solution_dataset,
@@ -63,10 +64,16 @@ def test_resolve_solution_dataset_prefers_sol1_link():
     assert resolve_solution_dataset(model, "sol2") == "dset2"
 
 
+def test_boundary_dataset_score_prefers_inlet_over_edg():
+    assert _boundary_dataset_score("inlet", "Inlet", "dset5") > _boundary_dataset_score("inlet", "Inlet", "edg1")
+    assert _boundary_dataset_score("inlet", "Inlet", "edg1") < 0
+
+
 def test_resolve_boundary_datasets_by_label():
     model = _FakeModelJava(
         {
             "dset1": _FakeDataset("Study 1/Solution 1 (sol1)", "sol1"),
+            "edg1": _FakeDataset("Inlet"),
             "dset2": _FakeDataset("Inlet"),
             "dset3": _FakeDataset("Outlet"),
             "dset4": _FakeDataset("Wall"),
