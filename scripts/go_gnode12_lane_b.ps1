@@ -2,6 +2,7 @@
 #
 # A/B vs Lane A (teacher + optional mu unlock): same mu_ratio_max and June anchor cache.
 # Prereq: go_gnode11_finish.ps1 (corrector ckpt in archive or outputs/biochem/).
+# Preflight MinGtPosFrac default 0.38 (not 0.55): corrector pred-flow widens dgamma mask vs Lane A (~0.80).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_b.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_b.ps1 -CorrectorCkpt outputs\biochem\biochem_best_high_mu.pth
@@ -17,7 +18,7 @@ param(
     [string] $ClotLeg = "gnode12_lane_b_clotphi",
     [double] $MuRatioMax = 20,
     [int] $ClotEpochs = 35,
-    [double] $MinGtPosFrac = 0.55,
+    [double] $MinGtPosFrac = 0.38,
     [double] $MinClotMinF1 = 0.26,
     [switch] $SkipDump,
     [switch] $SkipClot,

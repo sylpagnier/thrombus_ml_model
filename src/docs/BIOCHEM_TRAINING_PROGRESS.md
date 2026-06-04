@@ -138,7 +138,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | **GNODE 11b** (step-3 smoke) | `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0` | **Pass (plumbing)** | **§167**: `20260604T105007Z`; gate `--step3`; mu flat; species OK; effective **2+2 ep** (CLI restore bug, fixed) |
 | **GNODE 11 finish** (II.0 pseudo) | `pseudo_w>0`, corrector val rows | **Pass (plumbing)** | **§169**: `20260604T110525Z`; `pseudo_w=0.159`, coverage **100%**; mu flat **~1.444**; gate **PASS** |
 | **GNODE 12 Lane A** (dump+clot) | min clot F1 **>=0.26**, optional mu trend | **Pass (clot)** | **§170**: mu unlock **1.44->0.47**; p007 F1 **0.750** min **0.594**; beats kine loop **0.522** |
-| **GNODE 12 Lane B** (corrector dump+clot) | min F1 **>=0.26**; vs Lane A p007 | **In progress** | **`go_gnode12_lane_b.ps1`**; init **11 finish** `biochem_best_high_mu.pth` |
+| **GNODE 12 Lane B** (corrector dump+clot) | min F1 **>=0.26**; vs Lane A p007 | **In progress** | Dump OK; preflight **gt+=0.438** failed at 0.55 (§171); default gate **0.38** |
 | **GNODE 10 smoke** (predicted kine, 3ep) | `flow_trivial=0`; `L_bio` down; species stable | **Partial** | **§161**: `20260603T183923Z`; DEQ path (no GT note in passive line); `L_kine` flat **2.25**; mu **~1.446**; need FI line + longer run before dump |
 | **M5.3** mu-unlock finetune (wall/high weights) | `go_passive_mu_unlock_finetune.ps1` 12ep | **Fail** | **§135**: best all **0.797 @ ep2** then bulk **regress ->1.17**; wall/high improve; species OK; `clot_frac=0` |
 | **M5.4** step-2 bridge from unlock | `passive_m5_bridge` 12ep, `GRAD_SCALE_ON_CAP` | **Pass (gate)** | **§135**: all **0.781**; wall **2.09**; FI **0.019**; mu still no spatial clots |
@@ -1418,7 +1418,15 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Gate:** `check_gnode12_lane_a_gate.py` on canonical jsonl **PASS**; optional mu trend row missing (`20260604T120007Z/run.jsonl` not found locally — unlock metrics from console).
 - **Eval pitfall:** duplicate `eval_clot_phi_multi_anchor` at end of `go_gnode12_lane_a.ps1` (without full `CLOT_PHI_DGAMMA_SLICE` env) wrote **`gnode10_sweep/multi_anchor_gnode12_lane_a_clotphi.jsonl`** (mean F1 **0.276**, p007 **0.466**, `gt+=0.32`) — **ignore**; launcher now gates on leg **`multi_anchor.jsonl` only** (same class of bug as §163/§164).
 - **Viz:** `outputs/biochem/viz/clot_phi_gnode12_lane_a_clotphi_p007_tfinal.png`.
-- **Next:** Lane B / corrector species dump; or promote **`gnode12_lane_a_clotphi/clot_phi_best.pth`** for comparisons.
+- **Next:** Lane B resume after preflight threshold fix (**§171**); promote Lane A ckpt for viz.
+
+### 171. GNODE **12 Lane B** preflight fail — corrector flow widens mask (`2026-06-04`)
+
+- **Dump:** `biochem_best_high_mu.pth` (11 finish corrector); arch **in=12**; **6** anchors `anchors_gnode12_corrector_predkine_uvp` OK.
+- **Preflight (1ep):** val **`gt+=0.438`** (score **-1**); stopped at **`MinGtPosFrac=0.55`** (Lane A preflight **0.808**).
+- **Cause:** GT **mu_eff** unchanged vs Lane A; **pred `[u,v,p]`** from corrector rollout is **~1.7x** faster (`u_rms` **~0.86** vs Lane A **~0.50** on p007). **`CLOT_PHI_DGAMMA_SLICE=1`** expands supervision mask early (t=0 mask **174** vs Lane A **25**); time-averaged val **`gt+`** dilutes to **0.44** though t=4 alone **0.66**.
+- **Not a stride/cache bug:** same June `anchors_stride_72` src; dump loader fix (`resolve_gnode_phase3_ctor_kwargs`) required for legacy ckpt without `model_config`.
+- **Fix:** Lane B launcher default **`MinGtPosFrac=0.38`**; resume **`go_gnode12_lane_b.ps1 -SkipDump`** for clot-phi. Compare vs Lane A on **multi-anchor F1**, not preflight `gt+` alone.
 
 ### 166. GNODE **11a** Phase 3 crash — PyG `DataBatch` `x_schema` list (`2026-06-04`)
 
