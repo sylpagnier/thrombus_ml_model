@@ -901,7 +901,12 @@ def main(argv: list[str] | None = None) -> None:
             "comsol_models/phase2_nowound_XXX.mph (patientXXX) via mph, then write .pt graphs."
         )
     )
-    parser.add_argument("--stem", type=str, default="", help="Only this stem (default: all meshes).")
+    parser.add_argument(
+        "--stem",
+        type=str,
+        default="",
+        help="One or more stems: patient007 | 7 | 5,8,9 | 5-9 (default: all meshes in table).",
+    )
     parser.add_argument("--force", action="store_true", help="Re-pull COMSOL txt and overwrite graphs.")
     parser.add_argument(
         "--no-from-comsol",
@@ -915,7 +920,17 @@ def main(argv: list[str] | None = None) -> None:
     extractor = PatientDataExtractor(phase="biochem_anchors")
     _auto_scaffold_anchor_sidecars(extractor.raw_dir)
 
-    stem_list = [args.stem.strip()] if args.stem.strip() else None
+    stem_list = None
+    if args.stem.strip():
+        from src.data_gen.lib.biochem_comsol_auto_export import (
+            collect_biochem_extract_stems,
+            resolve_stem_selection,
+        )
+
+        table = collect_biochem_extract_stems(extractor.raw_dir, extractor.label_dir)
+        stem_list = resolve_stem_selection(args.stem.strip(), table)
+        if not stem_list:
+            raise SystemExit("[ERR] No stems matched --stem.")
     extractor.run(
         from_comsol=not args.no_from_comsol,
         force_comsol_pull=args.force,

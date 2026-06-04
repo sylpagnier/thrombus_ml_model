@@ -28,8 +28,9 @@ from datetime import datetime
 from pathlib import Path
 
 from src.data_gen.lib.biochem_comsol_auto_export import (
+    collect_biochem_extract_stems,
     resolve_biochem_comsol_model_path,
-    stems_from_phase2_nowound_mph,
+    resolve_stem_selection,
 )
 from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
 from src.data_gen.pipeline_biochem import _auto_scaffold_anchor_sidecars
@@ -94,17 +95,7 @@ def _domain_export_stems(label_dir: Path) -> list[str]:
 
 
 def _collect_stems(raw_dir: Path, label_dir: Path) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for stem in (
-        stems_in_dir(raw_dir)
-        + _domain_export_stems(label_dir)
-        + stems_from_phase2_nowound_mph()
-    ):
-        if stem not in seen:
-            seen.add(stem)
-            out.append(stem)
-    return sorted(out)
+    return collect_biochem_extract_stems(raw_dir, label_dir)
 
 
 def _status_for_stem(
@@ -223,22 +214,44 @@ def _prompt_yes_no(label: str, *, default: bool = False) -> bool:
         print("  Enter y or n.")
 
 
-def _resolve_choice(raw: str, statuses: list[AnchorExtractStatus]) -> AnchorExtractStatus | None:
-    text = raw.strip()
-    if not text:
-        return None
-    if text.isdigit():
-        idx = int(text)
-        if 1 <= idx <= len(statuses):
-            return statuses[idx - 1]
-        print(f"  Index out of range (1-{len(statuses)}).")
-        return None
-    lower = text.lower()
-    for s in statuses:
-        if s.stem.lower() == lower:
-            return s
-    print(f"  Unknown stem: {text}")
-    return None
+def _resolve_choices(
+    raw: str,
+    statuses: list[AnchorExtractStatus],
+    *,
+    raw_dir: Path,
+    label_dir: Path,
+    proc_dir: Path,
+    kine_dir: Path,
+) -> list[AnchorExtractStatus]:
+    """Parse ``5,8,9``, ``5-9``, or ``patient005,patient008`` into status rows."""
+    try:
+        stems = resolve_stem_selection(raw, statuses)
+    except ValueError as exc:
+        print(f"  {exc}")
+        return []
+    if not stems:
+        return []
+    by_stem = {s.stem: s for s in statuses}
+    picked: list[AnchorExtractStatus] = []
+    for stem in stems:
+        if stem in by_stem:
+            picked.append(by_stem[stem])
+        else:
+            print(f"  [i] Adding {stem} (not in table; will try if .mph exists).")
+            picked.append(
+                _status_for_stem(
+                    stem,
+                    raw_dir=raw_dir,
+                    label_dir=label_dir,
+                    proc_dir=proc_dir,
+                    kine_dir=kine_dir,
+                )
+            )
+    return picked
+
+
+def _can_run_status(s: AnchorExtractStatus, *, from_comsol: bool) -> bool:
+    return s.can_extract or (from_comsol and s.can_pull_from_comsol)
 
 
 def _maybe_pull_comsol(
@@ -316,6 +329,60 @@ def _run_extract(
     return False
 
 
+def _run_extract_batch(
+    picked: list[AnchorExtractStatus],
+    extractor: PatientDataExtractor,
+    *,
+    force: bool,
+    skip_enrich: bool,
+    raw_dir: Path,
+    from_comsol: bool,
+    model_path: Path | None,
+) -> tuple[int, int]:
+    """Extract multiple stems; returns ``(ok_count, total)``."""
+    runnable = [s for s in picked if _can_run_status(s, from_comsol=from_comsol)]
+    skipped = [s.stem for s in picked if s not in runnable]
+    if skipped:
+        print(f"[WARN] Skipping (no .mph / no source): {', '.join(skipped)}")
+
+    partial = [s for s in runnable if not s.exports_ready]
+    if partial:
+        names = ", ".join(s.stem for s in partial)
+        print(f"[WARN] Partial exports for: {names}")
+        if not _prompt_yes_no("Continue batch anyway?", default=True):
+            return 0, len(picked)
+
+    needs_overwrite = [
+        s
+        for s in runnable
+        if (extractor.proc_dir / f"{s.stem}.pt").is_file() and not force
+    ]
+    if needs_overwrite:
+        names = ", ".join(s.stem for s in needs_overwrite)
+        print(f"[WARN] Graphs already exist: {names}")
+        if not _prompt_yes_no("Overwrite existing .pt files in this batch?", default=False):
+            runnable = [s for s in runnable if s not in needs_overwrite]
+
+    if not runnable:
+        return 0, len(picked)
+
+    print(f"\n[i] Batch extract {len(runnable)} stem(s): {', '.join(s.stem for s in runnable)}\n")
+    ok = 0
+    for s in runnable:
+        if _run_extract(
+            s.stem,
+            extractor,
+            force=force,
+            skip_enrich=skip_enrich,
+            raw_dir=raw_dir,
+            from_comsol=from_comsol,
+            model_path=model_path,
+        ):
+            ok += 1
+    print(f"\n[i] Batch done: {ok}/{len(runnable)} succeeded.")
+    return ok, len(picked)
+
+
 def _interactive_loop(
     statuses: list[AnchorExtractStatus],
     extractor: PatientDataExtractor,
@@ -333,10 +400,13 @@ def _interactive_loop(
         and (s.can_extract or (from_comsol and s.can_pull_from_comsol))
     ]
     print(f"\n[i] {len(ready)} stem(s) ready to extract (not yet graphed).")
-    print("[i] Enter stem name, list index, 'l' to relist, 'q' to quit.\n")
+    print(
+        "[i] Enter index or stem, or several: 5 | 5,8,9 | 5-9 | patient008,patient009 | "
+        "'l' relist, 'q' quit.\n"
+    )
 
     while True:
-        raw = input("Extract which anchor? ").strip()
+        raw = input("Extract which anchor(s)? ").strip()
         if not raw:
             continue
         if raw.lower() in ("q", "quit", "exit"):
@@ -350,56 +420,71 @@ def _interactive_loop(
             )
             continue
 
-        picked = _resolve_choice(raw, statuses)
-        if picked is None:
-            continue
-
-        can_run = picked.can_extract or (from_comsol and picked.can_pull_from_comsol)
-        if not can_run:
-            print(
-                f"[ERR] {picked.stem}: need domain .txt or a phase2_nowound_XXX.mph in comsol_models/ "
-                f"(--from-comsol exports mesh + fields)."
-            )
-            if picked.has_mesh and picked.export_count < 4:
-                missing = []
-                if not picked.has_inlet_txt:
-                    missing.append("inlet")
-                if not picked.has_outlet_txt:
-                    missing.append("outlet")
-                if not picked.has_wall_txt:
-                    missing.append("wall")
-                if missing:
-                    print(
-                        f"       Missing boundary exports: {', '.join(missing)} "
-                        "(extraction may still fail BC mapping)."
-                    )
-            continue
-
-        if not picked.exports_ready:
-            print(
-                f"[WARN] {picked.stem}: only {picked.export_count}/4 COMSOL txt files present; "
-                "continuing anyway (domain txt is required)."
-            )
-            if not _prompt_yes_no("Continue?", default=False):
-                continue
-
-        ok = _run_extract(
-            picked.stem,
-            extractor,
-            force=force,
-            skip_enrich=skip_enrich,
+        picked_list = _resolve_choices(
+            raw,
+            statuses,
             raw_dir=raw_dir,
-            from_comsol=from_comsol,
-            model_path=model_path,
+            label_dir=extractor.label_dir,
+            proc_dir=extractor.proc_dir,
+            kine_dir=extractor.kine_anchor_dir,
         )
-        if ok and not _prompt_yes_no("Extract another?", default=True):
-            break
+        if not picked_list:
+            continue
+
+        if len(picked_list) == 1:
+            picked = picked_list[0]
+            if not _can_run_status(picked, from_comsol=from_comsol):
+                print(
+                    f"[ERR] {picked.stem}: need domain .txt or phase2_nowound_XXX.mph "
+                    f"(--from-comsol exports mesh + fields)."
+                )
+                continue
+            if not picked.exports_ready:
+                print(
+                    f"[WARN] {picked.stem}: only {picked.export_count}/4 COMSOL txt files present; "
+                    "continuing anyway (domain txt is required)."
+                )
+                if not _prompt_yes_no("Continue?", default=False):
+                    continue
+            ok = _run_extract(
+                picked.stem,
+                extractor,
+                force=force,
+                skip_enrich=skip_enrich,
+                raw_dir=raw_dir,
+                from_comsol=from_comsol,
+                model_path=model_path,
+            )
+            if ok and not _prompt_yes_no("Extract another?", default=True):
+                break
+        else:
+            _run_extract_batch(
+                picked_list,
+                extractor,
+                force=force,
+                skip_enrich=skip_enrich,
+                raw_dir=raw_dir,
+                from_comsol=from_comsol,
+                model_path=model_path,
+            )
+            if not _prompt_yes_no("Extract more?", default=False):
+                break
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--stem", type=str, default="", help="Extract this stem only (non-interactive pick).")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing .pt without prompting.")
+    parser.add_argument(
+        "--stem",
+        type=str,
+        default="",
+        help="One or more stems: patient007 | 7 | 5,8,9 | 5-9 | patient008,patient011 (non-interactive).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-pull domain txt / overwrite .pt. Keeps mesh and boundary txt unless "
+        "BIOCHEM_COMSOL_FORCE_MESH=1 or BIOCHEM_COMSOL_FORCE_BOUNDARY=1.",
+    )
     parser.add_argument("--list-only", action="store_true", help="Print status table and exit.")
     parser.add_argument("--raw-dir", type=Path, default=None, help="Anchor meshes (default: data/raw/biochem_anchors).")
     parser.add_argument(
@@ -465,21 +550,32 @@ def main(argv: list[str] | None = None) -> None:
 
     stem_arg = args.stem.strip()
     if stem_arg:
-        picked = next((s for s in statuses if s.stem == stem_arg), None)
-        if picked is None:
-            picked = _status_for_stem(
-                stem_arg,
+        picked_list = _resolve_choices(
+            stem_arg,
+            statuses,
+            raw_dir=raw_dir,
+            label_dir=label_dir,
+            proc_dir=extractor.proc_dir,
+            kine_dir=extractor.kine_anchor_dir,
+        )
+        if not picked_list:
+            raise SystemExit("[ERR] No stems matched --stem selection.")
+        if len(picked_list) == 1:
+            s = picked_list[0]
+            if not _can_run_status(s, from_comsol=args.from_comsol):
+                raise SystemExit(f"[ERR] {s.stem}: missing mesh and/or COMSOL source (see table above).")
+            ok = _run_extract(
+                s.stem,
+                extractor,
+                force=args.force,
+                skip_enrich=args.skip_enrich,
                 raw_dir=raw_dir,
-                label_dir=label_dir,
-                proc_dir=extractor.proc_dir,
-                kine_dir=extractor.kine_anchor_dir,
+                from_comsol=args.from_comsol,
+                model_path=args.model_path,
             )
-            statuses.append(picked)
-        can_run = picked.can_extract or (args.from_comsol and picked.can_pull_from_comsol)
-        if not can_run:
-            raise SystemExit(f"[ERR] {stem_arg}: missing mesh and/or COMSOL source (see table above).")
-        ok = _run_extract(
-            picked.stem,
+            raise SystemExit(0 if ok else 1)
+        ok_count, _ = _run_extract_batch(
+            picked_list,
             extractor,
             force=args.force,
             skip_enrich=args.skip_enrich,
@@ -487,7 +583,7 @@ def main(argv: list[str] | None = None) -> None:
             from_comsol=args.from_comsol,
             model_path=args.model_path,
         )
-        raise SystemExit(0 if ok else 1)
+        raise SystemExit(0 if ok_count > 0 else 1)
 
     _interactive_loop(
         statuses,

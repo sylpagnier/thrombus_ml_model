@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import meshio
@@ -20,6 +21,137 @@ _BOUNDARY_SPECS: tuple[tuple[str, str], ...] = (
     ("outlet", "is_outlet"),
     ("wall", "is_wall"),
 )
+
+# Phase-2 anchors (e.g. phase2_nowound_008): explicit box selections labeled inlet/outlet/wall.
+# Older templates: is_inlet=sel1(x,y) or box1/box2/dif1 tags.
+_STATIC_BOUNDARY_EXPRS: dict[str, tuple[str, ...]] = {
+    "inlet": ("inlet(x,y)", "is_inlet", "sel1(x,y)", "box1(x,y)"),
+    "outlet": ("outlet(x,y)", "is_outlet", "sel2(x,y)", "box2(x,y)"),
+    "wall": ("wall(x,y)", "is_wall", "sel3(x,y)", "dif1(x,y)"),
+}
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
+    """Map inlet/outlet/wall -> ``<selection_tag>(x,y)`` from COMSOL Definitions > Selections."""
+    found: dict[str, str] = {}
+    s_root = model_java.selection()
+    try:
+        tags = [str(t) for t in s_root.tags()]
+    except Exception:
+        return found
+
+    for bname in ("inlet", "outlet", "wall"):
+        for sid in tags:
+            low = sid.lower()
+            if "nastran" in low or low.startswith("imp"):
+                continue
+            if low == bname:
+                found[bname] = f"{sid}(x,y)"
+                break
+
+    for sid in tags:
+        low = sid.lower()
+        if "nastran" in low or low.startswith("imp"):
+            continue
+        try:
+            label = str(s_root.get(sid).name()).lower()
+        except Exception:
+            label = low
+        expr = f"{sid}(x,y)"
+        for bname, keys in (
+            ("inlet", ("inlet",)),
+            ("outlet", ("outlet",)),
+            ("wall", ("wall",)),
+        ):
+            if bname in found:
+                continue
+            if label == bname or low == bname:
+                found[bname] = expr
+                continue
+            if any(k in label for k in keys) or any(k in low for k in keys):
+                found[bname] = expr
+    return found
+
+
+def boundary_mask_expr_candidates(model_java, bname: str) -> list[str]:
+    """Ordered COMSOL expressions to probe for a boundary mask (deduped)."""
+    discovered = discover_boundary_mask_exprs(model_java)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(expr: str) -> None:
+        key = expr.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+
+    if bname in discovered:
+        _add(discovered[bname])
+    _add(f"{bname}(x,y)")
+    for expr in _STATIC_BOUNDARY_EXPRS.get(bname, ()):
+        _add(expr)
+    return out
+
+
+def _evaluate_boundary_mask(
+    model_java,
+    coords_cm: np.ndarray,
+    expr: str,
+    *,
+    dataset_tag: str,
+) -> np.ndarray:
+    vals = _evaluate_at_coords_and_time(
+        model_java,
+        coords_cm,
+        [expr],
+        dataset_tag=dataset_tag,
+        time_value=0.0,
+    ).reshape(-1)
+    if vals.size != coords_cm.shape[0]:
+        raise ValueError(f"Boundary mask {expr!r}: length {vals.size} != {coords_cm.shape[0]}")
+    return vals
+
+
+def write_boundary_txt_from_axis_extents(
+    coords_cm: np.ndarray,
+    label_dir: Path,
+    stem: str,
+    *,
+    axis: int = 0,
+    band_frac: float = 0.02,
+    force: bool = False,
+) -> None:
+    """Heuristic inlet/outlet/wall from mesh bbox (flow along ``axis``, walls on the other axis)."""
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    pts = np.asarray(coords_cm[:, :2], dtype=np.float64)
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    span = np.maximum(hi - lo, 1e-9)
+    tol = np.maximum(span * float(band_frac), 1e-6)
+
+    inlet_m = pts[:, axis] <= lo[axis] + tol[axis]
+    outlet_m = pts[:, axis] >= hi[axis] - tol[axis]
+    other = 1 - axis
+    wall_m = (
+        (pts[:, other] <= lo[other] + tol[other]) | (pts[:, other] >= hi[other] - tol[other])
+    ) & ~(inlet_m | outlet_m)
+
+    specs = (("inlet", inlet_m), ("outlet", outlet_m), ("wall", wall_m))
+    for bname, mask in specs:
+        out_path = label_dir / f"{stem}_{bname}.txt"
+        if out_path.is_file() and not force:
+            continue
+        coords = np.unique(pts[mask, :2], axis=0) if np.any(mask) else np.zeros((0, 2))
+        lines = ["% Model: mesh axis-extent heuristic", "% x  y"]
+        for x, y in coords:
+            lines.append(f"0 0 {x:.10f} {y:.10f}")
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info("[OK] %s: %s boundary heuristic (%d unique coords)", stem, bname, len(coords))
 
 
 def find_comsol_mesh_tag(model_java) -> str:
@@ -66,35 +198,132 @@ def write_boundary_txt_from_comsol_masks(
     dataset_tag: str = "dset1",
     threshold: float = 0.5,
     force: bool = False,
+    preserve_existing_on_failure: bool = True,
 ) -> None:
     """Write inlet/outlet/wall ``.txt`` using COMSOL selection variables on mesh nodes."""
     label_dir = Path(label_dir)
     label_dir.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
 
-    for bname, expr in _BOUNDARY_SPECS:
+    for bname, _default_expr in _BOUNDARY_SPECS:
         out_path = label_dir / f"{stem}_{bname}.txt"
         if out_path.is_file() and not force:
             continue
 
-        vals = _evaluate_at_coords_and_time(
-            model_java,
-            coords_cm,
-            [expr],
-            dataset_tag=dataset_tag,
-            time_value=0.0,
-        ).reshape(-1)
-        mask = vals > threshold
+        expr_used: str | None = None
+        mask: np.ndarray | None = None
+        last_exc: Exception | None = None
+        for expr in boundary_mask_expr_candidates(model_java, bname):
+            try:
+                vals = _evaluate_boundary_mask(
+                    model_java,
+                    coords_cm,
+                    expr,
+                    dataset_tag=dataset_tag,
+                )
+                mask = vals > threshold
+                expr_used = expr
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.debug("[i] %s: boundary %s expr %s failed: %s", stem, bname, expr, exc)
+
+        if mask is None:
+            if preserve_existing_on_failure and out_path.is_file():
+                logger.warning(
+                    "[WARN] %s: COMSOL boundary %s failed (%s); keeping existing %s.",
+                    stem,
+                    bname,
+                    last_exc,
+                    out_path.name,
+                )
+                continue
+            failures.append(f"{bname} ({last_exc})")
+            continue
+
         if not np.any(mask):
-            logger.warning("[WARN] %s: no nodes matched %s for %s boundary.", stem, expr, bname)
+            logger.warning(
+                "[WARN] %s: no nodes matched %s for %s boundary.",
+                stem,
+                expr_used,
+                bname,
+            )
             coords = np.zeros((0, 2), dtype=np.float64)
         else:
             coords = np.unique(coords_cm[mask, :2], axis=0)
 
-        lines = ["% Model: COMSOL selection masks", "% x  y"]
+        lines = [f"% Model: COMSOL mask ({expr_used})", "% x  y"]
         for x, y in coords:
             lines.append(f"0 0 {x:.10f} {y:.10f}")
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        logger.info("[OK] %s: %s boundary (%d unique coords)", stem, bname, len(coords))
+        logger.info("[OK] %s: %s boundary via %s (%d unique coords)", stem, bname, expr_used, len(coords))
+
+    if failures:
+        raise RuntimeError(
+            f"{stem}: COMSOL boundary mask export failed for: {', '.join(failures)}. "
+            "Re-save the .mph with is_inlet/is_outlet/is_wall (sel1-sel3) or named selections "
+            "box1/box2/dif1, or keep manual *_inlet/outlet/wall.txt exports."
+        )
+
+
+def ensure_boundary_txt_files(
+    model_java,
+    coords_cm: np.ndarray,
+    mesh_path: Path,
+    label_dir: Path,
+    stem: str,
+    *,
+    vessel_cfg,
+    dataset_tag: str = "dset1",
+    force_boundary: bool = False,
+) -> None:
+    """Write missing boundary txt from Gmsh tags, COMSOL masks, or mesh-extent heuristic."""
+    from src.data_gen.lib.biochem_comsol_auto_export import write_boundary_txt_from_mesh
+
+    label_dir = Path(label_dir)
+    paths = tuple(label_dir / f"{stem}_{b}.txt" for b in ("inlet", "outlet", "wall"))
+    if all(p.is_file() for p in paths) and not force_boundary:
+        return
+
+    if mesh_has_gmsh_boundary_tags(mesh_path):
+        write_boundary_txt_from_mesh(
+            mesh_path,
+            label_dir,
+            stem,
+            vessel_cfg=vessel_cfg,
+            force=force_boundary,
+        )
+        return
+
+    try:
+        write_boundary_txt_from_comsol_masks(
+            model_java,
+            coords_cm,
+            label_dir,
+            stem,
+            dataset_tag=dataset_tag,
+            force=force_boundary,
+            preserve_existing_on_failure=not force_boundary,
+        )
+    except Exception as exc:
+        if all(p.is_file() for p in paths):
+            logger.warning(
+                "[WARN] %s: COMSOL boundary masks unavailable (%s); using existing boundary txt.",
+                stem,
+                exc,
+            )
+            return
+        logger.warning(
+            "[WARN] %s: COMSOL boundary masks failed (%s); trying mesh-extent heuristic.",
+            stem,
+            exc,
+        )
+        write_boundary_txt_from_axis_extents(
+            coords_cm,
+            label_dir,
+            stem,
+            force=force_boundary,
+        )
 
 
 def ensure_anchor_mesh_from_comsol(

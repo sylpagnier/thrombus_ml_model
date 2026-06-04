@@ -12,6 +12,10 @@ Typical workflow::
     3. ``python -m src.tools.extract_biochem_comsol --stem <stem> --from-comsol``
 
 Requires: COMSOL 6.x + ``pip install mph`` (same as kinematics ``AnchorGenerator``).
+
+``--force`` rewrites domain field txt only; existing mesh and boundary txt are kept unless
+``BIOCHEM_COMSOL_FORCE_MESH=1`` or ``BIOCHEM_COMSOL_FORCE_BOUNDARY=1``. Older ``.mph`` files
+without ``sel1``-``sel3`` use named selections (``box1``/``box2``/``dif1``) or keep manual boundaries.
 """
 
 from __future__ import annotations
@@ -29,6 +33,12 @@ from src.config import PhysicsConfig, VesselConfig, biochem_comsol_time_cap_s
 from src.utils.paths import comsol_models_dir, data_root
 
 logger = logging.getLogger(__name__)
+
+_BOUNDARY_SUFFIXES = ("_inlet", "_outlet", "_wall")
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 # Internal column order (no x,y) written as COMSOL wide export fields.
 DOMAIN_FIELD_NAMES: tuple[str, ...] = (
@@ -92,6 +102,92 @@ def patient_stem_from_phase2_mph(path: Path) -> str | None:
     if not m:
         return None
     return f"patient{int(m.group(1)):03d}"
+
+
+def resolve_stem_selection(
+    raw: str,
+    statuses: Sequence[tuple[str, ...]] | Sequence[object],
+    *,
+    stem_attr: str = "stem",
+) -> list[str]:
+    """Parse ``5,8-10``, ``patient005,patient008``, or ``5 8 9`` into anchor stem names.
+
+    ``statuses`` is the status table order (1-based indices match the printed ``#`` column).
+    """
+    if not raw or not str(raw).strip():
+        return []
+
+    def _stem_at(i: int) -> str:
+        row = statuses[i - 1]
+        if isinstance(row, str):
+            return row
+        return str(getattr(row, stem_attr))
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add_stem(stem: str) -> None:
+        if stem not in seen:
+            seen.add(stem)
+            out.append(stem)
+
+    def _add_index(idx: int) -> None:
+        if idx < 1 or idx > len(statuses):
+            raise ValueError(f"Index {idx} out of range (1-{len(statuses)}).")
+        _add_stem(_stem_at(idx))
+
+    tokens = re.split(r"[\s,;]+", raw.strip())
+    for token in tokens:
+        if not token:
+            continue
+        m_patient = _PATIENT_STEM_RE.match(token.strip())
+        if m_patient:
+            stem_name = f"patient{int(m_patient.group(1)):03d}"
+            table_hit = next(
+                (_stem_at(i + 1) for i in range(len(statuses)) if _stem_at(i + 1).lower() == stem_name),
+                stem_name,
+            )
+            _add_stem(table_hit)
+            continue
+        if re.fullmatch(r"\d+\s*-\s*\d+", token):
+            a_str, b_str = re.split(r"\s*-\s*", token)
+            a_i, b_i = int(a_str), int(b_str)
+            if a_i > b_i:
+                a_i, b_i = b_i, a_i
+            for idx in range(a_i, b_i + 1):
+                _add_index(idx)
+            continue
+        if token.isdigit():
+            _add_index(int(token))
+            continue
+        raise ValueError(f"Unrecognized stem token: {token!r}")
+
+    return out
+
+
+def collect_biochem_extract_stems(raw_dir: Path, label_dir: Path) -> list[str]:
+    """Union of mesh stems, domain export stems, and ``phase2_nowound_*.mph`` (sorted)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    if raw_dir.is_dir():
+        for ext in (".msh", ".nas"):
+            for p in sorted(raw_dir.glob(f"*{ext}")):
+                if p.stem not in seen:
+                    seen.add(p.stem)
+                    out.append(p.stem)
+    if label_dir.is_dir():
+        for p in sorted(label_dir.glob("*.txt")):
+            stem = p.stem
+            if any(stem.endswith(suf) for suf in _BOUNDARY_SUFFIXES):
+                continue
+            if stem not in seen:
+                seen.add(stem)
+                out.append(stem)
+    for stem in stems_from_phase2_nowound_mph():
+        if stem not in seen:
+            seen.add(stem)
+            out.append(stem)
+    return sorted(out)
 
 
 def stems_from_phase2_nowound_mph(models_dir: Path | None = None) -> list[str]:
@@ -430,39 +526,32 @@ class BiochemComsolAutoExporter:
             assert self._model is not None
             from src.data_gen.lib.biochem_comsol_mesh_export import (
                 ensure_anchor_mesh_from_comsol,
-                mesh_has_gmsh_boundary_tags,
-                write_boundary_txt_from_comsol_masks,
+                ensure_boundary_txt_files,
             )
             from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 
-            mesh_path, mesh_exported = ensure_anchor_mesh_from_comsol(
+            force_mesh = force and _env_flag("BIOCHEM_COMSOL_FORCE_MESH")
+            mesh_path, _mesh_exported = ensure_anchor_mesh_from_comsol(
                 self._model.java,
                 stem,
                 self.raw_dir,
-                force=force,
+                force=force_mesh,
             )
             mesh = meshio.read(mesh_path)
             coords_cm = np.asarray(mesh.points[:, :2], dtype=np.float64)
 
             if boundary_from_mesh:
-                use_gmsh = mesh_has_gmsh_boundary_tags(mesh_path) and not mesh_exported
-                if use_gmsh:
-                    write_boundary_txt_from_mesh(
-                        mesh_path,
-                        self.label_dir,
-                        stem,
-                        vessel_cfg=self.vessel_cfg,
-                        force=force,
-                    )
-                else:
-                    write_boundary_txt_from_comsol_masks(
-                        self._model.java,
-                        coords_cm,
-                        self.label_dir,
-                        stem,
-                        dataset_tag=self.dataset_tag,
-                        force=force,
-                    )
+                force_boundary = force and _env_flag("BIOCHEM_COMSOL_FORCE_BOUNDARY")
+                ensure_boundary_txt_files(
+                    self._model.java,
+                    coords_cm,
+                    mesh_path,
+                    self.label_dir,
+                    stem,
+                    vessel_cfg=self.vessel_cfg,
+                    dataset_tag=self.dataset_tag,
+                    force_boundary=force_boundary,
+                )
 
             if skip_fields:
                 logger.info("[skip] %s exists (use force=True to rewrite fields)", domain_path.name)
