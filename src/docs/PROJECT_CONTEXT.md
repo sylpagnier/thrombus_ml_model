@@ -145,12 +145,13 @@ Primary modules (also routed through `python -m src.bin.main inspect <target> --
 | Module | Purpose |
 |--------|---------|
 | `python -m src.tools.inspect_kinematics_data` | **Kinematics / 2 COMSOL anchors** (`vessel_*.npz`): **default** = full-directory health scan (flags + CSV) **then** interactive plot (random sample or `--sample-idx`; Regenerate / `r`). Also: `--summary` (compact text only), `--scan-only` (health/CSV, no GUI), `--skip-health-scan` (plot only), `--plot-static`, `--inspect-template-tags`. |
+| `python -m src.tools.extract_biochem_comsol` | **Biochem COMSOL extract** (interactive): status table for mesh/exports/graphs, pick stem, run `PatientDataExtractor` -> `graphs_biochem_anchors/*.pt`. PyCharm: run this module. CLI alias: `python -m src.bin.main data extract-biochem -- [--list-only]`. |
 | `python -m src.tools.inspect_biochem_data` | **Biochem** domain `.txt` + graphs: **default** = one anchor stem at a time (brief availability line + qualitative text for that stem), one figure (domain time-slider or single-time 2×2; graph-only stems use graph views). **Regenerate Random Anchor** / `r` like kinematics. `--summary` = full table only. `--no-regenerate` fixes the current stem (`biochem` / `biochem_anchors` / `biochem_mix`; legacy `biochem_patients` still accepted). |
 | `python -m src.tools.inspect_comsol_model` | Live **COMSOL** model browser (`mph`): `--list-models`, `--model`, `--all-models`. |
 | `python -m src.tools.inspect_graph_sample` | **Processed** `.pt` graphs (kinematics/stage A style): COMSOL overlap, WLS condition numbers, BC masks, widgets. |
 | `python -m src.tools.verify_deq_convergence` | Manual Picard vs Anderson residual curves (not pytest). |
 
-`bin.main` shortcuts: `inspect anchor` and `inspect kinematics` → `inspect_kinematics_data`, `inspect biochem`, `inspect comsol`, `inspect graph`, `inspect deq`.
+`bin.main` shortcuts: `data extract-biochem` → `extract_biochem_comsol`; `inspect anchor` and `inspect kinematics` → `inspect_kinematics_data`, `inspect biochem`, `inspect comsol`, `inspect graph`, `inspect deq`.
 
 ## Conventions for edits
 

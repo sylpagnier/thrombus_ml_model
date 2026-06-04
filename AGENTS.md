@@ -24,7 +24,7 @@
 - **I.3 XY bridge** (viability **PASS**, §134): `go_passive_xy_block_pass.ps1` — hold 3ep + learn 6ep, `GRAD_SCALE_ON_CAP=1`; val FI **~0.013**. Lock canonical: `go_passive_lock_xy_ckpt.ps1` -> `biochem_teacher_passive_xy_locked.pth`. M5 chunks: plan **I.4** table (mu-unlock from xy_locked).
 - **Passive transport (Step 2a, 1-way)**: Mat/FI on **COMSOL GT `[u,v,p]`** (`BIOCHEM_GT_KINE_VEL=1`), `mu_ratio_max=1`, `DETACH_MACRO=0`, **`BIOCHEM_PASSIVE_ADR_BACKPROP=0`** (ADR log-only until `L_Data_Bio` falls) — `.\scripts\go_passive_transport.ps1 -Fresh`. Phase B ramp: `go_phaseB_xy_passive.ps1`. **M3 align probe** (12ep): `go_m3_align_probe.ps1`. **Promote + confirm**: `go_passive_lock_align_ckpt.ps1` -> `outputs/biochem/biochem_teacher_passive_align_locked.pth`; **20ep** `go_passive_align_20ep.ps1` (train-anchor species via `BIOCHEM_PASSIVE_SPECIES_TRAIN_EVAL=1`); **step-2 bridge** `go_passive_step2_bridge.ps1` (`LOSS_DATA_ONLY=1`, `COMPLEXITY_STEP=2`, modest `MU_LOG`/`MU_SI`, low-weight `transport_only` ADR, not step 3); **mu-unlock probe** `go_passive_mu_unlock_probe.ps1` (`BIOCHEM_PASSIVE_MU_UNLOCK=1`, `LOSS_ISOLATE=MU_LOG`, `TRAIN_MU=1`, bio frozen, init locked ckpt); **finetune** `go_passive_mu_unlock_finetune.ps1` (wall+high-mu weights, init `biochem_teacher_passive_mu_unlock_best.pth`); **I.1 X probe** `go_passive_x_probe.ps1` (3ep matrix, ~30-45 min); **promote dump** `go_passive_x_block_finish.ps1 -Promote` only when probes pick a recipe. **6h explore** `go_passive_explore_6h.ps1` (isolated X/Y/XY legs, kin-blocked). Checklist: [src/docs/PASSIVE_KIN_BLOCKER_CHECKLIST.md](src/docs/PASSIVE_KIN_BLOCKER_CHECKLIST.md). Gates: `check_m3_align_gate.py`, `check_passive_step2_bridge_gate.py`, `check_passive_mu_unlock_gate.py`, `check_passive_mu_unlock_finetune_gate.py`; species table: `eval_passive_species_anchors.py`. Env: `BIOCHEM_SUPERVISION_MASK_TIMES`, `BIOCHEM_ADR_*`, `BIOCHEM_PASSIVE_STEP2_BRIDGE`, `BIOCHEM_PASSIVE_MU_UNLOCK`. Doc: [src/docs/BIOCHEM_TRAINING_PROGRESS.md](src/docs/BIOCHEM_TRAINING_PROGRESS.md).
 - **GT-flow clot-phi (no kin model)**: ladder `go_gt_flow_species_ladder_6h.ps1`; round2 `go_gt_flow_round2_4h.ps1` (best so far **min F1 0.357** `long_adapt_blend`); round3 `go_gt_flow_round3_4h.ps1` (finetune toward **0.38**); chain `go_gt_flow_chain_r2finish_r3_4h.ps1`.
-- **GNODE-ODE ladder (9.x, GT vel)**: doc [src/docs/GNODE_ODE_LADDER.md](src/docs/GNODE_ODE_LADDER.md); smoke **9.1** `go_gnode91_smoke.ps1`; ~8h queue **9.4-9.6** `go_gnode_8h_ladder.ps1`; **9.9** `go_gnode99.ps1` (after_94 init, FI/Mat=3/2, dump best ckpt, stride 72); headless teacher PNG `snapshot_biochem_teacher.py` + clot-band `snapshot_biochem_teacher_clotband.py`.
+- **GNODE-ODE ladder (9.x GT vel / 10-12 predicted kine)**: doc [src/docs/GNODE_ODE_LADDER.md](src/docs/GNODE_ODE_LADDER.md); **10** `go_gnode10_sweep.ps1`, `go_gnode10_finish.ps1`, `go_gnode10_kine_loop.ps1`; **11** `go_gnode11_*` + `check_gnode11_finish_gate.py`; **12 Lane A** `go_gnode12_lane_a.ps1` (optional mu_ratio uncap, dump, clot-phi) + `check_gnode12_lane_a_gate.py`
 - **GNODE-ODE component ladder (9.0–9.9)**: [src/docs/GNODE_ODE_LADDER.md](src/docs/GNODE_ODE_LADDER.md) — simplest forward smoke -> passive -> dump/clot-phi; fast iterations first.
 - **Clot-phi rollout (6a/6b)**: [src/docs/CLOT_PHI_ROLLOUT.md](src/docs/CLOT_PHI_ROLLOUT.md); `go_rung6a_clot_phi_rollout_gt.ps1`, `go_rung6b_clot_phi_rollout_kine.ps1`.
 - Teacher checkpoints: `biochem_teacher_best_high_mu.pth` (global best teacher by high-μ val), `biochem_teacher_last.pth` (latest run backup). Viz default: best high-μ teacher → last teacher. Optional legacy all-truth: `biochem_teacher_best.pth` if `BIOCHEM_TEACHER_KEEP_GLOBAL_BEST_ALL=1`.
@@ -38,16 +38,16 @@
 - **Backfill** `geometry_level` on existing graphs from mesh JSON (no COMSOL): `python -m src.data_gen.backfill_kinematics_geometry_level`
 - **Bend-sign A/B** (down-only vs bidirectional, isolated graph dirs): `powershell -File .\scripts\go_kinematics_bend_ab.ps1 -Arm both -NumVessels 120 -AnchorMax 0`
 - **Recovery sweep ~10h** (main `graphs_kinematics/newtonian`, 8 scaled recipes, quiet logs): `powershell -File .\scripts\go_kinematics_recovery12h.ps1` (optional `-TargetHours 10`)
-- **Production allfix** (100 ep, 3000 graphs, auto-resume): `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"` — best **20260601**: Rel L2 **0.126** @ ep 80 (`outputs/kinematics/production_allfix/`)
-- **Synthetic polish**: `go_kinematics_production_allfix_finetune.ps1 -ContinuityFocus`
-- **Stage-A ladder** (optional polish + clinical + dual gates): `go_kinematics_stage_a_ladder.ps1 -SkipFoundation -Resume outputs/kinematics/production_allfix/kinematics_ckpt_81.pth`
-- **Clinical anchor finetune**: `go_kinematics_clinical_anchor_finetune.ps1` -> `outputs/kinematics/clinical_anchor_finetune/`; val = patient holdout + synthetic L2 holdout; gates (patient + synthetic + synthetic L2): `check_kinematics_promotion_gates.py`, `promote_kinematics_checkpoint.ps1`
+- **Production allfix (default 3-phase loop)**: `powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"` — phases 1-3 + promote; `-FoundationOnly` for phase 1 only. Best finetune **20260603** ep **119**: Rel L2 **0.087** (`production_allfix/`)
+- **Synthetic polish only**: `go_kinematics_production_allfix_finetune.ps1 -ContinuityFocus`
+- **Clinical geometry only**: `go_kinematics_clinical_anchor_finetune.ps1`
+- **Stage-A ladder** (orchestrator): `go_kinematics_stage_a_ladder.ps1` (`-SkipFoundation` to resume after phase 1)
 - Doc: [src/docs/KINEMATICS_BEST_ARCHITECTURE.md](src/docs/KINEMATICS_BEST_ARCHITECTURE.md) (Stage-A ladder + geometry table)
 
 ## Kinematics (Stage A) architecture record
 
 - Reference manifest (architecture/flags only, no weights): [data/reference/kinematics_best_20260426T184600Z.json](data/reference/kinematics_best_20260426T184600Z.json) (best run `20260426T184600Z`, epoch 84).
-- **Current repo best (weights)**: `outputs/kinematics/production_allfix/kinematics_best.pth` — production allfix run `20260601T180106Z`, val Rel L2 **0.1263** @ epoch 80 (Adam; do not use post-L-BFGS epochs).
+- **Current repo best (weights)**: `outputs/kinematics/production_allfix/kinematics_best.pth` — finetune after production `20260601T180106Z`, val Rel L2 **0.0870** @ epoch **119** (Adam; skip LBFGS).
 - Doc: [src/docs/KINEMATICS_BEST_ARCHITECTURE.md](src/docs/KINEMATICS_BEST_ARCHITECTURE.md).
 - Code: `snapshot_gino_deq_model_config` / `resolve_gino_deq_ctor_kwargs` in [src/architecture/kinematics_model_config.py](src/architecture/kinematics_model_config.py).
 - `train_kinematics_predictor.py` embeds `model_config` in `kinematics_best.pth` and writes `outputs/kinematics/kinematics_architecture.json`.
@@ -59,6 +59,7 @@
 
 ## Scripts layout
 
+- **Biochem COMSOL extract (interactive):** `python -m src.tools.extract_biochem_comsol` (PyCharm: run module `src.tools.extract_biochem_comsol`, cwd = repo root); `go_extract_biochem_interactive.ps1`; `python -m src.bin.main data extract-biochem -- [--list-only|--stem NAME]`.
 - Active launchers and utilities: [scripts/README.md](scripts/README.md).
 - Historical sweep names in `BIOCHEM_TRAINING_PROGRESS.md` referred to one-off runners since removed; use current `go_*` scripts instead.
 

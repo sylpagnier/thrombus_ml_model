@@ -4,6 +4,7 @@ Examples:
     python -m src.bin.main train kinematics
     python -m src.bin.main train biochem -- --epochs 10
     python -m src.bin.main data kinematics
+    python -m src.bin.main data extract-biochem -- --list-only
     python -m src.bin.main eval benchmark
     python -m src.bin.main inspect graph
     python -m src.bin.main orchestrate all
@@ -27,6 +28,7 @@ MODULE_MAP: dict[tuple[str, str], str] = {
     ("train", "explore"): "src.training.train_kinematics_predictor",
     ("data", "kinematics"): "src.data_gen.pipeline_kinematics",
     ("data", "biochem"): "src.data_gen.pipeline_biochem",
+    ("data", "extract-biochem"): "src.tools.extract_biochem_comsol",
     ("eval", "benchmark"): "src.evaluation.run_benchmark",
     ("eval", "visualize"): "src.evaluation.visualize_pipeline",
     ("inspect", "anchor"): "src.tools.inspect_kinematics_data",
