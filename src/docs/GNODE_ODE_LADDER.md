@@ -71,14 +71,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_clot_phi_from_
   -AnchorDir outputs\biochem\gnode_8h_ladder\anchors_stride_72 -LegName gnode99_promoted -Epochs 35
 ```
 
-**Rung 10 (2026-06-03):** **`K5_kine15`** (FI **~0.003**). Clot: **`go_gnode10_finish`** (GT u,v,p) p007 **0.629**; **`go_gnode10_kine_loop`** (pred u,v,p) p007 **0.522**. **Rung 11 (2026-06-04 PASS):** **11a** step-2 smoke; **11b** step-3 smoke; **finish (II.0)** **`go_gnode11_finish.ps1`** — **`pseudo_w=0.159`**, mu flat **~1.444** (§169). **Rung 12 Lane A:** **`go_gnode12_lane_a.ps1`** — optional **mu_ratio uncap** finetune (`MuRatioMax` default **20**), dump with matching rollout cap, clot-phi; gate **`check_gnode12_lane_a_gate.py`** (min F1 **0.26**).
+**Rung 10 (2026-06-03):** **`K5_kine15`** (FI **~0.003**). Clot: **`go_gnode10_finish`** (GT u,v,p) p007 **0.629**; **`go_gnode10_kine_loop`** (pred u,v,p) p007 **0.522**. **Rung 11 (2026-06-04 PASS):** **11a** step-2 smoke; **11b** step-3 smoke; **finish (II.0)** **`go_gnode11_finish.ps1`** — **`pseudo_w=0.159`**, mu flat **~1.444** (§169). **Rung 12 Lane A (PASS):** **`go_gnode12_lane_a.ps1`** — optional **mu_ratio uncap** finetune (`MuRatioMax` default **20**), dump with matching rollout cap, clot-phi; gate **`check_gnode12_lane_a_gate.py`** (min F1 **0.26**; §170 p007 **0.750**).
+
+**Rung 12 Lane B:** **`go_gnode12_lane_b.ps1`** — **11 finish corrector** rollout + same dump/clot recipe (A/B vs Lane A); gate **`check_gnode12_lane_b_gate.py`** (warn if p007 below Lane A).
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_a.ps1
-python scripts/check_gnode12_lane_a_gate.py --eval-json outputs/biochem/gnode10_sweep/multi_anchor_gnode12_lane_a_clotphi.jsonl
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_b.ps1
+python scripts/check_gnode12_lane_b_gate.py
 ```
 
-Prereq: **`go_gnode11_finish.ps1`** (or pass `-TeacherCkpt`). Skip mu finetune: **`-SkipMuUnlock`** (dump still uses `-MuRatioMax` for rollout).
+Prereq Lane B: **`go_gnode11_finish.ps1`** (archive `gnode11_finish/biochem_best_high_mu.pth`). Lane A: pass `-TeacherCkpt` or run mu unlock; **`-SkipMuUnlock`** resumes from `gnode12_mu_unlock/`.
 
 ---
 

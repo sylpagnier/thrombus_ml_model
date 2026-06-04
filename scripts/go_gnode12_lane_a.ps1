@@ -7,8 +7,8 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_a.ps1 -SkipMuUnlock
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_a.ps1 -MuRatioMax 80 -MuUnlockEpochs 8
 #
-# After run:
-#   python scripts/check_gnode12_lane_a_gate.py --eval-json outputs/biochem/gnode10_sweep/multi_anchor_gnode12_lane_a_clotphi.jsonl
+# After run (canonical eval only):
+#   python scripts/check_gnode12_lane_a_gate.py --eval-json outputs/biochem/passive_species_focus_compare/gnode12_lane_a_clotphi/multi_anchor.jsonl
 
 param(
     [string] $TeacherCkpt = "",
@@ -45,7 +45,7 @@ if (-not (Test-Path (Join-Path $RepoRoot $JuneAnchorDir))) {
 }
 
 $MuUnlockDir = Join-Path $RepoRoot "outputs\biochem\gnode10_sweep\gnode12_mu_unlock"
-$EvalJson = Join-Path $RepoRoot "outputs\biochem\gnode10_sweep\multi_anchor_$ClotLeg.jsonl"
+$EvalJson = Join-Path $RepoRoot "outputs\biochem\passive_species_focus_compare\$ClotLeg\multi_anchor.jsonl"
 
 Write-Host "[NEW] GNODE 12 Lane A (dump + clot-phi)" -ForegroundColor Cyan
 Write-Host "[i]  teacher=$TeacherPath" -ForegroundColor DarkGray
@@ -83,70 +83,25 @@ if ($MuUnlockEpochs -gt 0 -and -not $SkipMuUnlock) {
     Write-Host "[OK]  mu unlock ckpt -> $TeacherPath" -ForegroundColor Green
 }
 
-Set-Gnode12DumpRolloutEnv -MuRatioMax "$MuRatioMax"
-$TeacherRel = Get-Gnode12PathRelativeToRepo -FullPath $TeacherPath -RepoRoot $RepoRoot
-
-if (-not $SkipDump) {
-    Write-Host "[NEW] dump species + pred [u,v,p] (mu_ratio_max=$MuRatioMax)" -ForegroundColor Cyan
-    Invoke-PythonRc scripts/dump_teacher_species_to_anchors.py `
-        --teacher $TeacherRel `
-        --src-dir $JuneAnchorDir `
-        --out-dir $OutAnchorDir `
-        --device cuda `
-        --no-subsample `
-        --write-kine-macro `
-        --mu-ratio-max $MuRatioMax `
-        --force
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} elseif (-not (Test-Path (Join-Path $RepoRoot $OutAnchorDir))) {
-    Write-Host "[ERR] -SkipDump but missing $OutAnchorDir" -ForegroundColor Red
-    exit 1
-}
-
-$preflightLeg = "${ClotLeg}_preflight"
-& powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_clot_phi_from_anchor_dir.ps1" `
-    -AnchorDir $OutAnchorDir -LegName $preflightLeg -Epochs 1 -SkipViz -SkipEval
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-$preflightLog = Join-Path $RepoRoot "outputs\biochem\passive_species_focus_compare\$preflightLeg\clot_phi_train_log.jsonl"
-$gtPlus = $null
-if (Test-Path $preflightLog) {
-    $row = (Get-Content $preflightLog -Tail 1) | ConvertFrom-Json
-    $gtPlus = [double]$row.val.gt_pos_frac
-}
-if ($null -eq $gtPlus -or $gtPlus -lt $MinGtPosFrac) {
-    Write-Host "[ERR] preflight gt+=$gtPlus (need >= $MinGtPosFrac)" -ForegroundColor Red
-    exit 1
-}
-Write-Host "[OK]  preflight gt+=$([math]::Round($gtPlus, 3))" -ForegroundColor Green
+Invoke-Gnode12DumpClotLeg `
+    -RolloutCkptPath $TeacherPath `
+    -JuneAnchorDir $JuneAnchorDir `
+    -OutAnchorDir $OutAnchorDir `
+    -ClotLeg $ClotLeg `
+    -MuRatioMax $MuRatioMax `
+    -ClotEpochs $ClotEpochs `
+    -MinGtPosFrac $MinGtPosFrac `
+    -SkipDump:$SkipDump `
+    -SkipClot:$SkipClot `
+    -SkipViz:$SkipViz `
+    -LaneLabel "A" `
+    -BaselineNote "(baseline: gnode10_kine_loop p007 ~0.522)"
 
 if ($SkipClot) {
     if (-not $SkipGate) {
         Write-Host "[WARN] clot skipped; lane gate needs eval json from a full run" -ForegroundColor Yellow
     }
     exit 0
-}
-
-$env:CLOT_PHI_ANCHOR_DIR = $OutAnchorDir
-Remove-Item Env:CLOT_PHI_ROLLOUT -ErrorAction SilentlyContinue
-$env:CLOT_PHI_VEL_SOURCE = "gt"
-
-$clotArgs = @(
-    "-AnchorDir", $OutAnchorDir,
-    "-LegName", $ClotLeg,
-    "-Epochs", "$ClotEpochs"
-)
-if ($SkipViz) { $clotArgs += "-SkipViz" }
-
-Write-Host "[NEW] clot-phi ${ClotEpochs}ep (vel=file pred u,v,p)" -ForegroundColor Cyan
-& powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_clot_phi_from_anchor_dir.ps1" @clotArgs
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-$ckpt = Join-Path $RepoRoot "outputs\biochem\passive_species_focus_compare\$ClotLeg\clot_phi_best.pth"
-try {
-    Invoke-PythonRc scripts/eval_clot_phi_multi_anchor.py --checkpoint $ckpt --out $EvalJson --anchor-dir $OutAnchorDir
-} finally {
-    Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
 }
 
 if (-not $SkipGate) {
@@ -159,6 +114,3 @@ if (-not $SkipGate) {
 }
 
 Write-Host "[OK]  GNODE 12 Lane A complete." -ForegroundColor Green
-Write-Host "[i]  anchors: $OutAnchorDir" -ForegroundColor DarkGray
-Write-Host "[i]  clot-phi: $ckpt" -ForegroundColor DarkGray
-Write-Host "[i]  eval: $EvalJson (baseline: gnode10_kine_loop p007 ~0.522)" -ForegroundColor DarkGray

@@ -26,7 +26,10 @@ from src.training.train_clot_phi_simple import (
     _list_anchor_paths,
     _run_epoch,
 )
-from src.evaluation.clot_phi_checkpoint_env import apply_clot_phi_config_from_checkpoint
+from src.evaluation.clot_phi_checkpoint_env import (
+    apply_clot_phi_config_from_checkpoint,
+    apply_clot_phi_eval_defaults,
+)
 from src.utils.paths import get_project_root
 
 
@@ -76,6 +79,7 @@ def main() -> None:
         os.environ["CLOT_PHI_ANCHOR_DIR"] = str(anchor_dir.resolve())
 
     model, species_head, cfg = _load_models(ckpt_path, device)
+    apply_clot_phi_eval_defaults()
 
     raw_anchor = (os.environ.get("CLOT_PHI_ANCHOR_DIR") or "").strip()
     if raw_anchor:

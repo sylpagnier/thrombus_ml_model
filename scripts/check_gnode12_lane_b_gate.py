@@ -1,4 +1,4 @@
-"""Metric gate for rung 12 Lane A (clot-phi on predicted-kine dump; optional mu-unlock run)."""
+"""Metric gate for rung 12 Lane B (clot-phi on gnode11_finish corrector dump)."""
 
 from __future__ import annotations
 
@@ -27,18 +27,19 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--eval-json",
-        default="outputs/biochem/passive_species_focus_compare/gnode12_lane_a_clotphi/multi_anchor.jsonl",
+        default="outputs/biochem/passive_species_focus_compare/gnode12_lane_b_clotphi/multi_anchor.jsonl",
     )
     ap.add_argument("--min-clot-min-f1", type=float, default=0.26)
-    ap.add_argument("--min-gt-pos-frac", type=float, default=0.55)
     ap.add_argument(
-        "--max-teacher-mu-log-mae",
-        type=float,
-        default=1.35,
-        help="Optional mu-unlock trend gate (all-truth logMAE must be <= this).",
+        "--compare-lane-a-json",
+        default="",
+        help="Lane A multi_anchor.jsonl for optional p007 compare (warn only).",
     )
-    ap.add_argument("--mu-unlock-run-jsonl", default="", help="Explicit gnode12_mu_unlock run.jsonl.")
-    ap.add_argument("--skip-mu-trend", action="store_true", help="Do not require mu unlock improvement.")
+    ap.add_argument(
+        "--skip-lane-a-compare",
+        action="store_true",
+        help="Do not warn if p007 F1 is below Lane A.",
+    )
     args = ap.parse_args()
 
     root = get_project_root()
@@ -48,12 +49,14 @@ def main() -> None:
 
     sys.exit(
         run_lane_gate(
-            lane_label="A",
+            lane_label="B",
             eval_path=eval_path,
             min_clot_min_f1=args.min_clot_min_f1,
-            skip_mu_trend=args.skip_mu_trend,
-            max_teacher_mu_log_mae=args.max_teacher_mu_log_mae,
-            mu_unlock_run_jsonl=args.mu_unlock_run_jsonl,
+            skip_mu_trend=True,
+            max_teacher_mu_log_mae=1.35,
+            mu_unlock_run_jsonl="",
+            compare_lane_a_json=args.compare_lane_a_json,
+            warn_if_below_lane_a_p007=not args.skip_lane_a_compare,
         )
     )
 

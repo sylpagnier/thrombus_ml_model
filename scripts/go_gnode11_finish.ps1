@@ -49,6 +49,20 @@ $rc = Invoke-PythonRc -m src.training.train_biochem_corrector --new --skip-pretr
     --save-best --run-name $RunNote
 if ($rc -ne 0) { exit $rc }
 
+foreach ($name in @(
+        "biochem_best_high_mu.pth",
+        "biochem_best.pth",
+        "biochem_teacher_best_high_mu.pth",
+        "biochem_latest_checkpoint.pth",
+        "biochem_teacher_last.pth"
+    )) {
+    $src = Join-Path $RepoRoot "outputs\biochem\$name"
+    if (Test-Path $src) {
+        Copy-Item -Force $src (Join-Path $ArchiveDir $name)
+        Write-Host "[OK]  archived $name -> gnode11_finish/" -ForegroundColor Green
+    }
+}
+
 if ($SkipGate) {
     Write-Host "[OK]  training complete (gate skipped)." -ForegroundColor Green
     exit 0

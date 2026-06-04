@@ -56,3 +56,32 @@ def apply_clot_phi_config_from_checkpoint(cfg: dict[str, Any]) -> None:
     from src.core_physics.clot_phi_rollout import sync_rollout_env_from_checkpoint
 
     sync_rollout_env_from_checkpoint(cfg)
+
+
+def apply_clot_phi_eval_defaults() -> None:
+    """Env from ``go_clot_phi_from_anchor_dir`` / ``_clot_phi_shared_env`` not stored in ckpt.
+
+    Uses setdefault so checkpoint config and explicit env win.
+    """
+    defaults = {
+        "CLOT_PHI_MASK_MODE": "neighbor",
+        "CLOT_PHI_WALL_HOPS": "1",
+        "CLOT_PHI_CLOT_HOPS": "2",
+        "CLOT_PHI_CLOT_TOUCH_HOPS": "1",
+        "CLOT_PHI_CENTER_EXCLUDE_FRAC": "0.10",
+        "CLOT_PHI_DGAMMA_SLICE": "1",
+        "CLOT_PHI_DGAMMA_WALL_MIN_SI": "100",
+        "CLOT_PHI_DGAMMA_OFFWALL_PCT": "80",
+        "CLOT_PHI_SHEAR_MIN_FRAC": "0",
+        "CLOT_PHI_SOFT_LABELS": "1",
+        "CLOT_PHI_BALANCED": "1",
+        "CLOT_PHI_JOINT_USE_PRED_SPECIES": "1",
+        "CLOT_PHI_PHYSICS_GELATION_GATE": "1",
+        "CLOT_PHI_PHYSICS_MU_RATIO_MAX": "4",
+        "CLOT_PHI_PHYSICS_BLEND_ALPHA": "0.75",
+        "CLOT_PHI_ANCHOR_BALANCED": "1",
+    }
+    for key, val in defaults.items():
+        os.environ.setdefault(key, val)
+    if not (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "").strip():
+        os.environ.setdefault("CLOT_PHI_DGAMMA_FEATURE_TIME", "ref")

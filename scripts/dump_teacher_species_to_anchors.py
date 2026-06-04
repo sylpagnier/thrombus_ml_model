@@ -20,7 +20,11 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from src.architecture.gnode_biochem import GNODE_Phase3
+from src.architecture.gnode_biochem import (
+    GNODE_Phase3,
+    apply_biochem_forward_policy_from_checkpoint_meta,
+    resolve_gnode_phase3_ctor_kwargs,
+)
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
 from src.utils.nondim import to_t_nd
@@ -57,26 +61,44 @@ def _build_teacher(
     device: torch.device,
     mu_ratio_max: float,
 ) -> GNODE_Phase3:
-    mc = ckpt.get("model_config") or {}
+    state_dict = ckpt.get("model_state_dict") or ckpt
+    bio_prior_default = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2") or "2"))
+    ctor = resolve_gnode_phase3_ctor_kwargs(
+        ckpt,
+        state_dict,
+        bio_encoder_prior_dim_default=bio_prior_default,
+        latent_dim_default=256,
+        fourier_bands_default=16,
+        use_siren_default=True,
+        gnode_layers_default=1,
+        max_inner_iters_default=10,
+    )
     teacher = GNODE_Phase3(
         phys_cfg=phys_cfg,
-        in_channels=int(mc.get("in_channels", 18)),
-        spatial_channels=int(mc.get("spatial_channels", 15)),
-        latent_dim=int(mc.get("latent_dim", 256)),
-        max_inner_iters=int(mc.get("max_inner_iters", 10)),
-        bio_encoder_prior_dim=int(mc.get("bio_encoder_prior_dim", 2)),
+        in_channels=int(ctor["in_channels"]),
+        spatial_channels=int(ctor["spatial_channels"]),
+        latent_dim=int(ctor["latent_dim"]),
+        max_inner_iters=max(3, int(ctor.get("max_inner_iters", 10))),
+        bio_encoder_prior_dim=int(ctor["bio_encoder_prior_dim"]),
         mu_ratio_max=mu_ratio_max,
         mat_crit=float(bio_cfg.viscosity_mat_crit),
         fi_crit=float(bio_cfg.viscosity_fi_crit),
         temp_mat=float(bio_cfg.viscosity_gnode_temp_mat),
         temp_fi=float(bio_cfg.viscosity_gnode_temp_fi),
-        num_fourier_freqs=int(mc.get("num_fourier_freqs", 16)),
-        use_siren_decoder=bool(mc.get("use_siren_decoder", True)),
-        gnode_layers=int(mc.get("gnode_layers", 1)),
-        use_hard_bcs=bool(mc.get("use_hard_bcs", True)),
+        num_fourier_freqs=int(ctor["num_fourier_freqs"]),
+        use_siren_decoder=bool(ctor["use_siren_decoder"]),
+        gnode_layers=int(ctor["gnode_layers"]),
+        use_hard_bcs=bool(ctor["use_hard_bcs"]),
     ).to(device)
-    teacher.load_state_dict(ckpt["model_state_dict"], strict=False)
+    teacher.load_state_dict(state_dict, strict=False)
+    apply_biochem_forward_policy_from_checkpoint_meta(ckpt, quiet=False)
     teacher.eval()
+    print(
+        f"[i]  GNODE rollout arch: in={int(ctor['in_channels'])} spatial={int(ctor['spatial_channels'])} "
+        f"prior={int(ctor['bio_encoder_prior_dim'])} latent={int(ctor['latent_dim'])} "
+        f"siren={int(ctor['use_siren_decoder'])} fourier={int(ctor['num_fourier_freqs'])}",
+        flush=True,
+    )
     return teacher
 
 
