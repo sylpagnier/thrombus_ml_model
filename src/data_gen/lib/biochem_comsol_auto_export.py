@@ -7,8 +7,8 @@ files are generated from Gmsh mesh tags (no COMSOL boundary export needed).
 Typical workflow::
 
     1. Generate mesh: ``data/raw/biochem_anchors/<stem>.msh`` (+ ``.nas``).
-    2. Run the biochem study in COMSOL; save ``<stem>.mph`` next to the mesh
-       (or set ``BIOCHEM_COMSOL_MODEL``).
+    2. Run the biochem study in COMSOL; save as ``comsol_models/phase2_nowound_XXX.mph``
+       (maps to anchor stem ``patientXXX``) or set ``BIOCHEM_COMSOL_MODEL``.
     3. ``python -m src.tools.extract_biochem_comsol --stem <stem> --from-comsol``
 
 Requires: COMSOL 6.x + ``pip install mph`` (same as kinematics ``AnchorGenerator``).
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -81,8 +82,23 @@ def _parse_expr_list(raw: str | None) -> tuple[str, ...]:
     return tuple(parts)
 
 
+_PATIENT_STEM_RE = re.compile(r"^patient(\d+)$", re.IGNORECASE)
+
+
+def phase2_nowound_mph_name_for_stem(stem: str) -> str | None:
+    """Map anchor stem ``patient007`` -> COMSOL filename ``phase2_nowound_007.mph``."""
+    m = _PATIENT_STEM_RE.match(stem.strip())
+    if not m:
+        return None
+    return f"phase2_nowound_{int(m.group(1)):03d}.mph"
+
+
 def resolve_biochem_comsol_model_path(stem: str, explicit: Path | None = None) -> Path | None:
-    """Return first existing ``.mph`` for ``stem`` (explicit path, env, then search dirs)."""
+    """Return first existing ``.mph`` for ``stem`` (explicit path, env, then search dirs).
+
+    Anchor stems ``patientXXX`` resolve to ``comsol_models/phase2_nowound_XXX.mph``
+    (3-digit index, e.g. ``patient7`` -> ``phase2_nowound_007.mph``).
+    """
     if explicit is not None:
         p = Path(explicit)
         if p.is_file():
@@ -96,12 +112,16 @@ def resolve_biochem_comsol_model_path(stem: str, explicit: Path | None = None) -
             return p.resolve()
 
     dr = data_root()
-    candidates = [
+    models_dir = comsol_models_dir()
+    candidates: list[Path] = [
         dr / "raw" / "biochem_anchors" / f"{stem}.mph",
-        comsol_models_dir() / "runs" / f"{stem}.mph",
-        comsol_models_dir() / f"{stem}.mph",
-        comsol_models_dir() / "phase2_nowound_001.mph",
+        models_dir / "runs" / f"{stem}.mph",
+        models_dir / f"{stem}.mph",
     ]
+    mapped = phase2_nowound_mph_name_for_stem(stem)
+    if mapped:
+        candidates.append(models_dir / mapped)
+
     for p in candidates:
         if p.is_file():
             return p.resolve()

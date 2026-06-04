@@ -6,10 +6,35 @@ import numpy as np
 
 from src.data_gen.lib.biochem_comsol_auto_export import (
     DOMAIN_FIELD_NAMES,
+    phase2_nowound_mph_name_for_stem,
+    resolve_biochem_comsol_model_path,
     write_boundary_txt_from_mesh,
     write_wide_domain_txt,
 )
 from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
+
+
+def test_phase2_nowound_mph_name_for_patient_stem():
+    assert phase2_nowound_mph_name_for_stem("patient007") == "phase2_nowound_007.mph"
+    assert phase2_nowound_mph_name_for_stem("patient7") == "phase2_nowound_007.mph"
+    assert phase2_nowound_mph_name_for_stem("vessel_001") is None
+
+
+def test_resolve_patient_stem_to_phase2_nowound_mph(tmp_path, monkeypatch):
+    models = tmp_path / "comsol_models"
+    models.mkdir()
+    (models / "phase2_nowound_003.mph").write_bytes(b"stub")
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_auto_export.comsol_models_dir",
+        lambda: models,
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_auto_export.data_root",
+        lambda: tmp_path,
+    )
+    got = resolve_biochem_comsol_model_path("patient003")
+    assert got == (models / "phase2_nowound_003.mph").resolve()
+    assert resolve_biochem_comsol_model_path("patient999") is None
 
 
 def test_write_wide_domain_txt_roundtrip_with_extractor(tmp_path):

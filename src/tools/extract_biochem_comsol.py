@@ -1,7 +1,8 @@
 """Interactive biochem COMSOL -> PyG graph extraction.
 
 **Automated path (recommended):** run the study in COMSOL, save ``<stem>.mph`` next to the
-mesh under ``data/raw/biochem_anchors/``, then::
+mesh under ``data/raw/biochem_anchors/``, with COMSOL saves as
+``comsol_models/phase2_nowound_XXX.mph`` (for ``patientXXX``), then::
 
     python -m src.tools.extract_biochem_comsol --stem patient007 --from-comsol
 
@@ -47,6 +48,7 @@ class AnchorExtractStatus:
     has_kine_graph: bool
     biochem_graph_mtime: float | None
     has_comsol_model: bool
+    comsol_model_path: Path | None
 
     @property
     def export_count(self) -> int:
@@ -110,6 +112,7 @@ def _status_for_stem(
     biochem_pt = proc_dir / f"{stem}.pt"
     kine_pt = kine_dir / f"{stem}.pt"
     mtime = biochem_pt.stat().st_mtime if biochem_pt.is_file() else None
+    mph_path = resolve_biochem_comsol_model_path(stem)
     return AnchorExtractStatus(
         stem=stem,
         has_mesh=mesh,
@@ -120,7 +123,8 @@ def _status_for_stem(
         has_biochem_graph=biochem_pt.is_file(),
         has_kine_graph=kine_pt.is_file(),
         biochem_graph_mtime=mtime,
-        has_comsol_model=resolve_biochem_comsol_model_path(stem) is not None,
+        comsol_model_path=mph_path,
+        has_comsol_model=mph_path is not None,
     )
 
 
@@ -169,26 +173,26 @@ def print_status_table(
         return
     print(
         f"{'#':>3}  {'stem':<18}  {'tag':<14}  {'mesh':<5}  {'exports':<14}  "
-        f"{'biochem .pt':<20}  {'kine .pt':<6}  {'mph':<5}"
+        f"{'biochem .pt':<20}  {'kine':<6}  {'COMSOL .mph':<22}"
     )
-    print("-" * 98)
+    print("-" * 110)
     for i, s in enumerate(statuses, start=1):
         mesh = "yes" if s.has_mesh else "no"
         graph = "yes" if s.has_biochem_graph else "no"
         if s.has_biochem_graph:
             graph = f"yes {_fmt_mtime(s.biochem_graph_mtime)}"
         kine = "yes" if s.has_kine_graph else "no"
-        mph = "yes" if s.has_comsol_model else "no"
+        mph = s.comsol_model_path.name if s.comsol_model_path else "-"
         print(
             f"{i:>3}  {s.stem:<18}  {_row_tag(s):<14}  {mesh:<5}  "
-            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<5}"
+            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<22}"
         )
     print(
-        "\n[i] [ready] = mesh + domain txt. [mph ready] = mesh + saved .mph (use --from-comsol). "
+        "\n[i] [ready] = mesh + domain txt. [mph ready] = mesh + phase2_nowound_XXX.mph for patientXXX. "
         "[extracted] = biochem graph exists."
     )
     print(
-        "[i] If mesh stem is patient_007 but exports are patient007.txt, run:\n"
+        "[i] patient007 -> comsol_models/phase2_nowound_007.mph. Mesh/export stem mismatch:\n"
         "      python -m src.tools.prepare_biochem_anchors --strip-prefix-underscore"
     )
 
