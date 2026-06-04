@@ -58,18 +58,27 @@ if ($MuUnlockEpochs -gt 0 -and -not $SkipMuUnlock) {
     Set-Gnode12MuUnlockEnv -Epochs $MuUnlockEpochs -MuRatioMax "$MuRatioMax"
     Copy-Item -Force $TeacherPath (Join-Path $RepoRoot "outputs\biochem\biochem_teacher_best_high_mu.pth")
     Write-Host "[NEW] mu unlock ${MuUnlockEpochs}ep (pred kine, mu_ratio_max=$MuRatioMax)" -ForegroundColor Cyan
+    Write-Host "[i]  mu unlock training (~${MuUnlockEpochs} min on GPU; console may be quiet until val lines)" -ForegroundColor DarkGray
     $rc = Invoke-PythonRc -m src.training.train_biochem_corrector --new --skip-pretrain --init-from-best `
         --epochs $MuUnlockEpochs --save-best --run-name gnode12_mu_unlock
-    if ($rc -ne 0) { exit $rc }
+    if ($rc -ne 0) {
+        Write-Host "[ERR] mu unlock training failed (exit=$rc). See outputs/reports/training/biochem/*/run.jsonl" -ForegroundColor Red
+        exit $rc
+    }
+    Write-Host "[OK]  mu unlock training finished (exit=0)" -ForegroundColor Green
     foreach ($rel in @(
             "biochem_teacher_passive_mu_unlock_best.pth",
             "biochem_teacher_best_high_mu.pth"
         )) {
         $cand = Join-Path $MuUnlockDir $rel
         if (Test-Path $cand) {
-            $TeacherPath = $cand
+            $TeacherPath = Resolve-Gnode12RepoPath -Path $cand
             break
         }
+    }
+    if (-not (Test-Path $TeacherPath)) {
+        Write-Host "[ERR] mu unlock ckpt missing under $MuUnlockDir" -ForegroundColor Red
+        exit 1
     }
     Write-Host "[OK]  mu unlock ckpt -> $TeacherPath" -ForegroundColor Green
 }

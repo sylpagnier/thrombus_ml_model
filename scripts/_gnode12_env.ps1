@@ -39,12 +39,14 @@ function Resolve-Gnode12TeacherCkpt {
         $p = Resolve-Gnode12RepoPath -Path $UserPath
         if ($p -and (Test-Path $p)) { return $p }
     }
+    # gnode11_finish archive dir is often empty (ckpts live in outputs/biochem/ during run only).
     foreach ($rel in @(
             "outputs\biochem\gnode10_sweep\gnode12_mu_unlock\biochem_teacher_passive_mu_unlock_best.pth",
             "outputs\biochem\gnode10_sweep\gnode12_mu_unlock\biochem_teacher_best_high_mu.pth",
             "outputs\biochem\gnode10_sweep\gnode11_finish\biochem_teacher_best_high_mu.pth",
             "outputs\biochem\gnode10_sweep\gnode11_finish\biochem_teacher_last.pth",
-            "outputs\biochem\gnode10_sweep\gnode11_finish\biochem_latest_checkpoint.pth"
+            "outputs\biochem\gnode10_sweep\gnode11_finish\biochem_latest_checkpoint.pth",
+            "outputs\biochem\biochem_teacher_best_high_mu.pth"
         )) {
         $c = Resolve-Gnode12RepoPath -Path $rel
         if ($c -and (Test-Path $c)) { return $c }
