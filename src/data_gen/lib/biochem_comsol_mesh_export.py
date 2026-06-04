@@ -11,6 +11,7 @@ import meshio
 import numpy as np
 
 from src.data_gen.lib.biochem_comsol_auto_export import _evaluate_at_coords_and_time
+from src.data_gen.lib.biochem_comsol_datasets import resolve_boundary_datasets, sample_coords_from_dataset
 from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 from src.tools.prepare_biochem_anchors import scaffold_anchor_sidecars
 
@@ -189,6 +190,44 @@ def mesh_has_gmsh_boundary_tags(mesh_path: Path) -> bool:
         return False
 
 
+def write_boundary_txt_from_boundary_datasets(
+    model_java,
+    label_dir: Path,
+    stem: str,
+    *,
+    boundary_datasets: dict[str, str] | None = None,
+    force: bool = False,
+) -> bool:
+    """Write boundary txt from Results datasets Inlet/Outlet/Wall (same as inlet_nodes export)."""
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    bmap = boundary_datasets if boundary_datasets is not None else resolve_boundary_datasets(model_java)
+    if not all(k in bmap for k in ("inlet", "outlet", "wall")):
+        missing = [k for k in ("inlet", "outlet", "wall") if k not in bmap]
+        logger.debug("[i] %s: boundary datasets missing %s", stem, missing)
+        return False
+
+    for bname in ("inlet", "outlet", "wall"):
+        out_path = label_dir / f"{stem}_{bname}.txt"
+        if out_path.is_file() and not force:
+            continue
+        dset_tag = bmap[bname]
+        coords = sample_coords_from_dataset(model_java, dset_tag)
+        unique = np.unique(coords[:, :2], axis=0) if coords.size else np.zeros((0, 2))
+        lines = [f"% Model: COMSOL dataset {dset_tag}", "% x  y"]
+        for x, y in unique:
+            lines.append(f"0 0 {x:.10f} {y:.10f}")
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info(
+            "[OK] %s: %s boundary from dataset '%s' (%d unique coords)",
+            stem,
+            bname,
+            dset_tag,
+            len(unique),
+        )
+    return True
+
+
 def write_boundary_txt_from_comsol_masks(
     model_java,
     coords_cm: np.ndarray,
@@ -294,6 +333,17 @@ def ensure_boundary_txt_files(
             force=force_boundary,
         )
         return
+
+    try:
+        if write_boundary_txt_from_boundary_datasets(
+            model_java,
+            label_dir,
+            stem,
+            force=force_boundary,
+        ):
+            return
+    except Exception as exc:
+        logger.warning("[WARN] %s: COMSOL boundary datasets failed (%s); trying mask expressions.", stem, exc)
 
     try:
         write_boundary_txt_from_comsol_masks(

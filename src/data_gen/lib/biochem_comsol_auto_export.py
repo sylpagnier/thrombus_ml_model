@@ -14,8 +14,11 @@ Typical workflow::
 Requires: COMSOL 6.x + ``pip install mph`` (same as kinematics ``AnchorGenerator``).
 
 ``--force`` rewrites domain field txt only; existing mesh and boundary txt are kept unless
-``BIOCHEM_COMSOL_FORCE_MESH=1`` or ``BIOCHEM_COMSOL_FORCE_BOUNDARY=1``. Older ``.mph`` files
-without ``sel1``-``sel3`` use named selections (``box1``/``box2``/``dif1``) or keep manual boundaries.
+``BIOCHEM_COMSOL_FORCE_MESH=1`` or ``BIOCHEM_COMSOL_FORCE_BOUNDARY=1``.
+
+Domain fields use the Results dataset linked to ``sol1`` (Study 1 biochemistry), not ``sol2``.
+Boundaries prefer Results datasets ``Inlet`` / ``Outlet`` / ``Wall`` (same as inlet_nodes export).
+Override: ``BIOCHEM_COMSOL_DATASET_TAG``, ``BIOCHEM_COMSOL_INLET_DATASET``, etc.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import meshio
 import numpy as np
 
 from src.config import PhysicsConfig, VesselConfig, biochem_comsol_time_cap_s
+from src.data_gen.lib.biochem_comsol_datasets import resolve_solution_dataset
 from src.utils.paths import comsol_models_dir, data_root
 
 logger = logging.getLogger(__name__)
@@ -465,7 +469,8 @@ class BiochemComsolAutoExporter:
             os.environ.get("BIOCHEM_COMSOL_DOMAIN_EXPRS")
         )
         self.sol_tag = (sol_tag or os.environ.get("BIOCHEM_COMSOL_SOL_TAG") or "sol1").strip()
-        self.dataset_tag = (dataset_tag or os.environ.get("BIOCHEM_COMSOL_DATASET_TAG") or "dset1").strip()
+        self._dataset_tag_explicit = (dataset_tag or os.environ.get("BIOCHEM_COMSOL_DATASET_TAG") or "").strip()
+        self.dataset_tag = self._dataset_tag_explicit or "dset1"
         self._client = None
         self._model = None
 
@@ -524,6 +529,11 @@ class BiochemComsolAutoExporter:
         self._model_path = resolved
         with self:
             assert self._model is not None
+            self.dataset_tag = resolve_solution_dataset(
+                self._model.java,
+                self.sol_tag,
+                explicit=self._dataset_tag_explicit or None,
+            )
             from src.data_gen.lib.biochem_comsol_mesh_export import (
                 ensure_anchor_mesh_from_comsol,
                 ensure_boundary_txt_files,
@@ -560,7 +570,14 @@ class BiochemComsolAutoExporter:
             if resolve_anchor_mesh_path(self.raw_dir, stem) is None:
                 raise RuntimeError(f"{stem}: mesh export failed under {self.raw_dir}")
             times = _discover_solution_times(self._model.java, self.sol_tag)
-            logger.info("[i] %s: evaluating %d time step(s) on %d mesh nodes", stem, len(times), len(coords_cm))
+            logger.info(
+                "[i] %s: evaluating %d time step(s) on %d mesh nodes (dataset=%s, sol=%s)",
+                stem,
+                len(times),
+                len(coords_cm),
+                self.dataset_tag,
+                self.sol_tag,
+            )
 
             fields_by_time: dict[float, np.ndarray] = {}
             for t in times:
