@@ -6,8 +6,8 @@ files are generated from Gmsh mesh tags (no COMSOL boundary export needed).
 
 Typical workflow::
 
-    1. Generate mesh: ``data/raw/biochem_anchors/<stem>.msh`` (+ ``.nas``).
-    2. Run the biochem study in COMSOL; save as ``comsol_models/phase2_nowound_XXX.mph``
+    1. Run the biochem study in COMSOL; save as ``comsol_models/phase2_nowound_XXX.mph``.
+    2. Mesh ``.nas``/``.msh`` is auto-exported from the ``.mph`` when missing (no manual mesh export).
        (maps to anchor stem ``patientXXX``) or set ``BIOCHEM_COMSOL_MODEL``.
     3. ``python -m src.tools.extract_biochem_comsol --stem <stem> --from-comsol``
 
@@ -423,26 +423,53 @@ class BiochemComsolAutoExporter:
             )
 
         domain_path = self.label_dir / f"{stem}.txt"
-        if domain_path.is_file() and not force:
-            logger.info("[skip] %s exists (use force=True to rewrite)", domain_path.name)
-            return domain_path
-
-        mesh_path = self._resolve_mesh_path(stem)
-        mesh = meshio.read(mesh_path)
-        coords_cm = np.asarray(mesh.points[:, :2], dtype=np.float64)
-
-        if boundary_from_mesh:
-            write_boundary_txt_from_mesh(
-                mesh_path,
-                self.label_dir,
-                stem,
-                vessel_cfg=self.vessel_cfg,
-                force=force,
-            )
+        skip_fields = domain_path.is_file() and not force
 
         self._model_path = resolved
         with self:
             assert self._model is not None
+            from src.data_gen.lib.biochem_comsol_mesh_export import (
+                ensure_anchor_mesh_from_comsol,
+                mesh_has_gmsh_boundary_tags,
+                write_boundary_txt_from_comsol_masks,
+            )
+            from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
+
+            mesh_path, mesh_exported = ensure_anchor_mesh_from_comsol(
+                self._model.java,
+                stem,
+                self.raw_dir,
+                force=force,
+            )
+            mesh = meshio.read(mesh_path)
+            coords_cm = np.asarray(mesh.points[:, :2], dtype=np.float64)
+
+            if boundary_from_mesh:
+                use_gmsh = mesh_has_gmsh_boundary_tags(mesh_path) and not mesh_exported
+                if use_gmsh:
+                    write_boundary_txt_from_mesh(
+                        mesh_path,
+                        self.label_dir,
+                        stem,
+                        vessel_cfg=self.vessel_cfg,
+                        force=force,
+                    )
+                else:
+                    write_boundary_txt_from_comsol_masks(
+                        self._model.java,
+                        coords_cm,
+                        self.label_dir,
+                        stem,
+                        dataset_tag=self.dataset_tag,
+                        force=force,
+                    )
+
+            if skip_fields:
+                logger.info("[skip] %s exists (use force=True to rewrite fields)", domain_path.name)
+                return domain_path
+
+            if resolve_anchor_mesh_path(self.raw_dir, stem) is None:
+                raise RuntimeError(f"{stem}: mesh export failed under {self.raw_dir}")
             times = _discover_solution_times(self._model.java, self.sol_tag)
             logger.info("[i] %s: evaluating %d time step(s) on %d mesh nodes", stem, len(times), len(coords_cm))
 

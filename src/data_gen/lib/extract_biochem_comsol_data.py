@@ -878,7 +878,10 @@ class PatientDataExtractor:
                             flush=True,
                         )
                         continue
-                elif force_comsol_pull or not domain_txt.is_file():
+                elif force_comsol_pull or not domain_txt.is_file() or not (
+                    (self.raw_dir / f"{stem}.msh").is_file()
+                    or (self.raw_dir / f"{stem}.nas").is_file()
+                ):
                     print(f"[i] COMSOL pull {stem} <- {mph_path.name}", flush=True)
                     try:
                         self.pull_comsol_exports(stem, model_path=mph_path, force=force_comsol_pull)

@@ -74,7 +74,7 @@ class AnchorExtractStatus:
 
     @property
     def can_pull_from_comsol(self) -> bool:
-        return self.has_mesh and self.has_comsol_model
+        return self.has_comsol_model
 
     @property
     def already_extracted(self) -> bool:
@@ -157,7 +157,7 @@ def _row_tag(s: AnchorExtractStatus) -> str:
     if s.can_extract:
         return "[ready*]"
     if s.has_comsol_model and not s.has_mesh:
-        return "[mph only]"
+        return "[mph->mesh]"
     if s.has_domain_txt and not s.has_mesh:
         return "[no mesh]"
     if s.has_mesh and not s.has_domain_txt and s.has_comsol_model:
@@ -201,7 +201,7 @@ def print_status_table(
             f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<22}"
         )
     print(
-        "\n[i] [ready] = mesh + domain txt. [mph ready] = mesh + phase2_nowound_XXX.mph for patientXXX. "
+        "\n[i] [ready] = mesh + domain txt. [mph->mesh] = .mph only (mesh auto-exported on extract). "
         "[extracted] = biochem graph exists."
     )
     print(
@@ -357,8 +357,8 @@ def _interactive_loop(
         can_run = picked.can_extract or (from_comsol and picked.can_pull_from_comsol)
         if not can_run:
             print(
-                f"[ERR] {picked.stem}: need mesh in {raw_dir} and either domain .txt or a saved .mph "
-                f"(--from-comsol)."
+                f"[ERR] {picked.stem}: need domain .txt or a phase2_nowound_XXX.mph in comsol_models/ "
+                f"(--from-comsol exports mesh + fields)."
             )
             if picked.has_mesh and picked.export_count < 4:
                 missing = []

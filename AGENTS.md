@@ -59,7 +59,7 @@
 
 ## Scripts layout
 
-- **Biochem COMSOL extract:** default auto-pull from `comsol_models/phase2_nowound_XXX.mph` (`patientXXX`). Run `python -m src.data_gen.lib.extract_biochem_comsol_data` (batch) or `src.tools.extract_biochem_comsol` (interactive). Legacy manual txt: `--no-from-comsol`. Env: `BIOCHEM_COMSOL_MODEL`, `BIOCHEM_COMSOL_DOMAIN_EXPRS`, `BIOCHEM_COMSOL_SOL_TAG`, `BIOCHEM_COMSOL_DATASET_TAG`.
+- **Biochem COMSOL extract:** default auto-pull from `comsol_models/phase2_nowound_XXX.mph` (`patientXXX`); auto-exports mesh `.nas`/`.msh` and boundaries from COMSOL when missing. Run `python -m src.data_gen.lib.extract_biochem_comsol_data`. Legacy manual exports: `--no-from-comsol`.
 - Active launchers and utilities: [scripts/README.md](scripts/README.md).
 - Historical sweep names in `BIOCHEM_TRAINING_PROGRESS.md` referred to one-off runners since removed; use current `go_*` scripts instead.
 
