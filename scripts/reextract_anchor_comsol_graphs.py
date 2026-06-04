@@ -33,6 +33,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stem", type=str, default="", help="Only this stem (default: all meshes).")
     parser.add_argument(
+        "--stems",
+        type=str,
+        default="",
+        help="Comma-separated stems (e.g. patient001,patient007); overrides --stem when set.",
+    )
+    parser.add_argument(
         "--skip-enrich",
         action="store_true",
         help="Skip sidecar centerline/d_bar enrichment (use existing JSON).",
@@ -49,7 +55,12 @@ def main() -> None:
     if not raw_dir.is_dir():
         raise SystemExit(f"[ERR] raw anchor dir missing: {raw_dir}")
 
-    stems = [args.stem.strip()] if args.stem.strip() else stems_in_dir(raw_dir)
+    if args.stems.strip():
+        stems = [s.strip() for s in args.stems.split(",") if s.strip()]
+    elif args.stem.strip():
+        stems = [args.stem.strip()]
+    else:
+        stems = stems_in_dir(raw_dir)
     if not stems:
         raise SystemExit(f"[ERR] no mesh stems under {raw_dir}")
 
