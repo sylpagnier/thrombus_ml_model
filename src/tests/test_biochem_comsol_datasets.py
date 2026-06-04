@@ -69,6 +69,11 @@ def test_boundary_dataset_score_prefers_inlet_over_edg():
     assert _boundary_dataset_score("inlet", "Inlet", "edg1") < 0
 
 
+def test_boundary_dataset_score_template_box_selections():
+    assert _boundary_dataset_score("inlet", "inlet", "box1") >= 95
+    assert _boundary_dataset_score("wall", "wall", "dif1") >= 95
+
+
 def test_resolve_boundary_datasets_by_label():
     model = _FakeModelJava(
         {

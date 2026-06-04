@@ -464,6 +464,58 @@ def _print_model_structure(model, show_properties: bool = False) -> None:
         _print_functions(_safe_call(lambda: comp.func(), None), f"Component {comp_id}")
 
 
+def _print_biochem_extract_readiness(model) -> None:
+    """Pre-flight: Export nodes + datasets used by extract_biochem_comsol."""
+    from src.data_gen.lib.biochem_comsol_datasets import (
+        list_comsol_datasets,
+        resolve_boundary_datasets,
+        resolve_solution_dataset,
+    )
+    from src.data_gen.lib.biochem_comsol_mph_export import (
+        list_result_export_tags,
+        resolve_export_tags,
+    )
+
+    print("\n=== BIOCHEM EXTRACT READINESS ===")
+    print("[i] Default pull: Results > Export nodes (set BIOCHEM_COMSOL_USE_MPH_EXPORTS=0 for Interp fallback).")
+
+    exports = list_result_export_tags(model.java)
+    print(f"\nExport nodes ({len(exports)}):")
+    for tag in exports:
+        print(f"  - {tag}")
+    need = resolve_export_tags()
+    print("\nRequired Export tags (env overrides in parentheses):")
+    for role, tag in need.items():
+        hit = tag if tag in exports else next((e for e in exports if e.lower() == tag.lower()), None)
+        status = "OK" if hit else "MISSING"
+        print(f"  - {role}: {tag} -> {status}" + (f" (found as {hit})" if hit and hit != tag else ""))
+
+    rows = list_comsol_datasets(model.java)
+    print(f"\nResult datasets ({len(rows)}):")
+    for row in rows:
+        sol = row.get("solution") or ""
+        extra = f", sol={sol}" if sol else ""
+        print(f"  - {row['tag']}: {row.get('label') or row['tag']}{extra}")
+
+    try:
+        dom = resolve_solution_dataset(model.java, "sol1")
+        print(f"\nDomain dataset for sol1: {dom}")
+    except Exception as exc:
+        print(f"\n[WARN] Domain dataset for sol1: {exc}")
+
+    try:
+        bmap = resolve_boundary_datasets(model.java)
+        print(f"Boundary datasets: {bmap}")
+    except Exception as exc:
+        print(f"[WARN] Boundary datasets: {exc}")
+
+    print(
+        "\n[i] Template selections: box1=inlet, box2=outlet, dif1=wall; "
+        "vars is_inlet=sel1(x,y) (Interp may fail; Export nodes preferred)."
+    )
+    print("[i] Material mu: mu_b*(mu1(Mat)+mu2(FI)) must match sol_data expressions in Export.")
+
+
 def inspect_model(model_path: Path, show_properties: bool = False) -> None:
     try:
         import mph
@@ -483,6 +535,7 @@ def inspect_model(model_path: Path, show_properties: bool = False) -> None:
         _print_parameters(model)
         _print_variables(model)
         _print_named_selections(model)
+        _print_biochem_extract_readiness(model)
         _print_functions(_safe_call(lambda: model.java.func(), None), "Global")
         # _print_studies(model)  # Removed: Not relevant for PINN context mapping
     finally:
