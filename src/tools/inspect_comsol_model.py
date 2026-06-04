@@ -472,6 +472,7 @@ def _print_biochem_extract_readiness(model) -> None:
         resolve_solution_dataset,
     )
     from src.data_gen.lib.biochem_comsol_mph_export import (
+        discover_export_tags,
         list_result_export_tags,
         resolve_export_tags,
     )
@@ -483,12 +484,19 @@ def _print_biochem_extract_readiness(model) -> None:
     print(f"\nExport nodes ({len(exports)}):")
     for tag in exports:
         print(f"  - {tag}")
-    need = resolve_export_tags()
-    print("\nRequired Export tags (env overrides in parentheses):")
+    discovered = discover_export_tags(model.java)
+    need = resolve_export_tags(model.java)
+    print("\nResolved Export tags (env overrides win; else auto from labels/dset1/edg*):")
     for role, tag in need.items():
         hit = tag if tag in exports else next((e for e in exports if e.lower() == tag.lower()), None)
         status = "OK" if hit else "MISSING"
-        print(f"  - {role}: {tag} -> {status}" + (f" (found as {hit})" if hit and hit != tag else ""))
+        auto = discovered.get(role)
+        extra = ""
+        if auto and auto != tag:
+            extra = f" (auto={auto})"
+        elif auto and status == "OK":
+            extra = " (auto)"
+        print(f"  - {role}: {tag} -> {status}{extra}")
 
     rows = list_comsol_datasets(model.java)
     print(f"\nResult datasets ({len(rows)}):")

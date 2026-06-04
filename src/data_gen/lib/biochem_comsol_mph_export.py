@@ -36,13 +36,117 @@ def use_mph_result_exports() -> bool:
     return _env_flag("BIOCHEM_COMSOL_USE_MPH_EXPORTS", default_true=True)
 
 
-def resolve_export_tags() -> dict[str, str]:
+def _export_node_label(node) -> str:
+    for getter in (lambda: node.label(), lambda: node.name()):
+        try:
+            val = getter()
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _export_expr_count(node) -> int:
+    try:
+        arr = node.getStringArray("expr")
+        return len(list(arr)) if arr is not None else 0
+    except Exception:
+        return 0
+
+
+def _export_dataset_tag(node) -> str:
+    try:
+        return str(node.getString("data")).strip()
+    except Exception:
+        return ""
+
+
+def discover_export_tags(model_java) -> dict[str, str]:
+    """Map domain/inlet/outlet/wall -> Export node tag (``data1`` or ``sol_data``, etc.)."""
+    out: dict[str, str] = {}
+    export_root = model_java.result().export()
+    entries: list[dict] = []
+
+    for tag in list_result_export_tags(model_java):
+        try:
+            node = export_root.get(tag)
+        except Exception:
+            continue
+        try:
+            if "Data" not in str(node.getType()):
+                continue
+        except Exception:
+            continue
+        entries.append(
+            {
+                "tag": str(tag),
+                "label": _export_node_label(node).lower(),
+                "expr_n": _export_expr_count(node),
+                "dataset": _export_dataset_tag(node),
+            }
+        )
+
+    label_patterns: dict[str, tuple[str, ...]] = {
+        "domain": ("sol_data", "sol data", "domain", "solution", "wide"),
+        "inlet": ("inlet_nodes", "inlet node", "inlet"),
+        "outlet": ("outlet_nodes", "outlet node", "outlet"),
+        "wall": ("wall_nodes", "wall node", "wall"),
+    }
+    for role, patterns in label_patterns.items():
+        for ex in entries:
+            if any(p in ex["label"] for p in patterns):
+                out[role] = ex["tag"]
+                break
+
+    for ex in entries:
+        if ex["dataset"] == "dset1" and "domain" not in out:
+            out["domain"] = ex["tag"]
+
+    for ex in entries:
+        ds = ex["dataset"].lower()
+        for role, ds_tag in (("inlet", "edg1"), ("outlet", "edg2"), ("wall", "edg3")):
+            if ds == ds_tag and role not in out:
+                out[role] = ex["tag"]
+
+    remaining = [ex for ex in entries if ex["tag"] not in out.values()]
+    if "domain" not in out and remaining:
+        dom = max(remaining, key=lambda e: e["expr_n"])
+        out["domain"] = dom["tag"]
+        remaining = [ex for ex in remaining if ex["tag"] != dom["tag"]]
+
+    small = sorted(
+        [ex for ex in remaining if ex["expr_n"] <= 4 or ex["label"] in ("",)],
+        key=lambda e: e["tag"],
+    )
+    for role, ex in zip(("inlet", "outlet", "wall"), small):
+        if role not in out:
+            out[role] = ex["tag"]
+
+    for role, ex in zip(("inlet", "outlet", "wall"), remaining):
+        if role not in out:
+            out[role] = ex["tag"]
+
+    return out
+
+
+def resolve_export_tags(model_java=None) -> dict[str, str]:
     """Map logical roles -> COMSOL Export node tags in the .mph."""
     out = dict(_DEFAULT_EXPORT_TAGS)
     for role, env_name in _ENV_EXPORT_KEYS.items():
         val = (os.environ.get(env_name) or "").strip()
         if val:
             out[role] = val
+
+    if model_java is not None:
+        discovered = discover_export_tags(model_java)
+        available = set(list_result_export_tags(model_java))
+        for role in ("domain", "inlet", "outlet", "wall"):
+            if (os.environ.get(_ENV_EXPORT_KEYS[role]) or "").strip():
+                continue
+            tag = discovered.get(role)
+            if tag and tag in available:
+                out[role] = tag
     return out
 
 
@@ -198,7 +302,7 @@ def pull_exports_via_mph_nodes(
     raw_dir = Path(raw_dir)
     ensure_biochem_extract_dirs(raw_dir, label_dir)
 
-    tags = resolve_export_tags()
+    tags = resolve_export_tags(model_java)
     domain_p = label_dir / f"{stem}.txt"
     boundary_paths = {
         "inlet": label_dir / f"{stem}_inlet.txt",

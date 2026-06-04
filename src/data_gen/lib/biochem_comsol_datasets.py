@@ -149,17 +149,21 @@ def resolve_solution_dataset(
 
 
 def _boundary_dataset_score(bname: str, label: str, tag: str) -> int:
-    """Higher = better match. Deprioritize edge-only datasets (``edg*``)."""
+    """Higher = better match. Deprioritize stray edge datasets, not ``edg*`` named Inlet/Outlet/Wall."""
     ll = label.lower().strip()
     tl = tag.lower().strip()
-    if tl.startswith("edg") or ll.startswith("edge"):
-        return -100
+    if ll == bname or tl == bname:
+        if tl.startswith("edg"):
+            return 90
+        return 100
     # phase2_template_nowound selections: box1=inlet, box2=outlet, dif1=wall
     legacy_tag = {"inlet": "box1", "outlet": "box2", "wall": "dif1"}.get(bname)
     if legacy_tag and tl == legacy_tag:
         return 95
-    if ll == bname or tl == bname:
-        return 100
+    if tl.startswith("edg") and bname in ll:
+        return 85
+    if (tl.startswith("edg") or ll.startswith("edge")) and bname not in ll:
+        return -100
     if ll.endswith(f" {bname}") or f"_{bname}" in tl:
         return 50
     if bname in ll.split():

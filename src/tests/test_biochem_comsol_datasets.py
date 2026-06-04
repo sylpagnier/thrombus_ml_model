@@ -66,7 +66,24 @@ def test_resolve_solution_dataset_prefers_sol1_link():
 
 def test_boundary_dataset_score_prefers_inlet_over_edg():
     assert _boundary_dataset_score("inlet", "Inlet", "dset5") > _boundary_dataset_score("inlet", "Inlet", "edg1")
-    assert _boundary_dataset_score("inlet", "Inlet", "edg1") < 0
+    assert _boundary_dataset_score("inlet", "Inlet", "edg1") == 90
+    assert _boundary_dataset_score("inlet", "edge only", "edg9") < 0
+
+
+def test_resolve_boundary_datasets_edg_labels_only():
+    model = _FakeModelJava(
+        {
+            "dset1": _FakeDataset("Study 1/Solution 1", "sol1"),
+            "edg1": _FakeDataset("Inlet"),
+            "edg2": _FakeDataset("Outlet"),
+            "edg3": _FakeDataset("Wall"),
+        }
+    )
+    assert resolve_boundary_datasets(model) == {
+        "inlet": "edg1",
+        "outlet": "edg2",
+        "wall": "edg3",
+    }
 
 
 def test_boundary_dataset_score_template_box_selections():
