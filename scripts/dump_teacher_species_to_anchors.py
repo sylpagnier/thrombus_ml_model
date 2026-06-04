@@ -35,7 +35,28 @@ def _heartbeat(label: str, interval_s: float, stop: threading.Event) -> None:
         print(f"[i]  {label} ... {tick * interval_s:.0f}s", flush=True)
 
 
-def _build_teacher(ckpt: dict, *, phys_cfg: PhysicsConfig, bio_cfg: BiochemConfig, device: torch.device) -> GNODE_Phase3:
+def _resolve_rollout_mu_ratio_max(
+    bio_cfg: BiochemConfig,
+    *,
+    cli_value: float | None,
+) -> float:
+    """COMSOL mu1/mu2 step ceiling for offline rollout (not mu_eff ratio)."""
+    if cli_value is not None:
+        return max(float(cli_value), 1.0)
+    raw = (os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX") or "").strip()
+    if raw:
+        return max(float(raw), 1.0)
+    return max(float(getattr(bio_cfg, "mu_ratio_max", 80.0)), 1.0)
+
+
+def _build_teacher(
+    ckpt: dict,
+    *,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    mu_ratio_max: float,
+) -> GNODE_Phase3:
     mc = ckpt.get("model_config") or {}
     teacher = GNODE_Phase3(
         phys_cfg=phys_cfg,
@@ -44,7 +65,7 @@ def _build_teacher(ckpt: dict, *, phys_cfg: PhysicsConfig, bio_cfg: BiochemConfi
         latent_dim=int(mc.get("latent_dim", 256)),
         max_inner_iters=int(mc.get("max_inner_iters", 10)),
         bio_encoder_prior_dim=int(mc.get("bio_encoder_prior_dim", 2)),
-        mu_ratio_max=float(getattr(bio_cfg, "mu_ratio_max", 80.0)),
+        mu_ratio_max=mu_ratio_max,
         mat_crit=float(bio_cfg.viscosity_mat_crit),
         fi_crit=float(bio_cfg.viscosity_fi_crit),
         temp_mat=float(bio_cfg.viscosity_gnode_temp_mat),
@@ -72,7 +93,28 @@ def main() -> None:
         help="If >0, adapt stride per-anchor so subsampled trajectory keeps at least this many timesteps.",
     )
     ap.add_argument("--only", default="", help="Comma-separated anchor stems to process (default: all).")
+    ap.add_argument(
+        "--src-dir",
+        default="",
+        help="Read anchors from this directory (default: graphs_biochem_anchors).",
+    )
+    ap.add_argument(
+        "--no-subsample",
+        action="store_true",
+        help="Keep full time axis on each graph (use with pre-subsampled --src-dir caches).",
+    )
+    ap.add_argument(
+        "--write-kine-macro",
+        action="store_true",
+        help="Copy teacher-predicted [u,v,p] (y ch 0:3) into output; requires BIOCHEM_GT_KINE_VEL=0.",
+    )
     ap.add_argument("--force", action="store_true", help="Overwrite existing cached anchors.")
+    ap.add_argument(
+        "--mu-ratio-max",
+        type=float,
+        default=None,
+        help="Override teacher mu_ratio_max for rollout (default: env BIOCHEM_TEACHER_MU_RATIO_MAX or bio_cfg).",
+    )
     args = ap.parse_args()
 
     root = get_project_root()
@@ -88,17 +130,33 @@ def main() -> None:
     phys_cfg = PhysicsConfig(phase="biochem")
     bio_cfg = BiochemConfig(phase="biochem")
 
-    # Match passive-transport behavior: use COMSOL GT [u,v,p] (skip DEQ kinematics solve).
-    os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
-    os.environ.setdefault("BIOCHEM_TEACHER_MU_RATIO_MAX", "1.0")
+    # Default GT [u,v,p] unless caller set BIOCHEM_GT_KINE_VEL=0 (predicted DEQ path).
+    if args.write_kine_macro:
+        os.environ["BIOCHEM_GT_KINE_VEL"] = "0"
+    else:
+        os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
+    rollout_mu_ratio = _resolve_rollout_mu_ratio_max(bio_cfg, cli_value=args.mu_ratio_max)
+    os.environ["BIOCHEM_TEACHER_MU_RATIO_MAX"] = f"{rollout_mu_ratio:g}"
     # Speed knobs for offline rollout.
     os.environ.setdefault("BIOCHEM_ADJOINT_RK4_SUBSTEPS", "1")
     os.environ.setdefault("BIOCHEM_TBPTT_MAX_WINDOW", "6")
 
     ckpt = torch.load(teacher_path, map_location=device, weights_only=False)
-    teacher = _build_teacher(ckpt, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device)
+    teacher = _build_teacher(
+        ckpt,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        mu_ratio_max=rollout_mu_ratio,
+    )
+    print(f"[i]  rollout mu_ratio_max={rollout_mu_ratio:g}", flush=True)
 
-    anchor_dir = root / VesselConfig(phase="biochem_anchors").graph_output_dir
+    if args.src_dir:
+        anchor_dir = Path(args.src_dir)
+        if not anchor_dir.is_absolute():
+            anchor_dir = root / anchor_dir
+    else:
+        anchor_dir = root / VesselConfig(phase="biochem_anchors").graph_output_dir
     anchors = sorted(p for p in anchor_dir.glob("*.pt") if p.is_file())
     if not anchors:
         raise FileNotFoundError(f"No anchors found in {anchor_dir}")
@@ -113,11 +171,12 @@ def main() -> None:
             print(f"[skip] {out_path.name} exists", flush=True)
             continue
 
-        print(f"[i]  rolling species for {p.name}", flush=True)
+        kine_note = " + pred [u,v,p]" if args.write_kine_macro else ""
+        print(f"[i]  rolling species{kine_note} for {p.name}", flush=True)
         data = torch.load(p, weights_only=False).to(device)
         data = infer_missing_schema(data, phase_hint="biochem")
 
-        stride = max(int(args.time_stride), 1)
+        stride = 1 if args.no_subsample else max(int(args.time_stride), 1)
         if hasattr(data, "y") and torch.is_tensor(data.y) and data.y.dim() == 3:
             total_steps = int(data.y.shape[0])
             min_steps = max(int(args.min_steps), 0)
@@ -180,6 +239,8 @@ def main() -> None:
         data_out = data.to("cpu")
         pred_cpu = pred_series.to("cpu")
         data_out.y[:, :, 4:16] = pred_cpu[:, :, 4:16]
+        if args.write_kine_macro:
+            data_out.y[:, :, 0:3] = pred_cpu[:, :, 0:3]
         if hasattr(data_out, "y_valid_mask") and torch.is_tensor(data_out.y_valid_mask):
             if tuple(data_out.y_valid_mask.shape) != tuple(data_out.y.shape):
                 data_out.y_valid_mask = build_y_valid_mask(

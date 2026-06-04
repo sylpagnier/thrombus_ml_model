@@ -395,7 +395,7 @@ def apply_biochem_forward_policy(
     if not quiet:
         summary = format_biochem_forward_policy_summary(policy)
         if summary:
-            print(f"   ↳ forward_policy restored ({summary})", flush=True)
+            print(f"   -> forward_policy restored ({summary})", flush=True)
     return applied
 
 

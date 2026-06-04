@@ -62,9 +62,23 @@ We peel the onion:
 | **9.6** | **ADR backprop** on | **~12ep** | `check_m3_align_gate.py` PASS; clot-band phi not worse than 9.4 | `go_m3_align_probe.ps1` from `after_94` ckpt (`gnode96_adr_union`); §150 — **M3 PASS**, spatial phi **degraded** |
 | **9.7** | **Mu unlock** (probe) | **~1 h** | Val all logMAE **< ~0.85** with species guard | `go_passive_mu_unlock_probe.ps1` + teacher snapshot (**PASS** on `20260601T201352Z`, best **0.804**, species FI ~0.027; wall/high worsen) |
 | **9.8** | **Step-2 bridge** | **~1 h** | Species held; mu not worse; `L_bio`/ADR must descend | `go_passive_step2_bridge.ps1 -GradScaleOnCap` (**PASS** `20260602T145236Z`: mu **0.781**, FI **~0.01**; §153; no GSC = no-op §152) |
-| **9.9** | **Full teacher** (clot_band, TBPTT) | **2–4 h** | Clot-phi on dump beats 9.5; viz bands | Long teacher + full clotband_focus viz stack |
+| **9.9** | **Full teacher** (clot_band, TBPTT) | **2–4 h** | Clot-phi on dump beats 9.5; viz bands | `go_gnode99.ps1` (fresh teacher+dump) **or** cached clot-phi only (see below) |
 
-**Rung 10 (plan):** replace GT vel with **GINO-DEQ** each step (same as ladder **6b** + full GNODE species). **Rung 11:** corrector / synthetics (Phase II).
+**9.9 promoted (2026-06-03):** clot-phi 35ep on canonical **`outputs/biochem/gnode_8h_ladder/anchors_stride_72`** — p007 F1 **0.630**, min **0.340** (`gnode99_promoted/clot_phi_best.pth`). **Archived** under `outputs/biochem/archive/anchors_stride_72_*`; stable copies: `gnode99_promoted_clot_phi_best.pth`, `gnode_after94_teacher_last.pth`, `rung6b_clot_phi_best.pth` (§160). **Do not** overwrite live cache with `-Fresh` ladder dumps until p007 val shows **`gt+=~0.578`** (1ep preflight: `gnode99_preflight_check`; fresh dumps gave **~0.464** / `gt+=0.390`). Fast repro:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_clot_phi_from_anchor_dir.ps1" `
+  -AnchorDir outputs\biochem\gnode_8h_ladder\anchors_stride_72 -LegName gnode99_promoted -Epochs 35
+```
+
+**Rung 10 (2026-06-03):** **`K5_kine15`** (FI **~0.003**). Clot: **`go_gnode10_finish`** (GT u,v,p) p007 **0.629**; **`go_gnode10_kine_loop`** (pred u,v,p) p007 **0.522**. **Rung 11 (2026-06-04 PASS):** **11a** step-2 smoke; **11b** step-3 smoke; **finish (II.0)** **`go_gnode11_finish.ps1`** — **`pseudo_w=0.159`**, mu flat **~1.444** (§169). **Rung 12 Lane A:** **`go_gnode12_lane_a.ps1`** — optional **mu_ratio uncap** finetune (`MuRatioMax` default **20**), dump with matching rollout cap, clot-phi; gate **`check_gnode12_lane_a_gate.py`** (min F1 **0.26**).
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_gnode12_lane_a.ps1
+python scripts/check_gnode12_lane_a_gate.py --eval-json outputs/biochem/gnode10_sweep/multi_anchor_gnode12_lane_a_clotphi.jsonl
+```
+
+Prereq: **`go_gnode11_finish.ps1`** (or pass `-TeacherCkpt`). Skip mu finetune: **`-SkipMuUnlock`** (dump still uses `-MuRatioMax` for rollout).
 
 ---
 

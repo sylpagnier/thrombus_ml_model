@@ -16,6 +16,30 @@ KINE_X_SCHEMA = "kine_x_v1_18ch"
 BIO_X_SCHEMA = "biochem_x_v1_15ch"
 
 
+def coerce_graph_schema_token(schema) -> str:
+    """Normalize ``x_schema`` / ``y_schema`` from PyG ``DataBatch`` (often length-1 lists)."""
+    if schema is None:
+        return ""
+    if isinstance(schema, (list, tuple)):
+        if len(schema) == 0:
+            return ""
+        first = str(schema[0])
+        if all(str(s) == first for s in schema):
+            return first
+        return first
+    return str(schema)
+
+
+def normalize_graph_schema_attrs(data) -> None:
+    """In-place fix for batched or legacy schema metadata on a graph or batch."""
+    if hasattr(data, "x_schema"):
+        data.x_schema = coerce_graph_schema_token(getattr(data, "x_schema", None))
+    if hasattr(data, "y_schema"):
+        data.y_schema = coerce_graph_schema_token(getattr(data, "y_schema", None))
+    if hasattr(data, "x_biochem_schema"):
+        data.x_biochem_schema = coerce_graph_schema_token(getattr(data, "x_biochem_schema", None))
+
+
 @dataclass(frozen=True)
 class ChannelSchema:
     name: str
@@ -152,6 +176,7 @@ def attach_channel_metadata(
 
 
 def infer_missing_schema(data, phase_hint: Optional[str] = None):
+    normalize_graph_schema_attrs(data)
     if getattr(data, "x_schema", None) and getattr(data, "y_schema", None):
         return data
 
@@ -236,7 +261,7 @@ def biochem_encoder_x(data) -> torch.Tensor:
                 f"x_biochem width {int(xb.shape[-1])} != {X_SCHEMAS[BIO_X_SCHEMA].width} for {BIO_X_SCHEMA}."
             )
         return xb
-    schema = str(getattr(data, "x_schema", "") or "")
+    schema = coerce_graph_schema_token(getattr(data, "x_schema", None))
     if schema == BIO_X_SCHEMA:
         return data.x
     if schema == KINE_X_SCHEMA:

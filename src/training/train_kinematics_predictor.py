@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -663,13 +663,16 @@ def train_kinematics(
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 except (ValueError, RuntimeError):
                     print("[kin] WARN could not restore AdamW optimizer state; fresh optimizer.")
-            if "scheduler_state_dict" in ckpt:
+            if finetune_lr is None and "scheduler_state_dict" in ckpt:
                 try:
                     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 except (ValueError, RuntimeError):
                     print("[kin] WARN could not restore scheduler state; fresh scheduler.")
             start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
             best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
+            ckpt_comp = float(ckpt.get("composite", float("nan")))
+            if math.isfinite(ckpt_comp):
+                best_val_composite_loss = min(best_val_composite_loss, ckpt_comp)
             # Always re-enter LBFGS via normal handoff so static batches are rebuilt deterministically.
             lbfgs_initialized = False
             print(f"[kin] Loaded full training state (next epoch: {start_epoch})")
@@ -683,7 +686,12 @@ def train_kinematics(
     if finetune_lr is not None and finetune_lr > 0:
         for pg in optimizer.param_groups:
             pg["lr"] = float(finetune_lr)
-        print(f"[kin] Finetune LR set to {float(finetune_lr):.2e}")
+        # Do not step the production cosine schedule on finetune (ep 83+ LR ~1e-4 bug).
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        print(
+            f"[kin] Finetune LR fixed at {float(finetune_lr):.2e} "
+            "(constant scheduler; production schedule discarded)"
+        )
 
     diary = TrainingDiary("kinematics")
     diary.log_run_start(
@@ -1027,8 +1035,7 @@ def train_kinematics(
             }
             torch.save(state_payload, state_path)
             torch.save(state_payload, kinematics_dir() / "kinematics_state_latest.pth")
-            ckpt_keep = max(3, int(os.environ.get("KINEMATICS_CKPT_KEEP", "3")))
-            _prune_kine_training_artifacts(kinematics_dir(), keep=ckpt_keep)
+            _prune_kine_training_artifacts(kinematics_dir(), keep=3)
 
         run_val = len(val_data) > 0 and (
             epoch % val_every == 0

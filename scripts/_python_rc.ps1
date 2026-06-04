@@ -8,10 +8,11 @@ function Invoke-PythonRc {
     )
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
+    # Do not pipe through Write-Host: line buffering breaks tqdm \r updates (one bar per batch).
     if ($Quiet) {
         & python -u @PyArgs 2>&1 | Out-Null
     } else {
-        & python -u @PyArgs 2>&1 | ForEach-Object { Write-Host $_ }
+        & python -u @PyArgs
     }
     $rc = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
     $ErrorActionPreference = $prevEap

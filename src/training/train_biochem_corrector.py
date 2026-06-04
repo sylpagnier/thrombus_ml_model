@@ -90,6 +90,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
+from src.utils.biochem_console import (
+    biochem_tqdm,
+    biochem_tqdm_refresh_stride,
+    configure_biochem_console,
+    format_biochem_tqdm_postfix,
+    sanitize_console_text,
+)
+
 if sys.platform != "win32":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 else:
@@ -328,7 +336,6 @@ def _biochem_non_blocking_transfer(device: torch.device, dl_kw: Dict[str, Any]) 
     return device.type == "cuda" and bool(dl_kw.get("pin_memory"))
 
 
-from tqdm import tqdm
 import random
 from torch_geometric.data import Dataset
 from src.utils.paths import (
@@ -445,7 +452,12 @@ from src.training.biochem_supervision_masks import (
     resolve_data_bio_supervision_mask,
     supervision_mask_times_mode,
 )
-from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
+from src.utils.channel_schema import (
+    BIO_Y_SCHEMA,
+    assert_graph_schema,
+    infer_missing_schema,
+    normalize_graph_schema_attrs,
+)
 from src.utils.nondim import to_t_nd
 
 
@@ -1546,7 +1558,7 @@ def _teacher_stage_best_practice_defaults(max_epochs: int) -> None:
     _setdef("BIOCHEM_RESIDUAL_SPARSE_LAMBDA_END", "0.5")
     _setdef("BIOCHEM_RESIDUAL_SPARSE_RAMP_EPOCHS", str(max(8, max_epochs // 2)))
     print(
-        "🧷 Teacher-stage defaults applied (COMSOL forcing + PDE cap + mu regression). "
+        "[i]  Teacher-stage defaults applied (COMSOL forcing + PDE cap + mu regression). "
         "Unset any var to inherit; skip entirely with BIOCHEM_NO_TEACHER_DEFAULTS=1 "
         "(default from PyCharm/simplest preset)."
     )
@@ -1883,7 +1895,7 @@ def _biochem_debug_log_path():
 
 def _biochem_dbg_line(msg: str) -> None:
     """Stdout + append to ``<reports_dir>/biochem_debug.log`` (tqdm often obscures raw prints)."""
-    print(msg, flush=True)
+    print(sanitize_console_text(msg), flush=True)
     if not _biochem_debug_enabled():
         return
     try:
@@ -4130,6 +4142,7 @@ def compute_biochem_loss(
 ):
     curriculum = curriculum or CurriculumConfig()
     train_cfg = train_cfg or BiochemTrainingConfig.from_env()
+    normalize_graph_schema_attrs(data)
     kernels.set_biochem_huber_delta(_scheduled_biochem_huber_delta(bio_cfg, epoch))
     if model.training:
         model._biochem_teacher_epoch = int(epoch)
@@ -7157,7 +7170,7 @@ def _restore_cli_teacher_epoch_override_after_presets() -> None:
         return
     ep_s = str(ep)
     os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep_s
-    os.environ["BIOCHEM_EPOCHS"] = ep_s
+    # Do not clobber corrector epoch count set by launcher (BIOCHEM_EPOCHS).
 
 
 def _apply_biochem_supervised_data_leash_after_presets() -> None:
@@ -7231,6 +7244,7 @@ def _apply_biochem_mu_gate_hard_threshold_after_presets() -> None:
 
 
 def train_biochem_corrector(epochs=60, lr=1e-3):
+    configure_biochem_console()
     _apply_biochem_env_aliases()
     warn_step3_multitask_if_disabled()
     if not biochem_legacy_losses_enabled():
@@ -7243,7 +7257,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     _preset = (os.environ.get("BIOCHEM_PRESET") or "").strip().lower()
     if _preset in _OVERNIGHT_STEP2_PRESET_ALIASES:
         print(
-            "🌙 BIOCHEM_PRESET overnight-step2: long AE/ODE/teacher, val every "
+            "[i]  BIOCHEM_PRESET overnight-step2: long AE/ODE/teacher, val every "
             f"{os.environ.get('BIOCHEM_TEACHER_VAL_EVERY', '?')} ep, TBPTT cap "
             f"{os.environ.get('BIOCHEM_TBPTT_MAX_WINDOW', '?')}, mu SI + COMSOL temporal "
             f"(w_pt={os.environ.get('BIOCHEM_COMSOL_TEMPORAL_WEIGHT', '?')}) in data-only backprop. "
@@ -7264,7 +7278,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     if sys.platform == "win32":
         _win_ps = (
             " | PowerShell: $env:BIOCHEM_PRESET='overnight_step2' "
-            "(cmd.exe: set BIOCHEM_PRESET=overnight_step2 && python …)"
+            "(cmd.exe: set BIOCHEM_PRESET=overnight_step2 && python ...)"
         )
     print(
         "   Env snapshot: BIOCHEM_PRESET="
@@ -7739,6 +7753,8 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
     best_high_mu_epoch = -1
     mu_score_ema: Optional[float] = None
     teacher_best_mu_score = 0.0
+    pseudo_w = 0.0
+    pseudo_label_coverage = 0.0
     latest_ckpt_save = model_dir / "biochem_latest_checkpoint.pth"
     try:
         val_every = max(1, int(os.environ.get("BIOCHEM_VAL_EVERY", "4")))
@@ -7766,6 +7782,8 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         teacher_best_epoch: int = -1,
         best_composite: Optional[float] = None,
         last_epoch_completed: Optional[int] = None,
+        pseudo_w: Optional[float] = None,
+        pseudo_label_coverage: Optional[float] = None,
     ) -> None:
         nonlocal run_log_end_emitted
         if run_log_end_emitted or not run_log.enabled:
@@ -7773,18 +7791,23 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         run_log_end_emitted = True
         if interrupted:
             print("\n[WARN]  Training interrupted; appending biochem run log end row.")
-        run_log.log_end(
-            run_note=(os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
-            stop_after_teacher=bool(stop_after_teacher),
-            teacher_best_mu_score=float(teacher_best_mu_score),
-            teacher_best_epoch=int(teacher_best_epoch),
-            best_composite=best_composite,
-            last_epoch_completed=last_epoch_completed,
-            interrupted=bool(interrupted),
-            checkpoint_teacher=str(model_dir / BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME),
-            checkpoint_high_mu=str(model_dir / BIOCHEM_BEST_HIGH_MU_CKPT_NAME),
-            checkpoint_latest=str(latest_ckpt_save),
-        )
+        end_fields: Dict[str, Any] = {
+            "run_note": (os.environ.get("BIOCHEM_RUN_NOTE") or "").strip(),
+            "stop_after_teacher": bool(stop_after_teacher),
+            "teacher_best_mu_score": float(teacher_best_mu_score),
+            "teacher_best_epoch": int(teacher_best_epoch),
+            "best_composite": best_composite,
+            "last_epoch_completed": last_epoch_completed,
+            "interrupted": bool(interrupted),
+            "checkpoint_teacher": str(model_dir / BIOCHEM_TEACHER_BEST_HIGH_MU_CKPT_NAME),
+            "checkpoint_high_mu": str(model_dir / BIOCHEM_BEST_HIGH_MU_CKPT_NAME),
+            "checkpoint_latest": str(latest_ckpt_save),
+        }
+        if pseudo_w is not None:
+            end_fields["pseudo_w"] = float(pseudo_w)
+        if pseudo_label_coverage is not None:
+            end_fields["pseudo_label_coverage"] = float(pseudo_label_coverage)
+        run_log.log_end(**end_fields)
 
     run_log.log_meta(
         device=str(device),
@@ -7852,6 +7875,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             )
             del temp_teacher
             pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
+            pseudo_label_coverage = float(pseudo_cov)
             if len(train_physics) > 0:
                 print(
                     f" Pseudo-label coverage after resume: {len(pseudo_bank)}/{len(train_physics)} "
@@ -7954,6 +7978,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 device=device,
             )
             pseudo_cov = len(pseudo_bank) / max(1, len(train_physics))
+            pseudo_label_coverage = float(pseudo_cov)
             if len(train_physics) > 0:
                 print(
                     f" Pseudo-label coverage: {len(pseudo_bank)}/{len(train_physics)} "
@@ -7964,7 +7989,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             if teacher_best_mu_score < min_teacher_score:
                 pseudo_w = 0.0
                 print(
-                    f"🧷 Synthetic pseudo-label weight set to 0 "
+                    f"[pseudo] Synthetic pseudo-label weight set to 0 "
                     f"(teacher mu_score {teacher_best_mu_score:.4f} < "
                     f"BIOCHEM_PSEUDO_MIN_TEACHER_MU_SCORE={min_teacher_score})."
                 )
@@ -7974,7 +7999,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 ramp = min(1.0, max(0.0, (teacher_best_mu_score - min_teacher_score) / denom))
                 pseudo_w = pseudo_w_base * ramp
                 print(
-                    f"🧷 Synthetic pseudo-label loss weight: {pseudo_w:.3f} "
+                    f"[pseudo] Synthetic pseudo-label loss weight: {pseudo_w:.3f} "
                     f"(base={pseudo_w_base:.3f}, teacher_mu_score={teacher_best_mu_score:.4f}, ramp={ramp:.3f})"
                 )
 
@@ -8063,6 +8088,8 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
             teacher_best_epoch=int(teacher_best_epoch),
             best_composite=float(best_composite),
             last_epoch_completed=last_epoch_completed,
+            pseudo_w=float(pseudo_w),
+            pseudo_label_coverage=float(pseudo_label_coverage),
         )
 
     atexit.register(lambda: _emit_corrector_run_end(True))
@@ -8194,7 +8221,8 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         l_mulog_weighted_sum = 0.0
         w_mu_log_ep = max(float(os.environ.get("BIOCHEM_MU_LOG_ANCHOR_WEIGHT", "0.0")), 0.0)
 
-        pbar = tqdm(loader, desc=f"Biochem Ep {epoch:02d}")
+        tqdm_stride = biochem_tqdm_refresh_stride()
+        pbar = biochem_tqdm(loader, desc=f"Biochem Ep {epoch:02d}")
         for batch_idx, data in enumerate(pbar):
             total_batches += 1
             batch_t0 = time.perf_counter()
@@ -8323,31 +8351,30 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                         else:
                             ema_metrics["L_MuLog_aux"] = (1 - ema_alpha) * ema_metrics["L_MuLog_aux"] + ema_alpha * v_mul
 
-            pbar_post = {
-                "L_tot": f"{ema_metrics['L_tot']:.2e}",
-                "L_Kine": f"{ema_metrics['L_Data_Kine']:.2e}",
-                "L_Bio": f"{ema_metrics['L_Data_Bio']:.2e}",
-                "L_ADR_F": f"{ema_metrics['L_ADR_F']:.2e}",
-                "L_W_Bio": f"{ema_metrics['L_W_Bio']:.2e}",
-                "L_W_Phy": f"{ema_metrics['L_W_Phy']:.2e}",
-                "TF_eff": f"{metrics['TF_eff']:.2f}",
-                "ODE": f"{int(metrics.get('ODE_Evals', 0))}",
-                "Pceil": f"{current_phys_ceiling:.0f}",
-                "t_batch": f"{batch_dt:.2f}s",
-                "A_sup": f"{anchor_supervised_batches}/{total_batches}",
-                "P_sup": f"{pseudo_supervised_batches}/{total_batches}",
-            }
-            if "L_MuSI_aux" in ema_metrics:
-                pbar_post["L_MuSI"] = f"{ema_metrics['L_MuSI_aux']:.2e}"
-            if w_mu_log_ep > 0.0 and "L_MuLog_aux" in ema_metrics:
-                pbar_post["L_MuLog"] = f"{ema_metrics['L_MuLog_aux']:.2e}"
-            pbar.set_postfix(pbar_post)
+            if (batch_idx % tqdm_stride == 0) or (batch_idx + 1 == len(loader)):
+                postfix = format_biochem_tqdm_postfix(
+                    ema_metrics=ema_metrics,
+                    metrics=metrics,
+                    batch_dt=batch_dt,
+                    anchor_supervised_batches=anchor_supervised_batches,
+                    pseudo_supervised_batches=pseudo_supervised_batches,
+                    total_batches=total_batches,
+                    current_phys_ceiling=current_phys_ceiling,
+                    w_mu_log_ep=w_mu_log_ep,
+                )
+                pbar.set_postfix_str(postfix, refresh=False)
+                pbar.refresh()
+
+        try:
+            pbar.close()
+        except Exception:
+            pass
 
         scheduler.step()
         if total_batches > 0:
             frac = anchor_supervised_batches / float(total_batches)
             print(
-                f"📌 Anchor-supervised batches: {anchor_supervised_batches}/{total_batches} "
+                f"[i]  Anchor-supervised batches: {anchor_supervised_batches}/{total_batches} "
                 f"({frac:.1%})"
             )
             pfrac = pseudo_supervised_batches / float(total_batches)
@@ -8376,7 +8403,7 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
                 )
             if no_grad_skipped_batches > 0:
                 print(
-                    f"🛟 No-grad micro-batches skipped: {no_grad_skipped_batches}/{total_batches} "
+                    f"[WARN]  No-grad micro-batches skipped: {no_grad_skipped_batches}/{total_batches} "
                     f"({(no_grad_skipped_batches / float(total_batches)):.1%})"
                 )
             if total_batches > 0 and ode_zero_batches / float(total_batches) > 0.5:
@@ -8670,7 +8697,10 @@ def _parse_args():
         "--epochs",
         type=int,
         default=0,
-        help="Override BIOCHEM_TEACHER_EPOCHS for sweep-style launches.",
+        help=(
+            "Override BIOCHEM_TEACHER_EPOCHS when BIOCHEM_CLI_TEACHER_EPOCHS is unset; "
+            "does not override a pre-set BIOCHEM_EPOCHS (corrector)."
+        ),
     )
     p.add_argument(
         "--save-best",
@@ -8738,9 +8768,14 @@ if __name__ == "__main__":
         os.environ["BIOCHEM_RUN_NOTE"] = str(args.run_name).strip()
     if int(getattr(args, "epochs", 0) or 0) > 0:
         ep = str(int(args.epochs))
-        os.environ["BIOCHEM_CLI_TEACHER_EPOCHS"] = ep
-        os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep
-        os.environ["BIOCHEM_EPOCHS"] = ep
+        cli_teacher = (os.environ.get("BIOCHEM_CLI_TEACHER_EPOCHS") or "").strip()
+        if cli_teacher:
+            os.environ["BIOCHEM_TEACHER_EPOCHS"] = cli_teacher
+        else:
+            os.environ["BIOCHEM_CLI_TEACHER_EPOCHS"] = ep
+            os.environ["BIOCHEM_TEACHER_EPOCHS"] = ep
+        if not (os.environ.get("BIOCHEM_EPOCHS") or "").strip():
+            os.environ["BIOCHEM_EPOCHS"] = ep
     if getattr(args, "save_best", False):
         # Kept for CLI compatibility with generic sweep launchers.
         os.environ.setdefault("BIOCHEM_SAVE_BEST", "1")

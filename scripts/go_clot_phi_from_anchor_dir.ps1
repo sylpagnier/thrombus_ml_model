@@ -4,7 +4,8 @@ param(
     [int] $Epochs = 20,
     [double] $BioFiWeight = 2.0,
     [double] $BioMatWeight = 2.0,
-    [switch] $SkipViz
+    [switch] $SkipViz,
+    [switch] $SkipEval
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,15 +58,25 @@ python -m src.training.train_clot_phi_simple
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $ckpt = "outputs/biochem/passive_species_focus_compare/$LegName/clot_phi_best.pth"
-$out = "outputs/biochem/passive_species_focus_compare/$LegName/multi_anchor.jsonl"
-python scripts/eval_clot_phi_multi_anchor.py --checkpoint $ckpt --out $out
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not $SkipEval) {
+    if (-not (Test-Path $ckpt)) {
+        Write-Host "[ERR] No checkpoint at $ckpt (val score may have stayed -1; train more epochs)." -ForegroundColor Red
+        exit 1
+    }
+    $out = "outputs/biochem/passive_species_focus_compare/$LegName/multi_anchor.jsonl"
+    python scripts/eval_clot_phi_multi_anchor.py --checkpoint $ckpt --out $out --anchor-dir $AnchorDir
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 if (-not $SkipViz) {
+    if (-not (Test-Path $ckpt)) {
+        Write-Host "[WARN] Skip viz: no checkpoint at $ckpt" -ForegroundColor Yellow
+    } else {
     $env:CLOT_PHI_ANCHOR_DIR = $AnchorDir
-    Invoke-ClotPhiScatterViz -Checkpoint $ckpt -Anchor patient007 -TimeIndex -1 `
-        -Out "outputs/biochem/viz/clot_phi_${LegName}_p007_tfinal.png"
-    Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
+        Invoke-ClotPhiScatterViz -Checkpoint $ckpt -Anchor patient007 -TimeIndex -1 `
+            -Out "outputs/biochem/viz/clot_phi_${LegName}_p007_tfinal.png"
+        Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
+    }
 }
 
 exit 0

@@ -52,6 +52,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out", default="outputs/biochem/clot_phi_finalize/multi_anchor_eval.jsonl")
+    ap.add_argument(
+        "--anchor-dir",
+        default="",
+        help="Dumped anchor cache (overrides ckpt config anchor_dir after load).",
+    )
     args = ap.parse_args()
 
     root = get_project_root()
@@ -62,7 +67,13 @@ def main() -> None:
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
     anchor_dir = root / VesselConfig(phase="biochem_anchors").graph_output_dir
-    paths = _list_anchor_paths(anchor_dir)
+
+    cli_anchor = (args.anchor_dir or "").strip()
+    if cli_anchor:
+        anchor_dir = Path(cli_anchor)
+        if not anchor_dir.is_absolute():
+            anchor_dir = root / anchor_dir
+        os.environ["CLOT_PHI_ANCHOR_DIR"] = str(anchor_dir.resolve())
 
     model, species_head, cfg = _load_models(ckpt_path, device)
 

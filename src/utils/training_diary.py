@@ -342,6 +342,8 @@ class BiochemRunLogger:
             or best.get("val_avg_mu_log_mae_high_mu"),
             "val_mu_pearson": best.get("val_mu_pearson") or best.get("val_avg_mu_pearson"),
             "teacher_best_mu_score": fields.get("teacher_best_mu_score"),
+            "pseudo_w": fields.get("pseudo_w"),
+            "pseudo_label_coverage": fields.get("pseudo_label_coverage"),
             "best_composite": fields.get("best_composite"),
             "interrupted": bool(fields.get("interrupted", False)),
             "checkpoint_teacher": fields.get("checkpoint_teacher"),

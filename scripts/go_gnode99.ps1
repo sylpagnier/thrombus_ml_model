@@ -172,11 +172,13 @@ if ($SkipViz) { $clotArgs += "-SkipViz" }
 & powershell @clotArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$env:CLOT_PHI_ANCHOR_DIR = $AnchorDir
 python scripts/eval_clot_phi_multi_anchor.py `
     --checkpoint "outputs\biochem\passive_species_focus_compare\$LegName\clot_phi_best.pth" `
-    --anchor-dir $AnchorDir `
     --out (Join-Path $OutRoot "multi_anchor.jsonl")
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$evalRc = $LASTEXITCODE
+Remove-Item Env:CLOT_PHI_ANCHOR_DIR -ErrorAction SilentlyContinue
+if ($evalRc -ne 0) { exit $evalRc }
 
 if (-not $SkipViz) {
     $ClotCkpt = "outputs\biochem\passive_species_focus_compare\$LegName\clot_phi_best.pth"

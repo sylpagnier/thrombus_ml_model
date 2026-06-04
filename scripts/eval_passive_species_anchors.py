@@ -32,9 +32,13 @@ from src.training.train_biochem_corrector import (
 from scripts.dump_teacher_species_to_anchors import _build_teacher
 
 
-def _apply_align_eval_env() -> None:
-    os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
-    os.environ.setdefault("BIOCHEM_GT_KINE_SKIP_DEQ", "1")
+def _apply_align_eval_env(*, predicted_kine: bool = False) -> None:
+    if predicted_kine:
+        os.environ["BIOCHEM_GT_KINE_VEL"] = "0"
+        os.environ.pop("BIOCHEM_GT_KINE_SKIP_DEQ", None)
+    else:
+        os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
+        os.environ.setdefault("BIOCHEM_GT_KINE_SKIP_DEQ", "1")
     os.environ.setdefault("BIOCHEM_TEACHER_MU_RATIO_MAX", "1.0")
     os.environ.setdefault("BIOCHEM_DATA_BIO_MASK_MODE", "clot_band")
     os.environ.setdefault("BIOCHEM_ADR_MASK_MODE", "match_data_bio")
@@ -65,9 +69,14 @@ def main() -> int:
         default=None,
         help="Exit 1 if any anchor FI logMAE exceeds this.",
     )
+    ap.add_argument(
+        "--predicted-kine",
+        action="store_true",
+        help="Evaluate with Stage-A DEQ (BIOCHEM_GT_KINE_VEL=0), for rung 10 teachers.",
+    )
     args = ap.parse_args()
 
-    _apply_align_eval_env()
+    _apply_align_eval_env(predicted_kine=bool(args.predicted_kine))
 
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.is_file():

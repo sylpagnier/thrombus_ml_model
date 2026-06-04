@@ -31,8 +31,11 @@ class PatientDataExtractor:
     (``STATE_CHANNEL_MU_EFF_ND`` in ``src.config``) is ``mu_effective`` via
     ``PhysicsConfig.viscosity_si_to_nd`` (canonical cross-phase ND viscosity reference).
 
-    --- COMSOL Export Instructions ---
-    To make this script work, export the exact node-wise data from COMSOL to match the .msh topology.
+    Automated COMSOL pull (no manual Results export): ``pull_comsol_exports(stem)`` or
+    ``python -m src.tools.extract_biochem_comsol --from-comsol`` after saving ``<stem>.mph``.
+
+    --- Manual COMSOL Export Instructions ---
+    Alternatively, export the exact node-wise data from COMSOL to match the .msh topology.
     IMPORTANT: export from ``Component 1 -> Mesh 1`` geometry coordinates (the solved component mesh),
     not directly from the raw Mesh Import object, otherwise node coordinates/order can drift and mapping fails.
 
@@ -410,6 +413,24 @@ class PatientDataExtractor:
             time_blocks[ t_val ] = df_step
 
         return time_blocks
+
+    def pull_comsol_exports(
+        self,
+        stem: str,
+        *,
+        model_path: Path | None = None,
+        force: bool = False,
+    ) -> Path:
+        """Sample a solved ``.mph`` onto the anchor mesh and write ``cfd_results_biochem`` txt."""
+        from src.data_gen.lib.biochem_comsol_auto_export import pull_biochem_comsol_exports
+
+        return pull_biochem_comsol_exports(
+            stem,
+            label_dir=self.label_dir,
+            raw_dir=self.raw_dir,
+            model_path=model_path,
+            force=force,
+        )
 
     def process_patient(self, stem):
         """

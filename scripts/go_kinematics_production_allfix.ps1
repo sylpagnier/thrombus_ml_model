@@ -1,15 +1,26 @@
-# Production Stage-A kinematics (one command, auto-resume, crash retry).
+# Production Stage-A kinematics: default = full 3-phase loop (foundation + polish + clinical anchors).
 #
-# Run (same line every time; resumes if interrupted or LBFGS crashes):
+# Default (foundation -> synthetic polish -> clinical geometry finetune -> promote):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"
 #
-# Start over from scratch:
+# Foundation only (legacy / debugging):
+#   ... -FoundationOnly
+#
+# Start foundation from scratch:
 #   ... -Fresh
 #
-# Outputs: outputs/kinematics/production_allfix/kinematics_best.pth
+# Outputs: outputs/kinematics/production_allfix/kinematics_best.pth (phase 1-2)
+#          outputs/kinematics/kinematics_best.pth (promoted after phase 3)
 
 param(
   [switch]$Fresh,
+  [switch]$FoundationOnly,
+  [switch]$SkipSyntheticPolish,
+  [switch]$SkipClinicalAnchors,
+  [switch]$SkipPromote,
+  [switch]$RequireClinical,
+  [string]$Holdout = "patient007",
+  [switch]$NoContinuityFocus,
   [int]$Epochs = 100,
   [int]$AdamEpochs = 85,
   [int]$Stage1End = 40,
@@ -33,8 +44,6 @@ $env:KINEMATICS_WSS_FUSE = "1"
 $env:KINEMATICS_FOURIER_LEARNABLE = "1"
 $env:KINEMATICS_VAL_EVERY = "1"
 $env:KINEMATICS_OUTPUT_DIR = "outputs/kinematics/production_allfix"
-# Keep more numbered ckpts so ep-80 (ckpt_81) survives long runs (default prune keep=3).
-$env:KINEMATICS_CKPT_KEEP = "15"
 # Adam-only default: 20260601 production run -- LBFGS ep 86+ hurt val; ep 98-99 NaN (April same pattern).
 $env:KINEMATICS_SKIP_LBFGS = "1"
 
@@ -138,7 +147,7 @@ while ($attempt -lt $maxAttempts) {
   & python @trainArgs
   $exit = $LASTEXITCODE
   if ($exit -eq 0) {
-    Write-Host "[kin-prod] finished OK -> outputs/kinematics/production_allfix/kinematics_best.pth"
+    Write-Host "[kin-prod] phase 1 finished OK -> outputs/kinematics/production_allfix/kinematics_best.pth"
     break
   }
 
@@ -158,4 +167,26 @@ while ($attempt -lt $maxAttempts) {
 
 if ($attempt -ge $maxAttempts) {
   throw "[kin-prod] exceeded $maxAttempts resume attempts."
+}
+
+if ($FoundationOnly) {
+  Write-Host "[kin-prod] -FoundationOnly: skipping phases 2-3 (synthetic polish + clinical anchors)."
+  exit 0
+}
+
+Write-Host "[kin-prod] chaining phases 2-3 (synthetic polish + clinical geometry finetune)..."
+$ladderArgs = @(
+  "-SkipFoundation",
+  "-Holdout", $Holdout
+)
+if ($SkipSyntheticPolish) { $ladderArgs += "-SkipSyntheticPolish" }
+if ($SkipClinicalAnchors) { $ladderArgs += "-SkipClinicalAnchors" }
+if ($SkipPromote) { $ladderArgs += "-SkipPromote" }
+if ($RequireClinical) { $ladderArgs += "-RequireClinical" }
+if (-not $NoContinuityFocus) { $ladderArgs += "-ContinuityFocus" }
+if ($Quiet) { $ladderArgs += "-Quiet" }
+
+& (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderArgs
+if ($LASTEXITCODE -ne 0) {
+  throw "[kin-prod] post-foundation ladder failed (exit $LASTEXITCODE)."
 }

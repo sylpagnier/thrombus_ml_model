@@ -1,17 +1,22 @@
-"""Interactive biochem COMSOL export -> PyG graph extraction.
+"""Interactive biochem COMSOL -> PyG graph extraction.
 
-Run after manual COMSOL solves: export domain + boundary ``.txt`` files to
-``data/processed/cfd_results_biochem/`` and keep meshes in
-``data/raw/biochem_anchors/``. Writes ``data/processed/graphs_biochem_anchors/<stem>.pt``
-(and steady kine anchors under ``graphs_kinematics_anchors/carreau/`` when applicable).
+**Automated path (recommended):** run the study in COMSOL, save ``<stem>.mph`` next to the
+mesh under ``data/raw/biochem_anchors/``, then::
+
+    python -m src.tools.extract_biochem_comsol --stem patient007 --from-comsol
+
+This samples the solved model via LiveLink (``mph``) and writes
+``data/processed/cfd_results_biochem/*.txt`` before building graphs.
+
+**Manual path:** export domain + boundary ``.txt`` yourself, then run without ``--from-comsol``.
 
 PyCharm: **Run** module ``src.tools.extract_biochem_comsol`` (working directory = repo root).
 
 CLI::
 
-    python -m src.tools.extract_biochem_comsol
-    python -m src.bin.main data extract-biochem -- --list-only
-    python -m src.tools.extract_biochem_comsol --stem patient007 --force
+    python -m src.tools.extract_biochem_comsol --from-comsol
+    python -m src.bin.main data extract-biochem -- --from-comsol --stem patient007
+    python -m src.tools.extract_biochem_comsol --list-only
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from src.data_gen.lib.biochem_comsol_auto_export import resolve_biochem_comsol_model_path
 from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
 from src.data_gen.pipeline_biochem import _auto_scaffold_anchor_sidecars
 from src.tools.prepare_biochem_anchors import enrich_anchor_meshes, stems_in_dir
@@ -40,6 +46,7 @@ class AnchorExtractStatus:
     has_biochem_graph: bool
     has_kine_graph: bool
     biochem_graph_mtime: float | None
+    has_comsol_model: bool
 
     @property
     def export_count(self) -> int:
@@ -59,6 +66,10 @@ class AnchorExtractStatus:
     @property
     def can_extract(self) -> bool:
         return self.has_mesh and self.has_domain_txt
+
+    @property
+    def can_pull_from_comsol(self) -> bool:
+        return self.has_mesh and self.has_comsol_model
 
     @property
     def already_extracted(self) -> bool:
@@ -109,6 +120,7 @@ def _status_for_stem(
         has_biochem_graph=biochem_pt.is_file(),
         has_kine_graph=kine_pt.is_file(),
         biochem_graph_mtime=mtime,
+        has_comsol_model=resolve_biochem_comsol_model_path(stem) is not None,
     )
 
 
@@ -135,6 +147,8 @@ def _row_tag(s: AnchorExtractStatus) -> str:
         return "[ready*]"
     if s.has_domain_txt and not s.has_mesh:
         return "[no mesh]"
+    if s.has_mesh and not s.has_domain_txt and s.has_comsol_model:
+        return "[mph ready]"
     if s.has_mesh and not s.has_domain_txt:
         return "[no export]"
     return "[incomplete]"
@@ -155,22 +169,23 @@ def print_status_table(
         return
     print(
         f"{'#':>3}  {'stem':<18}  {'tag':<14}  {'mesh':<5}  {'exports':<14}  "
-        f"{'biochem .pt':<20}  {'kine .pt':<6}"
+        f"{'biochem .pt':<20}  {'kine .pt':<6}  {'mph':<5}"
     )
-    print("-" * 92)
+    print("-" * 98)
     for i, s in enumerate(statuses, start=1):
         mesh = "yes" if s.has_mesh else "no"
         graph = "yes" if s.has_biochem_graph else "no"
         if s.has_biochem_graph:
             graph = f"yes {_fmt_mtime(s.biochem_graph_mtime)}"
         kine = "yes" if s.has_kine_graph else "no"
+        mph = "yes" if s.has_comsol_model else "no"
         print(
             f"{i:>3}  {s.stem:<18}  {_row_tag(s):<14}  {mesh:<5}  "
-            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}"
+            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<5}"
         )
     print(
-        "\n[i] [ready] = mesh + domain txt (boundaries recommended). "
-        "[ready*] = domain only. [extracted] = biochem graph exists."
+        "\n[i] [ready] = mesh + domain txt. [mph ready] = mesh + saved .mph (use --from-comsol). "
+        "[extracted] = biochem graph exists."
     )
     print(
         "[i] If mesh stem is patient_007 but exports are patient007.txt, run:\n"
@@ -209,6 +224,42 @@ def _resolve_choice(raw: str, statuses: list[AnchorExtractStatus]) -> AnchorExtr
     return None
 
 
+def _maybe_pull_comsol(
+    stem: str,
+    extractor: PatientDataExtractor,
+    *,
+    from_comsol: bool,
+    model_path: Path | None,
+    force: bool,
+) -> bool:
+    domain_txt = extractor.label_dir / f"{stem}.txt"
+    if domain_txt.is_file() and not force:
+        return True
+    if not from_comsol:
+        if not domain_txt.is_file():
+            print(
+                f"[ERR] {stem}: missing {domain_txt.name}. "
+                "Use --from-comsol after saving <stem>.mph, or export txt manually."
+            )
+        return domain_txt.is_file()
+
+    resolved = resolve_biochem_comsol_model_path(stem, model_path)
+    if resolved is None:
+        print(
+            f"[ERR] {stem}: no .mph found. Save solved model to "
+            f"{extractor.raw_dir / f'{stem}.mph'} or set BIOCHEM_COMSOL_MODEL."
+        )
+        return False
+
+    print(f"[NEW] Pulling COMSOL fields from {resolved} ...")
+    try:
+        extractor.pull_comsol_exports(stem, model_path=resolved, force=force)
+    except Exception as exc:
+        print(f"[ERR] COMSOL pull failed for {stem}: {exc}")
+        return False
+    return domain_txt.is_file() or (extractor.label_dir / f"{stem}.txt").is_file()
+
+
 def _run_extract(
     stem: str,
     extractor: PatientDataExtractor,
@@ -216,7 +267,14 @@ def _run_extract(
     force: bool,
     skip_enrich: bool,
     raw_dir: Path,
+    from_comsol: bool,
+    model_path: Path | None,
 ) -> bool:
+    if not _maybe_pull_comsol(
+        stem, extractor, from_comsol=from_comsol, model_path=model_path, force=force
+    ):
+        return False
+
     biochem_pt = extractor.proc_dir / f"{stem}.pt"
     if biochem_pt.is_file() and not force:
         print(
@@ -248,8 +306,15 @@ def _interactive_loop(
     force: bool,
     skip_enrich: bool,
     raw_dir: Path,
+    from_comsol: bool,
+    model_path: Path | None,
 ) -> None:
-    ready = [s for s in statuses if s.can_extract and not s.already_extracted]
+    ready = [
+        s
+        for s in statuses
+        if not s.already_extracted
+        and (s.can_extract or (from_comsol and s.can_pull_from_comsol))
+    ]
     print(f"\n[i] {len(ready)} stem(s) ready to extract (not yet graphed).")
     print("[i] Enter stem name, list index, 'l' to relist, 'q' to quit.\n")
 
@@ -272,8 +337,12 @@ def _interactive_loop(
         if picked is None:
             continue
 
-        if not picked.can_extract:
-            print(f"[ERR] {picked.stem}: need mesh in {raw_dir} and {picked.stem}.txt in {extractor.label_dir}.")
+        can_run = picked.can_extract or (from_comsol and picked.can_pull_from_comsol)
+        if not can_run:
+            print(
+                f"[ERR] {picked.stem}: need mesh in {raw_dir} and either domain .txt or a saved .mph "
+                f"(--from-comsol)."
+            )
             if picked.has_mesh and picked.export_count < 4:
                 missing = []
                 if not picked.has_inlet_txt:
@@ -303,6 +372,8 @@ def _interactive_loop(
             force=force,
             skip_enrich=skip_enrich,
             raw_dir=raw_dir,
+            from_comsol=from_comsol,
+            model_path=model_path,
         )
         if ok and not _prompt_yes_no("Extract another?", default=True):
             break
@@ -329,6 +400,17 @@ def main(argv: list[str] | None = None) -> None:
         "--skip-enrich",
         action="store_true",
         help="Skip Gmsh sidecar enrichment before extract.",
+    )
+    parser.add_argument(
+        "--from-comsol",
+        action="store_true",
+        help="Pull domain/boundary txt from a solved .mph via mph before graph extract.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=None,
+        help="Explicit path to solved .mph (default: <stem>.mph in biochem_anchors or BIOCHEM_COMSOL_MODEL).",
     )
     args = parser.parse_args(argv)
 
@@ -375,14 +457,17 @@ def main(argv: list[str] | None = None) -> None:
                 kine_dir=extractor.kine_anchor_dir,
             )
             statuses.append(picked)
-        if not picked.can_extract:
-            raise SystemExit(f"[ERR] {stem_arg}: missing mesh or domain .txt (see table above).")
+        can_run = picked.can_extract or (args.from_comsol and picked.can_pull_from_comsol)
+        if not can_run:
+            raise SystemExit(f"[ERR] {stem_arg}: missing mesh and/or COMSOL source (see table above).")
         ok = _run_extract(
             picked.stem,
             extractor,
             force=args.force,
             skip_enrich=args.skip_enrich,
             raw_dir=raw_dir,
+            from_comsol=args.from_comsol,
+            model_path=args.model_path,
         )
         raise SystemExit(0 if ok else 1)
 
@@ -392,6 +477,8 @@ def main(argv: list[str] | None = None) -> None:
         force=args.force,
         skip_enrich=args.skip_enrich,
         raw_dir=raw_dir,
+        from_comsol=args.from_comsol,
+        model_path=args.model_path,
     )
 
 

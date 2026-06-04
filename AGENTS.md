@@ -59,7 +59,7 @@
 
 ## Scripts layout
 
-- **Biochem COMSOL extract (interactive):** `python -m src.tools.extract_biochem_comsol` (PyCharm: run module `src.tools.extract_biochem_comsol`, cwd = repo root); `go_extract_biochem_interactive.ps1`; `python -m src.bin.main data extract-biochem -- [--list-only|--stem NAME]`.
+- **Biochem COMSOL extract (interactive):** after solving in COMSOL, save `<stem>.mph` under `data/raw/biochem_anchors/`, then `python -m src.tools.extract_biochem_comsol --from-comsol --stem <stem>` (pulls fields via `mph`, no manual Results export). PyCharm: module `src.tools.extract_biochem_comsol`. Env: `BIOCHEM_COMSOL_MODEL`, `BIOCHEM_COMSOL_DOMAIN_EXPRS`, `BIOCHEM_COMSOL_SOL_TAG` (default `sol1`), `BIOCHEM_COMSOL_DATASET_TAG` (default `dset1`).
 - Active launchers and utilities: [scripts/README.md](scripts/README.md).
 - Historical sweep names in `BIOCHEM_TRAINING_PROGRESS.md` referred to one-off runners since removed; use current `go_*` scripts instead.
 

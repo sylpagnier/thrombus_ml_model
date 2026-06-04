@@ -57,8 +57,23 @@ Script: `scripts/go_kinematics_production_allfix.ps1` — allfix toggles, **3000
 | April reference | ~2000 | 0.101 | — | 0.157 | 84 (pre-LBFGS) |
 | 30-ep allfix smoke | 2000 cap | 0.132 | 0.135 | 0.335 | 29 |
 | **Production allfix** | **3000** | **0.126** | **0.120** | **0.307** | **80** |
+| **Finetune allfix** (ContinuityFocus) | **3000** | **0.087** | **0.083** | **0.233** | **119** |
 
-Full graphs + long Carreau beat the 30-ep smoke (~4% Rel L2 gain; L1 **0.120** vs 0.135). Still **~0.026** above April on Rel L2 and **~2×** on div_u — likely need L2 finetune and/or continuity-focused polish, not more LBFGS.
+Full graphs + long Carreau beat the 30-ep smoke (~4% Rel L2 gain; L1 **0.120** vs 0.135). Production ep 80 still **~0.026** above April on Rel L2. **Continuity finetune ep 119 beats April** on Rel L2 (0.087 vs 0.101) and div_u (0.233 vs 0.157); L2 subset still ~0.120.
+
+### Finetune run (2026-06-03, `go_kinematics_production_allfix_finetune.ps1`)
+
+Resume from production `kinematics_best.pth` (ep 80). `kinematics_validation.jsonl` appends multiple attempts; **use ep 119 as the promoted best**.
+
+| Phase | Epochs | Best Rel L2 | L1 | L2 | div_u | composite | Note |
+|-------|--------|-------------|-----|-----|-------|-----------|------|
+| Finetune start (5e-6) | 82 | 0.127 | 0.121 | 0.169 | 0.300 | **30.10** | saved best (composite) |
+| LR scheduler bug | 83–87 | 0.153–0.165 | — | ~0.19 | 0.37+ | 37–42 | cosine restored -> LR ~1e-4 |
+| Recovery + long Carreau tail | 88–118 | 0.122 -> 0.090 | — | 0.16 -> 0.12 | 0.32 -> 0.24 | 32 -> 24 | steady gain at ~1e-4 LR |
+| **Best saved** | **119** | **0.087** | **0.083** | **0.120** | **0.233** | **23.37** | **beats April Rel L2** |
+| End | 121 | 0.089 | 0.087 | 0.120 | 0.245 | 24.54 | slight regression |
+
+**Lessons:** (1) LBFGS tail still harmful (production ep 85–99). (2) Finetune ep 83+ LR jump (pre-`cf0308c`) caused one bad week of val; extended training afterward still helped. (3) Constant 5e-6 finetune with the scheduler fix is the clean recipe going forward; this run's ep 119 weights are the current repo best.
 
 **Promote for biochem/viz:**
 
@@ -66,17 +81,45 @@ Full graphs + long Carreau beat the 30-ep smoke (~4% Rel L2 gain; L1 **0.120** v
 Copy-Item outputs\kinematics\production_allfix\kinematics_best.pth outputs\kinematics\kinematics_best.pth -Force
 ```
 
-**Next lever:** `go_kinematics_production_allfix_finetune.ps1` from `kinematics_best.pth` (default `-ContinuityFocus`, Adam-only). Optional `-TryLbfgs` for risky 5-epoch LBFGS tail.
+(`kinematics_best.pth` under `production_allfix/` should reflect **ep 119** if finetune completed.)
 
-## Stage-A ladder (recommended order)
+**Next lever:** phase 3 clinical anchors from finetune best — `go_kinematics_clinical_anchor_finetune.ps1` + dual promotion gates.
 
-Three explicit phases. Use **production ep-80** (`outputs/kinematics/production_allfix/kinematics_ckpt_81.pth` or `kinematics_best.pth` if restored) as the healthy checkpoint before any finetune.
+## Stage-A default training loop (3 phases)
 
-| Phase | Script | Purpose |
-|-------|--------|---------|
-| **1 Foundation** | `go_kinematics_production_allfix.ps1` | 3000 graphs, allfix, 100 ep, Adam-only (LBFGS off) |
-| **2 Synthetic polish** (optional) | `go_kinematics_production_allfix_finetune.ps1 -ContinuityFocus` | Lower LR, mild BC; same synthetic corpus |
-| **3 Clinical anchors** | `go_kinematics_clinical_anchor_finetune.ps1` | `graphs_kinematics_anchors/carreau/patient*.pt` + synthetic cap |
+**One command** runs foundation -> synthetic polish -> clinical geometry finetune -> gated promote:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_production_allfix.ps1"
+```
+
+| Phase | What | Data |
+|-------|------|------|
+| **1 Foundation** | 3000 synthetic graphs, 100 ep, Adam-only | `graphs_kinematics/` |
+| **2 Synthetic polish** | +40 ep ContinuityFocus finetune | same synthetic corpus |
+| **3 Clinical geometry** | +25 ep patient-anchor finetune | `graphs_kinematics_anchors/carreau/patient*.pt` + synthetic cap |
+
+Phase 3 adapts the model to **geometries this deployment will see** (patient vessels). Holdout stems (default `patient007`) stay val-only; promotion requires patient + synthetic + synthetic-L2 gates. If no `patient*.pt` exist, phase 3 is skipped with a warning and phase-2 best is copied to global `kinematics_best.pth`.
+
+**Opt out flags** (on `go_kinematics_production_allfix.ps1`):
+
+| Flag | Effect |
+|------|--------|
+| `-FoundationOnly` | Phase 1 only (legacy) |
+| `-SkipSyntheticPolish` | Skip phase 2 |
+| `-SkipClinicalAnchors` | Skip phase 3 |
+| `-SkipPromote` | Train phase 3 but do not copy to global best |
+| `-RequireClinical` | Fail if phase 3 cannot run (no patient graphs) |
+| `-Holdout patient007,patient003` | Val-only patient stems for phase 3 |
+| `-NoContinuityFocus` | Phase 2 without BC bump |
+
+**Resume mid-ladder** (phase 1 already done):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_kinematics_stage_a_ladder.ps1" -SkipFoundation -Holdout patient007
+```
+
+Orchestrator only: `go_kinematics_stage_a_ladder.ps1` (same flags + `-Fresh` for phase 1).
 
 **Clinical phase details**
 
@@ -93,7 +136,7 @@ python scripts/check_kinematics_promotion_gates.py --checkpoint outputs/kinemati
 powershell -File .\scripts\promote_kinematics_checkpoint.ps1 -Checkpoint outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth
 ```
 
-Default gates: holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**, synthetic **L2** val **rel_L2 <= 0.22**. Orchestrator: `go_kinematics_stage_a_ladder.ps1` (`-SkipFoundation` after production).
+Default gates: holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**, synthetic **L2** val **rel_L2 <= 0.22** (automatic at end of default loop).
 
 ## GINO_DEQ constructor (must match for biochem load)
 
