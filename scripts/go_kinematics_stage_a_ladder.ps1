@@ -55,15 +55,15 @@ if (-not (Test-Path $ckpt)) {
 
 if (-not $SkipSyntheticPolish) {
   Write-Host "[ladder] === phase 2/3: synthetic polish (ContinuityFocus finetune) ==="
-  $ftArgs = @(
-    "-Resume", $ckpt,
-    "-FinetuneEpochs", "$SyntheticFinetuneEpochs"
-  )
   $useContinuity = (-not $NoContinuityFocus) -or $ContinuityFocus
-  if ($useContinuity) { $ftArgs += "-ContinuityFocus" }
-  if ($Quiet) { $ftArgs += "-Quiet" }
+  $ftParams = @{
+    Resume         = $ckpt
+    FinetuneEpochs = $SyntheticFinetuneEpochs
+  }
+  if ($useContinuity) { $ftParams.ContinuityFocus = $true }
+  if ($Quiet) { $ftParams.Quiet = $true }
   Write-Host ("[ladder] synthetic polish epochs={0}" -f $SyntheticFinetuneEpochs)
-  & (Join-Path $PSScriptRoot "go_kinematics_production_allfix_finetune.ps1") @ftArgs
+  & (Join-Path $PSScriptRoot "go_kinematics_production_allfix_finetune.ps1") @ftParams
   if ($LASTEXITCODE -ne 0) { throw "[ladder] phase 2 synthetic polish failed." }
   $ckpt = Join-Path $RepoRoot "outputs\kinematics\production_allfix\kinematics_best.pth"
 }
