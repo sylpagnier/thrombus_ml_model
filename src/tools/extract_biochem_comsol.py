@@ -1,13 +1,12 @@
 """Interactive biochem COMSOL -> PyG graph extraction.
 
 **Default:** COMSOL auto-pull is on. Save solves as ``comsol_models/phase2_nowound_XXX.mph``
-(for anchor ``patientXXX``), then run either entry point::
+with Export nodes ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes`` configured.
 
-    python -m src.data_gen.lib.extract_biochem_comsol_data
-    python -m src.tools.extract_biochem_comsol --stem patient007
+    python -m src.tools.extract_biochem_comsol
 
-This samples the solved model via LiveLink (``mph``) and writes
-``data/processed/cfd_results_biochem/*.txt`` before building graphs.
+Runs those exports (mesh from comp1/mesh1), writes ``cfd_results_biochem/*.txt``, builds
+``graphs_biochem_anchors/*.pt``. Creates data folders automatically if missing.
 
 **Manual path:** export domain + boundary ``.txt`` yourself, then run without ``--from-comsol``.
 
@@ -521,16 +520,13 @@ def main(argv: list[str] | None = None) -> None:
     raw_dir = args.raw_dir or (dr / "raw" / "biochem_anchors")
     label_dir = args.label_dir or (dr / "processed" / "cfd_results_biochem")
 
-    if not raw_dir.is_dir() and not label_dir.is_dir():
-        raise SystemExit(
-            f"[ERR] Neither mesh dir nor export dir exists.\n"
-            f"  meshes: {raw_dir}\n  exports: {label_dir}"
-        )
-
-    if not args.skip_sidecars and raw_dir.is_dir():
-        _auto_scaffold_anchor_sidecars(raw_dir)
+    from src.data_gen.lib.biochem_comsol_mph_export import ensure_biochem_extract_dirs
 
     extractor = PatientDataExtractor(phase="biochem_anchors", raw_dir=raw_dir, label_dir=label_dir)
+    ensure_biochem_extract_dirs(raw_dir, label_dir, extractor.proc_dir)
+
+    if not args.skip_sidecars:
+        _auto_scaffold_anchor_sidecars(raw_dir)
     stems = _collect_stems(raw_dir, label_dir)
     statuses = [
         _status_for_stem(

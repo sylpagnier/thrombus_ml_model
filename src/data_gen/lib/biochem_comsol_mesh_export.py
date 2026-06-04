@@ -491,7 +491,9 @@ def ensure_anchor_mesh_from_comsol(
     if existing is not None and not force:
         return existing, False
 
-    tag = mesh_tag or find_comsol_mesh_tag(model_java)
+    from src.data_gen.lib.biochem_comsol_mph_export import find_comp1_mesh_tag
+
+    tag = mesh_tag or find_comp1_mesh_tag(model_java)
     safe_nas = str(nas_path.resolve()).replace("\\", "/")
     logger.info("[NEW] %s: exporting COMSOL mesh -> %s", stem, nas_path.name)
     model_java.mesh(tag).export(safe_nas)

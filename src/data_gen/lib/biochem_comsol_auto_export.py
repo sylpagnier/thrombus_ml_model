@@ -7,9 +7,11 @@ files are generated from Gmsh mesh tags (no COMSOL boundary export needed).
 Typical workflow::
 
     1. Run the biochem study in COMSOL; save as ``comsol_models/phase2_nowound_XXX.mph``.
-    2. Mesh ``.nas``/``.msh`` is auto-exported from the ``.mph`` when missing (no manual mesh export).
-       (maps to anchor stem ``patientXXX``) or set ``BIOCHEM_COMSOL_MODEL``.
-    3. ``python -m src.tools.extract_biochem_comsol --stem <stem> --from-comsol``
+    2. Ensure Results > Export nodes exist: ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes``.
+    3. ``python -m src.tools.extract_biochem_comsol`` (default) runs those exports + builds graphs.
+
+    Mesh from ``comp1`` / ``mesh1``; domain from ``sol_data`` (Study 1 / ``sol1`` dataset in the .mph).
+    Set ``BIOCHEM_COMSOL_USE_MPH_EXPORTS=0`` to use Interp sampling instead of Export nodes.
 
 Requires: COMSOL 6.x + ``pip install mph`` (same as kinematics ``AnchorGenerator``).
 
@@ -530,16 +532,45 @@ class BiochemComsolAutoExporter:
         self._model_path = resolved
         with self:
             assert self._model is not None
+            from src.data_gen.lib.biochem_comsol_mesh_export import (
+                ensure_anchor_mesh_from_comsol,
+                ensure_boundary_txt_files,
+            )
+            from src.data_gen.lib.biochem_comsol_mph_export import (
+                pull_exports_via_mph_nodes,
+                use_mph_result_exports,
+            )
+            from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
+
+            mph_export_ok = False
+            if use_mph_result_exports():
+                try:
+                    pull_exports_via_mph_nodes(
+                        self._model.java,
+                        stem,
+                        label_dir=self.label_dir,
+                        raw_dir=self.raw_dir,
+                        force=force,
+                    )
+                    mph_export_ok = True
+                    logger.info("[OK] %s: pulled via COMSOL Export nodes (sol_data / *_nodes)", stem)
+                except Exception as exc:
+                    logger.warning(
+                        "[WARN] %s: COMSOL Export nodes failed (%s); using Interp fallback.",
+                        stem,
+                        exc,
+                    )
+
+            if mph_export_ok:
+                if skip_fields:
+                    logger.info("[skip] %s exists (use force=True to rewrite fields)", domain_path.name)
+                return domain_path
+
             self.dataset_tag = resolve_solution_dataset(
                 self._model.java,
                 self.sol_tag,
                 explicit=self._dataset_tag_explicit or None,
             )
-            from src.data_gen.lib.biochem_comsol_mesh_export import (
-                ensure_anchor_mesh_from_comsol,
-                ensure_boundary_txt_files,
-            )
-            from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 
             force_mesh = force and _env_flag("BIOCHEM_COMSOL_FORCE_MESH")
             mesh_path, _mesh_exported = ensure_anchor_mesh_from_comsol(
@@ -551,8 +582,20 @@ class BiochemComsolAutoExporter:
             mesh = meshio.read(mesh_path)
             coords_cm = np.asarray(mesh.points[:, :2], dtype=np.float64)
 
-            if boundary_from_mesh:
+            if boundary_from_mesh and not mph_export_ok:
                 force_boundary = force and _env_flag("BIOCHEM_COMSOL_FORCE_BOUNDARY")
+                ensure_boundary_txt_files(
+                    self._model.java,
+                    coords_cm,
+                    mesh_path,
+                    self.label_dir,
+                    stem,
+                    vessel_cfg=self.vessel_cfg,
+                    dataset_tag=self.dataset_tag,
+                    force_boundary=force_boundary,
+                )
+            elif boundary_from_mesh and mph_export_ok and (force and _env_flag("BIOCHEM_COMSOL_FORCE_BOUNDARY")):
+                force_boundary = True
                 ensure_boundary_txt_files(
                     self._model.java,
                     coords_cm,
@@ -601,13 +644,13 @@ class BiochemComsolAutoExporter:
                         100.0 * nan_frac,
                     )
 
-        write_wide_domain_txt(
-            domain_path,
-            times_s=times,
-            coords_xy_cm=coords_cm,
-            fields_by_time=fields_by_time,
-        )
-        logger.info("[OK] Wrote domain export %s (%d times, %d nodes)", domain_path, len(times), len(coords_cm))
+            write_wide_domain_txt(
+                domain_path,
+                times_s=times,
+                coords_xy_cm=coords_cm,
+                fields_by_time=fields_by_time,
+            )
+            logger.info("[OK] Wrote domain export %s (%d times, %d nodes)", domain_path, len(times), len(coords_cm))
         return domain_path
 
 
