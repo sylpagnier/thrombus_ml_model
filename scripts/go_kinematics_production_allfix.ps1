@@ -175,18 +175,18 @@ if ($FoundationOnly) {
 }
 
 Write-Host "[kin-prod] chaining phases 2-3 (synthetic polish + clinical geometry finetune)..."
-$ladderArgs = @(
-  "-SkipFoundation",
-  "-Holdout", $Holdout
-)
-if ($SkipSyntheticPolish) { $ladderArgs += "-SkipSyntheticPolish" }
-if ($SkipClinicalAnchors) { $ladderArgs += "-SkipClinicalAnchors" }
-if ($SkipPromote) { $ladderArgs += "-SkipPromote" }
-if ($RequireClinical) { $ladderArgs += "-RequireClinical" }
-if (-not $NoContinuityFocus) { $ladderArgs += "-ContinuityFocus" }
-if ($Quiet) { $ladderArgs += "-Quiet" }
+$ladderParams = @{
+  SkipFoundation = $true
+  Holdout        = $Holdout
+}
+if ($SkipSyntheticPolish) { $ladderParams["SkipSyntheticPolish"] = $true }
+if ($SkipClinicalAnchors) { $ladderParams["SkipClinicalAnchors"] = $true }
+if ($SkipPromote) { $ladderParams["SkipPromote"] = $true }
+if ($RequireClinical) { $ladderParams["RequireClinical"] = $true }
+if (-not $NoContinuityFocus) { $ladderParams["ContinuityFocus"] = $true }
+if ($Quiet) { $ladderParams["Quiet"] = $true }
 
-& (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderArgs
+& (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderParams
 if ($LASTEXITCODE -ne 0) {
   throw "[kin-prod] post-foundation ladder failed (exit $LASTEXITCODE)."
 }

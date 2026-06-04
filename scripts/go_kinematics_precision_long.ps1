@@ -10,7 +10,7 @@
 
 param(
   [string]$Resume = "outputs/kinematics/production_allfix/kinematics_best.pth",
-  [string]$Holdout = "patient007",
+  [string]$Holdout = "",
   [int]$SyntheticFinetuneEpochs = 60,
   [int]$ClinicalFinetuneEpochs = 50,
   [switch]$SkipPromote,
@@ -22,7 +22,8 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 $anchorDir = Join-Path $RepoRoot "data\processed\graphs_kinematics_anchors\carreau"
-$nPatient = @(Get-ChildItem -Path $anchorDir -Filter "patient*.pt" -ErrorAction SilentlyContinue).Count
+$patientFiles = @(Get-ChildItem -Path $anchorDir -Filter "patient*.pt" -ErrorAction SilentlyContinue)
+$nPatient = $patientFiles.Count
 if ($nPatient -lt 1) {
   throw @"
 [kin-precision] no patient*.pt under $anchorDir
@@ -30,23 +31,33 @@ Run first: python scripts/reextract_anchor_comsol_graphs.py
 "@
 }
 
+if (-not $Holdout.Trim()) {
+  if ($nPatient -lt 2) {
+    $Holdout = $patientFiles[0].BaseName
+    Write-Host "[kin-precision] WARN only one patient graph; holdout=$Holdout (train set empty for clinical phase)"
+  } else {
+    $Holdout = $patientFiles[-1].BaseName
+    Write-Host ("[kin-precision] default holdout={0} (last patient stem; override with -Holdout)" -f $Holdout)
+  }
+}
+
 Write-Host ("[kin-precision] patient kine graphs={0} | synth_ft_epochs={1} | clinical_epochs={2} | holdout={3}" -f `
   $nPatient, $SyntheticFinetuneEpochs, $ClinicalFinetuneEpochs, $Holdout)
 Write-Host "[kin-precision] resume=$Resume (git pull recommended before long run)"
 
-$ladderArgs = @(
-  "-SkipFoundation",
-  "-RequireClinical",
-  "-ContinuityFocus",
-  "-Resume", $Resume,
-  "-Holdout", $Holdout,
-  "-SyntheticFinetuneEpochs", "$SyntheticFinetuneEpochs",
-  "-ClinicalFinetuneEpochs", "$ClinicalFinetuneEpochs"
-)
-if ($SkipPromote) { $ladderArgs += "-SkipPromote" }
-if ($Quiet) { $ladderArgs += "-Quiet" }
+$ladderParams = @{
+  SkipFoundation          = $true
+  RequireClinical         = $true
+  ContinuityFocus         = $true
+  Resume                  = $Resume
+  Holdout                 = $Holdout
+  SyntheticFinetuneEpochs = $SyntheticFinetuneEpochs
+  ClinicalFinetuneEpochs  = $ClinicalFinetuneEpochs
+}
+if ($SkipPromote) { $ladderParams["SkipPromote"] = $true }
+if ($Quiet) { $ladderParams["Quiet"] = $true }
 
-& (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderArgs
+& (Join-Path $PSScriptRoot "go_kinematics_stage_a_ladder.ps1") @ladderParams
 if ($LASTEXITCODE -ne 0) {
   throw "[kin-precision] ladder failed (exit $LASTEXITCODE)."
 }
