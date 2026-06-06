@@ -17,11 +17,12 @@ Set-Location $RepoRoot
 Write-Host "[NEW] R0 clot forecast label sanity" -ForegroundColor Cyan
 Write-Host "[i]  Checks GT mu growth + |dlog mu| on anchor pairs (no model)" -ForegroundColor DarkGray
 
-$rc = Invoke-PythonRc @(
+$pyArgs = @(
     (Join-Path $RepoRoot "scripts\check_clot_forecast_r0.py"),
     "--anchors", $Anchors,
     "--pair-stride", "$PairStride",
     "--mu-thr-si", "$MuThrSi"
 )
+$rc = Invoke-PythonRc -PyArgs $pyArgs
 if ($rc -ne 0) { exit $rc }
 Write-Host "[OK]  R0 complete" -ForegroundColor Green

@@ -10,6 +10,10 @@ from pathlib import Path
 
 import torch
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from src.config import PhysicsConfig, VesselConfig, STATE_CHANNEL_MU_EFF_ND
 from src.core_physics.clot_phi_simple import (
     cap_mu_eff_si,
