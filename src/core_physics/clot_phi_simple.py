@@ -147,11 +147,24 @@ def gt_neg_dgamma_dx_phys(
 ) -> torch.Tensor:
     """COMSOL-aligned ``max(0, -d(gamma)/dx)`` [1/(m*s)] from GT ``u,v`` (matches ``d(spf.sr,x)`` band)."""
     y = data.y[time_index].to(device=device, dtype=torch.float32)
+    return pred_neg_dgamma_dx_phys(data, y[:, 0], y[:, 1], bio_cfg, device)
+
+
+def pred_neg_dgamma_dx_phys(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    """``max(0, -d(gamma)/dx)`` from predicted or patched ``u,v`` (deploy-safe)."""
     props = {
         "u_ref": data.u_ref.to(device=device),
         "d_bar": data.d_bar.to(device=device),
     }
-    fields = compute_clot_kinematics_fields(data, y[:, 0], y[:, 1], bio_cfg, props)
+    u = u_nd.reshape(-1).to(device=device, dtype=torch.float32)
+    v = v_nd.reshape(-1).to(device=device, dtype=torch.float32)
+    fields = compute_clot_kinematics_fields(data, u, v, bio_cfg, props)
     return (-fields.dgamma_dx_phys).clamp(min=0.0)
 
 
@@ -520,6 +533,8 @@ def clot_phi_model_kind() -> str:
     raw = (os.environ.get("CLOT_PHI_MODEL") or "mlp").strip().lower()
     if raw in ("linear", "logistic", "lr"):
         return "linear"
+    if raw in ("mpnn", "gnn", "conv"):
+        return "mpnn"
     return "mlp"
 
 
@@ -534,6 +549,7 @@ def clot_phi_mlp_depth() -> int:
 
 
 def clot_phi_feature_dim() -> int:
+    from src.core_physics.clot_forecast import clot_forecast_extra_feature_dim
     from src.core_physics.clot_phi_rollout import clot_phi_rollout_extra_feature_dim
 
     extra_sp = 2 if clot_phi_species_features_enabled() else 0
@@ -543,7 +559,7 @@ def clot_phi_feature_dim() -> int:
         base = 7 if clot_phi_oracle_mu_enabled() else 6
         if clot_phi_use_prior_features():
             base += clot_phi_prior_feature_count()
-    return base + clot_phi_rollout_extra_feature_dim()
+    return base + clot_phi_rollout_extra_feature_dim() + clot_forecast_extra_feature_dim()
 
 
 def rule_phi_from_mu_cap(
@@ -713,6 +729,61 @@ class ClotPhiSpeciesHead(nn.Module):
         return self.net(x)
 
 
+class ClotPhiMPNNHybrid(nn.Module):
+    """One-hop message passing + hybrid phi / delta_log_mu heads (forecast prong C)."""
+
+    uses_mpnn = True
+
+    def __init__(self, in_dim: int = 3, hidden: int = 32):
+        super().__init__()
+        from torch_geometric.nn import MessagePassing
+
+        h = max(int(hidden), 8)
+
+        class _Conv(MessagePassing):
+            def __init__(self) -> None:
+                super().__init__(aggr="add")
+                self.lin_nei = nn.Linear(in_dim, h)
+                self.lin_self = nn.Linear(in_dim, h)
+
+            def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+                return self.propagate(edge_index, x=x)
+
+            def message(self, x_j: torch.Tensor, x_i: torch.Tensor) -> torch.Tensor:
+                return F.silu(self.lin_nei(x_j) + self.lin_self(x_i))
+
+        self.conv = _Conv()
+        drop = clot_phi_dropout()
+        self.post = nn.Sequential(
+            nn.Linear(h, h),
+            nn.SiLU(),
+            nn.Dropout(p=drop) if drop > 0.0 else nn.Identity(),
+        )
+        self.phi_fc = nn.Linear(h, 1)
+        self.dlog_fc = nn.Linear(h, 1)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _hidden(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        return self.post(self.conv(x, edge_index))
+
+    def forward_logits(self, x: torch.Tensor, edge_index: torch.Tensor | None = None) -> torch.Tensor:
+        if edge_index is None:
+            raise ValueError("ClotPhiMPNNHybrid requires edge_index")
+        return self.phi_fc(self._hidden(x, edge_index)).squeeze(-1)
+
+    def forward_delta_log_mu(self, x: torch.Tensor, edge_index: torch.Tensor | None = None) -> torch.Tensor:
+        if edge_index is None:
+            raise ValueError("ClotPhiMPNNHybrid requires edge_index")
+        return F.softplus(self.dlog_fc(self._hidden(x, edge_index)).squeeze(-1))
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor | None = None) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x, edge_index))
+
+
 class ClotPhiHybrid(nn.Module):
     """Minimal hybrid: phi logits + ``delta_log_mu`` (``mu = mu_c * exp(delta)``)."""
 
@@ -760,10 +831,17 @@ class ClotPhiHybrid(nn.Module):
 
 
 def build_clot_phi_model(in_dim: int, hidden: int) -> nn.Module:
-    """Factory: ``CLOT_PHI_HYBRID`` + ``CLOT_PHI_MODEL=linear|mlp``."""
+    """Factory: ``CLOT_PHI_HYBRID`` + ``CLOT_PHI_MODEL=linear|mlp|mpnn``."""
+    kind = clot_phi_model_kind()
     if clot_phi_hybrid_enabled():
-        return ClotPhiHybrid(in_dim=in_dim, hidden=hidden, linear=(clot_phi_model_kind() == "linear"))
+        if kind == "mpnn":
+            return ClotPhiMPNNHybrid(in_dim=in_dim, hidden=hidden)
+        return ClotPhiHybrid(in_dim=in_dim, hidden=hidden, linear=(kind == "linear"))
     return ClotPhiMLP(in_dim=in_dim, hidden=hidden)
+
+
+def clot_phi_model_uses_mpnn(model: nn.Module) -> bool:
+    return bool(getattr(model, "uses_mpnn", False))
 
 
 @dataclass
@@ -788,6 +866,7 @@ def build_clot_phi_step(
     *,
     u_nd_override: torch.Tensor | None = None,
     v_nd_override: torch.Tensor | None = None,
+    y_slice_override: torch.Tensor | None = None,
     rollout_state: "ClotPhiRolloutState | None" = None,
 ) -> ClotPhiStepBatch:
     """One time slice: labels and features on wall-adjacent nodes."""
@@ -798,7 +877,11 @@ def build_clot_phi_step(
         resolve_uv_for_rollout_step,
     )
 
-    y = data.y[time_index].to(device)
+    y = (
+        y_slice_override.to(device)
+        if y_slice_override is not None
+        else data.y[time_index].to(device)
+    )
     u_gt = y[:, 0]
     v_gt = y[:, 1]
     if clot_phi_rollout_enabled():

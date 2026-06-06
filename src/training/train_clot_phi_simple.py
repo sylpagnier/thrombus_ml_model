@@ -20,6 +20,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
+from src.core_physics.clot_forecast import (
+    build_clot_forecast_pair_step,
+    clot_forecast_one_step_enabled,
+    clot_forecast_pair_stride,
+    snapshot_clot_forecast_config,
+)
 from src.core_physics.clot_phi_simple import (
     ClotPhiSpeciesHead,
     build_clot_phi_model,
@@ -33,6 +39,7 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_mask_mode,
     clot_phi_minimal_features_enabled,
     clot_phi_model_kind,
+    clot_phi_model_uses_mpnn,
     clot_phi_mu_cap_si,
     clot_phi_oracle_mu_enabled,
     clot_phi_physics_oracle_enabled,
@@ -242,6 +249,43 @@ def _species_data_mse(
     return torch.mean(((p_log - t_log) ** 2) * w)
 
 
+def _model_logits(model: torch.nn.Module, feats: torch.Tensor, edge_index: torch.Tensor | None) -> torch.Tensor:
+    if clot_phi_model_uses_mpnn(model):
+        if edge_index is None:
+            raise ValueError("mpnn model requires edge_index")
+        return model.forward_logits(feats, edge_index)
+    return model.forward_logits(feats)
+
+
+def _model_delta_log_mu(model: torch.nn.Module, feats: torch.Tensor, edge_index: torch.Tensor | None) -> torch.Tensor:
+    if clot_phi_model_uses_mpnn(model):
+        if edge_index is None:
+            raise ValueError("mpnn model requires edge_index")
+        return model.forward_delta_log_mu(feats, edge_index)
+    return model.forward_delta_log_mu(feats)
+
+
+def _build_step(
+    data,
+    ti: int,
+    *,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    rollout_state: ClotPhiRolloutState | None,
+    t_steps: int,
+    pair_stride: int,
+):
+    if clot_forecast_one_step_enabled():
+        t_out = ti + pair_stride
+        if t_out >= t_steps:
+            return None
+        return build_clot_forecast_pair_step(data, ti, t_out, phys_cfg, bio_cfg, device)
+    return build_clot_phi_step(
+        data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+    )
+
+
 def _run_epoch(
     model: torch.nn.Module | None,
     paths: List[str],
@@ -304,6 +348,9 @@ def _run_epoch(
         for p, n in zip(paths, approx_steps):
             path_step_scale[p] = float(target / float(max(n, 1)))
 
+    pair_stride = clot_forecast_pair_stride()
+    forecast_one_step = clot_forecast_one_step_enabled()
+
     with torch.set_grad_enabled(train):
         for path in paths:
             data = torch.load(path, weights_only=False).to(device)
@@ -319,12 +366,28 @@ def _run_epoch(
                 continue
             n_graphs += 1
             t_steps = data.y.shape[0]
-            rollout_on = clot_phi_rollout_enabled() and not rule_baseline and not physics_oracle
+            edge_index = data.edge_index.to(device) if model is not None and clot_phi_model_uses_mpnn(model) else None
+            rollout_on = (
+                clot_phi_rollout_enabled()
+                and not rule_baseline
+                and not physics_oracle
+                and not forecast_one_step
+            )
             rollout_state = ClotPhiRolloutState() if rollout_on else None
-            for ti in range(0, t_steps, max(1, time_stride)):
-                step = build_clot_phi_step(
-                    data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+            t_max = t_steps - pair_stride if forecast_one_step else t_steps
+            for ti in range(0, max(t_max, 0), max(1, time_stride)):
+                step = _build_step(
+                    data,
+                    ti,
+                    phys_cfg=phys_cfg,
+                    bio_cfg=bio_cfg,
+                    device=device,
+                    rollout_state=rollout_state,
+                    t_steps=t_steps,
+                    pair_stride=pair_stride,
                 )
+                if step is None:
+                    continue
                 m = step.loss_mask
                 if not bool(m.any().item()):
                     continue
@@ -382,7 +445,7 @@ def _run_epoch(
                         if _env_bool("CLOT_PHI_JOINT_USE_PRED_SPECIES", True):
                             sp_for_physics = sp_pred
                     u_sl, v_sl = step.u_flow_nd, step.v_flow_nd
-                    logits = model.forward_logits(feats)
+                    logits = _model_logits(model, feats, edge_index)
                     idx = _loss_indices(logits, tgt, m, balanced=balanced and train)
                     tm = tgt[idx]
                     pw = torch.tensor([pos_weight], device=device, dtype=logits.dtype)
@@ -391,7 +454,7 @@ def _run_epoch(
                     phi_ml = torch.sigmoid(logits)
                     mu_mse = torch.tensor(0.0, device=device)
                     if hybrid:
-                        dlog = model.forward_delta_log_mu(feats)
+                        dlog = _model_delta_log_mu(model, feats, edge_index)
                         mu_ml = mu_eff_from_delta_log_si(step.mu_c_si, dlog)
                     else:
                         mu_ml = log_blend_mu_eff_si(step.mu_c_si, phi_ml)
@@ -623,6 +686,7 @@ def main() -> None:
         f"minimal={int(clot_phi_minimal_features_enabled())} species_feat={int(clot_phi_species_features_enabled())} "
         f"joint_bio={int(joint_bio)} in_dim={in_dim} "
         f"rollout={int(clot_phi_rollout_enabled())} vel={clot_phi_vel_source()} "
+        f"forecast={snapshot_clot_forecast_config()} "
         f"train={len(train_paths)} val={len(val_paths)} "
         f"prior={prior:.3f} pos_weight={pos_weight:.2f} mu_log_w={mu_log_lambda:.2f} "
         f"bio_w={_bio_lambda():.2f}",
@@ -724,6 +788,7 @@ def main() -> None:
                     and clot_phi_carry_log_mu_enabled(),
                     "rollout_detach": clot_phi_rollout_detach_carry(),
                     "dgamma_feature_time": (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "ref").strip(),
+                    **snapshot_clot_forecast_config(),
                 },
             }
             if species_head is not None:
