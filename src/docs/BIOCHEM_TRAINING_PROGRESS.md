@@ -107,7 +107,29 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 ---
 
-## Where we are now (2026-05)
+## Where we are now (2026-06)
+
+### Deploy policy (teacher-only)
+
+**Decision (2026-06):** treat the **teacher stage as the full deploy model** for now. Skip corrector + synthetic pseudo-label mixing (`STOP_AFTER_TEACHER=1`, no Phase II pseudo bank). Revisit pseudo only if time allows.
+
+**Canonical architecture (best evidence so far):**
+
+| Piece | Choice |
+|-------|--------|
+| Flow | **GINO-DEQ predicted kine** (`BIOCHEM_GT_KINE_VEL=0`), Stage-A `kinematics_best.pth` inside macro loop |
+| Biochem | **GNODE Phase3** — latent **256**, Fourier **16**, **SIREN**, hard BCs, **delta-mu head**, no explicit gelation |
+| Loss tier | **Step-2 data-only** (`BIOCHEM_COMPLEXITY_STEP=2`, `BIOCHEM_LOSS_DATA_ONLY=1`) |
+| Deploy mu feedback | `BIOCHEM_TEACHER_MU_RATIO_MAX=20` (clot viscosity in forward) |
+| μ finetune recipe | Lane A **mu-unlock** (`PASSIVE_MU_UNLOCK=1`, bio frozen, `LOSS_ISOLATE=MU_LOG`) when promoting clot track |
+
+**Checkpoints (teacher-only, use in this order):**
+
+1. **μ (saved best):** `outputs/biochem/sweep_mu_complexity_6h/FULL_step2/biochem_teacher_best_high_mu.pth` — val all **~0.449** (teacher ep9); corrector adds **~0.003** only (§173).
+2. **μ (unsaved peak):** mu6h `FULL_overnight` teacher **0.444** ep10 — leg **OOM** before archive; weights not in `sweep_mu_complexity_6h/FULL_overnight/`.
+3. **Clot track (Lane A):** `outputs/biochem/gnode10_sweep/gnode12_lane_a_promoted/biochem_teacher_best_high_mu.pth` or `gnode12_mu_unlock/` — p007 clot F1 **0.750** (§170); same stack, mu-unlock tuned.
+
+**New-vessel + extrapolation viz:** `scripts/go_teacher_new_vessel_clot_viz.ps1` -> `src/evaluation/visualize_pipeline.py --teacher-only --synthetic` (sets pred-kine env + `VIZ_BIOCHEM_EXTRA_FRACTION` for time past `t_final`). Headless clot phi/mu on anchors: `scripts/snapshot_biochem_teacher_clotband.py`.
 
 ### Gate checklist
 
@@ -136,9 +158,11 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 | **GNODE 10 kine loop** | K5 dump pred `[u,v,p]` + clot on file vel | **Partial** | **§164**: p007 **0.522** min **0.267**; pred-flow coupling cost vs finish |
 | **GNODE 11a** (corrector smoke) | `STOP_AFTER_TEACHER=0` + step-2 bridge | **Pass (plumbing)** | **§165-166**: `20260604T102253Z`; Phase 3 synthetics OK after DataBatch `x_schema` fix; mu flat **~1.446**; species FI **~0.002** |
 | **GNODE 11b** (step-3 smoke) | `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0` | **Pass (plumbing)** | **§167**: `20260604T105007Z`; gate `--step3`; mu flat; species OK; effective **2+2 ep** (CLI restore bug, fixed) |
-| **GNODE 11 finish** (II.0 pseudo) | `pseudo_w>0`, corrector val rows | **Pass (plumbing)** | **§169**: `20260604T110525Z`; `pseudo_w=0.159`, coverage **100%**; mu flat **~1.444**; gate **PASS** |
+| **GNODE 11 finish** (II.0 pseudo) | `pseudo_w>0`, corrector val rows | **Pass (plumbing)** | **§169** K5: mu flat **~1.444**; **§172** Lane A init: val mu **~0.453** (metric win) |
 | **GNODE 12 Lane A** (dump+clot) | min clot F1 **>=0.26**, optional mu trend | **Pass (clot)** | **§170**: mu unlock **1.44->0.47**; p007 F1 **0.750** min **0.594**; beats kine loop **0.522** |
 | **GNODE 12 Lane B** (corrector dump+clot) | min F1 **>=0.26**; vs Lane A p007 | **Fail (clot)** | **§171**: p007 **0.488** min **0.163** (p003); Lane A **0.750** / **0.594**; gate FAIL |
+| **Mu6h comprehensive sweep** (pred kine, teacher+corrector+synth, LoRA) | Best val mu all **~0.44**; high-mu **~1.09**; step-3 regresses | **Partial** | **§173**: `go_mu_complexity_6h.ps1`; init Lane A promoted; **FULL_step2** all **0.446** (corr ep17) high **1.096**; **FULL_overnight** teacher **0.444** ep10 then **OOM** corr ep40; step-3 **0.459**; r **~-0.02**; finish gate PASS (plumbing) |
+| **A/B/C mask-only mu rollout** (`go_mlp_abc_compare_1h.ps1`, stride 5, pred kine) | Bulk all logMAE **~0.82** (B/C); high-μ / clot-gate **~3.9–4.0** (worse than A **~2.66**) | **Partial (bulk)** / **Fail (clots)** | **§174**; **§175** clot_shape scorecard: **B wins** (0.018) but all legs **~0** at t_final; A high recall / distant-FP bleed |
 | **GNODE 10 smoke** (predicted kine, 3ep) | `flow_trivial=0`; `L_bio` down; species stable | **Partial** | **§161**: `20260603T183923Z`; DEQ path (no GT note in passive line); `L_kine` flat **2.25**; mu **~1.446**; need FI line + longer run before dump |
 | **M5.3** mu-unlock finetune (wall/high weights) | `go_passive_mu_unlock_finetune.ps1` 12ep | **Fail** | **§135**: best all **0.797 @ ep2** then bulk **regress ->1.17**; wall/high improve; species OK; `clot_frac=0` |
 | **M5.4** step-2 bridge from unlock | `passive_m5_bridge` 12ep, `GRAD_SCALE_ON_CAP` | **Pass (gate)** | **§135**: all **0.781**; wall **2.09**; FI **0.019**; mu still no spatial clots |
@@ -175,10 +199,13 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 - **GNODE 9.4–9.5** (§149): species + clot-phi gate **PASS**; **9.6** (§150): M3 ADR **PASS**, spatial clot-band phi **FAIL** vs after_94 — promote **after_94** for dump/clot-phi; **9.7** mu unlock **PASS** (§151); **9.8** bridge **PASS** with `-GradScaleOnCap` (§153); **9.9** (§158-159): **PASS** — clot-phi on **`gnode_8h_ladder/anchors_stride_72`** only (`gnode99_promoted`); **FAIL** on fresh re-dumps (§154-157); archive cache before ladder `-Fresh`.
 - **Step-2 teacher “done” (μ)**: **Interim pass on patient007** — **K1/K8/K10e** (§90/§96/§103): **~0.47–0.49** all; **K10e** adds wall-adjacent mask + log/K10E loss but **still no viz clots** (`learned` flat). **clot6h sweep** (§112): 8 legs × ~4m, **K11** isolate — **no** leg beats **K11f** viz goal; **O0** oracle-at-train does **not** reproduce COMSOL red clots in **viz** (inference uses learned head). **K7** split+wall **~0.52** all but wall **~5.4**. **Caveat**: good logMAE ≠ COMSOL-qualitative wall bands. Corrector not started.
 - **Corrector + optional spatial priors** (corona *components*, not preset): only after joint step-2 stable; corona preset itself **unvalidated**.
-- **Step 3 (multitask backward)**: **In progress** — **K2** `COMPLEXITY_STEP=3`, `LOSS_DATA_ONLY=0`, explicit gelation, OomSafe **12ep complete** on RTX 500 4GB (no OOM); val all **5.58→4.22** (still **>> K1 0.464**); train **`L_tot` ~700–1700** (Kendall dominates); preflight **5.77**. Next: `GELATION_PRIOR_GATE=1` and/or cap μ₂ / staged re-enable gelation; keep **DATA_KINE** or **MU_LOG** until val **<1.0** before full PDE sum.
+- **Mu6h sweep (§173)**: pred-kine **teacher+corrector+synth** stack **plumbing PASS**; best completed mu **~0.446** (`FULL_step2` corrector); overnight teacher **0.444** @ ep10 but **OOM** @ corrector ep40 (`mu_ratio~22`, TBPTT=14, LoRA unlock ep36 on 4GB). **Step-2 beats step-2.5 and step-3** on this init; corrector adds **~0.003** vs teacher-only. **Next:** retry overnight with TBPTT cap **5–8**, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, or cap `mu_ratio` before LoRA unlock; promote `sweep_mu_complexity_6h/FULL_step2/biochem_best_high_mu.pth`.
+- **A/B/C mask-only mu (§174–§175)**: bulk wins (all logMAE **1.40 -> 0.82**); **clot_shape** north-star favors **Leg B** (**0.018** vs A **0.006** / C **0.004** on `--fast` smoke) but absolute scores **~0** — B/C **under-predict** clots (recall **~0.01**); A **recall ~0.41** with **distant-FP bleed** (pred clot frac **42–74%** vs GT **<1%**). **Next:** full stride scorecard (`go_mlp_abc_scorecard.ps1` no `-Fast`); coupled train; do not rank by bulk logMAE alone.
+- **Deploy coupled Step 2 smoke (§177–§178)**: **FAIL** closed-loop — offline val `mu_ok` **5%** but diagnose **`mu_mlp` 0%** in allowed (baseline **0.9%**); do **not** promote; **only** `go_diagnose_deploy_gate` @ t_final for promotion.
+- **Step 3 (multitask backward)**: **Fail vs step-2 on mu6h** (§173) — `mu6h_FULL_step3`: teacher **0.459**, corrector flat **~0.467**; train **`L_tot` ~55** (Kendall dominates). Older **K2** OomSafe run: val **5.58→4.22**. Do **not** promote step-3 for deployable mu until val **<0.45** on same init/recipe.
 - **Overnight / production**: Run only after fast probes pass with `VAL_TIME_STRIDE=10`; confirm once with `stride=1`.
 
-**We are roughly at: μ formulation validated on patient007** (MU_LOG / MU_SI / DATA_KINE isolates + TBPTT=6 all reach **~0.40–0.49** val logMAE, and latest spatial-decay run reached **0.3016**) **with subset caveats** (wall can reach ~**1.47** in geometry-isolate mode but is not robust; high-μ tail still trades off against wall in several checkpoints, bulk **r** weak/inconsistent). Next: finish **J2**, confirm **J3** (laptop B), then step-2 joint without isolate; not at corona / step 3.
+**We are roughly at: teacher-only deploy** (mu6h §173: pred-kine step-2 teacher **~0.444–0.449** val all; corrector/pseudo **deferred**). **Clot track** still **Lane A** teacher dump (**F1 0.750**). Next: new-vessel extrapolation via `visualize_pipeline --teacher-only --synthetic`; optional OOM-safe overnight re-run to archive **0.444** teacher ckpt; **not** step-3 / corona for deploy.
 
 ---
 
@@ -1431,6 +1458,138 @@ Report per run: `outputs/reports/training/biochem/<run_id>/run.jsonl` (`meta` / 
 - **Multi-anchor:** **mean 0.399** **min 0.163** (p003) p007 **0.488** p001 **0.525** p006 **0.540** — **min F1 gate FAIL**; **`check_gnode12_lane_b_gate.py` FAIL** (p007 **< Lane A 0.750**).
 - **Lesson:** 11-finish **corrector** dump + same clot recipe **does not beat** teacher-unlock Lane A on spatial clot metrics; corrector **pred-flow** (~0.86 `u_rms`) + low time-averaged **`gt+=0.438`** caps recoverable F1. **Promote Lane A** for pred-kine clot track; corrector value is Phase II synthetics, not this dump.
 
+### 173. **Mu6h comprehensive sweep** — pred kine + teacher/corrector/synth (`2026-06-04`)
+
+- **Launcher:** `go_mu_complexity_6h.ps1` (~393 min planned); manifest `outputs/biochem/sweep_mu_complexity_6h/manifest.jsonl`; summarizer `summarize_mu_complexity_6h.py`.
+- **Init:** `gnode12_lane_a_promoted/biochem_teacher_best_high_mu.pth` (delta-μ, pred kine, `mu_ratio_max=20`); stack = GINO-DEQ + GNODE Phase3, LoRA, pseudo bank **9/9**.
+- **Legs (ranked by val all logMAE):**
+
+| Leg | Tier | Teacher best | Corrector best | Wall | High-μ | Pseudo_w | Status |
+|-----|------|--------------|----------------|------|--------|----------|--------|
+| **FULL_overnight** | 2-overnight-full | **0.4442** ep10 | 0.4471 ep39 (plateau) | 1.673 | 1.128 | 0.445 | **FAIL** OOM corr ep40 |
+| FULL_step2p5 | 2.5-full | **0.4451** ep11 | 0.4453 ep14 | 1.696 | 1.125 | 0.444 | Complete |
+| **FULL_step2** | 2-full | 0.4489 ep9 | **0.4459** ep17 | 1.698 | **1.096** | 0.443 | Complete; saved global `biochem_best_high_mu` ep03 |
+| FULL_step3 | 3-full | 0.4593 ep9 | 0.4668 ep13 | 1.684 | 1.161 | 0.352 | Complete; **regressed** vs step-2 |
+| smoke | 0-smoke-full | 0.4952 ep1 | 0.4881 ep1 | 1.695 | 1.207 | 0.301 | Plumbing OK (2+2 ep) |
+
+- **Overnight preset:** `BIOCHEM_PRESET=overnight_step2` — TBPTT cap **14**, `W_MuSI=8` / `W_MuLog=2`, `L_PhysTemp` in backward; teacher **14ep** best **0.4442**; corrector reached ep39 (**0.4471**) then **CUDA OOM** in `_solve_kinematics_macro` / Anderson stack @ **`mu_ratio=22.2x`**, LoRA unlock ep36, 4GB GPU.
+- **Step-2 vs 2.5:** `step2p5` adds `L_PhysTemp` + `BIOCHEM_PRESET=step2p5` — **no mu gain** vs plain step-2 (both **~0.445**).
+- **Step-3:** `LOSS_DATA_ONLY=0`, train `L_tot~55` ep0; val mu stuck **~0.467** corrector; confirms trainer warning that step-3 Kendall multitask **regresses** vs MU_LOG step-2 (**~0.46 vs ~0.45**).
+- **Species:** FI logMAE **~0.001–0.004** on full legs (excellent); Mat similar.
+- **Mu quality:** Pearson **r ~-0.02 to -0.04** throughout — scale fit without spatial pattern; wall logMAE **~1.67–1.70** unchanged vs Track 2 (**§172**).
+- **Global bests:** none of these legs beat `gnode12_mu_unlock` teacher high-μ (**~0.867**); best sweep high-μ **1.0913** (`FULL_step2` corrector ep03).
+- **Finish gate:** `check_gnode11_finish_gate.py` **PASS** on completed legs (step-3 logs env WARN for `COMPLEXITY_STEP=3` but still PASS plumbing).
+- **Lesson:** For deployable **pred-kine + pseudo** recipe, stay on **step-2 data-only**; corrector is optional **~0.003** all-truth gain; **do not** use step-3 for mu on 4GB without major loss retune. Overnight needs **memory** fixes before ep40+.
+- **Next:** `go_mu_complexity_6h.ps1 -Legs FULL_overnight` with TBPTT **5–8** and/or delayed LoRA; viz `sweep_mu_complexity_6h/FULL_step2/biochem_best_high_mu.pth`; clot still **Lane A** path (**§170**).
+
+### 174. **A/B/C mask-only mu rollout** — `go_mlp_abc_compare_1h.ps1` (2026-06-05)
+
+- **Launcher:** `go_mlp_abc_compare_1h.ps1`; JSON `outputs/biochem/mlp_clot_inject_probe/abc_compare_1h.json`.
+- **Config:** pred kine (`GT_KINE_VEL=0`); teacher `clot_baseline/teacher_best_high_mu.pth`; clot MLP `clot_phi_best.pth`; anchors **p003/p007/p006**; `time_stride=5`; t_final eval; Leg B **`MLP_MU_MAP` + `gt_clot` + `cap_low_shear`**; Leg C **`MU_NEIGHBOR_WALL_ONLY` + same mask/bulk** (GNODE delta head overlay only on mask).
+- **Means (3 anchors):**
+
+| Leg | mu_all | high_mu | clot_gate | rel_L2 uvp |
+|-----|--------|---------|-----------|------------|
+| **A** baseline (full-domain delta head) | **1.405** | **2.660** | **2.628** | **0.867** |
+| **B** MLP mu map v2 | **0.824** | 3.965 | 3.609 | 0.833 |
+| **C** GNODE mask-only | **0.820** | 3.925 | 3.818 | 1.009 |
+
+- **Delta vs A:** B/C improve **all-mesh** logMAE by **~0.58** (cap_low_shear bulk fix); **high-μ and clot-gate logMAE worsen by ~+1.3–1.4** (sparse clot nodes dominate error when bulk is correct).
+- **Per-anchor:** **p007** drives failure — A high **3.59**, B **4.98**, C **4.97**; GT mean high-μ **1.08**, rollout pred high **~0.006** (severe under-prediction). **p006** easiest (GT high mean **0.073**). Leg B **MLP region mean ~0.09** on p003/p007 but committed rollout channel still **~0.006–0.008** on high-μ nodes — **clot-map vs rollout μ mismatch** persists.
+- **B vs C:** **Statistical tie** on μ metrics; C slightly better all/clot_gate; B better **uvp** on p007 (**0.64** vs **1.03**). Mask-only GNODE head does not beat MLP overlay on this frozen ckpt stack.
+- **Runtime:** **~4.5h** GPU wall (each leg ~90 min for 3 anchors); script label **~1h** is optimistic — DEQ+rollout dominates.
+- **Lesson:** Mask-only + capped Carreau **fixes bulk purple plateau** (K8/K9 class) but **does not restore COMSOL wall clots** without retraining overlay on **pred [u,v]** closed loop. Prefer **clot_gate** / high-μ subset metrics over all-mesh logMAE when judging B/C.
+- **Next:** `go_mlp_mu_map_v2_coupled_train.ps1` (short finetune); viz dynamic μ at t_final with pred flow; full scorecard `go_mlp_abc_scorecard.ps1` (no `-Fast`).
+
+### 175. **A/B/C clot-shape scorecard** — `go_mlp_abc_scorecard.ps1 -Fast` (2026-06-02)
+
+- **Launcher:** `go_mlp_abc_scorecard.ps1 -Fast`; JSON `outputs/biochem/mlp_clot_inject_probe/abc_scorecard_fast.json`.
+- **North-star:** `clot_shape` only (location-weighted F1 on binary clots, `mu_eff >= 0.055` Pa*s, rollout ch3); `flow_score` + `clot_recall` listed separately (not composited).
+- **Config:** same ckpt stack as **§174**; `--fast` = **3 keyframes** (0, mid, t_final), DEQ iters **<=4**, RK4 substeps **1** — **smoke only**, not comparable to full stride-5 rollout.
+- **Means (3 anchors, t_final eval row):**
+
+| Leg | **clot_shape** | recall | flow | rel_L2 | mu_all | notes |
+|-----|----------------|--------|------|--------|--------|-------|
+| **B** MLP mu map v2 | **0.018** | 0.009 | **0.389** | **0.733** | 0.811 | **best north-star**; zero distant FP; misses almost all GT clots |
+| **A** baseline | 0.006 | **0.413** | 0.286 | 0.857 | 1.459 | high recall but **pred clot frac 42–74%** (GT **<1%**) — distant-FP catastrophe |
+| **C** GNODE mask-only | 0.004 | 0.002 | 0.326 | 0.808 | **0.810** | tie B on bulk; **clot_shape_final=0** all anchors |
+
+- **Per-anchor:** B wins **p003** (`clot_shape=0.043`, 1 TP / 0 FP); A/B/C all **~0.011** on **p007** (1 TP); **p006** B/C **0** shape. **clot_shape_mean** over 3 rollout steps **~0** for B/C — clots not sustained in closed loop.
+- **flow_ok:** **0/3** anchors all legs (`clot_frac_ok` fails: under- or over-predict clot area).
+- **Winner:** **Leg B** on `clot_shape` — but **no leg is acceptable** (best mean **0.018**); B wins by **not** painting the mesh red (precision) while A “wins” recall by flooding false clots.
+- **Lesson:** New scorecard **aligns qual/quant** vs logMAE: A looked better on high-μ logMAE in **§174** but **clot_shape** correctly ranks it worst spatially; bulk logMAE still favors B/C.
+- **Next:** Re-run **without `-Fast`** for deployable ranking; target **clot_shape >0.3** + **recall >0.4** before promoting; `go_mlp_mu_map_v2_coupled_train.ps1`.
+
+### 176. **Deploy Leg B baseline** — neighbor physics mask (`2026-06-06`)
+
+- **Promoted:** `outputs/biochem/clot_baseline/manifest.json` **lane_b_deploy**; recipe `data/reference/clot_baseline_lane_b_deploy.json`; env module `src/inference/deploy_mu_map_env.py`.
+- **Forward (no GT in mu commit):** `BIOCHEM_MLP_MU_MAP_MASK=neighbor` — wall nucleation (`mask_wall` + `phi>=0.5`) + **pred mu** seeds (`prev mu_eff >= 0.055`) + **1-hop** mesh growth; pred `[u,v]` + species into clot-phi; closed-loop `prev_mu_eff` feedback each macro step.
+- **Sweep (`sweep_b_deploy_configs.py`):** pred **-dgamma/dx** in **commit** mask helps **p006** but **collapses p007** (`clot_shape` **0.011** vs **0.238** legacy); **canonical commit mask keeps dgamma OFF** (dgamma stays in clot-phi **features** only).
+- **Smoke scorecard** (`go_mlp_b_deploy_probe.ps1 -Fast -Leg B_deploy`): JSON `b_deploy_baseline_fast.json` — mean **`clot_shape=0.108`** recall **0.575** flow **0.291**; **p007 `0.235` flow_ok**; **p003 `0.076`**; **p006 `0.013`**; distant FP **~630**/anchor (vs oracle B **0**).
+- **vs oracle B** (same smoke): deploy **~0.11** vs gt_clot **~0.48** mean `clot_shape` — **deployable plumbing PASS**, spatial precision gap remains.
+- **Launchers:** `go_mlp_b_deploy_probe.ps1`, `go_promote_deploy_baseline.ps1`, `go_mlp_abc_viz.ps1 -Leg B_deploy`; inference `ClotBaselinePredictor.from_manifest()` attaches MLP injector + deploy env.
+- **Next:** `go_mlp_mu_map_v2_coupled_train.ps1` with **`MASK=neighbor`**; full stride scorecard; optional `-dgamma` commit ablation per vessel class.
+
+### 177. **Deploy coupled Step 2 smoke** — clot-phi finetune on pred-kine (`mlp_deploy_coupled_smoke`, 2026-06-02)
+
+- **Launcher:** `go_mlp_deploy_coupled_finetune.ps1 -Smoke -Fresh`; trainer `train_mlp_deploy_coupled.py`; ckpt `outputs/biochem/mlp_deploy_coupled_smoke/clot_phi_best.pth`.
+- **Config:** Lane A teacher + Lane A clot init; **B_wired** (`mlp_band`); **2 ep**, **2 train** anchors (p001/p006), val **p007**; **FAST** = 3 rollout frames/anchor; **mu_only** (phi head frozen); losses: log-μ + hinge + commit BCE on deploy vision band.
+- **Step 1 baseline (pre-train):** `go_diagnose_deploy_gate.ps1 -Leg B_wired -Fast` p007 @ t≈7950s — vision **106** nodes; **φ 100%** in band; **`mu_mlp` 0.9%** ≥0.055; commit **0.9%**; blocker **`mu_mlp`** (`mu_mlp_p90≈0.037`).
+- **Train log (2 ep, ~28 min):**
+
+| ep | val F1 | val logMAE | val `mu_ok` band | val `both` | score | wall time |
+|----|--------|------------|------------------|------------|-------|-----------|
+| 1 | 0.855 | 0.277 | **0.051** | 0.051 | **-1.0** | 815s |
+| 2 | 0.855 | 0.261 | **0.051** | 0.051 | **-1.0** | 1012s |
+
+- **Train (p001/p006):** `frac_mu_ok_band` **0.261** (26%); `commit_bce` **stuck ~6.91** (commit surrogate not moving); `pred_pos_frac=1.0` in band (φ saturates high).
+- **Post-train diagnose (same ckpt, closed loop):** p007 **`mu_mlp` 0.0%** in allowed (vs **0.9%** baseline); **`mu_mlp_p90=0.030`** Pa·s; **42** GT clots in band @ t_final, **0%** commit; blocker **`mu_mlp_low`**. **No deploy improvement** — slightly worse than init on closed-loop gate.
+- **Lesson:** Offline val **`mu_ok=5%`** (MLP forward on **cached** pred `[u,v]` slices) **does not transfer** to closed-loop **`apply_mu_map`** on p007; high val **F1=0.855** is **misleading** (`pred_pos_frac=1.0`, recall=1.0). Checkpoint score **-1** correctly rejects predict-all. **2 ep / 3 frames / 2 anchors** insufficient; need **closed-loop metric** for promotion (diagnose gate or `clot_shape`), not offline band F1.
+- **Next:** (1) rank ckpts by **`go_diagnose_deploy_gate`** `frac_mu_mlp_ge_thr_in_allowed` @ t_final, not trainer val; (2) **align trainer val** with `predict_mlp_fields_at_rollout_frame` + frozen allowed mask (§178); (3) longer run only after diagnose beats baseline; (4) raise μ on **allowed** nodes (hinge/commit target frozen t=0 band).
+
+### 178. **Deploy coupled Step 2 v2 smoke + diagnose** — closed loop still blocked (`mlp_deploy_coupled_v2_smoke`, 2026-06-02)
+
+- **Launcher:** `go_mlp_deploy_coupled_finetune.ps1 -Smoke -Fresh` (v2: soft `mlp_band`, closed-loop rollouts, deploy score); ckpt `outputs/biochem/mlp_deploy_coupled_v2_smoke/clot_phi_best.pth`.
+- **Train (2 ep, ~22 min):** val offline `both=mu_ok=0.051`, `rollout_ok=0.038`, `deploy_score=0.427` (flat ep1–2); train anchors **`frac_mu_ok=0`**; `commit_bce` **3.5–6.5**; `dlog_fc` bias init **0.046**; hinge **~0** (supervise nodes already above thr in trainer path only).
+- **Diagnose (`go_diagnose_deploy_gate.ps1 -Leg B_wired -Fast` p007):**
+
+| frame | t (s) | n_allowed | GT clot in allowed | φ≥0.5 | μ_mlp≥0.055 | commit | μ_mlp p90 |
+|-------|-------|-----------|-------------------|-------|-------------|--------|-----------|
+| 0 | 0 | 83 | 0 | **100%** | **0%** | 0% (no_commit_t0) | 0.032 |
+| 1 | 3975 | 83 | 6 | **100%** | **0%** | 0% | 0.032 |
+| 2 | 7950 | 83 | **42** | **100%** | **0%** | 0% | **0.032** |
+
+- **t_final summary:** blocker **`mu_mlp`** (`mu_mlp_low`); **`frac_rollout_mu_ge_thr_in_allowed=0%`**; supervision @ t **231** nodes vs **83** frozen allowed (Δ **−148**).
+- **vs Step 1 baseline (init clot ckpt):** baseline **`mu_mlp` 0.9%** in band, **`mu_mlp_p90≈0.037`**; v2 smoke **0%**, **`p90≈0.032`** — **regressed** on true deploy metric.
+- **Lesson:** Trainer val **5.1%** uses direct `model.forward` on `vision & region`; diagnose uses **`predict_mlp_fields_at_rollout_frame`** + **frozen t=0 allowed** (83 nodes). Metrics **do not transfer** — promotion must use diagnose; fix trainer val to match diagnose path before full 12 ep.
+- **Next:** wire val/promote to diagnose-equivalent forward; supervise hinge/commit on **allowed** mask only; do not run full coupled finetune until diagnose `frac_mu_mlp` **> 0.9%** baseline on smoke.
+
+### 179. **Deploy coupled Step 2 v3 dev + diagnose** — aligned metrics, t_final still blocked (`mlp_deploy_coupled_v3_dev`, 2026-06-06)
+
+- **Launcher:** `go_mlp_deploy_coupled_finetune.ps1 -Dev -Fresh` (v3: `forward_mlp_fields_at_rollout_frame`, frozen allowed, `allowed_hinge=12`, inline `gate_final`); ckpt `outputs/biochem/mlp_deploy_coupled_v3_dev/clot_phi_best.pth`.
+- **Train (4 ep, ~55 min):** p007 final-frame only; inline **`gate_mu=both=4%`** flat ep1–4; **`gate_mu_p90≈0.028`**; `gate_n_gt_clot=2` (inline gate undercounts vs full diagnose **42** — promotion bug).
+- **Diagnose (`go_diagnose_deploy_gate.ps1 -Leg B_wired -Fast` p007, same ckpt):**
+
+| frame | t (s) | allow | φ≥0.5 | μ_mlp≥0.055 | commit | gt | μ_mlp p90 |
+|-------|-------|-------|-------|-------------|--------|-----|-----------|
+| 0 | 0 | 83 | 100% | 0% | 0% | 0 | 0.024 |
+| 1 | 3975 | 83 | 100% | **1.2%** | 1.2% | 6 | 0.024 |
+| 2 | **7950** | 86 | 100% | **0%** | **0%** | **42** | **0.024** |
+
+- **t_final:** blocker **`mu_mlp`**; **`mu_mlp_p90=0.024`** (vs init baseline **0.037**, v2 **0.032**) — **regressed**; **42** GT clots, **0%** commit.
+- **Lesson:** v3 fixes **metric path** (inline gate ≈ mid-frame) but **training on fast final slice** + weak μ lift **does not help t_final**; inline `gate_n_gt_clot=2` vs diagnose **42** means trainer promotion gate still wrong frame/mask — fix `_diagnose_gate_final` to use true t_final label + full allowed before scaling epochs.
+- **Next:** (1) fix inline gate to match diagnose t_final; (2) train with **full stride t_final** (not fast 3-frame proxy); (3) stronger allowed hinge / higher lr on `dlog_fc`; (4) multi-anchor smoke before 12 ep.
+
+### 172. GNODE **11 finish Track 2** — Lane A promoted init (`20260604T190101Z`, Phase II.0)
+
+- **Launcher:** `go_gnode11_finish.ps1` `-InitCkpt gnode12_lane_a_promoted/biochem_teacher_best_high_mu.pth` `-RunNote gnode11_finish_lane12a` **8+12ep**; same step-2 bridge + pseudo env as **§169** (`mu_ratio_max=1`, `LOSS_DATA_ONLY=1`, pred kine).
+- **Gate:** `check_gnode11_finish_gate.py` **PASS** — `pseudo_w=0.442`, coverage **1.0**, **8** teacher + **12** corrector val rows; species FI last **~0.003**.
+- **Teacher (8ep):** val `mu_log_mae` **0.624 -> 0.454** (best ep7); `mu_score` **-0.454**; `L_kine` **~2.0** (pred-kine leash); `L_bio(avg)` **~0.007** ep7; species FI **~0.003**.
+- **Corrector (12ep):** val mu **0.454-0.454** (best **0.453** @ corrector ep8); wall **~1.70** / high-mu **~1.11** (weak); `r` **~-0.027**; train `L_tot` volatile on pseudo mix (**~0.31-1.63** console); ep5+ pseudo **~70%** batches (`TF~0.45` ep5-7).
+- **vs §169 (K5 init):** anchor mu **1.444 flat -> ~0.453** — **Track 2 metric PASS**; pseudo **0.442 vs 0.159** (teacher already above `PSEUDO_MIN=-2.0` at start).
+- **Caveats:** still **step-2** / `mu_ratio_max=1` (not Lane A unlock env); wall/high-mu subsets poor; **do not** expect corrector-only ckpt to beat Lane A clot (**§171**).
+- **Next:** archive copy `gnode11_finish_lane12a/`; optional longer corrector; clot still via **Lane A** dump; step-2.5 / step-3 only after wall/high-mu review.
+
 ### 166. GNODE **11a** Phase 3 crash — PyG `DataBatch` `x_schema` list (`2026-06-04`)
 
 - **Symptom:** `ValueError: Cannot resolve biochem encoder features (x_schema="['biochem_x_v1_15ch']", x.shape=(N, 15), x_biochem missing)` on first synthetic batch in Phase 3; teacher stage unaffected.
@@ -2214,14 +2373,96 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-06-03 | **GNODE 9.9 promoted** cached dump (`gnode99_promoted`, 35ep) | n/a | — | — | p007 F1 **0.630** min **0.340** mean **0.513**; **9.9 PASS**; §159 |
 | 2026-06-03 | **9.9 preflight** cached dump (`gnode99_preflight_check`, 1ep) | n/a | — | — | ep0 p007 F1 **0.516** **`gt+=0.578`**; cache OK; not full-train gate; §160 |
 | 2026-06-03 | **K0 gate recheck** `kinematics_best.pth` | n/a | — | — | p007 rel_L2 **0.191 PASS**; syn **0.246 FAIL**; promote script blocked; §160 |
-| 2026-06-04 | **GNODE 12 Lane B** (`go_gnode12_lane_b`, corrector dump+clot) | n/a | n/a | n/a | p007 F1 **0.488** min **0.163** mean **0.399**; `gt+=0.438`; vs Lane A **FAIL**; §171 |
+| 2026-06-04 | **mu6h** `FULL_overnight` (`20260604T220222Z`, overnight_step2) | **0.444** (teacher ep10) | **1.673** wall | **~-0.036** | corrector **40ep** then **OOM** ep40; best corr **0.447** ep39; pseudo **0.445**; §173 |
+| 2026-06-04 | **mu6h** `FULL_step2p5` (`20260604T204228Z`, +L_PhysTemp) | **0.445** (teacher ep11) | **1.696** wall | **~-0.039** | flat vs step-2; pseudo **0.444**; §173 |
+| 2026-06-04 | **mu6h** `FULL_step2` (`20260604T195751Z`, 12+18ep) | **0.446** (corr ep17) | **1.698** wall | **~-0.019** | best high-mu **1.096** ep03; pseudo **0.443**; beats step3; §173 |
+| 2026-06-04 | **mu6h** `FULL_step3` (`20260604T212559Z`, multitask) | **0.459** (teacher ep9) | **1.684** wall | **~-0.013** | corrector **~0.467**; `L_tot~55`; **regressed**; §173 |
+| 2026-06-04 | **mu6h** smoke (`20260604T194843Z`, 2+2ep) | **0.488** (corr ep1) | **1.695** wall | **~-0.021** | plumbing; pseudo **0.301**; §173 |
+| 2026-06-02 | **Deploy coupled v2 smoke + diagnose** (`mlp_deploy_coupled_v2_smoke`, 2ep FAST) | trainer val `mu_ok` **0.051** | n/a | n/a | diagnose p007 **`mu_mlp` 0%** (`p90=0.032`, baseline **0.9%**/0.037); **FAIL**; §178 |
+| 2026-06-02 | **Deploy coupled smoke** (`mlp_deploy_coupled_smoke`, 2ep FAST, mu_only, p001/p006 train) | offline val `mu_ok` **0.051** | n/a | n/a | diagnose p007 **`mu_mlp` 0%** in band (baseline **0.9%**); val F1 **0.855** misleading (`pred+=1.0`); score **-1**; **FAIL**; §177 |
+| 2026-06-06 | **Deploy coupled v3 dev + diagnose** (`mlp_deploy_coupled_v3_dev`, 4ep p007 final FAST) | inline gate **4%** | n/a | n/a | diagnose t_final **`mu_mlp` 0%** p90 **0.024** (baseline **0.9%**/0.037); mid **1.2%**; **FAIL**; §179 |
 | 2026-06-04 | **GNODE 12 Lane A** (`go_gnode12_lane_a`, mu unlock+dump+clot) | unlock **0.474** (6ep) | n/a (clot) | n/a | p007 F1 **0.750** min **0.594** mean **0.687**; dump `gt+=0.808`; beats kine loop; gate **PASS**; §170 |
+| 2026-06-04 | **GNODE 11 finish Track 2** (`20260604T190101Z`, Lane A init, II.0) | **0.453** (corr ep8) | **1.698** wall | **~-0.027** | init promoted; teacher **0.624->0.454**; `pseudo_w=0.442`; vs K5 **§169** mu win; gate **PASS**; §172 |
 | 2026-06-04 | **GNODE 11 finish** (`20260604T110525Z`, K5, II.0) | **1.444** flat (best ep10) | **1.956** wall | **~-0.034** | **8+12ep**; `pseudo_w=0.159` **9/9**; corrector `L_tot` **~2.9->0.29**; finish gate **PASS**; §169 |
 | 2026-06-04 | **GNODE 11b** step-3 smoke (`20260604T105007Z`, K5, multitask) | **1.446** flat | **1.956** wall | **~-0.034** | `LOSS_DATA_ONLY=0`; teacher `L_tot~57`; corrector **2ep** (CLI quirk); gate **PASS**; §167 |
 | 2026-06-04 | **GNODE 11a** corrector smoke (`20260604T102253Z`, K5 init, step-2) | **1.446** flat | **1.956** wall | **~-0.034** | Teacher+corrector **4ep**; species FI **~0.002**; pseudo **w=0**; plumbing gate **PASS**; §165-166 |
 | 2026-06-03 | **GNODE 10 smoke** predicted kine (`gnode10_predicted_kine_smoke`, 3ep) | **1.446** flat | **1.96** wall | **-0.034** r | `flow_trivial=0` `t0|u|=0.85`; `L_bio` **6.7->1.0**; `L_kine` flat; **PARTIAL**; §161 |
 | 2026-06-03 | **ladder 6a** rollout GT+carry (`rollout_gt_rung6a`, 60ep `-Fresh`) | n/a | — | — | p007 val F1 **0.490** `pred+=0.266`; mean **0.278** min **0.037**; ckpt ep50; §155 |
 | 2026-06-03 | **ladder 6b** rollout kine (`rollout_kine_rung6b`, 60ep, `KineTf=0.3`, `kinematics_best.pth`) | n/a | — | — | p007 F1 **0.697** `rec=0.799` `pred+=0.298`; mean **0.521**; beats 6a weak anchors; §155 |
+| 2026-06-05 | **abc_compare_1h** A/B/C mask-only (`go_mlp_abc_compare_1h.ps1`, stride 5, p003/007/006, pred kine) | A **1.405** / B **0.824** / C **0.820** | n/a | n/a | high_mu A **2.66** B **3.96** C **3.92**; clot_gate A **2.63** B **3.61** C **3.82**; bulk fix OK, clots under-predict on p007; B~C tie; ~4.5h; §174 |
+| 2026-06-02 | **abc_scorecard_fast** A/B/C clot_shape (`go_mlp_abc_scorecard.ps1 -Fast`, 3 keyframes) | A **0.006** / **B 0.018** / C **0.004** clot_shape | n/a | n/a | recall A **0.41** B **0.01** C **0.002**; rel_L2 B **0.73** A **0.86**; **B wins** north-star; all **flow_warn**; smoke only; §175 |
+| 2026-06-06 | **forecast R0** label sanity (`go_clot_forecast_r0.ps1`, 3 anchors) | n/a | — | — | **PASS** 3/3; clot growth + dlog mu; `clot_forecast_ladder/r0_label_sanity.json` |
+| 2026-06-06 | **forecast R1A** one-step MLP (`r1_prong_a`, 40ep, mask=target) | n/a | — | — | p007 F1 **0.476** min **0.038** mean **0.282**; gate p007 OK / min fail; §180 |
+| 2026-06-06 | **forecast R1B** MLP+log(mu_t) (`r1_prong_b`, 40ep) | n/a | — | — | p007 F1 **0.573** rec **0.592** logMAE **0.130**; min **0.075** mean **0.366**; **backbone winner**; §180 |
+| 2026-06-06 | **forecast R1C** MPNN+log(mu_t) (`r1_prong_c`, 40ep) | n/a | — | — | p007 F1 **0.578** min **0.075** mean **0.365**; ~tie B; §180 |
+| 2026-06-06 | **forecast R1D** deploy_pred (`r1_prong_d`, 40ep, B init) | n/a | — | — | p007 F1 **0.584** logMAE **0.035** score **0.759**; mean **0.554** inflated (p001/p004 ~1.0); min **0.038**; §182 |
+| 2026-06-06 | **forecast R2** rung6a rollout GT (`rollout_gt_rung6a`, legacy recipe) | n/a | — | — | p007 band F1 **0.491** pred+ **0.270**; **not** R1D-aligned; viz neighbor band t=53; §183 |
+| 2026-06-06 | **forecast R2-simple** phi rollout (`r2_simple_phi_rollout`, 60ep cold) | n/a | — | — | p007 band F1 **0.201** shape **0.014** plateau ep19; no collapse; §184 |
+| 2026-06-06 | **forecast R2a** one-step phi in_dim=3 (`r2a_one_step_phi`, 40ep) | n/a | — | — | p007 band F1 **0.205** ep21 plateau; shape **0.014**; no mu_t; §184 |
+| 2026-06-06 | **forecast R2a+** one-step phi+log(mu_t) fixed mu (`r2a_plus`, 40ep) | n/a | — | — | p007 band F1 **~0.559** ep24+; shape **0.014**; **no ckpt** (scorer bug, fixed); §185 |
+
+---
+
+### 180. Forecast ladder R1 A/B/C — one-step GT flow (`2026-06-06`)
+
+- **R0 PASS:** 3/3 anchors show clot growth + |dlog mu| (`go_clot_forecast_r0.ps1`).
+- **R1A** (MLP, no mu_t, mask=target @ t_out): p007 val F1 **0.476** `pred+=0.230`; multi-anchor mean **0.282** min **0.038** (p006); p007 gate OK, min-anchor fail.
+- **R1B** (MLP + `log(mu_t)`, mask=target): best ep25 val F1 **0.573** `rec=0.592` logMAE **0.130** `pred+=0.372`; multi-anchor mean **0.366** min **0.075** (p006); **+0.097 p007 F1 vs A**; **backbone winner** (best mean score **0.534**, p001 **0.641**).
+- **R1C** (MPNN + log(mu_t)): best ep5 val F1 **0.578**; mean **0.365** min **0.075**; **~tie B** on p007 (+0.005) without mean gain — MPNN not worth complexity yet.
+- **Lesson:** `log(mu_t)` input is required for one-step forecast; oracle target-time mask hides deploy gap — **R1D** (`deploy_input` band @ t_in) is next before R2 rollout.
+- **Next:** `go_clot_forecast_r1.ps1 -Prong D -Fresh` (B init, deploy neighbor loss band); then `go_rung6a` with winning ckpt.
+
+### 181. Forecast R1D deploy_input degeneracy (`2026-06-06`)
+
+- **Symptom:** R1D `deploy_input` + `NEIGHBOR_REQUIRE_PHI=1` + GT phi/mu @ t_in -> val **F1=1.0**, **pred+=gt+=1.0**, checkpoint score **-1.0** (memorization gate).
+- **Cause:** Oracle GT phi @ t_in + require_phi strips the 1-hop growth frontier; loss band = already-clot nodes only; trivial perfect metrics.
+- **Fix:** **`deploy_pred`** mask = detached **model phi @ t_in** + mu(t_in) seeds; **`NEIGHBOR_REQUIRE_PHI=0`** so frontier nodes stay in band. Oracle `deploy_input` kept as ablation only.
+- **Next:** re-run `go_clot_forecast_r1.ps1 -Prong D -Fresh`; expect p007 F1 ~0.35-0.55 (not 1.0).
+
+### 182. Forecast R1D deploy_pred PASS — p007 tie B, logMAE win (`2026-06-06`)
+
+- **Config:** MLP + `log(mu_t)`, `deploy_pred` band (model phi @ t_in, mu seeds, `REQUIRE_PHI=0`), init R1B ckpt, 40ep.
+- **p007 (canonical val):** best ep16 val F1 **0.584** `rec=0.584` logMAE **0.035** `pred+=0.537` `gt+=0.538` score **0.759** — **+0.011 F1 vs R1B**, **~4x better logMAE** (0.130 -> 0.035); healthy pred/gt balance inside band.
+- **Plateau:** val F1 flat **~0.585** from ep3; deploy band stable after B init finetune.
+- **Multi-anchor:** mean F1 **0.554** **misleading** — p001 **0.997** / p004 **0.988** (band ~all-clot, score **-1**); p002/p003 ~B; p006 still **0.038** (min-anchor fail). Mean score **0.018** due to memorization gate on p001/p004.
+- **vs R1B p007:** F1 +0.011, recall -0.008, logMAE much better; **promote R1D ckpt for R2** (deploy-faithful band) over pure B.
+- **Graph strip for MLP forward:** **not worth it for accuracy** — per-node MLP + minimal local features; loss already masked; band-only forward gives identical band preds. Optional speed opt only. Revisit if MPNN/subgraph in R5.
+- **Next:** R2 multi-step carry (`go_rung6a_clot_phi_rollout_gt.ps1`) init `r1_prong_d/clot_phi_best.pth`; eval with deploy band + no GT clot seeds.
+
+### 183. Forecast R2 rung6a — legacy rollout, viz vs deploy gap (`2026-06-06`)
+
+- **Config:** legacy rung6a (`rollout=1`, `mask=neighbor`, `joint_bio=1`, `species_feat=1`, **no** R1D/forecast env, cold start).
+- **p007:** best ep45 band F1 **0.491** `rec=0.452` logMAE **0.479** `pred+=0.270` `gt+=0.345` score **0.600**; multi-anchor mean F1 **0.288** min **0.093**.
+- **Viz (t=53):** PNG looks excellent on **neighbor band** φ/μ — this is **not** deploy: oracle GT-seeded band, GT `[u,v]`, full-mesh **clot_shape** was not logged (now added to train/eval).
+- **vs R1D:** band F1 **0.491 < 0.584** — legacy R2 recipe regressed vs forecast R1D; do not promote until R2 uses R1D ckpt + `deploy_pred` + forecast carry.
+- **Metric policy:** rank spatial quality on **`clot_shape`** (full mesh, location-weighted); band `f1` alone can look good in oracle band while mesh-wide shape is weak.
+- **Next:** wire `go_rung6a` to R1D; re-run; read `shape=` in epoch lines and viz `[i] clot_shape=…`.
+
+### 184. Forecast R2 simplified stack — phi-only fixed mu, rollout vs one-step (`2026-06-06`)
+
+- **R2-simple** (`rollout=1`, `carry_phi=1`, `in_dim=4`, cold): train stable (no ep25 mu collapse); p007 band F1 plateau **~0.201** ep19; **`clot_shape=0.014` flat**; full-mesh over-clot risk on viz (`pred_frac~0.75`).
+- **R2α** (`one_step`, `in_dim=3`, no mu_t): same plateau **F1~0.205** ep21; shape **0.014** — removing rollout did not fix spatial metric.
+- **Lesson:** band F1 ~0.20 floor without **`log(mu@t_in)`**; mu regression / carry not the only blocker — **current-state mu feature** required for one-step deploy_pred.
+- **Next:** R2α+ with `CLOT_FORECAST_INPUT_MU=1`; gate on band F1 + `clot_shape` before phi-carry rollout.
+
+### 185. Forecast R2α+ PASS band / FAIL shape — phi-only near R1D F1 (`2026-06-06`)
+
+- **Config:** `one_step`, `deploy_pred`, `hybrid=0`, `FIXED_MU_FROM_PHI=1`, `mu_solid=0.10`, `log(mu@t_in)`, MLP `in_dim=4`, cold start, 40ep (`go_clot_forecast_r2a_plus.ps1`).
+- **p007 val:** ep2 F1 **0.538** -> plateau **~0.559** (ep24-39); `prec~0.558` `rec~0.564`; `pred+=gt+=~0.003` (micro deploy band); **`clot_shape=0.014` flat**; logMAE **~1.834** (diagnostic; no mu regression loss).
+- **vs R1D:** band F1 **0.559 vs 0.584** (~96% of hybrid one-step) **without** delta_log_mu head; **`clot_shape` still fails** north-star (same ~0.014 as rollout legs).
+- **Train/val gap:** train band F1 **~0.22** vs val **~0.56** (balanced train subsampling vs full p007 val).
+- **Artifact bug:** scorer returned **-1** all epochs (`pred+<0.02` gate on fixed_mu path) -> **no `clot_phi_best.pth` saved**; eval script failed. **Fixed:** tiny-`gt+` branch mirrors hybrid scorer (shape×0.65 + f1×0.35).
+- **Gate:** band F1 **PASS** (~0.56 > 0.35); **`clot_shape` FAIL** (< 0.10). **Do not** promote for spatial deploy until shape moves; **OK** to use as one-step phi teacher for R2β rollout init after re-run saves ckpt.
+- **Next:** re-run `go_clot_forecast_r2a_plus.ps1 -Fresh` (scorer fix); add shape-aware loss or audit `clot_shape` @ t_out vs band-only success; then R2β phi-carry rollout init from R2α+ ckpt.
+
+### 186. Autonomy 8h — Lane A deploy vs forecast ladder (`2026-06-07`)
+
+- **Launcher:** `go_autonomous_clot_8h.ps1` -> `autonomy_clot_8h.py`; report `outputs/biochem/autonomy_clot_8h/run_20260607_001853/autonomy_report.jsonl` (~42 min wall, not full 8h budget).
+- **Track 1 Lane A** (pred-kine dump `anchors_gnode12_predkine_uvp`, forecast one-step phi + fixed mu): **best `a04_target_long`** p007 **`clot_shape=0.034`** band F1 **0.707** `shape_pred~0.751`; deploy finetune legs (`a02`/`a05`) **~0.029-0.034 shape**, F1 **0.57-0.60** (deploy_pred); wide MLP leg failed fast.
+- **Track 2 forecast** (COMSOL GT flow, same head): best **`f04_deploy_bulk`** rank **0.207** shape **0.011** F1 **0.569**; all forecast legs **`shape_pred~0.747`** — no beat vs pre-sweep.
+- **Winner:** **Lane A `a04_target_long`** rank **0.270**; ckpt `.../lane_a/a04_target_long/clot_phi_best.pth`. **North-star still FAIL** (`clot_shape` << 0.10; ~75% mesh flagged clot).
+- **Lesson:** pred-kine dump + target curriculum improves **full-mesh shape ~2.5x** vs GT-flow forecast (~0.034 vs ~0.011); mesh_bulk / deploy finetune does not fix global over-clot; target mask still needed for best spatial score (not deploy_pred alone).
+- **Next:** finetune `a04_target_long` -> `deploy_pred` with stronger bulk; or hybrid R1D head on dump anchors; gate on `clot_shape` + deploy_pred F1.
 
 ---
 

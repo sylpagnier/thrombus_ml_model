@@ -29,7 +29,7 @@ from src.training.train_biochem_corrector import (
     _biochem_dataloader_kw,
     _compute_passive_species_on_loader,
 )
-from scripts.dump_teacher_species_to_anchors import _build_teacher
+from src.inference.biochem_teacher_loader import build_biochem_teacher, resolve_rollout_mu_ratio_max
 
 
 def _apply_align_eval_env(*, predicted_kine: bool = False) -> None:
@@ -93,7 +93,14 @@ def main() -> int:
     kernels = BiochemPhysicsKernels(bio_cfg, PhysicsKernels(phys_cfg=phys_cfg))
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    teacher = _build_teacher(ckpt, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device)
+    mu_ratio_max = resolve_rollout_mu_ratio_max(bio_cfg, cli_value=None)
+    teacher = build_biochem_teacher(
+        ckpt,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        mu_ratio_max=mu_ratio_max,
+    )
 
     files = _list_anchor_files()
     if not files:

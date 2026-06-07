@@ -11,7 +11,7 @@ import matplotlib.tri as mtri
 import numpy as np
 import torch
 
-from src.config import BiochemConfig, PhysicsConfig, VesselConfig
+from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
 from src.core_physics.clot_phi_rollout import ClotPhiRolloutState, clot_phi_rollout_enabled
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_model,
@@ -24,6 +24,7 @@ from src.core_physics.clot_phi_simple import (
     mu_eff_from_delta_log_si,
 )
 from src.evaluation.clot_phi_checkpoint_env import apply_clot_phi_config_from_checkpoint
+from src.evaluation.clot_shape_score import compute_clot_shape_metrics
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 from src.utils.paths import get_project_root
 
@@ -161,10 +162,23 @@ def main() -> None:
 
     idx = np.where(m)[0]
     gt_pos = int((phi_gt[m] > 0.05).sum())
+    y_sl = data.y[ti].to(device=device, dtype=torch.float32)
+    pred_state = y_sl.clone()
+    pred_state[:, STATE_CHANNEL_MU_EFF_ND] = phys_cfg.viscosity_si_to_nd(
+        torch.tensor(mu_pr, device=device, dtype=torch.float32)
+    )
+    shape_m = compute_clot_shape_metrics(
+        pred_state=pred_state,
+        gt_state=y_sl,
+        edge_index=data.edge_index.to(device),
+        phys_cfg=phys_cfg,
+    )
     print(
         f"[i]  t={ti} region_n={int(m.sum())} gt_pos_n={gt_pos} "
         f"mean_pred_phi={float(phi_pr[m].mean()):.3f} mean_gt_phi={float(phi_gt[m].mean()):.3f} "
-        f"frac_pred_phi>=0.5={float((phi_pr[m] >= 0.5).mean()):.3f}",
+        f"frac_pred_phi>=0.5={float((phi_pr[m] >= 0.5).mean()):.3f} | "
+        f"clot_shape={shape_m['clot_shape']:.3f} (full mesh mu>={shape_m['clot_mu_thresh_si']:.3f}) "
+        f"rec={shape_m['clot_recall']:.3f} pred_frac={shape_m['clot_pred_frac']:.3f} gt_frac={shape_m['clot_gt_frac']:.3f}",
         flush=True,
     )
 

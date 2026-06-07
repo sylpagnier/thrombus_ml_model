@@ -199,44 +199,41 @@ class MeshToGraph(MeshToGraphComplete):
     def _get_boundary_masks(self, mesh, num_nodes):
         return gmsh_line_boundary_masks(mesh, num_nodes, dict(self.vessel_cfg.TAGS))
 
-    def process_file(self, filename):
-        stem = Path(filename).stem
-        msh_path = self.raw_dir / filename
-        json_path = self.raw_dir / f"{stem}.json"
-        label_path = self.label_dir / f"{stem}.npz"
+    def process_mesh(
+        self,
+        mesh: meshio.Mesh,
+        meta: dict,
+        *,
+        stem: str = "demo",
+        label_npz: Path | None = None,
+    ) -> Data | None:
+        """Build a kinematics ``Data`` graph from an in-memory mesh + sidecar metadata.
 
-        if not msh_path.exists(): return
+        Edited-wall meshes must supply consistent ``centerline_pts`` / ``centerline_tangents``
+        in ``meta`` (produced by ``compute_geometry_from_walls``).
+        """
+        nodes = mesh.points[:, :2]
 
-        try:
-            mesh = meshio.read(msh_path)
-            nodes = mesh.points[:, :2]
-        except Exception as e:
-            print(f"Skipping {filename}: {e}")
-            return
-
-        # --- Element & Metadata Extraction ---
         all_tris = []
         if "triangle" in mesh.cells_dict:
             all_tris.append(mesh.cells_dict["triangle"])
         elif hasattr(mesh, "get_cells_type"):
             tc = mesh.get_cells_type("triangle")
-            if len(tc) > 0: all_tris.append(tc)
+            if len(tc) > 0:
+                all_tris.append(tc)
 
-        if not all_tris: return
+        if not all_tris:
+            return None
         tri_nodes = np.vstack(all_tris)
 
-        d_bar = None
-        meta = None
-        if json_path.exists():
-            with open(json_path, 'r') as f:
-                meta = json.load(f)
-                d_bar = meta.get('d_bar')
+        d_bar = meta.get("d_bar") if meta is not None else None
         if d_bar is None or (isinstance(d_bar, (int, float)) and float(d_bar) <= 0):
             d_bar = float(np.max(np.ptp(nodes, axis=0)) + 1e-6)
 
         if meta is None:
             raise ValueError(
-                f"{stem}: missing sidecar JSON {json_path}; flow priors and wall normal orientation require centerline metadata."
+                f"{stem}: missing sidecar metadata; flow priors and wall normal orientation "
+                "require centerline_pts / centerline_tangents."
             )
         assert_mesh_unit(meta, MESH_UNIT_M, stem=stem, builder="MeshToGraph")
         spine_pts_nd = meta.get("centerline_pts")
@@ -353,9 +350,9 @@ class MeshToGraph(MeshToGraphComplete):
         y_labels = torch.zeros((len(nodes), 5), dtype=torch.float32)
         is_anchor = False
 
-        if label_path.exists():
+        if label_npz is not None and label_npz.exists():
             try:
-                cfd = np.load(label_path)
+                cfd = np.load(label_npz)
                 sol_points = np.stack([cfd['x'].flatten(), cfd['y'].flatten()], axis=-1)
                 sol_tree = cKDTree(sol_points)
                 _, idx = sol_tree.query(nodes)
@@ -563,7 +560,42 @@ class MeshToGraph(MeshToGraphComplete):
         if idx is not None:
             data.config_id = int(idx)
 
-        torch.save(data, self.proc_dir / f"{stem}.pt")
+        return data
+
+    def process_file(self, filename):
+        stem = Path(filename).stem
+        msh_path = self.raw_dir / filename
+        json_path = self.raw_dir / f"{stem}.json"
+        label_path = self.label_dir / f"{stem}.npz"
+
+        if not msh_path.exists():
+            return
+
+        try:
+            mesh = meshio.read(msh_path)
+        except Exception as e:
+            print(f"Skipping {filename}: {e}")
+            return
+
+        meta = None
+        if json_path.exists():
+            with open(json_path, "r") as f:
+                meta = json.load(f)
+        if meta is None:
+            print(
+                f"Skipping {filename}: missing sidecar JSON {json_path}; "
+                "flow priors require centerline metadata."
+            )
+            return
+
+        data = self.process_mesh(
+            mesh,
+            meta,
+            stem=stem,
+            label_npz=label_path if label_path.exists() else None,
+        )
+        if data is not None:
+            torch.save(data, self.proc_dir / f"{stem}.pt")
 
     def run(self, max_files=None) -> None:
         """Convert ``.msh`` files under ``raw_dir`` to graph ``.pt`` (with labels if CFD ``.npz`` exists).

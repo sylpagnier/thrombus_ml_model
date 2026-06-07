@@ -23,7 +23,7 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from scripts.dump_teacher_species_to_anchors import _build_teacher
+from src.inference.biochem_teacher_loader import build_biochem_teacher, resolve_rollout_mu_ratio_max
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
 from src.utils.channel_schema import assert_graph_schema, infer_missing_schema
 from src.utils.nondim import to_t_nd
@@ -110,7 +110,14 @@ def main() -> int:
         return 2
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    teacher = _build_teacher(ckpt, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device)
+    mu_ratio_max = resolve_rollout_mu_ratio_max(bio_cfg, cli_value=None)
+    teacher = build_biochem_teacher(
+        ckpt,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        mu_ratio_max=mu_ratio_max,
+    )
 
     data = torch.load(anchor_path, weights_only=False).to(device)
     data = infer_missing_schema(data, phase_hint="biochem")

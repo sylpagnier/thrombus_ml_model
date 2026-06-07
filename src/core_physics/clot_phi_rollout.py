@@ -35,6 +35,87 @@ def clot_phi_carry_log_mu_enabled() -> bool:
     return _env_bool("CLOT_PHI_CARRY_LOG_MU", True)
 
 
+def clot_phi_carry_gt_warmup_epochs() -> int:
+    """Train-only: first N epochs feed log(GT mu @ ti) in carry slot (R1D-aligned)."""
+    raw = (os.environ.get("CLOT_PHI_CARRY_GT_WARMUP_EPOCHS") or "0").strip()
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def clot_phi_carry_gt_warmup_steps() -> int:
+    """Train-only: first K macro indices per graph use GT log mu in carry slot (-1 = disabled)."""
+    raw = (os.environ.get("CLOT_PHI_CARRY_GT_WARMUP_STEPS") or "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def clot_phi_carry_gt_fade_epochs() -> int:
+    """Train-only: linear blend GT -> pred carry over this many epochs after warmup_epochs."""
+    raw = (os.environ.get("CLOT_PHI_CARRY_GT_FADE_EPOCHS") or "0").strip()
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def carry_gt_warmup_active(time_index: int, train_epoch: int | None) -> bool:
+    """GT carry bridge applies only during training (eval always uses pred carry)."""
+    if train_epoch is None:
+        return False
+    warm_ep = clot_phi_carry_gt_warmup_epochs()
+    if warm_ep > 0 and train_epoch < warm_ep:
+        return True
+    warm_steps = clot_phi_carry_gt_warmup_steps()
+    if warm_steps < 0:
+        return True
+    if warm_steps > 0 and int(time_index) < warm_steps:
+        return True
+    return False
+
+
+def carry_gt_fade_alpha(train_epoch: int | None) -> float | None:
+    """Blend weight on pred carry during fade window; None if not fading."""
+    if train_epoch is None:
+        return None
+    warm_ep = clot_phi_carry_gt_warmup_epochs()
+    fade_ep = clot_phi_carry_gt_fade_epochs()
+    if fade_ep <= 0 or train_epoch < warm_ep:
+        return None
+    if train_epoch >= warm_ep + fade_ep:
+        return None
+    return float(train_epoch - warm_ep) / float(fade_ep)
+
+
+def resolve_carry_log_mu_feature(
+    *,
+    time_index: int,
+    train_epoch: int | None,
+    gt_mu_cap_si: torch.Tensor,
+    rollout_state: "ClotPhiRolloutState | None",
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Carry-column log mu: GT warm-up (R1D) -> optional fade -> pred carry."""
+    if not clot_phi_carry_log_mu_enabled():
+        return None
+    log_gt = torch.log(gt_mu_cap_si.reshape(-1).to(device=device, dtype=torch.float32).clamp(min=1e-8))
+    fade_a = carry_gt_fade_alpha(train_epoch)
+    if fade_a is not None:
+        if rollout_state is not None and rollout_state.log_mu_prev is not None:
+            log_pred = rollout_state.log_mu_prev.reshape(-1).to(device=device, dtype=log_gt.dtype)
+        else:
+            log_pred = log_gt
+        return (1.0 - fade_a) * log_gt + fade_a * log_pred
+    if carry_gt_warmup_active(time_index, train_epoch):
+        return log_gt
+    if rollout_state is not None and rollout_state.log_mu_prev is not None:
+        return rollout_state.log_mu_prev.reshape(-1).to(device=device)
+    return None
+
+
 def clot_phi_vel_source() -> VelSource:
     raw = (os.environ.get("CLOT_PHI_VEL_SOURCE") or "gt").strip().lower()
     if raw in ("kin", "kinematics", "deq", "gino"):
@@ -94,6 +175,7 @@ def append_rollout_carry_features(
     n_nodes: int,
     device: torch.device,
     dtype: torch.dtype,
+    log_mu_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Concatenate carry channels (zeros at t=0 when prev is None)."""
     cols: list[torch.Tensor] = [feats]
@@ -103,10 +185,11 @@ def append_rollout_carry_features(
         else:
             cols.append(phi_prev.reshape(-1, 1).to(device=device, dtype=dtype))
     if clot_phi_carry_log_mu_enabled():
-        if log_mu_prev is None:
+        log_col = log_mu_override if log_mu_override is not None else log_mu_prev
+        if log_col is None:
             cols.append(torch.zeros(n_nodes, 1, device=device, dtype=dtype))
         else:
-            cols.append(log_mu_prev.reshape(-1, 1).to(device=device, dtype=dtype))
+            cols.append(log_col.reshape(-1, 1).to(device=device, dtype=dtype))
     return torch.cat(cols, dim=1)
 
 
@@ -212,3 +295,11 @@ def resolve_uv_for_rollout_step(
     u = (1.0 - tf) * u_p + tf * u_gt
     v = (1.0 - tf) * v_p + tf * v_gt
     return u, v, u_gt, v_gt
+
+
+def snapshot_carry_gt_warmup_config() -> dict[str, int]:
+    return {
+        "carry_gt_warmup_epochs": clot_phi_carry_gt_warmup_epochs(),
+        "carry_gt_warmup_steps": clot_phi_carry_gt_warmup_steps(),
+        "carry_gt_fade_epochs": clot_phi_carry_gt_fade_epochs(),
+    }

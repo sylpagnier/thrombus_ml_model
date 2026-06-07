@@ -149,9 +149,10 @@ Primary modules (also routed through `python -m src.bin.main inspect <target> --
 | `python -m src.tools.inspect_biochem_data` | **Biochem** domain `.txt` + graphs: **default** = one anchor stem at a time (brief availability line + qualitative text for that stem), one figure (domain time-slider or single-time 2×2; graph-only stems use graph views). **Regenerate Random Anchor** / `r` like kinematics. `--summary` = full table only. `--no-regenerate` fixes the current stem (`biochem` / `biochem_anchors` / `biochem_mix`; legacy `biochem_patients` still accepted). |
 | `python -m src.tools.inspect_comsol_model` | Live **COMSOL** model browser (`mph`): `--list-models`, `--model`, `--all-models`. |
 | `python -m src.tools.inspect_graph_sample` | **Processed** `.pt` graphs (kinematics/stage A style): COMSOL overlap, WLS condition numbers, BC masks, widgets. |
+| `python -m src.tools.demo_kinematics_flow` | **Synthetic kinematics flow demo**: parametric sliders + optional **Edit walls** drag on top/bot station polylines (pinned inlet/outlet); Gmsh mesh -> graph -> GINO-DEQ u/v/p (``inspect flow`` via `bin.main`). |
 | `python -m src.tools.verify_deq_convergence` | Manual Picard vs Anderson residual curves (not pytest). |
 
-`bin.main` shortcuts: `data extract-biochem` → `extract_biochem_comsol`; `inspect anchor` and `inspect kinematics` → `inspect_kinematics_data`, `inspect biochem`, `inspect comsol`, `inspect graph`, `inspect deq`.
+`bin.main` shortcuts: `data extract-biochem` → `extract_biochem_comsol`; `inspect anchor` and `inspect kinematics` → `inspect_kinematics_data`, `inspect biochem`, `inspect comsol`, `inspect graph`, `inspect flow`, `inspect deq`.
 
 ## Conventions for edits
 

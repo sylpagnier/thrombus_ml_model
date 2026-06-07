@@ -55,6 +55,30 @@ def _masked_rel_l2(pred_uvp: torch.Tensor, true_uvp: torch.Tensor, mask: torch.T
     return torch.norm(p - y, p=2) / (den + 1e-8)
 
 
+def rel_l2_uvp(
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    *,
+    node_mask: torch.Tensor | None = None,
+) -> float:
+    """Kinematics val convention: ||pred[u,v,p]-true[u,v,p]||_2 / ||true[u,v,p]||_2.
+
+    When ``node_mask`` is set (e.g. ``anchor_node_mask(data)``), only supervised nodes
+    contribute -- same as ``quantify_performance`` for ``train_kinematics_predictor``.
+    """
+    if node_mask is not None:
+        rel = _masked_rel_l2(pred, true, node_mask)
+        return float(rel.item()) if rel is not None else float("nan")
+    p = pred[:, :3]
+    y = true[:, :3]
+    if p.numel() < 1:
+        return float("nan")
+    den = torch.norm(y, p=2)
+    if den <= 0:
+        return float("nan")
+    return float((torch.norm(p - y, p=2) / (den + 1e-8)).item())
+
+
 def _sdf_grad_proxy(data) -> Optional[torch.Tensor]:
     if not hasattr(data, "edge_index") or data.edge_index is None:
         return None

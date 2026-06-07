@@ -1,4 +1,5 @@
 import logging
+import sys
 import json
 import random
 import numpy as np
@@ -23,6 +24,25 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+_MAX_COMSOL_RECONNECTS_PER_BATCH = 20
+_CONSECUTIVE_FAST_FAIL_THRESHOLD = 3  # Errno 22 bursts -> reconnect immediately
+
+
+def _safe_log(level: str, msg: str, *args, **kwargs) -> None:
+    """Log without aborting the anchor batch if the console pipe is broken (Windows/PyCharm)."""
+    try:
+        getattr(logger, level)(msg, *args, **kwargs)
+    except OSError:
+        pass
+
+
+def _tqdm_or_plain(iterable, *, desc: str):
+    try:
+        sys.stdout.flush()
+        return tqdm(iterable, desc=desc)
+    except OSError:
+        return iterable
 
 
 def list_anchor_candidate_json_paths(
@@ -192,8 +212,56 @@ class AnchorGenerator:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.client:
-            logger.info("Disconnecting from COMSOL...")
-            self.client.clear()
+            _safe_log("info", "Disconnecting from COMSOL...")
+            try:
+                self.client.clear()
+            except Exception as exc:
+                _safe_log("warning", "mph client.clear() failed on exit: %s", exc)
+        return False
+
+    def _clear_all_solution_data(self) -> None:
+        if not self.model:
+            return
+        try:
+            for tag in self.model.java.sol().tags():
+                self.model.java.sol(tag).clearSolutionData()
+        except Exception as exc:
+            _safe_log("warning", "clearSolutionData failed: %s", exc)
+
+    def _ensure_mesh_handles(self) -> Tuple[Any, str]:
+        mesh_j = self.model.java.component("comp1").mesh("mesh1")
+        import_tag = _get_import_feature_tag(mesh_j)
+        return mesh_j, import_tag
+
+    def _reconnect_comsol_session(self, reason: str) -> Tuple[Any, str]:
+        """Drop broken MPh/Java state and reload the template."""
+        _safe_log("warning", "COMSOL session recovery: %s", reason)
+        try:
+            if self.client:
+                self.client.clear()
+        except Exception:
+            pass
+        self.client = mph.start(cores=1)
+        self.model = self.client.load(str(self.template_path))
+        self._set_global_physics_parameters()
+        return self._ensure_mesh_handles()
+
+    @staticmethod
+    def _is_comsol_solver_failure(exc: BaseException) -> bool:
+        text = repr(exc)
+        needles = (
+            "FlException",
+            "Failed to find a solution",
+            "not converged",
+            "Maximum number of Newton",
+        )
+        return any(n in text for n in needles)
+
+    @staticmethod
+    def _is_likely_session_broken(exc: BaseException) -> bool:
+        if isinstance(exc, OSError):
+            return True
+        return AnchorGenerator._is_comsol_solver_failure(exc)
 
     def _set_global_physics_parameters(self):
         logger.info(f"Setting global physics in {self.phys_cfg.viscosity_model} mode.")
@@ -280,9 +348,8 @@ class AnchorGenerator:
             return False
 
         try:
-            logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
-            for tag in self.model.java.sol().tags():
-                self.model.java.sol(tag).clearSolutionData()
+            _safe_log("debug", "[%s] Purging old solution data from COMSOL memory...", i)
+            self._clear_all_solution_data()
 
             with open(json_file, "r", encoding="utf-8") as f:
                 meta = json.load(f)
@@ -365,9 +432,20 @@ class AnchorGenerator:
                     logger.debug(f"[{i}] Skipping step n={n_val}, already exists.")
                     continue
 
-                logger.info(f"[{i}] Solving for n_index = {n_val}...")
+                _safe_log("info", "[%s] Solving for n_index = %s...", i, n_val)
                 self.model.parameter('n_index', str(n_val))
-                self.model.solve()
+                try:
+                    self.model.solve()
+                except Exception as solve_exc:
+                    _safe_log(
+                        "warning",
+                        "[%s] COMSOL model.solve() failed at n_index=%s: %s: %s",
+                        i,
+                        n_val,
+                        type(solve_exc).__name__,
+                        getattr(solve_exc, "msg", solve_exc),
+                    )
+                    raise
 
                 u, v, p, mu = self._evaluate_at_coords(target_nodes)
                 u, v, p, mu = u.flatten(), v.flatten(), p.flatten(), mu.flatten()
@@ -452,11 +530,22 @@ class AnchorGenerator:
                 )
             return True
 
+        except OSError:
+            self._clear_all_solution_data()
+            raise
         except Exception as e:
-            logger.error(f"Error on {i}: {e}")
-            logger.debug(f"[{i}] Purging old solution data from COMSOL memory...")
-            for tag in self.model.java.sol().tags():
-                self.model.java.sol(tag).clearSolutionData()
+            if self._is_comsol_solver_failure(e):
+                _safe_log(
+                    "warning",
+                    "Sample %s: COMSOL solve failed (n_index=%s): %s: %s",
+                    i,
+                    self.phys_cfg.n,
+                    type(e).__name__,
+                    e,
+                )
+            else:
+                _safe_log("error", "Error on %s: %s", i, e)
+            self._clear_all_solution_data()
             return False
 
     def run_batch(
@@ -524,10 +613,9 @@ class AnchorGenerator:
         )
 
         try:
-            mesh_j = self.model.java.component("comp1").mesh("mesh1")
-            import_tag = _get_import_feature_tag(mesh_j)
+            mesh_j, import_tag = self._ensure_mesh_handles()
         except Exception as e:
-            logger.critical(f"Setup failed: {e}")
+            _safe_log("critical", "Setup failed: %s", e)
             return {
                 "existing_before": existing_npz,
                 "requested_new": max_new,
@@ -540,21 +628,50 @@ class AnchorGenerator:
                 "setup_failed": True,
             }
 
+        reconnect_count = 0
+        consecutive_fast_fails = 0
         new_written = 0
         attempted = 0
         n_failed = 0
-        for json_file in tqdm(candidates, desc="Anchors"):
+        for json_file in _tqdm_or_plain(candidates, desc="Anchors"):
             if new_written >= max_new:
                 break
             attempted += 1
-            if self._process_single_anchor(
-                json_file,
-                mesh_j,
-                import_tag,
-                allow_overwrite=allow_overwrite,
-                continuation_steps=continuation_steps,
-            ):
+            ok = False
+            try:
+                ok = self._process_single_anchor(
+                    json_file,
+                    mesh_j,
+                    import_tag,
+                    allow_overwrite=allow_overwrite,
+                    continuation_steps=continuation_steps,
+                )
+            except Exception as exc:
+                consecutive_fast_fails += 1
+                if (
+                    reconnect_count < _MAX_COMSOL_RECONNECTS_PER_BATCH
+                    and consecutive_fast_fails >= _CONSECUTIVE_FAST_FAIL_THRESHOLD
+                    and (
+                        isinstance(exc, OSError)
+                        or self._is_comsol_solver_failure(exc)
+                    )
+                ):
+                    reason = (
+                        f"{consecutive_fast_fails} fast failures "
+                        f"(last: {type(exc).__name__}: {exc})"
+                    )
+                    mesh_j, import_tag = self._reconnect_comsol_session(reason)
+                    reconnect_count += 1
+                    consecutive_fast_fails = 0
+                    attempted -= 1
+                    continue
+                consecutive_fast_fails = 0
+                _safe_log("error", "Unhandled error on %s: %s", json_file.stem, exc)
+                ok = False
+
+            if ok:
                 new_written += 1
+                consecutive_fast_fails = 0
             else:
                 n_failed += 1
 

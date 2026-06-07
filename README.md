@@ -21,6 +21,9 @@ python -m src.training.train_kinematics_predictor
 
 # Unified CLI (train / data / eval / inspect / orchestrate)
 python -m src.bin.main train kinematics
+
+# Kinematics flow demo (sliders + GINO-DEQ inference; headless: add --no-gui)
+python -m src.bin.main inspect flow -- --rheology carreau
 ```
 
 Artifacts: checkpoints under `outputs/kinematics/` and `outputs/biochem/`; reports under `outputs/reports/`; datasets under `data/` via `data_root()`.

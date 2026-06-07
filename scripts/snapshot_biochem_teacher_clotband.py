@@ -26,7 +26,7 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from scripts.dump_teacher_species_to_anchors import _build_teacher
+from src.inference.biochem_teacher_loader import build_biochem_teacher, resolve_rollout_mu_ratio_max
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_step,
@@ -44,7 +44,6 @@ from src.utils.paths import get_project_root
 def _apply_gt_flow_env() -> None:
     os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
     os.environ.setdefault("BIOCHEM_GT_KINE_SKIP_DEQ", "1")
-    os.environ.setdefault("BIOCHEM_TEACHER_MU_RATIO_MAX", "1.0")
     os.environ.setdefault("BIOCHEM_ADJOINT_RK4_SUBSTEPS", "1")
     os.environ.setdefault("BIOCHEM_TBPTT_MAX_WINDOW", "6")
 
@@ -111,6 +110,12 @@ def main() -> int:
     ap.add_argument("--time-index", type=int, default=-1, help="Time index (-1 = final).")
     ap.add_argument("--out", default="", help="Output PNG path.")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--mu-ratio-max",
+        type=float,
+        default=None,
+        help="Teacher mu_ratio_max for rollout (default: env BIOCHEM_TEACHER_MU_RATIO_MAX or bio_cfg; Lane A ~20).",
+    )
     args = ap.parse_args()
 
     _apply_gt_flow_env()
@@ -142,7 +147,14 @@ def main() -> int:
     bio_cfg = BiochemConfig(phase="biochem")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    teacher = _build_teacher(ckpt, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device)
+    mu_ratio_max = resolve_rollout_mu_ratio_max(bio_cfg, cli_value=args.mu_ratio_max)
+    teacher = build_biochem_teacher(
+        ckpt,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        mu_ratio_max=mu_ratio_max,
+    )
 
     data = torch.load(anchor_path, weights_only=False).to(device)
     data = infer_missing_schema(data, phase_hint="biochem")

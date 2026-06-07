@@ -85,6 +85,42 @@ Copy-Item outputs\kinematics\production_allfix\kinematics_best.pth outputs\kinem
 
 **Next lever:** phase 3 clinical anchors from finetune best — `go_kinematics_clinical_anchor_finetune.ps1` + dual promotion gates.
 
+### Clinical anchor finetune (2026-06-05, `go_kinematics_precision_long.ps1` phase 3)
+
+Resume from synthetic-polish `production_allfix/kinematics_best.pth` at **epoch 167**. Run diary: `20260605T194538Z`. Data: **GRAPH_CAP=120** synthetic + **11** patient kine anchors; holdout **`patient007`** val-only; **50** clinical epochs (167–216).
+
+| Phase | Epoch | Global Rel L2 | L0 / L1 / L2 | div_u | patient p007 | synth val | synth L2 val | composite | Note |
+|-------|-------|---------------|--------------|-------|----------------|-----------|--------------|-----------|------|
+| Cold start (clinical mix) | 167 | 0.175 | 0.183 / 0.182 / 0.161 | 0.387 | 0.164 | 0.176 | 0.161 | 38.90 | momentum reset + capped corpus shock |
+| Recovery | 168 | 0.124 | 0.113 / 0.120 / 0.136 | 0.348 | 0.149 | 0.122 | 0.133 | 34.92 | |
+| Patient spike (gate fail) | 171 | 0.150 | — / — / 0.179 | 0.354 | **0.275** | 0.141 | 0.155 | 35.50 | dual gates blocked (patient) |
+| Patient best (manual pick) | **176** | 0.115 | 0.097 / 0.100 / 0.145 | 0.319 | **0.129** | 0.114 | 0.150 | 31.97 | gates OK; composite blocked save |
+| Patient best (manual pick) | **214** | 0.103 | 0.083 / 0.079 / 0.142 | 0.298 | **0.128** | 0.101 | 0.145 | 29.85 | **best p007** in run |
+| Synth-val best | **216** | **0.101** | 0.073 / 0.080 / 0.145 | 0.293 | 0.150 | **0.098** | 0.144 | 29.42 | end epoch; latest copied to best |
+| Prior (no clinical) | 119 | **0.087** | 0.083 / — / 0.120 | 0.233 | ~0.191 | — | — | 23.37 | synthetic-only reference |
+
+**Outcome:** Training **finished** at ep 216. **`[kin] WARN no Carreau best saved`** — no epoch passed **dual gates + composite &lt; resumed best** (`best_val_composite_loss` ~23.4 from ep 119; clinical val composite ~29–31 because `div_u` ~0.29–0.31). Latest weights copied to `kinematics_best.pth`, **not** a gated optimum.
+
+**Gate checklist (ep 214 / 216 vs defaults):**
+
+| Gate | Limit | ep 214 | ep 216 |
+|------|-------|--------|--------|
+| patient holdout rel_L2 | ≤ 0.25 | **0.128 Pass** | 0.150 Pass |
+| synthetic val rel_L2 | ≤ 0.20 | **0.101 Pass** | **0.098 Pass** |
+| synthetic L2 val rel_L2 | ≤ 0.22 | **0.145 Pass** | **0.144 Pass** |
+
+**Readout:** Clinical FT **helped patient007** (~0.191 → **~0.128–0.15**); **hurt** full-corpus synthetic rel_L2 (~0.087 → ~0.10) and **div_u** (~0.23 → ~0.29). Plateau ep **198–216** (global rel_L2 ~0.102–0.108; patient noisy 0.13–0.17). **Stop training**; manually promote **ep 214** (best p007) or **ep 216** (best synth val) — do not assume auto `kinematics_best.pth` is optimal.
+
+**Manual promote (Comsol):**
+
+```powershell
+# After copying ep-214 weights from kinematics_validation.jsonl / diary checkpoint if saved:
+python scripts/check_kinematics_promotion_gates.py --checkpoint outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth
+powershell -File .\scripts\promote_kinematics_checkpoint.ps1 -Checkpoint outputs\kinematics\clinical_anchor_finetune\kinematics_best.pth
+```
+
+If only `kinematics_ckpt_latest.pth` exists (ep 216), prefer it for synth gates; for **biochem on patient007**, re-run val on archived ep-176/214 weights if available, else accept ep 216 (p007 0.150).
+
 ## Stage-A default training loop (3 phases)
 
 **One command** runs foundation -> synthetic polish -> clinical geometry finetune -> gated promote:

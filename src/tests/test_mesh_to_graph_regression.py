@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
+
+import pytest
 import torch
 
 from src.config import BiochemConfig
@@ -225,3 +228,44 @@ def test_gmsh_line_boundary_masks_raises_without_wall():
     tags = {"Inlet": 1, "Outlet_1": 2, "Walls": 99}
     with pytest.raises(ValueError, match="no wall nodes"):
         gmsh_line_boundary_masks(m, num_nodes=3, tags=tags)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("gmsh") is None, reason="gmsh not installed")
+def test_process_mesh_returns_kinematics_contract(tmp_path):
+    """``process_mesh`` on a Gmsh-built vessel matches assembler width + sparse grads."""
+    import json
+
+    import meshio
+    import numpy as np
+
+    from src.config import NodeFeat, VesselConfig
+    from src.data_gen.lib.mesh_to_graph import MeshToGraph
+    from src.data_gen.lib.vessel_generator import build_vessel_mesh, make_vessel_params
+
+    cfg = VesselConfig(phase="kinematics")
+    gen_cfg = {
+        "num_ctrl_pts": cfg.num_ctrl_pts,
+        "base_length": cfg.base_length,
+        "mesh_lc": cfg.mesh_lc * 2.0,
+        "mesh_size_factor": cfg.mesh_size_factor,
+        "width_min": cfg.width_min,
+        "width_max": cfg.width_max,
+        "stenosis_factor_min": cfg.stenosis_factor_min,
+        "stenosis_factor_max": cfg.stenosis_factor_max,
+        "min_lumen_width_fraction": cfg.min_lumen_width_fraction,
+        "aneurysm_factor_min": cfg.aneurysm_factor_min,
+        "aneurysm_factor_max": cfg.aneurysm_factor_max,
+        "TAGS": dict(cfg.TAGS),
+        "unit": "m",
+    }
+    params = make_vessel_params(idx=0, level=0, cfg=cfg, rng=np.random.default_rng(3))
+    idx, ok, err = build_vessel_mesh(params, gen_cfg, tmp_path)
+    assert ok, err
+    mesh = meshio.read(tmp_path / f"vessel_{idx}.msh")
+    meta = json.loads((tmp_path / f"vessel_{idx}.json").read_text(encoding="utf-8"))
+    builder = MeshToGraph(phase="kinematics", rheology="carreau", proc_dir=tmp_path / "out")
+    data = builder.process_mesh(mesh, meta, stem="vessel_0")
+    assert data is not None
+    assert data.x.shape[1] == NodeFeat.WIDTH_D2.stop
+    assert data.G_x.is_sparse and data.G_y.is_sparse
+    assert hasattr(data, "mask_inlet")

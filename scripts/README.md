@@ -11,7 +11,10 @@ One-liners from repo root (see `AGENTS.md` for full ladder):
 | GT flow (no kin model) | **I.1 X:** `go_passive_x_block_pass.ps1`; **I.3 XY:** `go_passive_xy_block_pass.ps1`, `go_passive_lock_xy_ckpt.ps1`; **M3 ADR:** `go_m3_block_pass.ps1` (`-Turbo`); **M5 clot (~8h):** `go_m5_block_pass.ps1` (M5.3-M5.6 finetune+bridge+K10 wide/narrow/bias, GT vel); `go_passive_explore_6h.ps1` (scale only) (**6h** X/Y/XY ladder), `go_phase_a_xy_iterate.ps1`, `go_phaseB_xy_passive.ps1`, `go_m3_align_probe.ps1`, `go_passive_lock_align_ckpt.ps1`, `go_passive_align_20ep.ps1`, `go_passive_step2_bridge.ps1`, `go_passive_mu_unlock_probe.ps1`, `go_passive_mu_unlock_finetune.ps1`, `go_m3_adr_alignment_sweep.ps1`, `go_m3_narrowing_90m.ps1`, `go_gt_flow_species_ladder_6h.ps1`, `go_gt_flow_round2_4h.ps1`, ... |
 | GNODE 9.x (GT vel) | `go_gnode91_smoke.ps1` (9.1); `go_gnode_8h_ladder.ps1` (9.4-9.6 ~8h); `go_gnode99.ps1` (9.9 best-practice clot_band); `snapshot_biochem_teacher*.py`; `_gnode_viz_helpers.ps1` — [GNODE_ODE_LADDER.md](../src/docs/GNODE_ODE_LADDER.md) |
 | GNODE 10-12 (predicted kine) | `go_gnode10_*`; `go_gnode11_*` (11a/11b/finish); **`go_gnode12_lane_a.ps1`** / **`go_gnode12_lane_b.ps1`** (dump + clot); `check_gnode12_lane_*_gate.py`; `_gnode12_env.ps1` |
-| Sweeps | `go_health10h`, `go_visc3h` |
+| **Clot baseline (deploy)** | **`go_baseline_clot.ps1`** (train + promote); **`go_baseline_clot_viz.ps1`**; `promote_clot_baseline.py`; `python -m src.inference`; artifacts under `outputs/biochem/clot_baseline/` |
+| **CAVO deploy phases** | **`go_clot_deploy_phase1.ps1`** (Phase 1.1-1.2: input mask + dgamma, pred-kine dump); doc [DEPLOY_ARCHITECTURE.md](../src/docs/DEPLOY_ARCHITECTURE.md) |
+| **Mu coupling A/B/C** | **`go_mlp_abc_scorecard.ps1`** (north-star clot shape + flow guards); **`go_mlp_abc_viz.ps1`** (interactive or `-Headless` PNGs); **`go_mlp_abc_compare_1h.ps1`** (legacy JSON path); **`go_mlp_mu_map_v2_viz.ps1`** (Leg B only); `abc_scorecard*.json` |
+| Sweeps | `go_health10h`, `go_visc3h`, **`go_mu_complexity_6h.ps1`** (~6h **comprehensive** pred-kine + teacher->corrector/synth; `summarize_mu_complexity_6h.py`) |
 | Kinematics | **`go_kinematics_precision_long`** (60+50 ep finetune+clinical), **`go_kinematics_production_allfix`** (3-phase loop), `go_kinematics_stage_a_ladder`, `go_kinematics_production_allfix_finetune`, `go_kinematics_clinical_anchor_finetune`, `promote_kinematics_checkpoint`, `check_kinematics_promotion_gates.py` |
 
 `go_*` scripts set env vars and call `python -m src.training.train_biochem_corrector` or kinematics training directly, except:
@@ -49,6 +52,7 @@ One-liners from repo root (see `AGENTS.md` for full ladder):
 | `check_passive_mu_unlock_gate.py` | Mu-unlock probe gate (mu drop + species stable + `PASSIVE_MU_UNLOCK`) |
 | `check_passive_mu_unlock_finetune_gate.py` | Finetune gate (all-mu down, wall/high-mu recovery, species stable) |
 | `summarize_passive_explore_6h.py` | Rank `explore_6h` legs by species FI and mu drop |
+| `summarize_mu_complexity_6h.py` | Rank `sweep_mu_complexity_6h` legs by val `mu_log_mae` (best epoch) |
 | `eval_passive_species_anchors.py` | Per-anchor FI/Mat logMAE table for a passive teacher ckpt |
 | `snapshot_biochem_teacher.py` | Headless teacher rollout PNG (|u|, FI/Mat vs GT) for GNODE ladder checkups |
 | `snapshot_biochem_teacher_clotband.py` | Teacher clot-band PNG (GT vs pred phi/mu_eff in dgamma band; matches clot-phi layout) |

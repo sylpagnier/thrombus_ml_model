@@ -529,6 +529,11 @@ def clot_phi_hybrid_enabled() -> bool:
     return _env_bool("CLOT_PHI_HYBRID", False)
 
 
+def clot_phi_fixed_mu_from_phi_enabled() -> bool:
+    """Rollout/deploy: ``mu = log_blend(mu_c, phi, mu_solid)``; no mu carry or delta head."""
+    return _env_bool("CLOT_PHI_FIXED_MU_FROM_PHI", False)
+
+
 def clot_phi_model_kind() -> str:
     raw = (os.environ.get("CLOT_PHI_MODEL") or "mlp").strip().lower()
     if raw in ("linear", "logistic", "lr"):
@@ -611,6 +616,191 @@ def log_blend_mu_eff_si(mu_c_si: torch.Tensor, phi: torch.Tensor, mu_solid_si: f
     ph = phi.reshape(-1).clamp(0.0, 1.0)
     log_mu = (1.0 - ph) * torch.log(mc) + ph * torch.log(torch.tensor(solid, device=mc.device, dtype=mc.dtype))
     return torch.exp(log_mu)
+
+
+def mu_eff_from_carried_phi(
+    mu_c_si: torch.Tensor,
+    phi_prev: torch.Tensor | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Deploy/rollout mu seeds from carried phi (bulk Carreau when phi_prev is None)."""
+    mc = mu_c_si.reshape(-1).to(device=device, dtype=torch.float32).clamp(min=1e-8)
+    if phi_prev is None:
+        return mc
+    return log_blend_mu_eff_si(mu_c_si, phi_prev).reshape(-1).to(device=device)
+
+
+def snapshot_phi_only_rollout_config() -> dict[str, object]:
+    return {
+        "fixed_mu_from_phi": clot_phi_fixed_mu_from_phi_enabled(),
+        "mu_solid_si": clot_phi_mu_solid_si(),
+    }
+
+
+def clot_phi_mesh_aux_lambda() -> float:
+    """Auxiliary BCE on full eligible lumen at forecast target time (helps clot_shape)."""
+    return max(float(os.environ.get("CLOT_PHI_MESH_AUX_LAMBDA", "0") or "0"), 0.0)
+
+
+def clot_phi_mesh_bulk_lambda() -> float:
+    """Penalize phi>0 on bulk nodes (mu_gt below clot threshold) at target time."""
+    return max(float(os.environ.get("CLOT_PHI_MESH_BULK_LAMBDA", "0") or "0"), 0.0)
+
+
+def clot_phi_shape_use_t_out_mu() -> bool:
+    """One-step clot_shape: blend phi with Carreau mu_c @ t_out (not t_in)."""
+    return _env_bool("CLOT_PHI_SHAPE_USE_T_OUT", True)
+
+
+def lumen_eligible_mask(
+    data,
+    device: torch.device,
+    *,
+    n_nodes: int | None = None,
+) -> torch.Tensor:
+    """Eligible lumen nodes for mesh-wide aux loss / shape (wall + near-wall band)."""
+    n = int(n_nodes or data.num_nodes)
+    wall = _wall_mask_from_data(data, device, n)
+    return _lumen_supervision_eligible(data, device, wall, n).bool()
+
+
+def snapshot_mesh_aux_config() -> dict[str, float | bool]:
+    return {
+        "mesh_aux_lambda": clot_phi_mesh_aux_lambda(),
+        "mesh_bulk_lambda": clot_phi_mesh_bulk_lambda(),
+        "shape_use_t_out_mu": clot_phi_shape_use_t_out_mu(),
+    }
+
+
+def clot_phi_hard_support_projection_enabled() -> bool:
+    """When true, deployed mu = Carreau bulk off support band B_t (CAVO step 3-4)."""
+    raw = (os.environ.get("CLOT_PHI_HARD_SUPPORT_PROJECTION") or "").strip().lower()
+    if not raw:
+        try:
+            from src.core_physics.clot_forecast import clot_forecast_one_step_enabled
+
+            return clot_forecast_one_step_enabled()
+        except ImportError:
+            return False
+    return raw in ("1", "true", "yes", "on")
+
+
+def clot_support_band_mode() -> str:
+    """Physics support B_t for hard mu projection (independent of loss_mask).
+
+    - ``physics`` (default): dgamma wall @ ref + 1-hop from clot seeds @ mu_in / current step.
+    - ``frozen_t0``: seeds + dgamma band fixed from COMSOL mu @ t=0 only (deploy_band).
+    - ``loss_mask``: use step loss_mask (legacy / debug only).
+    """
+    raw = (os.environ.get("CLOT_PHI_SUPPORT_BAND") or "physics").strip().lower()
+    if raw in ("frozen_t0", "t0", "deploy_band", "b0"):
+        return "frozen_t0"
+    if raw in ("loss_mask", "loss", "legacy"):
+        return "loss_mask"
+    return "physics"
+
+
+def resolve_clot_support_band(
+    data,
+    device: torch.device,
+    mu_seed_cap_si: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig | None = None,
+    *,
+    frozen_t0: bool = False,
+) -> torch.Tensor:
+    """Deploy physics support B_t: dgamma-sliced neighbor shell from clot seeds.
+
+    Seeds default to ``mu_seed_cap_si`` (mu @ t_in for forecast). ``frozen_t0`` seeds from
+    COMSOL mu @ graph index 0 only (band envelope fixed for the trajectory).
+    """
+    bio = bio_cfg or BiochemConfig(phase="biochem")
+    if frozen_t0 or clot_support_band_mode() == "frozen_t0":
+        if hasattr(data, "y") and torch.is_tensor(data.y) and data.y.dim() == 3:
+            y0 = data.y[0].to(device)
+            mu_seed_cap_si = cap_mu_eff_si(
+                phys_cfg.viscosity_nd_to_si(y0[:, STATE_CHANNEL_MU_EFF_ND])
+            )
+    mu_seed = mu_seed_cap_si.reshape(-1).to(device=device)
+    thr = clot_phi_thresh_si(phys_cfg)
+    clot_seed = mu_seed >= thr
+    region = neighbor_supervision_mask(data, device, clot_seed)
+    if clot_phi_dgamma_slice_enabled():
+        region = dgamma_dx_slice_mask(data, device, region, clot_seed, bio)
+    return region.reshape(-1).bool()
+
+
+def apply_clot_support_projection(
+    mu_c_si: torch.Tensor,
+    mu_eff_si: torch.Tensor,
+    support_band: torch.Tensor,
+) -> torch.Tensor:
+    """Inside B_t keep model mu; outside B_t force Carreau bulk (no clot commit)."""
+    mc = mu_c_si.reshape(-1)
+    mu = mu_eff_si.reshape(-1)
+    band = support_band.reshape(-1).to(device=mu.device, dtype=torch.bool)
+    out = mc.clone()
+    if bool(band.any().item()):
+        out[band] = mu[band]
+    return out.reshape_as(mu)
+
+
+def project_mu_from_phi_with_support(
+    mu_c_si: torch.Tensor,
+    phi: torch.Tensor,
+    support_band: torch.Tensor,
+    *,
+    mu_solid_si: float | None = None,
+) -> torch.Tensor:
+    """log-blend phi -> mu, then hard-project onto support band."""
+    mu_blend = log_blend_mu_eff_si(mu_c_si, phi, mu_solid_si=mu_solid_si)
+    return apply_clot_support_projection(mu_c_si, mu_blend, support_band)
+
+
+def resolve_clot_support_band_for_step(
+    data,
+    device: torch.device,
+    step: "ClotPhiStepBatch",
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig | None = None,
+    *,
+    forecast_one_step: bool = False,
+) -> torch.Tensor:
+    """Resolve B_t for a train/eval step (physics, frozen t=0, or loss_mask)."""
+    mode = clot_support_band_mode()
+    if mode == "loss_mask":
+        return step.loss_mask.reshape(-1).to(device=device).bool()
+    frozen = mode == "frozen_t0"
+    if not frozen and forecast_one_step:
+        try:
+            from src.core_physics.clot_forecast import clot_forecast_mask_mode
+
+            frozen = clot_forecast_mask_mode() == "deploy_band"
+        except ImportError:
+            pass
+    mu_seed = step.mu_gt_cap.reshape(-1)
+    if (
+        forecast_one_step
+        and not frozen
+        and getattr(step, "mu_in_cap", None) is not None
+    ):
+        mu_seed = step.mu_in_cap.reshape(-1)
+    return resolve_clot_support_band(
+        data,
+        device,
+        mu_seed,
+        phys_cfg,
+        bio_cfg,
+        frozen_t0=frozen,
+    )
+
+
+def snapshot_clot_support_config() -> dict[str, object]:
+    return {
+        "hard_support_projection": clot_phi_hard_support_projection_enabled(),
+        "support_band": clot_support_band_mode(),
+    }
 
 
 def node_features_from_gt(
@@ -855,6 +1045,8 @@ class ClotPhiStepBatch:
     species_log_gt: torch.Tensor
     u_flow_nd: torch.Tensor
     v_flow_nd: torch.Tensor
+    mu_in_cap: torch.Tensor | None = None
+    phi_in_gt: torch.Tensor | None = None
 
 
 def build_clot_phi_step(
@@ -868,6 +1060,7 @@ def build_clot_phi_step(
     v_nd_override: torch.Tensor | None = None,
     y_slice_override: torch.Tensor | None = None,
     rollout_state: "ClotPhiRolloutState | None" = None,
+    train_epoch: int | None = None,
 ) -> ClotPhiStepBatch:
     """One time slice: labels and features on wall-adjacent nodes."""
     from src.core_physics.clot_phi_rollout import (
@@ -886,7 +1079,14 @@ def build_clot_phi_step(
     v_gt = y[:, 1]
     if clot_phi_rollout_enabled():
         mu_for_kine = None
-        if rollout_state is not None and rollout_state.log_mu_prev is not None:
+        if clot_phi_fixed_mu_from_phi_enabled():
+            if rollout_state is not None and rollout_state.phi_prev is not None:
+                y_k = data.y[time_index].to(device)
+                mu_c_k = carreau_mu_si_from_uv(data, y_k[:, 0], y_k[:, 1], phys_cfg)
+                mu_for_kine = mu_eff_from_carried_phi(
+                    mu_c_k, rollout_state.phi_prev, device=device
+                )
+        elif rollout_state is not None and rollout_state.log_mu_prev is not None:
             mu_for_kine = torch.exp(rollout_state.log_mu_prev.clamp(max=20.0))
         u, v, _, _ = resolve_uv_for_rollout_step(
             data, time_index, mu_for_kine, device
@@ -916,10 +1116,20 @@ def build_clot_phi_step(
         v_nd_override=v,
     )
     if clot_phi_rollout_enabled() and rollout_state is not None:
+        from src.core_physics.clot_phi_rollout import resolve_carry_log_mu_feature
+
+        log_mu_carry = resolve_carry_log_mu_feature(
+            time_index=int(time_index),
+            train_epoch=train_epoch,
+            gt_mu_cap_si=mu_cap,
+            rollout_state=rollout_state,
+            device=device,
+        )
         feats = append_rollout_carry_features(
             feats,
             phi_prev=rollout_state.phi_prev,
             log_mu_prev=rollout_state.log_mu_prev,
+            log_mu_override=log_mu_carry,
             n_nodes=int(data.num_nodes),
             device=device,
             dtype=feats.dtype,

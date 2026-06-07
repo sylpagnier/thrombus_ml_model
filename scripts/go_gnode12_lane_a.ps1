@@ -59,12 +59,9 @@ if ($MuUnlockEpochs -gt 0 -and -not $SkipMuUnlock) {
     Copy-Item -Force $TeacherPath (Join-Path $RepoRoot "outputs\biochem\biochem_teacher_best_high_mu.pth")
     Write-Host "[NEW] mu unlock ${MuUnlockEpochs}ep (pred kine, mu_ratio_max=$MuRatioMax)" -ForegroundColor Cyan
     Write-Host "[i]  mu unlock training (~${MuUnlockEpochs} min on GPU; console may be quiet until val lines)" -ForegroundColor DarkGray
-    $rc = Invoke-PythonRc -m src.training.train_biochem_corrector --new --skip-pretrain --init-from-best `
-        --epochs $MuUnlockEpochs --save-best --run-name gnode12_mu_unlock
-    if ($rc -ne 0) {
-        Write-Host "[ERR] mu unlock training failed (exit=$rc). See outputs/reports/training/biochem/*/run.jsonl" -ForegroundColor Red
-        exit $rc
-    }
+    Invoke-PythonRcCheck -m src.training.train_biochem_corrector --new --skip-pretrain --init-from-best `
+        --epochs $MuUnlockEpochs --save-best --run-name gnode12_mu_unlock `
+        -Label "mu unlock training"
     Write-Host "[OK]  mu unlock training finished (exit=0)" -ForegroundColor Green
     foreach ($rel in @(
             "biochem_teacher_passive_mu_unlock_best.pth",
@@ -106,11 +103,11 @@ if ($SkipClot) {
 
 if (-not $SkipGate) {
     Write-Host "[NEW] lane A gate check" -ForegroundColor Cyan
-    $gateRc = Invoke-PythonRc scripts/check_gnode12_lane_a_gate.py `
+    Invoke-PythonRcCheck scripts/check_gnode12_lane_a_gate.py `
         --eval-json $EvalJson `
         --min-clot-min-f1 $MinClotMinF1 `
-        --min-gt-pos-frac $MinGtPosFrac
-    if ($gateRc -ne 0) { exit $gateRc }
+        --min-gt-pos-frac $MinGtPosFrac `
+        -Label "lane A gate"
 }
 
 Write-Host "[OK]  GNODE 12 Lane A complete." -ForegroundColor Green

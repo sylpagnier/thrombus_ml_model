@@ -4361,7 +4361,14 @@ def compute_biochem_loss(
         )
         data_bio_mask_n = int(node_is_bio_target.sum().item())
         if (
-            bio_mask_mode in ("clot_band", "clotdec_band", "wall_clot_band", "decision_band")
+            bio_mask_mode in (
+                "clot_band",
+                "clotdec_band",
+                "wall_clot_band",
+                "decision_band",
+                "neighbor",
+                "neighbor_band",
+            )
             and data_bio_mask_n < 32
             and model.training
             and _biochem_env_truthy("BIOCHEM_WARN_SMALL_SUPERVISION_MASK", default=True)
@@ -4374,8 +4381,16 @@ def compute_biochem_loss(
                 flush=True,
             )
 
-        pred_bio = pred_series_data_freq[:, node_is_bio_target, 4:16]
-        targ_bio = target_series[:, node_is_bio_target, 4:16]
+        from src.training.biochem_species_scope import (
+            data_bio_species_channel_indices,
+            slice_bio_species_channels,
+        )
+
+        pred_bio_full = pred_series_data_freq[:, node_is_bio_target, 4:16]
+        targ_bio_full = target_series[:, node_is_bio_target, 4:16]
+        ch_idx = data_bio_species_channel_indices()
+        pred_bio = slice_bio_species_channels(pred_bio_full)
+        targ_bio = slice_bio_species_channels(targ_bio_full)
 
         scales = bio_cfg.get_species_scales(device=device)
         target_ranges = scales.clone()
@@ -4385,14 +4400,17 @@ def compute_biochem_loss(
         target_ranges[11] = max(float(bio_cfg.viscosity_mat_crit), 1e-8)          # Mat
 
         # Relative channel weighting without expm1-space amplification.
-        channel_weights = (scales / target_ranges).view(1, 1, 12)
+        channel_weights = (scales[ch_idx] / target_ranges[ch_idx]).view(1, 1, len(ch_idx))
         channel_weights = torch.clamp(channel_weights, min=1.0, max=100.0)
         # Optional teacher-side species emphasis for clot-driving channels.
         # Keep defaults at 1.0 to preserve existing behavior unless explicitly requested.
         fi_w = max(float(os.environ.get("BIOCHEM_DATA_BIO_FI_WEIGHT", "1.0")), 0.0)
         mat_w = max(float(os.environ.get("BIOCHEM_DATA_BIO_MAT_WEIGHT", "1.0")), 0.0)
-        channel_weights[..., 8] = channel_weights[..., 8] * fi_w
-        channel_weights[..., 11] = channel_weights[..., 11] * mat_w
+        for j, ch in enumerate(ch_idx):
+            if ch == 8:
+                channel_weights[..., j] = channel_weights[..., j] * fi_w
+            elif ch == 11:
+                channel_weights[..., j] = channel_weights[..., j] * mat_w
 
         # Huber directly in bounded log1p output space.
         base_huber = F.huber_loss(pred_bio, targ_bio, reduction="none", delta=1.0)
@@ -7576,6 +7594,12 @@ def train_biochem_corrector(epochs=60, lr=1e-3):
         inject_biochem_kinematic_lora(model, rank=lora_rank, alpha=lora_alpha)
     else:
         print(" LoRA injection skipped (BIOCHEM_LORA_RANK=0).")
+
+    from src.inference.clot_phi_inject_attach import attach_clot_phi_injector_to_teacher
+
+    _mlp_inj = attach_clot_phi_injector_to_teacher(model, device)
+    if _mlp_inj is not None:
+        print(" MLP clot coupling attached for closed-loop mu map / inject during train.")
 
     if _biochem_debug_enabled():
         cap = _biochem_debug_batches_cap()

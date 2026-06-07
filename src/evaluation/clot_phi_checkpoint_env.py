@@ -51,8 +51,30 @@ def apply_clot_phi_config_from_checkpoint(cfg: dict[str, Any]) -> None:
         os.environ["CLOT_PHI_CARRY_LOG_MU"] = "1" if cfg["rollout_carry_log_mu"] else "0"
     if "rollout_detach" in cfg:
         os.environ["CLOT_PHI_ROLLOUT_DETACH"] = "1" if cfg["rollout_detach"] else "0"
+    if "fixed_mu_from_phi" in cfg:
+        os.environ["CLOT_PHI_FIXED_MU_FROM_PHI"] = "1" if cfg["fixed_mu_from_phi"] else "0"
+    if cfg.get("mu_solid_si") is not None:
+        os.environ["CLOT_PHI_MU_SOLID_SI"] = str(cfg["mu_solid_si"])
+    if cfg.get("mesh_aux_lambda") is not None:
+        os.environ["CLOT_PHI_MESH_AUX_LAMBDA"] = str(cfg["mesh_aux_lambda"])
+    if cfg.get("mesh_bulk_lambda") is not None:
+        os.environ["CLOT_PHI_MESH_BULK_LAMBDA"] = str(cfg["mesh_bulk_lambda"])
+    if "shape_use_t_out_mu" in cfg:
+        os.environ["CLOT_PHI_SHAPE_USE_T_OUT"] = "1" if cfg["shape_use_t_out_mu"] else "0"
     if cfg.get("dgamma_feature_time"):
         os.environ["CLOT_PHI_DGAMMA_FEATURE_TIME"] = str(cfg["dgamma_feature_time"])
+    if cfg.get("forecast_mask"):
+        os.environ["CLOT_FORECAST_MASK"] = str(cfg["forecast_mask"])
+    if cfg.get("forecast_one_step"):
+        os.environ["CLOT_FORECAST_MODE"] = "one_step"
+    if "forecast_input_mu" in cfg:
+        os.environ["CLOT_FORECAST_INPUT_MU"] = "1" if cfg["forecast_input_mu"] else "0"
+    if "forecast_mu_carry" in cfg:
+        os.environ["CLOT_FORECAST_MU_CARRY"] = "1" if cfg["forecast_mu_carry"] else "0"
+    if "forecast_mu_carry_detach" in cfg:
+        os.environ["CLOT_FORECAST_MU_CARRY_DETACH"] = "1" if cfg["forecast_mu_carry_detach"] else "0"
+    if cfg.get("forecast_mu_init"):
+        os.environ["CLOT_FORECAST_MU_INIT"] = str(cfg["forecast_mu_init"])
     from src.core_physics.clot_phi_rollout import sync_rollout_env_from_checkpoint
 
     sync_rollout_env_from_checkpoint(cfg)

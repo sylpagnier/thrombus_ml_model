@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import Any, Mapping
 
 import torch
@@ -125,6 +126,78 @@ def resolve_gt_kine_uvp_at_step(
     return gt
 
 
+def resolve_y_label_index_at_macro_step(
+    batch,
+    evaluation_times: torch.Tensor,
+    macro_index: int,
+    *,
+    bio_cfg: BiochemConfig,
+    start_idx: int = 0,
+) -> int:
+    """Map rollout macro step -> ``data.y`` COMSOL label index by physical time [s].
+
+    Rollout uses ``evaluation_times[i]`` (nondimensional). COMSOL labels are indexed by
+    export step, not by macro index. Subsampled viz (41 knots) and ``time_stride`` probes
+    must not use ``i`` as ``data.y[i]`` — that mis-aligns ``gt_clot`` masks and MLP features.
+    """
+    macro_index = int(macro_index)
+    if not hasattr(batch, "y") or batch.y is None or getattr(batch.y, "ndim", 0) != 3:
+        return max(0, macro_index)
+    n_y = int(batch.y.shape[0])
+    n_eval = int(evaluation_times.numel())
+    if n_eval < 1:
+        return min(max(macro_index, 0), n_y - 1)
+    macro_index = min(max(macro_index, 0), n_eval - 1)
+
+    # Contiguous training/TBPTT slice: eval grid matches y[start_idx : start_idx + n_eval].
+    if (
+        int(start_idx) >= 0
+        and int(start_idx) + n_eval <= n_y
+        and n_eval <= n_y
+    ):
+        cand = int(start_idx) + macro_index
+        t_ref = float(getattr(bio_cfg, "t_final", 30000.0))
+        times_si = bio_cfg.resolve_biochem_times(batch, batch.y.device)
+        t_query_si = float(evaluation_times[macro_index].detach().item()) * t_ref
+        label_si = float(times_si[cand].detach().item())
+        if abs(t_query_si - label_si) <= max(1.0, 1e-3 * abs(label_si)):
+            return cand
+
+    t_ref = float(getattr(bio_cfg, "t_final", 30000.0))
+    times_si = bio_cfg.resolve_biochem_times(batch, batch.y.device).reshape(-1)
+    t_query_si = float(evaluation_times[macro_index].detach().item()) * t_ref
+    idx = int(torch.argmin(torch.abs(times_si - t_query_si)).item())
+    return min(max(idx, 0), n_y - 1)
+
+
+def resolve_y_reference_at_macro_step(
+    y_true_trajectory: torch.Tensor | None,
+    macro_index: int,
+    label_y_idx: int,
+    num_times: int,
+) -> torch.Tensor | None:
+    """Pick GT label row for MLP/clot injectors (aligned eval slice or full ``data.y``)."""
+    if y_true_trajectory is None or getattr(y_true_trajectory, "ndim", 0) != 3:
+        return None
+    n_tr = int(y_true_trajectory.shape[0])
+    if n_tr == int(num_times):
+        ti = min(max(int(macro_index), 0), n_tr - 1)
+        return y_true_trajectory[ti]
+    ti = min(max(int(label_y_idx), 0), n_tr - 1)
+    return y_true_trajectory[ti]
+
+
+def resolve_gt_kine_index_at_macro_step(
+    y_true_trajectory: torch.Tensor | None,
+    macro_index: int,
+    label_y_idx: int,
+    num_times: int,
+) -> int:
+    if y_true_trajectory is not None and int(y_true_trajectory.shape[0]) == int(num_times):
+        return int(macro_index)
+    return int(label_y_idx)
+
+
 def _biochem_mu_ic_steady_kin_enabled() -> bool:
     """Bootstrap rollout ``μ_eff`` at macro step 0 from one-shot frozen-kin DEQ (viz steady panel).
 
@@ -150,6 +223,27 @@ def _biochem_mu_k10e_simple_enabled() -> bool:
 def _biochem_k10g_oracle_clots_enabled() -> bool:
     """Sanity: in the wall-adjacent band, set ``μ_eff`` from GT excess over ``μ_ss`` (needs ``y_true_trajectory``)."""
     return _biochem_env_truthy("BIOCHEM_K10G_ORACLE_CLOTS")
+
+
+def _biochem_mu_neighbor_wall_only_enabled() -> bool:
+    """Carreau ``μ_c`` bulk + learned excess only in fixed ``neighbor_wall`` band (no GT clot seeds)."""
+    return _biochem_env_truthy("BIOCHEM_MU_NEIGHBOR_WALL_ONLY")
+
+
+def _biochem_rollout_progress_enabled() -> bool:
+    return _biochem_env_truthy("BIOCHEM_ROLLOUT_PROGRESS")
+
+
+def _should_log_rollout_step(step_idx: int, num_times: int) -> bool:
+    """Sparse macro-step logs: all steps when short, ~8 updates when long."""
+    n = max(int(num_times), 1)
+    i = int(step_idx)
+    if n <= 12:
+        return True
+    if i == 0 or i == n - 1:
+        return True
+    stride = max(1, n // 8)
+    return (i + 1) % stride == 0
 
 
 def _k10e_env_float(name: str, default: float) -> float:
@@ -258,6 +352,9 @@ _BIOCHEM_FORWARD_POLICY_BOOL_FIELDS: tuple[tuple[str, str], ...] = (
     ("mu_k10d_simple", "BIOCHEM_MU_K10D_SIMPLE"),
     ("mu_k10e_simple", "BIOCHEM_MU_K10E_SIMPLE"),
     ("mu_k10g_oracle_clots", "BIOCHEM_K10G_ORACLE_CLOTS"),
+    ("mlp_clot_inject", "BIOCHEM_MLP_CLOT_INJECT"),
+    ("mlp_mu_map", "BIOCHEM_MLP_MU_MAP"),
+    ("mu_neighbor_wall_only", "BIOCHEM_MU_NEIGHBOR_WALL_ONLY"),
 )
 
 _BIOCHEM_FORWARD_POLICY_CLIP_FIELDS: tuple[tuple[str, str], ...] = (
@@ -288,6 +385,9 @@ def snapshot_biochem_forward_policy() -> dict[str, Any]:
         "mu_k10d_simple": _biochem_mu_k10d_simple_enabled(),
         "mu_k10e_simple": _biochem_mu_k10e_simple_enabled(),
         "mu_k10g_oracle_clots": _biochem_k10g_oracle_clots_enabled(),
+        "mlp_clot_inject": _biochem_env_truthy("BIOCHEM_MLP_CLOT_INJECT"),
+        "mlp_mu_map": _biochem_env_truthy("BIOCHEM_MLP_MU_MAP"),
+        "mu_neighbor_wall_only": _biochem_mu_neighbor_wall_only_enabled(),
     }
     if policy["mu_k10d_simple"]:
         raw_max = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
@@ -350,6 +450,12 @@ def format_biochem_forward_policy_summary(policy: Mapping[str, Any] | None) -> s
         tags.append("k10e_wall_adjacent_mu")
     if policy.get("mu_k10g_oracle_clots"):
         tags.append("k10g_oracle_clots")
+    if policy.get("mlp_clot_inject"):
+        tags.append("mlp_clot_inject")
+    if policy.get("mlp_mu_map"):
+        tags.append("mlp_mu_map")
+    if policy.get("mu_neighbor_wall_only"):
+        tags.append("neighbor_wall_mu")
     if policy.get("mu_gemini_fix"):
         tags.append("gemini_fix")
     if policy.get("gelation_prior_gate") is False:
@@ -438,6 +544,47 @@ PASSIVE_MU_UNLOCK_SHELL_ENV_KEYS: tuple[str, ...] = (
     "BIOCHEM_USE_SPLIT_MU_HEAD",
     "BIOCHEM_USE_WALL_DELTA_HEAD",
 )
+
+MLP_CLOT_INJECT_SHELL_ENV_KEYS: tuple[str, ...] = (
+    "BIOCHEM_MLP_CLOT_INJECT",
+    "BIOCHEM_MLP_MU_MAP",
+    "BIOCHEM_MLP_MU_MAP_PHI_GATE",
+    "BIOCHEM_MLP_MU_MAP_MASK",
+    "BIOCHEM_MLP_MU_MAP_BULK",
+    "BIOCHEM_MLP_MU_MAP_GAMMA_THRESH_ND",
+    "BIOCHEM_MLP_MU_MAP_GEO_CAP",
+    "BIOCHEM_MLP_MU_MAP_PHI_THRESH",
+    "BIOCHEM_MLP_MU_MAP_PHI_Q",
+    "BIOCHEM_MLP_MU_MAP_EXCESS_Q",
+    "BIOCHEM_MLP_MU_MAP_RATIO_THRESH",
+    "BIOCHEM_MLP_MU_MAP_PHI_SOFT",
+    "BIOCHEM_MLP_CLOT_CKPT",
+    "BIOCHEM_MLP_CLOT_MU_SI",
+    "BIOCHEM_MLP_CLOT_BLEND",
+    "BIOCHEM_MLP_CLOT_PHI_THRESH",
+    "BIOCHEM_MLP_CLOT_REGION",
+    "BIOCHEM_MLP_CLOT_USE_PRED_SPECIES",
+    "BIOCHEM_MU_NEIGHBOR_WALL_ONLY",
+    "BIOCHEM_MU_NEIGHBOR_WALL_MASK",
+    "BIOCHEM_MU_NEIGHBOR_WALL_BULK",
+)
+
+
+def snapshot_mlp_clot_inject_shell_env() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in MLP_CLOT_INJECT_SHELL_ENV_KEYS:
+        raw = os.environ.get(key)
+        if raw is not None and str(raw).strip() != "":
+            out[key] = str(raw).strip()
+    return out
+
+
+def restore_mlp_clot_inject_shell_env(snapshot: Mapping[str, str]) -> list[str]:
+    restored: list[str] = []
+    for key, val in snapshot.items():
+        os.environ[key] = str(val)
+        restored.append(key)
+    return restored
 
 
 def snapshot_passive_mu_unlock_shell_env() -> dict[str, str]:
@@ -904,6 +1051,7 @@ class GNODE_Phase3(nn.Module):
         # Initial Condition Encoder (Maps spatial config to z0)
         self.bio_encoder_prior_dim = max(0, int(bio_encoder_prior_dim))
         self._bio_cfg = BiochemConfig(phase="biochem")
+        self._clot_phi_injector: Any = None
         self.bio_encoder = SpectralLinear(
             in_features=in_channels + 3 + spatial_channels + self.bio_encoder_prior_dim,
             out_features=latent_dim,
@@ -1333,6 +1481,13 @@ class GNODE_Phase3(nn.Module):
         safe_val = torch.clamp(norm_val, min=-50.0, max=50.0)
         return self.mu_ratio_max * torch.sigmoid(safe_val)
 
+    def set_clot_phi_injector(self, injector: Any) -> None:
+        """Optional MLP trigger -> mu_eff injection (see ``clot_phi_mu_inject``)."""
+        self._clot_phi_injector = injector
+
+    def clear_clot_phi_injector(self) -> None:
+        self._clot_phi_injector = None
+
     def autoencode(self, batch):
         """
         Kinematics: Pure spatial representation learning (no ODE time integration).
@@ -1486,6 +1641,9 @@ class GNODE_Phase3(nn.Module):
         pred_trajectory = []
         detach_macro_state = self.detach_macro_state_default if detach_macro_state is None else bool(detach_macro_state)
         prev_clot_gate = None
+        deploy_allowed_commit_mask = None
+        if getattr(self._clot_phi_injector, "clear_seed_growth_state", None) is not None:
+            self._clot_phi_injector.clear_seed_growth_state()
 
         # ==========================================
         # 2. MACRO-MICRO STEPPING (Two-Way Coupling)
@@ -1493,7 +1651,25 @@ class GNODE_Phase3(nn.Module):
         use_gt_kine = _biochem_gt_kine_vel_enabled()
         skip_deq_for_gt = use_gt_kine and _biochem_gt_kine_skip_deq()
 
+        rollout_progress = _biochem_rollout_progress_enabled() and not self.training
+        rollout_progress_t0 = time.perf_counter() if rollout_progress else None
+        if rollout_progress:
+            print(f"   [i]  rollout start ({num_times} macro steps)", flush=True)
+
         for i in range(num_times):
+            label_y_idx = resolve_y_label_index_at_macro_step(
+                batch,
+                evaluation_times,
+                i,
+                bio_cfg=self._bio_cfg,
+                start_idx=int(start_idx),
+            )
+            y_ref_macro = resolve_y_reference_at_macro_step(
+                y_true_trajectory, i, label_y_idx, num_times
+            )
+            gt_kine_idx = resolve_gt_kine_index_at_macro_step(
+                y_true_trajectory, i, label_y_idx, num_times
+            )
             # --- A. MACRO STEP: SOLVE KINEMATICS (Frozen Biochemistry) ---
             kin_in = self._slice_kinematics_input(batch, clone=True)
 
@@ -1506,7 +1682,7 @@ class GNODE_Phase3(nn.Module):
                 u_v_p = resolve_gt_kine_uvp_at_step(
                     batch,
                     y_true_trajectory,
-                    i,
+                    gt_kine_idx,
                     truth_mask,
                     device,
                     kin_encoded.dtype,
@@ -1529,7 +1705,7 @@ class GNODE_Phase3(nn.Module):
                 gt_uvp = resolve_gt_kine_uvp_at_step(
                     batch,
                     y_true_trajectory,
-                    i,
+                    gt_kine_idx,
                     truth_mask,
                     device,
                     u_v_p.dtype,
@@ -1541,6 +1717,23 @@ class GNODE_Phase3(nn.Module):
             # --- B. UPDATE DYNAMIC RHEOLOGY FOR CURRENT TIME ---
             u_nd = u_v_p[:, 0:1]
             v_nd = u_v_p[:, 1:2]
+            sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
+
+            from src.core_physics.clot_phi_mu_inject import biochem_mlp_mu_map_enabled
+
+            mu_map_v2_active = (
+                biochem_mlp_mu_map_enabled()
+                and self._clot_phi_injector is not None
+                and getattr(self._clot_phi_injector, "_model", None) is not None
+            )
+            mu_neighbor_wall_active = (
+                _biochem_mu_neighbor_wall_only_enabled()
+                and not mu_map_v2_active
+                and not (
+                    _biochem_delta_mu_head_enabled()
+                    and _biochem_split_mu_regime_head_enabled()
+                )
+            )
 
             du_dx_nd = torch.sparse.mm(batch.G_x, u_nd)
             du_dy_nd = torch.sparse.mm(batch.G_y, u_nd)
@@ -1558,349 +1751,468 @@ class GNODE_Phase3(nn.Module):
             dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
             dshear_ds_phys = dshear_ds / torch.clamp(d_bar, min=1e-8)
 
-            # 1) Pure shear-thinning kinematic baseline (no species coupling).
-            mu_kin_baseline = mu_inf + (mu_0 - mu_inf) * torch.pow(
-                1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0
-            )
-
-            # 2) Biochem gelation: explicit FI/Mat gates + species-only learned nonnegative penalty.
-            sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
-            species_si = self.species_log_nd_to_si(sp_safe)
-            FI_si = species_si[:, 8:9]
-            # STRICT COMSOL PARITY: viscosity depends on Mat (channel 11) only.
-            Mat_si = species_si[:, 11:12]
-
-            if _biochem_mu_disable_explicit_gelation():
-                explicit_gelation = torch.zeros_like(Mat_si)
-                learned_gelation = torch.zeros_like(Mat_si)
-            else:
-                mu1_term = (
-                    torch.zeros_like(Mat_si)
-                    if _biochem_mu_disable_mu1()
-                    else self.mu1_sigmoid(Mat_si)
-                )
-                mu2_term = (
-                    torch.zeros_like(FI_si)
-                    if _biochem_mu_disable_mu2()
-                    else self.mu2_sigmoid(FI_si)
-                )
-                mu2_cap_raw = (os.environ.get("BIOCHEM_MU2_SIGMOID_CAP") or "").strip()
-                if mu2_cap_raw:
-                    mu2_cap = max(float(mu2_cap_raw), 0.0)
-                    mu2_term = torch.clamp(mu2_term, max=mu2_cap)
-                explicit_gelation = mu1_term + mu2_term
-                learned_gelation = self.learned_clot_penalty(sp_safe)
-            gel_extra = explicit_gelation + learned_gelation
-            if _biochem_gelation_prior_gate_enabled():
-                # Wall-localised [0,1] map: keeps bulk lumen near pure Carreau (μ_kin_baseline) unless
-                # kinematics indicate clot-risk (separation / low-shear × wall proximity).
-                props_g = {"u_ref": u_ref.to(dtype=torch.float32), "d_bar": d_bar.to(dtype=torch.float32)}
-                p_gate = clot_prior_score_flat(
+            if mu_map_v2_active:
+                # Leg B v2: mu_eff = Carreau(u,v) + clot-mask MLP overlay (no GNODE mu head).
+                y_ref = y_ref_macro
+                if (
+                    y_ref is None
+                    and y_true_trajectory is not None
+                    and int(y_true_trajectory.shape[0]) > label_y_idx
+                ):
+                    y_ref = y_true_trajectory[label_y_idx]
+                current_mu_eff = self._clot_phi_injector.apply_mu_map(
                     batch,
-                    u_nd.reshape(-1),
-                    v_nd.reshape(-1),
-                    self._bio_cfg,
-                    props_g,
+                    label_y_idx,
+                    u_nd=u_nd.reshape(-1),
+                    v_nd=v_nd.reshape(-1),
+                    species_log=sp_safe,
+                    y_reference=y_ref,
+                    prev_mu_eff_si=current_mu_eff.reshape(-1),
+                    allowed_commit_mask=deploy_allowed_commit_mask,
+                    macro_step_index=i,
                 )
-                p_gate = p_gate.detach().clamp(0.0, 1.0).reshape(-1, 1).to(dtype=gel_extra.dtype)
-                gel_extra = gel_extra * p_gate
-            total_multiplier = 1.0 + gel_extra
-            current_mu_eff = mu_kin_baseline * total_multiplier
-            if _biochem_delta_mu_head_enabled():
-                if _biochem_split_mu_regime_head_enabled():
-                    # Trigger features (SI/physics aligned):
-                    # [log1p species(12), FI_si, Mat_si, gamma_dot, wall_prox, wall_mask,
-                    #  adverse_shear_cue, low_shear_cue]
-                    sdf_nd = kin_in[:, NodeFeat.SDF]
-                    wall_prox = torch.exp(-torch.abs(sdf_nd)).to(dtype=sp_safe.dtype)
-                    wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
-                    adverse_shear_cue = torch.relu(-(dshear_ds_phys - self.sgt)).to(dtype=sp_safe.dtype)
-                    adverse_shear_cue = adverse_shear_cue / (adverse_shear_cue + abs(float(self.sgt)) + 1e-6)
-                    low_shear_cue = 1.0 / (1.0 + gamma_dot.to(dtype=sp_safe.dtype))
-                    trigger_feats = torch.cat(
-                        [
-                            sp_safe,
-                            FI_si,
-                            Mat_si,
-                            gamma_dot.to(dtype=sp_safe.dtype),
-                            wall_prox,
-                            wall_mask,
-                            adverse_shear_cue,
-                            low_shear_cue,
-                        ],
-                        dim=1,
-                    )
-                    gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
-                    use_nucleation_growth = _biochem_clot_nucleation_growth_enabled()
-                    if use_nucleation_growth:
-                        nuc_logits = self.mu_nucleation_gate_head(trigger_feats) + self.mu_clot_nucleation_bias
-                        growth_logits = self.mu_growth_gate_head(trigger_feats) + self.mu_clot_growth_bias
-                        nucleation_prob = torch.sigmoid(torch.clamp(nuc_logits / gate_temp, min=-50.0, max=50.0))
-                        growth_prob = torch.sigmoid(torch.clamp(growth_logits / gate_temp, min=-50.0, max=50.0))
-                        if prev_clot_gate is None:
-                            gate = nucleation_prob
-                        else:
-                            growth_mix = (self.mu_clot_growth_memory * prev_clot_gate) + (
-                                (1.0 - self.mu_clot_growth_memory) * growth_prob
-                            )
-                            gate = torch.maximum(nucleation_prob, growth_mix)
-                        wall_prior = torch.maximum(wall_prox, self.mu_clot_wall_prior_mix * wall_mask)
-                        gate = gate * torch.clamp(wall_prior, min=self.mu_clot_wall_prior_floor, max=1.0)
-                    else:
-                        gate_logits = self.mu_trigger_gate_head(trigger_feats)
-                        gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
-                        nucleation_prob = gate
-                        growth_prob = gate
-                    # Physics prior: suppress neural tail/wall corrections when no local clotting mass exists.
-                    bio_suppressor_enabled = (
-                        (os.environ.get("BIOCHEM_USE_BIO_GATE_SUPPRESSOR", "0") or "").strip().lower()
-                        in ("1", "true", "yes", "on")
-                    )
-                    if bio_suppressor_enabled:
-                        suppressor_thresh = max(
-                            float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI", "1e-4")),
-                            1e-8,
-                        )
-                        suppressor_power = max(
-                            float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_POWER", "1.0")),
-                            0.1,
-                        )
-                        bio_gate_floor = min(
-                            max(float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR", "0.0")), 0.0),
-                            0.95,
-                        )
-                        bio_signal = torch.clamp((FI_si + Mat_si) / suppressor_thresh, min=0.0, max=1.0)
-                        bio_signal = torch.pow(bio_signal, suppressor_power)
-                        if bio_gate_floor > 0.0:
-                            bio_signal = torch.clamp(bio_signal, min=bio_gate_floor, max=1.0)
-                        # Detached to avoid rewarding artificial FI/Mat spikes to open the gate.
-                        gate = gate * bio_signal.detach()
-                    gate_hard_thresh = _mu_trigger_gate_hard_threshold()
-                    soft_gate_steepness = self._mu_soft_gate_steepness()
-                    if gate_hard_thresh > 0.0 and _mu_soft_gate_scope() == "all":
-                        gate = _apply_mu_gate_soft_threshold(gate, steepness=soft_gate_steepness)
-                    else:
-                        trigger_gate_min = min(
-                            max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN", "0.0")), 0.0),
-                            0.95,
-                        )
-                        if trigger_gate_min > 0.0:
-                            gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
-                    delta_bulk_raw = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
-                    delta_tail_raw = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
-                    bulk_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_BULK", "1.5"))
-                    wall_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0"))
-                    if _biochem_delta_mu_symmetric_bulk_clip():
-                        delta_bulk = torch.clamp(delta_bulk_raw, min=-bulk_clip, max=bulk_clip)
-                    else:
-                        delta_bulk = delta_bulk_raw
-                    if _biochem_mu_gemini_fix_enabled():
-                        delta_tail = torch.clamp(delta_tail_raw, min=0.0, max=wall_clip)
-                    else:
-                        delta_tail = delta_tail_raw
-                    if _biochem_mu_additive_delta_enabled():
-                        delta_log_mu_bulk_tail = delta_bulk + (gate * delta_tail)
-                    else:
-                        delta_log_mu_bulk_tail = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
-                    delta_log_mu = delta_log_mu_bulk_tail
+                if getattr(self._clot_phi_injector, "next_allowed_commit_mask", None) is not None:
+                    deploy_allowed_commit_mask = self._clot_phi_injector.next_allowed_commit_mask
+                current_mu_eff = current_mu_eff.clamp(min=1e-8)
+            elif mu_neighbor_wall_active:
+                # Leg C: cap_low_shear Carreau bulk + GNODE mu head only on mask (not full domain).
+                from src.core_physics.clot_phi_mu_inject import (
+                    compose_mask_only_mu_eff,
+                    neighbor_wall_mu_mask_mode,
+                    resolve_mu_map_baselines_si,
+                    resolve_neighbor_wall_mu_mask,
+                )
 
-                    if _biochem_wall_delta_head_enabled():
+                y_ref = y_ref_macro
+                if (
+                    y_ref is None
+                    and y_true_trajectory is not None
+                    and int(y_true_trajectory.shape[0]) > label_y_idx
+                ):
+                    y_ref = y_true_trajectory[label_y_idx]
+                y_slice = (
+                    batch.y[label_y_idx].to(device)
+                    if y_ref is None
+                    else y_ref.to(device)
+                )
+                mu_bulk, mu_anchor = resolve_mu_map_baselines_si(
+                    batch, u_nd.reshape(-1), v_nd.reshape(-1), self.phys_cfg
+                )
+                if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                    mu_overlay = mu_eff_ic_steady_si.reshape(-1, 1)
+                elif _biochem_delta_mu_head_enabled() and not _biochem_split_mu_regime_head_enabled():
+                    delta_in = torch.cat([z_kin, sp_safe], dim=1)
+                    delta_log_mu = self.mu_delta_head(delta_in)
+                    delta_log_mu = torch.clamp(
+                        delta_log_mu,
+                        min=-self.mu_delta_log_clip,
+                        max=self.mu_delta_log_clip,
+                    )
+                    mu_overlay = (mu_anchor.reshape(-1, 1) * torch.exp(delta_log_mu)).clamp(
+                        min=1e-8
+                    )
+                    self._last_mu_delta_bulk = delta_log_mu.detach()
+                elif mu_k10e_simple:
+                    learned_delta_raw = F.softplus(
+                        self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
+                    )
+                    learned_delta_nd = torch.clamp(
+                        learned_delta_raw,
+                        max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
+                    )
+                    mu_overlay = (
+                        mu_anchor.reshape(-1, 1) + learned_delta_nd * mu_nd_scale
+                    ).clamp(min=1e-8)
+                    self._last_mu_delta_bulk = learned_delta_nd.detach()
+                else:
+                    mu_overlay = mu_anchor.reshape(-1, 1)
+
+                if mu_neighbor_wall_active:
+                    nw_mask = resolve_neighbor_wall_mu_mask(
+                        batch,
+                        device,
+                        self.phys_cfg,
+                        time_index=label_y_idx,
+                        y_slice=y_slice,
+                    )
+                    current_mu_eff = compose_mask_only_mu_eff(
+                        mu_bulk, mu_overlay.reshape(-1), nw_mask
+                    )
+                    self._last_neighbor_wall_mask = (
+                        nw_mask.reshape(-1, 1).to(dtype=current_mu_eff.dtype).detach()
+                    )
+                    self.last_diag_neighbor_wall_mode = neighbor_wall_mu_mask_mode()
+                    current_mu_eff = current_mu_eff.clamp(min=1e-8)
+
+            if not mu_map_v2_active and not mu_neighbor_wall_active:
+                # 1) Pure shear-thinning kinematic baseline (no species coupling).
+                mu_kin_baseline = mu_inf + (mu_0 - mu_inf) * torch.pow(
+                    1.0 + (lam * gamma_dot) ** 2, (n_idx - 1.0) / 2.0
+                )
+
+                # 2) Biochem gelation: explicit FI/Mat gates + species-only learned nonnegative penalty.
+                species_si = self.species_log_nd_to_si(sp_safe)
+                FI_si = species_si[:, 8:9]
+                # STRICT COMSOL PARITY: viscosity depends on Mat (channel 11) only.
+                Mat_si = species_si[:, 11:12]
+
+                if _biochem_mu_disable_explicit_gelation():
+                    explicit_gelation = torch.zeros_like(Mat_si)
+                    learned_gelation = torch.zeros_like(Mat_si)
+                else:
+                    mu1_term = (
+                        torch.zeros_like(Mat_si)
+                        if _biochem_mu_disable_mu1()
+                        else self.mu1_sigmoid(Mat_si)
+                    )
+                    mu2_term = (
+                        torch.zeros_like(FI_si)
+                        if _biochem_mu_disable_mu2()
+                        else self.mu2_sigmoid(FI_si)
+                    )
+                    mu2_cap_raw = (os.environ.get("BIOCHEM_MU2_SIGMOID_CAP") or "").strip()
+                    if mu2_cap_raw:
+                        mu2_cap = max(float(mu2_cap_raw), 0.0)
+                        mu2_term = torch.clamp(mu2_term, max=mu2_cap)
+                    explicit_gelation = mu1_term + mu2_term
+                    learned_gelation = self.learned_clot_penalty(sp_safe)
+                gel_extra = explicit_gelation + learned_gelation
+                if _biochem_gelation_prior_gate_enabled():
+                    # Wall-localised [0,1] map: keeps bulk lumen near pure Carreau (μ_kin_baseline) unless
+                    # kinematics indicate clot-risk (separation / low-shear × wall proximity).
+                    props_g = {"u_ref": u_ref.to(dtype=torch.float32), "d_bar": d_bar.to(dtype=torch.float32)}
+                    p_gate = clot_prior_score_flat(
+                        batch,
+                        u_nd.reshape(-1),
+                        v_nd.reshape(-1),
+                        self._bio_cfg,
+                        props_g,
+                    )
+                    p_gate = p_gate.detach().clamp(0.0, 1.0).reshape(-1, 1).to(dtype=gel_extra.dtype)
+                    gel_extra = gel_extra * p_gate
+                total_multiplier = 1.0 + gel_extra
+                current_mu_eff = mu_kin_baseline * total_multiplier
+                if _biochem_delta_mu_head_enabled():
+                    if _biochem_split_mu_regime_head_enabled():
+                        # Trigger features (SI/physics aligned):
+                        # [log1p species(12), FI_si, Mat_si, gamma_dot, wall_prox, wall_mask,
+                        #  adverse_shear_cue, low_shear_cue]
+                        sdf_nd = kin_in[:, NodeFeat.SDF]
+                        wall_prox = torch.exp(-torch.abs(sdf_nd)).to(dtype=sp_safe.dtype)
                         wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
-                        wall_signal_val = torch.maximum(
-                            wall_prox,
-                            self.mu_wall_mask_mix * wall_mask,
-                        )
-                        wall_gate_min = min(
-                            max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
-                            0.99,
-                        )
-                        wall_gate = _wall_gate_from_signal(
-                            wall_signal_val,
-                            center=self.mu_wall_gate_center,
-                            temp=self.mu_wall_gate_temp,
-                            t_scale=float(self.T_scale),
-                            logit_bias=float(self._mu_wall_gate_logit_bias),
-                            gate_min=wall_gate_min,
-                        )
-
-                        if bio_suppressor_enabled:
-                            # --- FIXED: Listen to the Alpha environment variable! ---
-                            wall_alpha = float(os.environ.get("BIOCHEM_BIO_SUPPRESS_WALL_ALPHA", "1.0"))
-                            # If alpha=0, effective_bio is 1.0 (no suppression).
-                            # If alpha=1, effective_bio is strictly the biological mass.
-                            effective_bio = bio_signal.detach() * wall_alpha + (1.0 - wall_alpha)
-                            wall_gate = wall_gate * effective_bio
-
-                        if gate_hard_thresh > 0.0:
-                            wall_gate = _apply_mu_gate_soft_threshold(
-                                wall_gate, steepness=soft_gate_steepness
-                            )
-                            wall_gate = wall_gate * _apply_mu_gate_soft_threshold(
-                                wall_signal_val, steepness=soft_gate_steepness
-                            )
-
-                        wall_isolate_geom = (
-                            (os.environ.get("BIOCHEM_WALL_HEAD_ISOLATE_GEOM", "0") or "").strip().lower()
-                            in ("1", "true", "yes", "on")
-                        )
-                        # Keep wall-head tensor width unchanged while allowing geometric isolation/blending.
-                        geom_only_feats = torch.cat(
+                        adverse_shear_cue = torch.relu(-(dshear_ds_phys - self.sgt)).to(dtype=sp_safe.dtype)
+                        adverse_shear_cue = adverse_shear_cue / (adverse_shear_cue + abs(float(self.sgt)) + 1e-6)
+                        low_shear_cue = 1.0 / (1.0 + gamma_dot.to(dtype=sp_safe.dtype))
+                        trigger_feats = torch.cat(
                             [
-                                torch.zeros_like(sp_safe),
-                                torch.zeros_like(FI_si),
-                                torch.zeros_like(Mat_si),
-                                sdf_nd.view(-1, 1).to(dtype=sp_safe.dtype),
+                                sp_safe,
+                                FI_si,
+                                Mat_si,
+                                gamma_dot.to(dtype=sp_safe.dtype),
                                 wall_prox,
-                                torch.zeros_like(wall_mask),
-                                torch.zeros_like(adverse_shear_cue),
-                                torch.zeros_like(low_shear_cue),
+                                wall_mask,
+                                adverse_shear_cue,
+                                low_shear_cue,
                             ],
                             dim=1,
                         )
-                        geom_blend = min(
-                            max(float(os.environ.get("BIOCHEM_WALL_HEAD_GEOM_BLEND", "0.0")), 0.0),
-                            1.0,
-                        )
-                        if wall_isolate_geom:
-                            geom_blend = 1.0
-                        wall_input_feats = ((1.0 - geom_blend) * trigger_feats) + (geom_blend * geom_only_feats)
-
-                        delta_wall_raw = self.mu_delta_wall_head(
-                            torch.cat([z_kin, wall_input_feats], dim=1)
-                        )
-                        if _biochem_mu_gemini_fix_enabled():
-                            delta_wall = torch.clamp(
-                                delta_wall_raw, min=0.0, max=wall_clip
-                            )
+                        gate_temp = max(self.mu_trigger_gate_temp * max(self.T_scale, 0.25), 1e-5)
+                        use_nucleation_growth = _biochem_clot_nucleation_growth_enabled()
+                        if use_nucleation_growth:
+                            nuc_logits = self.mu_nucleation_gate_head(trigger_feats) + self.mu_clot_nucleation_bias
+                            growth_logits = self.mu_growth_gate_head(trigger_feats) + self.mu_clot_growth_bias
+                            nucleation_prob = torch.sigmoid(torch.clamp(nuc_logits / gate_temp, min=-50.0, max=50.0))
+                            growth_prob = torch.sigmoid(torch.clamp(growth_logits / gate_temp, min=-50.0, max=50.0))
+                            if prev_clot_gate is None:
+                                gate = nucleation_prob
+                            else:
+                                growth_mix = (self.mu_clot_growth_memory * prev_clot_gate) + (
+                                    (1.0 - self.mu_clot_growth_memory) * growth_prob
+                                )
+                                gate = torch.maximum(nucleation_prob, growth_mix)
+                            wall_prior = torch.maximum(wall_prox, self.mu_clot_wall_prior_mix * wall_mask)
+                            gate = gate * torch.clamp(wall_prior, min=self.mu_clot_wall_prior_floor, max=1.0)
                         else:
-                            delta_wall = delta_wall_raw
-                        if (
-                            (os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY", "0") or "").strip().lower()
+                            gate_logits = self.mu_trigger_gate_head(trigger_feats)
+                            gate = torch.sigmoid(torch.clamp(gate_logits / gate_temp, min=-50.0, max=50.0))
+                            nucleation_prob = gate
+                            growth_prob = gate
+                        # Physics prior: suppress neural tail/wall corrections when no local clotting mass exists.
+                        bio_suppressor_enabled = (
+                            (os.environ.get("BIOCHEM_USE_BIO_GATE_SUPPRESSOR", "0") or "").strip().lower()
                             in ("1", "true", "yes", "on")
-                        ):
-                            wall_decay_factor = max(
-                                float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FACTOR", "6.0")),
-                                0.0,
+                        )
+                        if bio_suppressor_enabled:
+                            suppressor_thresh = max(
+                                float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_THRESHOLD_SI", "1e-4")),
+                                1e-8,
                             )
-                            wall_decay_floor = min(
-                                max(float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FLOOR", "0.0")), 0.0),
+                            suppressor_power = max(
+                                float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_POWER", "1.0")),
+                                0.1,
+                            )
+                            bio_gate_floor = min(
+                                max(float(os.environ.get("BIOCHEM_BIO_SUPPRESSOR_GATE_FLOOR", "0.0")), 0.0),
+                                0.95,
+                            )
+                            bio_signal = torch.clamp((FI_si + Mat_si) / suppressor_thresh, min=0.0, max=1.0)
+                            bio_signal = torch.pow(bio_signal, suppressor_power)
+                            if bio_gate_floor > 0.0:
+                                bio_signal = torch.clamp(bio_signal, min=bio_gate_floor, max=1.0)
+                            # Detached to avoid rewarding artificial FI/Mat spikes to open the gate.
+                            gate = gate * bio_signal.detach()
+                        gate_hard_thresh = _mu_trigger_gate_hard_threshold()
+                        soft_gate_steepness = self._mu_soft_gate_steepness()
+                        if gate_hard_thresh > 0.0 and _mu_soft_gate_scope() == "all":
+                            gate = _apply_mu_gate_soft_threshold(gate, steepness=soft_gate_steepness)
+                        else:
+                            trigger_gate_min = min(
+                                max(float(os.environ.get("BIOCHEM_TRIGGER_GATE_MIN", "0.0")), 0.0),
+                                0.95,
+                            )
+                            if trigger_gate_min > 0.0:
+                                gate = torch.clamp(gate, min=trigger_gate_min, max=1.0)
+                        delta_bulk_raw = self.mu_delta_bulk_head(torch.cat([z_kin, sp_safe], dim=1))
+                        delta_tail_raw = self.mu_delta_tail_head(torch.cat([z_kin, trigger_feats], dim=1))
+                        bulk_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_BULK", "1.5"))
+                        wall_clip = float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0"))
+                        if _biochem_delta_mu_symmetric_bulk_clip():
+                            delta_bulk = torch.clamp(delta_bulk_raw, min=-bulk_clip, max=bulk_clip)
+                        else:
+                            delta_bulk = delta_bulk_raw
+                        if _biochem_mu_gemini_fix_enabled():
+                            delta_tail = torch.clamp(delta_tail_raw, min=0.0, max=wall_clip)
+                        else:
+                            delta_tail = delta_tail_raw
+                        if _biochem_mu_additive_delta_enabled():
+                            delta_log_mu_bulk_tail = delta_bulk + (gate * delta_tail)
+                        else:
+                            delta_log_mu_bulk_tail = ((1.0 - gate) * delta_bulk) + (gate * delta_tail)
+                        delta_log_mu = delta_log_mu_bulk_tail
+
+                        if _biochem_wall_delta_head_enabled():
+                            wall_mask = batch.mask_wall.view(-1, 1).to(dtype=sp_safe.dtype)
+                            wall_signal_val = torch.maximum(
+                                wall_prox,
+                                self.mu_wall_mask_mix * wall_mask,
+                            )
+                            wall_gate_min = min(
+                                max(float(os.environ.get("BIOCHEM_WALL_GATE_MIN", "0.0")), 0.0),
+                                0.99,
+                            )
+                            wall_gate = _wall_gate_from_signal(
+                                wall_signal_val,
+                                center=self.mu_wall_gate_center,
+                                temp=self.mu_wall_gate_temp,
+                                t_scale=float(self.T_scale),
+                                logit_bias=float(self._mu_wall_gate_logit_bias),
+                                gate_min=wall_gate_min,
+                            )
+
+                            if bio_suppressor_enabled:
+                                # --- FIXED: Listen to the Alpha environment variable! ---
+                                wall_alpha = float(os.environ.get("BIOCHEM_BIO_SUPPRESS_WALL_ALPHA", "1.0"))
+                                # If alpha=0, effective_bio is 1.0 (no suppression).
+                                # If alpha=1, effective_bio is strictly the biological mass.
+                                effective_bio = bio_signal.detach() * wall_alpha + (1.0 - wall_alpha)
+                                wall_gate = wall_gate * effective_bio
+
+                            if gate_hard_thresh > 0.0:
+                                wall_gate = _apply_mu_gate_soft_threshold(
+                                    wall_gate, steepness=soft_gate_steepness
+                                )
+                                wall_gate = wall_gate * _apply_mu_gate_soft_threshold(
+                                    wall_signal_val, steepness=soft_gate_steepness
+                                )
+
+                            wall_isolate_geom = (
+                                (os.environ.get("BIOCHEM_WALL_HEAD_ISOLATE_GEOM", "0") or "").strip().lower()
+                                in ("1", "true", "yes", "on")
+                            )
+                            # Keep wall-head tensor width unchanged while allowing geometric isolation/blending.
+                            geom_only_feats = torch.cat(
+                                [
+                                    torch.zeros_like(sp_safe),
+                                    torch.zeros_like(FI_si),
+                                    torch.zeros_like(Mat_si),
+                                    sdf_nd.view(-1, 1).to(dtype=sp_safe.dtype),
+                                    wall_prox,
+                                    torch.zeros_like(wall_mask),
+                                    torch.zeros_like(adverse_shear_cue),
+                                    torch.zeros_like(low_shear_cue),
+                                ],
+                                dim=1,
+                            )
+                            geom_blend = min(
+                                max(float(os.environ.get("BIOCHEM_WALL_HEAD_GEOM_BLEND", "0.0")), 0.0),
                                 1.0,
                             )
-                            wall_dist = torch.abs(sdf_nd).view(-1, 1).to(dtype=sp_safe.dtype)
-                            wall_decay = torch.exp(-wall_dist * wall_decay_factor)
-                            if wall_decay_floor > 0.0:
-                                wall_decay = wall_decay_floor + ((1.0 - wall_decay_floor) * wall_decay)
-                            delta_wall = delta_wall * wall_decay
-                        self._last_log_mu_before_wall = (
-                            torch.log(current_mu_eff.clamp(min=1e-8)) + delta_log_mu
+                            if wall_isolate_geom:
+                                geom_blend = 1.0
+                            wall_input_feats = ((1.0 - geom_blend) * trigger_feats) + (geom_blend * geom_only_feats)
+
+                            delta_wall_raw = self.mu_delta_wall_head(
+                                torch.cat([z_kin, wall_input_feats], dim=1)
+                            )
+                            if _biochem_mu_gemini_fix_enabled():
+                                delta_wall = torch.clamp(
+                                    delta_wall_raw, min=0.0, max=wall_clip
+                                )
+                            else:
+                                delta_wall = delta_wall_raw
+                            if (
+                                (os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY", "0") or "").strip().lower()
+                                in ("1", "true", "yes", "on")
+                            ):
+                                wall_decay_factor = max(
+                                    float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FACTOR", "6.0")),
+                                    0.0,
+                                )
+                                wall_decay_floor = min(
+                                    max(float(os.environ.get("BIOCHEM_WALL_SPATIAL_DECAY_FLOOR", "0.0")), 0.0),
+                                    1.0,
+                                )
+                                wall_dist = torch.abs(sdf_nd).view(-1, 1).to(dtype=sp_safe.dtype)
+                                wall_decay = torch.exp(-wall_dist * wall_decay_factor)
+                                if wall_decay_floor > 0.0:
+                                    wall_decay = wall_decay_floor + ((1.0 - wall_decay_floor) * wall_decay)
+                                delta_wall = delta_wall * wall_decay
+                            self._last_log_mu_before_wall = (
+                                torch.log(current_mu_eff.clamp(min=1e-8)) + delta_log_mu
+                            )
+                            wall_delta_act = _mu_wall_branch_delta(delta_wall)
+                            wall_mix = _biochem_mu_wall_mix_mode()
+                            if wall_mix == "relu_add":
+                                wall_term = self.mu_wall_delta_gain * wall_delta_act
+                                delta_log_mu = delta_log_mu + (wall_mask * wall_term)
+                                wall_gate = torch.ones_like(wall_gate)
+                            else:
+                                wall_gate = _apply_wall_gate_curriculum(
+                                    wall_gate,
+                                    wall_mask,
+                                    teacher_epoch=self._biochem_teacher_epoch,
+                                    curriculum_epochs=self._mu_wall_gate_curriculum_epochs,
+                                )
+                                delta_log_mu = delta_log_mu + (
+                                    self.mu_wall_delta_gain * wall_gate * wall_delta_act
+                                )
+                            self._last_mu_wall_gate = wall_gate
+                            self._last_mu_delta_wall = delta_wall
+
+                        delta_log_mu = torch.clamp(
+                            delta_log_mu,
+                            min=-wall_clip,
+                            max=wall_clip,
                         )
-                        wall_delta_act = _mu_wall_branch_delta(delta_wall)
-                        wall_mix = _biochem_mu_wall_mix_mode()
-                        if wall_mix == "relu_add":
-                            wall_term = self.mu_wall_delta_gain * wall_delta_act
-                            delta_log_mu = delta_log_mu + (wall_mask * wall_term)
-                            wall_gate = torch.ones_like(wall_gate)
-                        else:
-                            wall_gate = _apply_wall_gate_curriculum(
-                                wall_gate,
-                                wall_mask,
-                                teacher_epoch=self._biochem_teacher_epoch,
-                                curriculum_epochs=self._mu_wall_gate_curriculum_epochs,
-                            )
-                            delta_log_mu = delta_log_mu + (
-                                self.mu_wall_delta_gain * wall_gate * wall_delta_act
-                            )
-                        self._last_mu_wall_gate = wall_gate
-                        self._last_mu_delta_wall = delta_wall
 
-                    delta_log_mu = torch.clamp(
-                        delta_log_mu,
-                        min=-wall_clip,
-                        max=wall_clip,
-                    )
-
-                    # Expose lightweight diagnostics for training loss/metrics.
-                    self._last_mu_trigger_gate = gate
-                    self._last_mu_delta_bulk = delta_bulk
-                    self._last_mu_delta_tail = delta_tail
-                    self._last_mu_nucleation_prob = nucleation_prob
-                    self._last_mu_growth_prob = growth_prob
-                    self._last_mu_nucleation_cue = (
-                        0.50 * adverse_shear_cue + 0.20 * wall_prox + 0.30 * torch.clamp((FI_si + Mat_si), min=0.0, max=1.0)
-                    ).detach()
-                    prev_clot_gate = gate.detach() if detach_macro_state else gate
-                else:
-                    delta_in = torch.cat([z_kin, sp_safe], dim=1)
-                    delta_log_mu = self.mu_delta_head(delta_in)
-                effective_delta_clip = self.mu_delta_log_clip
-                if (
-                    (os.environ.get("BIOCHEM_USE_SPLIT_MU_HEAD", "0") or "").strip().lower()
-                    in ("1", "true", "yes", "on")
-                ):
-                    effective_delta_clip = max(
-                        effective_delta_clip,
-                        float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0")),
-                    )
-                delta_log_mu = torch.clamp(delta_log_mu, min=-effective_delta_clip, max=effective_delta_clip)
-                if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
-                    current_mu_eff = mu_eff_ic_steady_si.clone()
-                else:
-                    current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
-            elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
-                current_mu_eff = mu_eff_ic_steady_si.clone()
-            elif mu_k10d_simple or mu_k10e_simple:
-                sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
-                if mu_ss_const is None:
-                    mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
-                        batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
-                    )
-                learned_delta_raw = F.softplus(
-                    self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
-                )
-                if mu_k10e_simple:
+                        # Expose lightweight diagnostics for training loss/metrics.
+                        self._last_mu_trigger_gate = gate
+                        self._last_mu_delta_bulk = delta_bulk
+                        self._last_mu_delta_tail = delta_tail
+                        self._last_mu_nucleation_prob = nucleation_prob
+                        self._last_mu_growth_prob = growth_prob
+                        self._last_mu_nucleation_cue = (
+                            0.50 * adverse_shear_cue + 0.20 * wall_prox + 0.30 * torch.clamp((FI_si + Mat_si), min=0.0, max=1.0)
+                        ).detach()
+                        prev_clot_gate = gate.detach() if detach_macro_state else gate
+                    else:
+                        delta_in = torch.cat([z_kin, sp_safe], dim=1)
+                        delta_log_mu = self.mu_delta_head(delta_in)
+                    effective_delta_clip = self.mu_delta_log_clip
+                    if (
+                        (os.environ.get("BIOCHEM_USE_SPLIT_MU_HEAD", "0") or "").strip().lower()
+                        in ("1", "true", "yes", "on")
+                    ):
+                        effective_delta_clip = max(
+                            effective_delta_clip,
+                            float(os.environ.get("BIOCHEM_DELTA_MU_LOG_CLIP_WALL", "5.0")),
+                        )
+                    delta_log_mu = torch.clamp(delta_log_mu, min=-effective_delta_clip, max=effective_delta_clip)
                     if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
                         current_mu_eff = mu_eff_ic_steady_si.clone()
-                        self._last_k10e_adj_mask = torch.zeros_like(mu_eff_ic_steady_si)
-                        self._last_mu_delta_bulk = torch.zeros_like(mu_eff_ic_steady_si)
                     else:
-                        learned_delta_nd = torch.clamp(
-                            learned_delta_raw,
-                            max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
+                        current_mu_eff = current_mu_eff * torch.exp(delta_log_mu)
+                    if not _biochem_split_mu_regime_head_enabled():
+                        self._last_mu_delta_bulk = delta_log_mu.detach()
+                        self._last_mu_delta_tail = torch.zeros_like(delta_log_mu)
+                        self._last_mu_trigger_gate = torch.zeros_like(delta_log_mu)
+                elif mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                    current_mu_eff = mu_eff_ic_steady_si.clone()
+                elif mu_k10d_simple or mu_k10e_simple:
+                    sp_safe = torch.clamp(current_species, _SPECIES_LOG1P_MIN, _SPECIES_LOG1P_MAX)
+                    if mu_ss_const is None:
+                        mu_ss_const, _, z_kin_ws = self._steady_kinematics_mu_uv(
+                            batch, z_kin_ws, mod_adv, mod_rheo, mod_curve
                         )
-                        sdf_nd = kin_in[:, NodeFeat.SDF]
-                        wall_mask = batch.mask_wall.view(-1, 1).to(dtype=learned_delta_nd.dtype)
-                        adj_mask = k10e_wall_adjacent_mask(sdf_nd, wall_mask)
-                        if _biochem_env_truthy("BIOCHEM_K10E_CORONA_GROWTH", default=True):
-                            adj_mask = _k10e_dilate_adjacent_mask(
-                                adj_mask, batch.edge_index.to(device=adj_mask.device)
-                            )
-                        learned_delta_si = learned_delta_nd * mu_nd_scale
-                        if (
-                            _biochem_k10g_oracle_clots_enabled()
-                            and y_true_trajectory is not None
-                            and int(y_true_trajectory.shape[0]) > i
-                            and int(y_true_trajectory.shape[-1]) > PredChannels.MU_EFF_ND
-                        ):
-                            mu_gt_si = self.phys_cfg.viscosity_nd_to_si(
-                                y_true_trajectory[i, :, PredChannels.MU_EFF_ND : PredChannels.MU_EFF_ND + 1]
-                            ).to(device=mu_ss_const.device, dtype=mu_ss_const.dtype)
-                            clot_boost = (mu_gt_si - mu_ss_const).clamp(min=0.0)
-                            current_mu_eff = mu_ss_const + (adj_mask * clot_boost)
-                            self._last_mu_delta_bulk = (clot_boost / mu_nd_scale).detach()
+                    learned_delta_raw = F.softplus(
+                        self.mu_delta_head(torch.cat([z_kin, sp_safe], dim=1))
+                    )
+                    if mu_k10e_simple:
+                        if mu_ic_steady_kin and i == 0 and mu_eff_ic_steady_si is not None:
+                            current_mu_eff = mu_eff_ic_steady_si.clone()
+                            self._last_k10e_adj_mask = torch.zeros_like(mu_eff_ic_steady_si)
+                            self._last_mu_delta_bulk = torch.zeros_like(mu_eff_ic_steady_si)
                         else:
-                            current_mu_eff = mu_ss_const + (adj_mask * learned_delta_si)
-                            self._last_mu_delta_bulk = learned_delta_nd.detach()
-                        self._last_k10e_adj_mask = adj_mask.detach()
-                else:
-                    learned_delta = learned_delta_raw
-                    max_delta_raw = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
-                    if max_delta_raw:
-                        learned_delta = torch.clamp(learned_delta, max=max(float(max_delta_raw), 1e-8))
-                    current_mu_eff = mu_ss_const + learned_delta
-                    self._last_mu_delta_bulk = learned_delta.detach()
-                self._last_mu_delta_tail = torch.zeros_like(self._last_mu_delta_bulk)
-                self._last_mu_trigger_gate = torch.zeros_like(self._last_mu_delta_bulk)
-            current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
+                            learned_delta_nd = torch.clamp(
+                                learned_delta_raw,
+                                max=max(_k10e_env_float("BIOCHEM_K10E_MU_DELTA_ND_MAX", 18.0), 1e-6),
+                            )
+                            sdf_nd = kin_in[:, NodeFeat.SDF]
+                            wall_mask = batch.mask_wall.view(-1, 1).to(dtype=learned_delta_nd.dtype)
+                            adj_mask = k10e_wall_adjacent_mask(sdf_nd, wall_mask)
+                            if _biochem_env_truthy("BIOCHEM_K10E_CORONA_GROWTH", default=True):
+                                adj_mask = _k10e_dilate_adjacent_mask(
+                                    adj_mask, batch.edge_index.to(device=adj_mask.device)
+                                )
+                            learned_delta_si = learned_delta_nd * mu_nd_scale
+                            if (
+                                _biochem_k10g_oracle_clots_enabled()
+                                and y_true_trajectory is not None
+                                and int(y_true_trajectory.shape[0]) > i
+                                and int(y_true_trajectory.shape[-1]) > PredChannels.MU_EFF_ND
+                            ):
+                                mu_gt_si = self.phys_cfg.viscosity_nd_to_si(
+                                    y_true_trajectory[i, :, PredChannels.MU_EFF_ND : PredChannels.MU_EFF_ND + 1]
+                                ).to(device=mu_ss_const.device, dtype=mu_ss_const.dtype)
+                                clot_boost = (mu_gt_si - mu_ss_const).clamp(min=0.0)
+                                current_mu_eff = mu_ss_const + (adj_mask * clot_boost)
+                                self._last_mu_delta_bulk = (clot_boost / mu_nd_scale).detach()
+                            else:
+                                current_mu_eff = mu_ss_const + (adj_mask * learned_delta_si)
+                                self._last_mu_delta_bulk = learned_delta_nd.detach()
+                            self._last_k10e_adj_mask = adj_mask.detach()
+                    else:
+                        learned_delta = learned_delta_raw
+                        max_delta_raw = (os.environ.get("BIOCHEM_K10D_MU_DELTA_SI_MAX") or "").strip()
+                        if max_delta_raw:
+                            learned_delta = torch.clamp(learned_delta, max=max(float(max_delta_raw), 1e-8))
+                        current_mu_eff = mu_ss_const + learned_delta
+                        self._last_mu_delta_bulk = learned_delta.detach()
+                    self._last_mu_delta_tail = torch.zeros_like(self._last_mu_delta_bulk)
+                    self._last_mu_trigger_gate = torch.zeros_like(self._last_mu_delta_bulk)
+                current_mu_eff = torch.clamp(current_mu_eff, min=1e-8)
+
+                if (
+                    self._clot_phi_injector is not None
+                    and getattr(self._clot_phi_injector, "enabled", False)
+                    and not biochem_mlp_mu_map_enabled()
+                ):
+                    y_ref = y_ref_macro
+                    if (
+                        y_ref is None
+                        and y_true_trajectory is not None
+                        and int(y_true_trajectory.shape[0]) > label_y_idx
+                    ):
+                        y_ref = y_true_trajectory[label_y_idx]
+                    current_mu_eff = self._clot_phi_injector.apply(
+                        batch,
+                        label_y_idx,
+                        current_mu_eff,
+                        u_nd=u_nd.reshape(-1),
+                        v_nd=v_nd.reshape(-1),
+                        species_log=sp_safe,
+                        y_reference=y_ref,
+                    )
 
             # ==========================================
             # BIOCHEM ATTENTION MODULATOR (Streamwise + detached)
@@ -2046,7 +2358,20 @@ class GNODE_Phase3(nn.Module):
                     current_species = current_species.detach()
                     current_mu_eff = current_mu_eff.detach()
 
+            if rollout_progress and rollout_progress_t0 is not None and _should_log_rollout_step(i, num_times):
+                t_nd = float(evaluation_times[i].item())
+                t_ref_si = float(getattr(self._bio_cfg, "t_final", 30000.0))
+                elapsed = time.perf_counter() - rollout_progress_t0
+                print(
+                    f"   [i]  macro {i + 1}/{num_times} t~{t_nd * t_ref_si:.0f}s (+{elapsed:.0f}s)",
+                    flush=True,
+                )
+
         # Stack into shape: [ Time, Nodes, 16 ]
         pred_series = torch.stack(pred_trajectory, dim=0)
+
+        if rollout_progress and rollout_progress_t0 is not None:
+            elapsed = time.perf_counter() - rollout_progress_t0
+            print(f"   [i]  rollout done ({num_times} steps, {elapsed:.0f}s)", flush=True)
 
         return pred_series

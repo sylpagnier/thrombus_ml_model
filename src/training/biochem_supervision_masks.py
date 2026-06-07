@@ -90,6 +90,9 @@ def resolve_data_bio_supervision_mask(
 ) -> torch.Tensor:
     """Same node set as ``L_Data_Bio`` (anchor + optional clot_band / wall_only)."""
     bio_mask_mode = (os.environ.get("BIOCHEM_DATA_BIO_MASK_MODE") or "global").strip().lower()
+    # ``neighbor`` = clot-phi neighbor shell (wall + GT clot seeds + 1-hop); needs CLOT_PHI_* env.
+    if bio_mask_mode in ("neighbor", "neighbor_band", "neighbor_shell"):
+        bio_mask_mode = "clot_band"
     node_is_bio_target = truth_mask.view(-1).bool().to(device=device)
     times_mode = supervision_mask_times_mode()
 

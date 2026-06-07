@@ -20,12 +20,8 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from src.architecture.gnode_biochem import (
-    GNODE_Phase3,
-    apply_biochem_forward_policy_from_checkpoint_meta,
-    resolve_gnode_phase3_ctor_kwargs,
-)
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
+from src.inference.biochem_teacher_loader import build_biochem_teacher, resolve_rollout_mu_ratio_max
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
 from src.utils.nondim import to_t_nd
 from src.utils.paths import get_project_root
@@ -37,69 +33,6 @@ def _heartbeat(label: str, interval_s: float, stop: threading.Event) -> None:
     while not stop.wait(interval_s):
         tick += 1
         print(f"[i]  {label} ... {tick * interval_s:.0f}s", flush=True)
-
-
-def _resolve_rollout_mu_ratio_max(
-    bio_cfg: BiochemConfig,
-    *,
-    cli_value: float | None,
-) -> float:
-    """COMSOL mu1/mu2 step ceiling for offline rollout (not mu_eff ratio)."""
-    if cli_value is not None:
-        return max(float(cli_value), 1.0)
-    raw = (os.environ.get("BIOCHEM_TEACHER_MU_RATIO_MAX") or "").strip()
-    if raw:
-        return max(float(raw), 1.0)
-    return max(float(getattr(bio_cfg, "mu_ratio_max", 80.0)), 1.0)
-
-
-def _build_teacher(
-    ckpt: dict,
-    *,
-    phys_cfg: PhysicsConfig,
-    bio_cfg: BiochemConfig,
-    device: torch.device,
-    mu_ratio_max: float,
-) -> GNODE_Phase3:
-    state_dict = ckpt.get("model_state_dict") or ckpt
-    bio_prior_default = max(0, int(os.environ.get("BIOCHEM_BIO_ENCODER_PRIOR_DIM", "2") or "2"))
-    ctor = resolve_gnode_phase3_ctor_kwargs(
-        ckpt,
-        state_dict,
-        bio_encoder_prior_dim_default=bio_prior_default,
-        latent_dim_default=256,
-        fourier_bands_default=16,
-        use_siren_default=True,
-        gnode_layers_default=1,
-        max_inner_iters_default=10,
-    )
-    teacher = GNODE_Phase3(
-        phys_cfg=phys_cfg,
-        in_channels=int(ctor["in_channels"]),
-        spatial_channels=int(ctor["spatial_channels"]),
-        latent_dim=int(ctor["latent_dim"]),
-        max_inner_iters=max(3, int(ctor.get("max_inner_iters", 10))),
-        bio_encoder_prior_dim=int(ctor["bio_encoder_prior_dim"]),
-        mu_ratio_max=mu_ratio_max,
-        mat_crit=float(bio_cfg.viscosity_mat_crit),
-        fi_crit=float(bio_cfg.viscosity_fi_crit),
-        temp_mat=float(bio_cfg.viscosity_gnode_temp_mat),
-        temp_fi=float(bio_cfg.viscosity_gnode_temp_fi),
-        num_fourier_freqs=int(ctor["num_fourier_freqs"]),
-        use_siren_decoder=bool(ctor["use_siren_decoder"]),
-        gnode_layers=int(ctor["gnode_layers"]),
-        use_hard_bcs=bool(ctor["use_hard_bcs"]),
-    ).to(device)
-    teacher.load_state_dict(state_dict, strict=False)
-    apply_biochem_forward_policy_from_checkpoint_meta(ckpt, quiet=False)
-    teacher.eval()
-    print(
-        f"[i]  GNODE rollout arch: in={int(ctor['in_channels'])} spatial={int(ctor['spatial_channels'])} "
-        f"prior={int(ctor['bio_encoder_prior_dim'])} latent={int(ctor['latent_dim'])} "
-        f"siren={int(ctor['use_siren_decoder'])} fourier={int(ctor['num_fourier_freqs'])}",
-        flush=True,
-    )
-    return teacher
 
 
 def main() -> None:
@@ -157,14 +90,14 @@ def main() -> None:
         os.environ["BIOCHEM_GT_KINE_VEL"] = "0"
     else:
         os.environ.setdefault("BIOCHEM_GT_KINE_VEL", "1")
-    rollout_mu_ratio = _resolve_rollout_mu_ratio_max(bio_cfg, cli_value=args.mu_ratio_max)
+    rollout_mu_ratio = resolve_rollout_mu_ratio_max(bio_cfg, cli_value=args.mu_ratio_max)
     os.environ["BIOCHEM_TEACHER_MU_RATIO_MAX"] = f"{rollout_mu_ratio:g}"
     # Speed knobs for offline rollout.
     os.environ.setdefault("BIOCHEM_ADJOINT_RK4_SUBSTEPS", "1")
     os.environ.setdefault("BIOCHEM_TBPTT_MAX_WINDOW", "6")
 
     ckpt = torch.load(teacher_path, map_location=device, weights_only=False)
-    teacher = _build_teacher(
+    teacher = build_biochem_teacher(
         ckpt,
         phys_cfg=phys_cfg,
         bio_cfg=bio_cfg,

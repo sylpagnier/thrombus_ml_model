@@ -127,6 +127,7 @@ def main() -> None:
         rows.append(row)
         print(
             f"{stem}: val f1={va['clot_f1']:.3f} rec={va['clot_rec']:.3f} "
+            f"shape={va.get('clot_shape', 0):.3f} shape_rec={va.get('clot_shape_rec', 0):.3f} "
             f"logMAE={va['mu_log_mae']:.3f} pred+={va['pred_pos_frac']:.3f} score={row['val_score']:.3f}"
         )
 
@@ -138,16 +139,19 @@ def main() -> None:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     f1s = [r["val"]["clot_f1"] for r in rows]
+    shapes = [r["val"].get("clot_shape", 0.0) for r in rows]
     maes = [r["val"]["mu_log_mae"] for r in rows]
     scores = [r["val_score"] for r in rows]
     mean_f1 = sum(f1s) / max(len(f1s), 1)
     min_f1 = min(f1s) if f1s else 0.0
+    mean_shape = sum(shapes) / max(len(shapes), 1)
     mean_mae = sum(maes) / max(len(maes), 1)
     min_mae = min(maes) if maes else 0.0
     mean_score = sum(scores) / max(len(scores), 1)
     print(
         f"[OK]  n={len(rows)} mean_f1={mean_f1:.3f} min_f1={min_f1:.3f} "
-        f"mean_logMAE={mean_mae:.3f} min_logMAE={min_mae:.3f} mean_score={mean_score:.3f} -> {out_path}"
+        f"mean_shape={mean_shape:.3f} mean_logMAE={mean_mae:.3f} min_logMAE={min_mae:.3f} "
+        f"mean_score={mean_score:.3f} -> {out_path}"
     )
 
 

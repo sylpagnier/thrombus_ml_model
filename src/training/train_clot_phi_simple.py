@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -19,11 +20,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from src.config import BiochemConfig, PhysicsConfig, VesselConfig
+from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
+from src.evaluation.clot_shape_score import compute_clot_shape_metrics
 from src.core_physics.clot_forecast import (
     build_clot_forecast_pair_step,
+    build_deploy_eligible_phi_gt,
+    clot_forecast_deploy_loss_enabled,
+    clot_forecast_mask_mode,
+    clot_forecast_mu_carry_detach,
+    clot_forecast_mu_carry_enabled,
     clot_forecast_one_step_enabled,
     clot_forecast_pair_stride,
+    iter_forecast_pairs,
+    resolve_forecast_deploy_mask_from_model,
+    resolve_rollout_prev_mu_si,
     snapshot_clot_forecast_config,
 )
 from src.core_physics.clot_phi_simple import (
@@ -33,6 +43,9 @@ from src.core_physics.clot_phi_simple import (
     cap_mu_eff_si,
     clot_phi_dropout,
     clot_phi_feature_dim,
+    clot_phi_fixed_mu_from_phi_enabled,
+    clot_phi_mesh_aux_lambda,
+    clot_phi_mesh_bulk_lambda,
     clot_phi_mlp_depth,
     clot_phi_hybrid_enabled,
     clot_phi_joint_bio_enabled,
@@ -47,8 +60,15 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_species_features_enabled,
     clot_phi_thresh_si,
     clot_phi_use_prior_features,
+    apply_clot_support_projection,
+    clot_phi_hard_support_projection_enabled,
     log_blend_mu_eff_si,
+    lumen_eligible_mask,
     mu_eff_from_delta_log_si,
+    resolve_clot_support_band_for_step,
+    snapshot_clot_support_config,
+    snapshot_mesh_aux_config,
+    snapshot_phi_only_rollout_config,
     physics_mu_eff_si,
     physics_phi_from_mu,
     rule_phi_from_mu_cap,
@@ -60,6 +80,7 @@ from src.core_physics.clot_phi_rollout import (
     clot_phi_rollout_detach_carry,
     clot_phi_rollout_enabled,
     clot_phi_vel_source,
+    snapshot_carry_gt_warmup_config,
 )
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
 from src.utils.paths import get_project_root
@@ -133,6 +154,145 @@ def _dice_score(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> 
     return (2.0 * inter + eps) / (float(pb.sum()) + float(tb.sum()) + eps)
 
 
+def _state_with_pred_mu(y_slice: torch.Tensor, mu_si: torch.Tensor, phys_cfg: PhysicsConfig) -> torch.Tensor:
+    """Build a pseudo rollout state with predicted mu_eff in channel 3 (SI -> ND)."""
+    state = y_slice.clone().to(dtype=torch.float32)
+    mu_cap = cap_mu_eff_si(mu_si.reshape(-1))
+    state[:, STATE_CHANNEL_MU_EFF_ND] = phys_cfg.viscosity_si_to_nd(mu_cap)
+    return state
+
+
+def _accumulate_clot_shape(
+    *,
+    shape_sums: dict[str, float],
+    data,
+    phi_pred: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    time_index: int,
+    t_out: int | None,
+    forecast_one_step: bool,
+    pair_stride: int,
+    t_steps: int,
+    fixed_mu_from_phi: bool,
+    hybrid: bool,
+    mu_pred: torch.Tensor,
+) -> None:
+    """Update shape_sums with one clot_shape sample (one-step uses mu_c @ t_out)."""
+    from src.core_physics.clot_phi_simple import clot_phi_shape_use_t_out_mu
+
+    t_shape = int(time_index)
+    if forecast_one_step and clot_phi_shape_use_t_out_mu():
+        if t_out is not None:
+            t_shape = int(t_out)
+        else:
+            t_shape = min(int(time_index) + int(pair_stride), int(t_steps) - 1)
+    if t_shape < 0 or t_shape >= int(t_steps):
+        return
+    if clot_phi_hard_support_projection_enabled() and mu_pred is not None:
+        mu_shape = mu_pred.reshape(-1)
+    elif forecast_one_step and clot_phi_shape_use_t_out_mu() and fixed_mu_from_phi:
+        step_out = build_clot_phi_step(data, t_shape, phys_cfg, bio_cfg, device)
+        mu_shape = log_blend_mu_eff_si(step_out.mu_c_si, phi_pred)
+    elif hybrid:
+        mu_shape = mu_pred.reshape(-1)
+    elif fixed_mu_from_phi:
+        step_t = build_clot_phi_step(data, t_shape, phys_cfg, bio_cfg, device)
+        mu_shape = log_blend_mu_eff_si(step_t.mu_c_si, phi_pred)
+    else:
+        mu_shape = mu_pred.reshape(-1)
+    y_sl = data.y[t_shape].to(device=device, dtype=torch.float32)
+    pred_state = _state_with_pred_mu(y_sl, mu_shape, phys_cfg)
+    sm = compute_clot_shape_metrics(
+        pred_state=pred_state,
+        gt_state=y_sl,
+        edge_index=data.edge_index.to(device),
+        phys_cfg=phys_cfg,
+    )
+    shape_sums["clot_shape"] += float(sm["clot_shape"])
+    shape_sums["clot_shape_rec"] += float(sm["clot_recall"])
+    shape_sums["clot_shape_pred_frac"] += float(sm["clot_pred_frac"])
+    shape_sums["clot_shape_gt_frac"] += float(sm["clot_gt_frac"])
+
+
+def _maybe_project_deploy_mu(
+    *,
+    data,
+    step,
+    mu_pred: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    forecast_one_step: bool,
+) -> torch.Tensor:
+    if not clot_phi_hard_support_projection_enabled():
+        return mu_pred.reshape(-1)
+    band = resolve_clot_support_band_for_step(
+        data,
+        device,
+        step,
+        phys_cfg,
+        bio_cfg,
+        forecast_one_step=forecast_one_step,
+    )
+    return apply_clot_support_projection(step.mu_c_si, mu_pred, band)
+
+
+def _mesh_aux_losses(
+    *,
+    phi_pred: torch.Tensor,
+    data,
+    step,
+    ti: int,
+    t_out: int | None,
+    forecast_one_step: bool,
+    pair_stride: int,
+    t_steps: int,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    use_soft: bool,
+) -> torch.Tensor:
+    """Full-mesh eligible-lumen aux BCE + bulk phi suppression at forecast target time."""
+    aux_w = clot_phi_mesh_aux_lambda()
+    bulk_w = clot_phi_mesh_bulk_lambda()
+    if aux_w <= 0.0 and bulk_w <= 0.0:
+        return torch.tensor(0.0, device=device)
+    t_mesh = int(ti)
+    if forecast_one_step:
+        if t_out is not None:
+            t_mesh = int(t_out)
+        else:
+            t_mesh = min(int(ti) + int(pair_stride), int(t_steps) - 1)
+    elig = lumen_eligible_mask(data, device)
+    if not bool(elig.any().item()):
+        return torch.tensor(0.0, device=device)
+    loss = torch.tensor(0.0, device=device)
+    if aux_w > 0.0:
+        phi_mesh_gt = build_deploy_eligible_phi_gt(
+            data,
+            t_mesh,
+            phys_cfg,
+            bio_cfg,
+            device,
+            use_soft=use_soft,
+        )
+        idx = elig.nonzero(as_tuple=False).view(-1)
+        pm = phi_pred[idx].clamp(1e-6, 1.0 - 1e-6)
+        tm = phi_mesh_gt[idx]
+        loss = loss + aux_w * F.binary_cross_entropy(pm, tm)
+    if bulk_w > 0.0:
+        thr = clot_phi_thresh_si(phys_cfg)
+        mu_gt_t = step.mu_gt_cap.reshape(-1)
+        bulk = elig & (mu_gt_t < thr)
+        if bool(bulk.any().item()):
+            idx_b = bulk.nonzero(as_tuple=False).view(-1)
+            pm = phi_pred[idx_b].clamp(1e-6, 1.0 - 1e-6)
+            loss = loss + bulk_w * F.binary_cross_entropy(pm, torch.zeros_like(pm))
+    return loss
+
+
 def _clot_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
     """Precision/recall/F1 and positive rate inside the supervision mask."""
     if not bool(mask.any().item()):
@@ -160,10 +320,29 @@ def _clot_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) 
     }
 
 
+def _checkpoint_rank_score(va: dict[str, float]) -> float:
+    """North-star rank for forecast / fixed-mu legs (always non-negative if f1>0)."""
+    shape = float(va.get("clot_shape", 0.0))
+    f1 = float(va.get("clot_f1", 0.0))
+    return shape * 0.65 + f1 * 0.35
+
+
 def _checkpoint_score(va: dict[str, float]) -> float:
     """Prefer non-collapsed val F1; penalize predict-none / predict-all / memorization."""
     if _env_bool("CLOT_PHI_REGRESSION_ONLY", False):
         return -float(va.get("mu_log_mae", 99.0))
+    if clot_phi_fixed_mu_from_phi_enabled() or clot_forecast_one_step_enabled():
+        shape = float(va.get("clot_shape", 0.0))
+        f1 = float(va.get("clot_f1", 0.0))
+        pp = float(va.get("pred_pos_frac", 0.0))
+        gt = float(va.get("gt_pos_frac", 0.0))
+        if pp > 0.95:
+            return -1.0
+        if gt >= 0.05 and pp > 3.5 * gt:
+            return -1.0
+        if gt < 0.05 and pp > 0.35:
+            return -1.0
+        return _checkpoint_rank_score(va)
     f1 = float(va.get("clot_f1", 0.0))
     pp = float(va.get("pred_pos_frac", 0.0))
     gt = float(va.get("gt_pos_frac", 0.0))
@@ -273,16 +452,63 @@ def _build_step(
     bio_cfg: BiochemConfig,
     device: torch.device,
     rollout_state: ClotPhiRolloutState | None,
+    forecast_state: ClotPhiRolloutState | None,
     t_steps: int,
     pair_stride: int,
+    t_out: int | None = None,
+    train_epoch: int | None = None,
 ):
     if clot_forecast_one_step_enabled():
-        t_out = ti + pair_stride
-        if t_out >= t_steps:
+        t_out_i = int(t_out if t_out is not None else ti + pair_stride)
+        if t_out_i >= t_steps or t_out_i < 0:
             return None
-        return build_clot_forecast_pair_step(data, ti, t_out, phys_cfg, bio_cfg, device)
+        return build_clot_forecast_pair_step(
+            data,
+            ti,
+            t_out_i,
+            phys_cfg,
+            bio_cfg,
+            device,
+            forecast_state=forecast_state,
+            train_epoch=train_epoch,
+        )
     return build_clot_phi_step(
-        data, ti, phys_cfg, bio_cfg, device, rollout_state=rollout_state
+        data,
+        ti,
+        phys_cfg,
+        bio_cfg,
+        device,
+        rollout_state=rollout_state,
+        train_epoch=train_epoch,
+    )
+
+
+def _resolve_step_loss_mask(
+    step,
+    data,
+    model: torch.nn.Module | None,
+    edge_index: torch.Tensor | None,
+    *,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    hybrid: bool,
+) -> torch.Tensor:
+    """Deploy-faithful forecast band (pred phi @ t_in); static for legacy modes."""
+    mode = clot_forecast_mask_mode()
+    if mode not in ("deploy_input", "deploy_pred"):
+        return step.loss_mask
+    if model is None:
+        return step.loss_mask
+    return resolve_forecast_deploy_mask_from_model(
+        data,
+        step=step,
+        model=model,
+        edge_index=edge_index,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        hybrid=hybrid,
     )
 
 
@@ -301,6 +527,7 @@ def _run_epoch(
     physics_oracle: bool = False,
     species_head: torch.nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
+    train_epoch: int | None = None,
 ) -> dict[str, float]:
     if train:
         if model is None or rule_baseline or physics_oracle:
@@ -331,8 +558,15 @@ def _run_epoch(
         "pred_pos_frac": 0.0,
         "gt_pos_frac": 0.0,
     }
+    shape_sums = {
+        "clot_shape": 0.0,
+        "clot_shape_rec": 0.0,
+        "clot_shape_pred_frac": 0.0,
+        "clot_shape_gt_frac": 0.0,
+    }
     n_steps = 0
     n_graphs = 0
+    n_shape_graphs = 0
     dice_lambda = max(float(os.environ.get("CLOT_PHI_DICE_LAMBDA", "0") or "0"), 0.0)
     anchor_balanced = _env_bool("CLOT_PHI_ANCHOR_BALANCED", False)
     path_step_scale: dict[str, float] = {}
@@ -350,6 +584,7 @@ def _run_epoch(
 
     pair_stride = clot_forecast_pair_stride()
     forecast_one_step = clot_forecast_one_step_enabled()
+    step_train_epoch = train_epoch if train else None
 
     with torch.set_grad_enabled(train):
         for path in paths:
@@ -374,8 +609,17 @@ def _run_epoch(
                 and not forecast_one_step
             )
             rollout_state = ClotPhiRolloutState() if rollout_on else None
-            t_max = t_steps - pair_stride if forecast_one_step else t_steps
-            for ti in range(0, max(t_max, 0), max(1, time_stride)):
+            forecast_carry_on = forecast_one_step and clot_forecast_mu_carry_enabled()
+            forecast_state = ClotPhiRolloutState() if forecast_carry_on else None
+            if forecast_one_step:
+                pair_list = iter_forecast_pairs(
+                    t_steps, time_stride=max(1, time_stride), pair_stride=pair_stride
+                )
+            else:
+                pair_list = [(ti, ti) for ti in range(0, t_steps, max(1, time_stride))]
+            last_mu_pred_si: torch.Tensor | None = None
+            last_gt_y: torch.Tensor | None = None
+            for ti, t_out in pair_list:
                 step = _build_step(
                     data,
                     ti,
@@ -383,15 +627,48 @@ def _run_epoch(
                     bio_cfg=bio_cfg,
                     device=device,
                     rollout_state=rollout_state,
+                    forecast_state=forecast_state,
                     t_steps=t_steps,
                     pair_stride=pair_stride,
+                    t_out=t_out if forecast_one_step else None,
+                    train_epoch=step_train_epoch,
                 )
                 if step is None:
                     continue
-                m = step.loss_mask
+                tgt = step.phi_gt
+                if clot_forecast_deploy_loss_enabled() and not forecast_one_step:
+                    mu_in = resolve_rollout_prev_mu_si(
+                        rollout_state,
+                        step,
+                        device,
+                        time_index=ti,
+                        train_epoch=step_train_epoch,
+                    )
+                    step = replace(
+                        step,
+                        mu_in_cap=mu_in,
+                        phi_in_gt=step.phi_gt,
+                    )
+                    tgt = build_deploy_eligible_phi_gt(
+                        data,
+                        ti,
+                        phys_cfg,
+                        bio_cfg,
+                        device,
+                        use_soft=use_soft,
+                    )
+                m = _resolve_step_loss_mask(
+                    step,
+                    data,
+                    model,
+                    edge_index,
+                    phys_cfg=phys_cfg,
+                    bio_cfg=bio_cfg,
+                    device=device,
+                    hybrid=hybrid,
+                )
                 if not bool(m.any().item()):
                     continue
-                tgt = step.phi_gt
                 if rule_baseline:
                     phi_pred = rule_phi_from_mu_cap(step.mu_gt_cap, step.region, phys_cfg)
                     mu_pred = log_blend_mu_eff_si(step.mu_c_si, phi_pred)
@@ -502,6 +779,15 @@ def _run_epoch(
                             mu_mse = F.mse_loss(log_mu_p[idx], log_mu_t[idx])
                         phi_pred = phi_ml
                         mu_pred = mu_ml
+                    mu_pred = _maybe_project_deploy_mu(
+                        data=data,
+                        step=step,
+                        mu_pred=mu_pred,
+                        phys_cfg=phys_cfg,
+                        bio_cfg=bio_cfg,
+                        device=device,
+                        forecast_one_step=forecast_one_step,
+                    )
                     if train and (not regression_only) and dice_lambda > 0.0:
                         pm = phi_pred[idx].clamp(1e-6, 1.0 - 1e-6)
                         inter = (pm * tm).sum()
@@ -512,6 +798,22 @@ def _run_epoch(
                             loss = mu_log_lambda * mu_mse + bio_lambda * bio_mse
                         else:
                             loss = bce + mu_log_lambda * mu_mse + bio_lambda * bio_mse
+                    if train and not rule_baseline and not physics_oracle:
+                        mesh_loss = _mesh_aux_losses(
+                            phi_pred=phi_pred,
+                            data=data,
+                            step=step,
+                            ti=ti,
+                            t_out=t_out if forecast_one_step else None,
+                            forecast_one_step=forecast_one_step,
+                            pair_stride=pair_stride,
+                            t_steps=t_steps,
+                            phys_cfg=phys_cfg,
+                            bio_cfg=bio_cfg,
+                            device=device,
+                            use_soft=use_soft,
+                        )
+                        loss = loss + mesh_loss
                     if train:
                         loss = loss * float(path_step_scale.get(path, 1.0))
                         loss.backward()
@@ -526,12 +828,60 @@ def _run_epoch(
                     for k, v in _clot_metrics(phi_pred, tgt, m).items():
                         metric_sums[k] += v
                     n_steps += 1
+                    t_gt = int(t_out) if forecast_one_step else int(ti)
+                    t_gt = min(int(t_gt), t_steps - 1)
+                    last_gt_y = data.y[t_gt].to(device=device, dtype=torch.float32)
+                    last_mu_pred_si = cap_mu_eff_si(mu_pred.reshape(-1))
                     if rollout_state is not None:
                         rollout_state.update_from_pred(
                             phi_pred,
                             mu_pred,
                             detach=clot_phi_rollout_detach_carry() or not train,
                         )
+                    if forecast_state is not None:
+                        forecast_state.update_from_pred(
+                            phi_pred,
+                            mu_pred,
+                            detach=clot_forecast_mu_carry_detach() or not train,
+                        )
+                    if forecast_one_step:
+                        _accumulate_clot_shape(
+                            shape_sums=shape_sums,
+                            data=data,
+                            phi_pred=phi_pred,
+                            phys_cfg=phys_cfg,
+                            bio_cfg=bio_cfg,
+                            device=device,
+                            time_index=ti,
+                            t_out=t_out,
+                            forecast_one_step=forecast_one_step,
+                            pair_stride=pair_stride,
+                            t_steps=t_steps,
+                            fixed_mu_from_phi=clot_phi_fixed_mu_from_phi_enabled(),
+                            hybrid=hybrid,
+                            mu_pred=mu_pred,
+                        )
+                        n_shape_graphs += 1
+
+            if (
+                not forecast_one_step
+                and last_mu_pred_si is not None
+                and last_gt_y is not None
+            ):
+                pred_state = _state_with_pred_mu(last_gt_y, last_mu_pred_si, phys_cfg)
+                gt_state = last_gt_y.clone()
+                ei_shape = data.edge_index.to(device)
+                sm = compute_clot_shape_metrics(
+                    pred_state=pred_state,
+                    gt_state=gt_state,
+                    edge_index=ei_shape,
+                    phys_cfg=phys_cfg,
+                )
+                shape_sums["clot_shape"] += float(sm["clot_shape"])
+                shape_sums["clot_shape_rec"] += float(sm["clot_recall"])
+                shape_sums["clot_shape_pred_frac"] += float(sm["clot_pred_frac"])
+                shape_sums["clot_shape_gt_frac"] += float(sm["clot_gt_frac"])
+                n_shape_graphs += 1
 
     denom = max(n_steps, 1)
     out = {
@@ -544,6 +894,9 @@ def _run_epoch(
         "n_graphs": float(n_graphs),
     }
     out.update({k: v / denom for k, v in metric_sums.items()})
+    shape_denom = max(n_shape_graphs, 1)
+    out.update({k: v / shape_denom for k, v in shape_sums.items()})
+    out["n_shape_graphs"] = float(n_shape_graphs)
     return out
 
 
@@ -681,11 +1034,13 @@ def main() -> None:
     print(
         f"[i]  clot_phi_simple: mask={clot_phi_mask_mode()} cap={clot_phi_mu_cap_si():.3f} Pa*s "
         f"thr={clot_phi_thresh_si(phys_cfg):.3f} soft={int(use_soft)} balanced={int(balanced)} "
-        f"hybrid={int(clot_phi_hybrid_enabled())} model={clot_phi_model_kind()} "
+        f"hybrid={int(clot_phi_hybrid_enabled())} fixed_mu={int(clot_phi_fixed_mu_from_phi_enabled())} "
+        f"model={clot_phi_model_kind()} "
         f"hidden={hidden} depth={clot_phi_mlp_depth()} dropout={clot_phi_dropout():.2f} "
         f"minimal={int(clot_phi_minimal_features_enabled())} species_feat={int(clot_phi_species_features_enabled())} "
         f"joint_bio={int(joint_bio)} in_dim={in_dim} "
         f"rollout={int(clot_phi_rollout_enabled())} vel={clot_phi_vel_source()} "
+        f"carry_bridge={snapshot_carry_gt_warmup_config()} "
         f"forecast={snapshot_clot_forecast_config()} "
         f"train={len(train_paths)} val={len(val_paths)} "
         f"prior={prior:.3f} pos_weight={pos_weight:.2f} mu_log_w={mu_log_lambda:.2f} "
@@ -720,6 +1075,7 @@ def main() -> None:
             balanced=balanced,
             species_head=species_head,
             optimizer=opt,
+            train_epoch=epoch,
         )
         with torch.no_grad():
             va = _run_epoch(
@@ -738,66 +1094,78 @@ def main() -> None:
         print(
             f"Ep {epoch:02d} | train bce={tr['bce']:.4f} mu_mse={tr.get('mu_log_mse', 0):.4f} "
             f"bio_mse={tr.get('bio_mse', 0):.4f} dice={tr['dice']:.3f} f1={tr['clot_f1']:.3f} "
-            f"logMAE={tr['mu_log_mae']:.3f} pred+={tr['pred_pos_frac']:.3f} | "
+            f"shape={tr.get('clot_shape', 0):.3f} logMAE={tr['mu_log_mae']:.3f} pred+={tr['pred_pos_frac']:.3f} | "
             f"val bce={va['bce']:.4f} mu_mse={va.get('mu_log_mse', 0):.4f} bio_mse={va.get('bio_mse', 0):.4f} "
             f"dice={va['dice']:.3f} "
-            f"f1={va['clot_f1']:.3f} prec={va['clot_prec']:.3f} rec={va['clot_rec']:.3f} "
+            f"f1={va['clot_f1']:.3f} shape={va.get('clot_shape', 0):.3f} shape_rec={va.get('clot_shape_rec', 0):.3f} "
+            f"prec={va['clot_prec']:.3f} rec={va['clot_rec']:.3f} "
             f"logMAE={va['mu_log_mae']:.3f} pred+={va['pred_pos_frac']:.3f} gt+={va['gt_pos_frac']:.3f} score={score:.3f}",
             flush=True,
         )
         row = {"epoch": epoch, "train": tr, "val": va, "val_score": score, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
+        ckpt_config = {
+            "mu_cap_si": clot_phi_mu_cap_si(),
+            "mu_thresh_si": clot_phi_thresh_si(phys_cfg),
+            "hidden": hidden,
+            "in_dim": in_dim,
+            "oracle_mu": clot_phi_oracle_mu_enabled(),
+            "species_features": clot_phi_species_features_enabled(),
+            "joint_bio": joint_bio,
+            "use_prior_features": clot_phi_use_prior_features(),
+            "prior_n": clot_phi_prior_feature_count(),
+            "hybrid": clot_phi_hybrid_enabled(),
+            "minimal_features": clot_phi_minimal_features_enabled(),
+            "model_kind": clot_phi_model_kind(),
+            "dropout": clot_phi_dropout(),
+            "mlp_depth": clot_phi_mlp_depth(),
+            "lr": lr,
+            "weight_decay": wd,
+            "mu_log_lambda": mu_log_lambda,
+            "bio_lambda": _bio_lambda(),
+            "regression_only": _regression_only(),
+            "anchor_dir": str(anchor_dir),
+            "physics_blend": _env_bool("CLOT_PHI_PHYSICS_BLEND", False),
+            "physics_blend_alpha": _physics_blend_alpha(),
+            "rollout": clot_phi_rollout_enabled(),
+            "rollout_vel_source": clot_phi_vel_source(),
+            "rollout_carry_phi": clot_phi_rollout_enabled() and clot_phi_carry_phi_enabled(),
+            "rollout_carry_log_mu": clot_phi_rollout_enabled() and clot_phi_carry_log_mu_enabled(),
+            "rollout_detach": clot_phi_rollout_detach_carry(),
+            **snapshot_phi_only_rollout_config(),
+            **snapshot_mesh_aux_config(),
+            **snapshot_clot_support_config(),
+            **snapshot_carry_gt_warmup_config(),
+            "dgamma_feature_time": (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "ref").strip(),
+            **snapshot_clot_forecast_config(),
+        }
+        last_payload: dict[str, Any] = {
+            "model_state_dict": model.state_dict(),
+            "epoch": epoch,
+            "val_dice": float(va["dice"]),
+            "val_f1": float(va["clot_f1"]),
+            "val_score": score,
+            "config": ckpt_config,
+        }
+        if species_head is not None:
+            last_payload["species_head_state_dict"] = species_head.state_dict()
+        torch.save(last_payload, out_dir / "clot_phi_last.pth")
+
         if score > best_score:
             best_score = score
             best_dice = float(va["dice"])
-            payload: dict[str, Any] = {
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch,
-                "val_dice": best_dice,
-                "val_f1": float(va["clot_f1"]),
-                "val_score": best_score,
-                "config": {
-                    "mu_cap_si": clot_phi_mu_cap_si(),
-                    "mu_thresh_si": clot_phi_thresh_si(phys_cfg),
-                    "hidden": hidden,
-                    "in_dim": in_dim,
-                    "oracle_mu": clot_phi_oracle_mu_enabled(),
-                    "species_features": clot_phi_species_features_enabled(),
-                    "joint_bio": joint_bio,
-                    "use_prior_features": clot_phi_use_prior_features(),
-                    "prior_n": clot_phi_prior_feature_count(),
-                    "hybrid": clot_phi_hybrid_enabled(),
-                    "minimal_features": clot_phi_minimal_features_enabled(),
-                    "model_kind": clot_phi_model_kind(),
-                    "dropout": clot_phi_dropout(),
-                    "mlp_depth": clot_phi_mlp_depth(),
-                    "lr": lr,
-                    "weight_decay": wd,
-                    "mu_log_lambda": mu_log_lambda,
-                    "bio_lambda": _bio_lambda(),
-                    "regression_only": _regression_only(),
-                    "anchor_dir": str(anchor_dir),
-                    "physics_blend": _env_bool("CLOT_PHI_PHYSICS_BLEND", False),
-                    "physics_blend_alpha": _physics_blend_alpha(),
-                    "rollout": clot_phi_rollout_enabled(),
-                    "rollout_vel_source": clot_phi_vel_source(),
-                    "rollout_carry_phi": clot_phi_rollout_enabled()
-                    and clot_phi_carry_phi_enabled(),
-                    "rollout_carry_log_mu": clot_phi_rollout_enabled()
-                    and clot_phi_carry_log_mu_enabled(),
-                    "rollout_detach": clot_phi_rollout_detach_carry(),
-                    "dgamma_feature_time": (os.environ.get("CLOT_PHI_DGAMMA_FEATURE_TIME") or "ref").strip(),
-                    **snapshot_clot_forecast_config(),
-                },
-            }
-            if species_head is not None:
-                payload["species_head_state_dict"] = species_head.state_dict()
+            payload = dict(last_payload)
+            payload["val_score"] = best_score
+            payload["val_dice"] = best_dice
             torch.save(payload, ckpt_path)
             print(
                 f"   [OK]  saved {ckpt_path} (val f1={va['clot_f1']:.3f} dice={best_dice:.3f} score={best_score:.3f})",
                 flush=True,
             )
+
+    if best_score < 0 and (out_dir / "clot_phi_last.pth").is_file():
+        print("[WARN] no val ckpt passed scorer; run recover_clot_phi_best_from_log.py", flush=True)
 
     print(f"[OK]  Done. Best val score={best_score:.3f} dice={best_dice:.3f} -> {ckpt_path}", flush=True)
 

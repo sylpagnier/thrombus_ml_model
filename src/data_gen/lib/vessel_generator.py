@@ -358,118 +358,182 @@ def _sample_params(
     }
 
 
+def recompute_pathology_offsets(
+    params: Dict[str, Any],
+    cfg: VesselConfig,
+    rng: np.random.Generator,
+    *,
+    strength: float = 1.0,
+    path_loc_frac: float | None = None,
+) -> Dict[str, Any]:
+    """Recompute stenosis/aneurysm offsets when pathology type or strength changes."""
+    out = dict(params)
+    v_type = str(out.get("v_type", "straight"))
+    width = float(out.get("width", cfg.width_min))
+    level = int(out.get("level", 0))
+    pro_thrombotic = level == 2
+    n = cfg.num_ctrl_pts
+    t = np.linspace(0, 1, n)
+    strength = float(np.clip(strength, 0.0, 1.0))
+
+    offsets = np.zeros(n)
+    if v_type != "straight" and strength > 0.0:
+        if v_type in ("stenosis", "occlusion"):
+            mult = 1.2 if pro_thrombotic else 1.0
+            mag = -float(
+                rng.uniform(
+                    cfg.stenosis_factor_min * width,
+                    min(0.9, cfg.stenosis_factor_max * mult) * width,
+                )
+            )
+        else:
+            mult = 1.5 if pro_thrombotic else 1.0
+            mag = float(
+                rng.uniform(
+                    cfg.aneurysm_factor_min * width,
+                    cfg.aneurysm_factor_max * mult * width,
+                )
+            )
+        mag *= strength
+
+        min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
+        if path_loc_frac is not None:
+            peak = int(min_idx + float(np.clip(path_loc_frac, 0.0, 1.0)) * (max_idx - min_idx))
+        else:
+            peak = int(rng.integers(min_idx, max_idx))
+
+        if pro_thrombotic:
+            std_dev = float(rng.uniform(0.02 * n, 0.05 * n))
+        else:
+            std_dev = float(rng.uniform(0.04 * n, 0.10 * n))
+
+        x_idx = np.arange(n)
+        gauss = np.exp(-0.5 * ((x_idx - peak) / std_dev) ** 2)
+        skew_factor = float(rng.uniform(-0.3, 0.3))
+        skew = 1.0 + skew_factor * ((x_idx - peak) / n)
+        offsets = mag * gauss * skew
+
+    out["offsets"] = offsets.tolist()
+    if v_type == "straight":
+        out["path_loc"] = 2
+    elif "path_loc" not in out:
+        out["path_loc"] = int(rng.choice([0, 1, 2]))
+    return out
+
+
+def make_vessel_params(
+    idx: int = 0,
+    level: int = 0,
+    cfg: VesselConfig | None = None,
+    rng: np.random.Generator | None = None,
+    **overrides: Any,
+) -> Dict[str, Any]:
+    """Sample one vessel parameter dict (same keys as ``_sample_params``)."""
+    cfg = cfg or VesselConfig(phase="kinematics")
+    rng = rng or np.random.default_rng(0)
+    base = _sample_params(idx, level, cfg, rng)
+    base.update(overrides)
+    return base
+
+
+def build_vessel_mesh(
+    params: Dict[str, Any],
+    cfg_dict: Dict[str, Any],
+    output_dir: str | Path,
+) -> Tuple[int, bool, str]:
+    """Build and mesh one vessel via Gmsh; returns ``(idx, success, error_msg)``."""
+    unit = cfg_dict.get("unit", "m")
+    unit_scale = 100.0 if unit == "cm" else 1.0
+    mesh_lc = cfg_dict["mesh_lc"] * unit_scale
+
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+        gmsh.option.setNumber("Mesh.Smoothing", 5)
+        gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+        gmsh.option.setNumber("Mesh.Binary", 0)
+        gmsh.option.setNumber("Mesh.SaveGroupsOfNodes", 1)
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeFactor", cfg_dict["mesh_size_factor"])
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_lc)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_lc)
+        return _build_and_mesh(params, cfg_dict, str(output_dir))
+    finally:
+        gmsh.finalize()
+
+
 def _build_and_mesh(
         params: Dict[str, Any],
         cfg_dict: Dict[str, Any],
         output_dir: str,
 ) -> Tuple[int, bool, str]:
     """Build, mesh, and save one vessel. Returns (idx, success, error_msg)."""
-    idx = params["idx"]
-    out = Path(output_dir)
+    from src.data_gen.lib.vessel_geometry import (
+        GeometryValidationError,
+        compute_geometry_from_params,
+        compute_geometry_from_walls,
+        validate_geometry,
+    )
 
+    idx = int(params["idx"])
     try:
-        n = cfg_dict["num_ctrl_pts"]
-        L = cfg_dict["base_length"]
-        lc = cfg_dict["mesh_lc"]
-        min_lumen_frac = float(cfg_dict["min_lumen_width_fraction"])
-        curve_type = params["curve_type"]
-        v_type = params["v_type"]
-        width = params["width"]
-        path_loc = params["path_loc"]
-        offsets = np.array(params["offsets"])
-
-        # 1. Base Centerline Geometry (Perfect shapes)
-        if curve_type == "straight":
-            pts, tangents = _centerline_straight(n, L, np.zeros(n - 4))
-        elif curve_type in ("arc", "hook"):
-            pts, tangents = _centerline_arc(
-                n, L, params["angle_span"], bend_sign=float(params.get("bend_sign", 1.0))
+        if str(params.get("geometry_mode", "parametric")) == "edited_walls":
+            top = np.asarray(params["top_coords"], dtype=float)
+            bot = np.asarray(params["bot_coords"], dtype=float)
+            geom = compute_geometry_from_walls(
+                top,
+                bot,
+                idx=idx,
+                unit=str(cfg_dict.get("unit", "m")),
+                params=params,
+                base_length=float(cfg_dict["base_length"]),
             )
         else:
-            pts, tangents = _centerline_s_curve(n, L, params["amplitude"])
+            geom = compute_geometry_from_params(params, cfg_dict)
+        validate_geometry(geom, cfg_dict)
+        return _mesh_geometry(geom, cfg_dict, output_dir)
+    except GeometryValidationError as exc:
+        return idx, False, str(exc)
+    except Exception as exc:
+        try:
+            gmsh.model.remove()
+        except Exception:
+            pass
+        return idx, False, str(exc)
 
-        # 2. Apply Global Tortuosity (Organic Centerline Meander)
-        tortuosity = np.array(params.get("tortuosity", np.zeros(n - 4)))
-        if np.any(tortuosity):
-            normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
-            pts[2:n - 2] += normals[2:n - 2] * tortuosity[:, np.newaxis]
 
-            # Recompute tangents and normals after adding meander
-            tangents = np.gradient(pts, axis=0)
-            norms = np.linalg.norm(tangents, axis=1, keepdims=True)
-            tangents = tangents / np.maximum(norms, 1e-9)
+def _mesh_geometry(
+    geom,
+    cfg_dict: Dict[str, Any],
+    output_dir: str,
+) -> Tuple[int, bool, str]:
+    """Gmsh meshing + file write from a ``VesselGeometry``."""
+    idx = int(geom.idx)
+    out = Path(output_dir)
+    lc = float(cfg_dict["mesh_lc"])
+    unit = str(cfg_dict.get("unit", "m"))
+    unit_scale = 100.0 if unit == "cm" else 1.0
+    if unit_scale != 1.0:
+        lc *= unit_scale
 
-        # Final normals for wall generation
-        normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    top_coords = geom.top_coords
+    bot_coords = geom.bot_coords
 
-        # 3. Compile Wall Offsets (Main pathology + High-frequency biological noise)
-        top_offsets = offsets if path_loc in (0, 2) else np.zeros(n)
-        bot_offsets = offsets if path_loc in (1, 2) else np.zeros(n)
+    try:
+        gmsh.model.add(f"vessel_{idx}")
 
-        top_offsets += np.array(params.get("noise_top", np.zeros(n)))
-        bot_offsets += np.array(params.get("noise_bot", np.zeros(n)))
+        top_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in top_coords]
+        bot_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in bot_coords]
 
-        top_dist = (width / 2.0) + top_offsets
-        bot_dist = (width / 2.0) + bot_offsets
-        cross_widths = top_dist + bot_dist
-        d_bar = float(np.mean(cross_widths))
+        s_top = gmsh.model.geo.addBSpline(top_tags)
+        l_out = gmsh.model.geo.addLine(top_tags[-1], bot_tags[-1])
+        s_bot = gmsh.model.geo.addBSpline(list(reversed(bot_tags)))
+        l_in = gmsh.model.geo.addLine(bot_tags[0], top_tags[0])
 
-        if d_bar < 1e-5 or np.any(cross_widths < 0):
-            raise ValueError(f"Degenerate geometry: d_bar={d_bar:.2e}")
-        if np.any(cross_widths < (width * min_lumen_frac)):
-            raise ValueError(f"Geometry too narrow at a control point.")
-
-        # 4. Generate Final Coordinates
-        top_coords = pts + normals * top_dist[:, np.newaxis]
-        bot_coords = pts - normals * bot_dist[:, np.newaxis]
-        # True wall tangents/normals must be computed from the final displaced wall curves.
-        top_tangents = np.gradient(top_coords, axis=0)
-        top_tangents = top_tangents / np.maximum(np.linalg.norm(top_tangents, axis=1, keepdims=True), 1e-9)
-        bot_tangents = np.gradient(bot_coords, axis=0)
-        bot_tangents = bot_tangents / np.maximum(np.linalg.norm(bot_tangents, axis=1, keepdims=True), 1e-9)
-        # Top wall order is inlet->outlet; CCW rotation gives outward normal.
-        top_normals = np.column_stack([-top_tangents[:, 1], top_tangents[:, 0]])
-        # Bottom wall uses opposite orientation for outward normal.
-        bot_normals = np.column_stack([bot_tangents[:, 1], -bot_tangents[:, 0]])
-
-        unit = cfg_dict.get("unit", "m")
-        unit_scale = 100.0 if unit == "cm" else 1.0
-
-        if unit_scale != 1.0:
-            top_coords *= unit_scale
-            bot_coords *= unit_scale
-            pts *= unit_scale
-            d_bar *= unit_scale
-            L *= unit_scale
-            lc *= unit_scale
-
-        # Safety Check for Self-Intersection
-        for coords in (top_coords, bot_coords):
-            step_vectors = np.diff(coords, axis=0)
-            step_lengths = np.linalg.norm(step_vectors, axis=1)
-            if np.any(step_lengths < (L / n) * 0.1):
-                raise ValueError("Self-intersection detected: Boundary spline collapsed.")
-
-            # --- NEW COMSOL OUTLET CHECK ---
-            # Ensure the physical X-coordinates of the outlet nodes are strictly > L/3
-            if top_coords[-1, 0] < (L / 3.0) or bot_coords[-1, 0] < (L / 3.0):
-                raise ValueError("Geometry rejected: Outlet curled back past L/3.")
-
-            # Gmsh geometry
-            gmsh.model.add(f"vessel_{idx}")
-
-            top_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in top_coords]
-            bot_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in bot_coords]
-
-            s_top = gmsh.model.geo.addBSpline(top_tags)
-            l_out = gmsh.model.geo.addLine(top_tags[-1], bot_tags[-1])
-            s_bot = gmsh.model.geo.addBSpline(list(reversed(bot_tags)))
-
-            l_in = gmsh.model.geo.addLine(bot_tags[0], top_tags[0])
-
-            cl = gmsh.model.geo.addCurveLoop([s_top, l_out, s_bot, l_in])
-            s = gmsh.model.geo.addPlaneSurface([cl])
-            gmsh.model.geo.synchronize()
+        cl = gmsh.model.geo.addCurveLoop([s_top, l_out, s_bot, l_in])
+        s = gmsh.model.geo.addPlaneSurface([cl])
+        gmsh.model.geo.synchronize()
 
         tags = cfg_dict["TAGS"]
         gmsh.model.addPhysicalGroup(1, [l_in], tags["Inlet"], name="Inlet")
@@ -487,33 +551,10 @@ def _build_and_mesh(
         gmsh.write(str(out / f"vessel_{idx}.nas"))
         gmsh.model.remove()
 
-        meta = {
-            "id": idx,
-            "type": f"{v_type}_{curve_type}",
-            "curve": curve_type,
-            "level": params["level"],
-            "bend_sign": float(params.get("bend_sign", 1.0)),
-            "bend_sign_mode": str(params.get("bend_sign_mode", resolve_bend_sign_mode())),
-            "unit": unit,
-            "d_bar": d_bar,
-            "d_inlet": float(np.linalg.norm(top_coords[0] - bot_coords[0])),
-            "num_outlets": 1,
-            # Nondimensional centerline (same scaling as mesh graphs: nodes / d_bar) + unit tangents
-            "centerline_pts": (pts / d_bar).tolist(),
-            "centerline_tangents": tangents.tolist(),
-            # Nondimensional wall coordinates + true displaced-wall tangents/normals.
-            "top_wall_pts": (top_coords / d_bar).tolist(),
-            "bot_wall_pts": (bot_coords / d_bar).tolist(),
-            "top_wall_tangents": top_tangents.tolist(),
-            "bot_wall_tangents": bot_tangents.tolist(),
-            "top_wall_normals": top_normals.tolist(),
-            "bot_wall_normals": bot_normals.tolist(),
-        }
-        with open(out / f"vessel_{idx}.json", "w") as f:
-            json.dump(meta, f, indent=4)
+        with open(out / f"vessel_{idx}.json", "w", encoding="utf-8") as f:
+            json.dump(geom.meta, f, indent=4)
 
         return idx, True, ""
-
     except Exception as exc:
         try:
             gmsh.model.remove()

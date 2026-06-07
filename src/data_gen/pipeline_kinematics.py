@@ -27,6 +27,13 @@ from src.data_gen.lib.vessel_generator import (
 )
 
 
+def _safe_print(*args, **kwargs) -> None:
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
 def _purge_anchor_npz_outputs(target_output_dir: Path) -> int:
     """Delete existing anchor ``vessel_*.npz`` files before a full cohort refresh."""
     removed = 0
@@ -309,29 +316,29 @@ def _execute_phase_interactive_plan(
         total_v = int(inv["mesh_json_with_valid_nas"])
 
         pool = ready_all if (plan.allow_overwrite_anchor and not force_full_anchor_refresh) else ready_add
-        print("\n--- Anchor CFD inventory (at run time) ---")
-        print(f"  CFD-ready pool: {pool} (add-only pool: {ready_add})\n")
+        _safe_print("\n--- Anchor CFD inventory (at run time) ---")
+        _safe_print(f"  CFD-ready pool: {pool} (add-only pool: {ready_add})\n")
 
         if pool == 0:
             if plan.allow_overwrite_anchor:
-                print("No meshes are CFD-ready — skipping anchor batch.\n")
+                _safe_print("No meshes are CFD-ready — skipping anchor batch.\n")
             else:
                 msg = "Nothing to add (need .json + non-empty .nas + .msh, and no .npz yet)."
                 if remaining > 0:
                     msg += " Some meshes lack .msh — export meshes for those vessels first."
                 elif total_v == 0:
                     msg = "No vessel meshes found in the mesh directory."
-                print(msg + "\nSkipping anchor batch.\n")
+                _safe_print(msg + "\nSkipping anchor batch.\n")
             max_new = 0
         elif anchor_target > 0:
             asked = min(anchor_target, pool)
             if anchor_target > pool:
-                print(
+                _safe_print(
                     f"  Only {pool} CFD-ready mesh(es); running at most {asked} anchors "
                     f"(target was {anchor_target}).\n"
                 )
             else:
-                print(
+                _safe_print(
                     f"  Running up to {asked} anchor CFD sample(s) toward target {anchor_target}.\n"
                 )
             max_new = asked
@@ -339,15 +346,15 @@ def _execute_phase_interactive_plan(
             assert plan.anchor_manual_max_new is not None
             asked = plan.anchor_manual_max_new
             if asked == 0:
-                print("Skipping anchor batch (0 requested).\n")
+                _safe_print("Skipping anchor batch (0 requested).\n")
                 max_new = 0
             else:
                 max_new = min(asked, pool)
                 if asked > pool:
-                    print(f"Requested {asked} but only {pool} mesh(es) match; running {max_new}.\n")
+                    _safe_print(f"Requested {asked} but only {pool} mesh(es) match; running {max_new}.\n")
 
         if pool > 0 and max_new > 0:
-            print("\n--- Running anchor CFD ---\n")
+            _safe_print("\n--- Running anchor CFD ---\n")
             with gen:
                 gen.run_batch(
                     max_new=max_new,
@@ -359,15 +366,22 @@ def _execute_phase_interactive_plan(
                 )
 
     if plan.run_mesh:
-        print("\n--- Mesh to graph ---")
-        from src.data_gen.lib.mesh_to_graph import MeshToGraph
+        _safe_print("\n--- Mesh to graph ---")
+        try:
+            from src.data_gen.lib.mesh_to_graph import MeshToGraph
 
-        # Process target graphs only; no intermediate continuation sweeps.
-        final_subdir = _final_subdir_for_rheology(rheology)
-        target_label = final_subdir
-        print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
-        processor.run()
+            # Process target graphs only; no intermediate continuation sweeps.
+            final_subdir = _final_subdir_for_rheology(rheology)
+            target_label = final_subdir
+            _safe_print(f"\nConverting Meshes -> Graphs for TARGET ({target_label})...")
+            processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
+            processor.run()
+        except OSError as exc:
+            _safe_print(f"\nMesh-to-graph aborted (console I/O): {exc}\n")
+            raise
+        except Exception as exc:
+            _safe_print(f"\nMesh-to-graph failed: {exc}\n")
+            raise
 
 
 def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
@@ -646,15 +660,22 @@ def _run_batch_for_phase(
             )
 
     if not args.skip_mesh:
-        print(f"--- Mesh to graph (rheology={rheology}) ---")
-        from src.data_gen.lib.mesh_to_graph import MeshToGraph
+        _safe_print(f"--- Mesh to graph (rheology={rheology}) ---")
+        try:
+            from src.data_gen.lib.mesh_to_graph import MeshToGraph
 
-        # Process target graphs only; no intermediate continuation sweeps.
-        final_subdir = _final_subdir_for_rheology(rheology)
-        target_label = final_subdir
-        print(f"\n⚙️ Converting Meshes -> Graphs for TARGET ({target_label})...")
-        processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
-        processor.run()
+            # Process target graphs only; no intermediate continuation sweeps.
+            final_subdir = _final_subdir_for_rheology(rheology)
+            target_label = final_subdir
+            _safe_print(f"\nConverting Meshes -> Graphs for TARGET ({target_label})...")
+            processor = MeshToGraph(phase="kinematics", n_subdir=final_subdir, rheology=rheology)
+            processor.run()
+        except OSError as exc:
+            _safe_print(f"\nMesh-to-graph aborted (console I/O): {exc}\n")
+            raise
+        except Exception as exc:
+            _safe_print(f"\nMesh-to-graph failed: {exc}\n")
+            raise
 
 
 def run_batch_pipeline(args: argparse.Namespace) -> None:
