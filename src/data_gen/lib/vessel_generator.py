@@ -206,9 +206,6 @@ def cohort_levels(
     return out
 
 
-# Target diameter occlusion at the stenosis peak (symmetric both-wall narrowing).
-MAX_STENOSIS_DIAMETER_OCCLUSION = 0.75
-
 _PATHOLOGY_MODE_CHOICES = ("random", "max_stenosis", "max_aneurysm")
 
 
@@ -240,9 +237,12 @@ def normalize_pathology_mode(mode: str | None) -> str | None:
 
 def stenosis_wall_offset_for_occlusion(
     width: float,
-    occlusion_frac: float = MAX_STENOSIS_DIAMETER_OCCLUSION,
+    cfg: VesselConfig,
+    occlusion_frac: float | None = None,
 ) -> float:
     """Negative wall offset magnitude (Gaussian peak, both walls) for diameter occlusion."""
+    if occlusion_frac is None:
+        return cfg.max_stenosis_wall_offset(width)
     occlusion_frac = float(np.clip(occlusion_frac, 0.0, 0.95))
     lumen_frac = 1.0 - occlusion_frac
     return (lumen_frac - 1.0) * float(width) / 2.0
@@ -294,12 +294,11 @@ def _sample_params(
     offsets = np.zeros(n)
     if v_type != "straight":
         if pathology_mode == "max_stenosis":
-            mag = stenosis_wall_offset_for_occlusion(width)
+            mag = cfg.max_stenosis_wall_offset(width)
         elif pathology_mode == "max_aneurysm":
-            mult = 1.5 if pro_thrombotic else 1.0
-            mag = float(cfg.aneurysm_factor_max * mult * width)
+            mag = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=pro_thrombotic)
         elif v_type in ("stenosis", "occlusion"):
-            mult = 1.2 if pro_thrombotic else 1.0  # Tighter stenosis
+            mult = cfg.stenosis_pro_thrombotic_mult if pro_thrombotic else 1.0
             mag = -float(
                 rng.uniform(
                     cfg.stenosis_factor_min * width,
@@ -307,7 +306,7 @@ def _sample_params(
                 )
             )
         else:
-            mult = 1.5 if pro_thrombotic else 1.0  # Deeper aneurysms
+            mult = cfg.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
             mag = float(rng.uniform(cfg.aneurysm_factor_min * width, cfg.aneurysm_factor_max * mult * width))
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
@@ -443,22 +442,31 @@ def recompute_pathology_offsets(
     offsets = np.zeros(n)
     if v_type != "straight" and strength > 0.0:
         if v_type in ("stenosis", "occlusion"):
-            mult = 1.2 if pro_thrombotic else 1.0
-            mag = -float(
-                rng.uniform(
-                    cfg.stenosis_factor_min * width,
-                    min(0.9, cfg.stenosis_factor_max * mult) * width,
+            mult = cfg.stenosis_pro_thrombotic_mult if pro_thrombotic else 1.0
+            at_max = strength >= 1.0 - 1e-9
+            if at_max:
+                mag = cfg.max_stenosis_wall_offset(width)
+            else:
+                mag = -float(
+                    rng.uniform(
+                        cfg.stenosis_factor_min * width,
+                        min(0.9, cfg.stenosis_factor_max * mult) * width,
+                    )
                 )
-            )
+                mag *= strength
         else:
-            mult = 1.5 if pro_thrombotic else 1.0
-            mag = float(
-                rng.uniform(
-                    cfg.aneurysm_factor_min * width,
-                    cfg.aneurysm_factor_max * mult * width,
+            mult = cfg.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
+            at_max = strength >= 1.0 - 1e-9
+            if at_max:
+                mag = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=pro_thrombotic)
+            else:
+                mag = float(
+                    rng.uniform(
+                        cfg.aneurysm_factor_min * width,
+                        cfg.aneurysm_factor_max * mult * width,
+                    )
                 )
-            )
-        mag *= strength
+                mag *= strength
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
         if path_loc_frac is not None:
@@ -683,6 +691,10 @@ class VesselGenerator:
             "min_lumen_width_fraction": self.cfg.min_lumen_width_fraction,
             "aneurysm_factor_min": self.cfg.aneurysm_factor_min,
             "aneurysm_factor_max": self.cfg.aneurysm_factor_max,
+            "max_stenosis_diameter_occlusion": self.cfg.max_stenosis_diameter_occlusion,
+            "max_aneurysm_factor": self.cfg.max_aneurysm_factor,
+            "stenosis_pro_thrombotic_mult": self.cfg.stenosis_pro_thrombotic_mult,
+            "aneurysm_pro_thrombotic_mult": self.cfg.aneurysm_pro_thrombotic_mult,
             "TAGS":               dict(self.cfg.TAGS),
         }
 

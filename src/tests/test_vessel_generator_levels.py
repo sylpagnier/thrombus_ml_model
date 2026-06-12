@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 from src.data_gen.lib.vessel_generator import (
-    MAX_STENOSIS_DIAMETER_OCCLUSION,
     _sample_params,
     cohort_levels,
     default_level_mix,
@@ -95,7 +94,7 @@ def test_sample_params_max_stenosis_targets_occlusion():
     peak_lumen = float(np.min(widths))
     nominal = float(p["width"])
     occlusion = 1.0 - (peak_lumen / nominal)
-    assert occlusion == pytest.approx(MAX_STENOSIS_DIAMETER_OCCLUSION, abs=0.03)
+    assert occlusion == pytest.approx(cfg.max_stenosis_diameter_occlusion, abs=0.03)
 
 
 def test_sample_params_max_aneurysm_uses_config_cap():
@@ -105,12 +104,19 @@ def test_sample_params_max_aneurysm_uses_config_cap():
     assert p["v_type"] == "aneurysm"
     offsets = np.asarray(p["offsets"], dtype=float)
     width = float(p["width"])
-    expected_peak = cfg.aneurysm_factor_max * 1.5 * width
+    expected_peak = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=True)
     assert float(np.max(offsets)) == pytest.approx(expected_peak, rel=0.02)
 
 
+def test_max_aneurysm_factor_is_double_nominal_cap():
+    cfg = VesselConfig(phase="biochem")
+    assert cfg.max_aneurysm_factor == pytest.approx(2.0 * cfg.aneurysm_factor_max)
+
+
 def test_stenosis_wall_offset_for_occlusion_math():
+    cfg = VesselConfig(phase="kinematics")
     width = 0.01
-    mag = stenosis_wall_offset_for_occlusion(width, occlusion_frac=0.75)
+    mag = cfg.max_stenosis_wall_offset(width)
     assert mag == pytest.approx(-0.00375)
     assert width + 2.0 * mag == pytest.approx(0.25 * width)
+    assert stenosis_wall_offset_for_occlusion(width, cfg) == mag

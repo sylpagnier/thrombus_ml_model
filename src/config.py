@@ -205,7 +205,23 @@ class VesselConfig:
     min_lumen_width_fraction: float = 0.2
     aneurysm_factor_min: float = 0.15
     aneurysm_factor_max: float = 0.2
+    # Max pathology targets (``pathology_mode=max_stenosis`` / ``max_aneurysm``; all phases)
+    max_stenosis_diameter_occlusion: float = 0.75  # symmetric both-wall peak (~75% diameter reduction)
+    max_aneurysm_factor: float = 0.4  # max_aneurysm mode cap (2x ``aneurysm_factor_max``)
+    stenosis_pro_thrombotic_mult: float = 1.2  # L2 random-sampling stenosis boost
+    aneurysm_pro_thrombotic_mult: float = 1.5  # L2 random-sampling / max_aneurysm boost
     num_ctrl_pts: int = 50
+
+    def max_stenosis_wall_offset(self, width: float) -> float:
+        """Negative wall offset at Gaussian peak (both walls) for ``max_stenosis_diameter_occlusion``."""
+        occlusion = max(0.0, min(0.95, float(self.max_stenosis_diameter_occlusion)))
+        lumen_frac = 1.0 - occlusion
+        return (lumen_frac - 1.0) * float(width) / 2.0
+
+    def max_aneurysm_wall_offset(self, width: float, *, pro_thrombotic: bool = False) -> float:
+        """Positive wall offset at Gaussian peak for ``max_aneurysm`` mode."""
+        mult = self.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
+        return float(self.max_aneurysm_factor * mult * width)
 
     # ND hydraulic priors (``graph_velocity_priors``): characteristic half-width and worst-case radius
     # fraction vs nominal (e.g. severe stenosis). Used to set a physical floor on inferred R_nd.
