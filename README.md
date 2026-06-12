@@ -6,9 +6,9 @@ Mesh-agnostic graph neural surrogate for vessel hemodynamics and coupled biochem
 
 | Document | Contents |
 |----------|----------|
-| [`src/docs/PROJECT_CONTEXT.md`](src/docs/PROJECT_CONTEXT.md) | Tiers vs stages, **architecture**, entry points, data layout, inspection tools, tests policy |
-| [`src/docs/TIER1_TRAINING_HISTORY.md`](src/docs/TIER1_TRAINING_HISTORY.md) | Tier 1 experiments, sweep decisions, V2/V3 notes |
-| [`src/docs/README.md`](src/docs/README.md) | Doc index and quick commands |
+| [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md) | Tiers vs stages, **architecture**, entry points, data layout, inspection tools, tests policy |
+| [`docs/TIER1_TRAINING_HISTORY.md`](docs/TIER1_TRAINING_HISTORY.md) | Tier 1 experiments, sweep decisions, V2/V3 notes |
+| [`docs/README.md`](docs/README.md) | Doc index and quick commands |
 
 ## Quick start
 

@@ -79,4 +79,4 @@ Use **`BIOCHEM_GT_KINE_VEL=1`** + **`BIOCHEM_GT_KINE_SKIP_DEQ=1`** for all teach
 
 ## Orchestrated 6h sweep
 
-See [scripts/go_passive_explore_6h.ps1](../../scripts/go_passive_explore_6h.ps1) and `outputs/biochem/explore_6h/`.
+See [scripts/go_passive_explore_6h.ps1](../scripts/go_passive_explore_6h.ps1) and `outputs/biochem/explore_6h/`.

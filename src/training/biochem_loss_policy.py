@@ -1,6 +1,6 @@
 """Canonical biochem loss policy (frozen-kin teacher, viscosity + species goal).
 
-See src/docs/BIOCHEM_TRAINING_PROGRESS.md section "Loss policy (approved vs deprecated)".
+See docs/BIOCHEM_TRAINING_PROGRESS.md section "Loss policy (approved vs deprecated)".
 
 Set ``BIOCHEM_LEGACY_LOSSES=1`` to re-enable deprecated isolate keys, sweep presets, and
 aux-loss blocks removed from the default forward path.
@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import FrozenSet
 
-_DOC = "src/docs/BIOCHEM_TRAINING_PROGRESS.md (Loss policy)"
+_DOC = "docs/BIOCHEM_TRAINING_PROGRESS.md (Loss policy)"
 
 # --- Approved for current Phase I teacher (GT flow, STOP_AFTER_TEACHER=1) ---
 

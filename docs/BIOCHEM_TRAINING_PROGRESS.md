@@ -6,7 +6,7 @@ Living notes for **Phase 3 biochem corrector** (`src/training/train_biochem_corr
 
 **Maintained by:** humans + Cursor agents (see `.cursor/rules/biochem-training-progress.mdc` and root `AGENTS.md`). Agents should append the run log and adjust gates when you paste training results; you do not need to ask each time unless you want to skip updates for a chat.
 
-**Loss policy module:** [src/training/biochem_loss_policy.py](../training/biochem_loss_policy.py) — enforces approved backward terms by default; set `BIOCHEM_LEGACY_LOSSES=1` to reproduce deprecated sweeps.
+**Loss policy module:** [src/training/biochem_loss_policy.py](../src/training/biochem_loss_policy.py) — enforces approved backward terms by default; set `BIOCHEM_LEGACY_LOSSES=1` to reproduce deprecated sweeps.
 
 ---
 
@@ -70,7 +70,7 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 **Goal:** Fit **Mat / FI** (and bulk species) with **fixed COMSOL flow** — biochemistry must not move the velocity field yet (`BIOCHEM_TEACHER_MU_RATIO_MAX=1`, no clot → μ feedback).
 
-**Launcher:** [`scripts/go_passive_transport.ps1`](../../scripts/go_passive_transport.ps1) → `BIOCHEM_PRESET=passive_transport`.
+**Launcher:** [`scripts/go_passive_transport.ps1`](../scripts/go_passive_transport.ps1) → `BIOCHEM_PRESET=passive_transport`.
 
 | Stage | Env / behavior | Status (2026-05-26) |
 |-------|----------------|---------------------|
@@ -1926,7 +1926,7 @@ Consolidated principles before re-introducing step-2 / corona / multitask losses
 
 **Goal:** Understand and improve the **μ closure** (derived + learned path) on the **standard held-out anchor** before `L_Data_Bio`, corona, or Kendall PDE enter `backward()`.
 
-**Runner:** [`scripts/run_biochem_mu_formulation_study.ps1`](../../scripts/run_biochem_mu_formulation_study.ps1)
+**Runner:** [`scripts/run_biochem_mu_formulation_study.ps1`](../scripts/run_biochem_mu_formulation_study.ps1)
 
 **Acceptance (Phase A pass):** val `mu_log_mae` (all) **&lt; 1.2** for **2 consecutive epochs** on **patient007**, `VAL_TIME_STRIDE=10`, full anchor load. Secondary: wall logMAE trending down; high-μ not worse than ep0 by &gt; 0.1; `r` &gt; 0.25 would be a bonus.
 

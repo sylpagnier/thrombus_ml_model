@@ -22,7 +22,7 @@
 
 Always: **`BIOCHEM_STOP_AFTER_TEACHER=1`** for teacher-only legs. Check **clot-φ** after every dump.
 
-**Viz helpers:** dot-source [`scripts/_gnode_viz_helpers.ps1`](../../scripts/_gnode_viz_helpers.ps1) — headless PNGs under `outputs/biochem/viz/`; optional interactive slider via `visualize_pipeline`.
+**Viz helpers:** dot-source [`scripts/_gnode_viz_helpers.ps1`](../scripts/_gnode_viz_helpers.ps1) — headless PNGs under `outputs/biochem/viz/`; optional interactive slider via `visualize_pipeline`.
 
 ---
 

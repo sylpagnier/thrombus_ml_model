@@ -1,13 +1,18 @@
 import numpy as np
+import pytest
 
 from src.data_gen.lib.vessel_generator import (
+    MAX_STENOSIS_DIAMETER_OCCLUSION,
     _sample_params,
     cohort_levels,
     default_level_mix,
+    normalize_pathology_mode,
     parse_level_mix,
     resolve_bend_sign_mode,
+    stenosis_wall_offset_for_occlusion,
 )
 from src.config import VesselConfig
+from src.data_gen.lib.vessel_geometry import compute_geometry_from_params
 
 
 def test_default_level_mix_sums_to_n():
@@ -65,3 +70,47 @@ def test_sample_params_level1_down_only_fixed_sign():
         if p["curve_type"] == "s_curve":
             assert p["amplitude"] >= 0.0
     assert resolve_bend_sign_mode() == "down_only"
+
+
+def test_normalize_pathology_mode_aliases():
+    assert normalize_pathology_mode("random") is None
+    assert normalize_pathology_mode("max-stenosis") == "max_stenosis"
+    assert normalize_pathology_mode("max_aneurysm") == "max_aneurysm"
+
+
+def test_sample_params_max_stenosis_targets_occlusion():
+    cfg = VesselConfig(phase="biochem")
+    gen_cfg = {
+        "num_ctrl_pts": cfg.num_ctrl_pts,
+        "base_length": cfg.base_length,
+        "min_lumen_width_fraction": cfg.min_lumen_width_fraction,
+        "unit": "m",
+    }
+    rng = np.random.default_rng(0)
+    p = _sample_params(0, 1, cfg, rng, pathology_mode="max_stenosis")
+    assert p["v_type"] == "stenosis"
+    assert p["path_loc"] == 2
+    geom = compute_geometry_from_params(p, gen_cfg)
+    widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
+    peak_lumen = float(np.min(widths))
+    nominal = float(p["width"])
+    occlusion = 1.0 - (peak_lumen / nominal)
+    assert occlusion == pytest.approx(MAX_STENOSIS_DIAMETER_OCCLUSION, abs=0.03)
+
+
+def test_sample_params_max_aneurysm_uses_config_cap():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(1)
+    p = _sample_params(0, 2, cfg, rng, pathology_mode="max_aneurysm")
+    assert p["v_type"] == "aneurysm"
+    offsets = np.asarray(p["offsets"], dtype=float)
+    width = float(p["width"])
+    expected_peak = cfg.aneurysm_factor_max * 1.5 * width
+    assert float(np.max(offsets)) == pytest.approx(expected_peak, rel=0.02)
+
+
+def test_stenosis_wall_offset_for_occlusion_math():
+    width = 0.01
+    mag = stenosis_wall_offset_for_occlusion(width, occlusion_frac=0.75)
+    assert mag == pytest.approx(-0.00375)
+    assert width + 2.0 * mag == pytest.approx(0.25 * width)

@@ -206,11 +206,54 @@ def cohort_levels(
     return out
 
 
+# Target diameter occlusion at the stenosis peak (symmetric both-wall narrowing).
+MAX_STENOSIS_DIAMETER_OCCLUSION = 0.75
+
+_PATHOLOGY_MODE_CHOICES = ("random", "max_stenosis", "max_aneurysm")
+
+
+def normalize_pathology_mode(mode: str | None) -> str | None:
+    """Return a canonical pathology mode or ``None`` for default random sampling."""
+    if mode is None:
+        return None
+    raw = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "": "random",
+        "default": "random",
+        "none": "random",
+        "max_stenosis": "max_stenosis",
+        "maxstenosis": "max_stenosis",
+        "stenosis_max": "max_stenosis",
+        "max_aneurysm": "max_aneurysm",
+        "maxaneurysm": "max_aneurysm",
+        "aneurysm_max": "max_aneurysm",
+    }
+    resolved = aliases.get(raw, raw)
+    if resolved == "random":
+        return None
+    if resolved not in _PATHOLOGY_MODE_CHOICES[1:]:
+        raise ValueError(
+            f"Unknown pathology_mode {mode!r}; use one of: {', '.join(_PATHOLOGY_MODE_CHOICES)}"
+        )
+    return resolved
+
+
+def stenosis_wall_offset_for_occlusion(
+    width: float,
+    occlusion_frac: float = MAX_STENOSIS_DIAMETER_OCCLUSION,
+) -> float:
+    """Negative wall offset magnitude (Gaussian peak, both walls) for diameter occlusion."""
+    occlusion_frac = float(np.clip(occlusion_frac, 0.0, 0.95))
+    lumen_frac = 1.0 - occlusion_frac
+    return (lumen_frac - 1.0) * float(width) / 2.0
+
+
 def _sample_params(
         idx: int,
         level: int,
         cfg: VesselConfig,
         rng: np.random.Generator,
+        pathology_mode: str | None = None,
 ) -> Dict[str, Any]:
     """
     Draw ALL random numbers for one vessel and return a plain picklable dict.
@@ -218,6 +261,7 @@ def _sample_params(
     """
     # Level-driven mode: 2 => pro-thrombotic cohort shaping.
     pro_thrombotic = (level == 2)
+    pathology_mode = normalize_pathology_mode(pathology_mode)
 
     if pro_thrombotic:
         # Eliminate straight vessels; favor sharp turns and hooks
@@ -231,7 +275,11 @@ def _sample_params(
     probs /= probs.sum()
     curve_type = str(rng.choice(keys, p=probs))
 
-    if pro_thrombotic:
+    if pathology_mode == "max_stenosis":
+        v_type = "stenosis"
+    elif pathology_mode == "max_aneurysm":
+        v_type = "aneurysm"
+    elif pro_thrombotic:
         # Guarantee a pathology. Aneurysms (stagnation) and Stenosis (downstream deceleration)
         v_type = str(rng.choice(["stenosis", "aneurysm"], p=[0.3, 0.7]))
     else:
@@ -245,7 +293,12 @@ def _sample_params(
     # 1. Main Clinical Pathology
     offsets = np.zeros(n)
     if v_type != "straight":
-        if v_type in ("stenosis", "occlusion"):
+        if pathology_mode == "max_stenosis":
+            mag = stenosis_wall_offset_for_occlusion(width)
+        elif pathology_mode == "max_aneurysm":
+            mult = 1.5 if pro_thrombotic else 1.0
+            mag = float(cfg.aneurysm_factor_max * mult * width)
+        elif v_type in ("stenosis", "occlusion"):
             mult = 1.2 if pro_thrombotic else 1.0  # Tighter stenosis
             mag = -float(
                 rng.uniform(
@@ -258,9 +311,12 @@ def _sample_params(
             mag = float(rng.uniform(cfg.aneurysm_factor_min * width, cfg.aneurysm_factor_max * mult * width))
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
-        peak = int(rng.integers(min_idx, max_idx))
+        if pathology_mode in ("max_stenosis", "max_aneurysm"):
+            peak = int(min_idx + 0.5 * (max_idx - min_idx))
+        else:
+            peak = int(rng.integers(min_idx, max_idx))
 
-        if pro_thrombotic:
+        if pathology_mode == "max_stenosis" or pro_thrombotic:
             # Sharper geometric transition to trigger sr_grad_flow < -750 (sgt)
             std_dev = float(rng.uniform(0.02 * n, 0.05 * n))
         else:
@@ -268,11 +324,19 @@ def _sample_params(
 
         x_idx = np.arange(n)
         gauss = np.exp(-0.5 * ((x_idx - peak) / std_dev) ** 2)
-        skew_factor = float(rng.uniform(-0.3, 0.3))
-        skew = 1.0 + skew_factor * ((x_idx - peak) / n)
+        if pathology_mode in ("max_stenosis", "max_aneurysm"):
+            skew = np.ones(n, dtype=float)
+        else:
+            skew_factor = float(rng.uniform(-0.3, 0.3))
+            skew = 1.0 + skew_factor * ((x_idx - peak) / n)
         offsets = mag * gauss * skew
 
-    path_loc = int(rng.choice([0, 1, 2])) if v_type != "straight" else 2
+    if v_type == "straight":
+        path_loc = 2
+    elif pathology_mode == "max_stenosis":
+        path_loc = 2  # symmetric both-wall narrowing for target occlusion
+    else:
+        path_loc = int(rng.choice([0, 1, 2]))
 
     # 2. Universal Centerline Tortuosity
     f1, f2 = rng.uniform(0.5, 1.5), rng.uniform(1.5, 2.5)
@@ -694,6 +758,7 @@ class VesselGenerator:
         seed: Optional[int] = None,
         start_idx: Optional[int] = None,
         unit: str = "m",
+        pathology_mode: str | None = None,
     ) -> None:
         """
         Parallel batch vessel generation.
@@ -712,7 +777,10 @@ class VesselGenerator:
         start_idx   : first vessel index ``vessel_{idx}.*``. If ``None``, appends after the
                       highest existing index in ``output_dir`` (no overwrite). Pass ``0`` to
                       fill from the beginning (may overwrite existing files).
+        pathology_mode : ``None``/``random`` (default), ``max_stenosis`` (~75% diameter
+                         occlusion at peak), or ``max_aneurysm`` (maximum expansion).
         """
+        pathology_mode = normalize_pathology_mode(pathology_mode)
         phys_cores  = os.cpu_count() or 1
         num_workers = max(1, phys_cores - 1) if num_workers is None else num_workers
         num_workers = min(num_workers, n)
@@ -733,6 +801,8 @@ class VesselGenerator:
                 f"[indices {start_idx}..{start_idx + n - 1}] "
                 f"[{num_workers} workers / {phys_cores} logical cores]"
             )
+        if pathology_mode:
+            logger.info("Pathology mode: %s", pathology_mode)
 
         cfg_d   = self._cfg_dict()
         cfg_d["unit"] = unit
@@ -742,7 +812,14 @@ class VesselGenerator:
         # Pre-sample everything in the main process
         per_vessel_levels = cohort_levels(n, level, level_mix, rng)
         all_params = [
-            _sample_params(start_idx + i, per_vessel_levels[i], self.cfg, rng) for i in range(n)
+            _sample_params(
+                start_idx + i,
+                per_vessel_levels[i],
+                self.cfg,
+                rng,
+                pathology_mode=pathology_mode,
+            )
+            for i in range(n)
         ]
         params_lookup = _params_by_idx(all_params)
 
@@ -821,6 +898,7 @@ class VesselGenerator:
                     int(failed_p.get("level", level)),
                     self.cfg,
                     rng,
+                    pathology_mode=pathology_mode,
                 )
                 for failed_p in failed_params
             ]
@@ -884,6 +962,7 @@ class VesselGeneratorPhase3(VesselGenerator):
         seed: Optional[int] = None,
         start_idx: Optional[int] = None,
         unit: str = "m",
+        pathology_mode: str | None = None,
     ) -> None:
         if start_idx is None:
             start_idx = 0
@@ -896,6 +975,7 @@ class VesselGeneratorPhase3(VesselGenerator):
             seed=seed,
             start_idx=start_idx,
             unit=unit,
+            pathology_mode=pathology_mode,
         )
 
 

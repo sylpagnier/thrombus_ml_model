@@ -6,7 +6,7 @@
 #   .\scripts\run_biochem_mu_formulation_study.ps1 -Phase A -Leg A0
 #   .\scripts\run_biochem_mu_formulation_study.ps1 -Phase B -Leg B1 -NewRun
 #
-# Docs: src/docs/BIOCHEM_TRAINING_PROGRESS.md (μ formulation study plan)
+# Docs: docs/BIOCHEM_TRAINING_PROGRESS.md (μ formulation study plan)
 
 param(
     [ValidateSet("A", "B", "C", "D")]

@@ -159,7 +159,7 @@ Primary modules (also routed through `python -m src.bin.main inspect <target> --
 - **Mesh-agnostic**: never assume fixed node/edge counts or regular grids.
 - **Naming**: prefer physical names (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`).
 - **Phases**: changing `phase` in config affects both data pipeline and model heads; grep for `phase` when touching defaults.
-- **Docs**: root `README.md` is the landing page; this file holds deeper orientation; `src/docs/README.md` indexes docs.
+- **Docs**: root `README.md` is the landing page; this file holds deeper orientation; `docs/README.md` indexes docs.
 
 ## Tests policy
 

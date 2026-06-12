@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Biochem training progress log
 
-When the user shares **biochem corrector** training outcomes (console logs, `metrics.jsonl`, val μ lines, “how did the run go”, hyperparameter experiments), **update** [src/docs/BIOCHEM_TRAINING_PROGRESS.md](src/docs/BIOCHEM_TRAINING_PROGRESS.md) in the same session unless they explicitly say not to.
+When the user shares **biochem corrector** training outcomes (console logs, `metrics.jsonl`, val μ lines, “how did the run go”, hyperparameter experiments), **update** [docs/BIOCHEM_TRAINING_PROGRESS.md](docs/BIOCHEM_TRAINING_PROGRESS.md) in the same session unless they explicitly say not to.
 
 ## What to update
 

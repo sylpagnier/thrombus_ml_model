@@ -6,7 +6,7 @@ Canonical **architecture and training flags** for the production **GINO_DEQ** ru
 
 | Path | Purpose |
 |------|---------|
-| [data/reference/kinematics_best_20260426T184600Z.json](../../data/reference/kinematics_best_20260426T184600Z.json) | **`model_config`** + **`training_recipe`** + best-epoch val metrics (no torch, no weights) |
+| [data/reference/kinematics_best_20260426T184600Z.json](../data/reference/kinematics_best_20260426T184600Z.json) | **`model_config`** + **`training_recipe`** + best-epoch val metrics (no torch, no weights) |
 | `outputs/kinematics/kinematics_architecture.json` | Optional: updated when you train kinematics here and save a new best |
 | `outputs/kinematics/kinematics_best.pth` | Optional: weights; if present, may also embed the same `model_config` |
 
@@ -187,7 +187,7 @@ Default gates: holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.2
 | `fourier_base` | 2.0 |
 | `activation_fn` | silu |
 
-Code: `snapshot_gino_deq_model_config` / `resolve_gino_deq_ctor_kwargs` in [src/architecture/kinematics_model_config.py](../architecture/kinematics_model_config.py).
+Code: `snapshot_gino_deq_model_config` / `resolve_gino_deq_ctor_kwargs` in [src/architecture/kinematics_model_config.py](../src/architecture/kinematics_model_config.py).
 
 ## Geometry curriculum (L0 / L1 / L2)
 

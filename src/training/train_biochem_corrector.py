@@ -30,7 +30,7 @@ knobs (e.g. raise ``BIOCHEM_TEACHER_EPOCHS``, ``BIOCHEM_AE_EPOCHS``, ``BIOCHEM_D
   Bundles gelation prior gate, **3-hop** prior dilation, ``L_PhysTemp``, and corrector
   (``BIOCHEM_STOP_AFTER_TEACHER=0``). **Not recommended** for current mu work — one logged run
   (2026-05-16) had flat teacher mu (~1.48) with confounded settings; not rerun post-A0.
-  See ``scripts/run_biochem_thrombus_corona.ps1`` and ``src/docs/BIOCHEM_TRAINING_PROGRESS.md``.
+  See ``scripts/run_biochem_thrombus_corona.ps1`` and ``docs/BIOCHEM_TRAINING_PROGRESS.md``.
 
 - **Comprehensive mu (experimental / unvalidated)**:
   ``BIOCHEM_PRESET=comprehensive_mu`` (aliases ``mu_comprehensive``, ``step2_comprehensive``).
@@ -667,7 +667,7 @@ def _apply_biochem_preset_comprehensive_mu_if_requested() -> None:
     _apply_biochem_mu_best_practice_env(only_if_missing=False)
     print(
         "[WARN]  BIOCHEM_PRESET=comprehensive_mu is experimental/unvalidated "
-        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md).",
+        "(see docs/BIOCHEM_TRAINING_PROGRESS.md).",
         flush=True,
     )
 
@@ -824,7 +824,7 @@ def _passive_transport_adr_in_backprop() -> bool:
 
     Full TBPTT + ADR backprop often yields bio grad L2 >> ``BIOCHEM_TEACHER_MAX_RAW_GRAD_L2``
     (skipped optimizer steps, flat ``L_Data_Bio``). Enable only after species loss is
-    clearly falling — see ``src/docs/BIOCHEM_TRAINING_PROGRESS.md`` passive-transport / §113.
+    clearly falling — see ``docs/BIOCHEM_TRAINING_PROGRESS.md`` passive-transport / §113.
     """
     return _biochem_env_truthy("BIOCHEM_PASSIVE_ADR_BACKPROP", default=False)
 
@@ -1020,7 +1020,7 @@ def _apply_biochem_preset_thrombus_corona_if_requested() -> None:
     _apply_biochem_mu_best_practice_env(only_if_missing=True)
     print(
         "[WARN]  BIOCHEM_PRESET=thrombus_corona is experimental/unvalidated "
-        "(see src/docs/BIOCHEM_TRAINING_PROGRESS.md). Prefer mu formulation study for mu work.",
+        "(see docs/BIOCHEM_TRAINING_PROGRESS.md). Prefer mu formulation study for mu work.",
         flush=True,
     )
 

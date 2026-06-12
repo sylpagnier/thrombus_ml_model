@@ -254,7 +254,7 @@ Debug by separating **what is supervised in backward** from **what is only logge
 
 **Always fix flow first:** `BIOCHEM_GT_KINE_VEL=1`, `BIOCHEM_GT_KINE_SKIP_DEQ=1`, `BIOCHEM_TEACHER_FORCE_MIN=1` for passive/GT-flow work.
 
-**Orchestrated ladder:** [scripts/go_passive_explore_6h.ps1](../../scripts/go_passive_explore_6h.ps1) runs X -> Y -> XY legs; [scripts/_passive_explore_base_env.ps1](../../scripts/_passive_explore_base_env.ps1) sets clean env (no `passive_transport` preset clobber).
+**Orchestrated ladder:** [scripts/go_passive_explore_6h.ps1](../scripts/go_passive_explore_6h.ps1) runs X -> Y -> XY legs; [scripts/_passive_explore_base_env.ps1](../scripts/_passive_explore_base_env.ps1) sets clean env (no `passive_transport` preset clobber).
 
 ### Gate scripts (per track)
 
@@ -279,9 +279,9 @@ Debug by separating **what is supervised in backward** from **what is only logge
 
 ## Loss function catalog
 
-**Enforced in code:** [biochem_loss_policy.py](../training/biochem_loss_policy.py) (`BIOCHEM_LEGACY_LOSSES=1` for old sweeps).
+**Enforced in code:** [biochem_loss_policy.py](../src/training/biochem_loss_policy.py) (`BIOCHEM_LEGACY_LOSSES=1` for old sweeps).
 
-**Source of truth (implementation):** `compute_biochem_loss()` and `_biochem_resolve_isolated_loss()` in [train_biochem_corrector.py](../training/train_biochem_corrector.py). **Evidence:** [BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md) run table + chronicle + **Loss policy** section.
+**Source of truth (implementation):** `compute_biochem_loss()` and `_biochem_resolve_isolated_loss()` in [train_biochem_corrector.py](../src/training/train_biochem_corrector.py). **Evidence:** [BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md) run table + chronicle + **Loss policy** section.
 
 ### How losses enter `backward`
 
@@ -568,4 +568,4 @@ Full complexity table: [BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.
 
 - Update **milestone Status** in this file when promotion criteria change materially.
 - Append **run evidence** to [BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md) (run table + chronicle), not duplicate long logs here.
-- When adding a new `go_*.ps1` leg, add one row to the relevant I.x table and [scripts/README.md](../../scripts/README.md).
+- When adding a new `go_*.ps1` leg, add one row to the relevant I.x table and [scripts/README.md](../scripts/README.md).

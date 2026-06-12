@@ -1,5 +1,5 @@
 # Step 2a passive biochem: 1-way transport (Data_Bio TBPTT; ADR metrics only by default).
-# See src/docs/BIOCHEM_TRAINING_PROGRESS.md — enable BIOCHEM_PASSIVE_ADR_BACKPROP=1 only after L_Data_Bio falls.
+# See docs/BIOCHEM_TRAINING_PROGRESS.md — enable BIOCHEM_PASSIVE_ADR_BACKPROP=1 only after L_Data_Bio falls.
 # Prereq: outputs/kinematics/kinematics_best.pth (Phase-1 GINO-DEQ).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\go_passive_transport.ps1" -Fresh
