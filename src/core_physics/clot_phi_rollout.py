@@ -270,6 +270,12 @@ class KinematicsUvProvider:
 _kine_provider: KinematicsUvProvider | None = None
 
 
+def reset_rollout_kine_provider() -> None:
+    """Clear cached GINO-DEQ provider (coupled rollout / per-anchor reset)."""
+    global _kine_provider
+    _kine_provider = None
+
+
 def resolve_uv_for_rollout_step(
     data,
     time_index: int,

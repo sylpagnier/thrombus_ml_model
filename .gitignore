@@ -30,3 +30,4 @@ outputs/
 # Ignore local heavy/generated directories
 comsol_models/
 notes/
+/docs/

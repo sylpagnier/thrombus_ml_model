@@ -74,6 +74,11 @@ def main() -> int:
         action="store_true",
         help="Evaluate with Stage-A DEQ (BIOCHEM_GT_KINE_VEL=0), for rung 10 teachers.",
     )
+    ap.add_argument(
+        "--only",
+        default="",
+        help="Comma-separated anchor stems (e.g. patient007) for quick diagnostics.",
+    )
     args = ap.parse_args()
 
     _apply_align_eval_env(predicted_kine=bool(args.predicted_kine))
@@ -103,6 +108,9 @@ def main() -> int:
     )
 
     files = _list_anchor_files()
+    only = [s.strip().lower() for s in (args.only or "").split(",") if s.strip()]
+    if only:
+        files = [p for p in files if p.stem.lower() in set(only)]
     if not files:
         print("[ERR] no anchor graphs found", file=sys.stderr)
         return 2

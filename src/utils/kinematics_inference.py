@@ -75,15 +75,24 @@ def load_kinematics_predictor(
     return model
 
 
-def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
-    """Run one GINO-DEQ forward pass; returns ``(N, C)`` predictions."""
+def _kin_solver_kwargs() -> dict[str, object]:
     solver = os.environ.get("VIZ_KIN_SOLVER", "anderson").strip().lower() or "anderson"
     beta = float(os.environ.get("VIZ_KIN_ANDERSON_BETA", "0.8"))
     warmup = int(os.environ.get("VIZ_KIN_ANDERSON_WARMUP", "5"))
-    pred = model(
-        data,
-        solver=solver,
-        anderson_beta=beta,
-        anderson_warmup_iters=max(0, warmup),
-    )
+    return {
+        "solver": solver,
+        "anderson_beta": beta,
+        "anderson_warmup_iters": max(0, warmup),
+    }
+
+
+def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
+    """Run one GINO-DEQ forward pass; returns ``(N, C)`` predictions."""
+    pred = model(data, **_kin_solver_kwargs())
     return pred[0] if isinstance(pred, tuple) else pred
+
+
+@torch.no_grad()
+def predict_kinematics_latent(model: GINO_DEQ, data: Data) -> torch.Tensor:
+    """Frozen DEQ latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
+    return model.solve_latent(data, **_kin_solver_kwargs())

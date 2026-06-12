@@ -89,8 +89,14 @@ def iter_forecast_pairs(
     *,
     time_stride: int = 1,
     pair_stride: int | None = None,
+    t_out_max: int | None = None,
 ) -> list[tuple[int, int]]:
-    """Valid (t_in, t_out) index pairs for one-step forecast (no extrapolation)."""
+    """Valid (t_in, t_out) index pairs for one-step forecast.
+
+    When ``t_out_max > t_steps - 1``, pairs extrapolate with ``t_in`` clamped to
+    ``t_steps - 1`` (Step 3b smoke / tests). Set ``CLOT_ML_EXTRAP_PAIRS=from_t0`` for
+    ``(0, t_out)`` schedule past the COMSOL window.
+    """
     t_steps = int(t_steps)
     if t_steps <= 0:
         return []
@@ -98,11 +104,22 @@ def iter_forecast_pairs(
     stride = max(1, stride)
     step = max(1, int(time_stride))
     schedule = clot_forecast_pair_schedule()
-    t_final = t_steps - 1
+    t_final_data = t_steps - 1
+    t_final = int(t_out_max) if t_out_max is not None else t_final_data
+    extrap = t_final > t_final_data
+    if extrap:
+        extrap_sched = (os.environ.get("CLOT_ML_EXTRAP_PAIRS") or "from_t0").strip().lower()
+        if extrap_sched in ("from_t0", "t0", "static"):
+            return [(0, int(t_out)) for t_out in range(stride, t_final + 1, step)]
+        pairs: list[tuple[int, int]] = []
+        for t_out in range(stride, t_final + 1, step):
+            t_in = max(0, min(t_out - stride, t_final_data))
+            pairs.append((int(t_in), int(t_out)))
+        return pairs
     if schedule == "static_final":
-        if t_final <= 0:
+        if t_final_data <= 0:
             return []
-        return [(0, t_final)]
+        return [(0, t_final_data)]
     if schedule == "from_t0":
         return [(0, int(t_out)) for t_out in range(stride, t_steps, step)]
     t_max = t_steps - stride
@@ -117,6 +134,7 @@ def clot_forecast_mask_mode() -> str:
     - ``deploy_input``: deploy band with GT phi + GT mu @ t_in (oracle ablation; degenerate).
     - ``deploy_pred``: deploy band with model phi @ t_in + mu @ t_in (deploy-faithful).
     - ``deploy_band``: loss on frozen physics band from GT mu @ t=0 (no future mu peek).
+    - ``ceiling_growth``: hop-growing support from t0 dgamma seed, capped by wall+K ceiling.
     """
     raw = (os.environ.get("CLOT_FORECAST_MASK") or "target").strip().lower()
     if raw in ("input", "t_in", "mu_in", "current"):
@@ -125,6 +143,8 @@ def clot_forecast_mask_mode() -> str:
         return "deploy_pred"
     if raw in ("deploy_band", "frozen_t0", "b0_band", "t0_band"):
         return "deploy_band"
+    if raw in ("ceiling_growth", "ceiling", "hop_growth", "growth"):
+        return "ceiling_growth"
     if raw in ("deploy", "deploy_input", "deploy_in", "band"):
         return "deploy_input"
     return "target"
@@ -182,8 +202,9 @@ def build_deploy_eligible_phi_gt(
         _lumen_supervision_eligible,
         _wall_mask_from_data,
         carreau_mu_si_from_uv,
-        phi_gt_binary,
-        phi_gt_soft,
+        clot_phi_gt_subtract_t0_mu,
+        gt_mu_anchor_cap_si,
+        resolve_phi_gt_labels,
     )
 
     y = data.y[int(time_index)].to(device)
@@ -193,9 +214,10 @@ def build_deploy_eligible_phi_gt(
     wall = _wall_mask_from_data(data, device, n)
     eligible = _lumen_supervision_eligible(data, device, wall, n)
     mu_c = carreau_mu_si_from_uv(data, y[:, 0], y[:, 1], phys_cfg)
-    if use_soft:
-        return phi_gt_soft(mu_cap, mu_c, eligible)
-    return phi_gt_binary(mu_cap, eligible, phys_cfg)
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device) if clot_phi_gt_subtract_t0_mu() else None
+    return resolve_phi_gt_labels(
+        mu_cap, mu_c, eligible, phys_cfg, soft=use_soft, mu_anchor_si=mu_anchor
+    )
 
 
 def clot_forecast_extra_feature_dim() -> int:
@@ -238,11 +260,13 @@ def resolve_forecast_loss_region(
     step_in: ClotPhiStepBatch,
     mu_cap_out: torch.Tensor,
     t_in: int,
+    t_out: int | None = None,
     phys_cfg: PhysicsConfig,
     bio_cfg: BiochemConfig,
     device: torch.device,
     phi_deploy: torch.Tensor | None = None,
     mu_mlp_deploy: torch.Tensor | None = None,
+    phi_pred_by_time: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Supervision / loss mask for one-step forecast pairs."""
     mode = clot_forecast_mask_mode()
@@ -256,6 +280,13 @@ def resolve_forecast_loss_region(
             phys_cfg,
             bio_cfg,
             frozen_t0=True,
+        )
+    if mode == "ceiling_growth":
+        from src.core_physics.clot_growth_masks import resolve_growth_support_at_time
+
+        t = int(t_out if t_out is not None else t_in)
+        return resolve_growth_support_at_time(
+            data, t, device, phys_cfg, bio_cfg, phi_pred_by_time=phi_pred_by_time
         )
     if mode in ("deploy_input", "deploy_pred"):
         phi = phi_deploy if mode == "deploy_pred" else step_in.phi_gt
@@ -420,6 +451,7 @@ def build_clot_forecast_pair_step(
     *,
     forecast_state: object | None = None,
     train_epoch: int | None = None,
+    phi_pred_by_time: dict[int, torch.Tensor] | None = None,
 ) -> ClotPhiStepBatch:
     """One-step pair: flow/features @ t_in, supervision labels @ t_out."""
     step_in = build_clot_phi_step(data, int(t_in), phys_cfg, bio_cfg, device)
@@ -451,9 +483,11 @@ def build_clot_forecast_pair_step(
             step_in=step_in,
             mu_cap_out=mu_cap_out,
             t_in=int(t_in),
+            t_out=int(t_out),
             phys_cfg=phys_cfg,
             bio_cfg=bio_cfg,
             device=device,
+            phi_pred_by_time=phi_pred_by_time,
         )
         if use_soft:
             phi_gt_out = phi_gt_soft(mu_cap_out, step_in.mu_c_si, region)

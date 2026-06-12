@@ -14,6 +14,7 @@ mark high ``mu_eff`` on ``mask_wall`` nodes (~95% of clot seeds on patient007).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -22,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.config import BiochemConfig, NodeFeat, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
 from src.core_physics.clot_kinematics_fields import adjacent_band_mask, compute_clot_kinematics_fields, compute_shear_rate
 from src.core_physics.kinematics_clot_prior import clot_prior_features, clot_prior_score_flat
 from src.utils.rheology import carreau_yasuda_viscosity
@@ -52,8 +53,23 @@ def cap_mu_eff_si(mu_si: torch.Tensor) -> torch.Tensor:
 
 def sdf_nd_from_data(data, device: torch.device, n: int) -> torch.Tensor:
     if hasattr(data, "x") and torch.is_tensor(data.x) and data.x.dim() == 2 and data.x.shape[1] > 2:
-        return data.x[:, 2].to(device=device, dtype=torch.float32).clamp(min=0.0)
+        return data.x[:, NodeFeat.SDF.start].to(device=device, dtype=torch.float32).clamp(min=0.0)
     return torch.zeros(n, device=device, dtype=torch.float32)
+
+
+def width_nd_from_data(data, device: torch.device, n: int) -> torch.Tensor:
+    """Hydraulic lumen width [ND] from graph node features (ray-march prior)."""
+    if (
+        hasattr(data, "x")
+        and torch.is_tensor(data.x)
+        and data.x.dim() == 2
+        and data.x.shape[1] > NodeFeat.WIDTH_ND.stop
+    ):
+        return data.x[:, NodeFeat.WIDTH_ND].reshape(-1).to(device=device, dtype=torch.float32).clamp(min=1e-6)
+    if hasattr(data, "width_nd") and data.width_nd is not None:
+        return data.width_nd.reshape(-1).to(device=device, dtype=torch.float32).clamp(min=1e-6)
+    sdf = sdf_nd_from_data(data, device, n)
+    return (2.0 * sdf).clamp(min=1e-6)
 
 
 def _wall_mask_from_data(data, device: torch.device, n: int) -> torch.Tensor:
@@ -307,6 +323,102 @@ def clot_phi_mask_mode() -> str:
     return "neighbor"
 
 
+def clot_phi_clot_seed_source() -> str:
+    """How neighbor-band clot seeds are chosen (``supervision_region_mask`` only).
+
+    - ``wall`` (default): geometry wall nodes + mesh hops (deploy nucleation shell).
+    - ``gt_mu``: COMSOL capped ``mu_eff`` at the current step (**oracle debug only**).
+    - ``none``: wall nodes only (no off-wall dilation from seeds).
+    """
+    raw = (os.environ.get("CLOT_PHI_CLOT_SEED_SOURCE") or "wall").strip().lower()
+    if raw in ("wall", "geometry", "mask_wall", "deploy", "nucleation"):
+        return "wall"
+    if raw in ("none", "wall_only", "off"):
+        return "none"
+    if raw in ("gt_mu", "oracle", "legacy"):
+        return "gt_mu"
+    return "wall"
+
+
+def clot_phi_loss_scope() -> str:
+    """Where clot loss / eval F1 are computed.
+
+    - ``ceiling`` (deploy default): fixed wall + ``CLOT_PHI_CEILING_HOPS`` band (no GT expansion).
+    - ``support``: time-varying B_t (wall @ t0 + 1-hop growth; pred or oracle seed).
+    - ``full_mesh``: all nodes (debug; includes Carreau bulk artifacts).
+    - ``nucleation``: static wall+hops band (geometry only).
+    - ``oracle``: legacy GT-mu seeds + GT dgamma slice (**debug only**).
+    """
+    raw = (os.environ.get("CLOT_PHI_LOSS_SCOPE") or "support").strip().lower()
+    if raw in ("oracle", "oracle_band", "legacy", "gt_mu", "band"):
+        return "oracle"
+    if raw in ("nucleation", "deploy_band", "wall"):
+        return "nucleation"
+    if raw in ("ceiling", "deploy"):
+        return "ceiling"
+    if raw in ("support", "growth", "ceiling_growth", "final_support", "b_t"):
+        return "support"
+    return "full_mesh"
+
+
+def clot_phi_forward_apply_region() -> bool:
+    """Whether physics/hybrid phi is zeroed outside the loss/support band."""
+    return clot_phi_loss_scope() != "full_mesh"
+
+
+def resolve_clot_loss_mask(
+    data,
+    device: torch.device,
+    mu_cap_si: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    *,
+    time_index: int = 0,
+    bio_cfg: BiochemConfig | None = None,
+    phi_pred_by_time: dict[int, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Boolean mask for loss / val F1 (scope-dependent)."""
+    n = int(data.num_nodes)
+    scope = clot_phi_loss_scope()
+    if scope == "full_mesh":
+        return torch.ones(n, device=device, dtype=torch.bool)
+    if scope == "ceiling":
+        from src.core_physics.clot_growth_masks import resolve_ceiling_mask
+
+        bio = bio_cfg or BiochemConfig(phase="biochem")
+        return resolve_ceiling_mask(data, device, bio).reshape(-1).to(device=device).bool()
+    if scope == "support":
+        from src.core_physics.clot_growth_masks import resolve_growth_support_at_time
+
+        bio = bio_cfg or BiochemConfig(phase="biochem")
+        return resolve_growth_support_at_time(
+            data,
+            int(time_index),
+            device,
+            phys_cfg,
+            bio,
+            phi_pred_by_time=phi_pred_by_time,
+        ).reshape(-1).to(device=device).bool()
+    region = supervision_region_mask(data, device, mu_cap_si, phys_cfg)
+    return region.reshape(-1).to(device=device).bool()
+
+
+def resolve_clot_seed_mask(
+    data,
+    device: torch.device,
+    mu_cap_si: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+) -> torch.Tensor:
+    """Boolean clot-seed nodes for neighbor-band dilation (before dgamma slice)."""
+    n = int(data.num_nodes)
+    src = clot_phi_clot_seed_source()
+    if src == "wall":
+        return _wall_mask_from_data(data, device, n)
+    if src == "none":
+        return torch.zeros(n, device=device, dtype=torch.bool)
+    thr = clot_phi_thresh_si(phys_cfg)
+    return mu_cap_si.reshape(-1).to(device=device) >= thr
+
+
 def supervision_region_mask(
     data,
     device: torch.device,
@@ -317,13 +429,11 @@ def supervision_region_mask(
     if clot_phi_mask_mode() == "sdf":
         region = sdf_supervision_mask(data, device)
     else:
-        thr = clot_phi_thresh_si(phys_cfg)
-        clot_seed = mu_cap_si.reshape(-1) >= thr
+        clot_seed = resolve_clot_seed_mask(data, device, mu_cap_si, phys_cfg)
         region = neighbor_supervision_mask(data, device, clot_seed)
     if clot_phi_dgamma_slice_enabled():
         bio_cfg = BiochemConfig(phase="biochem")
-        thr = clot_phi_thresh_si(phys_cfg)
-        clot_seed = mu_cap_si.reshape(-1) >= thr
+        clot_seed = resolve_clot_seed_mask(data, device, mu_cap_si, phys_cfg)
         region = dgamma_dx_slice_mask(data, device, region, clot_seed, bio_cfg)
     elif clot_phi_shear_min_frac() > 0.0:
         n = int(data.num_nodes)
@@ -385,6 +495,264 @@ def carreau_mu_si_from_uv(
     return phys_cfg.viscosity_nd_to_si(mu_nd).reshape(-1)
 
 
+def gamma_dot_nd_graph_from_uv(data, u_nd: torch.Tensor, v_nd: torch.Tensor) -> torch.Tensor:
+    """ND shear-rate invariant from sparse WLS gradients on ``u_nd``, ``v_nd``."""
+    u = u_nd.reshape(-1, 1).to(dtype=torch.float32)
+    v = v_nd.reshape(-1, 1).to(dtype=torch.float32)
+    du_dx = torch.sparse.mm(data.G_x, u)
+    du_dy = torch.sparse.mm(data.G_y, u)
+    dv_dx = torch.sparse.mm(data.G_x, v)
+    dv_dy = torch.sparse.mm(data.G_y, v)
+    return compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).reshape(-1)
+
+
+def gamma_dot_nd_kinematic_from_uv(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Kinematic ND shear proxy ``|u| / width`` (matches COMSOL bulk ``spf.mu`` at M=1)."""
+    n = int(data.num_nodes)
+    width = width_nd_from_data(data, device, n)
+    speed_nd = torch.sqrt(u_nd.reshape(-1).float() ** 2 + v_nd.reshape(-1).float() ** 2).clamp(min=1e-8)
+    return speed_nd / width
+
+
+def gamma_dot_nd_poiseuille_from_uv(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Parabolic-channel ND shear proxy (matches mesh biochem prior)."""
+    from src.data_gen.lib.graph_velocity_priors import mass_conserving_umax_nd, width_nd_to_radius_nd
+
+    n = int(data.num_nodes)
+    sdf = sdf_nd_from_data(data, device, n).float()
+    width = width_nd_from_data(data, device, n)
+    r_nd = width_nd_to_radius_nd(width.reshape(-1, 1)).reshape(-1).clamp(min=1e-6)
+    u_max_nd = mass_conserving_umax_nd(r_nd.reshape(-1, 1)).reshape(-1)
+    r_lane = (r_nd - sdf).clamp(min=0.0)
+    return torch.abs(-2.0 * u_max_nd * r_lane / (r_nd ** 2 + 1e-12))
+
+
+def clot_phi_physics_gamma_scale() -> float:
+    """Optional multiplier on resolved ND shear (1 = default)."""
+    return max(_env_float("CLOT_PHI_PHYSICS_GAMMA_SCALE", 1.0), 1e-12)
+
+
+def clot_phi_physics_poiseuille_scale() -> float:
+    """Scale Poiseuille leg of ``max`` gamma (COMSOL ``spf.sr`` calib on patient007 ~0.85)."""
+    return max(_env_float("CLOT_PHI_PHYSICS_POISEUILLE_SCALE", 0.85), 1e-12)
+
+
+def _comsol_sr_sidecar_path(anchor: str):
+    from pathlib import Path
+
+    from src.utils.paths import get_project_root
+
+    root = get_project_root()
+    for rel in (
+        f"data/processed/cfd_results_biochem_diag/{anchor}_sr.pt",
+        f"outputs/biochem/diagnostics/{anchor}_sr.pt",
+    ):
+        p = root / rel
+        if p.is_file():
+            return p
+    return None
+
+
+def gamma_dot_nd_comsol_sr_from_sidecar(
+    data,
+    *,
+    device: torch.device,
+    time_index: int = 0,
+    anchor: str | None = None,
+) -> torch.Tensor | None:
+    """COMSOL ``spf.sr`` [1/s] -> ND ``gamma_dot`` when sidecar exists (oracle/diag only)."""
+    stem = (anchor or (os.environ.get("CLOT_PHI_PHYSICS_COMSOL_SR_ANCHOR") or "")).strip()
+    if not stem:
+        return None
+    path = _comsol_sr_sidecar_path(stem)
+    if path is None:
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or not torch.is_tensor(payload.get("gamma_si")):
+        return None
+    gamma_si = payload["gamma_si"].float()
+    if gamma_si.dim() == 1:
+        g_si = gamma_si.reshape(-1)
+    else:
+        ti = max(0, min(int(time_index), int(gamma_si.shape[0]) - 1))
+        g_si = gamma_si[ti].reshape(-1)
+    if int(g_si.numel()) != int(data.num_nodes):
+        return None
+    u_ref = float(data.u_ref.view(-1)[0].item())
+    d_bar = float(data.d_bar.view(-1)[0].item())
+    return (g_si.to(device=device) * (d_bar / max(u_ref, 1e-8))).clamp(min=1e-12)
+
+
+def resolve_gamma_dot_nd_for_carreau(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    *,
+    device: torch.device,
+    mode: str | None = None,
+    time_index: int | None = None,
+) -> torch.Tensor:
+    """Resolve ND shear rate per ``CLOT_PHI_PHYSICS_GAMMA_MODE``."""
+    mode = (mode or clot_phi_physics_gamma_mode()).strip().lower()
+    scale = clot_phi_physics_gamma_scale()
+    if mode in ("comsol_sr", "spf_sr", "spf.sr"):
+        g_sr = gamma_dot_nd_comsol_sr_from_sidecar(
+            data, device=device, time_index=int(time_index or 0)
+        )
+        if g_sr is not None:
+            return g_sr * scale
+        mode = "max"
+    g_graph = gamma_dot_nd_graph_from_uv(data, u_nd, v_nd)
+    if mode == "graph":
+        return g_graph * scale
+    g_kin = gamma_dot_nd_kinematic_from_uv(data, u_nd, v_nd, device=device)
+    if mode in ("kinematic", "speed_width", "speed/width", "u_over_width"):
+        return g_kin * scale
+    poi_scale = clot_phi_physics_poiseuille_scale()
+    g_poi = gamma_dot_nd_poiseuille_from_uv(data, u_nd, v_nd, device=device) * poi_scale
+    if mode == "poiseuille":
+        return g_poi * scale
+    if mode in ("max_kinematic", "max_graph_kinematic"):
+        return torch.maximum(g_graph, g_kin) * scale
+    if mode in ("max", "max_graph_poiseuille", "blend_max", "comsol"):
+        return torch.maximum(torch.maximum(g_graph, g_poi), g_kin) * scale
+    return torch.maximum(torch.maximum(g_graph, g_poi), g_kin) * scale
+
+
+def carreau_mu_si_from_gamma_nd(
+    gamma_dot_nd: torch.Tensor,
+    mu_0_si: torch.Tensor,
+    mu_inf_si: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    *,
+    data,
+) -> torch.Tensor:
+    """Carreau-Yasuda in SI with per-node ``mu_0`` / ``mu_inf`` and ND ``gamma_dot``."""
+    device = gamma_dot_nd.device
+    dtype = torch.float32
+    g = gamma_dot_nd.reshape(-1, 1).to(device=device, dtype=dtype)
+    scale = float(phys_cfg.mu_viscosity_nd_scale)
+    mu_0_nd = (mu_0_si.reshape(-1, 1).to(device=device, dtype=dtype) / scale).clamp(min=1e-8)
+    mu_inf_nd = (mu_inf_si.reshape(-1, 1).to(device=device, dtype=dtype) / scale).clamp(min=1e-8)
+    lam_nd = float(phys_cfg.lam) * float(data.u_ref.view(-1)[0].item()) / float(
+        data.d_bar.view(-1)[0].item()
+    )
+    mu_nd = carreau_yasuda_viscosity(
+        g,
+        mu_inf_nd,
+        mu_0_nd,
+        torch.full_like(g, lam_nd),
+        float(phys_cfg.n),
+        float(phys_cfg.a),
+    )
+    return phys_cfg.viscosity_nd_to_si(mu_nd).reshape(-1).clamp(min=1e-8)
+
+
+def comsol_carreau_mu_si_from_uv(
+    data,
+    u_nd: torch.Tensor,
+    v_nd: torch.Tensor,
+    gel_factor: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    *,
+    device: torch.device,
+    gamma_mode: str | None = None,
+    time_index: int | None = None,
+) -> torch.Tensor:
+    """COMSOL ``spf.mu``: Carreau with gel-scaled limits ``mu0=mu_0*M``, ``mu_inf=mu_b*M``."""
+    gf = gel_factor.reshape(-1).to(device=device, dtype=torch.float32).clamp(min=1e-8)
+    mu_0_si = float(phys_cfg.mu_0) * gf
+    mu_inf_si = clot_phi_physics_mu_blood_si(phys_cfg) * gf
+    gamma_nd = resolve_gamma_dot_nd_for_carreau(
+        data,
+        u_nd,
+        v_nd,
+        device=device,
+        mode=gamma_mode,
+        time_index=time_index,
+    )
+    return carreau_mu_si_from_gamma_nd(
+        gamma_nd, mu_0_si, mu_inf_si, phys_cfg, data=data
+    )
+
+
+def _resolve_gelation_legs(
+    species_log1p: torch.Tensor,
+    bio_cfg: BiochemConfig,
+    *,
+    device: torch.device,
+    data=None,
+    u_nd: torch.Tensor | None = None,
+    v_nd: torch.Tensor | None = None,
+    time_index: int | None = None,
+    base_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(mu1, mu2, gel)`` with COMSOL or soft gelation legs."""
+    mu_ratio_max = clot_phi_physics_mu_ratio_max(bio_cfg)
+    sp_si = species_log1p_nd_to_si(species_log1p.to(device=device), bio_cfg)
+    fi_si = sp_si[:, 8]
+    mat_si = mat_si_for_gelation_from_log1p(species_log1p[:, 11].to(device=device), bio_cfg)
+    if base_mode in ("comsol", "comsol_carreau"):
+        mu1 = mu1_comsol_from_mat_si(mat_si, bio_cfg, mu_ratio_max)
+        mu2 = mu2_comsol_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
+    else:
+        mu1 = mu1_gelation_from_mat_si(mat_si, bio_cfg, mu_ratio_max)
+        mu2 = mu2_gelation_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
+    cap = clot_phi_physics_mu2_cap()
+    if cap is not None:
+        mu2 = mu2.clamp(max=cap)
+    if clot_phi_physics_wall_mat_only() and data is not None:
+        n = int(data.num_nodes)
+        wall = _wall_mask_from_data(data, device, n)
+        if base_mode in ("comsol", "comsol_carreau"):
+            mu1 = torch.where(wall, mu1, torch.ones_like(mu1))
+        else:
+            mu1 = torch.where(wall, mu1, torch.zeros_like(mu1))
+    onset = clot_phi_physics_gelation_onset_frac()
+    if onset > 0.0 and data is not None and time_index is not None:
+        from src.core_physics.clot_continuous_time import growth_time_frac
+
+        t_frac = growth_time_frac(data, int(time_index), bio_cfg=bio_cfg)
+        if t_frac < onset:
+            if base_mode in ("comsol", "comsol_carreau"):
+                mu1 = torch.ones_like(mu1)
+            else:
+                mu1 = torch.zeros_like(mu1)
+            mu2 = torch.zeros_like(mu2)
+    gel = mu1 + mu2
+    if (
+        clot_phi_physics_gelation_gate_enabled()
+        and data is not None
+        and u_nd is not None
+        and v_nd is not None
+    ):
+        props = {
+            "u_ref": data.u_ref.view(-1)[:1].to(device=device, dtype=gel.dtype),
+            "d_bar": data.d_bar.view(-1)[:1].to(device=device, dtype=gel.dtype),
+        }
+        gate = clot_prior_score_flat(
+            data,
+            u_nd.reshape(-1).to(device=device, dtype=gel.dtype),
+            v_nd.reshape(-1).to(device=device, dtype=gel.dtype),
+            bio_cfg,
+            props,
+        ).clamp(0.0, 1.0)
+        gel = gel * gate
+    return mu1, mu2, gel
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.environ.get(name) or "").strip().lower()
     if not raw:
@@ -422,13 +790,123 @@ def clot_phi_physics_gelation_gate_enabled() -> bool:
     return _env_bool("CLOT_PHI_PHYSICS_GELATION_GATE", False)
 
 
+def clot_phi_physics_mu_base_mode() -> str:
+    """``carreau``, ``blood``, ``comsol`` (mu_b*gel), or ``comsol_carreau`` (spf.mu-faithful)."""
+    raw = (os.environ.get("CLOT_PHI_PHYSICS_MU_BASE") or "carreau").strip().lower()
+    if raw in ("blood", "mu_b", "newtonian", "mu_inf"):
+        return "blood"
+    if raw in ("comsol_carreau", "comsol-carreau", "spf_mu", "spf.mu"):
+        return "comsol_carreau"
+    if raw in ("comsol", "comsol_blood", "mu_b_gel"):
+        return "comsol"
+    return "carreau"
+
+
+def clot_phi_physics_gamma_mode() -> str:
+    """Shear rate for COMSOL Carreau: ``graph``, ``kinematic``, ``poiseuille``, or ``max``."""
+    raw = (os.environ.get("CLOT_PHI_PHYSICS_GAMMA_MODE") or "").strip().lower()
+    if raw in ("graph", "wls", "gradient"):
+        return "graph"
+    if raw in ("kinematic", "speed_width", "speed/width", "u_over_width"):
+        return "kinematic"
+    if raw in ("poiseuille", "poi", "analytic"):
+        return "poiseuille"
+    if raw in ("comsol_sr", "spf_sr", "spf.sr"):
+        return "comsol_sr"
+    if raw in ("max", "max_graph_poiseuille", "blend_max", "comsol", "max_graph_kinematic"):
+        return "max"
+    base = clot_phi_physics_mu_base_mode()
+    return "max" if base == "comsol_carreau" else "graph"
+
+
+def clot_phi_physics_hard_step() -> bool:
+    return _env_bool("CLOT_PHI_PHYSICS_HARD_STEP", False)
+
+
+def clot_phi_physics_wall_mat_only() -> bool:
+    return _env_bool("CLOT_PHI_PHYSICS_WALL_MAT_ONLY", False)
+
+
+def clot_phi_physics_gelation_onset_frac() -> float:
+    try:
+        return max(float(os.environ.get("CLOT_PHI_PHYSICS_GELATION_ONSET_FRAC", "0") or "0"), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def clot_phi_physics_mu_blood_si(phys_cfg: PhysicsConfig) -> float:
+    """COMSOL mu_b infinite-shear scale [Pa*s] (= 0.035 Poise)."""
+    raw = (os.environ.get("CLOT_PHI_PHYSICS_MU_BLOOD_SI") or "").strip()
+    if raw:
+        return max(float(raw), 1e-8)
+    return float(phys_cfg.mu_inf)
+
+
+def clot_phi_physics_subtract_t0_mu() -> bool:
+    """Count only viscosity rise above per-node mu at t=0 (no baseline Carreau clot)."""
+    raw = (os.environ.get("CLOT_PHI_PHYSICS_SUBTRACT_T0_MU") or "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def clot_phi_gt_subtract_t0_mu() -> bool:
+    """GT labels: clot = viscosity growth above per-node COMSOL mu at macro t=0."""
+    raw = (os.environ.get("CLOT_PHI_GT_SUBTRACT_T0_MU") or "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def gt_mu_anchor_cap_si(data, phys_cfg: PhysicsConfig, device: torch.device) -> torch.Tensor:
+    """Per-node capped COMSOL mu_eff at macro t=0 (growth baseline for GT labels)."""
+    y0 = data.y[0].to(device)
+    mu0 = phys_cfg.viscosity_nd_to_si(y0[:, STATE_CHANNEL_MU_EFF_ND])
+    return cap_mu_eff_si(mu0)
+
+
+def snapshot_clot_physics_trigger_config() -> dict[str, object]:
+    return {
+        "mu_base": clot_phi_physics_mu_base_mode(),
+        "mu_ratio_max": os.environ.get("CLOT_PHI_PHYSICS_MU_RATIO_MAX", ""),
+        "hard_step": clot_phi_physics_hard_step(),
+        "gelation_gate": clot_phi_physics_gelation_gate_enabled(),
+        "wall_mat_only": clot_phi_physics_wall_mat_only(),
+        "gelation_onset_frac": clot_phi_physics_gelation_onset_frac(),
+        "subtract_t0_mu": clot_phi_physics_subtract_t0_mu(),
+        "gt_subtract_t0_mu": clot_phi_gt_subtract_t0_mu(),
+        "mu2_cap": os.environ.get("CLOT_PHI_PHYSICS_MU2_CAP", ""),
+        "thresh_si": os.environ.get("CLOT_PHI_THRESH_SI", ""),
+        "mu_blood_si": os.environ.get("CLOT_PHI_PHYSICS_MU_BLOOD_SI", ""),
+        "gamma_mode": clot_phi_physics_gamma_mode(),
+    }
+
+
+def mat_si_for_gelation_from_log1p(
+    mat_log1p: torch.Tensor,
+    bio_cfg: BiochemConfig,
+) -> torch.Tensor:
+    """COMSOL ``Mat`` argument for ``mu1(Mat)`` (model units, not plt/m^2).
+
+    COMSOL exports ``Mat`` as a concentration-like field compared at
+    ``viscosity_mat_crit`` (~2e7). Extract encodes surface channels as
+    ``log1p(raw/Minf)`` because ``surface_scale`` cancels in ND; gelation must
+    decode with ``expm1 * Minf`` only. ``species_log1p_nd_to_si`` multiplies an
+    extra ``surface_scale`` (~1e4) and breaks ``mu1`` step matching.
+    """
+    sp = mat_log1p.clamp(min=-10.0, max=8.0)
+    return torch.expm1(sp) * float(bio_cfg.Minf)
+
+
 def species_log1p_nd_to_si(species_log1p: torch.Tensor, bio_cfg: BiochemConfig) -> torch.Tensor:
     """``y`` species channels (log1p ND) -> SI concentrations (12 bulk)."""
     scales = bio_cfg.get_species_scales(device=species_log1p.device)[:12].to(
         device=species_log1p.device, dtype=species_log1p.dtype
     )
     sp = species_log1p.reshape(-1, 12).clamp(min=-10.0, max=8.0)
-    return torch.expm1(sp) * scales.view(1, -1)
+    out = torch.expm1(sp) * scales.view(1, -1)
+    out[:, 11] = mat_si_for_gelation_from_log1p(sp[:, 11], bio_cfg)
+    return out
 
 
 def mu1_gelation_from_mat_si(mat_si: torch.Tensor, bio_cfg: BiochemConfig, mu_ratio_max: float) -> torch.Tensor:
@@ -439,12 +917,41 @@ def mu1_gelation_from_mat_si(mat_si: torch.Tensor, bio_cfg: BiochemConfig, mu_ra
     return (float(mu_ratio_max) - 1.0) * torch.sigmoid(z)
 
 
+def mu1_comsol_from_mat_si(mat_si: torch.Tensor, bio_cfg: BiochemConfig, mu_ratio_max: float) -> torch.Tensor:
+    """COMSOL ``mu1(Mat)``: step from 1 -> mu_ratio_max at Mat crit."""
+    crit = float(bio_cfg.viscosity_mat_crit)
+    mat = mat_si.reshape(-1)
+    if clot_phi_physics_hard_step():
+        return torch.where(
+            mat >= crit,
+            torch.full_like(mat, float(mu_ratio_max)),
+            torch.ones_like(mat),
+        )
+    t_scale = max(float(bio_cfg.soft_step_T_scale), 1e-5)
+    temp = max(float(bio_cfg.viscosity_gnode_temp_mat) * t_scale, 1e-8)
+    z = torch.clamp((mat - crit) / temp, min=-50.0, max=50.0)
+    return 1.0 + (float(mu_ratio_max) - 1.0) * torch.sigmoid(z)
+
+
 def mu2_gelation_from_fi_si(fi_si: torch.Tensor, bio_cfg: BiochemConfig, mu_ratio_max: float) -> torch.Tensor:
     t_scale = max(float(bio_cfg.soft_step_T_scale), 1e-5)
     temp = max(float(bio_cfg.viscosity_gnode_temp_fi) * t_scale, 1e-8)
     crit = float(bio_cfg.viscosity_fi_crit)
     z = torch.clamp((fi_si.reshape(-1) - crit) / temp, min=-50.0, max=50.0)
     return float(mu_ratio_max) * torch.sigmoid(z)
+
+
+def mu2_comsol_from_fi_si(fi_si: torch.Tensor, bio_cfg: BiochemConfig, mu_ratio_max: float) -> torch.Tensor:
+    """COMSOL ``mu2(FI)``: step from 0 -> mu_ratio_max at FI crit."""
+    crit = float(bio_cfg.viscosity_fi_crit)
+    fi = fi_si.reshape(-1)
+    if clot_phi_physics_hard_step():
+        return torch.where(
+            fi >= crit,
+            torch.full_like(fi, float(mu_ratio_max)),
+            torch.zeros_like(fi),
+        )
+    return mu2_gelation_from_fi_si(fi, bio_cfg, mu_ratio_max)
 
 
 def clot_phi_physics_mu2_cap() -> float | None:
@@ -463,50 +970,72 @@ def physics_mu_eff_si(
     data=None,
     u_nd: torch.Tensor | None = None,
     v_nd: torch.Tensor | None = None,
+    phys_cfg: PhysicsConfig | None = None,
+    time_index: int | None = None,
 ) -> torch.Tensor:
-    """``mu = mu_c * (1 + mu1(Mat) + mu2(FI))`` with optional prior gate / mu2 cap."""
-    mu_ratio_max = clot_phi_physics_mu_ratio_max(bio_cfg)
-    sp_si = species_log1p_nd_to_si(species_log1p.to(device=device), bio_cfg)
-    fi_si = sp_si[:, 8]
-    mat_si = sp_si[:, 11]
-    mu1 = mu1_gelation_from_mat_si(mat_si, bio_cfg, mu_ratio_max)
-    mu2 = mu2_gelation_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
-    cap = clot_phi_physics_mu2_cap()
-    if cap is not None:
-        mu2 = mu2.clamp(max=cap)
-    gel = mu1 + mu2
-    if (
-        clot_phi_physics_gelation_gate_enabled()
-        and data is not None
-        and u_nd is not None
-        and v_nd is not None
-    ):
-        props = {
-            "u_ref": data.u_ref.view(-1)[:1].to(device=device, dtype=mu_c_si.dtype),
-            "d_bar": data.d_bar.view(-1)[:1].to(device=device, dtype=mu_c_si.dtype),
-        }
-        gate = clot_prior_score_flat(
+    """Gelation trigger: legacy Carreau*gel, COMSOL export, or COMSOL Carreau (spf.mu)."""
+    from src.config import PhysicsConfig as _PhysicsConfig
+
+    phys = phys_cfg or _PhysicsConfig(phase="biochem")
+    base_mode = clot_phi_physics_mu_base_mode()
+    _mu1, _mu2, gel = _resolve_gelation_legs(
+        species_log1p,
+        bio_cfg,
+        device=device,
+        data=data,
+        u_nd=u_nd,
+        v_nd=v_nd,
+        time_index=time_index,
+        base_mode=base_mode,
+    )
+    if base_mode == "comsol_carreau":
+        if data is None or u_nd is None or v_nd is None:
+            raise ValueError("comsol_carreau requires data, u_nd, and v_nd")
+        return comsol_carreau_mu_si_from_uv(
             data,
-            u_nd.reshape(-1).to(device=device, dtype=mu_c_si.dtype),
-            v_nd.reshape(-1).to(device=device, dtype=mu_c_si.dtype),
-            bio_cfg,
-            props,
-        ).clamp(0.0, 1.0)
-        gel = gel * gate
-    return (mu_c_si.reshape(-1) * (1.0 + gel)).clamp(min=1e-8)
+            u_nd,
+            v_nd,
+            gel,
+            phys,
+            device=device,
+            time_index=time_index,
+        )
+    mc = mu_c_si.reshape(-1)
+    mu_b = clot_phi_physics_mu_blood_si(phys)
+    if base_mode == "comsol":
+        mu_out = mu_b * gel
+    elif base_mode == "blood":
+        mu_out = mu_b * (1.0 + gel)
+    else:
+        mu_out = mc * (1.0 + gel)
+    return mu_out.clamp(min=1e-8)
 
 
 def physics_phi_from_mu(
     mu_phys_si: torch.Tensor,
     mu_c_si: torch.Tensor,
-    region: torch.Tensor,
+    region: torch.Tensor | None,
     phys_cfg: PhysicsConfig,
     *,
     soft: bool,
+    mu_anchor_si: torch.Tensor | None = None,
 ) -> torch.Tensor:
     mu_cap = cap_mu_eff_si(mu_phys_si)
+    mu_ref = mu_c_si.reshape(-1)
+    if mu_anchor_si is not None:
+        mu_ref = mu_anchor_si.reshape(-1).to(device=mu_cap.device, dtype=mu_cap.dtype).clamp(min=1e-8)
+        delta = (mu_cap.reshape(-1) - mu_ref).clamp(min=0.0)
+        mu_cap = (mu_ref + delta).clamp(min=1e-8)
+        if soft:
+            return phi_gt_soft(mu_cap, mu_ref, region)
+        growth = (mu_cap.reshape(-1) - mu_ref).clamp(min=0.0)
+        thr = clot_phi_thresh_si(phys_cfg)
+        phi = (growth >= thr).to(dtype=torch.float32)
+        if region is None:
+            return phi
+        return phi * region.reshape(-1).to(dtype=torch.float32)
     if soft:
-        return phi_gt_soft(mu_cap, mu_c_si, region)
+        return phi_gt_soft(mu_cap, mu_ref, region)
     return phi_gt_binary(mu_cap, region, phys_cfg)
 
 def clot_phi_use_prior_features() -> bool:
@@ -576,21 +1105,476 @@ def rule_phi_from_mu_cap(
     return phi_gt_binary(mu_cap_si, region, phys_cfg)
 
 
+def clot_prior_rule_p_quantile() -> float:
+    """Prior top-(1-p) fraction inside ceiling (default p80). Env: ``CLOT_PHI_PRIOR_RULE_P``."""
+    raw = (os.environ.get("CLOT_PHI_PRIOR_RULE_P") or "0.80").strip()
+    try:
+        p = float(raw)
+    except ValueError:
+        p = 0.95
+    return max(min(p, 0.99), 0.50)
+
+
+def _prior_rule_env_bool(key: str, default: bool) -> bool:
+    raw = (os.environ.get(key) or ("1" if default else "0")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _prior_rule_env_frac(key: str) -> float | None:
+    raw = (os.environ.get(key) or "").strip()
+    if not raw or raw.lower() in ("0", "none", "off", "false"):
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return max(min(v, 0.95), 0.01)
+
+
+def sweep_winner_prior_rule_config() -> ClotPriorRuleConfig:
+    """Best mean band-F1 from ``sweep_clot_prior_rules`` (2026-06, post topk fix): prior_p0.80."""
+    return ClotPriorRuleConfig(
+        name="prior_p0.80",
+        prior_p=0.80,
+        use_t0_strip=False,
+    )
+
+
+def _prior_rule_post_gate_from_env() -> str | None:
+    raw = (os.environ.get("CLOT_PHI_PRIOR_RULE_POST_GATE") or "").strip().lower()
+    if not raw or raw in ("0", "none", "off", "false"):
+        return None
+    return raw
+
+
+def prior_rule_config_from_env() -> ClotPriorRuleConfig:
+    """Build deploy rule from env (defaults = sweep winner)."""
+    base = sweep_winner_prior_rule_config()
+    combine = (os.environ.get("CLOT_PHI_PRIOR_RULE_COMBINE") or base.combine_legs).strip().lower()
+    if combine not in ("or", "and"):
+        combine = base.combine_legs
+    return ClotPriorRuleConfig(
+        name=base.name,
+        prior_p=clot_prior_rule_p_quantile() if _prior_rule_env_bool("CLOT_PHI_PRIOR_RULE_USE_PRIOR", True) else None,
+        use_t0_strip=_prior_rule_env_bool("CLOT_PHI_PRIOR_RULE_T0_STRIP", base.use_t0_strip),
+        flux_stream_top_frac=_prior_rule_env_frac("CLOT_PHI_PRIOR_RULE_FLUX_STREAM_TOP")
+        or base.flux_stream_top_frac,
+        flux_stag_top_frac=_prior_rule_env_frac("CLOT_PHI_PRIOR_RULE_FLUX_STAG_TOP")
+        or base.flux_stag_top_frac,
+        neg_dgamma_top_frac=_prior_rule_env_frac("CLOT_PHI_PRIOR_RULE_NEG_DGAMMA_TOP")
+        or base.neg_dgamma_top_frac,
+        require_on_wall=_prior_rule_env_bool("CLOT_PHI_PRIOR_RULE_ON_WALL", False),
+        max_hop_from_wall=(
+            int(os.environ["CLOT_PHI_PRIOR_RULE_MAX_HOP_WALL"])
+            if (os.environ.get("CLOT_PHI_PRIOR_RULE_MAX_HOP_WALL") or "").strip()
+            else None
+        ),
+        combine_legs=combine,
+        post_gate=_prior_rule_post_gate_from_env() or base.post_gate,
+        stag_off_wall_adjacent=_prior_rule_env_bool(
+            "CLOT_PHI_PRIOR_RULE_STAG_OFF_WALL_ADJ", base.stag_off_wall_adjacent
+        ),
+        rank_tie_break=_prior_rule_env_bool("CLOT_PHI_PRIOR_RULE_TIE_BREAK", base.rank_tie_break),
+        rank_dgamma_slice=_prior_rule_env_bool(
+            "CLOT_PHI_PRIOR_RULE_RANK_DGAMMA_SLICE", base.rank_dgamma_slice
+        ),
+        rank_sdf_max_nd=(
+            float(os.environ["CLOT_PHI_PRIOR_RULE_RANK_SDF_MAX"])
+            if (os.environ.get("CLOT_PHI_PRIOR_RULE_RANK_SDF_MAX") or "").strip()
+            else base.rank_sdf_max_nd
+        ),
+        flux_dx_raw_top_frac=_prior_rule_env_frac("CLOT_PHI_PRIOR_RULE_FLUX_DX_RAW_TOP")
+        or base.flux_dx_raw_top_frac,
+        skip_inlet_quantile=(
+            float(os.environ["CLOT_PHI_PRIOR_RULE_SKIP_INLET_Q"])
+            if (os.environ.get("CLOT_PHI_PRIOR_RULE_SKIP_INLET_Q") or "").strip()
+            else base.skip_inlet_quantile
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ClotPriorRuleConfig:
+    """Composable deploy rule legs (all evaluated @ t_in flow, union OR)."""
+
+    name: str = "prior_p85_or_t0"
+    prior_p: float | None = 0.85
+    use_t0_strip: bool = True
+    flux_stream_top_frac: float | None = None
+    flux_stag_top_frac: float | None = None
+    neg_dgamma_top_frac: float | None = None
+    require_on_wall: bool = False
+    max_hop_from_wall: int | None = None
+    combine_legs: str = "or"  # ``or`` = union; ``and`` = intersection of legs
+    post_gate: str | None = None  # optional final mask: t0_strip, t0_d1, t0_d2
+    stag_off_wall_adjacent: bool = False  # stag leg: adjacent band, exclude no-slip wall
+    rank_tie_break: bool = False  # top-k tie-break: secondary dx raw, tertiary hop from wall
+    rank_dgamma_slice: bool = False  # top-k pool = ceiling intersect dgamma adhesion slice @ t_in
+    rank_sdf_max_nd: float | None = None  # further restrict rank pool: sdf_nd <= cap inside ceiling
+    skip_inlet_quantile: float | None = None  # drop inlet-adjacent pool: keep hop_from_inlet >= q within ceiling
+    flux_dx_raw_top_frac: float | None = None  # top fraction by unclamped flux_path_dx_raw
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.prior_p is not None:
+            parts.append(f"prior_p{self.prior_p:.2f}")
+        if self.use_t0_strip:
+            parts.append("t0_strip")
+        if self.flux_stream_top_frac is not None:
+            parts.append(f"flux_stream_top{int(100*self.flux_stream_top_frac)}")
+        if self.flux_stag_top_frac is not None:
+            tag = f"flux_stag_top{int(100*self.flux_stag_top_frac)}"
+            if self.stag_off_wall_adjacent:
+                tag += "_offwall"
+            parts.append(tag)
+        if self.flux_dx_raw_top_frac is not None:
+            parts.append(f"dx_raw_top{int(100*self.flux_dx_raw_top_frac)}")
+        if self.neg_dgamma_top_frac is not None:
+            parts.append(f"neg_dx_top{int(100*self.neg_dgamma_top_frac)}")
+        if self.require_on_wall:
+            parts.append("on_wall")
+        if self.max_hop_from_wall is not None:
+            parts.append(f"hop_wall<={self.max_hop_from_wall}")
+        if self.combine_legs.strip().lower() == "and" and len(parts) > 1:
+            parts.append("AND")
+        if self.post_gate:
+            parts.append(f"gate_{self.post_gate}")
+        if self.rank_tie_break:
+            parts.append("tie_dx_hop")
+        if self.rank_dgamma_slice:
+            parts.append("dgamma_rank")
+        if self.rank_sdf_max_nd is not None:
+            parts.append(f"sdf<={self.rank_sdf_max_nd:.3f}")
+        if self.skip_inlet_quantile is not None:
+            parts.append(f"skip_inlet_q{int(100 * self.skip_inlet_quantile)}")
+        if parts:
+            return "|".join(parts)
+        return self.name if self.name else "empty"
+
+
+def default_prior_rule_config() -> ClotPriorRuleConfig:
+    return prior_rule_config_from_env()
+
+
+def _noslip_wall_mask(wall: torch.Tensor, u: torch.Tensor, v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Wall nodes with zero assigned velocity (no-slip BC patch)."""
+    speed = u.reshape(-1).abs() + v.reshape(-1).abs()
+    return wall.reshape(-1).bool() & (speed <= eps)
+
+
+def _rank01(x: torch.Tensor) -> torch.Tensor:
+    xmin = x.min()
+    span = (x.max() - xmin).clamp(min=1e-12)
+    return (x - xmin) / span
+
+
+def _top_frac_mask(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    top_frac: float,
+    *,
+    tie_dx: torch.Tensor | None = None,
+    tie_hop: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Top ``ceil(frac * n)`` nodes inside ``mask`` (exact count, optional lex tie-break)."""
+    frac = max(min(float(top_frac), 0.95), 0.01)
+    n = int(mask.sum())
+    if n <= 0:
+        return torch.zeros_like(mask.reshape(-1), dtype=torch.bool)
+    k = max(int(math.ceil(frac * n)), 1)
+    k = min(k, n)
+    idx_all = torch.where(mask.reshape(-1))[0]
+    vals = values.reshape(-1)[idx_all].to(dtype=torch.float32)
+    if tie_dx is not None and tie_hop is not None:
+        dx = tie_dx.reshape(-1)[idx_all].to(dtype=torch.float32)
+        hop = tie_hop.reshape(-1)[idx_all].to(dtype=torch.float32)
+        score = (
+            _rank01(vals) * 1_000_000.0
+            + _rank01(dx) * 1_000.0
+            + _rank01(-hop) * 1.0
+        )
+        pick = torch.argsort(score, descending=True, stable=True)[:k]
+    else:
+        pick = torch.topk(vals, k).indices
+    out = torch.zeros(int(values.numel()), device=values.device, dtype=torch.bool)
+    out[idx_all[pick]] = True
+    return out
+
+
+def predict_phi_prior_rule(
+    data,
+    device: torch.device,
+    bio_cfg: BiochemConfig,
+    *,
+    rule: ClotPriorRuleConfig | None = None,
+    t_in: int = 0,
+    ceiling_hops: int | None = None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Deploy rule: phi=1 on union of configured legs inside ceiling (optional filters)."""
+    from src.core_physics.clot_growth_masks import resolve_ceiling_mask, resolve_t0_dgamma_wall_mask
+
+    os.environ.setdefault("BIOCHEM_PRIOR_COMSOL_ALIGNED", "1")
+    os.environ.setdefault("BIOCHEM_PRIOR_NORM_MASK", "adjacent")
+
+    cfg = rule or default_prior_rule_config()
+    y_in = data.y[int(t_in)].to(device=device, dtype=torch.float32)
+    u = y_in[:, 0]
+    v = y_in[:, 1]
+    props = _anchor_flow_props(data, device)
+    fields = compute_clot_kinematics_fields(data, u, v, bio_cfg, props)
+    prior = clot_prior_score_flat(data, u, v, bio_cfg, props).reshape(-1)
+
+    ceiling = resolve_ceiling_mask(data, device, bio_cfg, ceiling_hops=ceiling_hops)
+    t0_strip = resolve_t0_dgamma_wall_mask(data, device, bio_cfg)
+    wall = _wall_mask_from_data(data, device, int(data.num_nodes))
+    noslip = _noslip_wall_mask(wall, u, v)
+    rank_mask = ceiling
+    n_rank_mask = int(ceiling.sum().item())
+    if cfg.rank_dgamma_slice:
+        clot_seed = torch.zeros(int(data.num_nodes), device=device, dtype=torch.bool)
+        rank_mask = dgamma_dx_slice_mask(data, device, ceiling, clot_seed, bio_cfg)
+        n_rank_mask = int(rank_mask.sum().item())
+    if cfg.rank_sdf_max_nd is not None:
+        sdf = sdf_nd_from_data(data, device, int(data.num_nodes))
+        rank_mask = rank_mask & (sdf <= float(cfg.rank_sdf_max_nd))
+        n_rank_mask = int(rank_mask.sum().item())
+    if cfg.skip_inlet_quantile is not None and hasattr(data, "mask_inlet") and data.mask_inlet is not None:
+        n_nodes = int(data.num_nodes)
+        inlet = data.mask_inlet.view(-1).to(device=device).bool()
+        if int(inlet.numel()) == n_nodes and bool(inlet.any().item()):
+            hop_in = _hop_distance_from_seed(inlet, data.edge_index.to(device=device)).float()
+            eligible = rank_mask & (hop_in > 0)
+            if bool(eligible.any().item()):
+                q = max(min(float(cfg.skip_inlet_quantile), 0.95), 0.0)
+                thr = torch.quantile(hop_in[eligible], q)
+                rank_mask = rank_mask & (hop_in >= thr)
+                n_rank_mask = int(rank_mask.sum().item())
+    dx_raw = fields.flux_path_dx_raw.reshape(-1)
+    neg_dx_flow = (-fields.dgamma_dx_phys).clamp(min=0.0).reshape(-1)
+    hop_wall = _hop_distance_from_seed(wall, data.edge_index.to(device=device)).float()
+    tie_dx = dx_raw if cfg.rank_tie_break else None
+    tie_hop = hop_wall if cfg.rank_tie_break else None
+    stag_rank_mask = rank_mask
+    if cfg.stag_off_wall_adjacent:
+        stag_rank_mask = rank_mask & fields.adjacent_band.reshape(-1).bool() & ~noslip
+
+    legs: list[torch.Tensor] = []
+    prior_thr = float("nan")
+    n_prior_leg = 0
+    n_stag_leg = 0
+    n_dx_raw_leg = 0
+    if cfg.prior_p is not None:
+        p = max(min(float(cfg.prior_p), 0.99), 0.50)
+        top_frac = max(1.0 - p, 0.01)
+        leg_prior = _top_frac_mask(prior, rank_mask, top_frac, tie_dx=tie_dx, tie_hop=tie_hop)
+        if bool(leg_prior.any().item()):
+            prior_thr = float(prior.reshape(-1)[leg_prior].min().item())
+        legs.append(leg_prior)
+        n_prior_leg = int(leg_prior.sum().item())
+    if cfg.use_t0_strip:
+        legs.append(t0_strip)
+    if cfg.flux_stream_top_frac is not None:
+        legs.append(
+            _top_frac_mask(
+                fields.flux_path_stream.reshape(-1),
+                rank_mask,
+                cfg.flux_stream_top_frac,
+                tie_dx=tie_dx,
+                tie_hop=tie_hop,
+            )
+        )
+    if cfg.flux_stag_top_frac is not None:
+        leg_stag = _top_frac_mask(
+            fields.flux_stag.reshape(-1),
+            stag_rank_mask,
+            cfg.flux_stag_top_frac,
+            tie_dx=tie_dx,
+            tie_hop=tie_hop,
+        )
+        legs.append(leg_stag)
+        n_stag_leg = int(leg_stag.sum().item())
+    if cfg.flux_dx_raw_top_frac is not None:
+        leg_dx = _top_frac_mask(
+            dx_raw,
+            rank_mask,
+            cfg.flux_dx_raw_top_frac,
+            tie_dx=neg_dx_flow,
+            tie_hop=tie_hop,
+        )
+        legs.append(leg_dx)
+        n_dx_raw_leg = int(leg_dx.sum().item())
+    if cfg.neg_dgamma_top_frac is not None:
+        legs.append(
+            _top_frac_mask(
+                neg_dx_flow,
+                rank_mask,
+                cfg.neg_dgamma_top_frac,
+                tie_dx=dx_raw,
+                tie_hop=tie_hop,
+            )
+        )
+
+    if not legs:
+        flag = torch.zeros(int(data.num_nodes), device=device, dtype=torch.bool)
+    elif str(cfg.combine_legs).strip().lower() == "and" and len(legs) > 1:
+        flag = legs[0]
+        for leg in legs[1:]:
+            flag = flag & leg
+    else:
+        flag = legs[0]
+        for leg in legs[1:]:
+            flag = flag | leg
+
+    if cfg.require_on_wall:
+        flag = flag & wall
+    if cfg.max_hop_from_wall is not None and hop_wall is not None:
+        flag = flag & (hop_wall <= float(cfg.max_hop_from_wall))
+
+    post_gate = (str(cfg.post_gate).strip().lower() if cfg.post_gate else "") or ""
+    n_post_gate = int(ceiling.sum().item())
+    if post_gate in ("t0_strip", "t0"):
+        flag = flag & t0_strip
+        n_post_gate = int(t0_strip.sum().item())
+    elif post_gate in ("t0_d1", "t0_strip_d1"):
+        from src.core_physics.clot_growth_masks import graph_dilate_hops
+
+        gate = graph_dilate_hops(t0_strip, data.edge_index.to(device=device), 1) & ceiling
+        flag = flag & gate
+        n_post_gate = int(gate.sum().item())
+    elif post_gate in ("t0_d2", "t0_strip_d2"):
+        from src.core_physics.clot_growth_masks import graph_dilate_hops
+
+        gate = graph_dilate_hops(t0_strip, data.edge_index.to(device=device), 2) & ceiling
+        flag = flag & gate
+        n_post_gate = int(gate.sum().item())
+
+    phi = flag.to(dtype=torch.float32)
+    meta: dict[str, float | int] = {
+        "rule": cfg.describe(),
+        "prior_p": float(cfg.prior_p) if cfg.prior_p is not None else -1.0,
+        "prior_thr": prior_thr,
+        "n_ceiling": int(ceiling.sum().item()),
+        "n_rank_mask": n_rank_mask,
+        "rank_dgamma_slice": int(cfg.rank_dgamma_slice),
+        "rank_sdf_max_nd": float(cfg.rank_sdf_max_nd) if cfg.rank_sdf_max_nd is not None else -1.0,
+        "n_t0_strip": int(t0_strip.sum().item()),
+        "n_prior_leg": n_prior_leg,
+        "n_stag_leg": n_stag_leg,
+        "n_dx_raw_leg": n_dx_raw_leg,
+        "stag_off_wall_adjacent": int(cfg.stag_off_wall_adjacent),
+        "rank_tie_break": int(cfg.rank_tie_break),
+        "n_prior_hit": n_prior_leg,
+        "n_post_gate": n_post_gate,
+        "post_gate": post_gate,
+        "n_flag": int(flag.sum().item()),
+    }
+    return phi, meta
+
+
+def _hop_distance_from_seed(seed: torch.Tensor, edge_index: torch.Tensor, max_hops: int = 64) -> torch.Tensor:
+    from src.core_physics.clot_growth_masks import graph_dilate_hops
+
+    n = int(seed.numel())
+    dist = torch.full((n,), max_hops + 1, dtype=torch.long, device=seed.device)
+    if not bool(seed.any().item()):
+        return dist
+    dist[seed] = 0
+    active = seed.clone()
+    for h in range(max_hops):
+        nxt = graph_dilate_hops(active, edge_index, 1) & ~active
+        if not bool(nxt.any().item()):
+            break
+        dist[nxt] = h + 1
+        active = active | nxt
+    return dist
+
+
+def _anchor_flow_props(data, device: torch.device) -> dict[str, torch.Tensor]:
+    if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == data.num_nodes:
+        u_ref = data.u_ref.to(device=device, dtype=torch.float32).reshape(-1)[:1]
+        d_bar = data.d_bar.to(device=device, dtype=torch.float32).reshape(-1)[:1]
+    else:
+        u_ref = torch.as_tensor(data.u_ref, device=device, dtype=torch.float32).reshape(1)
+        d_bar = torch.as_tensor(data.d_bar, device=device, dtype=torch.float32).reshape(1)
+    return {"u_ref": u_ref, "d_bar": d_bar}
+
+
+def predict_phi_prior_rule_baseline(
+    data,
+    device: torch.device,
+    bio_cfg: BiochemConfig,
+    *,
+    t_in: int = 0,
+    ceiling_hops: int | None = None,
+    rule: ClotPriorRuleConfig | None = None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Deploy rule: phi=1 where (prior >= p85 inside ceiling) OR t0 dgamma strip (default)."""
+    return predict_phi_prior_rule(
+        data,
+        device,
+        bio_cfg,
+        rule=rule or default_prior_rule_config(),
+        t_in=t_in,
+        ceiling_hops=ceiling_hops,
+    )
+
+
+def predict_prior_rule_deploy(
+    data,
+    t_out: int,
+    *,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    t_in: int = 0,
+    rule: ClotPriorRuleConfig | None = None,
+) -> tuple[object, torch.Tensor, torch.Tensor, dict[str, float | int]]:
+    """Static-final deploy: t_in flow -> phi rule -> fixed-mu blend -> support projection."""
+    from src.core_physics.clot_forecast import build_clot_forecast_pair_step
+
+    step = build_clot_forecast_pair_step(
+        data,
+        int(t_in),
+        int(t_out),
+        phys_cfg,
+        bio_cfg,
+        device,
+    )
+    phi, meta = predict_phi_prior_rule_baseline(
+        data, device, bio_cfg, t_in=int(t_in), rule=rule
+    )
+    mu = log_blend_mu_eff_si(step.mu_c_si, phi)
+    mu = project_deploy_mu_with_support(
+        data=data,
+        step=step,
+        mu_pred=mu,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
+        forecast_one_step=True,
+        time_index=int(t_out),
+        bulk_time_index=int(t_out),
+    )
+    return step, phi, mu, meta
+
+
 def phi_gt_binary(
     mu_cap_si: torch.Tensor,
-    region: torch.Tensor,
+    region: torch.Tensor | None,
     phys_cfg: PhysicsConfig,
 ) -> torch.Tensor:
-    """Binary clot label (threshold on capped mu) inside the supervision region."""
+    """Binary clot label (threshold on capped mu). Region masks loss/viz band when set."""
     thr = clot_phi_thresh_si(phys_cfg)
     phi = (mu_cap_si.reshape(-1) >= thr).to(dtype=torch.float32)
+    if region is None:
+        return phi
     return phi * region.reshape(-1).to(dtype=torch.float32)
 
 
 def phi_gt_soft(
     mu_cap_si: torch.Tensor,
     mu_c_si: torch.Tensor,
-    region: torch.Tensor,
+    region: torch.Tensor | None,
 ) -> torch.Tensor:
     """Soft phi* from log-blend inversion with fixed mu_solid (stable labels when mu > mu_c)."""
     solid = clot_phi_mu_solid_si()
@@ -599,7 +1583,34 @@ def phi_gt_soft(
     denom = torch.log(torch.tensor(solid, device=mu.device, dtype=mu.dtype)) - torch.log(mc)
     denom = denom.clamp(min=1e-6)
     phi = ((torch.log(mu) - torch.log(mc)) / denom).clamp(0.0, 1.0)
+    if region is None:
+        return phi
     return phi * region.reshape(-1).to(dtype=torch.float32)
+
+
+def resolve_phi_gt_labels(
+    mu_cap_si: torch.Tensor,
+    mu_c_si: torch.Tensor,
+    region: torch.Tensor | None,
+    phys_cfg: PhysicsConfig,
+    *,
+    soft: bool,
+    mu_anchor_si: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """GT clot labels; growth-only above t=0 mu when ``CLOT_PHI_GT_SUBTRACT_T0_MU=1``."""
+    if mu_anchor_si is not None and clot_phi_gt_subtract_t0_mu():
+        anchor = mu_anchor_si.reshape(-1).to(device=mu_cap_si.device, dtype=mu_cap_si.dtype)
+        if soft:
+            return phi_gt_soft(mu_cap_si, anchor, region)
+        growth = (mu_cap_si.reshape(-1) - anchor).clamp(min=0.0)
+        thr = clot_phi_thresh_si(phys_cfg)
+        phi = (growth >= thr).to(dtype=torch.float32)
+        if region is None:
+            return phi
+        return phi * region.reshape(-1).to(dtype=torch.float32)
+    if soft:
+        return phi_gt_soft(mu_cap_si, mu_c_si, region)
+    return phi_gt_binary(mu_cap_si, region, phys_cfg)
 
 
 def mu_eff_from_delta_log_si(mu_c_si: torch.Tensor, delta_log_mu: torch.Tensor) -> torch.Tensor:
@@ -691,11 +1702,14 @@ def clot_support_band_mode() -> str:
 
     - ``physics`` (default): dgamma wall @ ref + 1-hop from clot seeds @ mu_in / current step.
     - ``frozen_t0``: seeds + dgamma band fixed from COMSOL mu @ t=0 only (deploy_band).
+    - ``ceiling_growth``: t0 dgamma growth seed + hop support capped by wall+K ceiling.
     - ``loss_mask``: use step loss_mask (legacy / debug only).
     """
     raw = (os.environ.get("CLOT_PHI_SUPPORT_BAND") or "physics").strip().lower()
     if raw in ("frozen_t0", "t0", "deploy_band", "b0"):
         return "frozen_t0"
+    if raw in ("ceiling_growth", "ceiling", "hop_growth", "growth"):
+        return "ceiling_growth"
     if raw in ("loss_mask", "loss", "legacy"):
         return "loss_mask"
     return "physics"
@@ -766,9 +1780,24 @@ def resolve_clot_support_band_for_step(
     bio_cfg: BiochemConfig | None = None,
     *,
     forecast_one_step: bool = False,
+    time_index: int | None = None,
+    phi_pred_by_time: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Resolve B_t for a train/eval step (physics, frozen t=0, or loss_mask)."""
+    """Resolve B_t for a train/eval step (physics, frozen t=0, ceiling growth, or loss_mask)."""
     mode = clot_support_band_mode()
+    if mode == "ceiling_growth":
+        from src.core_physics.clot_growth_masks import resolve_growth_support_at_time
+
+        bio = bio_cfg or BiochemConfig(phase="biochem")
+        t = 0 if time_index is None else int(time_index)
+        return resolve_growth_support_at_time(
+            data,
+            t,
+            device,
+            phys_cfg,
+            bio,
+            phi_pred_by_time=phi_pred_by_time,
+        )
     if mode == "loss_mask":
         return step.loss_mask.reshape(-1).to(device=device).bool()
     frozen = mode == "frozen_t0"
@@ -796,10 +1825,48 @@ def resolve_clot_support_band_for_step(
     )
 
 
+def project_deploy_mu_with_support(
+    *,
+    data,
+    step: "ClotPhiStepBatch",
+    mu_pred: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    forecast_one_step: bool = False,
+    time_index: int | None = None,
+    bulk_time_index: int | None = None,
+    phi_pred_by_time: dict[int, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Hard projection: model mu on support B_t; Carreau bulk elsewhere."""
+    if not clot_phi_hard_support_projection_enabled():
+        return mu_pred.reshape(-1)
+    band = resolve_clot_support_band_for_step(
+        data,
+        device,
+        step,
+        phys_cfg,
+        bio_cfg,
+        forecast_one_step=forecast_one_step,
+        time_index=time_index,
+        phi_pred_by_time=phi_pred_by_time,
+    )
+    if bulk_time_index is not None:
+        from src.core_physics.clot_growth_masks import resolve_bulk_carreau_mu_si
+
+        mu_bulk = resolve_bulk_carreau_mu_si(data, int(bulk_time_index), phys_cfg, device)
+    else:
+        mu_bulk = step.mu_c_si
+    return apply_clot_support_projection(mu_bulk, mu_pred, band)
+
+
 def snapshot_clot_support_config() -> dict[str, object]:
+    from src.core_physics.clot_growth_masks import snapshot_clot_growth_config
+
     return {
         "hard_support_projection": clot_phi_hard_support_projection_enabled(),
         "support_band": clot_support_band_mode(),
+        **snapshot_clot_growth_config(),
     }
 
 
@@ -1059,6 +2126,7 @@ def build_clot_phi_step(
     u_nd_override: torch.Tensor | None = None,
     v_nd_override: torch.Tensor | None = None,
     y_slice_override: torch.Tensor | None = None,
+    species_log_override: torch.Tensor | None = None,
     rollout_state: "ClotPhiRolloutState | None" = None,
     train_epoch: int | None = None,
 ) -> ClotPhiStepBatch:
@@ -1067,16 +2135,18 @@ def build_clot_phi_step(
         ClotPhiRolloutState,
         append_rollout_carry_features,
         clot_phi_rollout_enabled,
+        clot_phi_vel_source,
         resolve_uv_for_rollout_step,
     )
 
+    y_gt = data.y[time_index].to(device)
     y = (
         y_slice_override.to(device)
         if y_slice_override is not None
-        else data.y[time_index].to(device)
+        else y_gt
     )
-    u_gt = y[:, 0]
-    v_gt = y[:, 1]
+    u_gt = y_gt[:, 0]
+    v_gt = y_gt[:, 1]
     if clot_phi_rollout_enabled():
         mu_for_kine = None
         if clot_phi_fixed_mu_from_phi_enabled():
@@ -1093,20 +2163,42 @@ def build_clot_phi_step(
         )
     elif u_nd_override is not None and v_nd_override is not None:
         u, v = u_nd_override, v_nd_override
+    elif clot_phi_vel_source() == "kinematics":
+        from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
+
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
     else:
         u, v = u_gt, v_gt
-    mu_gt = phys_cfg.viscosity_nd_to_si(y[:, STATE_CHANNEL_MU_EFF_ND])
+    mu_gt = phys_cfg.viscosity_nd_to_si(y_gt[:, STATE_CHANNEL_MU_EFF_ND])
     mu_cap = cap_mu_eff_si(mu_gt)
-    region = supervision_region_mask(data, device, mu_cap, phys_cfg)
     mu_c = carreau_mu_si_from_uv(data, u, v, phys_cfg)
     use_soft = (os.environ.get("CLOT_PHI_SOFT_LABELS") or "0").strip().lower() in ("1", "true", "yes", "on")
-    if use_soft:
-        phi_gt = phi_gt_soft(mu_cap, mu_c, region)
+    loss_mask = resolve_clot_loss_mask(
+        data,
+        device,
+        mu_cap,
+        phys_cfg,
+        time_index=int(time_index),
+        bio_cfg=bio_cfg,
+    )
+    scope = clot_phi_loss_scope()
+    if scope in ("full_mesh", "support", "ceiling"):
+        region = loss_mask
     else:
-        phi_gt = phi_gt_binary(mu_cap, region, phys_cfg)
+        region = supervision_region_mask(data, device, mu_cap, phys_cfg)
+    # GT labels: growth above t=0 COMSOL mu (not baseline high-vis Carreau pockets).
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device) if clot_phi_gt_subtract_t0_mu() else None
+    phi_gt = resolve_phi_gt_labels(
+        mu_cap, mu_c, None, phys_cfg, soft=use_soft, mu_anchor_si=mu_anchor
+    )
+    y_feat = y_gt.clone()
+    if species_log_override is not None:
+        y_feat[:, 4:16] = species_log_override.to(device=device, dtype=torch.float32)
+    elif y_slice_override is not None:
+        y_feat = y.to(device=device, dtype=torch.float32)
     feats = node_features_from_gt(
         data,
-        y,
+        y_feat,
         phys_cfg,
         bio_cfg,
         device=device,
@@ -1134,8 +2226,7 @@ def build_clot_phi_step(
             device=device,
             dtype=feats.dtype,
         )
-    loss_mask = region.bool()
-    species_log = y[:, 4:16].to(device=device, dtype=torch.float32)
+    species_log = y_feat[:, 4:16].to(device=device, dtype=torch.float32)
     return ClotPhiStepBatch(
         features=feats,
         phi_gt=phi_gt,

@@ -620,6 +620,8 @@ class PatientDataExtractor:
             bulk_si = torch.zeros_like(raw_bulk_cgs)
             bulk_si[:, 0:2] = raw_bulk_cgs[:, 0:2] * bio_cfg.bulk_scale
             bulk_si[:, 2:9] = raw_bulk_cgs[:, 2:9] * (bio_cfg.bulk_scale * 1e-3)
+            # M/Mas/Mat: COMSOL model units for mu1(Mat) etc. (not plt/m^2). surface_scale
+            # cancels in log1p ND (raw/Minf); gelation decodes with expm1*Minf only.
             surf_si = raw_surf_cgs * bio_cfg.surface_scale
             species = torch.clamp(torch.cat([bulk_si, surf_si], dim=1), min=0.0)
 

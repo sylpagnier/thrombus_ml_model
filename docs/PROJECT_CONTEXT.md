@@ -33,6 +33,8 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 
 Separate from the full GNODE biochem stack: a **tiny hybrid head** on GT kinematics + capped `mu_eff` with a dgamma-sliced neighbor mask. Use it to validate masks/features before multitask biochem. Record and metrics: [CLOT_PHI_BASELINE.md](CLOT_PHI_BASELINE.md). Entry: `scripts/go_clot_phi_simple.ps1`.
 
+Related clot/T0 ladders: [T0_RUNG_LADDER.md](T0_RUNG_LADDER.md), [CLOT_TRIGGER_LADDER.md](CLOT_TRIGGER_LADDER.md), [CLOT_ML_DEPLOY_TRAINING_PLAN.md](CLOT_ML_DEPLOY_TRAINING_PLAN.md), [CLOT_ML_LADDER_V2.md](CLOT_ML_LADDER_V2.md). COMSOL mu/rheology alignment: [COMSOL_MU_RHEOLOGY_CHECKLIST.md](COMSOL_MU_RHEOLOGY_CHECKLIST.md).
+
 ### Biochem "Clot" Semantics
 
 In this repository, a "clot" is not a discrete model class. It is an interpretive

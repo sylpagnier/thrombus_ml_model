@@ -20,7 +20,6 @@ from src.core_physics.clot_forecast import (
 )
 from src.core_physics.clot_phi_rollout import ClotPhiRolloutState
 from src.core_physics.clot_phi_simple import (
-    apply_clot_support_projection,
     build_clot_phi_model,
     build_clot_phi_step,
     cap_mu_eff_si,
@@ -31,7 +30,7 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_thresh_si,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
-    resolve_clot_support_band_for_step,
+    project_deploy_mu_with_support,
 )
 from src.evaluation.clot_phi_checkpoint_env import (
     apply_clot_phi_config_from_checkpoint,
@@ -103,15 +102,17 @@ def _predict_forecast_step(
             mu_pred = log_blend_mu_eff_si(step.mu_c_si, phi_pred)
             mu_c_proj = step.mu_c_si
         if clot_phi_hard_support_projection_enabled():
-            band = resolve_clot_support_band_for_step(
-                data,
-                device,
-                step,
-                phys_cfg,
-                bio_cfg,
+            mu_pred = project_deploy_mu_with_support(
+                data=data,
+                step=step,
+                mu_pred=mu_pred,
+                phys_cfg=phys_cfg,
+                bio_cfg=bio_cfg,
+                device=device,
                 forecast_one_step=True,
+                time_index=int(t_out),
+                bulk_time_index=int(t_out),
             )
-            mu_pred = apply_clot_support_projection(mu_c_proj, mu_pred, band)
     return phi_pred, mu_pred.reshape(-1), step.phi_gt.reshape(-1)
 
 

@@ -41,6 +41,8 @@ def apply_clot_phi_config_from_checkpoint(cfg: dict[str, Any]) -> None:
         os.environ["CLOT_PHI_PHYSICS_BLEND"] = "1"
     elif "physics_blend" in cfg:
         os.environ["CLOT_PHI_PHYSICS_BLEND"] = "0"
+    if cfg.get("clot_trigger_star"):
+        os.environ["CLOT_TRIGGER_STAR"] = str(cfg["clot_trigger_star"])
     if "rollout" in cfg:
         os.environ["CLOT_PHI_ROLLOUT"] = "1" if cfg["rollout"] else "0"
     if cfg.get("rollout_vel_source"):
@@ -75,6 +77,28 @@ def apply_clot_phi_config_from_checkpoint(cfg: dict[str, Any]) -> None:
         os.environ["CLOT_FORECAST_MU_CARRY_DETACH"] = "1" if cfg["forecast_mu_carry_detach"] else "0"
     if cfg.get("forecast_mu_init"):
         os.environ["CLOT_FORECAST_MU_INIT"] = str(cfg["forecast_mu_init"])
+    if cfg.get("forecast_pair_schedule"):
+        os.environ["CLOT_FORECAST_PAIR_SCHEDULE"] = str(cfg["forecast_pair_schedule"])
+    if cfg.get("forecast_pair_stride") is not None:
+        os.environ["CLOT_FORECAST_PAIR_STRIDE"] = str(cfg["forecast_pair_stride"])
+    if "hard_support_projection" in cfg:
+        os.environ["CLOT_PHI_HARD_SUPPORT_PROJECTION"] = "1" if cfg["hard_support_projection"] else "0"
+    if cfg.get("support_band"):
+        os.environ["CLOT_PHI_SUPPORT_BAND"] = str(cfg["support_band"])
+    if cfg.get("ceiling_hops") is not None:
+        os.environ["CLOT_PHI_CEILING_HOPS"] = str(cfg["ceiling_hops"])
+    if cfg.get("growth_seed"):
+        os.environ["CLOT_PHI_GROWTH_SEED"] = str(cfg["growth_seed"])
+    if cfg.get("loss_scope"):
+        os.environ["CLOT_PHI_LOSS_SCOPE"] = str(cfg["loss_scope"])
+    if "trigger_rollout" in cfg:
+        os.environ["CLOT_PHI_TRIGGER_ROLLOUT"] = "1" if cfg["trigger_rollout"] else "0"
+    if cfg.get("forward_seed"):
+        os.environ["CLOT_TRIGGER_FORWARD_SEED"] = str(cfg["forward_seed"])
+    if "nucleation" in cfg:
+        os.environ["CLOT_TRIGGER_NUCLEATION"] = "1" if cfg["nucleation"] else "0"
+    if cfg.get("ic_phi_zero") is not None:
+        os.environ["CLOT_TRIGGER_IC_PHI_ZERO"] = "1" if cfg["ic_phi_zero"] else "0"
     from src.core_physics.clot_phi_rollout import sync_rollout_env_from_checkpoint
 
     sync_rollout_env_from_checkpoint(cfg)

@@ -3,10 +3,11 @@
 Visual clot definition (matches dynamic-mu viz with 0.04-0.10 Pa*s scale):
   node is "clot" when mu_eff_si >= CLOT_SHAPE_MU_THRESH_SI (default: clot_phi_thresh_si).
 
-North-star metric ``clot_shape`` is F1 with location-weighted precision: false clots
-one mesh hop away from GT clot are penalized lightly; distant false clots are penalized
-heavily. ``flow_score``, ``clot_recall``, and ``flow_ok`` are reported separately (not
-composited into ``clot_shape`` yet).
+North-star metric ``clot_shape`` is F1 with hop-graded precision on predictions:
+each predicted clot node earns proximity credit by graph hops to the nearest GT clot
+(full credit on GT, linear decay through ``CLOT_SHAPE_PROX_MAX_HOPS`` (default 5),
+zero at ``CLOT_SHAPE_PROX_MAX_HOPS + 1`` hops and beyond). Recall stays binary on GT
+clot nodes. ``flow_score``, ``clot_recall``, and ``flow_ok`` are reported separately.
 """
 
 from __future__ import annotations
@@ -98,6 +99,20 @@ def _safe_div(num: float, den: float) -> float:
     return float(num / den)
 
 
+def clot_shape_proximity_max_hops() -> int:
+    """Last hop distance that receives any precision credit (default 5)."""
+    return max(_env_int("CLOT_SHAPE_PROX_MAX_HOPS", 5), 0)
+
+
+def proximity_weight_from_gt_hops(hop_dist: int, *, max_hop: int | None = None) -> float:
+    """Credit for a predicted clot node: 1.0 on GT, linear decay to max_hop, 0 beyond."""
+    mh = clot_shape_proximity_max_hops() if max_hop is None else max(int(max_hop), 0)
+    h = int(hop_dist)
+    if h > mh:
+        return 0.0
+    return float(mh + 1 - h) / float(mh + 1)
+
+
 def compute_clot_shape_metrics(
     *,
     pred_state: torch.Tensor,
@@ -117,6 +132,15 @@ def compute_clot_shape_metrics(
     gt_clot = mu_clot_binary_mask(gt_mu, thresh).cpu().numpy()
     pred_clot = mu_clot_binary_mask(pred_mu, thresh).cpu().numpy()
 
+    eval_n = n_nodes
+    if node_mask is not None:
+        nm = node_mask.reshape(-1).detach().cpu().numpy().astype(bool)
+        if nm.shape[0] != n_nodes:
+            raise ValueError(f"node_mask length {nm.shape[0]} != n_nodes {n_nodes}")
+        gt_clot = np.logical_and(gt_clot, nm)
+        pred_clot = np.logical_and(pred_clot, nm)
+        eval_n = int(nm.sum())
+
     tp = int(np.logical_and(gt_clot, pred_clot).sum())
     fp = int(np.logical_and(~gt_clot, pred_clot).sum())
     fn = int(np.logical_and(gt_clot, ~pred_clot).sum())
@@ -128,20 +152,34 @@ def compute_clot_shape_metrics(
     recall = _safe_div(float(tp), float(tp + fn))
     f1 = _safe_div(2.0 * precision * recall, precision + recall)
 
-    adjacent_hops = max(_env_int("CLOT_SHAPE_ADJACENT_HOPS", 2), 0)
-    w_adj = max(_env_float("CLOT_SHAPE_FP_ADJ_WEIGHT", 0.15), 0.0)
-    w_dist = max(_env_float("CLOT_SHAPE_FP_DIST_WEIGHT", 1.0), 0.0)
+    prox_max = clot_shape_proximity_max_hops()
+    hop_dist = graph_hop_distance_from_seeds(edge_index, n_nodes, gt_clot, max_hops=prox_max + 2)
 
-    hop_dist = graph_hop_distance_from_seeds(edge_index, n_nodes, gt_clot)
+    pred_idx = np.where(pred_clot)[0]
+    if pred_idx.size > 0:
+        prox_w = np.array([proximity_weight_from_gt_hops(int(hop_dist[i]), max_hop=prox_max) for i in pred_idx])
+        graded_precision = float(prox_w.mean())
+        prox_zero = int((prox_w <= 0.0).sum())
+        prox_full = int((prox_w >= 1.0 - 1e-9).sum())
+    else:
+        graded_precision = 0.0
+        prox_zero = 0
+        prox_full = 0
+
     fp_mask = np.logical_and(~gt_clot, pred_clot)
-    fp_adj = int(np.logical_and(fp_mask, hop_dist <= adjacent_hops).sum())
-    fp_dist = int(np.logical_and(fp_mask, hop_dist > adjacent_hops).sum())
+    fp_adj = int(np.logical_and(fp_mask, hop_dist <= 2).sum())
+    fp_dist = int(np.logical_and(fp_mask, hop_dist > prox_max).sum())
+    fp_near = int(np.logical_and(fp_mask, (hop_dist > 0) & (hop_dist <= prox_max)).sum())
 
-    loc_precision = _safe_div(float(tp), float(tp + w_adj * fp_adj + w_dist * fp_dist))
-    clot_shape_score = _safe_div(2.0 * loc_precision * recall, loc_precision + recall)
+    loc_precision = graded_precision
+    clot_shape_score = _safe_div(2.0 * graded_precision * recall, graded_precision + recall)
 
-    gt_frac = _safe_div(float(gt_clot.sum()), float(n_nodes))
-    pred_frac = _safe_div(float(pred_clot.sum()), float(n_nodes))
+    gt_frac = _safe_div(float(gt_clot.sum()), float(eval_n))
+    pred_frac = _safe_div(float(pred_clot.sum()), float(eval_n))
+    # Penalize painting volume, not distant FP quality (graded_precision already ignores hop>=6).
+    clot_shape_efficiency = _safe_div(clot_shape_score, max(pred_frac, 1e-6))
+    gt_safe = max(gt_frac, 1e-6)
+    clot_shape_balanced = clot_shape_score * min(1.0, gt_safe / max(pred_frac, 1e-6))
     frac_ratio = _safe_div(pred_frac, gt_frac) if gt_frac > 0.0 else (0.0 if pred_frac <= 0.0 else float("inf"))
 
     bulk_mask = ~gt_clot
@@ -182,8 +220,15 @@ def compute_clot_shape_metrics(
         "clot_recall": recall,
         "clot_fp_adjacent": fp_adj,
         "clot_fp_distant": fp_dist,
+        "clot_fp_near_gt": fp_near,
         "clot_loc_precision": loc_precision,
+        "clot_graded_precision": graded_precision,
+        "clot_prox_full": prox_full,
+        "clot_prox_zero": prox_zero,
+        "clot_prox_max_hops": prox_max,
         "clot_shape": clot_shape_score,
+        "clot_shape_efficiency": clot_shape_efficiency,
+        "clot_shape_balanced": clot_shape_balanced,
         "clot_gt_frac": gt_frac,
         "clot_pred_frac": pred_frac,
         "clot_frac_ratio": frac_ratio,

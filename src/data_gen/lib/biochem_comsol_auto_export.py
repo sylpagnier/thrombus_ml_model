@@ -71,7 +71,7 @@ _DEFAULT_DOMAIN_EXPRS: tuple[str, ...] = (
     "u",
     "v",
     "p",
-    "mu_b*(mu1(Mat)+mu2(FI))",
+    "spf.mu",
     "rp",
     "ap",
     "apr",

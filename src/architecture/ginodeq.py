@@ -353,18 +353,22 @@ class GINO_DEQ(nn.Module):
             encoded_x = torch.cat([encoded_x, width_features], dim=1)
         return encoded_x, uv_prior
 
-    @torch.enable_grad()
-    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5, current_n=None):
+    def _solve_equilibrium_z(
+        self,
+        data,
+        *,
+        solver: str = "anderson",
+        anderson_beta: float = 0.8,
+        anderson_warmup_iters: int = 5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Anderson/Picard DEQ solve; returns equilibrium latent ``z`` and Jacobian penalty."""
         x_encoded, _ = self._apply_fourier_encoding(data.x)
         x_enc = self.encoder(x_encoded)
         z = x_enc.clone()
 
         row, col = data.edge_index
-
-        # Pull precomputed edge attributes directly instead of recalculating
         edge_attr = data.edge_attr
         edge_vec = edge_attr[:, :2]
-
         batch_idx = get_batch_tensor(data, data.x.size(0), data.x.device)
 
         wall_normals = data.x[:, NodeFeat.WALL_NORMAL]
@@ -393,7 +397,6 @@ class GINO_DEQ(nn.Module):
             curr_z_flat = curr_z.squeeze(0) if curr_z.ndim == 3 else curr_z
             mu = decode_mu(curr_z_flat)
             if getattr(self, "decouple_rheology", False):
-                # During warmup, preserve Kinematics latent feedback via frozen decoder clone.
                 if hasattr(self, "kinematics_mu_decoder"):
                     with torch.no_grad():
                         t1_mu_raw = self.kinematics_mu_decoder(curr_z_flat)
@@ -407,7 +410,6 @@ class GINO_DEQ(nn.Module):
             out = self.core(z_in, data.edge_index, edge_attr, batch_idx, mod_adv, mod_rheo, mod_curve)
             return out.unsqueeze(0) if curr_z.ndim == 3 else out
 
-        # Warm-start DEQ state with explicit physical priors: [u_prior, v_prior, p_prior, mu_prior].
         uv_prior = data.x[:, NodeFeat.UV_PRIOR]
         p_prior = data.x[:, NodeFeat.SHEAR_POT]
         mu_prior = data.x[:, NodeFeat.MU_PRIOR]
@@ -415,30 +417,62 @@ class GINO_DEQ(nn.Module):
         z_warm_start = z + self.z_prior_proj(priors)
         z_init = z_warm_start.unsqueeze(0) if z_warm_start.ndim == 2 else z_warm_start
 
-        # Solve for equilibrium without unrolling autograd through all fixed-point steps.
         with torch.no_grad():
             if solver == "picard":
                 z_star = z_init
                 for _ in range(self.max_iters):
                     z_star = f_coupled(z_star)
             else:
-                # Pass the warmup iters down to the Anderson solver.
                 z_star = anderson_acceleration(
                     f_coupled, z_init, batch_idx=batch_idx,
                     max_iter=self.max_iters, beta=anderson_beta, warmup_iters=anderson_warmup_iters
                 )
 
-        # Re-attach once so kinematics keep a differentiable path to coordinates.
         z_star_req = z_star.detach().requires_grad_(self.training)
         z_out = f_coupled(z_star_req)
         if self.training:
             eps = torch.randn_like(z_out)
             vjp = torch.autograd.grad(z_out, z_star_req, grad_outputs=eps, create_graph=True)[0]
             jac_loss = torch.mean(vjp ** 2)
-            z = z_out.squeeze(0)
+            z_eq = z_out.squeeze(0) if z_out.ndim == 3 else z_out
         else:
-            z = z_out.squeeze(0)
-            jac_loss = torch.tensor(0.0, device=z.device)
+            z_eq = z_out.squeeze(0) if z_out.ndim == 3 else z_out
+            jac_loss = torch.tensor(0.0, device=z_eq.device)
+        return z_eq, jac_loss
+
+    @torch.no_grad()
+    def solve_latent(
+        self,
+        data,
+        solver: str = "anderson",
+        anderson_beta: float = 0.8,
+        anderson_warmup_iters: int = 5,
+    ) -> torch.Tensor:
+        """Frozen inference: DEQ equilibrium latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
+        was_training = self.training
+        self.eval()
+        z, _ = self._solve_equilibrium_z(
+            data,
+            solver=solver,
+            anderson_beta=anderson_beta,
+            anderson_warmup_iters=anderson_warmup_iters,
+        )
+        if was_training:
+            self.train()
+        return z
+
+    @torch.enable_grad()
+    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5, current_n=None):
+        z, jac_loss = self._solve_equilibrium_z(
+            data,
+            solver=solver,
+            anderson_beta=anderson_beta,
+            anderson_warmup_iters=anderson_warmup_iters,
+        )
+
+        def decode_mu(latent_state):
+            mu_raw_state = self.mu_decoder(latent_state)
+            return self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw_state)
 
         mu = decode_mu(z)
 

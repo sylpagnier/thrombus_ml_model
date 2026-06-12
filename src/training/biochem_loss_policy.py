@@ -8,7 +8,11 @@ aux-loss blocks removed from the default forward path.
 from __future__ import annotations
 
 import os
-from typing import FrozenSet
+from typing import FrozenSet, Sequence
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 _DOC = "docs/BIOCHEM_TRAINING_PROGRESS.md (Loss policy)"
 
@@ -178,3 +182,157 @@ def approved_backward_summary() -> str:
         "W_MuLog/W_MuSI; MU_LOG unlock (delta head, bio frozen); masked ADR via PASSIVE_ADR_BACKPROP "
         "after species stable. GT_KINE_VEL=1."
     )
+
+
+class SpatialFocalLoss(nn.Module):
+    """Focal BCE for sparse wall-band species triggers (crushes medium-confidence halos).
+
+    ``alpha`` skews toward the minority positive (clot) class on imbalanced wall bands.
+    ``alpha=0.90`` -> positive errors weighted ~9x vs negative.
+    Pass per-channel ``alpha`` / ``gamma`` / ``channel_weight`` as length-C sequences.
+    """
+
+    def __init__(
+        self,
+        alpha: float | Sequence[float] = 0.90,
+        gamma: float | Sequence[float] = 2.0,
+        channel_weight: Sequence[float] | None = None,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.channel_weight = channel_weight
+
+    def _broadcast(self, val: float | Sequence[float], *, ref: torch.Tensor) -> torch.Tensor:
+        if isinstance(val, (list, tuple)):
+            t = torch.tensor(val, device=ref.device, dtype=ref.dtype)
+        else:
+            t = torch.tensor(float(val), device=ref.device, dtype=ref.dtype)
+        if t.ndim == 0:
+            return t
+        return t.view(1, -1)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        gamma = self._broadcast(self.gamma, ref=logits)
+        focal_weight = (1.0 - p_t) ** gamma
+        alpha = self._broadcast(self.alpha, ref=logits)
+        alpha_weight = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        loss = alpha_weight * focal_weight * bce_loss
+        if self.channel_weight is not None:
+            cw = self._broadcast(self.channel_weight, ref=logits)
+            loss = loss * cw
+        return loss.mean()
+
+
+class ActiveGrowthHuberLoss(nn.Module):
+    """Huber on GT-active growth nodes only + heavy FP penalty on inert ceiling nodes.
+
+    Prevents zero-delta collapse when most wall-band nodes have ``target_delta ~= 0``.
+    ``band_mask`` should be deployable (e.g. ceiling / wall+hops), not GT clot.
+    ``value_scale`` lifts ~1e-5 log-deltas into an O(1) Huber domain for usable grads.
+    """
+
+    def __init__(
+        self,
+        *,
+        delta_threshold: float = 1e-5,
+        delta_threshold_channels: Sequence[float] | None = None,
+        beta: float = 1.0,
+        fp_weight: float = 5.0,
+        fp_threshold: float | None = None,
+        value_scale: float = 1e5,
+        channel_weight: Sequence[float] | None = None,
+        underpred_weight: float = 2.0,
+        mature_frac: float = 0.95,
+        mature_exempt_fp: bool = False,
+        mature_max_log: Sequence[float] | None = None,
+    ):
+        super().__init__()
+        self.delta_threshold = float(delta_threshold)
+        if delta_threshold_channels is None:
+            self.delta_threshold_channels = (self.delta_threshold, self.delta_threshold)
+        else:
+            self.delta_threshold_channels = tuple(float(x) for x in delta_threshold_channels)
+        self.beta = float(beta)
+        self.fp_weight = float(fp_weight)
+        self.fp_threshold = float(fp_threshold) if fp_threshold is not None else self.delta_threshold
+        self.value_scale = float(value_scale)
+        self.channel_weight = channel_weight
+        self.underpred_weight = float(underpred_weight)
+        self.mature_frac = float(mature_frac)
+        self.mature_exempt_fp = bool(mature_exempt_fp)
+        self.mature_max_log = tuple(float(x) for x in mature_max_log) if mature_max_log else None
+
+    def _channel_thr(self, ch: int) -> float:
+        if ch < len(self.delta_threshold_channels):
+            return float(self.delta_threshold_channels[ch])
+        return self.delta_threshold
+
+    def forward(
+        self,
+        pred_delta: torch.Tensor,
+        target_delta: torch.Tensor,
+        band_mask: torch.Tensor,
+        current_log_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        m = band_mask.reshape(-1).to(device=pred_delta.device).bool()
+        if not bool(m.any().item()):
+            return pred_delta.sum() * 0.0
+        p_raw = pred_delta.reshape(-1, pred_delta.shape[-1])[m]
+        t_raw = target_delta.reshape(-1, target_delta.shape[-1])[m]
+        scale = self.value_scale
+        p = p_raw * scale
+        t = t_raw * scale
+        n_ch = int(p.shape[-1])
+        cw = self.channel_weight
+        if cw is None:
+            ch_w = [1.0] * n_ch
+        else:
+            ch_w = [float(cw[i]) if i < len(cw) else 1.0 for i in range(n_ch)]
+
+        losses: list[torch.Tensor] = []
+        beta = self.beta
+        for ch in range(n_ch):
+            thr_raw = self._channel_thr(ch)
+            active = t_raw[:, ch] > thr_raw
+            if bool(active.any().item()):
+                losses.append(
+                    ch_w[ch]
+                    * F.huber_loss(p[active, ch], t[active, ch], delta=beta, reduction="mean")
+                )
+                if self.underpred_weight > 0.0:
+                    miss = active & (p_raw[:, ch] < 0.5 * t_raw[:, ch])
+                    if bool(miss.any().item()):
+                        losses.append(
+                            ch_w[ch]
+                            * self.underpred_weight
+                            * F.mse_loss(p[miss, ch], t[miss, ch], reduction="mean")
+                        )
+            fp_thr = max(self.fp_threshold, self._channel_thr(ch))
+            fp = (~active) & (p_raw[:, ch] > fp_thr)
+            if (
+                self.mature_exempt_fp
+                and current_log_state is not None
+                and self.mature_max_log is not None
+                and ch < len(self.mature_max_log)
+            ):
+                st = current_log_state.reshape(-1, current_log_state.shape[-1])[m]
+                mature = st[:, ch] >= (self.mature_frac * float(self.mature_max_log[ch]))
+                fp = fp & (~mature)
+            if bool(fp.any().item()):
+                losses.append(
+                    ch_w[ch]
+                    * self.fp_weight
+                    * F.huber_loss(
+                        p[fp, ch],
+                        torch.zeros_like(p[fp, ch]),
+                        delta=beta,
+                        reduction="mean",
+                    )
+                )
+        if not losses:
+            return pred_delta.sum() * 0.0
+        return torch.stack(losses).mean()

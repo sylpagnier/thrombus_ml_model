@@ -39,7 +39,7 @@ if ($Fresh) {
 }
 
 Write-Host ""
-Write-Host "[NEW] CAVO S0 static_final leg=$LegName ep=$Epochs schedule=static_final proj=1" -ForegroundColor Cyan
+Write-Host "[NEW] CAVO S0 static_final leg=$LegName ep=$Epochs schedule=static_final ceiling_growth hops=$($env:CLOT_PHI_CEILING_HOPS)" -ForegroundColor Cyan
 Write-Host "[i]  anchors=$($env:CLOT_PHI_ANCHOR_DIR)" -ForegroundColor DarkGray
 
 Invoke-PythonRcCheck -m src.training.train_clot_phi_simple -Label "CAVO S0 train"
@@ -65,7 +65,7 @@ if (-not $SkipViz -and (Test-Path $ckpt)) {
         --anchor patient007 `
         --checkpoint $ckpt `
         --time-index -1 `
-        --plot-mode scatter `
+        --layout fullmesh `
         --out $png `
         -Label "S0 fullmesh viz"
 }

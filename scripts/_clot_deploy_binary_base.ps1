@@ -16,13 +16,15 @@ $env:CLOT_PHI_MU_LOG_LAMBDA = "0"
 $env:CLOT_PHI_MU_SOLID_SI = "0.10"
 $env:CLOT_PHI_SHAPE_USE_T_OUT = "1"
 
-# Physics band + deploy support projection.
+# dgamma wall seed + hop-growing support capped by ceiling (no initial clots).
 $env:CLOT_PHI_DGAMMA_SLICE = "1"
 $env:CLOT_PHI_DGAMMA_REF_TIME = "0"
 $env:CLOT_PHI_DGAMMA_FEATURE_TIME = "current"
 $env:CLOT_PHI_HARD_SUPPORT_PROJECTION = "1"
-$env:CLOT_PHI_SUPPORT_BAND = "physics"
-$env:CLOT_FORECAST_MASK = "deploy_band"
+$env:CLOT_PHI_SUPPORT_BAND = "ceiling_growth"
+$env:CLOT_FORECAST_MASK = "ceiling_growth"
+$env:CLOT_PHI_CEILING_HOPS = "2"
+$env:CLOT_PHI_GROWTH_SEED = "gt"
 
 # Full-mesh shape aux (off-band bulk suppression).
 $env:CLOT_PHI_MESH_AUX_LAMBDA = "0.65"

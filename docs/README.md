@@ -16,6 +16,24 @@ Start here, then open the linked files for depth.
 
 3. **[BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md)** — Biochem corrector training log: complexity ladder, μ diagnostics, env pitfalls, run table (update after experiments).
 
+## Ladders and specialized tracks
+
+| Doc | Topic |
+|-----|-------|
+| [T0_RUNG_LADDER.md](T0_RUNG_LADDER.md) | T0 isolation ladder (mu + clot physics) |
+| [CLOT_TRIGGER_LADDER.md](CLOT_TRIGGER_LADDER.md) | Clot trigger / deploy-mask audit ladder |
+| [CLOT_ML_DEPLOY_TRAINING_PLAN.md](CLOT_ML_DEPLOY_TRAINING_PLAN.md) | Clot ML V1 deploy training plan |
+| [CLOT_ML_LADDER_V2.md](CLOT_ML_LADDER_V2.md) | Clot ML V2 (band-GNN growth + nucleation mask) |
+| [CLOT_FORECAST_LADDER.md](CLOT_FORECAST_LADDER.md) | Clot forecast R0–R6 |
+| [DEPLOY_ARCHITECTURE.md](DEPLOY_ARCHITECTURE.md) | Deploy clot ladder (Track A/B) |
+| [GNODE_ODE_LADDER.md](GNODE_ODE_LADDER.md) | GNODE-ODE component ladder |
+| [CLOT_PHI_BASELINE.md](CLOT_PHI_BASELINE.md) | Simple clot-phi wall-local probe |
+| [CLOT_PHI_ROLLOUT.md](CLOT_PHI_ROLLOUT.md) | Clot-phi rollout (6a/6b) |
+| [COMSOL_MU_RHEOLOGY_CHECKLIST.md](COMSOL_MU_RHEOLOGY_CHECKLIST.md) | COMSOL mu/rheology alignment checklist |
+| [SPECIES_TEMPORAL_ML.md](SPECIES_TEMPORAL_ML.md) | Wall-band graph reaction rollout |
+| [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md) | Stage-A kinematics architecture record |
+| [PASSIVE_KIN_BLOCKER_CHECKLIST.md](PASSIVE_KIN_BLOCKER_CHECKLIST.md) | Passive transport / kin blocker gates |
+
 ## Common commands
 
 ```text

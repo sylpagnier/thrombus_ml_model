@@ -34,6 +34,7 @@ class ClotKinematicsFields:
     is_separation_stream: torch.Tensor
     flux_path_stream: torch.Tensor
     flux_path_dx: torch.Tensor
+    flux_path_dx_raw: torch.Tensor
     flux_stag: torch.Tensor
     wall_proximity: torch.Tensor
     adjacent_band: torch.Tensor
@@ -147,7 +148,8 @@ def compute_clot_kinematics_fields(
     is_sep_dy = torch.sigmoid(((-dy_thr) - dgamma_dy_phys) / T_gr).clamp(0.0, 1.0)
     flux_dx = (is_sep_dx * ((-dgamma_dx_phys).clamp(min=0.0)) / dx_thr).clamp(0.0, 5.0)
     flux_dy = (is_sep_dy * ((-dgamma_dy_phys).clamp(min=0.0)) / dy_thr).clamp(0.0, 5.0)
-    flux_path_dx = (w_dx * flux_dx + w_dy * flux_dy).clamp(0.0, 5.0)
+    flux_path_dx_raw = w_dx * flux_dx + w_dy * flux_dy
+    flux_path_dx = flux_path_dx_raw.clamp(0.0, 5.0)
 
     beta_res = max(_env_float("BIOCHEM_PRIOR_RESIDENCE_BOOST", 0.5), 0.0)
     vel_mag_si = vel_mag_nd * u_ref
@@ -174,6 +176,7 @@ def compute_clot_kinematics_fields(
         is_separation_stream=is_separation_stream,
         flux_path_stream=flux_path_stream,
         flux_path_dx=flux_path_dx,
+        flux_path_dx_raw=flux_path_dx_raw,
         flux_stag=flux_stag,
         wall_proximity=wall_proximity,
         adjacent_band=adj,

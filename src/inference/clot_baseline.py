@@ -12,13 +12,12 @@ import torch
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_phi_rollout import ClotPhiRolloutState, clot_phi_rollout_enabled
 from src.core_physics.clot_phi_simple import (
-    apply_clot_support_projection,
     build_clot_phi_model,
     build_clot_phi_step,
-    clot_phi_hard_support_projection_enabled,
     clot_phi_hybrid_enabled,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
+    project_deploy_mu_with_support,
     resolve_clot_support_band_for_step,
 )
 from src.evaluation.clot_phi_checkpoint_env import (
@@ -61,18 +60,20 @@ def _project_deploy_mu_if_enabled(
     bio_cfg: BiochemConfig,
     device: torch.device,
     forecast_one_step: bool,
+    time_index: int | None = None,
 ) -> torch.Tensor:
-    if not clot_phi_hard_support_projection_enabled():
-        return mu_pred.reshape(-1)
-    band = resolve_clot_support_band_for_step(
-        data,
-        device,
-        step,
-        phys_cfg,
-        bio_cfg,
+    bulk_t = int(time_index) if forecast_one_step and time_index is not None else None
+    return project_deploy_mu_with_support(
+        data=data,
+        step=step,
+        mu_pred=mu_pred,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+        device=device,
         forecast_one_step=forecast_one_step,
+        time_index=time_index,
+        bulk_time_index=bulk_t,
     )
-    return apply_clot_support_projection(step.mu_c_si, mu_pred, band)
 
 
 @torch.no_grad()
@@ -106,6 +107,7 @@ def predict_clot_phi_at_time(
                 bio_cfg=bio_cfg,
                 device=device,
                 forecast_one_step=False,
+                time_index=t_run,
             )
             state.update_from_pred(phi_r, mu_r, detach=True)
         rollout_state = state
@@ -128,6 +130,7 @@ def predict_clot_phi_at_time(
         bio_cfg=bio_cfg,
         device=device,
         forecast_one_step=False,
+        time_index=int(time_index),
     )
     return {
         "phi": phi_pred.reshape(-1),
@@ -140,6 +143,7 @@ def predict_clot_phi_at_time(
             phys_cfg,
             bio_cfg,
             forecast_one_step=False,
+            time_index=int(time_index),
         ).reshape(-1)
         if clot_phi_hard_support_projection_enabled()
         else step.region.reshape(-1),
