@@ -8,7 +8,7 @@ import torch
 
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_growth_masks import resolve_ceiling_mask
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def f1_zero_prediction_baseline(

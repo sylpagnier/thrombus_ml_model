@@ -25,7 +25,7 @@ from src.core_physics.clot_phi_simple import (
     neighbor_supervision_mask,
     predict_phi_prior_rule,
 )
-from src.training.train_clot_phi_simple import build_clot_phi_step
+from src.core_physics.clot_phi_simple import build_clot_phi_step
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, infer_missing_schema
 from src.utils.paths import get_project_root
 

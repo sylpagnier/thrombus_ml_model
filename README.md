@@ -22,7 +22,7 @@ python -m src.training.train_kinematics_predictor
 # Unified CLI (train / data / eval / inspect / orchestrate)
 python -m src.bin.main train kinematics
 
-# Kinematics flow demo (sliders + GINO-DEQ inference; headless: add --no-gui)
+# Kinematics flow demo (sliders + RGP-DEQ inference; headless: add --no-gui)
 python -m src.bin.main inspect flow -- --rheology carreau
 ```
 

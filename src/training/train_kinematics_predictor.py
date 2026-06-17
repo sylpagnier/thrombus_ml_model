@@ -1,7 +1,11 @@
 """
-Unified Kinematics Predictor Training with Mathematical Continuation Ramp.
-Implements dynamic dataset swapping, Carreau-Yasuda parameter ramping,
-and curriculum-based loss isolation.
+RGP-DEQ Stage-A flow trainer (canonical id: ``pmgp_deq_kine``).
+
+mu-coupled physics-modulated GAT + Perceiver DEQ for steady [u,v,p,mu] on vessel graphs.
+Carreau curriculum, dynamic dataset swapping, and loss isolation.
+
+Model class: ``GINO_DEQ`` (legacy class name; see ``docs/MODEL_NOMENCLATURE.md``).
+CLI: ``python -m src.bin.main train pmgp-deq-kine`` (alias: ``gino-deq-kine``).
 """
 import argparse
 import json

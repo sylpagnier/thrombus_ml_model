@@ -10,6 +10,7 @@ See ``docs/SPECIES_GNN_LADDER.md``.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,12 +44,22 @@ from src.core_physics.species_snapshot_gnn import (
     build_snapshot_features,
     fi_mat_active_labels,
     fi_mat_log_targets,
+    species_log_targets,
     snapshot_active_log_nd,
     snapshot_hidden_dim,
     snapshot_loss,
     snapshot_wall_hops,
     trigger_metrics,
 )
+from src.training.biochem_species_scope import (
+    FI_CHANNEL,
+    MAT_CHANNEL,
+    pushforward_local_index,
+    pushforward_state_bulk_indices,
+    pushforward_state_dim,
+    scatter_log_state_to_species_block,
+)
+from src.config import VesselConfig
 from src.training.biochem_loss_policy import ActiveGrowthHuberLoss
 from src.utils.paths import get_project_root
 
@@ -58,7 +69,7 @@ DEFAULT_S30_CKPT = "outputs/biochem/species_snapshot_s30/best.pth"
 DEFAULT_S31_CKPT = "outputs/biochem/species_snapshot_s31/best.pth"
 DEFAULT_S32_CKPT = "outputs/biochem/species_snapshot_s32/best.pth"
 DEFAULT_S33_CKPT = "outputs/biochem/species_snapshot_s33/best.pth"
-DEFAULT_S34_CKPT = "outputs/biochem/species_snapshot_s34/best.pth"
+DEFAULT_S34_CKPT = "outputs/biochem/biochem_gnn/species/best.pth"
 
 BIOCHEM_ANCHORS_6 = (
     "patient001",
@@ -68,8 +79,153 @@ BIOCHEM_ANCHORS_6 = (
     "patient006",
     "patient007",
 )
-CH_FI = 0
+CH_FI = 0  # legacy alias when scope is fi_mat
 CH_MAT = 1
+
+
+def _local_bulk_index(bulk_channel: int) -> int | None:
+    bulk = pushforward_state_bulk_indices()
+    try:
+        return bulk.index(int(bulk_channel))
+    except ValueError:
+        return None
+
+
+def _local_fi_idx() -> int | None:
+    return _local_bulk_index(FI_CHANNEL)
+
+
+def _local_mat_idx() -> int | None:
+    return _local_bulk_index(MAT_CHANNEL)
+
+
+def continuous_max_sat_log_vec(
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Per-local-channel saturation ceilings, length ``_sd()``."""
+    from src.core_physics.species_snapshot_gnn import _env_float_channel
+
+    fi_max, mat_max = continuous_max_sat_log()
+    default = _env_float_channel("SPECIES_CONTINUOUS_MAX_SAT_LOG_DEFAULT", fi_max)
+    vals: list[float] = []
+    for bch in pushforward_state_bulk_indices():
+        if bch == FI_CHANNEL:
+            vals.append(fi_max)
+        elif bch == MAT_CHANNEL:
+            vals.append(mat_max)
+        else:
+            vals.append(default)
+    dev = device or torch.device("cpu")
+    return torch.tensor(vals, device=dev, dtype=dtype).clamp(min=1e-8)
+
+
+def continuous_delta_threshold_vec() -> list[float]:
+    fi_thr, mat_thr = continuous_delta_threshold_channels()
+    default = continuous_delta_threshold()
+    out: list[float] = []
+    for bch in pushforward_state_bulk_indices():
+        if bch == FI_CHANNEL:
+            out.append(fi_thr)
+        elif bch == MAT_CHANNEL:
+            out.append(mat_thr)
+        else:
+            out.append(default)
+    return out
+
+
+def _scope_vec_from_fi_mat(fi_val: float, mat_val: float, *, default: float = 1.0) -> list[float]:
+    out = [float(default)] * _sd()
+    li_fi = _local_fi_idx()
+    li_mat = _local_mat_idx()
+    if li_fi is not None:
+        out[li_fi] = float(fi_val)
+    if li_mat is not None:
+        out[li_mat] = float(mat_val)
+    return out
+
+
+def pushforward_focal_alpha_vec() -> list[float]:
+    fi, mat = pushforward_focal_alpha_channels()
+    return _scope_vec_from_fi_mat(fi, mat, default=0.9)
+
+
+def pushforward_focal_gamma_vec() -> list[float]:
+    from src.core_physics.species_snapshot_gnn import snapshot_focal_gamma
+
+    fi, mat = pushforward_focal_gamma_channels()
+    return _scope_vec_from_fi_mat(fi, mat, default=float(snapshot_focal_gamma()))
+
+
+def _sd() -> int:
+    return pushforward_state_dim()
+
+
+def _ch_fi() -> int:
+    return pushforward_local_index("fi")
+
+
+def _ch_mat() -> int:
+    return pushforward_local_index("mat")
+
+
+def biochem_anchors_graph_dir(root: Path | None = None) -> Path:
+    base = root if root is not None else get_project_root()
+    return base / VesselConfig(phase="biochem_anchors").graph_output_dir
+
+
+def discover_biochem_anchors(root: Path | None = None) -> list[str]:
+    """All ``patient*.pt`` stems under ``graphs_biochem_anchors`` (sorted)."""
+    anchor_dir = biochem_anchors_graph_dir(root)
+    if not anchor_dir.is_dir():
+        return list(BIOCHEM_ANCHORS_6)
+    stems = sorted(p.stem for p in anchor_dir.glob("patient*.pt") if p.is_file())
+    return stems or list(BIOCHEM_ANCHORS_6)
+
+
+def parse_biochem_train_anchors(
+    raw: str,
+    *,
+    all_anchors: bool,
+    root: Path | None = None,
+) -> list[str]:
+    if all_anchors:
+        return discover_biochem_anchors(root)
+    items = [a.strip() for a in raw.split(",") if a.strip()]
+    return items or ["patient007"]
+
+
+# Historical short-horizon regime on patient007 (~53 macro-steps, ~2.2 h physical; F1 ~0.70-0.73).
+# Not the default deploy eval horizon — use ``graph_last_time_index`` / ``deploy_eval_time_index``.
+LEGACY_CAPPED_DEPLOY_HORIZON = 53
+
+
+def graph_last_time_index(n_times: int) -> int:
+    """Last macro-step index for a graph with ``n_times`` knots (0-based)."""
+    return max(int(n_times) - 1, 0)
+
+
+def legacy_capped_deploy_time_index(n_times: int) -> int:
+    """Legacy short-horizon deploy checkpoint."""
+    return min(LEGACY_CAPPED_DEPLOY_HORIZON, graph_last_time_index(n_times))
+
+
+def train_t0_max_for_n_times(n_times: int) -> int:
+    """Per-vessel window start cap scaled to each graph's full timeline."""
+    last = graph_last_time_index(n_times)
+    legacy_ref = legacy_capped_deploy_time_index(n_times)
+    return max(legacy_ref, int(round(35.0 * last / max(legacy_ref, 1))))
+
+
+def pushforward_train_t0_per_vessel() -> bool:
+    raw = (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def resolve_train_t0_max(n_times: int) -> int | None:
+    if pushforward_train_t0_per_vessel():
+        return train_t0_max_for_n_times(n_times)
+    return pushforward_train_t0_max()
 
 
 
@@ -135,29 +291,111 @@ def temporal_lambda_bounds() -> tuple[float, float]:
     return lo, hi
 
 
+def continuous_delta_residual() -> bool:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_RESIDUAL") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_delta_residual_alpha() -> float:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_RESIDUAL_ALPHA") or "0.35").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.35
+
+
+def continuous_temporal_offset() -> bool:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_OFFSET") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_temporal_offset_scale() -> float:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_OFFSET_SCALE") or "0.15").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.15
+
+
+def continuous_score_clot_weight() -> float:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_SCORE_CLOUT_W") or "0").strip()
+    try:
+        return min(max(float(raw), 0.0), 1.0)
+    except ValueError:
+        return 0.0
+
+
 def global_species_mass(log_state: torch.Tensor) -> torch.Tensor:
     """Scalar wall-band mass: sum of FI + Mat log1p ND (for temporal gate input)."""
-    st = log_state.reshape(-1, STATE_DIM)
+    st = log_state.reshape(-1, _sd())
     return st.sum()
 
 
 def global_species_mass_feature(log_state: torch.Tensor) -> torch.Tensor:
     """Normalized scalar feature in ``(1, 1)`` for the temporal MLP."""
     mass = global_species_mass(log_state)
-    n = max(int(log_state.reshape(-1, STATE_DIM).shape[0]), 1)
-    fi_max, mat_max = continuous_max_sat_log()
-    scale = float(n) * float(fi_max + mat_max)
+    n = max(int(log_state.reshape(-1, _sd()).shape[0]), 1)
+    maxes = continuous_max_sat_log_vec(log_state.device, log_state.dtype)
+    scale = float(n) * float(maxes.sum().item())
     return torch.log1p(mass / max(scale, 1e-6)).reshape(1, 1).to(
         device=log_state.device, dtype=log_state.dtype
     )
+
+
+def continuous_time_context_enabled() -> bool:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_CONTEXT") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_time_ref_seconds() -> float:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_REF_S") or "3000").strip()
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return 3000.0
+
+
+def continuous_time_fourier_freqs() -> int:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_FOURIER_FREQS") or "8").strip()
+    try:
+        return max(int(float(raw)), 0)
+    except ValueError:
+        return 8
+
+
+def encode_continuous_time_features(
+    time_index: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Global-time context: ``tau=t/t_ref`` + Fourier features shared across all graphs."""
+    t_ref = continuous_time_ref_seconds()
+    tau = max(float(time_index), 0.0) / t_ref
+    tau = max(0.0, min(1.0, tau))
+    out = [torch.tensor([tau], device=device, dtype=dtype)]
+    n_freq = continuous_time_fourier_freqs()
+    if n_freq > 0:
+        ang = 2.0 * math.pi * tau
+        for k in range(n_freq):
+            w = float(2**k)
+            out.append(torch.tensor([math.sin(w * ang)], device=device, dtype=dtype))
+            out.append(torch.tensor([math.cos(w * ang)], device=device, dtype=dtype))
+    return torch.cat(out, dim=0).reshape(1, -1)
+
+
+def continuous_time_feature_dim() -> int:
+    if not continuous_time_context_enabled():
+        return 0
+    return 1 + 2 * continuous_time_fourier_freqs()
 
 
 def continuous_feature_dim(latent_dim: int) -> int:
     """GNN input dim: ``[z_kin, sdf, state_norm, (optional sat_ratio)]``."""
     base = pushforward_feature_dim(int(latent_dim))
     if continuous_saturation_gate():
-        return base + STATE_DIM
-    return base
+        base += _sd()
+    return base + continuous_time_feature_dim()
 
 
 def continuous_vel_decay_enabled() -> bool:
@@ -233,7 +471,14 @@ def curriculum_unroll_for_epoch(epoch: int) -> int:
         return min(15, max_u)
     if epoch <= 40:
         return min(25, max_u)
-    return min(30, max_u)
+    if max_u <= 60:
+        return min(30, max_u)
+    # Long-horizon graphs (full COMSOL export): ramp unroll past legacy 30-step cap.
+    if epoch <= 50:
+        return min(50, max_u)
+    if epoch <= 60:
+        return min(80, max_u)
+    return min(120, max_u)
 
 
 def continuous_spatial_loss_weight() -> float:
@@ -313,19 +558,18 @@ def continuous_huber_beta_growth() -> float:
 
 
 def _growth_huber() -> ActiveGrowthHuberLoss:
-    fi_max, mat_max = continuous_max_sat_log()
     return ActiveGrowthHuberLoss(
         delta_threshold=continuous_delta_threshold(),
-        delta_threshold_channels=continuous_delta_threshold_channels(),
+        delta_threshold_channels=continuous_delta_threshold_vec(),
         beta=continuous_huber_beta_growth(),
         fp_weight=continuous_fp_weight(),
         fp_threshold=continuous_fp_threshold(),
         value_scale=continuous_delta_value_scale(),
-        channel_weight=continuous_channel_weights(),
+        channel_weight=continuous_channel_weights_vec(),
         underpred_weight=continuous_underpred_weight(),
         mature_frac=mature_clot_frac(),
         mature_exempt_fp=continuous_mature_fp_exempt(),
-        mature_max_log=(fi_max, mat_max),
+        mature_max_log=continuous_max_sat_log_vec().tolist(),
     )
 
 
@@ -335,6 +579,17 @@ def continuous_huber_beta() -> float:
         return max(float(raw), 1e-8)
     except ValueError:
         return 1e-4
+
+
+def continuous_channel_weights_vec() -> list[float]:
+    bulk = pushforward_state_bulk_indices()
+    cw_fi, cw_mat = continuous_channel_weights()
+    weights = [1.0] * len(bulk)
+    if FI_CHANNEL in bulk:
+        weights[bulk.index(FI_CHANNEL)] = cw_fi
+    if MAT_CHANNEL in bulk:
+        weights[bulk.index(MAT_CHANNEL)] = cw_mat
+    return weights
 
 
 def continuous_channel_weights() -> tuple[float, float]:
@@ -377,7 +632,7 @@ def log_series_on_band(
 ) -> list[torch.Tensor]:
     out: list[torch.Tensor] = []
     for t in time_indices:
-        out.append(fi_mat_log_targets(data, int(t), device)[node_idx])
+        out.append(species_log_targets(data, int(t), device)[node_idx])
     return out
 
 
@@ -386,14 +641,15 @@ def band_speed_at_time(
     time_index: int,
     device: torch.device,
     node_idx: torch.Tensor,
+    *,
+    for_training: bool = False,
 ) -> torch.Tensor:
-    """Normalized wall-band speed in [0, 1] from GT ``[u, v]``."""
-    y = data.y[int(time_index)].to(device=device, dtype=torch.float32)
-    u, v = y[:, 0], y[:, 1]
-    speed = torch.sqrt(u * u + v * v + 1e-12)
-    spd = speed[node_idx.reshape(-1)]
-    mx = spd.max().clamp(min=1e-6)
-    return (spd / mx).clamp(0.0, 1.0)
+    """Normalized wall-band speed in [0, 1] (pred kine when deploy-faithful)."""
+    from src.core_physics.species_deploy_rollout import band_speed_for_rollout
+
+    return band_speed_for_rollout(
+        data, time_index, device, node_idx, for_training=for_training
+    )
 
 
 def band_speed_series(
@@ -401,8 +657,13 @@ def band_speed_series(
     time_indices: Sequence[int],
     device: torch.device,
     node_idx: torch.Tensor,
+    *,
+    for_training: bool = False,
 ) -> list[torch.Tensor]:
-    return [band_speed_at_time(data, int(t), device, node_idx) for t in time_indices]
+    return [
+        band_speed_at_time(data, int(t), device, node_idx, for_training=for_training)
+        for t in time_indices
+    ]
 
 
 def _graph_blur_band_state(
@@ -435,7 +696,7 @@ def noisy_teacher_log_state0(
     blur = continuous_teacher_blur()
     if not training or (sigma <= 0.0 and fp_frac <= 0.0 and blur <= 0.0):
         return log_state0.clone()
-    st = log_state0.reshape(-1, STATE_DIM).clone()
+    st = log_state0.reshape(-1, _sd()).clone()
     if sigma > 0.0:
         st = st + torch.randn_like(st) * sigma
     if fp_frac > 0.0:
@@ -464,29 +725,32 @@ def apply_velocity_decay(
     wall_speed: torch.Tensor,
     alphas: tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
-    st = log_state.reshape(-1, STATE_DIM)
+    st = log_state.reshape(-1, _sd())
     spd = wall_speed.reshape(-1, 1).to(device=st.device, dtype=st.dtype)
     a_fi, a_mat = alphas
     decay = torch.zeros_like(st)
-    decay[:, CH_FI] = a_fi * spd.squeeze(-1) * st[:, CH_FI]
-    decay[:, CH_MAT] = a_mat * spd.squeeze(-1) * st[:, CH_MAT]
+    li_fi = _local_fi_idx()
+    li_mat = _local_mat_idx()
+    if li_fi is not None:
+        decay[:, li_fi] = a_fi * spd.squeeze(-1) * st[:, li_fi]
+    if li_mat is not None:
+        decay[:, li_mat] = a_mat * spd.squeeze(-1) * st[:, li_mat]
     return (st - decay).clamp(min=0.0)
 
 
 def log_delta_targets(log_prev: torch.Tensor, log_next: torch.Tensor) -> torch.Tensor:
-    return (log_next.reshape(-1, STATE_DIM) - log_prev.reshape(-1, STATE_DIM)).to(dtype=torch.float32)
+    return (log_next.reshape(-1, _sd()) - log_prev.reshape(-1, _sd())).to(dtype=torch.float32)
 
 
 def normalize_log_state(log_state: torch.Tensor) -> torch.Tensor:
     scale = continuous_state_scale()
-    return (log_state.reshape(-1, STATE_DIM) / scale).clamp(0.0, 1.0)
+    return (log_state.reshape(-1, _sd()) / scale).clamp(0.0, 1.0)
 
 
 def saturation_ratio_features(log_state: torch.Tensor) -> torch.Tensor:
     """``X_t / X_max`` per channel in ``[0, 1]`` (local concentration inhibitor)."""
-    st = log_state.reshape(-1, STATE_DIM)
-    fi_max, mat_max = continuous_max_sat_log()
-    maxes = torch.tensor([fi_max, mat_max], device=st.device, dtype=st.dtype).clamp(min=1e-8)
+    st = log_state.reshape(-1, _sd())
+    maxes = continuous_max_sat_log_vec(st.device, st.dtype)
     return (st / maxes.unsqueeze(0)).clamp(0.0, 1.0)
 
 
@@ -495,32 +759,48 @@ def build_continuous_step_features(
     log_state: torch.Tensor,
     *,
     training: bool = True,
+    time_index: int | None = None,
 ) -> torch.Tensor:
     state_norm = normalize_log_state(log_state)
     state_in = maybe_noise_log_state(state_norm, training=training)
     feats = torch.cat([base_feats, state_in], dim=-1)
     if continuous_saturation_gate():
         feats = torch.cat([feats, saturation_ratio_features(log_state)], dim=-1)
+    if continuous_time_context_enabled():
+        ti = int(time_index) if time_index is not None else 0
+        tctx = encode_continuous_time_features(ti, dtype=feats.dtype, device=feats.device)
+        feats = torch.cat([feats, tctx.expand(feats.shape[0], -1)], dim=-1)
     return feats
+
+
+def align_continuous_feature_dim(feats: torch.Tensor, model: nn.Module) -> torch.Tensor:
+    """Pad/truncate trailing feature blocks to match model input width."""
+    expected = int(getattr(model, "in_dim", feats.shape[1]))
+    got = int(feats.shape[1])
+    if got == expected:
+        return feats
+    if got > expected:
+        return feats[:, :expected]
+    pad = torch.zeros(feats.shape[0], expected - got, device=feats.device, dtype=feats.dtype)
+    return torch.cat([feats, pad], dim=-1)
 
 
 def apply_magnitude_headroom_clamp(
     magnitude: torch.Tensor,
     log_state: torch.Tensor,
 ) -> torch.Tensor:
-    """Differentiable soft-clamp: crush delta when near Mat/FI saturation ceiling."""
-    st = log_state.reshape(-1, STATE_DIM)
-    fi_max, mat_max = continuous_max_sat_log()
-    maxes = torch.tensor([fi_max, mat_max], device=st.device, dtype=st.dtype)
+    """Differentiable soft-clamp: crush delta when near species saturation ceiling."""
+    st = log_state.reshape(-1, _sd())
+    maxes = continuous_max_sat_log_vec(st.device, st.dtype)
     margin = maxes.unsqueeze(0) - st
     scale = saturation_headroom_scale()
     headroom = F.softplus(margin * scale) * continuous_delta_out_scale()
-    return torch.minimum(magnitude.reshape(-1, STATE_DIM), headroom)
+    return torch.minimum(magnitude.reshape(-1, _sd()), headroom)
 
 
 def denormalize_log_state(norm_state: torch.Tensor) -> torch.Tensor:
     scale = continuous_state_scale()
-    return norm_state.reshape(-1, STATE_DIM) * scale
+    return norm_state.reshape(-1, _sd()) * scale
 
 
 def soft_commit_log_state(
@@ -529,15 +809,14 @@ def soft_commit_log_state(
     straight_through: bool = False,
 ) -> torch.Tensor:
     """Freeze committed nodes at saturation (cannot un-clot)."""
-    st = log_state.reshape(-1, STATE_DIM).clone()
+    st = log_state.reshape(-1, _sd()).clone()
     thr = snapshot_active_log_nd()
-    sat_fi, sat_mat = continuous_max_sat_log()
-    sats = (sat_fi, sat_mat)
+    maxes = continuous_max_sat_log_vec(st.device, st.dtype)
     out = st.clone()
-    for ch in range(STATE_DIM):
-        commit_thr = continuous_mat_commit_thresh() if ch == CH_MAT else thr
+    for ch, bch in enumerate(pushforward_state_bulk_indices()):
+        commit_thr = continuous_mat_commit_thresh() if bch == MAT_CHANNEL else thr
         committed = st[:, ch] > commit_thr
-        sat_v = torch.tensor(sats[ch], device=st.device, dtype=st.dtype)
+        sat_v = maxes[ch]
         frozen = torch.where(committed, sat_v, st[:, ch])
         if straight_through and bool(committed.any().item()):
             hard = committed.float()
@@ -551,10 +830,13 @@ def log_state_to_active(log_state: torch.Tensor) -> torch.Tensor:
     """Binary readout from accumulated log state (eval/deploy)."""
     mat_thr = continuous_mat_commit_thresh()
     fi_thr = snapshot_active_log_nd()
-    st = log_state.reshape(-1, STATE_DIM)
+    st = log_state.reshape(-1, _sd())
     out = torch.zeros_like(st)
-    out[:, CH_FI] = (st[:, CH_FI] > fi_thr).float()
-    out[:, CH_MAT] = (st[:, CH_MAT] > mat_thr).float()
+    for ch, bch in enumerate(pushforward_state_bulk_indices()):
+        if bch == FI_CHANNEL:
+            out[:, ch] = (st[:, ch] > fi_thr).float()
+        elif bch == MAT_CHANNEL:
+            out[:, ch] = (st[:, ch] > mat_thr).float()
     return out
 
 
@@ -563,8 +845,10 @@ def step_has_growth_supervision(tgt_delta: torch.Tensor, mask: torch.Tensor) -> 
     if not bool(m.any().item()):
         return False
     t = tgt_delta.reshape(-1, tgt_delta.shape[-1])[m]
-    fi_thr, mat_thr = continuous_delta_threshold_channels()
-    return bool((t[:, CH_FI] > fi_thr).any().item() or (t[:, CH_MAT] > mat_thr).any().item())
+    for ch, thr_v in enumerate(continuous_delta_threshold_vec()):
+        if bool((t[:, ch] > thr_v).any().item()):
+            return True
+    return False
 
 
 def continuous_delta_loss(
@@ -586,12 +870,15 @@ def continuous_delta_loss(
         loss = _growth_huber()(pred_delta, tgt_delta, m, current_log_state=current_log_state)
         return loss * continuous_loss_scale()
     b = continuous_huber_beta() if beta is None else float(beta)
-    cw = channel_weight if channel_weight is not None else continuous_channel_weights()
     p = pred_delta[m]
     t = tgt_delta[m]
-    lf = F.huber_loss(p[:, CH_FI], t[:, CH_FI], delta=b, reduction="mean")
-    lm = F.huber_loss(p[:, CH_MAT], t[:, CH_MAT], delta=b, reduction="mean")
-    return (cw[0] * lf + cw[1] * lm) * continuous_loss_scale()
+    weights = continuous_channel_weights_vec()
+    losses = [
+        w * F.huber_loss(p[:, ch], t[:, ch], delta=b, reduction="mean")
+        for ch, w in enumerate(weights)
+    ]
+    wsum = max(sum(weights), 1e-6)
+    return (sum(losses) / wsum) * continuous_loss_scale()
 
 
 def growth_supervision_mask(
@@ -604,13 +891,13 @@ def growth_supervision_mask(
     if len(log_series) < 2:
         n = int(log_series[0].shape[0]) if log_series else 0
         dev = log_series[0].device if log_series else torch.device("cpu")
-        return torch.zeros(n, STATE_DIM, device=dev, dtype=torch.bool)
-    fi_thr, mat_thr = continuous_delta_threshold_channels()
+        return torch.zeros(n, _sd(), device=dev, dtype=torch.bool)
+    thr_vec = continuous_delta_threshold_vec()
     grew = torch.zeros_like(log_series[0], dtype=torch.bool)
     for step in range(len(log_series) - 1):
         d = log_delta_targets(log_series[step], log_series[step + 1])
-        grew[:, CH_FI] = grew[:, CH_FI] | (d[:, CH_FI] > fi_thr)
-        grew[:, CH_MAT] = grew[:, CH_MAT] | (d[:, CH_MAT] > mat_thr)
+        for ch, thr_v in enumerate(thr_vec):
+            grew[:, ch] = grew[:, ch] | (d[:, ch] > thr_v)
     return grew
 
 
@@ -643,7 +930,7 @@ def pushforward_log_state_step(
     wall_speed: torch.Tensor | None = None,
     vel_decay_alphas: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    nxt = log_state.reshape(-1, STATE_DIM) + pred_delta.reshape(-1, STATE_DIM)
+    nxt = log_state.reshape(-1, _sd()) + pred_delta.reshape(-1, _sd())
     if wall_speed is not None and vel_decay_alphas is not None:
         nxt = apply_velocity_decay(nxt, wall_speed, vel_decay_alphas)
     nxt = nxt.clamp(min=0.0)
@@ -679,6 +966,81 @@ def deploy_horizon_steps() -> int:
         return 0
 
 
+def deploy_eval_use_full_timeline() -> bool:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on", "full", "last")
+
+
+def deploy_eval_time_index(n_times: int) -> int:
+    """Deploy metric time index: per-graph last step unless explicitly capped."""
+    last = graph_last_time_index(n_times)
+    if deploy_eval_use_full_timeline():
+        return last
+    h = deploy_horizon_steps()
+    if h > 0:
+        return min(h, last)
+    return last
+
+
+def resolve_deploy_eval_time_index(n_times: int, *, time_index: int | None = None) -> int:
+    """Resolve eval index from explicit override or deploy convention."""
+    if time_index is not None:
+        return max(0, min(int(time_index), graph_last_time_index(n_times)))
+    return deploy_eval_time_index(n_times)
+
+
+def default_deploy_metric_times(n_times: int) -> list[int]:
+    """Standard deploy eval grid: t=0, mid probes, per-graph last."""
+    last = graph_last_time_index(n_times)
+    candidates = (0, 27, legacy_capped_deploy_time_index(n_times), last)
+    return sorted({max(0, min(int(t), last)) for t in candidates})
+
+
+def train_deploy_eval_flow_source() -> str:
+    raw = (os.environ.get("SPECIES_TRAIN_DEPLOY_EVAL_FLOW") or "kinematics").strip().lower()
+    if raw in ("gt", "comsol", "oracle"):
+        return "gt"
+    return "kinematics"
+
+
+def deploy_horizon_aux_all_packs() -> bool:
+    raw = (os.environ.get("SPECIES_DEPLOY_HORIZON_ALL_PACKS") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def deploy_horizon_aux_cap_steps() -> int:
+    """Cap TBPTT aux unroll length during training (VRAM); 0 = no cap."""
+    raw = (os.environ.get("SPECIES_DEPLOY_HORIZON_AUX_CAP") or "0").strip()
+    try:
+        return max(int(float(raw)), 0)
+    except ValueError:
+        return 0
+
+
+def deploy_eval_dual_times() -> bool:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_DUAL") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def deploy_eval_dual_full_weight() -> float:
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_DUAL_FULL_W") or "0.65").strip()
+    try:
+        return min(max(float(raw), 0.0), 1.0)
+    except ValueError:
+        return 0.65
+
+
+def deploy_eval_clot_times(n_times: int) -> list[int]:
+    """Time indices for deploy clot metric (single full or mid+full dual)."""
+    last = deploy_eval_time_index(n_times)
+    if not deploy_eval_dual_times():
+        return [last]
+    mid = legacy_capped_deploy_time_index(n_times)
+    if mid >= last:
+        return [last]
+    return [mid, last]
+
+
 def continuous_delta_out_scale() -> float:
     raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_OUT_SCALE") or "1e-5").strip()
     try:
@@ -697,7 +1059,7 @@ def continuous_delta_softplus_beta() -> float:
 
 def delta_readout(raw_delta: torch.Tensor) -> torch.Tensor:
     """Non-negative log increment (species do not decrease on clot front)."""
-    st = raw_delta.reshape(-1, STATE_DIM)
+    st = raw_delta.reshape(-1, _sd())
     if continuous_growth_only_loss():
         # ReLU dead-zone on negative logits caused zero-delta collapse; softplus keeps grads.
         return F.softplus(st, beta=continuous_delta_softplus_beta()) * continuous_delta_out_scale()
@@ -715,8 +1077,8 @@ def maybe_noise_log_state(norm_state: torch.Tensor, *, training: bool) -> torch.
 class SpeciesContinuousPushforwardGNN(SpeciesPushforwardGNN):
     """Same GraphSAGE backbone; readout predicts continuous log-delta (FI, Mat)."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = STATE_DIM):
-        super().__init__(in_dim, hidden=hidden, out_dim=out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
         self.log_vel_decay_fi = nn.Parameter(torch.tensor(-8.0))
         self.log_vel_decay_mat = nn.Parameter(torch.tensor(-8.0))
 
@@ -724,21 +1086,22 @@ class SpeciesContinuousPushforwardGNN(SpeciesPushforwardGNN):
 class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
     """Phase 3.5: decoupled spatial gate * magnitude delta (FI, Mat)."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = STATE_DIM):
-        super().__init__(in_dim, hidden=hidden, out_dim=out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
         self.log_vel_decay_fi = nn.Parameter(torch.tensor(-8.0))
         self.log_vel_decay_mat = nn.Parameter(torch.tensor(-8.0))
         h = self.hidden
         fused = h + self.in_dim
+        od = self.out_dim
         self.spatial_head = nn.Sequential(
             nn.Linear(fused, h),
             nn.ReLU(),
-            nn.Linear(h, out_dim),
+            nn.Linear(h, od),
         )
         self.magnitude_head = nn.Sequential(
             nn.Linear(fused, h),
             nn.ReLU(),
-            nn.Linear(h, out_dim),
+            nn.Linear(h, od),
         )
         for head in (self.spatial_head, self.magnitude_head):
             for m in head.modules():
@@ -758,6 +1121,27 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                     nn.init.xavier_uniform_(m.weight, gain=0.3)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+        self.delta_residual: nn.Linear | None = None
+        if continuous_delta_residual():
+            self.delta_residual = nn.Linear(fused, out_dim)
+            nn.init.zeros_(self.delta_residual.weight)
+            nn.init.zeros_(self.delta_residual.bias)
+        self.temporal_offset_gate: nn.Sequential | None = None
+        if continuous_temporal_offset():
+            self.temporal_offset_gate = nn.Sequential(
+                nn.Linear(1, 8),
+                nn.ReLU(),
+                nn.Linear(8, out_dim),
+            )
+            for m in self.temporal_offset_gate.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.2)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            last = self.temporal_offset_gate[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
 
     def temporal_lambda_from_state(self, log_state: torch.Tensor) -> torch.Tensor:
         """Scalar integration pace ``lambda in [lo, hi]`` from global band mass."""
@@ -787,6 +1171,14 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
             lam = self.temporal_lambda_from_state(log_state)
             magnitude = magnitude * lam
         pred_delta = spatial_gate * magnitude
+        if self.delta_residual is not None:
+            alpha = continuous_delta_residual_alpha()
+            pred_delta = pred_delta + alpha * self.delta_residual(h_fused)
+        if self.temporal_offset_gate is not None and log_state is not None:
+            off = self.temporal_offset_gate(global_species_mass_feature(log_state))
+            pred_delta = pred_delta + off.squeeze(0) * (
+                continuous_temporal_offset_scale() * continuous_delta_out_scale()
+            )
         return pred_delta, spatial_logits, magnitude
 
     def forward(
@@ -799,10 +1191,25 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
         return pred_delta
 
 
-def build_continuous_gnn(in_dim: int, *, hidden: int | None = None) -> nn.Module:
+def build_continuous_gnn(in_dim: int, *, hidden: int | None = None, arch: str | None = None) -> nn.Module:
+    from src.core_physics.species_gnode_pushforward import (
+        SpeciesGnodeDualHeadContinuousGNN,
+        species_pushforward_arch,
+    )
+
+    use_arch = (arch or species_pushforward_arch()).strip().lower()
+    if use_arch == "gnode":
+        if not continuous_dual_head():
+            raise ValueError("gnode pushforward arch requires SPECIES_CONTINUOUS_DUAL_HEAD=1")
+        return SpeciesGnodeDualHeadContinuousGNN(in_dim, hidden=hidden)
     if continuous_dual_head():
         return SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden)
     return SpeciesContinuousPushforwardGNN(in_dim, hidden=hidden)
+
+
+def bind_band_geometry(model: nn.Module, static: dict) -> None:
+    if hasattr(model, "set_band_geometry"):
+        model.set_band_geometry(static.get("pos_band"), static.get("edge_index"))
 
 
 def predict_continuous_step_delta(
@@ -812,10 +1219,20 @@ def predict_continuous_step_delta(
     log_state: torch.Tensor,
     *,
     training: bool = False,
+    pos_band: torch.Tensor | None = None,
+    time_index: int | None = None,
 ) -> torch.Tensor:
     """One closed-loop delta step (features + optional sat/temporal gates)."""
-    feats = build_continuous_step_features(base_feats, log_state, training=training)
-    if continuous_dual_head() and isinstance(model, SpeciesDualHeadContinuousGNN):
+    if hasattr(model, "set_band_geometry") and pos_band is not None:
+        model.set_band_geometry(pos_band, edge_index)
+    feats = build_continuous_step_features(
+        base_feats,
+        log_state,
+        training=training,
+        time_index=time_index,
+    )
+    feats = align_continuous_feature_dim(feats, model)
+    if continuous_dual_head() and hasattr(model, "forward_decoupled"):
         pred_delta, _, _ = model.forward_decoupled(feats, edge_index, log_state=log_state)
         return pred_delta
     return delta_readout(model(feats, edge_index))
@@ -823,11 +1240,11 @@ def predict_continuous_step_delta(
 
 def growth_delta_labels(tgt_delta: torch.Tensor) -> torch.Tensor:
     """Per-channel binary growth indicator from log-delta targets."""
-    fi_thr, mat_thr = continuous_delta_threshold_channels()
-    t = tgt_delta.reshape(-1, STATE_DIM)
+    thr_vec = continuous_delta_threshold_vec()
+    t = tgt_delta.reshape(-1, _sd())
     out = torch.zeros_like(t)
-    out[:, CH_FI] = (t[:, CH_FI] > fi_thr).float()
-    out[:, CH_MAT] = (t[:, CH_MAT] > mat_thr).float()
+    for ch, thr_v in enumerate(thr_vec):
+        out[:, ch] = (t[:, ch] > thr_v).float()
     return out
 
 
@@ -845,9 +1262,9 @@ def dual_head_step_loss(
     growth_tgt = growth_delta_labels(tgt_delta)
     if not step_has_growth_supervision(tgt_delta, m):
         return None
-    alpha = pushforward_focal_alpha_channels()
-    gamma = pushforward_focal_gamma_channels()
-    ch_w = pushforward_channel_weights()
+    alpha = pushforward_focal_alpha_vec()
+    gamma = pushforward_focal_gamma_vec()
+    ch_w = continuous_channel_weights_vec()
     spatial_l = snapshot_loss(
         spatial_logits,
         tgt_delta,
@@ -917,26 +1334,41 @@ def init_dual_head_widen_from_checkpoint(
 
 
 def init_dual_head_from_continuous(
-    dual: SpeciesDualHeadContinuousGNN,
+    dual: nn.Module,
     single: nn.Module,
     *,
     quiet: bool = False,
 ) -> None:
-    """Warm-start dual heads from single-readout continuous / s26 checkpoint."""
+    """Warm-start dual heads from single-readout continuous / snapshot checkpoint."""
     sd = single.state_dict()
     dual_sd = dual.state_dict()
-    for key in dual_sd:
-        if key in sd:
-            dual_sd[key] = sd[key]
+    copied = 0
+    for key in list(dual_sd.keys()):
+        if key in sd and dual_sd[key].shape == sd[key].shape:
+            dual_sd[key] = sd[key].clone()
+            copied += 1
     for prefix in ("spatial_head", "magnitude_head"):
         for suffix in (".0.weight", ".0.bias", ".2.weight", ".2.bias"):
             rk = f"readout{suffix}"
             pk = f"{prefix}{suffix}"
-            if rk in sd and pk in dual_sd:
-                dual_sd[pk] = sd[rk].clone()
-    dual.load_state_dict(dual_sd)
+            if rk not in sd or pk not in dual_sd:
+                continue
+            w_src = sd[rk]
+            w_dst = dual_sd[pk]
+            if w_src.shape == w_dst.shape:
+                dual_sd[pk] = w_src.clone()
+                copied += 1
+            elif suffix == ".0.weight" and w_src.ndim == 2 and w_dst.ndim == 2:
+                h = min(w_src.shape[0], w_dst.shape[0])
+                in_c = min(w_src.shape[1], w_dst.shape[1])
+                dual_sd[pk][:, :in_c] = w_src[:, :in_c]
+                copied += 1
+            elif suffix.endswith(".bias") and w_src.shape == w_dst.shape[: w_src.ndim]:
+                dual_sd[pk] = w_src.clone()
+                copied += 1
+    dual.load_state_dict(dual_sd, strict=False)
     if not quiet:
-        print("[OK] dual-head warm-start from single-readout checkpoint", flush=True)
+        print(f"[OK] dual-head partial warm-start ({copied} tensors)", flush=True)
 
 
 def unroll_continuous_loss(
@@ -953,11 +1385,15 @@ def unroll_continuous_loss(
     window_weight: float = 1.0,
     tbptt_tail: int | None = None,
     speed_fp_weight: float | None = None,
+    pos_band: torch.Tensor | None = None,
+    time_window: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
     n_steps = len(log_series) - 1
     if n_steps <= 0:
         z = base_feats.sum() * 0.0
         return z, [], []
+
+    bind_band_geometry(model, {"pos_band": pos_band, "edge_index": edge_index})
 
     if log_state0 is None:
         log_state = torch.zeros(base_feats.shape[0], STATE_DIM, device=base_feats.device, dtype=base_feats.dtype)
@@ -979,11 +1415,19 @@ def unroll_continuous_loss(
             if step < loss_start and training:
                 log_state = log_state.detach()
             feats = build_continuous_step_features(
-                base_feats, log_state, training=training and grad_step
+                base_feats,
+                log_state,
+                training=training and grad_step,
+                time_index=(
+                    int(time_window[step + 1])
+                    if time_window is not None and step + 1 < len(time_window)
+                    else step + 1
+                ),
             )
+            feats = align_continuous_feature_dim(feats, model)
             tgt_delta = log_delta_targets(log_series[step], log_series[step + 1])
             gt_log = log_series[step]
-            if continuous_dual_head() and isinstance(model, SpeciesDualHeadContinuousGNN):
+            if continuous_dual_head() and hasattr(model, "forward_decoupled"):
                 pred_delta, spatial_logits, magnitude = model.forward_decoupled(
                     feats, edge_index, log_state=log_state
                 )
@@ -1105,6 +1549,7 @@ def rollout_continuous_states(
     log_series: list[torch.Tensor],
     log_state0: torch.Tensor | None = None,
     speed_series: list[torch.Tensor] | None = None,
+    time_window: Sequence[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Returns log states, pred deltas, and binary readout states per step."""
     model.eval()
@@ -1119,7 +1564,16 @@ def rollout_continuous_states(
     actives: list[torch.Tensor] = [log_state_to_active(log_state)]
     for step in range(n_steps):
         pred_delta = predict_continuous_step_delta(
-            model, base_feats, edge_index, log_state, training=False
+            model,
+            base_feats,
+            edge_index,
+            log_state,
+            training=False,
+            time_index=(
+                int(time_window[step + 1])
+                if time_window is not None and step + 1 < len(time_window)
+                else step + 1
+            ),
         )
         deltas.append(pred_delta)
         spd = None
@@ -1147,19 +1601,25 @@ def rollout_prefix_log_state(
     """Detached closed-loop state at ``time_index`` from GT t=0 (scheduled sampling)."""
     was_training = model.training
     model.eval()
+    bind_band_geometry(model, static)
     node_idx = static["node_idx"]
     t_end = max(0, int(time_index))
-    log_state = fi_mat_log_targets(data, 0, device)[node_idx]
+    from src.core_physics.species_deploy_rollout import deploy_fimat_log_init
+
+    log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
+    pos_band = static.get("pos_band")
     with torch.no_grad():
         for t in range(t_end):
-            spd = band_speed_at_time(data, t + 1, device, node_idx)
+            spd = band_speed_at_time(data, t + 1, device, node_idx, for_training=True)
             pred_delta = predict_continuous_step_delta(
                 model,
                 static["base_feats"],
                 static["edge_index"],
                 log_state,
                 training=False,
+                pos_band=pos_band,
+                time_index=t + 1,
             )
             log_state = pushforward_log_state_step(
                 log_state,
@@ -1180,15 +1640,19 @@ def eval_full_rollout_fimat_f1(
     static: dict,
     device: torch.device,
     *,
-    time_index: int = 53,
+    time_index: int | None = None,
 ) -> dict[str, float]:
     """Closed-loop deploy Mat/FI F1 at ``time_index`` (full timeline from t=0)."""
     model.eval()
+    bind_band_geometry(model, static)
     node_idx = static["node_idx"]
     n_times = int(data.y.shape[0])
-    t_eval = max(0, min(int(time_index), n_times - 1))
-    log_state = fi_mat_log_targets(data, 0, device)[node_idx]
+    t_eval = resolve_deploy_eval_time_index(n_times, time_index=time_index)
+    from src.core_physics.species_deploy_rollout import deploy_fimat_log_init
+
+    log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
+    pos_band = static.get("pos_band")
     for t in range(t_eval):
         spd = band_speed_at_time(data, t + 1, device, node_idx)
         pred_delta = predict_continuous_step_delta(
@@ -1197,6 +1661,8 @@ def eval_full_rollout_fimat_f1(
             static["edge_index"],
             log_state,
             training=False,
+            pos_band=pos_band,
+            time_index=t + 1,
         )
         log_state = pushforward_log_state_step(
             log_state,
@@ -1205,7 +1671,7 @@ def eval_full_rollout_fimat_f1(
             wall_speed=spd,
             vel_decay_alphas=vel_alphas,
         )
-    gt_log = fi_mat_log_targets(data, t_eval, device)[node_idx]
+    gt_log = species_log_targets(data, t_eval, device)[node_idx]
     gt_active = log_state_to_active(gt_log)
     pred_active = log_state_to_active(log_state)
     band_m = torch.ones(log_state.shape[0], dtype=torch.bool, device=device)
@@ -1227,27 +1693,37 @@ def eval_deploy_clot_f1(
     bio_cfg,
     device: torch.device,
     *,
-    time_index: int = 53,
+    time_index: int | None = None,
     flow_source: str = "gt",
 ) -> dict[str, float]:
     """Closed-loop species rollout -> nucleation clot F1 at ``time_index`` (deploy physics)."""
     from src.core_physics.t0_mu_physics import gt_clot_phi_at_time, rollout_t0_clot_phi
     from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
+    from src.evaluation.clot_relaxed_metrics import (
+        clot_score_from_deploy_dict,
+        compute_clot_relaxed_metrics,
+        metrics_to_deploy_prefix,
+    )
     from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
-    from src.training.train_clot_phi_simple import _clot_metrics
 
     model.eval()
+    bind_band_geometry(model, static)
     node_idx = static["node_idx"]
     n_times = int(data.y.shape[0])
-    t_eval = max(0, min(int(time_index), n_times - 1))
-    out = data.y.clone().to(device=device)
-    log_state = fi_mat_log_targets(data, 0, device)[node_idx]
+    t_eval = resolve_deploy_eval_time_index(n_times, time_index=time_index)
+    from src.core_physics.species_deploy_rollout import (
+        alloc_species_y_series,
+        deploy_fimat_log_init,
+        pin_species_block,
+    )
+
+    out = alloc_species_y_series(data, device)
+    log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
+    pos_band = static.get("pos_band")
     for t in range(n_times):
-        sp = data.y[t, :, 4:16].to(device=device, dtype=torch.float32).clone()
-        idx = node_idx.reshape(-1)
-        sp[idx, FI_CHANNEL] = log_state[:, 0]
-        sp[idx, MAT_CHANNEL] = log_state[:, 1]
+        sp = pin_species_block(data, t, device)
+        sp = scatter_log_state_to_species_block(sp, log_state, node_idx)
         out[t, :, 4:16] = sp.clamp(min=0.0)
         if t >= n_times - 1:
             break
@@ -1258,6 +1734,8 @@ def eval_deploy_clot_f1(
             static["edge_index"],
             log_state,
             training=False,
+            pos_band=pos_band,
+            time_index=t + 1,
         )
         log_state = pushforward_log_state_step(
             log_state,
@@ -1278,16 +1756,14 @@ def eval_deploy_clot_f1(
             nucleation=True,
             nucleation_hops=1,
         )
-    mask = torch.ones(int(data.num_nodes), dtype=torch.bool, device=device)
     phi_gt = gt_clot_phi_at_time(data, t_eval, phys_cfg, device)
     phi_pred = traj[t_eval]["phi"]
-    m = _clot_metrics(phi_pred.reshape(-1), phi_gt.reshape(-1), mask)
-    return {
-        "deploy_clot_f1": float(m["clot_f1"]),
-        "deploy_clot_prec": float(m["clot_prec"]),
-        "deploy_clot_rec": float(m["clot_rec"]),
-        "time_index": int(t_eval),
-    }
+    edge_index = data.edge_index.to(device=device)
+    m = compute_clot_relaxed_metrics(phi_pred.reshape(-1), phi_gt.reshape(-1), edge_index)
+    out = metrics_to_deploy_prefix(m)
+    out["deploy_clot_score"] = clot_score_from_deploy_dict(out)
+    out["time_index"] = int(t_eval)
+    return out
 
 
 @torch.no_grad()
@@ -1301,6 +1777,7 @@ def eval_continuous_window(
     log_state0: torch.Tensor | None = None,
     speed_series: list[torch.Tensor] | None = None,
     physics_ctx: Any | None = None,
+    time_window: Sequence[int] | None = None,
 ) -> dict[str, float]:
     """Primary metric: final cumulative state F1 after soft-commit readout (ceiling mask)."""
     log_states, deltas, actives = rollout_continuous_states(
@@ -1310,11 +1787,12 @@ def eval_continuous_window(
         log_series=log_series,
         log_state0=log_state0 if log_state0 is not None else log_series[0],
         speed_series=speed_series,
+        time_window=time_window,
     )
-    gt_active = fi_mat_active_labels(log_series[-1])
+    gt_active = log_state_to_active(log_series[-1])
     pred_active = actives[-1]
     sm = trigger_metrics(pred_active, gt_active, mask)
-    init_active = fi_mat_active_labels(log_series[0])
+    init_active = log_state_to_active(log_series[0])
     sm_init = trigger_metrics(init_active, gt_active, mask)
 
     mean_growth_f1 = 0.0
@@ -1337,16 +1815,18 @@ def eval_continuous_window(
             prec = tp / max(tp + fp, 1e-6)
             rec = tp / max(tp + fn, 1e-6)
             gf1.append((2.0 * prec * rec) / max(prec + rec, 1e-6))
-            mat_g = grew[:, CH_MAT]
-            if bool(mat_g.any().item()):
-                pg = (pred_d[m][:, CH_MAT][mat_g] > thr).float()
-                tg = torch.ones_like(pg)
-                tp_m = float((pg * tg).sum().item())
-                fp_m = float((pg * (1.0 - tg)).sum().item())
-                fn_m = float(((1.0 - pg) * tg).sum().item())
-                prec_m = tp_m / max(tp_m + fp_m, 1e-6)
-                rec_m = tp_m / max(tp_m + fn_m, 1e-6)
-                gmf1.append((2.0 * prec_m * rec_m) / max(prec_m + rec_m, 1e-6))
+            li_mat = _local_mat_idx()
+            if li_mat is not None:
+                mat_g = grew[:, li_mat]
+                if bool(mat_g.any().item()):
+                    pg = (pred_d[m][:, li_mat][mat_g] > thr).float()
+                    tg = torch.ones_like(pg)
+                    tp_m = float((pg * tg).sum().item())
+                    fp_m = float((pg * (1.0 - tg)).sum().item())
+                    fn_m = float(((1.0 - pg) * tg).sum().item())
+                    prec_m = tp_m / max(tp_m + fp_m, 1e-6)
+                    rec_m = tp_m / max(tp_m + fn_m, 1e-6)
+                    gmf1.append((2.0 * prec_m * rec_m) / max(prec_m + rec_m, 1e-6))
         if gf1:
             mean_growth_f1 = sum(gf1) / len(gf1)
         if gmf1:
@@ -1452,6 +1932,63 @@ class SpeciesContinuousBundle:
     device: torch.device
 
 
+def load_pushforward_state_dict_partial(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    quiet: bool = False,
+) -> int:
+    """Load compatible tensors; copy overlapping output rows when scope/out_dim widens."""
+    dst = dict(model.state_dict())
+    copied = 0
+    skipped: list[str] = []
+    for key, src in state_dict.items():
+        if key not in dst:
+            skipped.append(key)
+            continue
+        tgt = dst[key]
+        if src.shape == tgt.shape:
+            dst[key] = src.to(device=tgt.device, dtype=tgt.dtype)
+            copied += 1
+            continue
+        if (
+            key.endswith(".weight")
+            and src.ndim == 2
+            and tgt.ndim == 2
+            and src.shape[1] == tgt.shape[1]
+        ):
+            n = min(int(src.shape[0]), int(tgt.shape[0]))
+            dst[key][:n] = src[:n].to(device=tgt.device, dtype=tgt.dtype)
+            copied += 1
+            continue
+        if key.endswith(".bias") and src.ndim == 1 and tgt.ndim == 1:
+            n = min(int(src.shape[0]), int(tgt.shape[0]))
+            dst[key][:n] = src[:n].to(device=tgt.device, dtype=tgt.dtype)
+            copied += 1
+            continue
+        if (
+            key.endswith(".0.weight")
+            and src.ndim == 2
+            and tgt.ndim == 2
+            and src.shape[0] == tgt.shape[0]
+        ):
+            in_c = min(int(src.shape[1]), int(tgt.shape[1]))
+            dst[key][:, :in_c] = src[:, :in_c].to(device=tgt.device, dtype=tgt.dtype)
+            copied += 1
+            continue
+        skipped.append(key)
+    model.load_state_dict(dst)
+    if not quiet:
+        ckpt_out = int(state_dict.get("readout.2.weight", torch.empty(0)).shape[0]) if state_dict else 0
+        msg = f"[OK] partial ckpt load ({copied} tensors"
+        if skipped:
+            msg += f", skipped {len(skipped)}"
+        if hasattr(model, "out_dim"):
+            msg += f", out {ckpt_out}->{int(model.out_dim)}"
+        print(msg + ")", flush=True)
+    return copied
+
+
 def load_continuous_bundle(
     ckpt_path: Path | str | None = None,
     *,
@@ -1478,6 +2015,10 @@ def load_continuous_bundle(
         os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
     if bool(meta.get("temporal_gate")):
         os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "1"
+    if bool(meta.get("delta_residual")):
+        os.environ["SPECIES_CONTINUOUS_DELTA_RESIDUAL"] = "1"
+    if bool(meta.get("temporal_offset")):
+        os.environ["SPECIES_CONTINUOUS_TEMPORAL_OFFSET"] = "1"
     if bool(meta.get("kin_per_vessel_norm")):
         os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
     if meta.get("mature_fp_exempt") is not None:
@@ -1489,14 +2030,20 @@ def load_continuous_bundle(
     else:
         use_dual = ckpt_dual or continuous_dual_head()
     if use_dual:
-        model = SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
+        ckpt_arch = str(meta.get("arch") or meta.get("pushforward_arch") or "").strip().lower()
+        if ckpt_arch == "gnode":
+            from src.core_physics.species_gnode_pushforward import SpeciesGnodeDualHeadContinuousGNN
+
+            model = SpeciesGnodeDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
+        else:
+            model = SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
     else:
         model = SpeciesContinuousPushforwardGNN(in_dim, hidden=hidden).to(dev)
-    model.load_state_dict(payload["model_state"], strict=False)
+    load_pushforward_state_dict_partial(model, payload["model_state"], quiet=quiet)
     model.eval()
     return SpeciesContinuousBundle(
         model=model,
-        latent_dim=int(meta.get("latent_dim", in_dim - 1 - STATE_DIM)),
+        latent_dim=int(meta.get("latent_dim", in_dim - 1 - _sd())),
         hidden=hidden,
         unroll=int(meta.get("unroll", pushforward_unroll_steps())),
         stride=int(meta.get("stride", pushforward_step_stride())),

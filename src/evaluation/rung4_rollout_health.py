@@ -14,7 +14,7 @@ from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_continuous_time import macro_tau_at_index
 from src.core_physics.clot_phi_simple import _wall_mask_from_data
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def _binary_jaccard(a: torch.Tensor, b: torch.Tensor) -> float:

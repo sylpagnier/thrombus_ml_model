@@ -181,7 +181,7 @@ Serial loop like biochem macro stepping, but clot head replaces species ODE:
 | Sub | What | Flow |
 |-----|------|------|
 | **6a** | GT `[u,v](t)` + **carry** `phi_{t-1}`, `log mu_{t-1}` | Tests **viscosity over time** without flow error |
-| **6b** | `MU_PRIOR = mu_{t-1}` -> **GINO-DEQ** -> MLP features | Two-way clot–kinematics; optional `CLOT_PHI_KINE_TF` blend |
+| **6b** | `MU_PRIOR = mu_{t-1}` -> **RGP-DEQ** -> MLP features | Two-way clot–kinematics; optional `CLOT_PHI_KINE_TF` blend |
 
 Doc: [CLOT_PHI_ROLLOUT.md](CLOT_PHI_ROLLOUT.md). Launchers: `go_rung6a_clot_phi_rollout_gt.ps1`, `go_rung6b_clot_phi_rollout_kine.ps1`.
 
@@ -203,7 +203,7 @@ Doc: [CLOT_PHI_ROLLOUT.md](CLOT_PHI_ROLLOUT.md). Launchers: `go_rung6a_clot_phi_
 | Rung | What | Gate (trend) |
 |------|------|----------------|
 | **K0** | Retrain `kinematics_best.pth` | Steady kin OK on p007 (unblocks 6b + 9.x) |
-| **9.0** | GINO-DEQ only (no GNODE train) | 5 min viz |
+| **9.0** | RGP-DEQ only (no GNODE train) | 5 min viz |
 | **9.1–9.3** | GNODE smoke, pretrain, 3ep DATA_BIO | Forward OK; FI trending down |
 | **9.4** | Passive transport (~12ep) | Val FI **< 0.05** |
 | **9.5** | Fast dump + clot-phi | min F1 **>= 0.26**; patches |

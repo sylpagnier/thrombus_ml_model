@@ -30,6 +30,24 @@ def test_slice_bio_species_channels() -> None:
     assert y.shape == (2, 10, 2)
 
 
+def test_fi_mat_thrombin_scope() -> None:
+    os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = "fi_mat_thrombin"
+    from src.training.biochem_species_scope import (
+        pushforward_state_bulk_indices,
+        pushforward_state_dim,
+    )
+
+    assert pushforward_state_bulk_indices() == [8, 11, 5]
+    assert pushforward_state_dim() == 3
+
+
+def test_all_pushforward_scope() -> None:
+    os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = "all"
+    from src.training.biochem_species_scope import pushforward_state_dim
+
+    assert pushforward_state_dim() == 12
+
+
 def test_neighbor_mask_mode_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.training.biochem_supervision_masks import resolve_data_bio_supervision_mask
 

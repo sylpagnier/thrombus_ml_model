@@ -39,7 +39,7 @@ from src.core_physics.clot_phi_simple import (
 )
 from src.core_physics.clot_t0_pattern_probe import _binary_auc, _decile_rule_metrics, _wall_mask, build_t0_feature_table
 from src.core_physics.clot_t0_extended_probe import build_feature_table_at_time
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def select_five_time_indices(n_times: int) -> list[int]:

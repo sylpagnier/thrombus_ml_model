@@ -36,7 +36,7 @@ from src.core_physics.clot_localized_spatial import (
     resolve_species_time_index,
     segment_topk_mask,
 )
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 _temporal_pred_uv: tuple[torch.Tensor, torch.Tensor] | None = None
 _temporal_pred_uv_key: int | None = None
@@ -678,6 +678,41 @@ def _localized_prog_template() -> TemporalGrowthRuleConfig:
             power=1.5,
         )
     return base
+
+
+INC40_BASELINE_RULE_NAME = "loc_prog_both_t20_s0_ndx25_inc40"
+
+
+def inc40_baseline_rule_config() -> TemporalGrowthRuleConfig:
+    """Deploy rules baseline: localized progressive_topk + 40% global incubation."""
+    return replace(
+        _localized_prog_template(),
+        name=INC40_BASELINE_RULE_NAME,
+        global_onset_frac=0.40,
+    )
+
+
+def rollout_inc40_phi_trajectory(
+    data,
+    phys_cfg: PhysicsConfig,
+    bio_cfg: BiochemConfig,
+    device: torch.device,
+    *,
+    vel_source: str | None = None,
+) -> dict[int, torch.Tensor]:
+    """Deploy-faithful inc40 temporal rule phi over the graph timeline."""
+    if vel_source is not None:
+        os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = str(vel_source)
+    else:
+        os.environ.setdefault("CLOT_TEMPORAL_VEL_SOURCE", "kinematics")
+    reset_temporal_kinematics_cache()
+    return rollout_temporal_phi(
+        data,
+        inc40_baseline_rule_config(),
+        device=device,
+        phys_cfg=phys_cfg,
+        bio_cfg=bio_cfg,
+    )
 
 
 def offset_ramp_rule_grid() -> list[TemporalGrowthRuleConfig]:

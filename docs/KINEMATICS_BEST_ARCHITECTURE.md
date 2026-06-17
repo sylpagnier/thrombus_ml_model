@@ -1,6 +1,6 @@
 # Kinematics best-model architecture (Stage A)
 
-Canonical **architecture and training flags** for the production **GINO_DEQ** run that biochem should match when building the frozen kinematics backbone. Weights are not required in this repo; the committed reference JSON is the source of truth for constructor kwargs and curriculum.
+Canonical architecture and training flags for the production **RGP-DEQ** run (`GINO_DEQ` class, `pmgp_deq_kine` id) that biochem should match when building the frozen kinematics backbone. Weights are not required in this repo; the committed reference JSON is the source of truth for constructor kwargs and curriculum.
 
 ## Reference files
 
@@ -174,7 +174,7 @@ powershell -File .\scripts\promote_kinematics_checkpoint.ps1 -Checkpoint outputs
 
 Default gates: holdout patient **rel_L2 <= 0.25**, synthetic val **rel_L2 <= 0.20**, synthetic **L2** val **rel_L2 <= 0.22** (automatic at end of default loop).
 
-## GINO_DEQ constructor (must match for biochem load)
+## RGP-DEQ (`GINO_DEQ`) constructor (must match for biochem load)
 
 | Field | Value |
 |-------|-------|

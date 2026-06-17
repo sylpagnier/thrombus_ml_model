@@ -1,9 +1,10 @@
-"""Phase 1 species GNN: static FI/Mat snapshot on wall-band subgraph.
+"""Wall-band GraphSAGE species operator (canonical: ``species_graphsage``).
 
-Inputs: frozen kinematics latent ``z_kin`` + distance-to-wall (SDF).
-Outputs: 2-channel FI / Mat (continuous log1p or BCE trigger probability).
+SciML type: discrete-time graph autoregressive operator on a wall-band subgraph.
+Backbone: 3-layer GraphSAGE; inputs = frozen ``GINO_DEQ`` latent ``z_kin`` + SDF.
+Deploy continuous variant extends this with dual-head pushforward (FI/Mat only).
 
-See ``docs/SPECIES_GNN_LADDER.md``.
+See ``docs/MODEL_NOMENCLATURE.md`` and ``docs/SPECIES_GNN_LADDER.md``.
 """
 
 from __future__ import annotations
@@ -23,7 +24,12 @@ from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_growth_masks import resolve_ceiling_mask
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.training.biochem_loss_policy import SpatialFocalLoss
-from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
+from src.training.biochem_species_scope import (
+    FI_CHANNEL,
+    MAT_CHANNEL,
+    pushforward_state_bulk_indices,
+    scatter_log_state_to_species_block,
+)
 from src.utils.paths import get_project_root
 
 DEFAULT_SNAPSHOT_CKPT = "outputs/biochem/species_snapshot_s1/best.pth"
@@ -199,15 +205,27 @@ def induced_subgraph(
     return node_idx, sub_ei, remap
 
 
+def species_log_targets(
+    data,
+    time_index: int,
+    device: torch.device,
+    *,
+    bulk_channels: list[int] | None = None,
+) -> torch.Tensor:
+    """GT log1p ND for active pushforward species channels, shape ``[N, C]``."""
+    y = data.y[int(time_index)].to(device=device, dtype=torch.float32)
+    sp = y[:, 4:16]
+    bulk = bulk_channels if bulk_channels is not None else pushforward_state_bulk_indices()
+    return torch.stack([sp[:, int(ch)] for ch in bulk], dim=-1)
+
+
 def fi_mat_log_targets(
     data,
     time_index: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """GT FI/Mat log1p channels, shape ``[N, 2]``."""
-    y = data.y[int(time_index)].to(device=device, dtype=torch.float32)
-    sp = y[:, 4:16]
-    return torch.stack([sp[:, FI_CHANNEL], sp[:, MAT_CHANNEL]], dim=-1)
+    """GT FI/Mat log1p channels, shape ``[N, 2]`` (legacy alias)."""
+    return species_log_targets(data, time_index, device, bulk_channels=[FI_CHANNEL, MAT_CHANNEL])
 
 
 def fi_mat_active_labels(
@@ -269,7 +287,7 @@ def snapshot_feature_dim(latent_dim: int) -> int:
 
 
 class SpeciesSnapshotGNN(nn.Module):
-    """3-layer GraphSAGE + initial-state residual readout (``z_kin`` + SDF -> FI/Mat)."""
+    """3-layer GraphSAGE + skip readout (``z_kin`` + SDF -> FI/Mat). Not a generic GNN/GNO."""
 
     def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = 2):
         super().__init__()
@@ -357,8 +375,10 @@ def trigger_metrics(
             "gt_pos_frac": 0.0,
         }
     m = mask.reshape(-1).bool()
-    pred_b = (pred[m] > 0.5).any(dim=-1).float()
-    tgt_b = (tgt_active[m] > 0.5).any(dim=-1).float()
+    pred_m = pred.reshape(pred.shape[0], -1)[m]
+    tgt_m = tgt_active.reshape(tgt_active.shape[0], -1)[m]
+    pred_b = (pred_m > 0.5).any(dim=-1).float()
+    tgt_b = (tgt_m > 0.5).any(dim=-1).float()
     tp = float((pred_b * tgt_b).sum().item())
     fp = float((pred_b * (1.0 - tgt_b)).sum().item())
     fn = float(((1.0 - pred_b) * tgt_b).sum().item())
@@ -366,7 +386,9 @@ def trigger_metrics(
     rec = tp / max(tp + fn, 1e-6)
     f1 = (2.0 * prec * rec) / max(prec + rec, 1e-6)
 
-    def _ch_f1(ch: int) -> float:
+    def _ch_f1(ch: int | None) -> float:
+        if ch is None or ch < 0 or ch >= int(pred.shape[-1]):
+            return 0.0
         pb = (pred[m, ch] > 0.5).float()
         tb = (tgt_active[m, ch] > 0.5).float()
         tpi = float((pb * tb).sum().item())
@@ -376,13 +398,17 @@ def trigger_metrics(
         ri = tpi / max(tpi + fni, 1e-6)
         return (2.0 * pi * ri) / max(pi + ri, 1e-6)
 
+    bulk = pushforward_state_bulk_indices()
+    li_fi = bulk.index(FI_CHANNEL) if FI_CHANNEL in bulk else None
+    li_mat = bulk.index(MAT_CHANNEL) if MAT_CHANNEL in bulk else None
+
     n = float(m.sum().item())
     return {
         "trigger_prec": prec,
         "trigger_rec": rec,
         "trigger_f1": f1,
-        "fi_f1": _ch_f1(0),
-        "mat_f1": _ch_f1(1),
+        "fi_f1": _ch_f1(li_fi),
+        "mat_f1": _ch_f1(li_mat),
         "pred_pos_frac": float(pred_b.sum().item()) / max(n, 1.0),
         "gt_pos_frac": float(tgt_b.sum().item()) / max(n, 1.0),
     }
@@ -417,13 +443,13 @@ def snapshot_loss(
             n_neg=n_neg, n_pos=max(n_pos, 1)
         )
     elif isinstance(focal_alpha, (list, tuple)):
-        alpha = (float(focal_alpha[0]), float(focal_alpha[1]))
+        alpha = tuple(float(x) for x in focal_alpha)
     else:
         alpha = float(focal_alpha)
     if focal_gamma is None:
         gamma: float | tuple[float, float] = snapshot_focal_gamma_channels()
     elif isinstance(focal_gamma, (list, tuple)):
-        gamma = (float(focal_gamma[0]), float(focal_gamma[1]))
+        gamma = tuple(float(x) for x in focal_gamma)
     else:
         gamma = float(focal_gamma)
     cw = channel_weight if channel_weight is not None else snapshot_channel_weights()

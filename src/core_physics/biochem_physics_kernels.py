@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,20 +11,56 @@ from src.utils.nondim import time_ratio_global_to_convective
 from src.utils.tensor_utils import as_tensor_like
 
 
-def surface_time_gate_scalar(data, cfg, *, device, dtype) -> torch.Tensor:
-    """Smooth COMSOL step2t(t) gate (adhesion active after ``cfg.surface_time_gate_s``)."""
-    t_raw = getattr(data, "t_global", None)
-    if t_raw is None:
-        t_val = float(cfg.t_final)
-    elif torch.is_tensor(t_raw):
-        t_val = float(t_raw.reshape(-1)[0].detach().cpu())
+def surface_time_gate_scalar(data, cfg, *, device, dtype, current_time_s: float | None = None) -> torch.Tensor:
+    """Smooth COMSOL step2t(t) gate (adhesion active after ``cfg.surface_time_gate_s``).
+
+    ``current_time_s``: override physical time in seconds (e.g. from macro-step tracker).
+    Falls back to ``data.t_global`` or ``cfg.t_final`` when None.
+    """
+    if current_time_s is not None:
+        t_val = float(current_time_s)
     else:
-        t_val = float(t_raw)
+        t_raw = getattr(data, "t_global", None)
+        if t_raw is None:
+            t_val = float(cfg.t_final)
+        elif torch.is_tensor(t_raw):
+            t_val = float(t_raw.reshape(-1)[0].detach().cpu())
+        else:
+            t_val = float(t_raw)
     gate_t = float(cfg.surface_time_gate_s)
     gate_slope = float(cfg.surface_time_gate_slope)
     return torch.sigmoid(
         (torch.as_tensor(t_val, device=device, dtype=dtype) - gate_t) * gate_slope
     )
+
+
+def _biochem_adhesion_gate_mode() -> str:
+    """Dispatch env: ``global_sigmoid`` (default) | ``fourier_tau`` | ``spatial_mlp``."""
+    return (os.environ.get("BIOCHEM_ADHESION_GATE") or "global_sigmoid").strip().lower()
+
+
+def compute_adhesion_gate(
+    data,
+    cfg,
+    *,
+    device: torch.Tensor,
+    dtype: torch.Tensor,
+    current_time_s: float | None = None,
+    node_features: torch.Tensor | None = None,
+    gate_module=None,
+) -> torch.Tensor:
+    """Unified adhesion gate dispatch.
+
+    Args:
+        gate_module: a ``FourierTauGate`` or ``SpatialConditionedGate`` instance
+            (from ``GNODE_Phase3``). When None falls back to global sigmoid.
+        node_features: node-level feature tensor [N, F]; required for spatial_mlp mode.
+        current_time_s: physical time in seconds at this macro step.
+    """
+    mode = _biochem_adhesion_gate_mode()
+    if mode in ("fourier_tau", "spatial_mlp") and gate_module is not None and current_time_s is not None:
+        return gate_module(node_features, current_time_s)
+    return surface_time_gate_scalar(data, cfg, device=device, dtype=dtype, current_time_s=current_time_s)
 
 
 class BiochemPhysicsKernels:
@@ -582,9 +620,25 @@ class BiochemPhysicsKernels:
                     Mas / Minf) * k_aa * AP_wall
         low_shear_Mas_adhesion = is_low_shear * (Mas / Minf) * k_aa * AP_wall
 
-        is_active_phase = surface_time_gate_scalar(
-            data, self.cfg, device=biochem_preds.device, dtype=biochem_preds.dtype
+        _gate_module = getattr(data, "_adhesion_gate_module", None)
+        _cur_t_s = getattr(data, "_current_time_s", None)
+        _gate_node_feat = biochem_preds if _gate_module is not None else None
+        _raw_gate = compute_adhesion_gate(
+            data,
+            self.cfg,
+            device=biochem_preds.device,
+            dtype=biochem_preds.dtype,
+            current_time_s=_cur_t_s,
+            node_features=_gate_node_feat,
+            gate_module=_gate_module,
         )
+        # Collapse per-node gate [N,1] or scalar to the surface subset.
+        if _raw_gate.dim() == 2:
+            is_active_phase = _raw_gate[mask_wall, :]  # [N_wall, 1]
+            _gate_scalar = _raw_gate                    # full domain for Neumann fluxes
+        else:
+            is_active_phase = _raw_gate
+            _gate_scalar = _raw_gate
         R_M = (
             pathological_RP_adhesion
             + low_shear_RP_adhesion
@@ -597,7 +651,11 @@ class BiochemPhysicsKernels:
         res_M = conv_time * ((dM_dt_nd / t_ref_global) - (Da * R_M)) / Minf
         res_Mas = conv_time * ((dMas_dt_nd / t_ref_global) - (Da * R_Mas)) / Minf
         res_Mat = conv_time * ((dMat_dt_nd / t_ref_global) - (Da * R_Mat)) / Minf
-        adhesion_gate = is_active_phase
+        # For Neumann flux coupling: wall-subset scalar gate [N_wall] or broadcastable.
+        if _raw_gate.dim() == 2:
+            adhesion_gate = _raw_gate[mask_wall, 0]  # [N_wall]
+        else:
+            adhesion_gate = _raw_gate
 
         loss_surface = (
             F.huber_loss(res_M, torch.zeros_like(res_M), delta=self._biochem_huber_delta)

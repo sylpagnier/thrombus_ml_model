@@ -367,6 +367,29 @@ def save_viscosity_calibration(
     )
 
 
+def resolve_deploy_gelation_beta(
+    device: torch.device,
+    *,
+    cal_path: Path | str | None = None,
+) -> torch.Tensor | None:
+    """Global s35 beta, or per-anchor ``SPECIES_GELATION_BETA_OVERRIDE`` env."""
+    if not viscosity_calibration_enabled():
+        return None
+    override = (os.environ.get("SPECIES_GELATION_BETA_OVERRIDE") or "").strip()
+    if override:
+        return torch.tensor(float(override), device=device, dtype=torch.float32)
+    raw = cal_path or os.environ.get("SPECIES_VISCOSITY_CALIB_PATH") or str(
+        viscosity_calibration_dir() / "beta.pth"
+    )
+    p = Path(raw)
+    if not p.is_absolute():
+        p = get_project_root() / p
+    if not p.is_file():
+        return None
+    cal, _ = load_viscosity_calibration(p, device=device)
+    return cal.beta
+
+
 def load_viscosity_calibration(
     path: Path | str | None = None,
     *,

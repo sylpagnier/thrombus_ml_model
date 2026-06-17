@@ -17,7 +17,8 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 
 ### Model and physics
 
-- **`GINO_DEQ`** (`src/architecture/ginodeq.py`): graph encoder → fixed-point **DEQ** loop (`core_physics.anderson`) over latent states with a required **global message/mixing** path (`AttentionGlobalMixingBlock`) for long-range pressure-like coupling and a required **SIREN** spatial decoder (`architecture/siren_decoder.py`).
+- **`GINO_DEQ`** (`src/architecture/ginodeq.py`): Stage-A **RGP-DEQ** — μ-coupled rheology-guided graph-perceiver DEQ on vessel graphs. Canonical id: **`pmgp_deq_kine`**. Train: `python -m src.bin.main train pmgp-deq-kine` (alias: `gino-deq-kine`).
+- **`biochem_deploy` stack** (`src/biochem_gnn/`): hybrid pipeline — frozen **`pmgp_deq_kine`** (**RGP-DEQ**) + **`species_graphsage`** + **`gelation_beta`** + **`clot_trigger_physics`**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
 - **LoRA** adapters: `src/architecture/lora_injection.py` (spectral / low-rank hooks used where config enables LoRA for sim-to-real).
 - **`PhysicsKernels`** (`src/core_physics/physics_kernels.py`): residual / BC / rheology interfaces shared by training and tests.
 - **Kinematics losses** align with `src/utils/kinematics_physics_terms.py` (not legacy standalone `kinematics` wrappers).
@@ -73,8 +74,9 @@ Training is driven by **self-contained scripts** that own dataloading loops, sch
 
 | Script | Role |
 |--------|------|
-| `src.training.train_kinematics_predictor` | Unified Kine phase curriculum trainer; Stage 1 Newtonian anchor -> Stage 2 physics ramp -> Stage 3 Kinematics target |
-| `src.training.train_biochem_corrector` | Biochem phase: Biochem coupled corrector and graph semantics |
+| `src.training.train_kinematics_predictor` | **RGP-DEQ** Stage-A flow trainer (`train gino-deq-kine`) |
+| `src.training.train_biochem_gnn` | **biochem_deploy** stack trainer (`train biochem-deploy`) |
+| `src.training.train_biochem_corrector` | Biochem phase: GNODE coupled corrector (research) |
 | `src.training.physics_curriculum` | Curriculum helpers consumed by training scripts |
 
 `python -m src.bin.main train kinematics` runs the same module as `train_kinematics_predictor` (see `MODULE_MAP` in `src/bin/main.py`).
@@ -97,9 +99,9 @@ There is **no** separate `src.main` package for training; use **`src.bin.orchest
 | Action | Command / module |
 |--------|------------------|
 | Chain training (recommended) | `python -m src.bin.orchestrate {a\|b\|all}` |
-| Unified Kine phase only | `python -m src.training.train_kinematics_predictor` or `python -m src.bin.main train kinematics` |
-| Biochem only | `python -m src.training.train_biochem_corrector` or `python -m src.bin.main train t3` |
-| Kine phase aliases | `python -m src.bin.main train t1` / `train t2` / `train explore` / `train kinematics` -> same unified Kine phase trainer |
+| Unified RGP-DEQ (Stage A) | `python -m src.bin.main train gino-deq-kine` or `train kinematics` |
+| Biochem corrector (GNODE) | `python -m src.bin.main train biochem` or `train t3` |
+| Biochem deploy stack | `python -m src.bin.main train biochem-deploy` |
 | Kinematics/2 datagen | `python -m src.data_gen.pipeline_kinematics` |
 | Biochem datagen | `python -m src.data_gen.pipeline_biochem` |
 
@@ -124,7 +126,7 @@ Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` 
 ## Source map
 
 - **`src/core_physics/`** — PDE-consistent building blocks (fluid kinematics, rheology, biochem kernels, Anderson). Shared by training and tests.
-- **`src/architecture/`** — `GINO_DEQ`, DEQ loop, LoRA, SIREN decoder, Biochem model variants.
+- **`src/architecture/`** — `GINO_DEQ` (RGP-DEQ class), DEQ loop, LoRA, SIREN decoder, Biochem model variants.
 - **`src/data_gen/`** — Top-level **pipelines** (`pipeline_kinematics`, `pipeline_biochem`); **`lib/`** holds mesh/COMSOL/graph builders imported by those pipelines and re-exported from `src.data_gen`.
 - **`src/training/`** — Predictor and corrector **scripts** (`train_kinematics_predictor`, `train_biochem_corrector`), `physics_curriculum.py`; import LoRA helpers from `src.architecture.lora_injection` when needed.
 - **`src/evaluation/`** — Benchmark drivers, phase comparison plots (may reference checkpoint paths).
@@ -151,7 +153,7 @@ Primary modules (also routed through `python -m src.bin.main inspect <target> --
 | `python -m src.tools.inspect_biochem_data` | **Biochem** domain `.txt` + graphs: **default** = one anchor stem at a time (brief availability line + qualitative text for that stem), one figure (domain time-slider or single-time 2×2; graph-only stems use graph views). **Regenerate Random Anchor** / `r` like kinematics. `--summary` = full table only. `--no-regenerate` fixes the current stem (`biochem` / `biochem_anchors` / `biochem_mix`; legacy `biochem_patients` still accepted). |
 | `python -m src.tools.inspect_comsol_model` | Live **COMSOL** model browser (`mph`): `--list-models`, `--model`, `--all-models`. |
 | `python -m src.tools.inspect_graph_sample` | **Processed** `.pt` graphs (kinematics/stage A style): COMSOL overlap, WLS condition numbers, BC masks, widgets. |
-| `python -m src.tools.demo_kinematics_flow` | **Synthetic kinematics flow demo**: parametric sliders + optional **Edit walls** drag on top/bot station polylines (pinned inlet/outlet); Gmsh mesh -> graph -> GINO-DEQ u/v/p (``inspect flow`` via `bin.main`). |
+| `python -m src.tools.demo_kinematics_flow` | **Synthetic kinematics flow demo**: parametric sliders + optional **Edit walls** drag on top/bot station polylines (pinned inlet/outlet); Gmsh mesh -> graph -> RGP-DEQ u/v/p (``inspect flow`` via `bin.main`). |
 | `python -m src.tools.verify_deq_convergence` | Manual Picard vs Anderson residual curves (not pytest). |
 
 `bin.main` shortcuts: `data extract-biochem` → `extract_biochem_comsol`; `inspect anchor` and `inspect kinematics` → `inspect_kinematics_data`, `inspect biochem`, `inspect comsol`, `inspect graph`, `inspect flow`, `inspect deq`.

@@ -17,7 +17,7 @@ from src.core_physics.clot_temporal_growth_rules import (
     deploy_score_from_eval_row,
 )
 from src.evaluation.clot_shape_score import graph_hop_distance_from_seeds
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def _mean_key(rows: list[dict], key: str) -> float:

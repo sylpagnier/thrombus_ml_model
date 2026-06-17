@@ -101,28 +101,9 @@ SPECIES_GROUPS = {
     "solid": (BulkSpecies.FI,),
 }
 
-# --- TEMP DEBUG (biochemistry / COMSOL pipeline) ---
-# Upper bound [s] on physical time kept when exporting graphs and when synthesizing
-# fallback timelines. **Not for production:** raise or remove this cap (or set it
-# well above your COMSOL ``t_end``) before full-horizon training and evaluation.
-BIOCHEM_T_MAX: float = 8000.0
-
-
 def biochem_comsol_time_cap_s() -> Optional[float]:
-    """Max physical time [s] kept when parsing wide COMSOL anchor exports.
-
-    Set ``BIOCHEM_EXTRACT_FULL_TIME=1`` to keep the full COMSOL time horizon (no cap).
-    Optional override: ``BIOCHEM_EXTRACT_T_MAX_S`` (float, or ``none``/``full`` for uncapped).
-    """
-    raw_full = (os.environ.get("BIOCHEM_EXTRACT_FULL_TIME") or "").strip().lower()
-    if raw_full in ("1", "true", "yes", "on"):
-        return None
-    raw_cap = (os.environ.get("BIOCHEM_EXTRACT_T_MAX_S") or "").strip().lower()
-    if raw_cap in ("none", "inf", "full"):
-        return None
-    if raw_cap and raw_cap not in ("default",):
-        return float(raw_cap)
-    return float(BIOCHEM_T_MAX)
+    """No global extraction cap: keep full COMSOL time horizon."""
+    return None
 
 
 PHASE_DEFAULT_MESH_SIZE_FACTOR: Dict[str, float] = {
@@ -542,7 +523,6 @@ class BiochemConfig:
                     "Anchor COMSOL exports must provide aligned time stamps."
                 )
             t_last = float(t[-1].item()) if t.numel() else float(self.t_final)
-            t_last = min(t_last, float(BIOCHEM_T_MAX))
             warnings.warn(
                 f"data.t length {t.numel()} != y time dim {t_steps}; "
                 f"using linspace(0, {t_last:g}, {t_steps}). Re-export graphs with aligned t.",
@@ -556,7 +536,7 @@ class BiochemConfig:
                 "Anchor biochem graph is missing `data.t`. "
                 "Anchor COMSOL exports must include time stamps."
             )
-        t_end = min(float(self.t_final), float(BIOCHEM_T_MAX))
+        t_end = float(self.t_final)
         return self._ensure_strictly_increasing_times(
             torch.linspace(0.0, t_end, steps=t_steps, device=device, dtype=torch.float32)
         )
@@ -566,10 +546,9 @@ class BiochemConfig:
 class CurriculumConfig:
     """Training curriculum schedules (keeps magic numbers out of training loops).
 
-    Biochem temporal rollouts are bounded by the timestamps on each graph (COMSOL
-    anchors after extraction use ``t <= BIOCHEM_T_MAX`` while the TEMP DEBUG cap
-    is enabled — see ``src.config.BIOCHEM_T_MAX`` and
-    ``src.training.physics_curriculum.biochem_physical_time_horizon_s``).
+    Biochem temporal rollouts are bounded by the timestamps on each graph.
+    Anchor graphs should carry COMSOL times in ``data.t`` (full horizon by default),
+    while synthetic/fallback timelines use ``BiochemConfig.t_final``.
     """
 
     # Kinematics: Carreau index n during viscosity distillation (anneals toward PhysicsConfig.n)

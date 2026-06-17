@@ -89,9 +89,11 @@ class AttentionGlobalMixingBlock(nn.Module):
 
 
 class MultiHeadPhysicsGATConv(MessagePassing):
-    """
-    Physics-Informed Multi-Head Graph Attention Network.
-    Strictly typed to satisfy IDE linters and PyG's message passing dispatcher.
+    """Physics-modulated multi-head GAT (PM-GAT).
+
+    Edge attention logits receive additive (or multiplicative) biases from
+    advection, wall-rheology, and curvature priors before softmax.
+    Core of PMGP-DEQ; see ``docs/MODEL_NOMENCLATURE.md``.
     """
 
     def __init__(
@@ -164,6 +166,11 @@ class MultiHeadPhysicsGATConv(MessagePassing):
 
 
 class GINOBlock(nn.Module):
+    """One PMGP-DEQ equilibrium step: PM-GAT + Perceiver global mixing + residual.
+
+    Legacy name ``GINOBlock`` (not Li et al. GINO). Prefer ``PMGPBlock`` in new docs.
+    """
+
     def __init__(
         self,
         latent_dim=64,
@@ -193,6 +200,15 @@ class GINOBlock(nn.Module):
 
 
 class GINO_DEQ(nn.Module):
+    """Stage-A flow surrogate: PMGP-DEQ (mu-coupled PM-GAT-Perceiver DEQ).
+
+    Equilibrium: z* = f(z*, mu(z*)) via Anderson/Picard; each step uses
+    ``GINOBlock`` (physics-modulated GAT + Perceiver global tokens).
+
+    Canonical id: ``pmgp_deq_kine`` (acronym PMGP-DEQ). Code class ``GINO_DEQ`` is legacy.
+    See ``docs/MODEL_NOMENCLATURE.md``.
+    """
+
     def __init__(
         self,
         in_channels=11,

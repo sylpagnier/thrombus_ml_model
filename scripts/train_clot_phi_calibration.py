@@ -27,7 +27,7 @@ from src.core_physics.species_gnn_clot_rollout import (
     prepare_species_gnn_rollout_static,
     rollout_species_gnn_species_series,
 )
-from src.core_physics.species_pushforward_continuous import BIOCHEM_ANCHORS_6
+from src.core_physics.species_pushforward_continuous import parse_biochem_train_anchors
 from src.core_physics.species_viscosity_calibration import (
     DEFAULT_S34_GNN_CKPT,
     MatViscosityCalibrator,
@@ -40,10 +40,7 @@ from src.core_physics.t0_device import require_cuda_device
 
 
 def _parse_anchors(raw: str, *, all_anchors: bool) -> list[str]:
-    if all_anchors:
-        return list(BIOCHEM_ANCHORS_6)
-    items = [x.strip() for x in raw.split(",") if x.strip()]
-    return items or ["patient007"]
+    return parse_biochem_train_anchors(raw, all_anchors=all_anchors, root=get_project_root())
 
 
 @torch.no_grad()
@@ -80,6 +77,8 @@ def _cache_species_rollouts(
 
 def _anchor_t_eval(pack: dict, default_t: int) -> int:
     t_last = int(pack.get("t_eval", default_t))
+    if int(default_t) < 0:
+        return t_last
     return min(int(default_t), t_last)
 
 
@@ -142,11 +141,16 @@ def _weighted_mu_loss(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Phase 6: finetune Mat beta for T=53 mu calibration")
+    ap = argparse.ArgumentParser(description="Phase 6: finetune Mat beta at deploy horizon")
     ap.add_argument("--gnn-ckpt", default=DEFAULT_S34_GNN_CKPT)
     ap.add_argument("--anchors", default="")
     ap.add_argument("--all-anchors", action="store_true")
-    ap.add_argument("--time-index", type=int, default=53)
+    ap.add_argument(
+        "--time-index",
+        type=int,
+        default=-1,
+        help="macro-step index; -1 = per-anchor last (full graph horizon)",
+    )
     ap.add_argument("--beta-init", type=float, default=1.5)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=0.05)

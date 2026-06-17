@@ -34,6 +34,7 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     load_species_gnn_rollout_bundle,
 )
 from src.core_physics.species_pushforward_continuous import BIOCHEM_ANCHORS_6  # noqa: E402
+from src.core_physics.species_pushforward_continuous import default_deploy_metric_times  # noqa: E402
 from src.core_physics.species_snapshot_gnn import wall_band_mask  # noqa: E402
 from src.core_physics.species_viscosity_calibration import (  # noqa: E402
     load_viscosity_calibration,
@@ -58,7 +59,7 @@ def _eval_anchor(
     *,
     device: torch.device,
     flow_source: str,
-    times: list[int],
+    times: list[int] | None,
     manifest: dict[str, str],
     compare_s0: bool,
     prefer_loao: bool,
@@ -69,7 +70,8 @@ def _eval_anchor(
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
     n_steps = int(data.y.shape[0])
-    times = sorted({max(0, min(int(t), n_steps - 1)) for t in times})
+    eval_times = times if times else default_deploy_metric_times(n_steps)
+    times = sorted({max(0, min(int(t), n_steps - 1)) for t in eval_times})
     t_last = times[-1]
 
     band = wall_band_mask(data, device, wall_hops=1).reshape(-1).bool()
@@ -77,12 +79,13 @@ def _eval_anchor(
     is_val = anchor == val_anchor
 
     loao_ckpt = resolve_loao_ckpt_for_anchor(anchor, manifest.get("loao_dir", ""))
-    use_loao = prefer_loao and loao_ckpt.is_file()
+    overrides_map = manifest.get("ckpt_overrides") or {}
+    picked_loao = isinstance(overrides_map, dict) and str(overrides_map.get(anchor, "")).find("species_gnn_loao") >= 0
     with species_gnn_deploy_env(
         manifest,
         overrides={"T0_R4_FLOW_SOURCE": flow_source},
-        anchor=anchor if use_loao else None,
-        prefer_loao=use_loao,
+        anchor=anchor,
+        prefer_loao=prefer_loao,
     ):
         gnn_report = eval_rung4_step_clot(
             data, phys, bio, device, step="species_gnn", times=times,
@@ -135,7 +138,7 @@ def _eval_anchor(
         "anchor": anchor,
         "flow_source": flow_source,
         "is_train_val_anchor": is_val,
-        "loao_ckpt": use_loao,
+        "loao_ckpt": picked_loao,
         "ckpt": str(ckpt),
         "species_gnn": {
             "clot": gnn_report["clot"],
@@ -161,7 +164,11 @@ def _eval_anchor(
 def main() -> int:
     ap = argparse.ArgumentParser(description="LOAO deploy eval for species GNN Rung 4")
     ap.add_argument("--anchors", default=",".join(BIOCHEM_ANCHORS_6))
-    ap.add_argument("--times", default="0,27,53")
+    ap.add_argument(
+        "--times",
+        default="",
+        help="comma macro indices; empty = per-graph default (0, 27, legacy cap, last)",
+    )
     ap.add_argument(
         "--flow",
         default="both",
@@ -178,7 +185,7 @@ def main() -> int:
     root = get_project_root()
     manifest = load_deploy_manifest(args.manifest.strip() or None)
     prefer_loao = not bool(args.global_ckpt)
-    times = [int(x.strip()) for x in args.times.split(",") if x.strip()]
+    times_arg = [int(x.strip()) for x in args.times.split(",") if x.strip()] if args.times.strip() else None
     anchors = [a.strip() for a in args.anchors.split(",") if a.strip()]
     flows = ["gt", "kinematics"] if args.flow == "both" else [args.flow]
 
@@ -194,7 +201,7 @@ def main() -> int:
                     anc,
                     device=device,
                     flow_source=flow,
-                    times=times,
+                    times=times_arg,
                     manifest=manifest,
                     compare_s0=not bool(args.no_s0),
                     prefer_loao=prefer_loao,
@@ -202,7 +209,7 @@ def main() -> int:
             )
             r = rows[-1]
             print(
-                f"  gnn F1@t53={r['species_gnn']['clot_f1_t_last']:.3f} "
+                f"  gnn F1@t_last={r['species_gnn']['clot_f1_t_last']:.3f} "
                 f"mat_mae={r['species_gnn']['species_band'].get('mat_log_mae', float('nan')):.5f} "
                 f"health={r['species_gnn']['health_pass']}",
                 flush=True,
@@ -217,13 +224,13 @@ def main() -> int:
         mean_f1 = sum(r["species_gnn"]["clot_f1_t_last"] for r in subset) / len(subset)
         mean_delta = sum(r.get("delta_f1_vs_s0", 0.0) for r in subset) / len(subset)
         print(
-            f"[i] LOAO holdout ({flow}) mean clot_f1@t53={mean_f1:.3f} delta_vs_s0={mean_delta:+.3f}",
+            f"[i] LOAO holdout ({flow}) mean clot_f1@t_last={mean_f1:.3f} delta_vs_s0={mean_delta:+.3f}",
             flush=True,
         )
 
     payload = {
         "manifest": manifest,
-        "times": times,
+        "times": times_arg,
         "anchors": anchors,
         "flow_modes": flows,
         "rows": rows,

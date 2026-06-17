@@ -1,10 +1,10 @@
-"""Species GNN -> full-timeline species -> T0 clot phi rollout.
+"""Species GNN -> full-timeline species -> physics clot trigger rollout.
 
-Builds a ``(T, N, 16)`` y-shaped species series from Phase 2 (binary pushforward)
-or Phase 2.5 (continuous log-delta), pins non-modeled channels to GT, then runs
-``rollout_t0_clot_phi`` under Rung2 gamma env.
+Builds a ``(T, N, C)`` y-shaped species series from the species GNN pushforward
+(continuous log-delta). Non-FI/Mat channels use resting plasma IC; only FI/Mat
+are predicted. Clot phi uses ``clot_trigger_physics`` (gelation + nucleation), not ML.
 
-See ``scripts/viz_species_gnn_clot_ladder.py``.
+See ``scripts/viz_species_gnn_clot_ladder.py`` and ``docs/MODEL_NOMENCLATURE.md``.
 """
 
 from __future__ import annotations
@@ -18,14 +18,21 @@ import torch
 
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
+from src.core_physics.species_deploy_rollout import (
+    alloc_species_y_series,
+    band_speed_for_rollout,
+    deploy_fimat_log_init,
+    pin_species_block,
+    reset_species_rollout_flow_cache,
+    species_rollout_pin_other,
+)
 from src.core_physics.species_pushforward_continuous import (
     SpeciesContinuousBundle,
     SpeciesDualHeadContinuousGNN,
-    band_speed_at_time,
+    bind_band_geometry,
     continuous_max_sat_log,
     continuous_vel_decay_enabled,
     predict_continuous_step_delta,
-    fi_mat_log_targets,
     load_continuous_bundle,
     log_series_on_band,
     model_vel_decay_alphas,
@@ -33,11 +40,14 @@ from src.core_physics.species_pushforward_continuous import (
     pushforward_log_state_step,
 )
 from src.core_physics.species_pushforward_gnn import (
-    STATE_DIM,
     SpeciesPushforwardBundle,
     build_band_base_features,
     load_pushforward_bundle,
     pushforward_state_step,
+)
+from src.training.biochem_species_scope import (
+    pushforward_state_dim,
+    scatter_log_state_to_species_block,
 )
 from src.core_physics.species_snapshot_gnn import (
     build_snapshot_features,
@@ -46,7 +56,6 @@ from src.core_physics.species_snapshot_gnn import (
     snapshot_wall_hops,
     wall_band_mask,
 )
-from src.core_physics.t0_rung4_ladder import resting_species_log_nd
 from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
 from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
 from src.utils.kinematics_inference import (
@@ -80,6 +89,7 @@ class SpeciesGnnRolloutStatic:
     node_idx: torch.Tensor
     band: torch.Tensor
     device: torch.device
+    pos_band: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +109,16 @@ class SpeciesGnnRolloutBundle:
 
 
 def _bundle_label_from_path(path: Path, phase: str) -> str:
+    path_s = str(path).replace("\\", "/")
+    if (
+        "biochem_deploy" in phase
+        or "biochem_gnn" in phase
+        or "clot_deploy_gnn" in phase
+        or "biochem_deploy" in path_s
+        or "biochem_gnn" in path_s
+        or "clot_deploy_gnn" in path_s
+    ):
+        return "biochem_deploy"
     if "s35" in phase:
         return "s35"
     if "s34" in phase:
@@ -140,6 +160,9 @@ def load_species_gnn_rollout_bundle(
     phase = str(meta.get("phase") or payload.get("phase") or "").lower()
     if bool(meta.get("kin_per_vessel_norm")):
         os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
+    scope = meta.get("pushforward_species_scope") or meta.get("species_scope")
+    if scope:
+        os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
     if bool(meta.get("dual_head")):
         os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
     if bool(meta.get("vel_decay")):
@@ -149,13 +172,15 @@ def load_species_gnn_rollout_bundle(
     if bool(meta.get("temporal_gate")):
         os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "1"
     label = _bundle_label_from_path(path, phase)
-    if "continuous" in phase or "dual_head" in phase or "long_horizon" in phase or "saturation" in phase or "temporal" in phase or phase in (
+    if "continuous" in phase or "dual_head" in phase or "long_horizon" in phase or "saturation" in phase or "temporal" in phase or "biochem_gnn" in phase or "clot_deploy_gnn" in phase or phase in (
         "s25_continuous",
         "s26_continuous",
         "s31_dual_head",
         "s32_long_horizon",
         "s33_saturation_gate",
         "s34_temporal_gate",
+        "biochem_gnn",
+        "clot_deploy_gnn",
     ):
         cont = load_continuous_bundle(path, device=dev, quiet=True)
         if cont is None:
@@ -184,6 +209,7 @@ def prepare_species_gnn_rollout_static(
         node_idx=stat["node_idx"],
         band=band,
         device=device,
+        pos_band=stat.get("pos_band"),
     )
 
 
@@ -192,20 +218,18 @@ def _write_fimat_log_to_species(
     log_state: torch.Tensor,
     node_idx: torch.Tensor,
 ) -> torch.Tensor:
-    out = species.clone()
-    idx = node_idx.reshape(-1)
-    st = log_state.reshape(-1, STATE_DIM)
-    out[idx, FI_CHANNEL] = st[:, 0]
-    out[idx, MAT_CHANNEL] = st[:, 1]
-    return out.clamp(min=0.0)
+    return scatter_log_state_to_species_block(species, log_state, node_idx)
 
 
 def _binary_state_to_log(state: torch.Tensor) -> torch.Tensor:
     fi_sat, mat_sat = continuous_max_sat_log()
-    st = state.reshape(-1, STATE_DIM)
+    sd = pushforward_state_dim()
+    st = state.reshape(-1, sd)
     out = torch.zeros_like(st)
-    out[:, 0] = torch.where(st[:, 0] > 0.5, torch.tensor(fi_sat, device=st.device, dtype=st.dtype), out[:, 0])
-    out[:, 1] = torch.where(st[:, 1] > 0.5, torch.tensor(mat_sat, device=st.device, dtype=st.dtype), out[:, 1])
+    if sd > 0:
+        out[:, 0] = torch.where(st[:, 0] > 0.5, torch.tensor(fi_sat, device=st.device, dtype=st.dtype), out[:, 0])
+    if sd > 1:
+        out[:, 1] = torch.where(st[:, 1] > 0.5, torch.tensor(mat_sat, device=st.device, dtype=st.dtype), out[:, 1])
     return out
 
 
@@ -218,36 +242,43 @@ def rollout_species_gnn_species_series(
     phys_cfg: PhysicsConfig | None = None,
     bio_cfg: BiochemConfig | None = None,
     device: torch.device | None = None,
-    pin_other_species: str = "gt",
+    pin_other_species: str | None = None,
 ) -> torch.Tensor:
-    """Full-timeline species series ``(T, N, 16)`` with FI/Mat from GNN rollout."""
+    """Full-timeline species series ``(T, N, C)`` with FI/Mat from GNN rollout.
+
+    Non-FI/Mat channels use resting plasma IC (deploy default), not GT.
+    """
     phys = phys_cfg or PhysicsConfig(phase="biochem")
     bio = bio_cfg or BiochemConfig(phase="biochem")
     dev = device or bundle.device
     stat = static or prepare_species_gnn_rollout_static(data, device=dev)
+    pin_mode = pin_other_species if pin_other_species is not None else species_rollout_pin_other()
+    reset_species_rollout_flow_cache()
     n_steps = int(data.y.shape[0])
-    out = data.y.clone().to(device=dev)
-    rest = resting_species_log_nd(data, dev)
+    out = alloc_species_y_series(data, dev)
 
     if bundle.kind == "continuous":
         assert bundle.continuous is not None
         model = bundle.continuous.model
-        log_state = fi_mat_log_targets(data, 0, dev)[stat.node_idx]
+        bind_band_geometry(model, {"pos_band": stat.pos_band, "edge_index": stat.edge_index})
+        log_state = deploy_fimat_log_init(data, dev, stat.node_idx)
         vel_alphas = model_vel_decay_alphas(model) if continuous_vel_decay_enabled() else None
         for t in range(n_steps):
-            if pin_other_species == "gt":
-                sp = data.y[t, :, 4:16].to(device=dev, dtype=torch.float32).clone()
-            else:
-                sp = rest.clone()
+            sp = pin_species_block(data, t, dev, pin_other=pin_mode)  # type: ignore[arg-type]
             sp = _write_fimat_log_to_species(sp, log_state, stat.node_idx)
             out[t, :, 4:16] = sp
             if t >= n_steps - 1:
                 break
             pred_delta = predict_continuous_step_delta(
-                model, stat.base_feats, stat.edge_index, log_state, training=False
+                model,
+                stat.base_feats,
+                stat.edge_index,
+                log_state,
+                training=False,
+                pos_band=stat.pos_band,
             )
             spd = (
-                band_speed_at_time(data, t + 1, dev, stat.node_idx)
+                band_speed_for_rollout(data, t + 1, dev, stat.node_idx)
                 if vel_alphas is not None
                 else None
             )
@@ -258,32 +289,32 @@ def rollout_species_gnn_species_series(
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
             )
-        if os.environ.get("SPECIES_VISCOSITY_CALIB", "").strip().lower() in ("1", "true", "yes", "on"):
-            from src.core_physics.species_viscosity_calibration import (
-                apply_mat_beta_to_species_series,
-                load_viscosity_calibration,
-                viscosity_calibration_dir,
-            )
+        from src.core_physics.species_viscosity_calibration import (
+            apply_mat_beta_to_species_series,
+            load_viscosity_calibration,
+            resolve_deploy_gelation_beta,
+            viscosity_calibration_dir,
+        )
 
+        gel_beta = resolve_deploy_gelation_beta(dev)
+        if gel_beta is not None:
             cal_path = os.environ.get("SPECIES_VISCOSITY_CALIB_PATH") or str(
                 viscosity_calibration_dir() / "beta.pth"
             )
+            t_boost = max(int(out.shape[0]) - 1, 0)
             if Path(cal_path).is_file():
-                cal, calib_bundle = load_viscosity_calibration(cal_path, device=dev)
+                _, calib_bundle = load_viscosity_calibration(cal_path, device=dev)
                 t_boost = int(calib_bundle.time_index)
-                out = apply_mat_beta_to_species_series(
-                    out, cal.beta, bio, time_index=min(t_boost, int(out.shape[0]) - 1)
-                )
+            out = apply_mat_beta_to_species_series(
+                out, gel_beta, bio, time_index=min(t_boost, int(out.shape[0]) - 1)
+            )
         return out
 
     assert bundle.binary is not None
     model = bundle.binary.model
-    state = fi_mat_active_labels(fi_mat_log_targets(data, 0, dev)[stat.node_idx])
+    state = fi_mat_active_labels(deploy_fimat_log_init(data, dev, stat.node_idx))
     for t in range(n_steps):
-        if pin_other_species == "gt":
-            sp = data.y[t, :, 4:16].to(device=dev, dtype=torch.float32).clone()
-        else:
-            sp = rest.clone()
+        sp = pin_species_block(data, t, dev, pin_other=pin_mode)  # type: ignore[arg-type]
         log_state = _binary_state_to_log(state)
         sp = _write_fimat_log_to_species(sp, log_state, stat.node_idx)
         out[t, :, 4:16] = sp
@@ -321,19 +352,9 @@ def rollout_species_gnn_phi_trajectory(
     pred = rollout_species_gnn_species_series(
         data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=dev,
     )
-    gel_beta = None
-    if os.environ.get("SPECIES_VISCOSITY_CALIB", "").strip().lower() in ("1", "true", "yes", "on"):
-        from src.core_physics.species_viscosity_calibration import (
-            load_viscosity_calibration,
-            viscosity_calibration_dir,
-        )
+    from src.core_physics.species_viscosity_calibration import resolve_deploy_gelation_beta
 
-        cal_path = os.environ.get("SPECIES_VISCOSITY_CALIB_PATH") or str(
-            viscosity_calibration_dir() / "beta.pth"
-        )
-        if Path(cal_path).is_file():
-            cal, _ = load_viscosity_calibration(cal_path, device=dev)
-            gel_beta = cal.beta
+    gel_beta = resolve_deploy_gelation_beta(dev)
     flow = _resolve_flow_source(flow_source)
     with t0_rung2_env():
         traj = rollout_t0_clot_phi(

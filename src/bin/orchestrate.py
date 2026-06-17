@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> None:
         choices=("kinematics", "biochem", "all"),
         help=(
             "kinematics: unified kinematics pretraining. "
-            "biochem: biochem corrector. 'all' runs kinematics then biochem."
+            "biochem: biochem deploy (GraphSAGE). 'all' runs kinematics then biochem."
         ),
     )
     args = p.parse_args(argv)
@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> None:
         _run_module("src.training.train_kinematics_predictor")
     if phase in ("biochem", "all"):
         print("=== Biochem training ===")
-        _run_module("src.training.train_biochem_corrector")
+        _run_module("src.training.train_biochem_gnn")
 
 
 if __name__ == "__main__":

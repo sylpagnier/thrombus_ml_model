@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.core_physics.species_pushforward_continuous import deploy_eval_time_index
 from src.core_physics.clot_growth_masks import gt_growth_commit_mask_at_time
 from src.core_physics.clot_phi_simple import (
     mat_si_for_gelation_from_log1p,
@@ -23,7 +24,7 @@ from src.core_physics.t0_mu_physics import (
     predict_mu_si_from_graph_species_legs,
     t0_physics_env,
 )
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 from src.utils.paths import get_project_root
 
 
@@ -68,7 +69,7 @@ def test_mat_matches_comsol_export(patient007_assets):
     bio = BiochemConfig(phase="biochem")
     phys = PhysicsConfig(phase="biochem")
     data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = min(53, int(data.y.shape[0]) - 1)
+    t = deploy_eval_time_index(int(data.y.shape[0]))
     mat_graph = mat_si_for_gelation_from_log1p(data.y[t, :, 15], bio)
     mat_comsol = debug["mat_si"][t].reshape(-1)
     growth = gt_growth_commit_mask_at_time(data, t, phys, torch.device("cpu"))
@@ -92,7 +93,7 @@ def test_mu1_from_graph_mat_matches_comsol(patient007_assets):
     bio = BiochemConfig(phase="biochem")
     device = torch.device("cpu")
     data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = min(53, int(data.y.shape[0]) - 1)
+    t = deploy_eval_time_index(int(data.y.shape[0]))
     with t0_physics_env("patient007", gamma_mode="comsol_sr"):
         _, py_mu1, _ = predict_mu_si_from_graph_species_legs(
             data, t, phys, bio, debug, device, mat_source="graph", fi_source="graph"
@@ -109,7 +110,7 @@ def test_t0_clot_f1_improves_with_mat_fix(patient007_assets):
     bio = BiochemConfig(phase="biochem")
     device = torch.device("cpu")
     data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = min(53, int(data.y.shape[0]) - 1)
+    t = deploy_eval_time_index(int(data.y.shape[0]))
     with t0_physics_env("patient007", gamma_mode="comsol_sr"):
         step = predict_mu_si_at_time(data, t, phys, bio, device, gamma_mode="comsol_sr")
     anchor = gt_mu_anchor_cap_si(data, phys, device)

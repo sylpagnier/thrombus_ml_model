@@ -20,11 +20,17 @@ import sys
 
 MODULE_MAP: dict[tuple[str, str], str] = {
     ("train", "kinematics"): "src.training.train_kinematics_predictor",
-    ("train", "biochem"): "src.training.train_biochem_corrector",
+    ("train", "biochem-gnn"): "src.training.train_biochem_gnn",
+    ("train", "biochem_gnn"): "src.training.train_biochem_gnn",
+    ("train", "biochem-deploy"): "src.training.train_biochem_gnn",
+    ("train", "biochem_deploy"): "src.training.train_biochem_gnn",
+    ("train", "pmgp-deq-kine"): "src.training.train_kinematics_predictor",
+    ("train", "pmgp_deq_kine"): "src.training.train_kinematics_predictor",
+    ("train", "gino-deq-kine"): "src.training.train_kinematics_predictor",
+    ("train", "gino_deq_kine"): "src.training.train_kinematics_predictor",
     # Backward-compatible aliases; all map to unified kinematics trainer.
     ("train", "t1"): "src.training.train_kinematics_predictor",
     ("train", "t2"): "src.training.train_kinematics_predictor",
-    ("train", "t3"): "src.training.train_biochem_corrector",
     ("train", "explore"): "src.training.train_kinematics_predictor",
     ("data", "kinematics"): "src.data_gen.pipeline_kinematics",
     ("data", "biochem"): "src.data_gen.pipeline_biochem",
@@ -92,11 +98,16 @@ def main(argv: list[str] | None = None) -> None:
         valid_targets = sorted(k[1] for k in MODULE_MAP if k[0] == ns.group)
         parser.error(f"unknown target '{ns.target}' for group '{ns.group}'. valid: {valid_targets}")
 
-    if ns.group == "train" and ns.target in {"t1", "t2", "t3", "explore"}:
-        canonical = "biochem" if ns.target == "t3" else "kinematics"
+    if ns.group == "train" and ns.target in {"t1", "t2", "explore"}:
+        canonical = "pmgp-deq-kine"
         print(
-            f"⚠️ Deprecated train target '{ns.target}'. "
+            f"[WARN] Deprecated train target '{ns.target}'. "
             f"Use 'train {canonical}' instead."
+        )
+    if ns.group == "train" and ns.target in {"biochem-gnn", "biochem_gnn"}:
+        print(
+            "[WARN] Deprecated train target "
+            f"'{ns.target}'. Use 'train biochem-deploy' instead."
         )
 
     if ns.group == "orchestrate":

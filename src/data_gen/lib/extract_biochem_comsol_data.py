@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 import glob
 import re
-from src.config import BIOCHEM_T_MAX, NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
+from src.config import NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig, biochem_comsol_time_cap_s
 from src.utils.kinematics_paths import BIOCHEM_ANCHOR_KINE_RHEOLOGY, kinematics_anchor_graph_dir
 from src.utils.paths import get_project_root
 from src.data_gen.lib.node_feature_assembly import build_biochem_bc_x_tensor

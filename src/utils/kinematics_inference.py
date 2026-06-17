@@ -1,4 +1,8 @@
-"""Shared kinematics checkpoint resolution and GINO-DEQ inference."""
+"""Shared PMGP-DEQ (Stage-A) checkpoint resolution and inference.
+
+Flow model = ``GINO_DEQ`` class (canonical id ``pmgp_deq_kine`` / PMGP-DEQ).
+Prefer ``load_pmgp_deq_kine`` / ``resolve_pmgp_deq_kine_ckpt``; legacy ``load_gino_deq_kine`` aliases retained.
+"""
 
 from __future__ import annotations
 
@@ -96,3 +100,15 @@ def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
 def predict_kinematics_latent(model: GINO_DEQ, data: Data) -> torch.Tensor:
     """Frozen DEQ latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
     return model.solve_latent(data, **_kin_solver_kwargs())
+
+
+# Canonical names (PMGP-DEQ Stage-A flow)
+resolve_pmgp_deq_kine_ckpt = resolve_kinematics_checkpoint
+load_pmgp_deq_kine = load_kinematics_predictor
+predict_pmgp_deq_flow = predict_kinematics
+predict_pmgp_deq_latent = predict_kinematics_latent
+# Legacy GINO-DEQ aliases
+resolve_gino_deq_kine_ckpt = resolve_pmgp_deq_kine_ckpt
+load_gino_deq_kine = load_pmgp_deq_kine
+predict_gino_deq_flow = predict_pmgp_deq_flow
+predict_gino_deq_latent = predict_pmgp_deq_latent

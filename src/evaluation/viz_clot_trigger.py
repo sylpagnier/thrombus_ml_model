@@ -16,7 +16,7 @@ from src.training.clot_trigger_stack import (
     physics_blend_alpha,
     physics_blend_enabled,
 )
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def clot_trigger_viz_f1(

@@ -30,16 +30,17 @@ from src.core_physics.t0_rung4_ladder import species_log_mae_in_mask
 from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
 from src.inference.species_gnn_deploy_env import (
     load_deploy_manifest,
-    resolve_loao_ckpt_for_anchor,
+    species_ckpt_for_anchor,
     species_gnn_deploy_env,
 )
-from src.training.train_clot_phi_simple import _clot_metrics
+from src.core_physics.species_pushforward_continuous import default_deploy_metric_times
+from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
 
 
 def _resolve_ckpt(
     graph_stem: str,
     *,
-    manifest: dict[str, str],
+    manifest: dict,
     loao: bool,
     explicit: str,
 ) -> Path:
@@ -47,13 +48,9 @@ def _resolve_ckpt(
     if explicit.strip():
         p = Path(explicit)
         return p if p.is_absolute() else root / p
-    if loao or manifest.get("loao_dir"):
-        loao_dir = manifest.get("loao_dir", "outputs/biochem/species_gnn_loao")
-        p = resolve_loao_ckpt_for_anchor(graph_stem, loao_dir)
-        if p.is_file():
-            return p
-    p = Path(manifest.get("species_gnn_ckpt", species_gnn_rollout_ckpt()))
-    return p if p.is_absolute() else root / p
+    if loao:
+        return species_ckpt_for_anchor(graph_stem, manifest, prefer_loao=True)
+    return species_ckpt_for_anchor(graph_stem, manifest, prefer_loao=False)
 
 
 @torch.no_grad()
@@ -75,20 +72,30 @@ def predict_species_gnn_deploy(
         raise FileNotFoundError(path)
     m = dict(manifest or load_deploy_manifest())
     stem = path.stem
-    ckpt = _resolve_ckpt(stem, manifest=m, loao=loao, explicit=species_ckpt)
+    explicit = species_ckpt.strip()
+    env_overrides: dict[str, str] = {"T0_R4_FLOW_SOURCE": flow_source}
+    if explicit:
+        ckpt = _resolve_ckpt(stem, manifest=m, loao=loao, explicit=explicit)
+        env_overrides["SPECIES_GNN_CLOUT_CKPT"] = str(ckpt)
+        env_overrides["T0_R4_SPECIES_GNN_CKPT"] = str(ckpt)
+        anchor_for_env = stem
+    else:
+        ckpt = _resolve_ckpt(stem, manifest=m, loao=loao, explicit="")
+        anchor_for_env = stem
 
-    overrides = {
-        "T0_R4_FLOW_SOURCE": flow_source,
-        "SPECIES_GNN_CLOUT_CKPT": str(ckpt),
-        "T0_R4_SPECIES_GNN_CKPT": str(ckpt),
-    }
-    with species_gnn_deploy_env(m, overrides=overrides):
+    with species_gnn_deploy_env(
+        m,
+        overrides=env_overrides,
+        anchor=anchor_for_env,
+        prefer_loao=loao,
+    ):
+        ckpt = Path(species_gnn_rollout_ckpt())
         data = torch.load(path, map_location=dev, weights_only=False)
         phys = PhysicsConfig(phase="biochem")
         bio = BiochemConfig(phase="biochem")
         n_steps = int(data.y.shape[0])
         if times is None:
-            times = [0, n_steps // 2, n_steps - 1]
+            times = default_deploy_metric_times(n_steps)
         times = sorted({max(0, min(int(t), n_steps - 1)) for t in times})
 
         bundle = load_species_gnn_rollout_bundle(ckpt, device=dev)
@@ -165,12 +172,16 @@ def _cli() -> int:
     ap.add_argument("--manifest", default="")
     ap.add_argument("--species-ckpt", default="")
     ap.add_argument("--loao", action="store_true", help="Use LOAO fold ckpt for this vessel stem")
-    ap.add_argument("--times", default="0,27,53")
+    ap.add_argument(
+        "--times",
+        default="",
+        help="comma macro indices; empty = per-graph default (0, 27, legacy mid, last)",
+    )
     ap.add_argument("--out", default="")
     ap.add_argument("--no-gt-eval", action="store_true")
     args = ap.parse_args()
 
-    times = [int(x.strip()) for x in args.times.split(",") if x.strip()]
+    times_arg = [int(x.strip()) for x in args.times.split(",") if x.strip()] if args.times.strip() else None
     manifest = load_deploy_manifest(args.manifest.strip() or None)
     result = predict_species_gnn_deploy(
         args.graph,
@@ -178,7 +189,7 @@ def _cli() -> int:
         manifest=manifest,
         loao=bool(args.loao),
         species_ckpt=args.species_ckpt.strip(),
-        times=times,
+        times=times_arg,
         eval_gt=not bool(args.no_gt_eval),
     )
     out = Path(args.out) if args.out.strip() else None
@@ -190,7 +201,7 @@ def _cli() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(
-        f"[OK] {result['anchor']} F1@t53={result['clot_f1_t_last']:.3f} "
+        f"[OK] {result['anchor']} F1@t_last={result['clot_f1_t_last']:.3f} "
         f"health={result['health_pass']} ckpt={result['species_ckpt']}",
         flush=True,
     )

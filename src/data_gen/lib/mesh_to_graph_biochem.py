@@ -18,7 +18,7 @@ from pathlib import Path
 from scipy.spatial import KDTree, cKDTree
 from torch_geometric.data import Data
 from tqdm import tqdm
-from src.config import BIOCHEM_T_MAX, NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig
+from src.config import NodeFeat, VesselConfig, PhysicsConfig, BiochemConfig
 from src.data_gen.lib.node_feature_assembly import (
     build_biochem_bc_x_tensor,
     build_kinematics_node_x_tensor,
@@ -604,8 +604,7 @@ class MeshToGraphPhase3:
 
             # 1) Dummy time trajectory [T, N, 16] + time tensor (length ``num_time_steps``, not COMSOL export width)
             num_times = bio_cfg.num_time_steps
-            # TEMP DEBUG: match truncated anchor horizon (``BIOCHEM_T_MAX``); do not assume full ``t_final``.
-            t_horizon_s = min(float(bio_cfg.t_final), float(BIOCHEM_T_MAX))
+            t_horizon_s = float(bio_cfg.t_final)
             eval_times_tensor = torch.linspace(0.0, t_horizon_s, num_times, dtype=torch.float32)
             y_tensor_series = torch.zeros((num_times, len(nodes), 16), dtype=torch.float32)
 

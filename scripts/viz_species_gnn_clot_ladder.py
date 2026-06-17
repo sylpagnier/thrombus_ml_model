@@ -1,4 +1,4 @@
-"""GT clot | R4.s0 rules | Species GNN clot phi ladder (CUDA).
+"""GT clot | inc40 rules | Species GNN clot phi ladder (CUDA).
 
 Three rows x time columns, matching ``viz_t0_rung4_step`` / ``viz_wall_band_species_m0``.
 """
@@ -30,14 +30,14 @@ from src.core_physics.species_gnn_ladder_viz import ladder_viz_times  # noqa: E4
 from src.core_physics.species_snapshot_gnn import species_gnn_viz_dir  # noqa: E402
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
-from src.core_physics.t0_rung4_ladder import rollout_rung4_phi_trajectory  # noqa: E402
+from src.core_physics.clot_temporal_growth_rules import rollout_inc40_phi_trajectory  # noqa: E402
 from src.evaluation.viz_clot_phi_simple import _scatter_fullmesh_region  # noqa: E402
 from src.evaluation.viz_clot_trigger import clot_trigger_viz_f1  # noqa: E402
 from src.utils.paths import get_project_root  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Species GNN clot phi ladder (GT | s0 | GNN)")
+    ap = argparse.ArgumentParser(description="Species GNN clot phi ladder (GT | inc40 | GNN)")
     ap.add_argument("--anchor", default="patient007")
     ap.add_argument("--ckpt", default="")
     ap.add_argument("--max-frames", type=int, default=10)
@@ -74,12 +74,12 @@ def main() -> int:
     phi_gnn = rollout_species_gnn_phi_trajectory(
         data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=device,
     )
-    phi_s0 = rollout_rung4_phi_trajectory(data, phys, bio, device, step="s0")
+    phi_rules = rollout_inc40_phi_trajectory(data, phys, bio, device, vel_source="kinematics")
     print(f"[i] rollout {time.perf_counter() - t0:.1f}s", flush=True)
 
     row_labels = [
         "GT clot",
-        "R4.s0 (rules)",
+        "inc40 rules",
         gnn_tag,
     ]
     fig, axes = plt.subplots(
@@ -95,15 +95,15 @@ def main() -> int:
     frames: list[dict] = []
     for j, t in enumerate(times):
         phi_gt = gt_clot_phi_at_time(data, int(t), phys, device)
-        p_s0 = phi_s0[int(t)]
+        p_rules = phi_rules[int(t)]
         p_gnn = phi_gnn[int(t)]
         tau = float(macro_tau_at_index(data, int(t), bio_cfg=bio))
-        m_s0 = clot_trigger_viz_f1(p_s0, phi_gt, mask)
+        m_rules = clot_trigger_viz_f1(p_rules, phi_gt, mask)
         m_gnn = clot_trigger_viz_f1(p_gnn, phi_gt, mask)
-        title = f"t={t} tau={tau:.2f}\ns0={m_s0['clot_f1']:.2f} gnn={m_gnn['clot_f1']:.2f}"
+        title = f"t={t} tau={tau:.2f}\ninc40={m_rules['clot_f1']:.2f} gnn={m_gnn['clot_f1']:.2f}"
         panels = [
             phi_gt.detach().cpu().numpy(),
-            p_s0.detach().cpu().numpy(),
+            p_rules.detach().cpu().numpy(),
             p_gnn.detach().cpu().numpy(),
         ]
         for i, vals in enumerate(panels):
@@ -116,7 +116,7 @@ def main() -> int:
         axes[0, j].set_title(title, fontsize=5)
         frames.append({
             "time": int(t), "tau": tau,
-            "s0_f1": float(m_s0["clot_f1"]),
+            "inc40_f1": float(m_rules["clot_f1"]),
             "gnn_f1": float(m_gnn["clot_f1"]),
         })
 

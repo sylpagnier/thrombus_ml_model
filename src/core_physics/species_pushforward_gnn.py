@@ -39,7 +39,13 @@ from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.utils.paths import get_project_root
 
 DEFAULT_PUSHFORWARD_CKPT = "outputs/biochem/species_snapshot_s2/best.pth"
-STATE_DIM = 2  # FI commit, Mat commit
+from src.training.biochem_species_scope import pushforward_state_dim
+
+STATE_DIM = 2  # legacy default; use pushforward_state_dim() for dynamic scope
+
+
+def _sd() -> int:
+    return pushforward_state_dim()
 
 
 def pushforward_ckpt_path() -> Path:
@@ -164,7 +170,7 @@ def pushforward_val_score_weights() -> tuple[float, float]:
 
 def apply_growth_thresholds(probs: torch.Tensor) -> torch.Tensor:
     fi_thr, mat_thr = pushforward_growth_thresholds()
-    out = probs.reshape(-1, STATE_DIM).clone()
+    out = probs.reshape(-1, _sd()).clone()
     if fi_thr != 0.5:
         out[:, 0] = (out[:, 0] >= fi_thr).float()
     if mat_thr != 0.5:
@@ -208,8 +214,9 @@ def step_loss_weights(n_steps: int) -> list[float]:
     return [(step + 1) / denom for step in range(n_steps)]
 
 
-def pushforward_feature_dim(latent_dim: int, *, state_dim: int = STATE_DIM) -> int:
-    return int(latent_dim) + 1 + int(state_dim)
+def pushforward_feature_dim(latent_dim: int, *, state_dim: int | None = None) -> int:
+    sd = _sd() if state_dim is None else int(state_dim)
+    return int(latent_dim) + 1 + sd
 
 
 def build_band_base_features(
@@ -233,8 +240,10 @@ def build_band_base_features(
         kin_mean, kin_std = kinematic_latent_band_stats(z_kin, node_idx)
     sdf = sdf_nd_from_data(data, device, n)
     base_feats = build_snapshot_features(z_kin, sdf, kin_mean=kin_mean, kin_std=kin_std)[node_idx]
+    pos_band = data.x[node_idx, :2].to(device=device, dtype=base_feats.dtype)
     return {
         "base_feats": base_feats,
+        "pos_band": pos_band,
         "edge_index": edge_sub,
         "node_idx": node_idx,
         "n_band": int(node_idx.numel()),
@@ -251,7 +260,7 @@ def build_pushforward_features(
 ) -> torch.Tensor:
     """``[z_kin, sdf_n, state_prev]`` on band nodes."""
     base = build_snapshot_features(z_kin, sdf_nd)
-    st = state_prev.reshape(-1, STATE_DIM).to(device=base.device, dtype=base.dtype).clamp(0.0, 1.0)
+    st = state_prev.reshape(-1, _sd()).to(device=base.device, dtype=base.dtype).clamp(0.0, 1.0)
     return torch.cat([base, st], dim=-1)
 
 
@@ -260,8 +269,8 @@ def growth_active_labels(
     active_next: torch.Tensor,
 ) -> torch.Tensor:
     """Per-channel 0->1 growth: ``(next > thr) & (prev <= thr)``."""
-    prev = active_prev.reshape(-1, STATE_DIM).float()
-    nxt = active_next.reshape(-1, STATE_DIM).float()
+    prev = active_prev.reshape(-1, _sd()).float()
+    nxt = active_next.reshape(-1, _sd()).float()
     return ((nxt > 0.5) & (prev <= 0.5)).to(dtype=torch.float32)
 
 
@@ -287,11 +296,11 @@ def pushforward_state_step(
     straight_through: bool = True,
 ) -> torch.Tensor:
     """OR new growth onto cumulative commit state (straight-through binary optional)."""
-    growth = torch.sigmoid(logits.reshape(-1, STATE_DIM))
+    growth = torch.sigmoid(logits.reshape(-1, _sd()))
     if straight_through:
         hard = (growth > 0.5).float()
         growth = hard + growth - growth.detach()
-    return torch.maximum(state.reshape(-1, STATE_DIM), growth).clamp(0.0, 1.0)
+    return torch.maximum(state.reshape(-1, _sd()), growth).clamp(0.0, 1.0)
 
 
 def maybe_noise_state(state: torch.Tensor, *, training: bool) -> torch.Tensor:
@@ -305,8 +314,8 @@ def maybe_noise_state(state: torch.Tensor, *, training: bool) -> torch.Tensor:
 class SpeciesPushforwardGNN(SpeciesSnapshotGNN):
     """Phase 2 GNN: same GraphSAGE + residual readout, wider input for prior state."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = STATE_DIM):
-        super().__init__(in_dim, hidden=hidden, out_dim=out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
 
 
 def iter_pushforward_windows(
@@ -344,7 +353,7 @@ def unroll_pushforward_loss(
         return z, [], []
 
     state = (
-        torch.zeros(base_feats.shape[0], STATE_DIM, device=base_feats.device, dtype=base_feats.dtype)
+        torch.zeros(base_feats.shape[0], _sd(), device=base_feats.device, dtype=base_feats.dtype)
         if state0 is None
         else state0.clone()
     )
@@ -395,7 +404,7 @@ def rollout_pushforward_states(
     model.eval()
     n_steps = len(active_series) - 1
     state = (
-        torch.zeros(base_feats.shape[0], STATE_DIM, device=base_feats.device, dtype=base_feats.dtype)
+        torch.zeros(base_feats.shape[0], _sd(), device=base_feats.device, dtype=base_feats.dtype)
         if state0 is None
         else state0.clone()
     )
@@ -510,7 +519,7 @@ def init_pushforward_from_snapshot(
     s2 = model.state_dict()
     s1_in = int(payload.get("in_dim", 0))
     s2_in = int(model.in_dim)
-    if s1_in <= 0 or s2_in != s1_in + STATE_DIM:
+    if s1_in <= 0 or s2_in != s1_in + _sd():
         if not quiet:
             print(f"[WARN] snapshot init dim mismatch s1={s1_in} s2={s2_in}")
         return False
@@ -570,7 +579,7 @@ def load_pushforward_bundle(
     model.eval()
     return SpeciesPushforwardBundle(
         model=model,
-        latent_dim=int(meta.get("latent_dim", in_dim - 1 - STATE_DIM)),
+        latent_dim=int(meta.get("latent_dim", in_dim - 1 - _sd())),
         hidden=hidden,
         unroll=int(meta.get("unroll", pushforward_unroll_steps())),
         stride=int(meta.get("stride", pushforward_step_stride())),

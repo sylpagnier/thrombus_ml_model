@@ -14,25 +14,23 @@ Start here, then open the linked files for depth.
 
 2. **[KINEMATICS_TRAINING_HISTORY.md](KINEMATICS_TRAINING_HISTORY.md)** — Kinematics sweep history, mesh-resolution decision, V2/V3 strategy.
 
-3. **[BIOCHEM_TRAINING_PROGRESS.md](BIOCHEM_TRAINING_PROGRESS.md)** — Biochem corrector training log: complexity ladder, μ diagnostics, env pitfalls, run table (update after experiments).
+3. **[BIOCHEM_GNN.md](BIOCHEM_GNN.md)** — Canonical biochem deploy baseline stack and usage.
 
-## Ladders and specialized tracks
+4. **[MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md)** — Canonical ids and aliases.
+
+5. **[BIOCHEM_LEGACY_LESSONS.md](BIOCHEM_LEGACY_LESSONS.md)** — Consolidated lessons from archived ladders.
+
+## Active docs
 
 | Doc | Topic |
 |-----|-------|
-| [T0_RUNG_LADDER.md](T0_RUNG_LADDER.md) | T0 isolation ladder (mu + clot physics) |
-| [CLOT_TRIGGER_LADDER.md](CLOT_TRIGGER_LADDER.md) | Clot trigger / deploy-mask audit ladder |
-| [CLOT_ML_DEPLOY_TRAINING_PLAN.md](CLOT_ML_DEPLOY_TRAINING_PLAN.md) | Clot ML V1 deploy training plan |
-| [CLOT_ML_LADDER_V2.md](CLOT_ML_LADDER_V2.md) | Clot ML V2 (band-GNN growth + nucleation mask) |
-| [CLOT_FORECAST_LADDER.md](CLOT_FORECAST_LADDER.md) | Clot forecast R0–R6 |
-| [DEPLOY_ARCHITECTURE.md](DEPLOY_ARCHITECTURE.md) | Deploy clot ladder (Track A/B) |
-| [GNODE_ODE_LADDER.md](GNODE_ODE_LADDER.md) | GNODE-ODE component ladder |
-| [CLOT_PHI_BASELINE.md](CLOT_PHI_BASELINE.md) | Simple clot-phi wall-local probe |
-| [CLOT_PHI_ROLLOUT.md](CLOT_PHI_ROLLOUT.md) | Clot-phi rollout (6a/6b) |
-| [COMSOL_MU_RHEOLOGY_CHECKLIST.md](COMSOL_MU_RHEOLOGY_CHECKLIST.md) | COMSOL mu/rheology alignment checklist |
-| [SPECIES_TEMPORAL_ML.md](SPECIES_TEMPORAL_ML.md) | Wall-band graph reaction rollout |
-| [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md) | Stage-A kinematics architecture record |
-| [PASSIVE_KIN_BLOCKER_CHECKLIST.md](PASSIVE_KIN_BLOCKER_CHECKLIST.md) | Passive transport / kin blocker gates |
+| [BIOCHEM_GNN.md](BIOCHEM_GNN.md) | Canonical biochem deploy baseline |
+| [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md) | Naming and aliases |
+| [DEPLOY_ARCHITECTURE.md](DEPLOY_ARCHITECTURE.md) | Current deploy architecture |
+| [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) | Architecture and entry-point map |
+| [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md) | Stage-A kinematics record |
+| [BIOCHEM_LEGACY_LESSONS.md](BIOCHEM_LEGACY_LESSONS.md) | Consolidated legacy learnings |
+| [archive/2026-06-16-biochem-cleanup.md](archive/2026-06-16-biochem-cleanup.md) | Cleanup archive index |
 
 ## Common commands
 
@@ -55,7 +53,7 @@ python -m src.data_gen.pipeline_biochem
 
 | Path | Role |
 |------|------|
-| `src/architecture/` | `GINO_DEQ`, DEQ solver hooks, LoRA, SIREN decoder |
+| `src/architecture/` | `GINO_DEQ` (RGP-DEQ), DEQ solver hooks, LoRA, SIREN decoder |
 | `src/core_physics/` | Physics kernels, Anderson acceleration, PDE-consistent terms |
 | `src/config.py` | `PhysicsConfig`, `VesselConfig`, channel enums (`PredChannels`, `NodeFeat`) |
 | `src/data_gen/` | Kinematics / Biochem pipelines and mesh→graph builders |
