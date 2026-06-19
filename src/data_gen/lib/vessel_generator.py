@@ -1093,7 +1093,15 @@ def _sample_patch_params(
 
 
 class BoundaryLayerPatchGenerator(VesselGenerator):
-    """Generates pure fluid 2D boundary layer boxes for local Subgraph GNN training."""
+    """Generates pure fluid 2D boundary layer boxes for local Subgraph GNN training.
+
+    NOTE (superseded for residual training): this Gmsh path emits *unstructured triangular*
+    meshes. For the local patch baseline (pure linear shear ``u = shear_rate*y``), triangular
+    faces bleed spurious ``v`` that would dominate the GNN residual label ``dU``. Prefer the
+    structured-grid COMSOL-direct pipeline in ``patch_factory_comsol.py``
+    (``PatchFactoryComsolGenerator``), which drives a mapped quad-mesh master ``.mph`` over
+    clot parameters. This class is retained for non-residual / quick-mesh use cases.
+    """
 
     # Flat-channel geometry: 2mm (streamwise) x 300-400um (wall-normal). The long domain
     # gives room for upstream development + a long clot + downstream wake; the tall channel
