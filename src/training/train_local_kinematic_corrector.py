@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,8 +240,11 @@ def train_corrector(
     best_path = out_dir / "local_kinematic_corrector_best.pth"
     last_path = out_dir / "local_kinematic_corrector_last.pth"
     best_val = float("inf")
+    best_val_rel = float("nan")
 
-    def _meta(epoch: int, train_mse: float, val_mse: float | None) -> dict[str, Any]:
+    def _meta(
+        epoch: int, train_mse: float, val_mse: float | None, val_rel: float | None = None
+    ) -> dict[str, Any]:
         return {
             "model": "LocalKinematicCorrector",
             "in_channels": LOCAL_CORRECTOR_IN_CHANNELS,
@@ -257,6 +261,7 @@ def train_corrector(
             "epoch": epoch,
             "train_mse_nd": train_mse,
             "val_mse_nd": val_mse,
+            "val_rel_l2": val_rel,
             "nd_cfg": vars(cfg),
         }
 
@@ -276,29 +281,45 @@ def train_corrector(
         train_mse = total / max(nb, 1)
 
         val_mse: float | None = None
+        val_rel: float | None = None
         if val_loader is not None:
             model.eval()
             vt = 0.0
             vb = 0
+            sq_err = 0.0   # sum ||pred - target||^2 over all nodes/components
+            sq_tgt = 0.0   # sum ||target||^2 (global L2 norm of the diversion field)
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(dev)
                     pred = model(batch.x, batch.edge_index)
                     vt += float(F.mse_loss(pred, batch.y).item())
                     vb += 1
+                    sq_err += float(((pred - batch.y) ** 2).sum().item())
+                    sq_tgt += float((batch.y ** 2).sum().item())
             val_mse = vt / max(vb, 1)
+            # Global relative L2 error: robust to the ~0 far-field targets (a per-sample
+            # mean would divide by tiny norms). Reported as a percentage of the true dU field.
+            val_rel = float((sq_err / sq_tgt) ** 0.5) if sq_tgt > 0 else float("nan")
 
+        # Selecting by MSE or relL2 picks the same epoch (val ||target|| is fixed), but we
+        # surface relL2 because it is the tangible "how far off is the diversion" number.
         score = val_mse if val_mse is not None else train_mse
         if score < best_val:
             best_val = score
-            save_local_corrector(best_path, model, _meta(epoch, train_mse, val_mse))
+            best_val_rel = val_rel if val_rel is not None else float("nan")
+            save_local_corrector(best_path, model, _meta(epoch, train_mse, val_mse, val_rel))
 
         if epoch % 10 == 0 or epoch == epochs - 1:
-            vtxt = f" | val MSE {val_mse:.6e}" if val_mse is not None else ""
+            if val_mse is not None:
+                rtxt = f" | val relL2 {val_rel * 100:.2f}%" if math.isfinite(val_rel) else ""
+                vtxt = f" | val MSE {val_mse:.6e}{rtxt}"
+            else:
+                vtxt = ""
             print(f"[i] epoch {epoch:3d} | train MSE {train_mse:.6e}{vtxt}")
 
-    save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse))
-    print(f"[OK] best val MSE_nd {best_val:.6e} -> {best_path}")
+    save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse, val_rel))
+    rel_txt = f" (relL2 {best_val_rel * 100:.2f}%)" if math.isfinite(best_val_rel) else ""
+    print(f"[OK] best val MSE_nd {best_val:.6e}{rel_txt} -> {best_path}")
     return model
 
 
