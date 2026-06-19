@@ -24,7 +24,6 @@ data = torch.load(
 phys = PhysicsConfig(phase="biochem")
 bio = BiochemConfig(phase="biochem")
 os.environ["CLOT_PHI_PHYSICS_MU_BASE"] = "comsol_carreau"
-os.environ["CLOT_PHI_PHYSICS_SUBTRACT_T0_MU"] = "1"
 os.environ["CLOT_PHI_PHYSICS_COMSOL_SR_ANCHOR"] = "patient007"
 
 for gamma in ("max", "comsol_sr"):

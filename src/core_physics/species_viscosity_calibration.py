@@ -20,6 +20,7 @@ from src.core_physics.clot_phi_simple import (
     carreau_mu_si_from_gamma_nd,
     clot_phi_physics_mu_blood_si,
     clot_phi_physics_mu_ratio_max,
+    fi_si_for_gelation_from_log1p,
     mat_si_for_gelation_from_log1p,
     resolve_gamma_dot_nd_for_carreau,
 )
@@ -37,8 +38,8 @@ from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
 from src.utils.rheology import phi_clot_from_mat_fi
 from src.utils.paths import get_project_root
 
-DEFAULT_S35_DIR = "outputs/biochem/species_snapshot_s35"
-DEFAULT_S34_GNN_CKPT = "outputs/biochem/species_snapshot_s34/best.pth"
+DEFAULT_S35_DIR = "outputs/biochem/biochem_gnn/viscosity"
+DEFAULT_S34_GNN_CKPT = "outputs/biochem/biochem_gnn/species/best.pth"
 SPECIES_SLICE_START = 4
 
 
@@ -200,11 +201,7 @@ def differentiable_clot_phi_from_full_y(
 ) -> torch.Tensor:
     """Soft clot phi from full ``y`` row using FI/Mat channels 8 and 11."""
     mat_si = mat_si_for_gelation_from_log1p(row16[:, MAT_CHANNEL], bio_cfg)
-    scales = bio_cfg.get_species_scales(device=row16.device)[:12].to(
-        device=row16.device, dtype=row16.dtype
-    )
-    fi_log = row16[:, FI_CHANNEL].clamp(min=-10.0, max=8.0)
-    fi_si = torch.expm1(fi_log) * scales[FI_CHANNEL]
+    fi_si = fi_si_for_gelation_from_log1p(row16[:, FI_CHANNEL], bio_cfg)
     t_scale = max(float(bio_cfg.soft_step_T_scale), 1e-5)
     temp_scale = gelation_temperature_scale()
     temp_mat = max(float(bio_cfg.viscosity_gnode_temp_mat) * t_scale / temp_scale, 1e-8)

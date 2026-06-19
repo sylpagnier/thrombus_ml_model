@@ -128,6 +128,13 @@ def _map_phase_to_phase(value: str) -> str:
         "biochem_patient",
     ):
         return "biochem"
+    if v in (
+        "patch_factory",
+        "patch",
+        "patch_factory_boundary_layer",
+        "boundary_layer_patch",
+    ):
+        return "patch_factory"
     raise ValueError(f"Unknown phase: {value}")
 
 
@@ -151,6 +158,12 @@ class VesselConfig:
             self.mesh_input_dir = dr / "raw/kinematics/meshes"
             self.output_dir = dr / "processed/cfd_results_kinematics"
             self.graph_output_dir = dr / "processed/graphs_kinematics"
+        elif self.phase == "patch_factory":
+            # Synthetic boundary-layer "patch" cohort for the local Subgraph GNN:
+            # flat fluid channels with clot morphology carried as JSON metadata.
+            self.mesh_input_dir = dr / "raw/patch_factory/meshes"
+            self.output_dir = dr / "processed/cfd_results_patch_factory"
+            self.graph_output_dir = dr / "processed/graphs_patch_factory"
         elif raw_phase in (
             "biochem_anchors",
             "biochem_anchor",

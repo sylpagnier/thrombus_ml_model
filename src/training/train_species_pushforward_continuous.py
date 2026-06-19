@@ -24,20 +24,19 @@ from src.core_physics.species_gelation_readout import (
     build_species_physics_ctx,
     continuous_physics_readout,
 )
-from src.biochem_gnn.config import apply_deploy_env, apply_train_recipe_env, checkpoint_phase_tag, normalize_train_phase
-from src.training.biochem_species_scope import pushforward_species_scope
+from src.biochem_gnn.config import PHASE_CKPT, apply_deploy_env, apply_train_recipe_env
+from src.training.biochem_species_scope import (
+    format_channel_list,
+    pushforward_species_scope,
+    pushforward_state_bulk_indices,
+    scope_label_for_channels,
+)
 from src.evaluation.clot_relaxed_metrics import clot_score_from_deploy_dict, species_continuous_clout_score_mode
 from src.core_physics.species_gnode_pushforward import species_pushforward_arch
 from src.core_physics.species_pushforward_continuous import (
     parse_biochem_train_anchors,
     pushforward_train_t0_per_vessel,
     resolve_train_t0_max,
-    DEFAULT_CONTINUOUS_CKPT,
-    DEFAULT_S26_CKPT,
-    DEFAULT_S30_CKPT,
-    DEFAULT_S31_CKPT,
-    DEFAULT_S32_CKPT,
-    DEFAULT_S33_CKPT,
     DEFAULT_S34_CKPT,
     SpeciesDualHeadContinuousGNN,
     band_speed_series,
@@ -83,7 +82,6 @@ from src.core_physics.species_pushforward_continuous import (
     filter_continuous_windows,
     init_continuous_from_snapshot,
     init_dual_head_from_continuous,
-    init_dual_head_widen_from_checkpoint,
     iter_pushforward_windows,
     mature_clot_frac,
     saturation_headroom_scale,
@@ -194,12 +192,12 @@ def _build_anchor_pack(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Train species continuous pushforward (phase 2.5/2.6/3.0)")
+    ap = argparse.ArgumentParser(description="Train species continuous pushforward (baseline biochem_gnn)")
     ap.add_argument(
         "--phase",
-        choices=("s25", "s26", "s30", "s31", "s32", "s33", "s34", "biochem_gnn", "clot_deploy_gnn"),
-        default="s25",
-        help="biochem_gnn == canonical deploy baseline GNN (aliases s34, clot_deploy_gnn)",
+        choices=("biochem_gnn", "clot_deploy_gnn"),
+        default="biochem_gnn",
+        help="canonical deploy baseline GNN",
     )
     ap.add_argument("--anchor", default="patient007")
     ap.add_argument("--anchors", default="", help="Comma-separated anchors for multi-vessel train")
@@ -210,7 +208,7 @@ def main() -> int:
         action="store_true",
         help="LOAO: drop val-anchor from training packs (train only on other vessels)",
     )
-    ap.add_argument("--init-s26", default="", help="Optional s26 checkpoint to warm-start")
+    ap.add_argument("--init", default="", help="Optional checkpoint to warm-start")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--grad-clip", type=float, default=None)
@@ -236,81 +234,18 @@ def main() -> int:
         os.environ["SPECIES_PUSHFORWARD_ARCH"] = str(args.arch).strip().lower()
     pushforward_arch = species_pushforward_arch()
 
-    phase = normalize_train_phase(str(args.phase).strip().lower())
-    if phase in ("s26", "s30", "s31", "s32", "s33", "s34"):
-        os.environ["SPECIES_CONTINUOUS_GROWTH_ONLY_LOSS"] = "1"
-    if phase in ("s31", "s32", "s33", "s34"):
-        os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
-        os.environ["SPECIES_CONTINUOUS_PHYSICS_READOUT"] = "0"
-        os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
-    if phase == "s34":
-        apply_train_recipe_env()
-        if args.unroll is None and not (os.environ.get("SPECIES_PUSHFORWARD_UNROLL") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_UNROLL"] = "10"
-    if phase == "s33":
-        os.environ.setdefault("SPECIES_CONTINUOUS_SATURATION_GATE", "1")
-        os.environ.setdefault("SPECIES_CONTINUOUS_MATURE_FP_EXEMPT", "1")
-        os.environ.setdefault("SPECIES_CONTINUOUS_MATURE_FRAC", "0.95")
-        os.environ.setdefault("SPECIES_CONTINUOUS_SATURATION_SCALE", "80")
-        for key, val in (
-            ("SPECIES_CONTINUOUS_VEL_DECAY", "1"),
-            ("SPECIES_CONTINUOUS_TEACHER_NOISE", "0.02"),
-            ("SPECIES_CONTINUOUS_TEACHER_FP_FRAC", "0.08"),
-            ("SPECIES_CONTINUOUS_TEACHER_BLUR", "0.25"),
-            ("SPECIES_CONTINUOUS_TBPTT_TAIL", "5"),
-            ("SPECIES_CONTINUOUS_CURRICULUM_UNROLL", "1"),
-            ("SPECIES_CONTINUOUS_CLOSED_LOOP_INIT", "0.45"),
-            ("SPECIES_CONTINUOUS_FINAL_STATE_WEIGHT", "0.35"),
-            ("SPECIES_CONTINUOUS_FINAL_STATE_ALL_BAND", "1"),
-            ("SPECIES_CONTINUOUS_SPEED_FP_WEIGHT", "4.0"),
-            ("SPECIES_CONTINUOUS_DEPLOY_HORIZON", "0"),
-        ):
-            os.environ.setdefault(key, val)
-        if args.unroll is None and not (os.environ.get("SPECIES_PUSHFORWARD_UNROLL") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_UNROLL"] = "10"
-        os.environ.setdefault("SPECIES_PUSHFORWARD_MAX_UNROLL", "200")
-        os.environ.setdefault("SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL", "1")
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MAX") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_MAX"] = "35"
-    if phase == "s32":
-        os.environ.setdefault("SPECIES_CONTINUOUS_VEL_DECAY", "1")
-        os.environ.setdefault("SPECIES_CONTINUOUS_TEACHER_NOISE", "0.02")
-        os.environ.setdefault("SPECIES_CONTINUOUS_TEACHER_FP_FRAC", "0.08")
-        os.environ.setdefault("SPECIES_CONTINUOUS_TEACHER_BLUR", "0.25")
-        os.environ.setdefault("SPECIES_CONTINUOUS_TBPTT_TAIL", "5")
-        os.environ.setdefault("SPECIES_CONTINUOUS_CURRICULUM_UNROLL", "1")
-        if args.unroll is None and not (os.environ.get("SPECIES_PUSHFORWARD_UNROLL") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_UNROLL"] = "10"
-        os.environ.setdefault("SPECIES_PUSHFORWARD_MAX_UNROLL", "15")
-        os.environ.setdefault("SPECIES_CONTINUOUS_CLOSED_LOOP_INIT", "0.45")
-        os.environ.setdefault("SPECIES_CONTINUOUS_FINAL_STATE_WEIGHT", "0.35")
-        os.environ.setdefault("SPECIES_CONTINUOUS_FINAL_STATE_ALL_BAND", "1")
-        os.environ.setdefault("SPECIES_CONTINUOUS_SPEED_FP_WEIGHT", "4.0")
-        os.environ.setdefault("SPECIES_CONTINUOUS_DEPLOY_HORIZON", "0")
-        os.environ.setdefault("SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL", "1")
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MAX") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_MAX"] = "35"
-        if not (os.environ.get("SPECIES_PUSHFORWARD_MAX_UNROLL") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_MAX_UNROLL"] = "200"
-    if phase == "s30":
-        os.environ["SPECIES_CONTINUOUS_PHYSICS_READOUT"] = "1"
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MIN") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_MIN"] = "17"
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MAX") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_MAX"] = "32"
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TAU_CENTER") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TAU_CENTER"] = "25"
+    phase = "biochem_gnn"
+    apply_train_recipe_env()
+    if args.unroll is None and not (os.environ.get("SPECIES_PUSHFORWARD_UNROLL") or "").strip():
+        os.environ["SPECIES_PUSHFORWARD_UNROLL"] = "10"
     if args.unroll is not None:
         os.environ["SPECIES_PUSHFORWARD_UNROLL"] = str(args.unroll)
     if args.stride is not None:
         os.environ["SPECIES_PUSHFORWARD_STEP_STRIDE"] = str(args.stride)
     if args.wall_hops is not None:
         os.environ["SPECIES_SNAPSHOT_WALL_HOPS"] = str(args.wall_hops)
-    if phase == "s34":
-        if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL") or "").strip():
-            os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL"] = "1"
-    elif not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MAX") or "").strip():
-        os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_MAX"] = "22"
+    if not (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL") or "").strip():
+        os.environ["SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL"] = "1"
 
     unroll = pushforward_unroll_steps()
     max_unroll = pushforward_max_unroll_steps()
@@ -326,27 +261,8 @@ def main() -> int:
     fp_w = continuous_fp_weight()
     physics_on = continuous_physics_readout()
     dual_head = continuous_dual_head()
-    if phase == "s34":
-        phase_tag = checkpoint_phase_tag("clot_deploy_gnn")
-        default_out = DEFAULT_S34_CKPT
-    elif phase == "s33":
-        phase_tag = "s33_saturation_gate"
-        default_out = DEFAULT_S33_CKPT
-    elif phase == "s32":
-        phase_tag = "s32_long_horizon"
-        default_out = DEFAULT_S32_CKPT
-    elif phase == "s31":
-        phase_tag = "s31_dual_head"
-        default_out = DEFAULT_S31_CKPT
-    elif phase == "s30":
-        phase_tag = "s30_continuous_physics"
-        default_out = DEFAULT_S30_CKPT
-    elif growth_only:
-        phase_tag = "s26_continuous"
-        default_out = DEFAULT_S26_CKPT
-    else:
-        phase_tag = "s25_continuous"
-        default_out = DEFAULT_CONTINUOUS_CKPT
+    phase_tag = PHASE_CKPT
+    default_out = DEFAULT_S34_CKPT
     lr = float(args.lr) if args.lr is not None else (3e-4 if growth_only else 1e-3)
     grad_clip = (
         float(args.grad_clip)
@@ -400,19 +316,7 @@ def main() -> int:
     in_dim = continuous_feature_dim(latent_dim)
     model = build_continuous_gnn(in_dim, hidden=hidden, arch=pushforward_arch).to(device)
 
-    init_s26 = args.init_s26.strip() or (
-        str(root / DEFAULT_S33_CKPT)
-        if phase == "s34"
-        else (
-            str(root / DEFAULT_S32_CKPT)
-            if phase == "s33"
-            else (
-                str(root / DEFAULT_S31_CKPT)
-                if phase == "s32"
-                else (str(root / DEFAULT_S26_CKPT) if phase in ("s30", "s31") else "")
-            )
-        )
-    )
+    init_ckpt = args.init.strip() or str(root / DEFAULT_S34_CKPT)
     if pushforward_arch == "gnode":
         snap_path = args.init_s1.strip() or str(root / DEFAULT_SNAPSHOT_CKPT)
         if Path(snap_path).is_file():
@@ -422,38 +326,28 @@ def main() -> int:
             if snap is not None:
                 init_dual_head_from_continuous(model, snap.model, quiet=False)
                 print(f"[OK] gnode dual-head warm-start from snapshot {snap_path}", flush=True)
-        elif init_s26 and Path(init_s26).is_file():
-            bundle = load_continuous_bundle(init_s26, device=device, quiet=True, architecture="dual")
+        elif init_ckpt and Path(init_ckpt).is_file():
+            bundle = load_continuous_bundle(init_ckpt, device=device, quiet=True, architecture="dual")
             if bundle is not None:
                 init_dual_head_from_continuous(model, bundle.model, quiet=False)
-                print(f"[OK] gnode dual-head warm-start from continuous {init_s26}", flush=True)
-    elif init_s26 and Path(init_s26).is_file():
+                print(f"[OK] gnode dual-head warm-start from continuous {init_ckpt}", flush=True)
+    elif init_ckpt and Path(init_ckpt).is_file():
         init_meta = {}
-        init_path = Path(init_s26)
+        init_path = Path(init_ckpt)
         if init_path.is_file():
             init_payload = torch.load(init_path, map_location="cpu", weights_only=False)
             init_meta = dict(init_payload.get("meta") or {})
         ckpt_is_dual = bool(init_meta.get("dual_head"))
         arch = "single" if dual_head and not ckpt_is_dual else None
-        if (
-            phase == "s33"
-            and continuous_saturation_gate()
-            and in_dim > prev_in_dim
-            and isinstance(model, SpeciesDualHeadContinuousGNN)
-        ):
-            init_dual_head_widen_from_checkpoint(
-                model, init_s26, prev_in_dim=prev_in_dim, device=device
-            )
-        else:
-            bundle = load_continuous_bundle(init_s26, device=device, quiet=True, architecture=arch)
-            if bundle is not None:
-                if dual_head and not ckpt_is_dual and isinstance(model, SpeciesDualHeadContinuousGNN):
-                    init_dual_head_from_continuous(model, bundle.model)
-                else:
-                    load_pushforward_state_dict_partial(
-                        model, bundle.model.state_dict(), quiet=False
-                    )
-                print(f"[OK] warm-start from {init_s26}", flush=True)
+        bundle = load_continuous_bundle(init_ckpt, device=device, quiet=True, architecture=arch)
+        if bundle is not None:
+            if dual_head and not ckpt_is_dual and isinstance(model, SpeciesDualHeadContinuousGNN):
+                init_dual_head_from_continuous(model, bundle.model)
+            else:
+                load_pushforward_state_dict_partial(
+                    model, bundle.model.state_dict(), quiet=False
+                )
+            print(f"[OK] warm-start from {init_ckpt}", flush=True)
     else:
         init_path = args.init_s1.strip() or str(root / DEFAULT_SNAPSHOT_CKPT)
         if Path(init_path).is_file():
@@ -542,6 +436,8 @@ def main() -> int:
         "kine_ckpt": kine_ckpt,
         "n_band": ref_static["n_band"],
         "pushforward_species_scope": pushforward_species_scope(),
+        "pushforward_species_channels": pushforward_state_bulk_indices(),
+        "pushforward_species_label": scope_label_for_channels(pushforward_state_bulk_indices()),
         "n_windows": n_windows,
         "growth_only_loss": growth_only,
         "dual_head": dual_head,
@@ -568,7 +464,7 @@ def main() -> int:
     for ep in range(1, int(args.epochs) + 1):
         model.train()
         ep_losses: list[float] = []
-        cur_unroll = curriculum_unroll_for_epoch(ep) if phase in ("s32", "s33", "s34") else unroll
+        cur_unroll = curriculum_unroll_for_epoch(ep)
         pack_order = packs[:]
         random.shuffle(pack_order)
 
@@ -601,8 +497,7 @@ def main() -> int:
                     continue
                 log_state0 = series[0]
                 if (
-                    phase in ("s32", "s33", "s34")
-                    and int(win_use[0]) > 0
+                    int(win_use[0]) > 0
                     and closed_loop_init_prob() > 0.0
                     and random.random() < closed_loop_init_prob()
                 ):
@@ -637,7 +532,7 @@ def main() -> int:
                 opt.step()
                 ep_losses.append(float(loss.item()))
 
-        if phase in ("s32", "s33", "s34"):
+        if True:
             h = deploy_horizon_steps()
             dep_packs = packs if deploy_horizon_aux_all_packs() else [val_pack]
             aux_cap = deploy_horizon_aux_cap_steps()
@@ -696,6 +591,9 @@ def main() -> int:
         deploy_clot_f1 = 0.0
         deploy_clot_guiding = 0.0
         deploy_clot_relaxed_f05 = 0.0
+        deploy_clot_relaxed_prec = 0.0
+        deploy_clot_relaxed_rec = 0.0
+        deploy_clot_pred_pos_frac = 0.0
         deploy_clot_dil_iou = 0.0
         deploy_clot_score = 0.0
         deploy_clot_guiding_mid = 0.0
@@ -736,7 +634,7 @@ def main() -> int:
                 val_init_f1.append(m["init_state_f1"])
                 val_pred_delta.append(m["mean_pred_delta"])
                 val_clot_phi_f1.append(m.get("clot_phi_f1", 0.0))
-            if phase in ("s32", "s33", "s34"):
+            if True:
                 n_val = int(val_pack["data"].y.shape[0])
                 t_deploy = deploy_eval_time_index(n_val)
                 dep = eval_full_rollout_fimat_f1(
@@ -803,6 +701,9 @@ def main() -> int:
                     deploy_clot_f1 = float(clf["deploy_clot_f1"])
                     deploy_clot_guiding = float(clf.get("deploy_clot_guiding", deploy_clot_f1))
                     deploy_clot_relaxed_f05 = float(clf.get("deploy_clot_relaxed_f05", deploy_clot_f1))
+                    deploy_clot_relaxed_prec = float(clf.get("deploy_clot_relaxed_prec", 0.0))
+                    deploy_clot_relaxed_rec = float(clf.get("deploy_clot_relaxed_rec", 0.0))
+                    deploy_clot_pred_pos_frac = float(clf.get("deploy_clot_pred_pos_frac", 0.0))
                     deploy_clot_dil_iou = float(clf.get("deploy_clot_dil_iou", 0.0))
                     if len(clf_by_t) > 1:
                         mid_t = legacy_capped_deploy_time_index(n_val)
@@ -832,7 +733,7 @@ def main() -> int:
             "val_clot_phi_f1": sum(val_clot_phi_f1) / max(len(val_clot_phi_f1), 1),
             "cur_unroll": cur_unroll,
         }
-        if phase in ("s32", "s33", "s34"):
+        if True:
             row["deploy_eval_t"] = t_deploy
             row["deploy_mat_f1"] = deploy_mat_f1
             row["deploy_fi_f1"] = deploy_fi_f1
@@ -843,6 +744,9 @@ def main() -> int:
                 row["deploy_clot_f1_t53"] = deploy_clot_f1
                 row["deploy_clot_guiding"] = deploy_clot_guiding
                 row["deploy_clot_relaxed_f05"] = deploy_clot_relaxed_f05
+                row["deploy_clot_relaxed_prec"] = deploy_clot_relaxed_prec
+                row["deploy_clot_relaxed_rec"] = deploy_clot_relaxed_rec
+                row["deploy_clot_pred_pos_frac"] = deploy_clot_pred_pos_frac
                 row["deploy_clot_dil_iou"] = deploy_clot_dil_iou
                 row["deploy_clot_score"] = deploy_clot_score
                 row["deploy_clot_guiding_mid"] = deploy_clot_guiding_mid
@@ -850,12 +754,15 @@ def main() -> int:
             f.write(json.dumps(row) + "\n")
 
         dep_msg = ""
-        if phase in ("s32", "s33", "s34"):
+        if True:
             dep_msg = f" deploy_mat_t={deploy_mat_f1:.3f} deploy_fi_t={deploy_fi_f1:.3f} t={t_deploy} unroll={cur_unroll}"
             if bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0:
                 dep_msg += (
                     f" deploy_clot_g={deploy_clot_guiding:.3f}"
                     f" f05={deploy_clot_relaxed_f05:.3f}"
+                    f" rprec={deploy_clot_relaxed_prec:.3f}"
+                    f" rrec={deploy_clot_relaxed_rec:.3f}"
+                    f" pos={deploy_clot_pred_pos_frac:.3f}"
                     f" diou={deploy_clot_dil_iou:.3f}"
                     f" f1={deploy_clot_f1:.3f}"
                 )
@@ -874,14 +781,14 @@ def main() -> int:
                 + 0.15 * row["val_state_f1"]
                 + 0.10 * row["val_growth_mat_f1"]
             )
-        elif phase in ("s32", "s33", "s34") and bool(args.exclude_val_from_train):
+        elif bool(args.exclude_val_from_train):
             score = (
                 0.55 * deploy_clot_score
                 + 0.25 * deploy_mat_f1
                 + 0.10 * row["val_state_f1"]
                 + 0.10 * row["val_growth_f1"]
             )
-        elif phase in ("s32", "s33", "s34"):
+        else:
             mat_score = (
                 0.70 * deploy_mat_f1
                 + 0.15 * row["val_growth_f1"]
@@ -893,14 +800,6 @@ def main() -> int:
                 score = (1.0 - clot_w) * mat_score + clot_w * deploy_clot_score
             else:
                 score = mat_score
-        elif dual_head or growth_only:
-            score = (
-                0.55 * row["val_growth_f1"]
-                + 0.30 * row["val_state_f1"]
-                + 0.15 * row["val_growth_mat_f1"]
-            )
-        else:
-            score = row["val_state_f1"]
         if score > best_score:
             best_score = score
             stale = 0

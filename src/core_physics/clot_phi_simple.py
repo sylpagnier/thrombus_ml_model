@@ -706,13 +706,24 @@ def _resolve_gelation_legs(
     mat_si = mat_si_for_gelation_from_log1p(species_log1p[:, 11].to(device=device), bio_cfg)
     if base_mode in ("comsol", "comsol_carreau"):
         mu1 = mu1_comsol_from_mat_si(mat_si, bio_cfg, mu_ratio_max)
-        mu2 = mu2_comsol_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
     else:
         mu1 = mu1_gelation_from_mat_si(mat_si, bio_cfg, mu_ratio_max)
-        mu2 = mu2_gelation_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
-    cap = clot_phi_physics_mu2_cap()
-    if cap is not None:
-        mu2 = mu2.clamp(max=cap)
+    # Fibrin leg: COMSOL validation (docs/COMSOL_PHYSICS_VALIDATION.md) shows mu2(FI)
+    # is identically 0 on patient007 -- FI peaks ~0.013 uM, far below the 0.6 uM
+    # viscosity_fi_crit gelation threshold, so fibrin never gels and contributes
+    # nothing to mu_eff. The clot trigger is platelet-matrix (Mat) driven. Fibrin is
+    # dropped by default to remove a spurious-trigger pathway under FI decode drift;
+    # re-enable with CLOT_PHI_PHYSICS_USE_FIBRIN=1 for ablations.
+    if clot_phi_physics_use_fibrin():
+        if base_mode in ("comsol", "comsol_carreau"):
+            mu2 = mu2_comsol_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
+        else:
+            mu2 = mu2_gelation_from_fi_si(fi_si, bio_cfg, mu_ratio_max)
+        cap = clot_phi_physics_mu2_cap()
+        if cap is not None:
+            mu2 = mu2.clamp(max=cap)
+    else:
+        mu2 = torch.zeros_like(mu1)
     if clot_phi_physics_wall_mat_only() and data is not None:
         n = int(data.num_nodes)
         wall = _wall_mask_from_data(data, device, n)
@@ -842,22 +853,6 @@ def clot_phi_physics_mu_blood_si(phys_cfg: PhysicsConfig) -> float:
     return float(phys_cfg.mu_inf)
 
 
-def clot_phi_physics_subtract_t0_mu() -> bool:
-    """Count only viscosity rise above per-node mu at t=0 (no baseline Carreau clot)."""
-    raw = (os.environ.get("CLOT_PHI_PHYSICS_SUBTRACT_T0_MU") or "1").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return True
-
-
-def clot_phi_gt_subtract_t0_mu() -> bool:
-    """GT labels: clot = viscosity growth above per-node COMSOL mu at macro t=0."""
-    raw = (os.environ.get("CLOT_PHI_GT_SUBTRACT_T0_MU") or "1").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return True
-
-
 def gt_mu_anchor_cap_si(data, phys_cfg: PhysicsConfig, device: torch.device) -> torch.Tensor:
     """Per-node capped COMSOL mu_eff at macro t=0 (growth baseline for GT labels)."""
     y0 = data.y[0].to(device)
@@ -872,9 +867,10 @@ def snapshot_clot_physics_trigger_config() -> dict[str, object]:
         "hard_step": clot_phi_physics_hard_step(),
         "gelation_gate": clot_phi_physics_gelation_gate_enabled(),
         "wall_mat_only": clot_phi_physics_wall_mat_only(),
+        "use_fibrin": clot_phi_physics_use_fibrin(),
         "gelation_onset_frac": clot_phi_physics_gelation_onset_frac(),
-        "subtract_t0_mu": clot_phi_physics_subtract_t0_mu(),
-        "gt_subtract_t0_mu": clot_phi_gt_subtract_t0_mu(),
+        "subtract_t0_mu": True,
+        "gt_subtract_t0_mu": True,
         "mu2_cap": os.environ.get("CLOT_PHI_PHYSICS_MU2_CAP", ""),
         "thresh_si": os.environ.get("CLOT_PHI_THRESH_SI", ""),
         "mu_blood_si": os.environ.get("CLOT_PHI_PHYSICS_MU_BLOOD_SI", ""),
@@ -898,14 +894,38 @@ def mat_si_for_gelation_from_log1p(
     return torch.expm1(sp) * float(bio_cfg.Minf)
 
 
+def fi_si_for_gelation_from_log1p(
+    fi_log1p: torch.Tensor,
+    bio_cfg: BiochemConfig,
+) -> torch.Tensor:
+    """COMSOL ``FI`` argument for ``mu2(FI)`` in uM (matches ``viscosity_fi_crit`` = 0.6 uM).
+
+    ``get_species_scales`` decodes FI to *working* units (SI [mol/m^3] * ``bulk_scale``).
+    COMSOL ``mu2`` steps at 0.6 **uM**, so convert working -> uM:
+    ``uM = (working / bulk_scale) * 1e3``  (1 mol/m^3 = 1e3 uM). Comparing FI in working
+    units against 0.6 was ~1e3x too lenient and spuriously gelled fibrin that never reaches
+    the physical 0.6 uM threshold (max GT FI ~0.013 uM). Parallels ``mat_si_for_gelation``.
+    """
+    sp = fi_log1p.clamp(min=-10.0, max=8.0)
+    scale_fi = float(bio_cfg.get_species_scales(device=fi_log1p.device)[8])
+    working = torch.expm1(sp) * scale_fi
+    return working * (1e3 / float(bio_cfg.bulk_scale))
+
+
 def species_log1p_nd_to_si(species_log1p: torch.Tensor, bio_cfg: BiochemConfig) -> torch.Tensor:
-    """``y`` species channels (log1p ND) -> SI concentrations (12 bulk)."""
+    """``y`` species channels (log1p ND) -> gelation-ready concentrations (12 bulk).
+
+    Bulk solutes are returned in working units, EXCEPT the two channels that feed the
+    COMSOL gelation steps: Mat (idx 11) -> ``mu1`` model units, FI (idx 8) -> uM for
+    ``mu2``. Both crits (``viscosity_mat_crit``, ``viscosity_fi_crit``) live in those units.
+    """
     scales = bio_cfg.get_species_scales(device=species_log1p.device)[:12].to(
         device=species_log1p.device, dtype=species_log1p.dtype
     )
     sp = species_log1p.reshape(-1, 12).clamp(min=-10.0, max=8.0)
     out = torch.expm1(sp) * scales.view(1, -1)
     out[:, 11] = mat_si_for_gelation_from_log1p(sp[:, 11], bio_cfg)
+    out[:, 8] = fi_si_for_gelation_from_log1p(sp[:, 8], bio_cfg)
     return out
 
 
@@ -959,6 +979,16 @@ def clot_phi_physics_mu2_cap() -> float | None:
     if not raw:
         return None
     return max(float(raw), 0.0)
+
+
+def clot_phi_physics_use_fibrin() -> bool:
+    """Include the fibrin gelation leg ``mu2(FI)`` in the clot trigger.
+
+    Default False: COMSOL validation shows FI never reaches ``viscosity_fi_crit``
+    (0.6 uM) on patient007, so ``mu2(FI)`` is identically 0 and the clot is
+    platelet-matrix (Mat) driven. Enable for fibrin-pathway ablations.
+    """
+    return _env_bool("CLOT_PHI_PHYSICS_USE_FIBRIN", False)
 
 
 def physics_mu_eff_si(
@@ -1597,20 +1627,20 @@ def resolve_phi_gt_labels(
     soft: bool,
     mu_anchor_si: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """GT clot labels; growth-only above t=0 mu when ``CLOT_PHI_GT_SUBTRACT_T0_MU=1``."""
-    if mu_anchor_si is not None and clot_phi_gt_subtract_t0_mu():
-        anchor = mu_anchor_si.reshape(-1).to(device=mu_cap_si.device, dtype=mu_cap_si.dtype)
-        if soft:
-            return phi_gt_soft(mu_cap_si, anchor, region)
-        growth = (mu_cap_si.reshape(-1) - anchor).clamp(min=0.0)
-        thr = clot_phi_thresh_si(phys_cfg)
-        phi = (growth >= thr).to(dtype=torch.float32)
-        if region is None:
-            return phi
-        return phi * region.reshape(-1).to(dtype=torch.float32)
+    """GT clot labels: growth above per-node COMSOL mu at macro t=0."""
+    anchor = (
+        mu_anchor_si.reshape(-1)
+        if mu_anchor_si is not None
+        else mu_c_si.reshape(-1)
+    ).to(device=mu_cap_si.device, dtype=mu_cap_si.dtype)
     if soft:
-        return phi_gt_soft(mu_cap_si, mu_c_si, region)
-    return phi_gt_binary(mu_cap_si, region, phys_cfg)
+        return phi_gt_soft(mu_cap_si, anchor, region)
+    growth = (mu_cap_si.reshape(-1) - anchor).clamp(min=0.0)
+    thr = clot_phi_thresh_si(phys_cfg)
+    phi = (growth >= thr).to(dtype=torch.float32)
+    if region is None:
+        return phi
+    return phi * region.reshape(-1).to(dtype=torch.float32)
 
 
 def mu_eff_from_delta_log_si(mu_c_si: torch.Tensor, delta_log_mu: torch.Tensor) -> torch.Tensor:
@@ -2187,7 +2217,7 @@ def build_clot_phi_step(
     else:
         region = supervision_region_mask(data, device, mu_cap, phys_cfg)
     # GT labels: growth above t=0 COMSOL mu (not baseline high-vis Carreau pockets).
-    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device) if clot_phi_gt_subtract_t0_mu() else None
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
     phi_gt = resolve_phi_gt_labels(
         mu_cap, mu_c, None, phys_cfg, soft=use_soft, mu_anchor_si=mu_anchor
     )

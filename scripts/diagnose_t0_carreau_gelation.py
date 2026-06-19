@@ -280,7 +280,6 @@ def main() -> int:
     os.environ["CLOT_PHI_PHYSICS_MU_RATIO_MAX"] = str(args.ratio_max)
     os.environ["CLOT_PHI_PHYSICS_HARD_STEP"] = "0"
     os.environ["CLOT_PHI_PHYSICS_GELATION_GATE"] = "0"
-    os.environ["CLOT_PHI_PHYSICS_SUBTRACT_T0_MU"] = "0"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     phys = PhysicsConfig(phase="biochem")

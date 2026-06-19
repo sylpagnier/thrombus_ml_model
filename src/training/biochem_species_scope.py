@@ -14,6 +14,103 @@ FIBRINOGEN_CHANNEL = 7
 FI_CHANNEL = 8
 MAT_CHANNEL = 11
 
+# Bulk slice index -> short name (y[:, 4:16] layout).
+BULK_CHANNEL_NAMES: dict[int, str] = {
+    0: "RP",
+    1: "AP",
+    2: "APR",
+    3: "APS",
+    4: "PT",
+    5: "T",
+    6: "AT",
+    7: "FG",
+    8: "FI",
+    9: "M",
+    10: "Mas",
+    11: "Mat",
+}
+
+FI_MAT_BASE_CHANNELS: tuple[int, ...] = (FI_CHANNEL, MAT_CHANNEL)
+
+# Single-channel add-on candidates for fi_mat + X screen (exclude FI/Mat).
+SCREEN_ADDON_CHANNEL_INDICES: tuple[int, ...] = tuple(
+    ch for ch in range(12) if ch not in FI_MAT_BASE_CHANNELS
+)
+
+
+def bulk_channel_name(ch: int) -> str:
+    return BULK_CHANNEL_NAMES.get(int(ch), f"ch{int(ch)}")
+
+
+def format_channel_list(channels: Sequence[int]) -> str:
+    return ",".join(str(int(c)) for c in channels)
+
+
+def canonical_pushforward_channel_order(channels: Sequence[int]) -> list[int]:
+    """FI then Mat then extras (stable); matches ``fi_mat_thrombin`` = ``[8,11,5]`` not ``[5,8,11]``."""
+    seen: set[int] = set()
+    extras: list[int] = []
+    for c in channels:
+        ch = int(c)
+        if ch in seen:
+            continue
+        seen.add(ch)
+        if ch not in FI_MAT_BASE_CHANNELS:
+            extras.append(ch)
+    ordered_base = [c for c in FI_MAT_BASE_CHANNELS if c in seen]
+    return ordered_base + sorted(extras)
+
+
+def parse_channel_list(spec: str) -> list[int]:
+    """Parse comma-separated bulk indices or short names (e.g. ``8,11,5`` or ``FI,Mat,T``)."""
+    out: list[int] = []
+    name_to_ch = {v.lower(): k for k, v in BULK_CHANNEL_NAMES.items()}
+    name_to_ch.update(
+        {
+            "fi": FI_CHANNEL,
+            "mat": MAT_CHANNEL,
+            "thrombin": THROMBIN_CHANNEL,
+            "th": THROMBIN_CHANNEL,
+            "pt": PROTHROMBIN_CHANNEL,
+            "fg": FIBRINOGEN_CHANNEL,
+        }
+    )
+    for part in (spec or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            out.append(int(token))
+            continue
+        key = token.lower()
+        if key not in name_to_ch:
+            raise ValueError(f"unknown species channel name {token!r}")
+        out.append(int(name_to_ch[key]))
+    return canonical_pushforward_channel_order(out)
+
+
+def pushforward_channels_from_env() -> list[int] | None:
+    raw = (os.environ.get("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS") or "").strip()
+    if not raw:
+        return None
+    return parse_channel_list(raw)
+
+
+def fi_mat_plus_channels(extra: Sequence[int]) -> list[int]:
+    return canonical_pushforward_channel_order([*FI_MAT_BASE_CHANNELS, *(int(c) for c in extra)])
+
+
+def scope_label_for_channels(channels: Sequence[int]) -> str:
+    ch = sorted({int(c) for c in channels})
+    base = sorted(FI_MAT_BASE_CHANNELS)
+    if ch == base:
+        return "fi_mat"
+    extras = [c for c in ch if c not in base]
+    if len(extras) == 1 and extras[0] == THROMBIN_CHANNEL:
+        return "fi_mat_thrombin"
+    extra_names = "+".join(bulk_channel_name(c) for c in extras)
+    return f"fi_mat+{extra_names}"
+
 
 def _normalize_scope(raw: str) -> str:
     aliases = {
@@ -71,6 +168,9 @@ def data_bio_species_channel_indices(*, n_channels: int = 12) -> list[int]:
 
 def pushforward_state_bulk_indices(*, n_channels: int = 12) -> list[int]:
     """Bulk channel indices modeled by GraphSAGE pushforward state."""
+    explicit = pushforward_channels_from_env()
+    if explicit is not None:
+        return explicit
     return _scope_channel_indices(pushforward_species_scope(), n_channels=n_channels)
 
 
@@ -128,4 +228,7 @@ def data_bio_species_scope_label() -> str:
 
 
 def pushforward_species_scope_label() -> str:
+    explicit = pushforward_channels_from_env()
+    if explicit is not None:
+        return scope_label_for_channels(explicit)
     return pushforward_species_scope()

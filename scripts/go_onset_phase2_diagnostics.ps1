@@ -100,7 +100,7 @@ function Run-Condition {
         "--max-windows", "$MaxWindows",
         "--unroll", "10",
         "--arch", "sage",
-        "--init-s26", $InitWarm,
+        "--init", $InitWarm,
         "--out", $SpeciesOut
     )
 

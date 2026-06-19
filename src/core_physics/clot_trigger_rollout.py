@@ -178,9 +178,7 @@ def rollout_clot_trigger_physics(
             time_index=int(t),
             mu_anchor_si=mu_anchor_si,
         )
-        from src.core_physics.clot_phi_simple import clot_phi_physics_subtract_t0_mu
-
-        if mu_anchor_si is None and clot_phi_physics_subtract_t0_mu():
+        if mu_anchor_si is None:
             mu_anchor_si = mu_raw.reshape(-1).clone()
             phi_raw, mu_raw = forward_physics_trigger_phi(
                 step,
@@ -241,7 +239,6 @@ def rollout_clot_trigger_hybrid_core(
     detach_prev: bool = True,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """Hybrid trigger trajectory with nucleation projection (trainable when not no_grad)."""
-    from src.core_physics.clot_phi_simple import clot_phi_physics_subtract_t0_mu
     from src.training.clot_trigger_stack import forward_clot_trigger_hybrid
 
     seed = growth_seed if growth_seed is not None else clot_trigger_forward_seed_mode()
@@ -268,7 +265,7 @@ def rollout_clot_trigger_hybrid_core(
             time_index=int(t),
             mu_anchor_si=mu_anchor_si,
         )
-        if mu_anchor_si is None and clot_phi_physics_subtract_t0_mu():
+        if mu_anchor_si is None:
             mu_anchor_si = bundle["mu_phys"].reshape(-1).detach().clone()
         if mode == "physics":
             phi_raw = bundle["phi_phys"]

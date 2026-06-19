@@ -268,6 +268,17 @@ def test_gt_growth_commits_zero_at_t0_and_early(anchor_graph) -> None:
         assert int(mask.sum().item()) == 0
 
 
+def test_gt_clot_phi_at_time_subtracts_t0_baseline(anchor_graph) -> None:
+    from src.core_physics.t0_mu_physics import gt_clot_phi_at_time
+
+    apply_clot_trigger_deploy_env()
+    device = torch.device("cpu")
+    phys = PhysicsConfig(phase="biochem")
+    for t in (0, 17):
+        phi = gt_clot_phi_at_time(anchor_graph, t, phys, device=device)
+        assert float(phi.sum().item()) <= 0.0 + 1e-6
+
+
 def test_star1_enables_trigger_rollout_training() -> None:
     apply_star1_train_env(fast=True)
     assert clot_phi_trigger_rollout_enabled()

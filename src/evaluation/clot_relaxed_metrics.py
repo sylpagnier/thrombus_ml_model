@@ -110,7 +110,31 @@ def species_continuous_clout_score_mode() -> str:
         return "relaxed_f05"
     if raw in ("dilation_iou", "iou", "dil_iou"):
         return "dilation_iou"
+    if raw in ("relaxed_prec_floor", "prec_floor", "relaxed_prec", "precision_floor"):
+        return "relaxed_prec_floor"
     return "guiding"
+
+
+def clot_prec_recall_floor() -> float:
+    """Min relaxed recall required before precision is rewarded at full weight."""
+    return max(_env_float("SPECIES_CLOUT_PREC_REC_FLOOR", 0.30), 0.0)
+
+
+def relaxed_prec_floor_score(relaxed_prec: float, relaxed_rec: float) -> float:
+    """Precision-first score that still demands the model predict *some* true clots.
+
+    - recall 0 -> 0 (degenerate empty / all-miss prediction is worthless)
+    - recall >= floor -> full relaxed precision
+    - 0 < recall < floor -> precision linearly ramped by recall/floor
+    """
+    p = float(relaxed_prec)
+    r = float(relaxed_rec)
+    if r <= 0.0:
+        return 0.0
+    floor = clot_prec_recall_floor()
+    if floor <= 0.0 or r >= floor:
+        return p
+    return p * (r / floor)
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -171,6 +195,10 @@ def clot_score_from_deploy_dict(m: dict[str, float]) -> float:
         return float(m.get("deploy_clot_relaxed_f05", m.get("clot_relaxed_f05", 0.0)))
     if mode == "dilation_iou":
         return float(m.get("deploy_clot_dil_iou", m.get("clot_dilation_iou", 0.0)))
+    if mode == "relaxed_prec_floor":
+        prec = float(m.get("deploy_clot_relaxed_prec", m.get("clot_relaxed_prec", 0.0)))
+        rec = float(m.get("deploy_clot_relaxed_rec", m.get("clot_relaxed_rec", 0.0)))
+        return relaxed_prec_floor_score(prec, rec)
     return float(m.get("deploy_clot_guiding", m.get("clot_guiding", 0.0)))
 
 
@@ -272,11 +300,14 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
         "clot_f1": f"{prefix}clot_f1",
         "clot_prec": f"{prefix}clot_prec",
         "clot_rec": f"{prefix}clot_rec",
+        "clot_relaxed_prec": f"{prefix}clot_relaxed_prec",
+        "clot_relaxed_rec": f"{prefix}clot_relaxed_rec",
         "clot_relaxed_f05": f"{prefix}clot_relaxed_f05",
         "clot_relaxed_f_beta": f"{prefix}clot_relaxed_f_beta",
         "clot_dilation_iou": f"{prefix}clot_dil_iou",
         "clot_guiding": f"{prefix}clot_guiding",
         "clot_iou": f"{prefix}clot_iou",
+        "pred_pos_frac": f"{prefix}clot_pred_pos_frac",
     }
     for src, dst in mapping.items():
         if src in m:

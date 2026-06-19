@@ -27,9 +27,7 @@ from src.utils.paths import get_project_root
 # --- identity (canonical SciML ids; legacy aliases still resolve) ---
 STACK_NAME = BIOCHEM_DEPLOY_STACK.id
 PHASE_TRAIN = BIOCHEM_DEPLOY_STACK.id
-PHASE_TRAIN_LEGACY = "s34"
 PHASE_CKPT = "biochem_gnn"
-PHASE_CKPT_LEGACY = "s34_temporal_gate"
 PHASE_MANIFEST = "biochem_gnn_baseline"
 PHASE_LOAO_INDEX = "biochem_gnn_loao"
 
@@ -63,7 +61,7 @@ STAGING_CKPT_PICK = STAGING_DIR / "ckpt_pick.json"
 STAGING_LOAO_EVAL = STAGING_DIR / "loao_eval_gt.json"
 
 DEFAULT_KINE_CKPT = Path("outputs/kinematics/kinematics_best.pth")
-INIT_WARMSTART = Path("outputs/biochem/species_snapshot_s33/best.pth")
+INIT_WARMSTART = Path("outputs/biochem/biochem_gnn/locked/species_gnn_best.pth")
 
 # --- legacy path fallbacks (read / migration) ---
 LEGACY_CLOT_DEPLOY_ROOT = Path("outputs/biochem/clot_deploy_gnn")
@@ -74,7 +72,7 @@ LEGACY_CLOT_LOCKED = LEGACY_CLOT_DEPLOY_ROOT / "locked"
 LEGACY_CLOT_REF = Path("data/reference/clot_deploy_gnn_baseline.json")
 LEGACY_CLOT_STAGING = Path("data/reference/clot_deploy_gnn_staging.json")
 
-LEGACY_GLOBAL = Path("outputs/biochem/species_snapshot_s34/best.pth")
+LEGACY_GLOBAL = Path("outputs/biochem/biochem_gnn/locked/species_gnn_best.pth")
 LEGACY_BETA = Path("outputs/biochem/species_snapshot_s35/beta.pth")
 LEGACY_LOAO = Path("outputs/biochem/species_gnn_loao")
 LEGACY_LOCKED = Path("outputs/biochem/species_gnn_deploy_baseline")
@@ -108,9 +106,7 @@ GLOBAL_TRAIN_RECIPE: dict[str, str] = {
     "SPECIES_CONTINUOUS_MATURE_FP_EXEMPT": "1",
     "SPECIES_CONTINUOUS_MATURE_FRAC": "0.95",
     "SPECIES_CONTINUOUS_SATURATION_SCALE": "80",
-    "SPECIES_CONTINUOUS_TEMPORAL_GATE": "1",
-    "SPECIES_CONTINUOUS_TEMPORAL_LAMBDA_MIN": "0.5",
-    "SPECIES_CONTINUOUS_TEMPORAL_LAMBDA_MAX": "1.5",
+    # Baseline temporal handling is explicit tau + Fourier context only.
     "SPECIES_CONTINUOUS_VEL_DECAY": "1",
     "SPECIES_CONTINUOUS_TEACHER_NOISE": "0.02",
     "SPECIES_CONTINUOUS_TEACHER_FP_FRAC": "0.08",
@@ -150,7 +146,6 @@ DEPLOY_INFERENCE_ENV: dict[str, str] = {
     "SPECIES_CONTINUOUS_TIME_CONTEXT": "1",
     "SPECIES_CONTINUOUS_TIME_REF_S": "3000",
     "SPECIES_CONTINUOUS_TIME_FOURIER_FREQS": "8",
-    "SPECIES_CONTINUOUS_TEMPORAL_GATE": "1",
     "SPECIES_CONTINUOUS_VEL_DECAY": "1",
     "SPECIES_CONTINUOUS_MATURE_FP_EXEMPT": "1",
     "SPECIES_VISCOSITY_CALIB": "1",
@@ -163,15 +158,7 @@ DEPLOY_INFERENCE_ENV: dict[str, str] = {
     "SPECIES_ROLLOUT_IC_SOURCE": "resting",
 }
 
-CKPT_PHASE_ALIASES = frozenset({
-    PHASE_CKPT,
-    PHASE_CKPT_LEGACY,
-    "clot_deploy_gnn",
-    "s34",
-    "s34_temporal_gate",
-    "species_gnn_deploy_baseline",
-    "species_gnn_deploy_r4_loao",
-})
+CKPT_PHASE_ALIASES = frozenset({PHASE_CKPT, "clot_deploy_gnn", "species_gnn_deploy_baseline"})
 
 
 def repo_root() -> Path:
@@ -228,14 +215,13 @@ def staging_ckpt_pick_path() -> Path:
 def normalize_train_phase(phase: str) -> str:
     p = (phase or "").strip().lower()
     if p in (PHASE_TRAIN, "clot_deploy_gnn", "deploy_gnn", "clot_deploy"):
-        return PHASE_TRAIN_LEGACY
+        return PHASE_CKPT
     return p
 
 
 def checkpoint_phase_tag(train_phase: str) -> str:
-    if normalize_train_phase(train_phase) == PHASE_TRAIN_LEGACY:
-        return PHASE_CKPT
-    return train_phase
+    _ = train_phase
+    return PHASE_CKPT
 
 
 def is_biochem_gnn_checkpoint_phase(phase: str) -> bool:
@@ -244,7 +230,6 @@ def is_biochem_gnn_checkpoint_phase(phase: str) -> bool:
         pl in CKPT_PHASE_ALIASES
         or "biochem_gnn" in pl
         or "clot_deploy_gnn" in pl
-        or "s34" in pl
     )
 
 
@@ -374,7 +359,13 @@ def apply_deploy_env(
             merged["SPECIES_GELATION_BETA_OVERRIDE"] = str(beta_ov[stem])
     merged["KINEMATICS_CHECKPOINT"] = str(m.get("kinematics_ckpt", rel_path(DEFAULT_KINE_CKPT)))
     scope = m.get("species_scope") or m.get("pushforward_species_scope")
-    if scope:
+    channels = m.get("species_channels") or m.get("pushforward_species_channels")
+    if channels:
+        if isinstance(channels, (list, tuple)):
+            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(x)) for x in channels)
+        else:
+            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
+    elif scope:
         merged["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
     if m.get("loao_auto") is not None:
         merged["BIOCHEM_GNN_LOAO_AUTO"] = str(m.get("loao_auto"))

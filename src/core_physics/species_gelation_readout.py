@@ -17,11 +17,12 @@ import torch.nn.functional as F
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
 from src.core_physics.clot_phi_simple import (
     clot_phi_physics_mu_ratio_max,
+    gt_mu_anchor_cap_si,
     mat_si_for_gelation_from_log1p,
     species_log1p_nd_to_si,
 )
 from src.core_physics.species_pushforward_gnn import STATE_DIM
-from src.core_physics.t0_mu_physics import gt_clot_phi_at_time, gt_mu_anchor_cap_si
+from src.core_physics.t0_mu_physics import gt_clot_phi_at_time
 from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
 from src.utils.rheology import multiplicative_clot_mu_eff_nd, phi_clot_from_mat_fi
 
@@ -110,6 +111,62 @@ def gelation_frontier_boost() -> float:
         return 2.0
 
 
+def _env_f(name: str, default: float, lo: float = 0.0) -> float:
+    raw = (os.environ.get(name) or str(default)).strip()
+    try:
+        return max(float(raw), lo)
+    except ValueError:
+        return default
+
+
+def footprint_tversky_enabled() -> bool:
+    """Moves 2+3: shape the clot footprint with a precision/recall-weighted Tversky loss."""
+    raw = (os.environ.get("SPECIES_FOOTPRINT_TVERSKY") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def footprint_tversky_params() -> dict[str, float]:
+    return {
+        "alpha": _env_f("SPECIES_FOOTPRINT_TVERSKY_ALPHA", 0.7),   # FP weight (precision, move 2)
+        "beta": _env_f("SPECIES_FOOTPRINT_TVERSKY_BETA", 0.3),     # FN weight (recall, move 3)
+        "wall_fp_w": _env_f("SPECIES_FOOTPRINT_WALL_FP_W", 2.0, 1.0),   # extra FP penalty on wall (move 2)
+        "lumen_fn_w": _env_f("SPECIES_FOOTPRINT_LUMEN_FN_W", 2.0, 1.0),  # extra FN penalty in lumen (move 3)
+        "bce_blend": _env_f("SPECIES_FOOTPRINT_BCE_BLEND", 0.25),  # keep some calibrated BCE
+    }
+
+
+def footprint_tversky_loss(
+    pred_phi: torch.Tensor,
+    gt_phi: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    wall: torch.Tensor | None = None,
+    lumen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Soft weighted Tversky: TP/(TP + a*FP + b*FN), FP up-weighted on wall, FN up-weighted in lumen."""
+    m = mask.reshape(-1).to(device=pred_phi.device).bool()
+    if not bool(m.any().item()):
+        return pred_phi.sum() * 0.0
+    p = pred_phi.reshape(-1)[m].clamp(1e-6, 1.0 - 1e-6)
+    t = gt_phi.reshape(-1)[m].clamp(0.0, 1.0)
+    par = footprint_tversky_params()
+    fp_w = torch.ones_like(p)
+    fn_w = torch.ones_like(p)
+    if wall is not None:
+        fp_w = fp_w + (par["wall_fp_w"] - 1.0) * wall.reshape(-1).to(p)[m]
+    if lumen is not None:
+        fn_w = fn_w + (par["lumen_fn_w"] - 1.0) * lumen.reshape(-1).to(p)[m]
+    tp = (p * t).sum()
+    fp = (par["alpha"] * fp_w * p * (1.0 - t)).sum()
+    fn = (par["beta"] * fn_w * (1.0 - p) * t).sum()
+    tversky = tp / (tp + fp + fn + 1e-6)
+    loss = 1.0 - tversky
+    blend = par["bce_blend"]
+    if blend > 0.0:
+        loss = loss + blend * F.binary_cross_entropy(p, t, reduction="mean")
+    return loss
+
+
 def gelation_phi_loss(
     pred_phi: torch.Tensor,
     gt_phi: torch.Tensor,
@@ -148,6 +205,8 @@ class SpeciesPhysicsCtx:
     time_window: list[int]
     rest_band: torch.Tensor
     mu_anchor_si: torch.Tensor
+    wall_band: torch.Tensor | None = None
+    lumen_band: torch.Tensor | None = None
 
 
 def build_species_physics_ctx(
@@ -164,6 +223,11 @@ def build_species_physics_ctx(
     rest_full = resting_species_log_nd(data, device)
     rest_band = rest_full[node_idx]
     anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
+    wall_band = lumen_band = None
+    if footprint_tversky_enabled() and hasattr(data, "mask_wall"):
+        wall_full = data.mask_wall.reshape(-1).to(device=device).bool()
+        wall_band = wall_full[node_idx].float()
+        lumen_band = (~wall_full[node_idx]).float()
     return SpeciesPhysicsCtx(
         data=data,
         phys_cfg=phys_cfg,
@@ -172,6 +236,8 @@ def build_species_physics_ctx(
         time_window=[int(t) for t in time_window],
         rest_band=rest_band,
         mu_anchor_si=anchor[node_idx],
+        wall_band=wall_band,
+        lumen_band=lumen_band,
     )
 
 
@@ -215,7 +281,12 @@ def physics_readout_losses(
     sp12 = band_log_state_to_species12(log_state, ctx.rest_band)
     phi_pred = differentiable_clot_phi_from_species12(sp12, ctx.bio_cfg)
     phi_gt = gt_phi_band_at_time(ctx, time_index, device)
-    phi_l = gelation_phi_loss(phi_pred, phi_gt, train_mask)
+    if footprint_tversky_enabled():
+        phi_l = footprint_tversky_loss(
+            phi_pred, phi_gt, train_mask, wall=ctx.wall_band, lumen=ctx.lumen_band
+        )
+    else:
+        phi_l = gelation_phi_loss(phi_pred, phi_gt, train_mask)
 
     mu_l = log_state.sum() * 0.0
     if continuous_mu_loss_weight() > 0.0:

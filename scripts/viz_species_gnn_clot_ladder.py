@@ -50,7 +50,7 @@ def main() -> int:
     ckpt = Path(args.ckpt) if args.ckpt.strip() else None
     bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
     if bundle is None:
-        raise SystemExit("[ERR] missing species GNN checkpoint (s25 or s2)")
+        raise SystemExit("[ERR] missing species GNN checkpoint (biochem_gnn baseline)")
 
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")

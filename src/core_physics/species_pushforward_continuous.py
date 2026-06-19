@@ -63,12 +63,8 @@ from src.config import VesselConfig
 from src.training.biochem_loss_policy import ActiveGrowthHuberLoss
 from src.utils.paths import get_project_root
 
-DEFAULT_CONTINUOUS_CKPT = "outputs/biochem/species_snapshot_s25/best.pth"
-DEFAULT_S26_CKPT = "outputs/biochem/species_snapshot_s26/best.pth"
-DEFAULT_S30_CKPT = "outputs/biochem/species_snapshot_s30/best.pth"
-DEFAULT_S31_CKPT = "outputs/biochem/species_snapshot_s31/best.pth"
-DEFAULT_S32_CKPT = "outputs/biochem/species_snapshot_s32/best.pth"
-DEFAULT_S33_CKPT = "outputs/biochem/species_snapshot_s33/best.pth"
+# Legacy alias retained for compatibility; default now points at canonical biochem_gnn species checkpoint.
+DEFAULT_CONTINUOUS_CKPT = "outputs/biochem/biochem_gnn/species/best.pth"
 DEFAULT_S34_CKPT = "outputs/biochem/biochem_gnn/species/best.pth"
 
 BIOCHEM_ANCHORS_6 = (
@@ -274,21 +270,13 @@ def continuous_mature_fp_exempt() -> bool:
 
 
 def continuous_temporal_gate() -> bool:
-    raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_GATE") or "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    """Retired temporal lambda gate (kept off globally)."""
+    return False
 
 
 def temporal_lambda_bounds() -> tuple[float, float]:
-    lo_raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_LAMBDA_MIN") or "0.5").strip()
-    hi_raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_LAMBDA_MAX") or "1.5").strip()
-    try:
-        lo = float(lo_raw)
-        hi = float(hi_raw)
-    except ValueError:
-        lo, hi = 0.5, 1.5
-    if hi <= lo:
-        hi = lo + 1.0
-    return lo, hi
+    # Compatibility only; temporal gate is disabled.
+    return 1.0, 1.0
 
 
 def continuous_delta_residual() -> bool:
@@ -1915,7 +1903,7 @@ def save_continuous_checkpoint(
         "in_dim": model.in_dim,
         "hidden": model.hidden,
         "out_dim": model.out_dim,
-        "phase": str(meta.get("phase", "s25_continuous")),
+        "phase": str(meta.get("phase", "biochem_gnn")),
         "meta": meta,
     }
     torch.save(payload, p)
@@ -2013,8 +2001,8 @@ def load_continuous_bundle(
         os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
     if bool(meta.get("vel_decay")):
         os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
-    if bool(meta.get("temporal_gate")):
-        os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "1"
+    # Retired: never re-enable temporal lambda gate from checkpoint metadata.
+    os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "0"
     if bool(meta.get("delta_residual")):
         os.environ["SPECIES_CONTINUOUS_DELTA_RESIDUAL"] = "1"
     if bool(meta.get("temporal_offset")):

@@ -24,7 +24,6 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_forward_apply_region,
     clot_phi_hybrid_enabled,
     clot_phi_model_uses_mpnn,
-    clot_phi_physics_subtract_t0_mu,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
     physics_mu_eff_si,
@@ -142,7 +141,7 @@ def forward_physics_trigger_phi(
         region,
         phys_cfg,
         soft=use_soft,
-        mu_anchor_si=mu_anchor_si if clot_phi_physics_subtract_t0_mu() else None,
+        mu_anchor_si=mu_anchor_si,
     )
     return phi_phys.reshape(-1), mu_phys.reshape(-1)
 
@@ -173,7 +172,7 @@ def forward_clot_trigger_hybrid(
         use_soft=use_soft,
         apply_region=clot_phi_forward_apply_region() and not _env_bool("CLOT_TRIGGER_NUCLEATION", True),
         time_index=time_index,
-        mu_anchor_si=mu_anchor_si if clot_phi_physics_subtract_t0_mu() else None,
+        mu_anchor_si=mu_anchor_si,
     )
     logits = _model_logits(model, step.features, edge_index)
     phi_ml = torch.sigmoid(logits)
@@ -242,7 +241,7 @@ def forward_trigger_rollout_step(
         mu_anchor_si=mu_anchor_si,
     )
     mu_anchor_out = mu_anchor_si
-    if mu_anchor_out is None and clot_phi_physics_subtract_t0_mu():
+    if mu_anchor_out is None:
         mu_anchor_out = bundle["mu_phys"].reshape(-1).detach().clone()
     seed_raw = growth_seed if growth_seed is not None else clot_trigger_forward_seed_mode()
     seed: str = "gt" if seed_raw == "gt" else "pred"
@@ -278,9 +277,7 @@ def forward_trigger_rollout_step(
 def apply_clot_trigger_deploy_env() -> None:
     """Deploy-faithful default: pred forward E(tau), fixed ceiling loss, growth-only GT labels."""
     apply_neighbor_band_trigger_env()
-    os.environ.setdefault("CLOT_PHI_PHYSICS_SUBTRACT_T0_MU", "1")
     os.environ.setdefault("CLOT_TRIGGER_IC_PHI_ZERO", "1")
-    os.environ.setdefault("CLOT_PHI_GT_SUBTRACT_T0_MU", "1")
     os.environ["CLOT_PHI_LOSS_SCOPE"] = "ceiling"
     os.environ["CLOT_PHI_GROWTH_SEED"] = "pred"
     os.environ["CLOT_PHI_CLOT_SEED_SOURCE"] = "wall"
@@ -298,9 +295,7 @@ def apply_clot_trigger_honest_env() -> None:
 def apply_clot_trigger_oracle_debug_env() -> None:
     """Explicit oracle: GT growth expansion for loss + GT forward envelope (upper bound only)."""
     apply_neighbor_band_trigger_env()
-    os.environ.setdefault("CLOT_PHI_PHYSICS_SUBTRACT_T0_MU", "1")
     os.environ.setdefault("CLOT_TRIGGER_IC_PHI_ZERO", "1")
-    os.environ.setdefault("CLOT_PHI_GT_SUBTRACT_T0_MU", "1")
     os.environ["CLOT_PHI_LOSS_SCOPE"] = "support"
     os.environ["CLOT_PHI_SUPPORT_BAND"] = "ceiling_growth"
     os.environ["CLOT_PHI_GROWTH_SEED"] = "gt"

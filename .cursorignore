@@ -1,19 +1,35 @@
-#    
-//*
-//*.
-//*
-//*
-*.
-*.
-*.
-*.
+# .cursorignore - what Cursor indexes AND what the agent can access
+# (separate from .gitignore). Hide heavy/binary files; keep source,
+# docs, JSON reports and text data readable on demand.
 
-#  
-/
-./
-/
-.
+# Heavy / binary simulation + mesh assets
+*.nas
+*.msh
+*.mph
+*.stl
+*.dxf
+*.vtu
+*.vtk
 
-#  
-/
-*.
+# Model checkpoints / tensors (large binaries)
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+
+# Python / build caches
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS cruft
+.DS_Store
+Thumbs.db

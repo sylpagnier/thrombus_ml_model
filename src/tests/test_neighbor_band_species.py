@@ -48,6 +48,24 @@ def test_all_pushforward_scope() -> None:
     assert pushforward_state_dim() == 12
 
 
+def test_explicit_channel_list_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BIOCHEM_PUSHFORWARD_SPECIES_SCOPE", raising=False)
+    monkeypatch.setenv("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS", "8,11,5")
+    from src.training.biochem_species_scope import (
+        parse_channel_list,
+        pushforward_channels_from_env,
+        pushforward_state_bulk_indices,
+        scope_label_for_channels,
+    )
+
+    assert parse_channel_list("FI,Mat,T") == [8, 11, 5]
+    assert parse_channel_list("8,11,5") == [8, 11, 5]
+    assert pushforward_channels_from_env() == [8, 11, 5]
+    assert pushforward_state_bulk_indices() == [8, 11, 5]
+    assert scope_label_for_channels([8, 11, 5]) == "fi_mat_thrombin"
+    assert scope_label_for_channels([8, 11, 4]) == "fi_mat+PT"
+
+
 def test_neighbor_mask_mode_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.training.biochem_supervision_masks import resolve_data_bio_supervision_mask
 

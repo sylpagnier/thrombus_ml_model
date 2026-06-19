@@ -35,7 +35,7 @@ if ($Step -eq "beta") { $Step = "viscosity" }
 $SpeciesCkpt = "outputs/biochem/biochem_gnn/species/best.pth"
 $BetaCkpt = "outputs/biochem/biochem_gnn/viscosity/beta.pth"
 $LoaoRoot = "outputs/biochem/biochem_gnn/loao"
-$InitWarm = "outputs/biochem/species_snapshot_s33/best.pth"
+$InitWarm = "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth"
 $StagingManifest = "data/reference/biochem_gnn_staging.json"
 $ReferenceManifest = "data/reference/biochem_gnn_baseline.json"
 $StagingEval = "outputs/biochem/biochem_gnn/staging/loao_eval_gt.json"
@@ -97,16 +97,11 @@ p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(m, indent=2), encoding='utf-8')
 print('[OK] staging manifest', p)
 "@
-    Invoke-PythonRcCheck -Label "pick ckpts" -PyArgs @(
-        "scripts/pick_species_gnn_loao_ckpts.py",
+    Invoke-PythonRcCheck -Label "deploy eval" -PyArgs @(
+        "scripts/eval_biochem_gnn_deploy_ab.py",
         "--manifest", $StagingManifest,
-        "--flow", "gt",
-        "--s0-f1", "0.408"
-    )
-    Invoke-PythonRcCheck -Label "loao eval" -PyArgs @(
-        "scripts/eval_t0_rung4_species_gnn_loao.py",
-        "--manifest", $StagingManifest,
-        "--flow", "both",
+        "--modes", "deploy_frozen",
+        "--times", "27,53",
         "--out", $StagingEval
     )
 }

@@ -49,7 +49,7 @@ $InitWarm = "outputs/biochem/biochem_gnn/global_guiding_5h/species/best.pth"
 foreach ($cand in @(
     "outputs/biochem/biochem_gnn/global_fulltime/species/best.pth",
     "outputs/biochem/species_gnn_deploy_baseline/species_gnn_best.pth",
-    "outputs/biochem/species_snapshot_s33/best.pth"
+    "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth"
 )) {
     if (-not (Test-Path (Join-Path $RepoRoot $InitWarm))) {
         if (Test-Path (Join-Path $RepoRoot $cand)) { $InitWarm = $cand }

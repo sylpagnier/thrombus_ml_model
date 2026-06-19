@@ -1,50 +1,39 @@
-    
+HemoGINO: Practical AI Coding Rules
 
- 
--      //, //, // (    // ****  //), //, //, //,  //.
--     , / ,  ,  ,   .
--      / (()), / / / (), // (()),  /       .
+Project Reality
+- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_gen/` (pipelines at package root; mesh/COMSOL/graph **lib** under `data_gen/lib/`), `src/training/`, `src/evaluation/`, `src/utils/`, and `src/tests/`.
+- The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
+- Large binary and generated artifacts: `data/` (`data_root()`), `outputs/stage_a` / `outputs/stage_b` (checkpoints), `outputs/reports/` (`reports_dir()`), and `comsol_models/`; do not treat them as source code.
 
-  ()
--   (//.)     (   -).
--   (//.)  -  (-     ).
--   (//.)    /      (  ).
--   - ..     ()    () .
--                    /.
+Tier Definitions (authoritative)
+- Tier 1 (`src/training/train_t1_predictor.py`): Newtonian hemodynamics baseline only (Stage A predictor warm-up).
+- Tier 2 (`src/training/train_t2_predictor.py`): adds non-Newtonian rheology (Carreau-Yasuda style behavior; Stage A predictor).
+- Tier 3 (`src/training/train_t3_corrector.py`): adds biochemical clot dynamics/coupling on top of flow backbone (Stage B corrector).
+- Orchestrator: `python -m src.main {a|b|all}` chains Stage A (predictor) and Stage B (corrector) training.
+- Do not assume Tier 3 is the primary stage for kinematic gains; major velocity quality should come from Tier 1/2.
 
-   ()
--  /    - ().   /   /     -.
--      /-.   -       (/ ),  -.
--      - /   .     -    "".
--               -     -     .
+Code Priorities
+- Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
+- Keep boundaries clear: shared physics lives in `core_physics`; GNODE/DEQ/LoRA in `architecture`; graphs/meshes/datagen in `data_gen`.
+- Prefer small, local changes over broad refactors unless explicitly requested.
+- Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
 
- 
--  -      ,  ,   .
--         //   //  .
--  ,        .
--      (, , , , , )    .
+Physics and Modeling Guardrails
+- Carreau-Yasuda rheology and Navier-Stokes consistency are central; avoid edits that weaken these constraints without justification.
+- For DEQ-related changes, preserve solver stability and convergence behavior.
+- For Tier 3 work, preserve the intended split between trainable adaptation layers and physics kernels unless asked otherwise.
 
-   
-- -   -           .
--  - ,      .
--    ,              .
+Data and File Hygiene
+- Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints).
+- Do not create duplicate source files with mixed path separators (for example both `src/file.py` and `src\file.py` variants).
+- Keep reusable logic in `src/`; interactive diagnostics live under `src/tools/`; automated tests under `src/tests/`.
 
-   
--     /  (, ., .,  //).
--           (   /.  . ).
--     /     //    //.
+Testing Expectations
+- Any meaningful logic change should include or update focused pytest coverage.
+- For physics kernels and extraction code, validate both numerical sanity and shape/index safety.
+- When touching training or data pipelines, run the smallest relevant test subset first, then expand if needed.
 
- 
--           .
--      ,      / .
--      ,       ,    .
-
-    
--     (  //.),   - /   .
--              // .
--       -    -      / .
-
-  
--   /    (  ).
--      -   ,      .
--   ,       /   .
+Documentation and Readability
+- Prefer concise docstrings/comments that explain why (not obvious what).
+- Keep equations plain text or LaTeX-compatible text where helpful, but prioritize clarity over notation density.
+- When behavior changes, update nearby docs or comments so phase/tier intent stays clear.

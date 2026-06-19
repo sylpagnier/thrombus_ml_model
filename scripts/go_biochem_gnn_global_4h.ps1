@@ -28,7 +28,7 @@ if (-not $Fresh -and (Test-Path (Join-Path $RepoRoot $GlobalSpecies))) {
     Write-Host "[i] resume warm-start from $InitWarm" -ForegroundColor DarkGray
 }
 if (-not (Test-Path (Join-Path $RepoRoot $InitWarm))) {
-    $InitWarm = "outputs/biochem/species_snapshot_s33/best.pth"
+    $InitWarm = "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth"
 }
 
 $env:SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL = "1"

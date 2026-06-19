@@ -147,19 +147,6 @@ def physics_sweep_legs() -> list[dict[str, Any]]:
             },
         },
         {
-            "id": "A_legacy_carreau_no_t0",
-            "note": "Legacy: no t0 mu subtract (ablation only)",
-            "env": {
-                "CLOT_PHI_PHYSICS_SUBTRACT_T0_MU": "0",
-                "CLOT_TRIGGER_IC_PHI_ZERO": "0",
-            },
-        },
-        {
-            "id": "N_subtract_t0_mu",
-            "note": "Alias: explicit t0 mu subtract (same as default A)",
-            "env": {"CLOT_PHI_PHYSICS_SUBTRACT_T0_MU": "1", "CLOT_TRIGGER_IC_PHI_ZERO": "1"},
-        },
-        {
             "id": "Z_gt_mu_oracle",
             "note": "Upper bound: phi from GT mu_eff (not physics)",
             "env": {},

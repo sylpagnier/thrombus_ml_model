@@ -84,20 +84,9 @@ def gt_clot_mask_at_time(
     time_index: int,
     phys_cfg: PhysicsConfig,
     device: torch.device,
-    *,
-    growth_only: bool | None = None,
 ) -> torch.Tensor:
-    """GT clot nodes. Default follows ``CLOT_PHI_GT_SUBTRACT_T0_MU`` (growth-only)."""
-    if growth_only is None:
-        from src.core_physics.clot_phi_simple import clot_phi_gt_subtract_t0_mu
-
-        growth_only = clot_phi_gt_subtract_t0_mu()
-    if growth_only:
-        return gt_growth_commit_mask_at_time(data, time_index, phys_cfg, device)
-    y = data.y[int(time_index)].to(device=device)
-    mu = phys_cfg.viscosity_nd_to_si(y[:, STATE_CHANNEL_MU_EFF_ND]).reshape(-1)
-    thr = clot_phi_thresh_si(phys_cfg)
-    return (mu >= thr).bool()
+    """GT clot nodes: growth-only above per-node mu at macro t=0."""
+    return gt_growth_commit_mask_at_time(data, time_index, phys_cfg, device)
 
 
 def gt_growth_commit_mask_at_time(

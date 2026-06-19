@@ -66,7 +66,7 @@ def _build_meta(
 ) -> Dict[str, Any]:
     curve_type = str(params.get("curve_type", "straight"))
     v_type = str(params.get("v_type", "straight"))
-    return {
+    meta = {
         "id": idx,
         "type": f"{v_type}_{curve_type}",
         "curve": curve_type,
@@ -86,6 +86,22 @@ def _build_meta(
         "top_wall_normals": top_normals.tolist(),
         "bot_wall_normals": bot_normals.tolist(),
     }
+
+    # Inject boundary-layer patch metadata for the COMSOL mu-clot painter.
+    for key in (
+        "clot_x_center",
+        "clot_height",
+        "clot_width",
+        "clot_edge_width",
+        "clot_mu_peak",
+        "inlet_shear_rate",
+    ):
+        if key in params:
+            meta[key] = float(params[key])
+    if "clot_shape" in params:
+        meta["clot_shape"] = str(params["clot_shape"])
+
+    return meta
 
 
 def compute_geometry_from_params(params: Dict[str, Any], cfg_dict: Dict[str, Any]) -> VesselGeometry:

@@ -219,6 +219,42 @@ def pushforward_feature_dim(latent_dim: int, *, state_dim: int | None = None) ->
     return int(latent_dim) + 1 + sd
 
 
+def stagnation_feats_enabled() -> bool:
+    """Move 4: append deployable low-shear/stagnation proxy features to band inputs."""
+    raw = (os.environ.get("SPECIES_STAGNATION_FEATS") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+@torch.no_grad()
+def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
+    """Deployable stagnation proxies on band nodes: [log1p(speed), log1p(shear_proxy), x_norm, y_norm].
+
+    Shear proxy = mean neighbour speed-gradient magnitude (a clot-free flow stagnation signal the
+    z_kin latent encodes only implicitly). All from the kinematic flow + geometry -> deployable.
+    """
+    from src.utils.kinematics_inference import predict_kinematics
+
+    uv = predict_kinematics(kine_model, data.clone()).to(device=device)
+    u, v = uv[:, 0], uv[:, 1]
+    speed = torch.sqrt(u * u + v * v)
+    pos = data.x[:, :2].to(device=device, dtype=speed.dtype)
+    row, col = data.edge_index.to(device=device)
+    dist = (pos[row] - pos[col]).norm(dim=1).clamp(min=1e-6)
+    grad = (speed[row] - speed[col]).abs() / dist
+    n = int(data.num_nodes)
+    acc = torch.zeros(n, device=device, dtype=speed.dtype)
+    deg = torch.zeros(n, device=device, dtype=speed.dtype)
+    acc.index_add_(0, row, grad)
+    deg.index_add_(0, row, torch.ones_like(grad))
+    shear_proxy = acc / deg.clamp(min=1.0)
+    pn = (pos - pos.mean(0)) / pos.std(0).clamp(min=1e-6)
+    feats = torch.stack(
+        [torch.log1p(speed.clamp(min=0)), torch.log1p(shear_proxy.clamp(min=0)), pn[:, 0], pn[:, 1]],
+        dim=1,
+    )
+    return feats[node_idx]
+
+
 def build_band_base_features(
     data,
     kine_model,
@@ -240,6 +276,9 @@ def build_band_base_features(
         kin_mean, kin_std = kinematic_latent_band_stats(z_kin, node_idx)
     sdf = sdf_nd_from_data(data, device, n)
     base_feats = build_snapshot_features(z_kin, sdf, kin_mean=kin_mean, kin_std=kin_std)[node_idx]
+    if stagnation_feats_enabled():
+        stag = _stagnation_band_features(data, kine_model, device, node_idx).to(dtype=base_feats.dtype)
+        base_feats = torch.cat([base_feats, stag], dim=1)
     pos_band = data.x[node_idx, :2].to(device=device, dtype=base_feats.dtype)
     return {
         "base_feats": base_feats,

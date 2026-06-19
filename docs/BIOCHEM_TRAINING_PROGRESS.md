@@ -131,6 +131,15 @@ Training is staged by **loss complexity** and **pipeline length**, not a single 
 
 **New-vessel + extrapolation viz:** `scripts/go_teacher_new_vessel_clot_viz.ps1` -> `src/evaluation/visualize_pipeline.py --teacher-only --synthetic` (sets pred-kine env + `VIZ_BIOCHEM_EXTRA_FRACTION` for time past `t_final`). Headless clot phi/mu on anchors: `scripts/snapshot_biochem_teacher_clotband.py`.
 
+### Biochem GNN onset follow-up (2026-06-17)
+
+Longer-budget promotion follow-up (`scripts/go_onset_promotion_followup.ps1`) for top two onset recipes; both trained 12 epochs and early-stopped.
+
+| Date | Config | p007 clot F1@t53 | Holdout mean F1@t53 | r | Note |
+|------|--------|-------------------|----------------------|---|------|
+| 2026-06-17 | `train_vel=kinematics`, baseline losses (`fp_w=8`) | 0.511 | 0.325 | n/a | Below locked baseline (0.701 / 0.523); not promotable |
+| 2026-06-17 | `train_vel=kinematics`, `fp_w=2` | 0.507 | 0.316 | n/a | Slightly worse than fp_w=8; not promotable |
+
 ### Gate checklist
 
 | Gate | Target (teacher) | Status | Notes |

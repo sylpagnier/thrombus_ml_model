@@ -1,8 +1,8 @@
-"""Phase 6 (s35): freeze s34 species GNN; finetune global Mat boost beta for mu @ T=53.
+"""Viscosity beta calibration: freeze baseline species GNN; fit global Mat boost beta.
 
 Usage::
 
-    python scripts/train_clot_phi_calibration.py --gnn-ckpt outputs/biochem/species_snapshot_s34/best.pth
+    python scripts/train_clot_phi_calibration.py --gnn-ckpt outputs/biochem/biochem_gnn/species/best.pth
     python scripts/train_clot_phi_calibration.py --all-anchors --epochs 200
 """
 

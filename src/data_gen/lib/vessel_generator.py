@@ -610,8 +610,16 @@ def _mesh_geometry(
         tags = cfg_dict["TAGS"]
         gmsh.model.addPhysicalGroup(1, [l_in], tags["Inlet"], name="Inlet")
         gmsh.model.addPhysicalGroup(1, [l_out], tags["Outlet_1"], name="Outlet_1")
-        gmsh.model.addPhysicalGroup(1, [s_top, s_bot], tags["Walls"], name="Walls")
         gmsh.model.addPhysicalGroup(2, [s], tags["Fluid_Domain"], name="Fluid_Domain")
+
+        # Boundary-layer patch cohort: split the lumped "Walls" group so COMSOL can apply
+        # no-slip on the bottom (where the clot attaches) and slip/symmetry on the top
+        # (unperturbed freestream). Standard vessels keep the single lumped "Walls" group.
+        if "Wall_Bottom" in tags and "Slip_Boundary" in tags:
+            gmsh.model.addPhysicalGroup(1, [s_bot], tags["Wall_Bottom"], name="Wall_Bottom")
+            gmsh.model.addPhysicalGroup(1, [s_top], tags["Slip_Boundary"], name="Slip_Boundary")
+        else:
+            gmsh.model.addPhysicalGroup(1, [s_top, s_bot], tags["Walls"], name="Walls")
 
         gmsh.model.mesh.generate(2)
 
@@ -677,6 +685,20 @@ class VesselGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if output_dir is None:
             migrate_legacy_vessel_meshes(self.output_dir)
+
+    def _sample_one(
+        self,
+        idx: int,
+        level: int,
+        rng: np.random.Generator,
+        pathology_mode: str | None = None,
+    ) -> Dict[str, Any]:
+        """Sample one vessel parameter dict.
+
+        Subclasses (e.g. ``BoundaryLayerPatchGenerator``) override this to swap in a
+        different parameter sampler while reusing the shared ``run_pipeline`` driver.
+        """
+        return _sample_params(idx, level, self.cfg, rng, pathology_mode=pathology_mode)
 
     def _cfg_dict(self) -> Dict[str, Any]:
         return {
@@ -824,10 +846,9 @@ class VesselGenerator:
         # Pre-sample everything in the main process
         per_vessel_levels = cohort_levels(n, level, level_mix, rng)
         all_params = [
-            _sample_params(
+            self._sample_one(
                 start_idx + i,
                 per_vessel_levels[i],
-                self.cfg,
                 rng,
                 pathology_mode=pathology_mode,
             )
@@ -905,10 +926,9 @@ class VesselGenerator:
             logger.info(f"Retry {retry_round}/{max_retries}: {len(failed_params)} samples")
 
             retry_batch = [
-                _sample_params(
+                self._sample_one(
                     int(failed_p["idx"]),
                     int(failed_p.get("level", level)),
-                    self.cfg,
                     rng,
                     pathology_mode=pathology_mode,
                 )
@@ -989,6 +1009,129 @@ class VesselGeneratorPhase3(VesselGenerator):
             unit=unit,
             pathology_mode=pathology_mode,
         )
+
+
+def _sample_patch_params(
+    idx: int, cfg: VesselConfig, rng: np.random.Generator
+) -> Dict[str, Any]:
+    """Force a flat 2mm x 300-400um box and define the mu-clot metadata.
+
+    The clot is NOT a hole in the mesh: the channel stays a perfectly flat fluid box.
+    The clot morphology (center, height, width, shape, peak viscosity) and the inlet
+    shear rate are emitted as metadata so the downstream COMSOL script can paint an
+    analytical Carreau viscosity field (mu spikes to ``clot_mu_peak`` over the clot
+    footprint on the no-slip bottom wall).
+
+    Domain sizing (avoid the "nozzle"/Venturi artifact):
+      * length 2mm gives ~700um unperturbed upstream development, a clot up to ~625um,
+        and ~700um downstream for the wake/reattachment zone.
+      * channel height 300-400um keeps the displaced flow far from the slip top wall so
+        it diffuses upward instead of accelerating through a narrow gap.
+
+    Morphology sweep (bias toward long, flat "smears", not just semicircles):
+      * ``clot_width`` swept 100um (~20 nodes) -> 625um (~125 nodes), biased wide.
+      * ``clot_shape`` in {plateau, gaussian, bbox}; plateau = sharp leading step,
+        long flat top, sharp trailing step (teaches the GNN the front stagnation zone
+        vs the parallel shear flow along the top).
+    """
+    length = float(cfg.base_length)  # 2mm (set by BoundaryLayerPatchGenerator)
+    n = cfg.num_ctrl_pts
+    lc = float(cfg.mesh_lc)
+
+    # Channel height (wall-normal). Sweep 300-400um so the top slip wall behaves as a
+    # near-infinite freestream relative to the boundary-layer-scale clot.
+    width = float(rng.uniform(cfg.width_min, cfg.width_max))
+
+    # Clot height: a boundary-layer-scale bump (~2-6 nodes). Keep the blockage ratio low
+    # (height / channel height ~ 3-10%) to avoid the artificial nozzle effect.
+    clot_height = float(rng.uniform(2.0 * lc, 6.0 * lc))
+
+    # Clot width (streamwise): sweep 20 -> 125 nodes, heavily biased toward wide smears.
+    # Beta(2,1) skews the fraction toward 1.0, favoring long flat morphologies.
+    min_w_nodes, max_w_nodes = 20.0, 125.0
+    wide_frac = float(rng.beta(2.0, 1.0))
+    clot_width = (min_w_nodes + wide_frac * (max_w_nodes - min_w_nodes)) * lc
+
+    # Morphology flag: occasionally a flat-topped "plateau", otherwise a smooth Gaussian
+    # peak or a uniform bounding box.
+    clot_shape = str(rng.choice(["plateau", "gaussian", "bbox"], p=[0.45, 0.35, 0.20]))
+    # Transition length of the leading/trailing steps for the plateau (1-2 nodes => sharp).
+    clot_edge_width = float(rng.uniform(lc, 2.0 * lc))
+
+    # Sweep viscosity intensity from soft gel to near-solid.
+    clot_mu_peak = float(rng.uniform(0.1, 10.0))
+
+    # Sweep local shear rate for COMSOL inlet conditions (U = shear_rate * y).
+    shear_rate = float(rng.uniform(50.0, 5000.0))
+
+    # Center the clot so upstream development and downstream wake lengths are guaranteed
+    # even for the widest (625um) smears.
+    clot_x_center = length / 2.0
+
+    return {
+        "idx": idx,
+        "level": 0,
+        "v_type": "flat_patch",
+        "curve_type": "straight",
+        "path_loc": 2,
+        "width": width,
+        "base_length": length,
+        "offsets": np.zeros(n).tolist(),
+        "noise_top": np.zeros(n).tolist(),
+        "noise_bot": np.zeros(n).tolist(),
+        "tortuosity": np.zeros(max(n - 4, 0)).tolist(),
+        # --- Metadata for COMSOL ---
+        "clot_x_center": clot_x_center,
+        "clot_height": clot_height,
+        "clot_width": clot_width,
+        "clot_shape": clot_shape,
+        "clot_edge_width": clot_edge_width,
+        "clot_mu_peak": clot_mu_peak,
+        "inlet_shear_rate": shear_rate,
+        "geometry_mode": "parametric",
+    }
+
+
+class BoundaryLayerPatchGenerator(VesselGenerator):
+    """Generates pure fluid 2D boundary layer boxes for local Subgraph GNN training."""
+
+    # Flat-channel geometry: 2mm (streamwise) x 300-400um (wall-normal). The long domain
+    # gives room for upstream development + a long clot + downstream wake; the tall channel
+    # keeps the slip top wall a near-infinite freestream (no nozzle/Venturi artifact).
+    PATCH_LENGTH: float = 2000e-6
+    PATCH_WIDTH_MIN: float = 300e-6
+    PATCH_WIDTH_MAX: float = 400e-6
+    # Ultra-dense meshing for the local subgraph (~5um node spacing resolves the
+    # boundary layer and the 20-125 node clot footprint).
+    PATCH_MESH_LC: float = 5e-6
+
+    def __init__(self, output_dir: Optional[str | Path] = None) -> None:
+        super().__init__(phase="patch_factory", output_dir=output_dir)
+        # Keep the live VesselConfig consistent with the patch cfg_dict so the parameter
+        # sampler (which reads cfg.mesh_lc / cfg.base_length / cfg.width_*) matches meshing.
+        self.cfg.mesh_lc = self.PATCH_MESH_LC
+        self.cfg.base_length = self.PATCH_LENGTH
+        self.cfg.width_min = self.PATCH_WIDTH_MIN
+        self.cfg.width_max = self.PATCH_WIDTH_MAX
+
+    def _cfg_dict(self) -> Dict[str, Any]:
+        cfg = super()._cfg_dict()
+        # Ensure ultra-dense meshing and the flat-box base length for the local subgraph.
+        cfg["mesh_lc"] = self.PATCH_MESH_LC
+        cfg["base_length"] = self.PATCH_LENGTH
+        # Custom tags for the top/bottom boundary-condition split.
+        cfg["TAGS"].update({"Wall_Bottom": 4, "Slip_Boundary": 5})
+        return cfg
+
+    def _sample_one(
+        self,
+        idx: int,
+        level: int,
+        rng: np.random.Generator,
+        pathology_mode: str | None = None,
+    ) -> Dict[str, Any]:
+        # Patch cohort ignores level / pathology_mode: every sample is a flat clot box.
+        return _sample_patch_params(idx, self.cfg, rng)
 
 
 def _prompt_int_choice(label: str, allowed: Tuple[int, ...]) -> int:

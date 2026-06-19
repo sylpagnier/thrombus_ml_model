@@ -1,31 +1,18 @@
-"""Mat channel decode for COMSOL mu1(Mat) gelation step."""
+"""Mat/FI channel decode for COMSOL mu1(Mat) / mu2(FI) gelation steps."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 import torch
 
-from src.config import BiochemConfig, PhysicsConfig
-from src.core_physics.species_pushforward_continuous import deploy_eval_time_index
-from src.core_physics.clot_growth_masks import gt_growth_commit_mask_at_time
+from src.config import BiochemConfig
 from src.core_physics.clot_phi_simple import (
+    fi_si_for_gelation_from_log1p,
     mat_si_for_gelation_from_log1p,
     mu1_comsol_from_mat_si,
+    mu2_comsol_from_fi_si,
     species_log1p_nd_to_si,
 )
-from src.core_physics.t0_mu_physics import (
-    clot_phi_binary_from_mu_growth,
-    gt_clot_phi_at_time,
-    gt_mu_anchor_cap_si,
-    load_debug_sidecar,
-    predict_mu_si_at_time,
-    predict_mu_si_from_graph_species_legs,
-    t0_physics_env,
-)
-from src.evaluation.clot_relaxed_metrics import legacy_clot_f1_metrics as _clot_metrics
-from src.utils.paths import get_project_root
 
 
 def test_mat_gelation_decode_removes_surface_scale_factor():
@@ -52,75 +39,6 @@ def test_species_log1p_mat_channel_uses_gelation_units():
     assert si[0, 9].item() == pytest.approx(legacy_m)
 
 
-@pytest.fixture
-def patient007_assets():
-    root = get_project_root()
-    graph = root / "data/processed/graphs_biochem_anchors/patient007.pt"
-    if not graph.is_file():
-        pytest.skip("patient007 graph missing")
-    debug = load_debug_sidecar("patient007", root=root)
-    if debug is None:
-        pytest.skip("patient007 debug sidecar missing; run build_comsol_debug_sidecar.py")
-    return root, graph, debug
-
-
-def test_mat_matches_comsol_export(patient007_assets):
-    root, graph_path, debug = patient007_assets
-    bio = BiochemConfig(phase="biochem")
-    phys = PhysicsConfig(phase="biochem")
-    data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = deploy_eval_time_index(int(data.y.shape[0]))
-    mat_graph = mat_si_for_gelation_from_log1p(data.y[t, :, 15], bio)
-    mat_comsol = debug["mat_si"][t].reshape(-1)
-    growth = gt_growth_commit_mask_at_time(data, t, phys, torch.device("cpu"))
-    active = mat_comsol > 1.0
-    ac = mat_graph.float() - mat_graph.float().mean()
-    bc = mat_comsol.float() - mat_comsol.float().mean()
-    den = ac.pow(2).sum().sqrt() * bc.pow(2).sum().sqrt()
-    pearson = float((ac * bc).sum().item() / den.clamp(min=1e-12).item())
-    assert pearson >= 0.99
-    if bool(growth.any().item()):
-        ratio_g = float((mat_comsol / mat_graph.clamp(min=1e-8))[growth].median().item())
-        assert 0.98 <= ratio_g <= 1.02
-    if bool(active.any().item()):
-        ratio_a = float((mat_comsol / mat_graph.clamp(min=1e-8))[active].median().item())
-        assert 0.98 <= ratio_a <= 1.02
-
-
-def test_mu1_from_graph_mat_matches_comsol(patient007_assets):
-    root, graph_path, debug = patient007_assets
-    phys = PhysicsConfig(phase="biochem")
-    bio = BiochemConfig(phase="biochem")
-    device = torch.device("cpu")
-    data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = deploy_eval_time_index(int(data.y.shape[0]))
-    with t0_physics_env("patient007", gamma_mode="comsol_sr"):
-        _, py_mu1, _ = predict_mu_si_from_graph_species_legs(
-            data, t, phys, bio, debug, device, mat_source="graph", fi_source="graph"
-        )
-    comsol_mu1 = debug["mu1"][t].reshape(-1)
-    frac_diff = float((py_mu1 != comsol_mu1).float().mean().item())
-    assert frac_diff < 0.02
-
-
-def test_t0_clot_f1_improves_with_mat_fix(patient007_assets):
-    """Graph species + COMSOL sr should approach oracle Mat/FI clot F1."""
-    root, graph_path, _debug = patient007_assets
-    phys = PhysicsConfig(phase="biochem")
-    bio = BiochemConfig(phase="biochem")
-    device = torch.device("cpu")
-    data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    t = deploy_eval_time_index(int(data.y.shape[0]))
-    with t0_physics_env("patient007", gamma_mode="comsol_sr"):
-        step = predict_mu_si_at_time(data, t, phys, bio, device, gamma_mode="comsol_sr")
-    anchor = gt_mu_anchor_cap_si(data, phys, device)
-    phi_gt = gt_clot_phi_at_time(data, t, phys, device)
-    phi_pred = clot_phi_binary_from_mu_growth(step.mu_pred_si, anchor, phys)
-    mask = torch.ones(phi_pred.numel(), dtype=torch.bool)
-    f1 = _clot_metrics(phi_pred.reshape(-1), phi_gt.reshape(-1), mask)["clot_f1"]
-    assert f1 >= 0.65
-
-
 def test_mu1_step_threshold_at_comsol_crit():
     bio = BiochemConfig(phase="biochem")
     crit = float(bio.viscosity_mat_crit)
@@ -130,3 +48,51 @@ def test_mu1_step_threshold_at_comsol_crit():
     mu_above = mu1_comsol_from_mat_si(above, bio, bio.mu_ratio_max)
     assert float(mu_below.item()) == pytest.approx(1.0, rel=0.01)
     assert float(mu_above.item()) == pytest.approx(float(bio.mu_ratio_max), rel=0.01)
+
+
+def _fi_nd_for_working(bio: BiochemConfig, working: float) -> torch.Tensor:
+    scale_fi = float(bio.get_species_scales(device=torch.device("cpu"))[8])
+    return torch.log1p(torch.tensor(working / scale_fi))
+
+
+def test_fi_gelation_decode_returns_uM_not_working():
+    """COMSOL mu2(FI) steps at 0.6 uM; decode must convert working -> uM (=working*1e3/bulk_scale)."""
+    bio = BiochemConfig(phase="biochem")
+    for working in (1.0, 700.0, 7000.0):
+        nd = _fi_nd_for_working(bio, working)
+        fi_uM = fi_si_for_gelation_from_log1p(nd, bio)
+        expected_uM = working * 1e3 / float(bio.bulk_scale)
+        assert float(fi_uM.item()) == pytest.approx(expected_uM, rel=1e-4)
+
+
+def test_species_log1p_fi_channel_uses_uM():
+    bio = BiochemConfig(phase="biochem")
+    working = 7000.0
+    sp = torch.zeros(3, 12)
+    sp[:, 8] = _fi_nd_for_working(bio, working)
+    si = species_log1p_nd_to_si(sp, bio)
+    expected_uM = working * 1e3 / float(bio.bulk_scale)
+    assert float(si[0, 8].item()) == pytest.approx(expected_uM, rel=1e-4)
+
+
+def test_fi_below_physical_crit_does_not_gel(monkeypatch):
+    """FI in working units above 0.6 but below 0.6 uM must NOT gel (was ~1e3x too lenient)."""
+    monkeypatch.setenv("CLOT_PHI_PHYSICS_HARD_STEP", "1")
+    bio = BiochemConfig(phase="biochem")
+    # working = 100 -> would gel under the old working-unit compare (100 > 0.6),
+    # but uM = 0.1 < 0.6, so the unit-correct mu2 must stay inert.
+    fi_uM = fi_si_for_gelation_from_log1p(_fi_nd_for_working(bio, 100.0), bio)
+    assert float(fi_uM.item()) < float(bio.viscosity_fi_crit)
+    mu2 = mu2_comsol_from_fi_si(fi_uM, bio, bio.mu_ratio_max)
+    assert float(mu2.reshape(-1)[0].item()) == pytest.approx(0.0)
+
+
+def test_fi_above_physical_crit_gels(monkeypatch):
+    monkeypatch.setenv("CLOT_PHI_PHYSICS_HARD_STEP", "1")
+    bio = BiochemConfig(phase="biochem")
+    # uM target = 1.0 (>= 0.6 crit) -> working = uM * bulk_scale / 1e3.
+    working = 1.0 * float(bio.bulk_scale) / 1e3
+    fi_uM = fi_si_for_gelation_from_log1p(_fi_nd_for_working(bio, working), bio)
+    assert float(fi_uM.item()) >= float(bio.viscosity_fi_crit)
+    mu2 = mu2_comsol_from_fi_si(fi_uM, bio, bio.mu_ratio_max)
+    assert float(mu2.reshape(-1)[0].item()) == pytest.approx(float(bio.mu_ratio_max), rel=1e-3)

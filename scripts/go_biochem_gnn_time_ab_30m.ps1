@@ -66,7 +66,7 @@ function Train-Leg([string]$LegKey, [string]$Label, [bool]$TimeContext) {
         "--max-windows", "$MaxWindows",
         "--unroll", "10",
         "--arch", "sage",
-        "--init-s26", $InitWarm,
+        "--init", $InitWarm,
         "--out", $speciesOut
     )
 

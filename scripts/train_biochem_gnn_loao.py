@@ -66,7 +66,7 @@ def _run_fold(
         str(epochs),
         "--early-stop",
         str(early_stop),
-        "--init-s26",
+        "--init",
         str(init_ckpt),
         "--out",
         str(ckpt),

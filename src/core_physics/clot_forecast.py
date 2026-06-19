@@ -67,6 +67,10 @@ def clot_forecast_pair_stride() -> int:
     return max(1, _env_int("CLOT_FORECAST_PAIR_STRIDE", 1))
 
 
+def clot_forecast_pair_schedule() -> str:
+    return (os.environ.get("CLOT_FORECAST_PAIR_SCHEDULE") or "rolling").strip().lower()
+
+
 def snapshot_clot_forecast_config() -> dict[str, object]:
     return {
         "one_step": clot_forecast_one_step_enabled(),
@@ -75,6 +79,7 @@ def snapshot_clot_forecast_config() -> dict[str, object]:
         "deploy_loss": clot_forecast_deploy_loss_enabled(),
         "mask_mode": clot_forecast_mask_mode(),
         "pair_stride": clot_forecast_pair_stride(),
+        "pair_schedule": clot_forecast_pair_schedule(),
     }
 
 
@@ -160,8 +165,16 @@ def build_clot_forecast_pair_step(
     mu_in_si = phys_cfg.viscosity_nd_to_si(mu_in_nd).reshape(-1)
     mu_out_si = phys_cfg.viscosity_nd_to_si(mu_out_nd).reshape(-1)
 
-    thr = _mu_clot_threshold_si(phys_cfg)
-    phi_gt = (mu_out_si >= thr).to(dtype=torch.float32)
+    from src.core_physics.clot_phi_simple import (
+        cap_mu_eff_si,
+        clot_phi_thresh_si,
+        gt_mu_anchor_cap_si,
+    )
+
+    mu_out_cap = cap_mu_eff_si(mu_out_si)
+    anchor = gt_mu_anchor_cap_si(data, phys_cfg, device).reshape(-1)
+    growth = (mu_out_cap.reshape(-1) - anchor).clamp(min=0.0)
+    phi_gt = (growth >= clot_phi_thresh_si(phys_cfg)).to(dtype=torch.float32)
     loss_mask = resolve_ceiling_mask(data, device, bio_cfg).reshape(-1).to(dtype=torch.bool)
     region = loss_mask.clone()
 

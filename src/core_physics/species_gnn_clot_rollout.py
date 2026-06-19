@@ -74,7 +74,7 @@ def species_gnn_rollout_ckpt() -> Path:
         or os.environ.get("SPECIES_GNN_CLOUT_CKPT")
         or os.environ.get("SPECIES_CONTINUOUS_CKPT")
         or os.environ.get("SPECIES_PUSHFORWARD_CKPT")
-        or "outputs/biochem/species_snapshot_s34/best.pth"
+        or "outputs/biochem/biochem_gnn/species/best.pth"
     ).strip()
     p = Path(raw)
     if not p.is_absolute():
@@ -119,22 +119,8 @@ def _bundle_label_from_path(path: Path, phase: str) -> str:
         or "clot_deploy_gnn" in path_s
     ):
         return "biochem_deploy"
-    if "s35" in phase:
-        return "s35"
-    if "s34" in phase:
-        return "s34"
-    if "s33" in phase:
-        return "s33"
-    if "s32" in phase:
-        return "s32"
-    if "s31" in phase:
-        return "s31"
-    if "s30" in phase:
-        return "s30"
-    if "s26" in phase:
-        return "s26"
-    if "s25" in phase or "continuous" in phase:
-        return "s25"
+    if "continuous" in phase or "biochem_gnn" in phase or "clot_deploy_gnn" in phase:
+        return "biochem_gnn"
     if "s2" in phase or "pushforward" in phase:
         return "s2"
     stem = path.parent.name
@@ -161,7 +147,13 @@ def load_species_gnn_rollout_bundle(
     if bool(meta.get("kin_per_vessel_norm")):
         os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
     scope = meta.get("pushforward_species_scope") or meta.get("species_scope")
-    if scope:
+    channels = meta.get("pushforward_species_channels") or meta.get("species_channels")
+    if channels:
+        if isinstance(channels, (list, tuple)):
+            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(c)) for c in channels)
+        else:
+            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
+    elif scope:
         os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
     if bool(meta.get("dual_head")):
         os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
@@ -169,18 +161,16 @@ def load_species_gnn_rollout_bundle(
         os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
     if bool(meta.get("saturation_gate")):
         os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
-    if bool(meta.get("temporal_gate")):
-        os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "1"
+    # Retired: do not re-enable temporal lambda gate from legacy checkpoint metadata.
+    os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "0"
     label = _bundle_label_from_path(path, phase)
-    if "continuous" in phase or "dual_head" in phase or "long_horizon" in phase or "saturation" in phase or "temporal" in phase or "biochem_gnn" in phase or "clot_deploy_gnn" in phase or phase in (
-        "s25_continuous",
-        "s26_continuous",
-        "s31_dual_head",
-        "s32_long_horizon",
-        "s33_saturation_gate",
-        "s34_temporal_gate",
-        "biochem_gnn",
-        "clot_deploy_gnn",
+    if (
+        "continuous" in phase
+        or "biochem_gnn" in phase
+        or "clot_deploy_gnn" in phase
+        or bool(meta.get("dual_head"))
+        or bool(meta.get("saturation_gate"))
+        or bool(meta.get("vel_decay"))
     ):
         cont = load_continuous_bundle(path, device=dev, quiet=True)
         if cont is None:

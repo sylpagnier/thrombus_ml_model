@@ -245,12 +245,14 @@ class BiochemPhysicsKernels:
         mu1_mat = self.kinetics._soft_step(
             M_wall, self.cfg.viscosity_mat_crit, self.cfg.viscosity_penalty_soft_temp_mat
         ) * (max_ratio - 1.0) + 1.0
-        # FI threshold is defined in SI concentration units (COMSOL). Convert the
-        # model state from log1p(nd) to SI before applying the smooth step.
+        # COMSOL mu2(FI) steps at viscosity_fi_crit = 0.6 uM. Decode log1p(nd) -> working
+        # units (SI [mol/m^3] * bulk_scale), then convert to uM (1 mol/m^3 = 1e3 uM) so the
+        # threshold comparison is unit-consistent (working-unit compare was ~1e3x lenient).
         fi_scale = float(self._get_species_scales(FI_field.device, FI_field.dtype)[8].item())
-        FI_si = torch.expm1(torch.clamp(FI_field, min=-10.0, max=8.0)) * fi_scale
+        FI_working = torch.expm1(torch.clamp(FI_field, min=-10.0, max=8.0)) * fi_scale
+        FI_uM = FI_working * (1e3 / float(self.cfg.bulk_scale))
         mu2_fi = self.kinetics._soft_step(
-            FI_si, self.cfg.viscosity_fi_crit, self.cfg.viscosity_penalty_soft_temp_fi
+            FI_uM, self.cfg.viscosity_fi_crit, self.cfg.viscosity_penalty_soft_temp_fi
         ) * max_ratio
 
         mu_total = mu1_mat + mu2_fi
@@ -601,11 +603,20 @@ class BiochemPhysicsKernels:
         omega_wall = self.kinetics.compute_omega(APR_wall, APS_wall, T_wall)
         k_pa_wall = self.kinetics.compute_k_pa(omega_wall, shear_wall)
 
-        # SI-only convention: adhesion rates and characteristic lengths are stored in SI in BiochemConfig.
-        k_rs = self.cfg.k_rs
-        k_as = self.cfg.k_as
-        k_aa = self.cfg.k_aa
-        L_char = self.cfg.L_char
+        # Unit-consistent SI convention (validated against COMSOL exports). The COMSOL
+        # phase-2 model runs in CGS/uM; this kernel works in SI throughout: rp/ap
+        # [plt/m^3] (linear_biochem_preds), Mas/Minf [plt/m^2], dshear_ds_wall [1/(s*m)]
+        # (graph WLS / d_bar), k_* [m/s], L_char [m], sgt [1/(s*m)]. With these, the
+        # dimensionless Da == surface_damkohler reconstructs the exported J0_Mat to
+        # machine precision -- see src/core_physics/comsol_surface_deposition.py and
+        # src/tests/test_comsol_wall_deposition_calibration.py (docs/COMSOL_PHYSICS_VALIDATION.md).
+        from src.core_physics.comsol_surface_deposition import DepositionConstants
+
+        _dep_k = DepositionConstants.si(self.cfg)
+        k_rs = _dep_k.k_rs
+        k_as = _dep_k.k_as
+        k_aa = _dep_k.k_aa
+        L_char = _dep_k.L
 
         # 5. Adhesion Rates (Matching COMSOL Inward Flux Rules)
         pathological_RP_adhesion = is_separation * (
