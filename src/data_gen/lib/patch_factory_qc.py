@@ -54,6 +54,10 @@ class QCThresholds:
     min_clot_dmu: float = 0.5       # max(mu) / clot_mu (viscosity actually rose)
 
 
+# np.trapz was renamed to np.trapezoid in NumPy 2.0 (and removed from some 2.x builds).
+_trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
+
 def _reshape(arr: np.ndarray, ny: int, nx: int) -> np.ndarray:
     return np.asarray(arr, dtype=np.float64).reshape(ny, nx)
 
@@ -82,7 +86,7 @@ def _flux(u: np.ndarray, y: np.ndarray, col_mask: np.ndarray) -> float:
     yy = y[col_mask]
     uu = u[col_mask]
     order = np.argsort(yy)
-    return float(np.trapz(uu[order], yy[order]))
+    return float(_trapezoid(uu[order], yy[order]))
 
 
 def compute_sample_qc(d: Dict[str, Any], thr: Optional[QCThresholds] = None) -> Dict[str, Any]:

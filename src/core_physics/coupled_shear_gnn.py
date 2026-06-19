@@ -20,7 +20,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GATv2Conv, SAGEConv
 
 
 class CoupledShearGNN(nn.Module):
@@ -62,6 +62,75 @@ class CoupledShearGNN(nn.Module):
         if self.prior_col is not None:
             out = out + x[:, int(self.prior_col)]                    # residual on the wallfunc prior
         return out                                                  # log1p(spf.sr) per node
+
+
+class LocalKinematicCorrector(nn.Module):
+    """Local k-hop kinematic corrector for velocity diversion around micro-clots.
+
+    Predicts a per-node residual ``[dU, dV]`` added to the frozen GINO-DEQ base
+    flow on the subgraph extracted around nucleating clot nodes. A GATv2 stack is
+    used so attention can learn the anisotropic diversion (flow reroutes over and
+    around a clot far more than it reverses behind it).
+
+    Expected input features (``in_channels=6``):
+        ``[dx, dy, dist_to_wall, u0, v0, delta_mu]`` where ``dx, dy`` are
+        coordinates relative to the clot center of mass.
+    """
+
+    def __init__(self, in_channels: int = 6, hidden_dim: int = 64, *, heads: int = 4):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.heads = int(heads)
+        self.conv1 = GATv2Conv(self.in_channels, self.hidden_dim, heads=self.heads, concat=False)
+        self.conv2 = GATv2Conv(self.hidden_dim, self.hidden_dim, heads=self.heads, concat=False)
+        self.conv3 = GATv2Conv(self.hidden_dim, self.hidden_dim, heads=self.heads, concat=False)
+        self.readout = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, 2),
+        )
+        # Start as a near-identity correction so an untrained model leaves the
+        # frozen base flow essentially unchanged.
+        nn.init.xavier_uniform_(self.readout[-1].weight, gain=0.01)
+        nn.init.zeros_(self.readout[-1].bias)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """Return kinematic correction ``[N_sub, 2]`` for the subgraph."""
+        h = F.gelu(self.conv1(x, edge_index))
+        h = F.gelu(self.conv2(h, edge_index))
+        h = F.gelu(self.conv3(h, edge_index))
+        return self.readout(h)
+
+
+def save_local_corrector(
+    path: Path | str, model: LocalKinematicCorrector, meta: dict[str, Any] | None = None
+) -> None:
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "in_channels": model.in_channels,
+            "hidden_dim": model.hidden_dim,
+            "heads": model.heads,
+            "meta": meta or {},
+        },
+        p,
+    )
+
+
+def load_local_corrector(
+    path: Path | str, device: torch.device | None = None
+) -> LocalKinematicCorrector:
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pl = torch.load(path, map_location=dev, weights_only=False)
+    m = LocalKinematicCorrector(
+        in_channels=int(pl.get("in_channels", 6)),
+        hidden_dim=int(pl.get("hidden_dim", 64)),
+        heads=int(pl.get("heads", 4)),
+    )
+    m.load_state_dict(pl["model_state"]); m.to(dev); m.eval()
+    return m
 
 
 def save_checkpoint(path: Path | str, model: CoupledShearGNN, meta: dict[str, Any]) -> None:
