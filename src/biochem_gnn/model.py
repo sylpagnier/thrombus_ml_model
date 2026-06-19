@@ -26,6 +26,7 @@ from src.core_physics.clot_phi_rollout import KinematicsUvProvider
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.core_physics.coupled_shear_gnn import (
     LocalKinematicCorrector,
+    assemble_local_corrector_features,
     load_local_corrector,
 )
 from src.core_physics.clot_coupled_rollout import (
@@ -259,8 +260,10 @@ class BiochemDeployStack:
 
         n = int(data.num_nodes)
         fluid_mu_si = float(getattr(self.phys, "mu_inf", 0.0035))
-        delta_mu = (mu_pred_si.reshape(-1) - fluid_mu_si)
-        clot_nodes = torch.where(delta_mu > float(self.cfg.local_corrector_mu_thresh_si))[0]
+        # SI delta-mu flags clot nodes; the corrector feature is the ND delta-mu so
+        # the synthetic-patch trainer and this deploy path share one viscosity scale.
+        delta_mu_si = mu_pred_si.reshape(-1) - fluid_mu_si
+        clot_nodes = torch.where(delta_mu_si > float(self.cfg.local_corrector_mu_thresh_si))[0]
         if clot_nodes.numel() == 0:
             return u_next, v_next
 
@@ -272,23 +275,13 @@ class BiochemDeployStack:
             num_nodes=n,
         )
 
-        pos = data.x[:, 0:2].to(device=self.device, dtype=torch.float32)
-        com = pos[clot_nodes].mean(dim=0, keepdim=True)
-        dx_dy = pos[subset] - com
-
-        sdf = sdf_nd_from_data(data, self.device, n).reshape(-1)
-        dist_to_wall = sdf[subset].unsqueeze(1)
-
-        x_sub = torch.cat(
-            [
-                dx_dy,
-                dist_to_wall,
-                u0[subset].unsqueeze(1),
-                v0[subset].unsqueeze(1),
-                delta_mu[subset].unsqueeze(1),
-            ],
-            dim=-1,
-        ).to(dtype=torch.float32)
+        pos_nd = data.x[:, 0:2].to(device=self.device, dtype=torch.float32)
+        sdf_nd = sdf_nd_from_data(data, self.device, n).reshape(-1)
+        # mu_pred_si and mu_inf share mu_viscosity_nd_scale, so delta_mu_nd is exact.
+        delta_mu_nd = self.phys.viscosity_si_to_nd(delta_mu_si)
+        x_sub = assemble_local_corrector_features(
+            pos_nd, sdf_nd, u0, v0, delta_mu_nd, clot_nodes, subset
+        )
 
         delta_uv = corrector(x_sub, sub_edge_index.to(self.device))
         u_next[subset] = u_next[subset] + delta_uv[:, 0]

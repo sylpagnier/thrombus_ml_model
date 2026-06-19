@@ -103,6 +103,50 @@ class LocalKinematicCorrector(nn.Module):
         return self.readout(h)
 
 
+LOCAL_CORRECTOR_IN_CHANNELS = 6
+LOCAL_CORRECTOR_FEATURE_NAMES = ("dx", "dy", "dist_to_wall", "u0", "v0", "delta_mu")
+
+
+def assemble_local_corrector_features(
+    pos_nd: torch.Tensor,
+    sdf_nd: torch.Tensor,
+    u0_nd: torch.Tensor,
+    v0_nd: torch.Tensor,
+    delta_mu_nd: torch.Tensor,
+    clot_nodes: torch.Tensor,
+    subset: torch.Tensor,
+) -> torch.Tensor:
+    """Build the corrector input ``[dx, dy, dist_to_wall, u0, v0, delta_mu]`` for ``subset``.
+
+    Single source of truth shared by training, the live verification tool, and the
+    deploy rollout so the corrector always sees the *same* feature convention.
+
+    All inputs MUST already be non-dimensionalized in the GINO-DEQ convention:
+    positions by the geometric length scale (``d_bar`` on patient graphs, channel
+    height on synthetic patches), velocity by ``u_ref``, and viscosity by
+    ``PhysicsConfig.mu_viscosity_nd_scale``.
+
+    Translation invariance: ``(dx, dy)`` are centered on the clot's center of mass,
+    averaged over ``clot_nodes`` ONLY -- never the (possibly boundary-truncated)
+    ``subset`` -- so the patch is dynamically re-centered the same way in train and
+    deploy.
+    """
+    pos_nd = pos_nd.reshape(-1, 2)
+    com = pos_nd[clot_nodes].mean(dim=0, keepdim=True)
+    dx_dy = pos_nd[subset] - com
+    feats = torch.cat(
+        [
+            dx_dy,
+            sdf_nd.reshape(-1, 1)[subset],
+            u0_nd.reshape(-1, 1)[subset],
+            v0_nd.reshape(-1, 1)[subset],
+            delta_mu_nd.reshape(-1, 1)[subset],
+        ],
+        dim=-1,
+    )
+    return feats.to(torch.float32)
+
+
 def save_local_corrector(
     path: Path | str, model: LocalKinematicCorrector, meta: dict[str, Any] | None = None
 ) -> None:
