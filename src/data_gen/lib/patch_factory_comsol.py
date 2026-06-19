@@ -27,16 +27,34 @@ to form the residual, and writes ``patch_{i}.npz`` + ``patch_{i}.json``.
 Template contract (build the .mph to match, or override via ``ComsolParamNames`` /
 ``PatchFactoryConfig.eval_exprs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-COMSOL global parameters (names configurable):
-  * ``shear_rate`` [1/s]  -- inlet shear, baseline ``u = shear_rate * y``
-  * ``clot_w``     [m]    -- clot streamwise width (footprint length)
-  * ``clot_h``     [m]    -- clot wall-normal height
+COMSOL global parameters (names configurable; lengths pushed in [um] for GUI readability,
+but units are explicit so any unit works):
+  * ``shear_rate`` [1/s]  -- inlet/freestream shear, baseline ``u = shear_rate * y``
+  * ``channel_h``  [um]   -- channel (domain) height H; the box MUST be built from this so
+                            the COMSOL domain matches the Python extraction grid
+  * ``clot_w``     [um]   -- clot streamwise width (footprint length)
+  * ``clot_h``     [um]   -- clot wall-normal height
   * ``clot_mu``    [Pa*s] -- peak viscosity inside the clot mask
-  * ``clot_x``     [m]    -- clot center x (defaults to L/2)
-  * ``clot_edge``  [m]    -- mask transition length (sharp steps for a "plateau")
-Evaluation expressions (component scope): ``u``, ``v``, ``p`` required; ``mu_final``
-(or your viscosity variable) optional.
+  * ``clot_x``     [um]   -- clot center x (defaults to L/2)
+Field evaluation (component scope): ``u``, ``v``, ``p`` required; viscosity via the Laminar
+Flow built-in ``spf.mu`` (optional/last).
 Domain: x in [0, L], y in [0, H] (origin at bottom-left, bottom wall at y=0).
+
+Clot model: ``Clot_Mask = flc2hs((clot_w/2 - |x-clot_x|)/1[um], 5) * flc2hs((clot_h-y)/1[um], 5)``
+-- a smoothed rectangle (~5um edges) on the bottom wall, applied as a continuous viscosity
+mask (high-viscosity porous zone, never a hole). Single morphology: metadata records
+``clot_shape = "smoothed_rect"``.
+
+Boundary conditions:
+  * Inlet (x=0):   freestream shear ``u = shear_rate * y``, ``v = 0``.
+  * Bottom (y=0):  no-slip wall (clot attaches here).
+  * Top (y=H):     PRESCRIBED freestream velocity ``u = shear_rate * y``, ``v = 0`` (a moving
+                   "lid" => exact Couette shear). This sustains the exact linear-shear baseline
+                   so the analytical residual ``dU = U - shear_rate*y`` is clean. (A slip top
+                   cannot sustain linear shear -- it imposes zero top stress -- so it would bias
+                   the baseline.) Valid because ``channel_h`` is scaled to clot width, keeping
+                   the lid in the decayed far field.
+  * Outlet (x=L):  outflow / zero normal stress (pressure reference p=0).
 """
 
 from __future__ import annotations
@@ -73,8 +91,16 @@ _CLOT_HEIGHT_MAX_NODES = 6.0   # ~30um (keep blockage ~3-10% of channel height)
 
 _SHEAR_RATE_RANGE = (50.0, 5000.0)   # [1/s]
 _CLOT_MU_RANGE = (0.1, 10.0)         # [Pa*s] soft gel -> near-solid
-_CLOT_SHAPE_CHOICES = ("plateau", "gaussian", "bbox")
-_CLOT_SHAPE_PROBS = (0.45, 0.35, 0.20)
+# The master template paints a single morphology: a smoothed rectangle (~5um edges) via
+# the product of two flc2hs Heaviside masks. We record this so metadata matches reality.
+_CLOT_SHAPE = "smoothed_rect"
+
+# Channel-height policy. A slip/symmetry top is only a valid "infinite freestream" if it
+# sits in the decayed far field. The disturbance from a shallow wide clot decays vertically
+# over ~its streamwise width, so we scale H with clot width (not clot height).
+_HEIGHT_FLOOR = 300e-6              # never below 300um (matches the small-clot regime)
+_HEIGHT_CLEARANCE_FACTOR = 2.0     # H >= factor * clot_width keeps the lid in the far field
+_HEIGHT_CEILING = 1500e-6          # cap so the widest smears stay affordable to mesh
 
 
 @dataclass
@@ -88,7 +114,6 @@ class PatchSample:
     clot_x_center: float
     clot_width: float
     clot_height: float
-    clot_edge_width: float
     clot_mu_peak: float
     clot_shape: str
 
@@ -103,28 +128,36 @@ def sample_patch_parameters(
     rng: np.random.Generator,
     *,
     length: float = 2000e-6,
-    height_range: Tuple[float, float] = (300e-6, 400e-6),
     grid_spacing: float = 5e-6,
+    height_floor: float = _HEIGHT_FLOOR,
+    height_clearance_factor: float = _HEIGHT_CLEARANCE_FACTOR,
+    height_ceiling: float = _HEIGHT_CEILING,
 ) -> PatchSample:
     """Draw one patch parameter set.
 
     Domain is sized to avoid the nozzle/Venturi artifact (long channel, tall freestream),
     and the clot footprint is biased toward long, flat morphologies so the GNN learns the
     front stagnation zone vs. the parallel shear along a long clot top.
+
+    Channel height is *adaptive*: ``H = clip(factor * clot_width, floor, ceiling)`` so the
+    slip/symmetry top always sits in the decayed far field even for the widest smears (the
+    vertical disturbance scale ~ clot width). ``H`` is driven into COMSOL as ``channel_h``
+    and used for the extraction grid, so the two always agree.
     """
     s = grid_spacing
-    height = float(rng.uniform(*height_range))
 
     wide_frac = float(rng.beta(2.0, 1.0))  # skew toward 1.0 => wide smears
     clot_width = (
         _CLOT_WIDTH_MIN_NODES + wide_frac * (_CLOT_WIDTH_MAX_NODES - _CLOT_WIDTH_MIN_NODES)
     ) * s
     clot_height = float(rng.uniform(_CLOT_HEIGHT_MIN_NODES, _CLOT_HEIGHT_MAX_NODES)) * s
-    clot_edge_width = float(rng.uniform(1.0, 2.0)) * s  # 1-2 nodes => sharp steps
-    clot_shape = str(rng.choice(_CLOT_SHAPE_CHOICES, p=_CLOT_SHAPE_PROBS))
 
     shear_rate = float(rng.uniform(*_SHEAR_RATE_RANGE))
     clot_mu_peak = float(rng.uniform(*_CLOT_MU_RANGE))
+
+    # Far-field clearance: keep the prescribed-freestream top >= factor * clot_width above
+    # the wall so the disturbance has decayed there.
+    height = float(np.clip(height_clearance_factor * clot_width, height_floor, height_ceiling))
 
     # Center the clot so the widest (625um) smear still keeps upstream development and
     # downstream wake length inside the domain.
@@ -139,9 +172,8 @@ def sample_patch_parameters(
         clot_x_center=float(clot_x_center),
         clot_width=float(clot_width),
         clot_height=float(clot_height),
-        clot_edge_width=float(clot_edge_width),
         clot_mu_peak=float(clot_mu_peak),
-        clot_shape=clot_shape,
+        clot_shape=_CLOT_SHAPE,
     )
 
 
@@ -176,11 +208,11 @@ def build_structured_grid(
 class ComsolParamNames:
     """Names of the COMSOL global parameters the master template exposes."""
     shear_rate: str = "shear_rate"
+    channel_height: str = "channel_h"
     clot_width: str = "clot_w"
     clot_height: str = "clot_h"
     clot_mu: str = "clot_mu"
     clot_x: str = "clot_x"
-    clot_edge: str = "clot_edge"
 
 
 @dataclass
@@ -188,12 +220,21 @@ class PatchFactoryConfig:
     template_path: Path = field(default_factory=lambda: comsol_models_dir() / "local_kine_template.mph")
     output_dir: Path = field(default_factory=lambda: data_root() / "processed" / "cfd_results_patch_factory")
     length: float = 2000e-6
-    height_range: Tuple[float, float] = (300e-6, 400e-6)
     grid_spacing: float = 5e-6
+    # Adaptive channel-height policy (slip-top far-field clearance vs clot width).
+    height_floor: float = _HEIGHT_FLOOR
+    height_clearance_factor: float = _HEIGHT_CLEARANCE_FACTOR
+    height_ceiling: float = _HEIGHT_CEILING
     param_names: ComsolParamNames = field(default_factory=ComsolParamNames)
-    # Field expressions evaluated at the grid (component scope). mu is optional/last.
-    eval_exprs: Sequence[str] = ("u", "v", "p", "mu_final")
+    # Field expressions evaluated at the grid (component scope). The viscosity is captured
+    # via the Laminar Flow built-in ``spf.mu`` (the template defines only ``Clot_Mask`` and
+    # applies it inside Fluid Properties -- there is no ``mu_final`` variable). mu is the
+    # optional last expr; if it fails, u/v/p are still saved.
+    eval_exprs: Sequence[str] = ("u", "v", "p", "spf.mu")
     dataset_tag: str = "dset1"
+    # channel_h drives the rectangle height, so the geometry + mapped mesh must be rebuilt
+    # before each solve. Mapped meshing on a rectangle is cheap.
+    rebuild_geometry_each_solve: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -259,16 +300,18 @@ class PatchFactoryComsolGenerator:
     def _apply_parameters(self, s: PatchSample) -> None:
         p = self.cfg.param_names
         m = self.model
+        um = 1e6  # push lengths in [um] for GUI readability (units are explicit either way)
         m.parameter(p.shear_rate, f"{s.shear_rate} [1/s]")
-        m.parameter(p.clot_width, f"{s.clot_width} [m]")
-        m.parameter(p.clot_height, f"{s.clot_height} [m]")
         m.parameter(p.clot_mu, f"{s.clot_mu_peak} [Pa*s]")
-        # clot_x / clot_edge are optional in the template; set best-effort.
-        for name, value in ((p.clot_x, s.clot_x_center), (p.clot_edge, s.clot_edge_width)):
-            try:
-                m.parameter(name, f"{value} [m]")
-            except Exception:
-                pass
+        # channel_h drives the domain box; it MUST match the extraction grid height.
+        m.parameter(p.channel_height, f"{s.height * um} [um]")
+        m.parameter(p.clot_width, f"{s.clot_width * um} [um]")
+        m.parameter(p.clot_height, f"{s.clot_height * um} [um]")
+        # clot_x is optional in the template (defaults to L/2); set best-effort.
+        try:
+            m.parameter(p.clot_x, f"{s.clot_x_center * um} [um]")
+        except Exception:
+            pass
 
     def _evaluate_grid(
         self, x: np.ndarray, y: np.ndarray
@@ -338,7 +381,7 @@ class PatchFactoryComsolGenerator:
             length=s.length, height=s.height, grid_spacing=s.grid_spacing,
             shear_rate=s.shear_rate, clot_x_center=s.clot_x_center,
             clot_width=s.clot_width, clot_height=s.clot_height,
-            clot_edge_width=s.clot_edge_width, clot_mu_peak=s.clot_mu_peak,
+            clot_mu_peak=s.clot_mu_peak,
             clot_shape=s.clot_shape, config_id=s.idx,
         )
         if mu is not None:
@@ -347,9 +390,27 @@ class PatchFactoryComsolGenerator:
         with open(self._sidecar(s), "w", encoding="utf-8") as f:
             json.dump(s.to_meta(), f, indent=2)
 
+    def _rebuild_geometry_and_mesh(self) -> None:
+        """Rebuild geometry + mapped mesh after ``channel_h`` changes the box height.
+
+        COMSOL usually rebuilds upstream nodes on solve, but doing it explicitly is robust
+        across mph versions. Best-effort: if these calls are unavailable, ``solve()`` still
+        triggers the dependency rebuild.
+        """
+        for fn_name in ("build", "mesh"):
+            fn = getattr(self.model, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                logger.warning("model.%s() failed (continuing to solve): %s", fn_name, exc)
+
     def _solve_one(self, s: PatchSample) -> bool:
         x, y, nx, ny = build_structured_grid(s.length, s.height, s.grid_spacing)
         self._apply_parameters(s)
+        if self.cfg.rebuild_geometry_each_solve:
+            self._rebuild_geometry_and_mesh()
         try:
             self.model.solve()
         except Exception as exc:
@@ -380,7 +441,7 @@ class PatchFactoryComsolGenerator:
             length=s.length, height=s.height, grid_spacing=s.grid_spacing,
             shear_rate=s.shear_rate, clot_x_center=s.clot_x_center,
             clot_width=s.clot_width, clot_height=s.clot_height,
-            clot_edge_width=s.clot_edge_width, clot_mu_peak=s.clot_mu_peak,
+            clot_mu_peak=s.clot_mu_peak,
             clot_shape=s.clot_shape, config_id=s.idx, dry_run=True,
         )
         with open(self._sidecar(s), "w", encoding="utf-8") as f:
@@ -403,8 +464,10 @@ class PatchFactoryComsolGenerator:
             sample_patch_parameters(
                 start_idx + i, rng,
                 length=self.cfg.length,
-                height_range=self.cfg.height_range,
                 grid_spacing=self.cfg.grid_spacing,
+                height_floor=self.cfg.height_floor,
+                height_clearance_factor=self.cfg.height_clearance_factor,
+                height_ceiling=self.cfg.height_ceiling,
             )
             for i in range(n)
         ]
