@@ -122,6 +122,22 @@ class PatchSample:
         d["unit"] = "m"
         return d
 
+    @classmethod
+    def from_meta(cls, meta: Dict[str, Any]) -> "PatchSample":
+        """Reconstruct a sample from a sidecar ``to_meta`` dict (for re-solve/convergence)."""
+        return cls(
+            idx=int(meta["idx"]),
+            length=float(meta["length"]),
+            height=float(meta["height"]),
+            grid_spacing=float(meta["grid_spacing"]),
+            shear_rate=float(meta["shear_rate"]),
+            clot_x_center=float(meta["clot_x_center"]),
+            clot_width=float(meta["clot_width"]),
+            clot_height=float(meta["clot_height"]),
+            clot_mu_peak=float(meta["clot_mu_peak"]),
+            clot_shape=str(meta.get("clot_shape", "smoothed_rect")),
+        )
+
 
 def sample_patch_parameters(
     idx: int,
@@ -235,6 +251,13 @@ class PatchFactoryConfig:
     # channel_h drives the rectangle height, so the geometry + mapped mesh must be rebuilt
     # before each solve. Mapped meshing on a rectangle is cheap.
     rebuild_geometry_each_solve: bool = True
+    # Mesh-convergence check: re-solve a few patches with the mapped-mesh element counts
+    # scaled by ``convergence_refine_factor`` and compare du. ``passed`` if max relative L2
+    # change <= ``convergence_tol``. Refinement scales the "numelem" of the mesh Distribution
+    # features (matches the template's inlet_outlet_distribution / wall_distribution).
+    convergence_samples: int = 3
+    convergence_refine_factor: float = 2.0
+    convergence_tol: float = 0.02
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +273,9 @@ class PatchFactoryComsolGenerator:
         self.cfg.template_path = Path(self.cfg.template_path)
         self.client = None
         self.model = None
+        # Mapped-mesh distribution element counts captured for the convergence refinement.
+        self._orig_numelem: Optional[Dict[str, "tuple[str, int]"]] = None
+        self._mesh_refine_ok: bool = False
 
     # -- COMSOL session lifecycle ------------------------------------------------
     def __enter__(self) -> "PatchFactoryComsolGenerator":
@@ -351,6 +377,121 @@ class PatchFactoryComsolGenerator:
         u, v, p = data[0], data[1], data[2]
         mu = data[3] if len(data) > 3 else None
         return u, v, p, mu
+
+    # -- Mesh convergence --------------------------------------------------------
+    def _capture_mesh_distributions(self) -> None:
+        """Read the mapped-mesh Distribution element counts (``numelem``) once.
+
+        Mapped meshes ignore the global ``MeshSizeFactor``; the element count lives on the
+        Distribution sub-features. We capture them so we can scale up for a refined re-solve
+        and restore afterwards. If none are found the FE mesh cannot be refined and the
+        convergence result is flagged inconclusive.
+        """
+        if self._orig_numelem is not None:
+            return
+        self._orig_numelem = {}
+        self._mesh_refine_ok = False
+        try:
+            mesh_j = self.model.java.component("comp1").mesh("mesh1")
+            for raw_tag in mesh_j.feature().tags():
+                tag = str(raw_tag)
+                for prop in ("numelem", "elemcount"):
+                    try:
+                        val = mesh_j.feature(tag).getString(prop)
+                    except Exception:
+                        continue
+                    if val is None or str(val).strip() == "":
+                        continue
+                    try:
+                        self._orig_numelem[tag] = (prop, int(round(float(val))))
+                    except Exception:
+                        continue
+                    break
+            self._mesh_refine_ok = len(self._orig_numelem) > 0
+        except Exception as exc:
+            logger.warning("Could not read mapped-mesh distributions: %s", exc)
+        if not self._mesh_refine_ok:
+            logger.warning(
+                "No mapped-mesh element-count distributions found; convergence cannot "
+                "refine the FE mesh (result will be flagged inconclusive)."
+            )
+
+    def _set_mesh_refinement(self, factor: float) -> None:
+        if not self._orig_numelem:
+            return
+        mesh_j = self.model.java.component("comp1").mesh("mesh1")
+        for tag, (prop, orig) in self._orig_numelem.items():
+            n = max(1, int(round(orig * factor)))
+            try:
+                mesh_j.feature(tag).set(prop, str(n))
+            except Exception as exc:
+                logger.warning("set %s on %s failed: %s", prop, tag, exc)
+
+    def _reset_mesh_refinement(self) -> None:
+        self._set_mesh_refinement(1.0)
+
+    def solve_du(self, s: PatchSample) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Solve one patch and return ``(x, y, du)`` (du = u - analytical baseline u)."""
+        x, y, _, _ = build_structured_grid(s.length, s.height, s.grid_spacing)
+        self._apply_parameters(s)
+        if self.cfg.rebuild_geometry_each_solve:
+            self._rebuild_geometry_and_mesh()
+        self.model.solve()
+        u, v, p, mu = self._evaluate_grid(x, y)
+        u_base, _ = baseline_shear_field(x, y, s.shear_rate)
+        return x, y, (u - u_base)
+
+    def convergence_check(
+        self,
+        samples: Sequence[PatchSample],
+        *,
+        refine_factor: Optional[float] = None,
+        tol: Optional[float] = None,
+        write_report: bool = True,
+    ) -> Dict[str, Any]:
+        """Re-solve ``samples`` at base + refined mesh; report relative L2 change in du.
+
+        Mesh-independence holds when the refined-vs-base relative L2 of the clot residual
+        ``du`` stays below ``tol`` for every sample.
+        """
+        refine_factor = float(refine_factor if refine_factor is not None else self.cfg.convergence_refine_factor)
+        tol = float(tol if tol is not None else self.cfg.convergence_tol)
+        self._capture_mesh_distributions()
+
+        per: List[Dict[str, Any]] = []
+        for s in samples:
+            try:
+                self._set_mesh_refinement(1.0)
+                _, _, du0 = self.solve_du(s)
+                self._set_mesh_refinement(refine_factor)
+                _, _, du1 = self.solve_du(s)
+                denom = float(np.linalg.norm(du0))
+                rel = float(np.linalg.norm(du1 - du0) / denom) if denom > 0 else float("nan")
+                logger.info("[conv] patch %s: rel L2 du(refined vs base) = %.4g", s.idx, rel)
+                per.append({"idx": int(s.idx), "rel_l2_du": rel, "baseline_du_norm": denom})
+            except Exception as exc:  # pragma: no cover - solver dependent
+                logger.warning("[conv] patch %s failed: %s", s.idx, exc)
+                per.append({"idx": int(s.idx), "rel_l2_du": float("nan"), "baseline_du_norm": float("nan")})
+        self._reset_mesh_refinement()
+
+        rels = [d["rel_l2_du"] for d in per if math.isfinite(d["rel_l2_du"])]
+        report: Dict[str, Any] = {
+            "refine_factor": refine_factor,
+            "tol": tol,
+            "n_samples": len(per),
+            "n_evaluated": len(rels),
+            "per_sample": per,
+            "median_rel_l2_du": float(np.median(rels)) if rels else float("nan"),
+            "max_rel_l2_du": float(np.max(rels)) if rels else float("nan"),
+            "mesh_refined": bool(self._mesh_refine_ok),
+            "passed": bool(rels) and self._mesh_refine_ok and (max(rels) <= tol),
+        }
+        if write_report:
+            self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.cfg.output_dir / "convergence_report.json", "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+        logger.info("Convergence: %s", {k: report[k] for k in ("passed", "median_rel_l2_du", "max_rel_l2_du", "mesh_refined")})
+        return report
 
     # -- Per-sample + batch ------------------------------------------------------
     def _sidecar(self, s: PatchSample) -> Path:
@@ -544,6 +685,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--template", type=str, default=None, help="Override master .mph path.")
     p.add_argument("--output-dir", type=str, default=None, help="Override output directory.")
     p.add_argument("--grid-spacing-um", type=float, default=5.0, help="Structured grid spacing [um].")
+    p.add_argument(
+        "--convergence",
+        action="store_true",
+        help="After the batch, re-solve a few patches at a refined mapped mesh and write "
+        "convergence_report.json (mesh-independence of du).",
+    )
+    p.add_argument("--convergence-samples", type=int, default=3, help="Patches for the convergence check.")
+    p.add_argument("--convergence-refine", type=float, default=2.0, help="Mesh element-count scale factor.")
+    p.add_argument("--convergence-tol", type=float, default=0.02, help="Max rel L2 du to PASS.")
     return p
 
 
@@ -563,8 +713,24 @@ if __name__ == "__main__":
             overwrite=args.overwrite, dry_run=True,
         )
     else:
+        cfg.convergence_samples = args.convergence_samples
+        cfg.convergence_refine_factor = args.convergence_refine
+        cfg.convergence_tol = args.convergence_tol
         with gen:
             gen.run_batch(
                 n=args.num_patches, seed=args.seed, start_idx=args.start_idx,
                 overwrite=args.overwrite, dry_run=False,
             )
+            if args.convergence:
+                rng = np.random.default_rng(args.seed)
+                samples = [
+                    sample_patch_parameters(
+                        args.start_idx + i, rng,
+                        length=cfg.length, grid_spacing=cfg.grid_spacing,
+                        height_floor=cfg.height_floor,
+                        height_clearance_factor=cfg.height_clearance_factor,
+                        height_ceiling=cfg.height_ceiling,
+                    )
+                    for i in range(min(args.convergence_samples, args.num_patches))
+                ]
+                gen.convergence_check(samples)

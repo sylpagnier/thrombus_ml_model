@@ -239,12 +239,92 @@ def _percentiles(vals: List[float]) -> Dict[str, float]:
     }
 
 
+def run_or_load_convergence(
+    directory: Path,
+    *,
+    n_samples: int = 3,
+    refine_factor: float = 2.0,
+    tol: float = 0.02,
+    template: Optional[Path] = None,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return a mesh-convergence report for the dataset.
+
+    Loads ``convergence_report.json`` if present (cheap); otherwise re-solves a few real
+    dataset samples at base + refined mapped mesh via COMSOL. Returns ``None`` (graceful)
+    when no report exists and COMSOL/template is unreachable.
+    """
+    directory = Path(directory)
+    report_path = directory / "convergence_report.json"
+    if report_path.exists() and not force:
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", report_path.name, exc)
+
+    # Need a fresh check: pick real (solved, non-dry-run) samples evenly across the dataset.
+    npzs = sorted(
+        glob.glob(str(directory / "patch_*.npz")),
+        key=lambda p: int(os.path.basename(p).split("_")[1].split(".")[0]),
+    )
+    candidates: List[Dict[str, Any]] = []
+    for p in npzs:
+        idx = int(os.path.basename(p).split("_")[1].split(".")[0])
+        sidecar = directory / f"patch_{idx}.json"
+        if not sidecar.exists():
+            continue
+        try:
+            with np.load(p) as z:
+                if "dry_run" in z.files and bool(np.asarray(z["dry_run"]).ravel()[0]):
+                    continue
+            with open(sidecar, "r", encoding="utf-8") as f:
+                candidates.append(json.load(f))
+        except Exception:
+            continue
+    if not candidates:
+        logger.warning("Convergence: no solved samples with sidecars found.")
+        return None
+
+    step = max(1, len(candidates) // max(1, n_samples))
+    chosen_meta = candidates[::step][:n_samples]
+
+    try:
+        from src.data_gen.lib.patch_factory_comsol import (
+            PatchFactoryComsolGenerator,
+            PatchFactoryConfig,
+            PatchSample,
+        )
+    except Exception as exc:
+        logger.warning("Convergence: cannot import COMSOL generator: %s", exc)
+        return None
+
+    cfg = PatchFactoryConfig(output_dir=directory)
+    if template is not None:
+        cfg.template_path = Path(template)
+    samples = [PatchSample.from_meta(m) for m in chosen_meta]
+    try:
+        with PatchFactoryComsolGenerator(cfg) as gen:
+            return gen.convergence_check(
+                samples, refine_factor=refine_factor, tol=tol, write_report=True
+            )
+    except Exception as exc:
+        logger.warning("Convergence check skipped (COMSOL/template not reachable): %s", exc)
+        return None
+
+
 def qc_dataset(
     directory: Path,
     *,
     thr: Optional[QCThresholds] = None,
     max_samples: Optional[int] = None,
     write_csv: bool = True,
+    run_convergence: bool = True,
+    convergence_samples: int = 3,
+    convergence_refine: float = 2.0,
+    convergence_tol: float = 0.02,
+    force_convergence: bool = False,
+    template: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run QC over all patches in ``directory``; print summary; return aggregate dict."""
     directory = Path(directory)
@@ -323,6 +403,35 @@ def qc_dataset(
             print(f"    {fl:<26} {c}/{n}")
     else:
         print("\n  No flags raised.")
+
+    # Mesh-convergence (default on). Skipped for dry-run datasets (du==0 -> meaningless).
+    convergence: Optional[Dict[str, Any]] = None
+    if run_convergence and not all_dry:
+        convergence = run_or_load_convergence(
+            directory,
+            n_samples=convergence_samples,
+            refine_factor=convergence_refine,
+            tol=convergence_tol,
+            template=template,
+            force=force_convergence,
+        )
+        print("\n  Mesh convergence (du, refined vs base)")
+        if convergence is None:
+            print("    [i] not available: no report and COMSOL/template not reachable.")
+            print("        Run with --template <master.mph>, or generate with --convergence.")
+        else:
+            status = "PASS" if convergence.get("passed") else "FAIL"
+            print(
+                f"    {status}: median rel L2 {convergence.get('median_rel_l2_du', float('nan')):.3g}"
+                f"  max {convergence.get('max_rel_l2_du', float('nan')):.3g}"
+                f"  (tol {convergence.get('tol')}, refine x{convergence.get('refine_factor')},"
+                f" n={convergence.get('n_evaluated', convergence.get('n_samples'))})"
+            )
+            if not convergence.get("mesh_refined", True):
+                print("    [WARN] FE mesh could not be refined (no mapped numelem distributions)"
+                      " -> result inconclusive.")
+    elif run_convergence and all_dry:
+        print("\n  Mesh convergence: skipped (dry-run dataset).")
     print("==================================================\n")
 
     csv_path = None
@@ -347,6 +456,7 @@ def qc_dataset(
         "stats": stats,
         "rows": rows,
         "csv": str(csv_path) if csv_path else None,
+        "convergence": convergence,
     }
 
 
@@ -460,6 +570,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete dry-run placeholder files (du==0) so a resumed solve refills only those indices.",
     )
+    # Mesh-convergence check (on by default; cached in convergence_report.json).
+    p.add_argument(
+        "--no-convergence",
+        action="store_true",
+        help="Skip the mesh-convergence check (otherwise run/load by default).",
+    )
+    p.add_argument(
+        "--force-convergence",
+        action="store_true",
+        help="Re-run the convergence check even if convergence_report.json exists.",
+    )
+    p.add_argument("--convergence-samples", type=int, default=3, help="Patches for the convergence check.")
+    p.add_argument("--convergence-refine", type=float, default=2.0, help="Mesh element-count scale factor.")
+    p.add_argument("--convergence-tol", type=float, default=0.02, help="Max rel L2 du to PASS.")
+    p.add_argument("--template", type=str, default=None, help="Master .mph path for the convergence re-solve.")
     return p
 
 
@@ -471,7 +596,16 @@ if __name__ == "__main__":
         print("Now re-run the solver to refill them:")
         print("  python -m src.data_gen.lib.patch_factory_comsol -n 1000 --seed 0")
         raise SystemExit(0)
-    result = qc_dataset(Path(args.dir), max_samples=args.max_samples)
+    result = qc_dataset(
+        Path(args.dir),
+        max_samples=args.max_samples,
+        run_convergence=not args.no_convergence,
+        convergence_samples=args.convergence_samples,
+        convergence_refine=args.convergence_refine,
+        convergence_tol=args.convergence_tol,
+        force_convergence=args.force_convergence,
+        template=Path(args.template) if args.template else None,
+    )
     if args.plot and result.get("n", 0) > 0:
         if args.plot_indices:
             idxs = [int(s) for s in args.plot_indices.split(",")]
