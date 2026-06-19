@@ -62,6 +62,13 @@
 - `train_kinematics_predictor.py` embeds `model_config` in `kinematics_best.pth` and writes `outputs/kinematics/kinematics_architecture.json`.
 - `train_biochem_corrector.py` reads Stage-A `model_config` (checkpoint → reference JSON → shape inference).
 
+## Local kinematic corrector (clot velocity diversion)
+
+- Local k-hop GNN that predicts velocity diversion `[dU,dV]` as a residual on the frozen GINO-DEQ base flow around micro-clots. Doc + run log: [docs/LOCAL_KINEMATIC_CORRECTOR.md](docs/LOCAL_KINEMATIC_CORRECTOR.md).
+- Data: COMSOL Patch Factory (`src/data_gen/lib/patch_factory_comsol.py`, no Gmsh; mapped quad grid; QC + default mesh-convergence in `patch_factory_qc.py`). Model: `LocalKinematicCorrector` (3x GATv2) in `src/core_physics/coupled_shear_gnn.py`.
+- Train: `python -m src.training.train_local_kinematic_corrector --epochs 600 --batch-size 4 --stride 2 --device cuda` (5 GiB-safe). Eval vs COMSOL truth: `python -m src.tools.eval_local_corrector ...`. Live overlay vs GINO-DEQ: `python -m src.tools.verify_local_corrector_live ...`.
+- Latest (2026-06-19): 300 ep -> held-out global relL2 26.7% (med 30%, p90 54%, max 106%); undertrained + hard tail on extreme clots. See doc run log.
+
 ## Console output (PowerShell)
 
 - Do not use emoji or decorative Unicode in training/script `print` output — Windows PowerShell often renders them as mojibake. Use ASCII tags (`[OK]`, `[WARN]`, `[i]`). See [.cursor/rules/powershell-console-ascii.mdc](.cursor/rules/powershell-console-ascii.mdc).
