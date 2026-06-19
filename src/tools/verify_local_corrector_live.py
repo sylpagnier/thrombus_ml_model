@@ -159,6 +159,7 @@ def _plot_diversion(
     if not gui:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import numpy as np
 
     d_bar = float(data.d_bar.reshape(-1)[0].item()) if hasattr(data, "d_bar") else 1.0
     um = d_bar * 1e6  # ND position -> micrometers
@@ -167,7 +168,7 @@ def _plot_diversion(
     u0n = u0[subset].detach().cpu().numpy(); v0n = v0[subset].detach().cpu().numpy()
     ufn = uf[subset].detach().cpu().numpy(); vfn = vf[subset].detach().cpu().numpy()
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5), sharex=True, sharey=True)
     ax1.quiver(pos[:, 0], pos[:, 1], u0n, v0n, color="tab:blue", alpha=0.6)
     ax1.scatter(cpos[:, 0], cpos[:, 1], color="black", s=30, zorder=5, label="clot")
     ax1.set_title("GINO-DEQ base flow (no clot)")
@@ -177,7 +178,25 @@ def _plot_diversion(
     ax2.scatter(cpos[:, 0], cpos[:, 1], color="black", s=30, zorder=5, label="clot obstacle")
     ax2.set_title("Corrected flow (with diversion)")
     ax2.set_xlabel("x [um]"); ax2.legend(fontsize=8)
-    for ax in (ax1, ax2):
+
+    # Overlay: base vs corrected on the SAME axes with a SHARED arrow scale so the
+    # diversion is directly comparable (independent autoscaling would be misleading).
+    ext = float(pos[:, 0].max() - pos[:, 0].min()) if pos.shape[0] else 0.0
+    target = 0.08 * ext if ext > 0 else 1.0
+    sp = np.sqrt(np.concatenate([u0n, ufn]) ** 2 + np.concatenate([v0n, vfn]) ** 2)
+    maxsp = float(sp.max()) if sp.size else 0.0
+    qkw = (
+        dict(angles="xy", scale_units="xy", scale=maxsp / target)
+        if (target > 0 and maxsp > 0)
+        else {}
+    )
+    ax3.quiver(pos[:, 0], pos[:, 1], u0n, v0n, color="tab:blue", alpha=0.45, label="base", **qkw)
+    ax3.quiver(pos[:, 0], pos[:, 1], ufn, vfn, color="tab:red", alpha=0.7, label="corrected", **qkw)
+    ax3.scatter(cpos[:, 0], cpos[:, 1], color="black", s=30, zorder=5, label="clot")
+    ax3.set_title("Overlay: base (blue) vs corrected (red)")
+    ax3.set_xlabel("x [um]"); ax3.legend(fontsize=8)
+
+    for ax in (ax1, ax2, ax3):
         ax.set_aspect("equal")
     fig.tight_layout()
 
