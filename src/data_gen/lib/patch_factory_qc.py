@@ -64,8 +64,8 @@ def _reshape(arr: np.ndarray, ny: int, nx: int) -> np.ndarray:
 
 def load_patch(npz_path: Path) -> Dict[str, Any]:
     """Load one patch npz into flat arrays + scalar metadata."""
-    z = np.load(npz_path)
-    d: Dict[str, Any] = {k: z[k] for k in z.files}
+    with np.load(npz_path) as z:  # context-manager closes the handle (Windows file lock)
+        d: Dict[str, Any] = {k: z[k] for k in z.files}
     d["path"] = Path(npz_path)
     d["idx"] = int(d.get("config_id", -1))
     for k in (
@@ -201,6 +201,32 @@ def compute_sample_qc(d: Dict[str, Any], thr: Optional[QCThresholds] = None) -> 
     }
 
 
+def purge_dry_run(directory: Path) -> List[int]:
+    """Delete dry-run placeholder ``patch_*.npz`` (+ ``.json``) so a resumed solve refills them.
+
+    Returns the list of purged indices. A real (solved) batch can then be re-run without
+    ``--overwrite``: resume fills only the now-missing indices.
+    """
+    directory = Path(directory)
+    purged: List[int] = []
+    for p in sorted(glob.glob(str(directory / "patch_*.npz"))):
+        try:
+            with np.load(p) as z:  # context-manager closes the handle (Windows file lock)
+                is_dry = bool(np.asarray(z["dry_run"]).ravel()[0]) if "dry_run" in z.files else False
+        except Exception:
+            is_dry = False
+        if not is_dry:
+            continue
+        idx = int(os.path.basename(p).split("_")[1].split(".")[0])
+        os.remove(p)
+        sidecar = directory / f"patch_{idx}.json"
+        if sidecar.exists():
+            sidecar.unlink()
+        purged.append(idx)
+    logger.info("Purged %d dry-run placeholder file(s) from %s", len(purged), directory)
+    return purged
+
+
 def _percentiles(vals: List[float]) -> Dict[str, float]:
     arr = np.asarray([v for v in vals if v is not None and math.isfinite(v)], dtype=np.float64)
     if arr.size == 0:
@@ -241,6 +267,17 @@ def qc_dataset(
             rows.append({"idx": int(os.path.basename(p).split("_")[1].split(".")[0]), "flags": ["load_error"]})
 
     n = len(rows)
+
+    # Dry-run detection. A dry-run placeholder (du==0, no COMSOL solve) is fine if the WHOLE
+    # dataset is a dry run, but is contamination if mixed into a real (solved) dataset.
+    dry_idxs = [r["idx"] for r in rows if r.get("is_dry_run")]
+    n_dry = len(dry_idxs)
+    all_dry = (n_dry == n)
+    if 0 < n_dry < n:
+        for r in rows:
+            if r.get("is_dry_run") and "dry_run_placeholder" not in r.get("flags", []):
+                r.setdefault("flags", []).append("dry_run_placeholder")
+
     flag_counts: Dict[str, int] = {}
     for r in rows:
         for fl in r.get("flags", []):
@@ -256,8 +293,14 @@ def qc_dataset(
     print("\n================ Patch Factory QC ================")
     print(f"  dir: {directory}")
     print(f"  samples: {n}   clean (no flags): {clean}   flagged: {n - clean}")
-    if rows and rows[0].get("is_dry_run"):
-        print("  [i] dry-run data: perturbation/SNR checks are skipped (du==0 by construction)")
+    if all_dry:
+        print("  [i] dry-run dataset: perturbation/SNR checks skipped (du==0 by construction)")
+    elif n_dry > 0:
+        preview = ", ".join(str(i) for i in sorted(dry_idxs)[:15])
+        more = "" if n_dry <= 15 else f", ... (+{n_dry - 15} more)"
+        print(f"  [WARN] CONTAMINATION: {n_dry}/{n} dry-run placeholder files (du==0, no clot")
+        print(f"         signal) are mixed into a solved dataset. These will poison training.")
+        print(f"         Regenerate them with --overwrite (or delete). Indices: {preview}{more}")
     print("\n  Metric (normalized by U_ref unless noted)   min      median   p95      max")
     label = {
         "far_du_rms": "baseline far-field |du| RMS (want ~0)",
@@ -412,11 +455,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-samples", type=int, default=None, help="Cap samples scanned.")
     p.add_argument("--plot", action="store_true", help="Write field panels + distribution plots.")
     p.add_argument("--plot-indices", type=str, default=None, help="Comma-separated patch indices for field panels.")
+    p.add_argument(
+        "--purge-dry-run",
+        action="store_true",
+        help="Delete dry-run placeholder files (du==0) so a resumed solve refills only those indices.",
+    )
     return p
 
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
+    if args.purge_dry_run:
+        purged = purge_dry_run(Path(args.dir))
+        print(f"Purged {len(purged)} dry-run placeholder file(s): {purged[:20]}{' ...' if len(purged) > 20 else ''}")
+        print("Now re-run the solver to refill them:")
+        print("  python -m src.data_gen.lib.patch_factory_comsol -n 1000 --seed 0")
+        raise SystemExit(0)
     result = qc_dataset(Path(args.dir), max_samples=args.max_samples)
     if args.plot and result.get("n", 0) > 0:
         if args.plot_indices:
