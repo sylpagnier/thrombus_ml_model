@@ -76,22 +76,28 @@ def build_grid_edge_index(ny: int, nx: int) -> torch.Tensor:
 
 
 def relative_loss(
-    pred: torch.Tensor, y: torch.Tensor, batch_idx: torch.Tensor, eps: float = 1e-12
+    pred: torch.Tensor, y: torch.Tensor, batch_idx: torch.Tensor, floor: float
 ) -> torch.Tensor:
-    """Mean per-graph normalized error: mean_g( sum||pred-y||^2 / (sum||y||^2 + eps) ).
+    """Mean per-graph normalized error: mean_g( sum||pred-y||^2 / (sum||y||^2 + floor) ).
 
     Plain MSE on the ND residual is magnitude-weighted: ``du_nd`` scales with shear / clot
     size (``u_ref`` is geometry-only), so big-signal patches dominate and the low-signal ones
     (low shear, small/thin clots) are neglected -> high *relative* error there (see the
     stratified eval). Normalizing each graph by its own target energy makes every patch count
     equally, which is exactly the relL2 metric we report.
+
+    ``floor`` is an **absolute** target-energy floor (a fraction of the dataset-median patch
+    energy). A naive ``1e-12`` floor lets the lowest-signal patches (tiny ``||y||^2``) get
+    astronomically up-weighted -> exploding, oscillating loss and a collapsed model. With a
+    real floor the loss smoothly transitions: relative (``err/den``) for typical/large patches,
+    bounded (``err/floor``, MSE-like) for the near-zero ones.
     """
     err = ((pred - y) ** 2).sum(dim=1)   # per-node squared error
     tgt = (y ** 2).sum(dim=1)            # per-node target energy
     ng = int(batch_idx.max().item()) + 1
     num = torch.zeros(ng, device=pred.device, dtype=pred.dtype).index_add_(0, batch_idx, err)
     den = torch.zeros(ng, device=pred.device, dtype=pred.dtype).index_add_(0, batch_idx, tgt)
-    return (num / (den + eps)).mean()
+    return (num / (den + floor)).mean()
 
 
 def _scalar(z: dict, key: str, default: float | None = None) -> float:
@@ -241,6 +247,8 @@ def train_corrector(
     curriculum_frac: float = 0.0,
     cosine: bool = True,
     loss_mode: str = "mse",
+    rel_floor_frac: float = 0.5,
+    grad_clip: float = 5.0,
 ) -> LocalKinematicCorrector:
     """Fit the corrector on Patch Factory residuals; save best-by-val checkpoint.
 
@@ -294,6 +302,20 @@ def train_corrector(
         f"| curriculum_frac {curriculum_frac} | cosine {cosine}"
     )
 
+    # Relative-loss denominator floor: a fraction of the median per-patch target energy. This
+    # bounds the up-weighting of near-zero-signal patches so the loss can't explode/oscillate.
+    rel_floor = 0.0
+    if loss_mode == "relative":
+        patch_energy = torch.tensor(
+            [float((d.y ** 2).sum()) for d in train_set], dtype=torch.float64
+        )
+        med_energy = float(patch_energy.median()) if len(patch_energy) else 0.0
+        rel_floor = max(rel_floor_frac * med_energy, 1e-12)
+        print(
+            f"[i] relative loss: median patch energy {med_energy:.4e} | floor "
+            f"{rel_floor:.4e} (frac {rel_floor_frac}) | grad_clip {grad_clip}"
+        )
+
     model = LocalKinematicCorrector(in_channels=LOCAL_CORRECTOR_IN_CHANNELS, hidden_dim=hidden_dim).to(dev)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = (
@@ -333,6 +355,8 @@ def train_corrector(
                 "curriculum_frac": curriculum_frac,
                 "cosine_lr": cosine,
                 "loss_mode": loss_mode,
+                "rel_floor_frac": rel_floor_frac if loss_mode == "relative" else None,
+                "grad_clip": grad_clip,
             },
         }
 
@@ -348,10 +372,12 @@ def train_corrector(
             optimizer.zero_grad()
             pred = model(batch.x, batch.edge_index)
             if loss_mode == "relative":
-                loss = relative_loss(pred, batch.y, batch.batch)
+                loss = relative_loss(pred, batch.y, batch.batch, rel_floor)
             else:
                 loss = F.mse_loss(pred, batch.y)
             loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             total += float(loss.item())
             nb += 1
@@ -429,6 +455,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--loss", choices=["mse", "relative"], default="mse",
                    help="'relative' normalizes each patch by its own target energy so "
                         "low-signal (low-shear/small) clots aren't drowned out by MSE.")
+    p.add_argument("--rel-floor-frac", type=float, default=0.5,
+                   help="Relative-loss denominator floor as a fraction of median patch energy "
+                        "(stabilizes near-zero-signal patches). Larger = closer to MSE.")
+    p.add_argument("--grad-clip", type=float, default=5.0,
+                   help="Max grad norm (0 disables). Guards against relative-loss spikes.")
     return p
 
 
@@ -455,4 +486,6 @@ if __name__ == "__main__":
         curriculum_frac=args.curriculum_frac,
         cosine=not args.no_cosine,
         loss_mode=args.loss,
+        rel_floor_frac=args.rel_floor_frac,
+        grad_clip=args.grad_clip,
     )

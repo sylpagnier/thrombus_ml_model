@@ -92,7 +92,10 @@ At global relL2 17.6% (800 ep). Tail = low-signal patches (diagnosis above).
 1. **Relative loss** (implemented, `--loss relative`) -- retrain and compare the bucket table;
    expect the low-shear/thin-clot terciles to improve. Watch for a small trade-off on the
    high-signal terciles (acceptable: those are already good and the metric we care about is
-   uniform relL2).
+   uniform relL2). **Stability note:** the per-patch normalization must floor the denominator
+   at a fraction of the *median* patch energy (`--rel-floor-frac`, default 0.5) + grad clip
+   (`--grad-clip`, default 5.0); a naive `1e-12` floor lets near-zero-signal patches blow the
+   loss to ~1e7 and collapse the model (val relL2 stuck ~100%, train loss oscillating).
 2. **Decide what matters**: if only the big-diversion clots matter for biochem coupling, the
    current model is already ~15-16% there and the tail is a low-impact metric artifact -> a
    signal-weighted acceptance metric may be more honest than raw relL2.
