@@ -67,7 +67,7 @@
 - Local k-hop GNN that predicts velocity diversion `[dU,dV]` as a residual on the frozen GINO-DEQ base flow around micro-clots. Doc + run log: [docs/LOCAL_KINEMATIC_CORRECTOR.md](docs/LOCAL_KINEMATIC_CORRECTOR.md).
 - Data: COMSOL Patch Factory (`src/data_gen/lib/patch_factory_comsol.py`, no Gmsh; mapped quad grid; QC + default mesh-convergence in `patch_factory_qc.py`). Model: `LocalKinematicCorrector` (3x GATv2) in `src/core_physics/coupled_shear_gnn.py`.
 - Train: `python -m src.training.train_local_kinematic_corrector --epochs 600 --batch-size 4 --stride 2 --device cuda` (5 GiB-safe). Eval vs COMSOL truth: `python -m src.tools.eval_local_corrector ...`. Live overlay vs GINO-DEQ: `python -m src.tools.verify_local_corrector_live ...`.
-- Latest (2026-06-19): 300 ep -> held-out global relL2 26.7% (med 30%, p90 54%, max 106%); undertrained + hard tail on extreme clots. See doc run log.
+- Latest (2026-06-20): 800 ep -> held-out global relL2 17.6% (med 19%, p90 42%, p95 56%, max 98%); improved across the board vs 300 ep (26.7%), still trending down but tail is now the bottleneck. See doc run log.
 
 ## Console output (PowerShell)
 

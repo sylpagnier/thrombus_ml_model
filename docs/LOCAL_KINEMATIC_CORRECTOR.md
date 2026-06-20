@@ -54,13 +54,19 @@ correction is worse than predicting zero (a failure-tail flag).
 | date | config | data | val MSE_nd (best) | held-out relL2 (global / med / p90 / max) | note |
 |------|--------|------|-------------------|-------------------------------------------|------|
 | 2026-06-19 | 300 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 3.00e-6 | 26.7% / 30.0% / 54.5% / 106.3% | First end-to-end. Healthy curve, still descending at 300 ep (undertrained). Heavy failure tail (max>100%) -> likely extreme clots (largest w/h, highest mu/shear). Live diversion smooth, no artifacts, max\|dUV_nd\|~0.31. |
+| 2026-06-20 | 800 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 1.30e-6 | 17.6% / 19.1% / 42.4% / 97.5% | Just more epochs (same arch/loss). Every metric improved: global 26.7->17.6%, median 30->19%, p90 54->42%, max 106->98% (tail no longer worse-than-zero). val relL2 still trending down at ep799 (noisy, val n=100) -> not fully plateaued; no overfit (val~train). Tail (p90/p95) now the bottleneck. |
 
 ## Where we are / next levers (priority)
-1. **Train longer** -- val was still descending at 300 ep; run 600-1000 ep.
-2. **Characterize the tail** -- inspect eval worst panel; add per-bucket relL2 by
-   `clot_w / clot_h / clot_mu / shear_rate` to locate where error concentrates.
-3. **Loss for the tail** -- plain MSE is energy-weighted; try a normalized / relative loss
+We are at global relL2 17.6% (800 ep) and closing on the <12% target, but the failure
+**tail is now the bottleneck** (p90 42%, p95 56%, max 98%). Plain epoch-stacking is hitting
+diminishing returns; the next gains come from the tail, not raw training time.
+1. **Characterize the tail** -- inspect eval worst panel; add per-bucket relL2 by
+   `clot_w / clot_h / clot_mu / shear_rate` to locate where error concentrates (most likely
+   the largest/most-occluding, highest-mu clots).
+2. **Loss for the tail** -- plain MSE is energy-weighted; try a normalized / relative loss
    so big-diversion patches don't dominate and small ones aren't ignored.
+3. **LR schedule** -- val relL2 is noisy and still drifting down; cosine decay (or a longer
+   run with decay) should both squeeze more and stabilize the best epoch.
 4. **Capacity** -- hidden 64 is small; try 96/128 once data/loss are set.
 5. **More/!balanced data** -- 1000 patches may under-cover the extreme-clot corner; consider
    oversampling wide/tall/high-mu clots.
