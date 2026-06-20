@@ -33,10 +33,27 @@ the biochem clot model needs.
 - ND convention: positions by length scale (`d_bar` on patient graphs, channel height `H` on
   patches), velocity by `PhysicsConfig.get_u_ref(H)`, viscosity by `mu_viscosity_nd_scale`.
 
+## Stage-A lessons ported (2026-06-20)
+From the Stage-A kinematics curriculum ([docs/KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md)):
+- **Difficulty-weighted oversampling** (clinical-anchor-boost analog): train sampler weight
+  `1 + hard_boost*difficulty`, where `difficulty = patch_difficulty(clot_mu, clot_w, clot_h)`
+  in `[0,1]` (single source of truth in `patch_factory_comsol.py`). `--hard-boost` (default 3).
+- **Curriculum ramp** (L0L1 -> L2-heavy analog): `--curriculum-frac F` ramps the boost 0->full
+  over the first `F` of epochs (easy-first, then hard). Default 0 (constant boost).
+- **Cosine LR** (Stage-A: scheduler helped, LBFGS hurt): on by default; `--no-cosine` to disable.
+- **Stratified (per-bucket) eval**: `eval_local_corrector` prints energy-weighted relL2 by
+  terciles of difficulty / clot_mu / clot_w / clot_h / occlusion / shear -> shows *where* the
+  failure tail lives.
+- **Harder data generation**: `patch_factory_comsol --hard-bias B` skews clot mu/width/height
+  toward the hard end for a fresh cohort (over-sample the difficult corner). `B=0` = original.
+
 ## Train / eval / viz
-- Train: `python -m src.training.train_local_kinematic_corrector --patch-dir data/processed/cfd_results_patch_factory --epochs 600 --batch-size 4 --stride 2 --device cuda`
-  - 5 GiB GPU: `batch-size 4 / stride 2` fits. Reports per-epoch val MSE_nd + val relL2.
-  - Saves `outputs/kinematics/local_corrector/local_kinematic_corrector_best.pth` (+ `_last`).
+- Train: `python -m src.training.train_local_kinematic_corrector --patch-dir data/processed/cfd_results_patch_factory --epochs 800 --batch-size 4 --stride 2 --device cuda --hard-boost 3 --curriculum-frac 0.3`
+  - 5 GiB GPU: `batch-size 4 / stride 2` fits. Reports per-epoch val MSE_nd + val relL2 + lr.
+  - Difficulty-weighted sampler + cosine LR on by default; `--hard-boost 0 --no-cosine` for the
+    legacy uniform/constant-LR recipe.
+  - Saves `outputs/kinematics/local_corrector/local_kinematic_corrector_best.pth` (+ `_last`);
+    checkpoint meta records `sampling` (hard_boost / curriculum_frac / cosine).
 - Eval (held-out vs COMSOL truth): `python -m src.tools.eval_local_corrector --patch-dir data/processed/cfd_results_patch_factory --corrector outputs/kinematics/local_corrector/local_kinematic_corrector_best.pth`
   - Global + per-sample relL2; truth/pred/error maps (best/median/worst) ->
     `outputs/reports/figures/kinematics/local_corrector_eval.png`.
@@ -58,18 +75,16 @@ correction is worse than predicting zero (a failure-tail flag).
 
 ## Where we are / next levers (priority)
 We are at global relL2 17.6% (800 ep) and closing on the <12% target, but the failure
-**tail is now the bottleneck** (p90 42%, p95 56%, max 98%). Plain epoch-stacking is hitting
-diminishing returns; the next gains come from the tail, not raw training time.
-1. **Characterize the tail** -- inspect eval worst panel; add per-bucket relL2 by
-   `clot_w / clot_h / clot_mu / shear_rate` to locate where error concentrates (most likely
-   the largest/most-occluding, highest-mu clots).
-2. **Loss for the tail** -- plain MSE is energy-weighted; try a normalized / relative loss
-   so big-diversion patches don't dominate and small ones aren't ignored.
-3. **LR schedule** -- val relL2 is noisy and still drifting down; cosine decay (or a longer
-   run with decay) should both squeeze more and stabilize the best epoch.
-4. **Capacity** -- hidden 64 is small; try 96/128 once data/loss are set.
-5. **More/!balanced data** -- 1000 patches may under-cover the extreme-clot corner; consider
-   oversampling wide/tall/high-mu clots.
+**tail is the bottleneck** (p90 42%, p95 56%, max 98%). Stage-A tooling is now wired in:
+1. **Run the bucket eval first** on the current best ckpt -> read which axis (clot_mu / size /
+   occlusion / shear) owns the tail; that decides whether to lean on oversampling vs new data.
+2. **Difficulty oversampling + curriculum** (implemented) -- retrain with `--hard-boost 3
+   --curriculum-frac 0.3` and compare relL2 + bucket table vs the 17.6% baseline.
+3. **Harder data** (implemented) -- if oversampling the existing 1000 isn't enough, generate a
+   hard cohort: `patch_factory_comsol --hard-bias 1.5`.
+4. **Loss for the tail** -- if oversampling helps the big patches but the smallest-signal ones
+   regress, try a normalized/relative loss (not yet implemented).
+5. **Capacity** -- hidden 64 is small; try 96/128 once data/loss are set.
 
 Target: global relL2 <~12% with p95 well under 100% before wiring into the biochem deploy
 rollout (`BiochemDeployStack.set_local_corrector` / `local_corrector_ckpt`).

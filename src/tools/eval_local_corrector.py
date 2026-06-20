@@ -22,6 +22,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -69,6 +70,43 @@ def _nd_cfg_from_meta(meta: dict[str, Any], args: argparse.Namespace) -> PatchNd
     return PatchNdConfig(
         crop_x_factor=args.crop_x_factor, crop_y_frac=args.crop_y_frac, stride=args.stride
     )
+
+
+def _print_buckets(per_sample: List[dict[str, Any]]) -> None:
+    """Stratified relL2 by terciles of each difficulty axis (Stage-A per-level lesson).
+
+    Energy-weighted relL2 per bucket = sqrt(sum sq_err / sum sq_tgt) over the bucket, so it
+    matches the global metric and reveals which clot regime drives the failure tail.
+    """
+    axes = [
+        ("difficulty", "difficulty (composite)", 1.0, ""),
+        ("clot_mu", "clot_mu", 1.0, " Pa.s"),
+        ("clot_w", "clot_w", 1e6, " um"),
+        ("clot_h", "clot_h", 1e6, " um"),
+        ("occlusion", "clot_h/H", 100.0, " %"),
+        ("shear", "shear_rate", 1.0, " 1/s"),
+    ]
+    print("\n  Stratified relL2 (energy-weighted) by terciles -- where the error lives:")
+    print(f"  {'axis':<22} {'low tercile':<22} {'mid tercile':<22} {'high tercile':<22}")
+    for key, label, scale, unit in axes:
+        rows = [r for r in per_sample if math.isfinite(r.get(key, float('nan')))]
+        if len(rows) < 3:
+            continue
+        rows.sort(key=lambda r: r[key])
+        k = len(rows) // 3
+        thirds = [rows[:k], rows[k:2 * k], rows[2 * k:]]
+        cells: List[str] = []
+        for grp in thirds:
+            if not grp:
+                cells.append("-")
+                continue
+            se = sum(r["sq_err"] for r in grp)
+            st = sum(r["sq_tgt"] for r in grp)
+            rel = (se / st) ** 0.5 if st > 0 else float("nan")
+            lo = grp[0][key] * scale
+            hi = grp[-1][key] * scale
+            cells.append(f"{rel * 100:5.1f}% [{lo:.0f}-{hi:.0f}{unit}]")
+        print(f"  {label:<22} {cells[0]:<22} {cells[1]:<22} {cells[2]:<22}")
 
 
 def _rel_l2(pred: torch.Tensor, truth: torch.Tensor) -> float:
@@ -119,12 +157,23 @@ def evaluate(
             d = data.to(dev)
             pred = corrector(d.x, d.edge_index)
             truth = d.y
-            sq_err += float(((pred - truth) ** 2).sum().item())
-            sq_tgt += float((truth ** 2).sum().item())
+            se = float(((pred - truth) ** 2).sum().item())
+            st = float((truth ** 2).sum().item())
+            sq_err += se
+            sq_tgt += st
             per_sample.append({
                 "split_pos": local_i,
                 "rel_l2": _rel_l2(pred, truth),
                 "n_nodes": int(d.x.shape[0]),
+                "sq_err": se,
+                "sq_tgt": st,
+                # stratification axes (attached in patch_to_data)
+                "difficulty": float(getattr(data, "difficulty", float("nan"))),
+                "clot_mu": float(getattr(data, "clot_mu", float("nan"))),
+                "clot_w": float(getattr(data, "clot_w", float("nan"))),
+                "clot_h": float(getattr(data, "clot_h", float("nan"))),
+                "occlusion": float(getattr(data, "occlusion", float("nan"))),
+                "shear": float(getattr(data, "shear", float("nan"))),
             })
 
     global_rel = float((sq_err / sq_tgt) ** 0.5) if sq_tgt > 0 else float("nan")
@@ -136,7 +185,9 @@ def evaluate(
     print(f"  per-sample relL2  median       : {pct(50) * 100:.2f}%")
     print(f"                    p90 / p95    : {pct(90) * 100:.2f}% / {pct(95) * 100:.2f}%")
     print(f"                    min / max    : {pct(0) * 100:.2f}% / {pct(100) * 100:.2f}%")
-    print("=================================================================\n")
+    print("=================================================================")
+    _print_buckets(per_sample)
+    print()
 
     # Pick best / median / worst (by per-sample relL2) for the truth-vs-pred maps.
     order = sorted([p for p in per_sample if np.isfinite(p["rel_l2"])], key=lambda p: p["rel_l2"])

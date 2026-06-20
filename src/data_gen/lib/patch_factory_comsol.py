@@ -140,6 +140,29 @@ class PatchSample:
         )
 
 
+def patch_difficulty(clot_mu_peak: float, clot_width: float, clot_height: float) -> float:
+    """Normalized [0,1] difficulty proxy for a patch (single source of truth).
+
+    The corrector's job is hardest where the diversion is large and nonlinear: high
+    viscosity contrast and a big clot footprint. Weighted toward ``clot_mu`` (the dominant
+    driver), then streamwise width, then wall-normal height. Used for stratified eval
+    buckets and difficulty-weighted training (see Stage-A geometry-curriculum lesson).
+    """
+    def nrm(x: float, lo: float, hi: float) -> float:
+        return min(1.0, max(0.0, (float(x) - lo) / (hi - lo))) if hi > lo else 0.0
+
+    mu_t = nrm(clot_mu_peak, _CLOT_MU_RANGE[0], _CLOT_MU_RANGE[1])
+    w_t = nrm(clot_width, 100e-6, 625e-6)
+    h_t = nrm(clot_height, 10e-6, 30e-6)
+    return float(0.5 * mu_t + 0.3 * w_t + 0.2 * h_t)
+
+
+def _skew_high(rng: np.random.Generator, lo: float, hi: float, bias: float) -> float:
+    """Draw in [lo, hi]; ``bias=0`` is uniform, larger ``bias`` skews toward ``hi``."""
+    a = 1.0 + 2.0 * max(0.0, float(bias))
+    return float(lo + (hi - lo) * float(rng.beta(a, 1.0)))
+
+
 def sample_patch_parameters(
     idx: int,
     rng: np.random.Generator,
@@ -149,6 +172,7 @@ def sample_patch_parameters(
     height_floor: float = _HEIGHT_FLOOR,
     height_clearance_factor: float = _HEIGHT_CLEARANCE_FACTOR,
     height_ceiling: float = _HEIGHT_CEILING,
+    hard_bias: float = 0.0,
 ) -> PatchSample:
     """Draw one patch parameter set.
 
@@ -160,17 +184,23 @@ def sample_patch_parameters(
     slip/symmetry top always sits in the decayed far field even for the widest smears (the
     vertical disturbance scale ~ clot width). ``H`` is driven into COMSOL as ``channel_h``
     and used for the extraction grid, so the two always agree.
+
+    ``hard_bias`` (>=0) skews clot mu / width / height toward their high (harder) end so a
+    fresh cohort over-samples the difficult corner the corrector struggles on (Stage-A
+    "sample more difficult problems" lesson). ``hard_bias=0`` keeps the original distribution.
     """
     s = grid_spacing
 
-    wide_frac = float(rng.beta(2.0, 1.0))  # skew toward 1.0 => wide smears
+    # clot width: already wide-skewed (beta(2,1)); hard_bias sharpens it further.
+    wide_a = 2.0 + 2.0 * max(0.0, float(hard_bias))
+    wide_frac = float(rng.beta(wide_a, 1.0))  # skew toward 1.0 => wide smears
     clot_width = (
         _CLOT_WIDTH_MIN_NODES + wide_frac * (_CLOT_WIDTH_MAX_NODES - _CLOT_WIDTH_MIN_NODES)
     ) * s
-    clot_height = float(rng.uniform(_CLOT_HEIGHT_MIN_NODES, _CLOT_HEIGHT_MAX_NODES)) * s
+    clot_height = _skew_high(rng, _CLOT_HEIGHT_MIN_NODES, _CLOT_HEIGHT_MAX_NODES, hard_bias) * s
 
     shear_rate = float(rng.uniform(*_SHEAR_RATE_RANGE))
-    clot_mu_peak = float(rng.uniform(*_CLOT_MU_RANGE))
+    clot_mu_peak = _skew_high(rng, _CLOT_MU_RANGE[0], _CLOT_MU_RANGE[1], hard_bias)
 
     # Far-field clearance: keep the prescribed-freestream top >= factor * clot_width above
     # the wall so the disturbance has decayed there.
@@ -598,6 +628,7 @@ class PatchFactoryComsolGenerator:
         overwrite: bool = False,
         dry_run: bool = False,
         max_reconnects: int = 20,
+        hard_bias: float = 0.0,
     ) -> Dict[str, Any]:
         """Sample ``n`` patches and (solve or dry-run) each, writing npz + json sidecars."""
         self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -610,6 +641,7 @@ class PatchFactoryComsolGenerator:
                 height_floor=self.cfg.height_floor,
                 height_clearance_factor=self.cfg.height_clearance_factor,
                 height_ceiling=self.cfg.height_ceiling,
+                hard_bias=hard_bias,
             )
             for i in range(n)
         ]
@@ -687,6 +719,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=str, default=None, help="Override output directory.")
     p.add_argument("--grid-spacing-um", type=float, default=5.0, help="Structured grid spacing [um].")
     p.add_argument(
+        "--hard-bias", type=float, default=0.0,
+        help="Skew clot mu/width/height toward the hard end (0=original dist). Over-sample "
+        "the difficult corner for a fresh cohort.",
+    )
+    p.add_argument(
         "--convergence",
         action="store_true",
         help="After the batch, re-solve a few patches at a refined mapped mesh and write "
@@ -711,7 +748,7 @@ if __name__ == "__main__":
         # No COMSOL session needed for a dry run.
         gen.run_batch(
             n=args.num_patches, seed=args.seed, start_idx=args.start_idx,
-            overwrite=args.overwrite, dry_run=True,
+            overwrite=args.overwrite, dry_run=True, hard_bias=args.hard_bias,
         )
     else:
         cfg.convergence_samples = args.convergence_samples
@@ -720,7 +757,7 @@ if __name__ == "__main__":
         with gen:
             gen.run_batch(
                 n=args.num_patches, seed=args.seed, start_idx=args.start_idx,
-                overwrite=args.overwrite, dry_run=False,
+                overwrite=args.overwrite, dry_run=False, hard_bias=args.hard_bias,
             )
             if args.convergence:
                 rng = np.random.default_rng(args.seed)

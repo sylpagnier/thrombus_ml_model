@@ -41,6 +41,7 @@ from src.core_physics.coupled_shear_gnn import (
     assemble_local_corrector_features,
     save_local_corrector,
 )
+from src.data_gen.lib.patch_factory_comsol import patch_difficulty
 from src.utils.paths import data_root, get_project_root
 
 
@@ -109,6 +110,8 @@ def patch_to_data(
         cx = _scalar(z, "clot_x_center")
         cw = _scalar(z, "clot_width")
         ch = _scalar(z, "clot_height")
+        clot_mu = _scalar(z, "clot_mu_peak", 0.0)
+        shear = _scalar(z, "shear_rate", 0.0)
 
     if not (np.isfinite(du).all() and np.isfinite(dv).all() and np.isfinite(mu).all()):
         return None
@@ -165,6 +168,15 @@ def patch_to_data(
     edge_index = build_grid_edge_index(ny_c, nx_c)
     data = Data(x=feats, edge_index=edge_index, y=target)
     data.num_nodes = feats.shape[0]
+    # Stratification / difficulty metadata (scalars; ignored by the model, used by the
+    # difficulty-weighted sampler and the per-bucket eval).
+    data.clot_mu = float(clot_mu)
+    data.clot_w = float(cw)
+    data.clot_h = float(ch)
+    data.channel_h = float(H)
+    data.shear = float(shear)
+    data.occlusion = float(ch / H) if H > 0 else 0.0
+    data.difficulty = patch_difficulty(clot_mu, cw, ch)
     return data
 
 
@@ -206,8 +218,17 @@ def train_corrector(
     out_dir: Path | str = DEFAULT_OUT_DIR,
     nd_cfg: PatchNdConfig | None = None,
     seed: int = 0,
+    hard_boost: float = 3.0,
+    curriculum_frac: float = 0.0,
+    cosine: bool = True,
 ) -> LocalKinematicCorrector:
-    """Fit the corrector on Patch Factory residuals; save best-by-val checkpoint."""
+    """Fit the corrector on Patch Factory residuals; save best-by-val checkpoint.
+
+    Difficulty-weighted sampling (Stage-A lesson): hard patches (high mu / big clot) are
+    over-sampled with weight ``1 + boost * difficulty``. ``curriculum_frac > 0`` ramps the
+    boost from 0 -> ``hard_boost`` over that fraction of epochs (easy-first, then hard, like
+    the L0L1 -> L2-heavy geometry curriculum). ``cosine`` anneals the LR over training.
+    """
     dev = torch.device(device) if device is not None else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -230,11 +251,35 @@ def train_corrector(
     val_set = [dataset[i] for i in range(n) if i in val_idx]
     print(f"[i] patches: {n} usable | train {len(train_set)} | val {len(val_set)}")
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    # Difficulty-weighted oversampling (Stage-A clinical-anchor-boost analog). Build a loader
+    # with weights = 1 + boost*difficulty; with a curriculum the boost ramps each epoch.
+    train_diff = torch.tensor(
+        [float(getattr(d, "difficulty", 0.0)) for d in train_set], dtype=torch.float64
+    )
+
+    def _make_train_loader(boost: float) -> DataLoader:
+        if boost <= 0.0:
+            return DataLoader(train_set, batch_size=batch_size, shuffle=True)
+        weights = (1.0 + boost * train_diff).clamp_min(1e-6)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights, num_samples=len(train_set), replacement=True
+        )
+        return DataLoader(train_set, batch_size=batch_size, sampler=sampler)
+
+    static_boost = hard_boost if curriculum_frac <= 0.0 else None
+    train_loader = _make_train_loader(static_boost if static_boost is not None else 0.0)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False) if val_set else None
+    print(
+        f"[i] difficulty: median {float(train_diff.median()):.3f} | hard_boost {hard_boost} "
+        f"| curriculum_frac {curriculum_frac} | cosine {cosine}"
+    )
 
     model = LocalKinematicCorrector(in_channels=LOCAL_CORRECTOR_IN_CHANNELS, hidden_dim=hidden_dim).to(dev)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+        if cosine else None
+    )
 
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     best_path = out_dir / "local_kinematic_corrector_best.pth"
@@ -263,9 +308,17 @@ def train_corrector(
             "val_mse_nd": val_mse,
             "val_rel_l2": val_rel,
             "nd_cfg": vars(cfg),
+            "sampling": {
+                "hard_boost": hard_boost,
+                "curriculum_frac": curriculum_frac,
+                "cosine_lr": cosine,
+            },
         }
 
     for epoch in range(epochs):
+        if curriculum_frac > 0.0:
+            ramp = min(1.0, (epoch + 1) / max(1.0, curriculum_frac * epochs))
+            train_loader = _make_train_loader(hard_boost * ramp)
         model.train()
         total = 0.0
         nb = 0
@@ -309,13 +362,17 @@ def train_corrector(
             best_val_rel = val_rel if val_rel is not None else float("nan")
             save_local_corrector(best_path, model, _meta(epoch, train_mse, val_mse, val_rel))
 
+        if scheduler is not None:
+            scheduler.step()
+
         if epoch % 10 == 0 or epoch == epochs - 1:
             if val_mse is not None:
                 rtxt = f" | val relL2 {val_rel * 100:.2f}%" if math.isfinite(val_rel) else ""
                 vtxt = f" | val MSE {val_mse:.6e}{rtxt}"
             else:
                 vtxt = ""
-            print(f"[i] epoch {epoch:3d} | train MSE {train_mse:.6e}{vtxt}")
+            lrtxt = f" | lr {optimizer.param_groups[0]['lr']:.2e}" if scheduler is not None else ""
+            print(f"[i] epoch {epoch:3d} | train MSE {train_mse:.6e}{vtxt}{lrtxt}")
 
     save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse, val_rel))
     rel_txt = f" (relL2 {best_val_rel * 100:.2f}%)" if math.isfinite(best_val_rel) else ""
@@ -338,6 +395,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--crop-y-frac", type=float, default=0.5)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
+    # Stage-A lessons: difficulty oversampling + curriculum + cosine LR.
+    p.add_argument("--hard-boost", type=float, default=3.0,
+                   help="Oversample weight = 1 + boost*difficulty (0 = uniform shuffle).")
+    p.add_argument("--curriculum-frac", type=float, default=0.0,
+                   help="Ramp hard_boost 0->full over this fraction of epochs (0 = constant).")
+    p.add_argument("--no-cosine", action="store_true", help="Disable cosine LR annealing.")
     return p
 
 
@@ -360,4 +423,7 @@ if __name__ == "__main__":
         device=args.device,
         nd_cfg=nd_cfg,
         seed=args.seed,
+        hard_boost=args.hard_boost,
+        curriculum_frac=args.curriculum_frac,
+        cosine=not args.no_cosine,
     )
