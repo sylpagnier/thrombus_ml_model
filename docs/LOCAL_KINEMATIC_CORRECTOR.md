@@ -73,18 +73,32 @@ correction is worse than predicting zero (a failure-tail flag).
 | 2026-06-19 | 300 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 3.00e-6 | 26.7% / 30.0% / 54.5% / 106.3% | First end-to-end. Healthy curve, still descending at 300 ep (undertrained). Heavy failure tail (max>100%) -> likely extreme clots (largest w/h, highest mu/shear). Live diversion smooth, no artifacts, max\|dUV_nd\|~0.31. |
 | 2026-06-20 | 800 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 1.30e-6 | 17.6% / 19.1% / 42.4% / 97.5% | Just more epochs (same arch/loss). Every metric improved: global 26.7->17.6%, median 30->19%, p90 54->42%, max 106->98% (tail no longer worse-than-zero). val relL2 still trending down at ep799 (noisy, val n=100) -> not fully plateaued; no overfit (val~train). Tail (p90/p95) now the bottleneck. |
 
+## Tail diagnosis (2026-06-20, stratified eval on the 800-ep ckpt)
+The failure tail is **the low-signal regime, not the hard clots.** Energy-weighted relL2 is
+worst at the *low* end of every axis; `shear_rate` has the steepest gradient (28.4% low ->
+15.1% high), then `clot_h` (25.1% -> 17.5%). The deployment-relevant big clots (high
+mu/size/shear) are already the best-fit (~15-16%).
+
+Mechanism: `get_u_ref(d_bar)` is **geometry-only** (no shear), so `du_nd = du_si/u_ref` scales
+with shear / clot size. Plain MSE on `du_nd` is therefore magnitude-weighted -> it fits big
+signals and neglects small ones -> high *relative* error on low-shear/small/thin clots.
+
+Consequence: `--hard-boost` (oversample high mu/size) is the **wrong direction** here (those
+are already best). The principled fix is the **relative loss** (`--loss relative`), which
+normalizes each patch by its own target energy so all signal scales count equally.
+
 ## Where we are / next levers (priority)
-We are at global relL2 17.6% (800 ep) and closing on the <12% target, but the failure
-**tail is the bottleneck** (p90 42%, p95 56%, max 98%). Stage-A tooling is now wired in:
-1. **Run the bucket eval first** on the current best ckpt -> read which axis (clot_mu / size /
-   occlusion / shear) owns the tail; that decides whether to lean on oversampling vs new data.
-2. **Difficulty oversampling + curriculum** (implemented) -- retrain with `--hard-boost 3
-   --curriculum-frac 0.3` and compare relL2 + bucket table vs the 17.6% baseline.
-3. **Harder data** (implemented) -- if oversampling the existing 1000 isn't enough, generate a
-   hard cohort: `patch_factory_comsol --hard-bias 1.5`.
-4. **Loss for the tail** -- if oversampling helps the big patches but the smallest-signal ones
-   regress, try a normalized/relative loss (not yet implemented).
-5. **Capacity** -- hidden 64 is small; try 96/128 once data/loss are set.
+At global relL2 17.6% (800 ep). Tail = low-signal patches (diagnosis above).
+1. **Relative loss** (implemented, `--loss relative`) -- retrain and compare the bucket table;
+   expect the low-shear/thin-clot terciles to improve. Watch for a small trade-off on the
+   high-signal terciles (acceptable: those are already good and the metric we care about is
+   uniform relL2).
+2. **Decide what matters**: if only the big-diversion clots matter for biochem coupling, the
+   current model is already ~15-16% there and the tail is a low-impact metric artifact -> a
+   signal-weighted acceptance metric may be more honest than raw relL2.
+3. **Capacity** -- hidden 64 is small; try 96/128 once the loss is settled.
+4. **Hard data / oversampling** -- only if a *future* diagnosis shows the hard corner
+   regressing (`--hard-bias` data gen, `--hard-boost` sampler). Not indicated now.
 
 Target: global relL2 <~12% with p95 well under 100% before wiring into the biochem deploy
 rollout (`BiochemDeployStack.set_local_corrector` / `local_corrector_ckpt`).

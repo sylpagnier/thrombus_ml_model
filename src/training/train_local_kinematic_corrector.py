@@ -75,6 +75,25 @@ def build_grid_edge_index(ny: int, nx: int) -> torch.Tensor:
     return torch.from_numpy(ei).long()
 
 
+def relative_loss(
+    pred: torch.Tensor, y: torch.Tensor, batch_idx: torch.Tensor, eps: float = 1e-12
+) -> torch.Tensor:
+    """Mean per-graph normalized error: mean_g( sum||pred-y||^2 / (sum||y||^2 + eps) ).
+
+    Plain MSE on the ND residual is magnitude-weighted: ``du_nd`` scales with shear / clot
+    size (``u_ref`` is geometry-only), so big-signal patches dominate and the low-signal ones
+    (low shear, small/thin clots) are neglected -> high *relative* error there (see the
+    stratified eval). Normalizing each graph by its own target energy makes every patch count
+    equally, which is exactly the relL2 metric we report.
+    """
+    err = ((pred - y) ** 2).sum(dim=1)   # per-node squared error
+    tgt = (y ** 2).sum(dim=1)            # per-node target energy
+    ng = int(batch_idx.max().item()) + 1
+    num = torch.zeros(ng, device=pred.device, dtype=pred.dtype).index_add_(0, batch_idx, err)
+    den = torch.zeros(ng, device=pred.device, dtype=pred.dtype).index_add_(0, batch_idx, tgt)
+    return (num / (den + eps)).mean()
+
+
 def _scalar(z: dict, key: str, default: float | None = None) -> float:
     if key not in z:
         if default is None:
@@ -221,6 +240,7 @@ def train_corrector(
     hard_boost: float = 3.0,
     curriculum_frac: float = 0.0,
     cosine: bool = True,
+    loss_mode: str = "mse",
 ) -> LocalKinematicCorrector:
     """Fit the corrector on Patch Factory residuals; save best-by-val checkpoint.
 
@@ -312,6 +332,7 @@ def train_corrector(
                 "hard_boost": hard_boost,
                 "curriculum_frac": curriculum_frac,
                 "cosine_lr": cosine,
+                "loss_mode": loss_mode,
             },
         }
 
@@ -326,7 +347,10 @@ def train_corrector(
             batch = batch.to(dev)
             optimizer.zero_grad()
             pred = model(batch.x, batch.edge_index)
-            loss = F.mse_loss(pred, batch.y)
+            if loss_mode == "relative":
+                loss = relative_loss(pred, batch.y, batch.batch)
+            else:
+                loss = F.mse_loss(pred, batch.y)
             loss.backward()
             optimizer.step()
             total += float(loss.item())
@@ -372,7 +396,8 @@ def train_corrector(
             else:
                 vtxt = ""
             lrtxt = f" | lr {optimizer.param_groups[0]['lr']:.2e}" if scheduler is not None else ""
-            print(f"[i] epoch {epoch:3d} | train MSE {train_mse:.6e}{vtxt}{lrtxt}")
+            ltag = "relL2^2" if loss_mode == "relative" else "MSE"
+            print(f"[i] epoch {epoch:3d} | train {ltag} {train_mse:.6e}{vtxt}{lrtxt}")
 
     save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse, val_rel))
     rel_txt = f" (relL2 {best_val_rel * 100:.2f}%)" if math.isfinite(best_val_rel) else ""
@@ -401,6 +426,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--curriculum-frac", type=float, default=0.0,
                    help="Ramp hard_boost 0->full over this fraction of epochs (0 = constant).")
     p.add_argument("--no-cosine", action="store_true", help="Disable cosine LR annealing.")
+    p.add_argument("--loss", choices=["mse", "relative"], default="mse",
+                   help="'relative' normalizes each patch by its own target energy so "
+                        "low-signal (low-shear/small) clots aren't drowned out by MSE.")
     return p
 
 
@@ -426,4 +454,5 @@ if __name__ == "__main__":
         hard_boost=args.hard_boost,
         curriculum_frac=args.curriculum_frac,
         cosine=not args.no_cosine,
+        loss_mode=args.loss,
     )
