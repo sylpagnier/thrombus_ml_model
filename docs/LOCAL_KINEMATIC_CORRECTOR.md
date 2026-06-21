@@ -72,7 +72,14 @@ correction is worse than predicting zero (a failure-tail flag).
 |------|--------|------|-------------------|-------------------------------------------|------|
 | 2026-06-19 | 300 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 3.00e-6 | 26.7% / 30.0% / 54.5% / 106.3% | First end-to-end. Healthy curve, still descending at 300 ep (undertrained). Heavy failure tail (max>100%) -> likely extreme clots (largest w/h, highest mu/shear). Live diversion smooth, no artifacts, max\|dUV_nd\|~0.31. |
 | 2026-06-20 | 800 ep, bs4, stride2, hidden64, heads4, MSE | 1000 patches (900/100) | 1.30e-6 | 17.6% / 19.1% / 42.4% / 97.5% | Just more epochs (same arch/loss). Every metric improved: global 26.7->17.6%, median 30->19%, p90 54->42%, max 106->98% (tail no longer worse-than-zero). val relL2 still trending down at ep799 (noisy, val n=100) -> not fully plateaued; no overfit (val~train). Tail (p90/p95) now the bottleneck. |
-| 2026-06-21 | 800 ep, bs4, stride2, hidden64, **relative loss** (floor 0.5*med, grad_clip 5), cosine, hard_boost 0 | 1000 patches (900/100) | 1.06e-6 | 15.9% global (med/p90/max pending eval) | First stable relative-loss run (after fixing the 1e-12 -> median-energy floor; the naive version had collapsed, val relL2~100%). **Beats the MSE 800-ep baseline on the headline too**: global relL2 17.6->15.9%, val MSE 1.30e-6->1.06e-6. Smooth monotonic descent, cosine annealed LR->0, plateaued cleanly (~16% from ep600). The relative loss was meant to help only the low-signal tail but improved the global energy-weighted metric as well -> the low-signal patches were dragging the whole model, not just their own bucket. **Next: run `eval_local_corrector` for the bucket table to confirm the low-shear/thin-clot terciles compressed.** |
+| 2026-06-21 | 800 ep, bs4, stride2, hidden64, **relative loss** (floor 0.5*med, grad_clip 5), cosine, hard_boost 0 | 1000 patches (900/100) | 1.06e-6 | 15.9% / 16.5% / 28.9% / 65.5% | First stable relative-loss run (after fixing the 1e-12 -> median-energy floor; the naive version had collapsed, val relL2~100%). **Beats the MSE 800-ep baseline everywhere**: global 17.6->15.9%, median 19.1->16.5%, p90 42.4->28.9%, p95 55.9->39.5%, max 97.5->65.5%, val MSE 1.30e-6->1.06e-6. Smooth monotonic descent, cosine annealed LR->0, plateaued ~16% from ep600. Designed to help only the low-signal tail but improved the global metric too -> low-signal patches were dragging the whole model, not just their bucket. |
+
+### Bucket verdict (relative loss vs MSE, low tercile -> the targets)
+The stratified table **flattened**: `clot_h/H` now flat (15.7/15.6/16.5), `clot_mu` nearly flat.
+Low-tercile drops: shear_rate 28.4->24.4, clot_h 25.1->17.3, difficulty 23.2->17.7,
+occlusion 20.5->15.7, clot_mu 20.2->17.9, clot_w 20.5->18.1. The single remaining hot cell is
+the **lowest-shear tercile (24.4%, [84-1613 1/s])** -- the intrinsically smallest-signal
+patches (tiny `du_nd`; `u_ref` is geometry-only). Relative loss is now the recipe to beat.
 
 ## Tail diagnosis (2026-06-20, stratified eval on the 800-ep ckpt)
 The failure tail is **the low-signal regime, not the hard clots.** Energy-weighted relL2 is
@@ -89,20 +96,17 @@ are already best). The principled fix is the **relative loss** (`--loss relative
 normalizes each patch by its own target energy so all signal scales count equally.
 
 ## Where we are / next levers (priority)
-At global relL2 **15.9%** (800 ep, relative loss) -- the current best, beating the MSE
-baseline (17.6%). The relative loss is now the default recipe to beat.
-0. **Confirm the bucket table** (`eval_local_corrector`) for the relative-loss ckpt -- verify
-   the low-shear/thin-clot terciles compressed (the whole point); log it. **(pending)**
-1. **Relative loss** (implemented, `--loss relative`) -- now validated; it improved *global*
-   relL2 too, so low-signal patches were dragging the whole model. **Stability note:** the
-   per-patch normalization must floor the denominator at a fraction of the *median* patch
-   energy (`--rel-floor-frac`, default 0.5) + grad clip (`--grad-clip`, default 5.0); a naive
-   `1e-12` floor blew the loss to ~1e7 and collapsed the model (val relL2 stuck ~100%).
-   Try `--rel-floor-frac 0.25` (more aggressive) if the bucket table shows the low terciles
-   still lagging.
-2. **Capacity** -- hidden 64 is small; try 96/128 now that the loss is settled.
-3. **Hard data / oversampling** -- only if a future diagnosis shows the hard corner
-   regressing. Not indicated.
+At global relL2 **15.9%** (800 ep, relative loss), tail much tighter (p90 28.9%, max 65.5%).
+Relative loss is the recipe to beat. The table is flat except one hot cell: **lowest-shear
+tercile 24.4%**. Remaining levers (diminishing returns -- decide if <12% global is worth it):
+1. **Lowest-shear cell** -- the only real outlier. Cheap A/B: `--rel-floor-frac 0.25` (push
+   small-signal patches harder). Or oversample low-shear directly. Risk: the absolute error
+   there is already tiny (deploy-irrelevant); may not be worth chasing.
+2. **Capacity** -- hidden 64 is small; try `--hidden-dim 96/128` now that the loss is settled.
+   Most likely lever for a uniform global drop.
+3. **More data** -- 900 train patches is modest; a second 1000-patch cohort would help the
+   tail percentiles (val n=100 is noisy).
+4. **Hard data / `--hard-boost`** -- still not indicated (error is at the *low* end).
 2. **Decide what matters**: if only the big-diversion clots matter for biochem coupling, the
    current model is already ~15-16% there and the tail is a low-impact metric artifact -> a
    signal-weighted acceptance metric may be more honest than raw relL2.
