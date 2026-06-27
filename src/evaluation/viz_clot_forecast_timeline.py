@@ -28,6 +28,7 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_hybrid_enabled,
     clot_phi_shape_use_t_out_mu,
     clot_phi_thresh_si,
+    gt_mu_anchor_cap_si,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
     project_deploy_mu_with_support,
@@ -116,8 +117,9 @@ def _predict_forecast_step(
     return phi_pred, mu_pred.reshape(-1), step.phi_gt.reshape(-1)
 
 
-def _clot_binary(mu_si: np.ndarray, thresh: float) -> np.ndarray:
-    return (mu_si >= thresh).astype(np.float32)
+def _clot_binary(mu_si: np.ndarray, anchor_si: np.ndarray, thresh: float) -> np.ndarray:
+    growth = np.maximum(mu_si.reshape(-1) - anchor_si.reshape(-1), 0.0)
+    return (growth >= thresh).astype(np.float32)
 
 
 def _pick_t_out_indices(t_steps: int, pair_stride: int, keyframes: int) -> list[int]:
@@ -175,6 +177,7 @@ def main() -> None:
     t_steps = int(data.y.shape[0])
     t_out_list = _pick_t_out_indices(t_steps, pair_stride, max(1, args.keyframes))
     thresh = clot_phi_thresh_si(phys_cfg)
+    mu_anchor_np = gt_mu_anchor_cap_si(data, phys_cfg, device).detach().cpu().numpy()
     pos = data.x[:, :2].detach().cpu().numpy()
 
     rows: list[dict] = []
@@ -206,11 +209,12 @@ def main() -> None:
             gt_state=y_out,
             edge_index=data.edge_index.to(device),
             phys_cfg=phys_cfg,
+            gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
         )
         mu_gt_np = mu_gt.detach().cpu().numpy()
         mu_pr_np = mu_pred.detach().cpu().numpy()
-        gt_panels.append(_clot_binary(mu_gt_np, thresh))
-        pr_panels.append(_clot_binary(mu_pr_np, thresh))
+        gt_panels.append(_clot_binary(mu_gt_np, mu_anchor_np, thresh))
+        pr_panels.append(_clot_binary(mu_pr_np, mu_anchor_np, thresh))
         titles.append(f"t_out={t_out}\nshape={sm['clot_shape']:.3f}")
         rows.append(
             {
@@ -321,8 +325,8 @@ def main() -> None:
     # Full-mesh deploy mu (projected) vs GT binary clot — matches clot_shape eval.
     mu_cap_v = float(os.environ.get("CLOT_PHI_MU_CAP_SI", "0.10"))
     fig3, axes3 = plt.subplots(1, 3, figsize=(14, 4.5))
-    gt_bin = _clot_binary(mu_gt_last, thresh)
-    pr_bin = _clot_binary(mu_pr_np, thresh)
+    gt_bin = _clot_binary(mu_gt_last, mu_anchor_np, thresh)
+    pr_bin = _clot_binary(mu_pr_np, mu_anchor_np, thresh)
     support_np = m.astype(float)
     for ax, vals, title, cmap, vmin, vmax in (
         (axes3[0], gt_bin, f"GT clot (>={thresh:.3f})", "Reds", 0, 1),

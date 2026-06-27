@@ -1,7 +1,7 @@
 """Clot shape scorecard: spatial overlap + location-weighted false positives + flow guards.
 
-Visual clot definition (matches dynamic-mu viz with 0.04-0.10 Pa*s scale):
-  node is "clot" when mu_eff_si >= CLOT_SHAPE_MU_THRESH_SI (default: clot_phi_thresh_si).
+Visual clot definition (canonical, matches ``gt_clot_phi_at_time``):
+  node is "clot" when ``relu(mu_eff(t) - mu_eff(t=0)) >= CLOT_SHAPE_MU_THRESH_SI``.
 
 North-star metric ``clot_shape`` is F1 with hop-graded precision on predictions:
 each predicted clot node earns proximity credit by graph hops to the nearest GT clot
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from src.config import PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
-from src.core_physics.clot_phi_simple import clot_phi_thresh_si
+from src.core_physics.clot_phi_simple import clot_phi_thresh_si, mu_growth_clot_binary_mask
 from src.utils.metrics import rel_l2_uvp
 
 
@@ -44,15 +44,26 @@ def _env_int(name: str, default: int) -> int:
 
 
 def resolve_clot_shape_mu_thresh_si(phys_cfg: PhysicsConfig) -> float:
-    """Threshold for binary visual clot on full mesh (Pa*s)."""
+    """Threshold for binary growth clot on full mesh (Pa*s)."""
     override = os.environ.get("CLOT_SHAPE_MU_THRESH_SI", "").strip()
     if override:
         return max(float(override), float(phys_cfg.mu_inf))
     return float(clot_phi_thresh_si(phys_cfg))
 
 
-def mu_clot_binary_mask(mu_si: torch.Tensor, thresh_si: float) -> torch.Tensor:
-    return mu_si.reshape(-1).to(dtype=torch.float32) >= float(thresh_si)
+def mu_clot_binary_mask(
+    mu_si: torch.Tensor,
+    thresh_si: float,
+    *,
+    mu_anchor_si: torch.Tensor,
+) -> torch.Tensor:
+    """Growth-only clot mask (canonical GT definition)."""
+    return mu_growth_clot_binary_mask(mu_si, mu_anchor_si, thresh_si)
+
+
+def _mu_anchor_from_state(state: torch.Tensor, phys_cfg: PhysicsConfig) -> torch.Tensor:
+    mu_ch = STATE_CHANNEL_MU_EFF_ND
+    return phys_cfg.viscosity_nd_to_si(state[:, mu_ch]).reshape(-1)
 
 
 def graph_hop_distance_from_seeds(
@@ -121,16 +132,24 @@ def compute_clot_shape_metrics(
     phys_cfg: PhysicsConfig,
     mu_thresh_si: float | None = None,
     node_mask: torch.Tensor | None = None,
+    mu_anchor_si: torch.Tensor | None = None,
+    gt_anchor_state: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    """Binary clot overlap on full mesh from rollout channel-3 mu_eff."""
+    """Binary clot overlap on full mesh from rollout channel-3 mu_eff (growth-only)."""
     mu_ch = STATE_CHANNEL_MU_EFF_ND
     pred_mu = phys_cfg.viscosity_nd_to_si(pred_state[:, mu_ch]).reshape(-1)
     gt_mu = phys_cfg.viscosity_nd_to_si(gt_state[:, mu_ch]).reshape(-1)
     n_nodes = int(pred_mu.numel())
     thresh = float(mu_thresh_si) if mu_thresh_si is not None else resolve_clot_shape_mu_thresh_si(phys_cfg)
 
-    gt_clot = mu_clot_binary_mask(gt_mu, thresh).cpu().numpy()
-    pred_clot = mu_clot_binary_mask(pred_mu, thresh).cpu().numpy()
+    if mu_anchor_si is None:
+        if gt_anchor_state is None:
+            raise ValueError("mu_anchor_si or gt_anchor_state required for growth-only clot labels")
+        mu_anchor_si = _mu_anchor_from_state(gt_anchor_state, phys_cfg)
+    anchor = mu_anchor_si.reshape(-1).to(device=gt_mu.device, dtype=gt_mu.dtype)
+
+    gt_clot = mu_clot_binary_mask(gt_mu, thresh, mu_anchor_si=anchor).cpu().numpy()
+    pred_clot = mu_clot_binary_mask(pred_mu, thresh, mu_anchor_si=anchor).cpu().numpy()
 
     eval_n = n_nodes
     if node_mask is not None:
@@ -258,6 +277,7 @@ def compute_clot_shape_trajectory(
     n_pred = int(pred_traj.shape[0])
     if pred_time_indices is None:
         pred_time_indices = list(range(n_pred))
+    gt_anchor_state = gt_traj[0]
     per_step: list[dict[str, Any]] = []
     for pi in pred_time_indices:
         pi = max(0, min(int(pi), n_pred - 1))
@@ -268,6 +288,7 @@ def compute_clot_shape_trajectory(
             edge_index=edge_index,
             phys_cfg=phys_cfg,
             node_mask=node_mask,
+            gt_anchor_state=gt_anchor_state,
         )
         m["pred_time_index"] = pi
         m["gt_time_index"] = gi

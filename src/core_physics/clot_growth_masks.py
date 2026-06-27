@@ -28,7 +28,7 @@ from src.core_physics.clot_phi_simple import (
 
 
 def clot_ceiling_hops() -> int:
-    return max(int(float(os.environ.get("CLOT_PHI_CEILING_HOPS", "2") or "2")), 0)
+    return max(int(float(os.environ.get("CLOT_PHI_CEILING_HOPS", "3") or "3")), 0)
 
 
 def growth_seed_mode() -> str:

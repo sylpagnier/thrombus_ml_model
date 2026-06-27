@@ -12,15 +12,24 @@ from src.utils.paths import biochem_dir, get_project_root
 
 @dataclass
 class ClotBaselineRecipe:
-    """Frozen training/deploy recipe for geometry -> clot maps (GNODE + clot-phi)."""
+    """Frozen deploy recipe for geometry -> clot maps (GraphSAGE species + clot-phi).
+
+    Species temporal evolution comes from the GraphSAGE ``biochem_deploy`` stack
+    (``species_ckpt``); the learned clot-phi MLP (``clot_phi_ckpt``) reads the
+    rolled-out species block and produces the deploy mu map.
+
+    ``teacher_ckpt`` is the legacy (pre-2026-06 GNODE) field, retained only so old
+    manifests still load; it is ignored by the GraphSAGE predictor.
+    """
 
     name: str = "lane_a"
-    description: str = "Pred-kine GNODE teacher + mu-unlock + dump + hybrid clot-phi MLP"
+    description: str = "GraphSAGE species pushforward + hybrid clot-phi MLP mu map"
     mu_ratio_max: float = 20.0
-    pred_kine: bool = True
+    pred_kine: bool = False
     june_anchor_dir: str = "outputs/biochem/gnode_8h_ladder/anchors_stride_72"
     dump_anchor_dir: str = "outputs/biochem/gnode10_sweep/anchors_gnode12_predkine_uvp"
-    teacher_ckpt: str = ""
+    species_ckpt: str = ""
+    teacher_ckpt: str = ""  # legacy GNODE field (ignored; kept for manifest back-compat)
     clot_phi_ckpt: str = ""
     mu_unlock_epochs: int = 6
     clot_epochs: int = 35
@@ -32,7 +41,7 @@ class ClotBaselineRecipe:
     def resolved_paths(self, root: Path | None = None) -> dict[str, Path]:
         root = root or get_project_root()
         out: dict[str, Path] = {}
-        for key in ("june_anchor_dir", "dump_anchor_dir", "teacher_ckpt", "clot_phi_ckpt", "init_teacher_ckpt"):
+        for key in ("june_anchor_dir", "dump_anchor_dir", "species_ckpt", "teacher_ckpt", "clot_phi_ckpt", "init_teacher_ckpt"):
             rel = getattr(self, key, "") or ""
             if rel:
                 p = Path(rel)
@@ -71,22 +80,27 @@ def default_lane_a_clot_phi_env() -> dict[str, str]:
 
 def default_lane_a_recipe() -> ClotBaselineRecipe:
     root = get_project_root()
-    promoted_teacher = root / "outputs/biochem/clot_baseline/teacher_best_high_mu.pth"
+    promoted_species = root / "outputs/biochem/clot_baseline/species_best.pth"
     promoted_clot = root / "outputs/biochem/clot_baseline/clot_phi_best.pth"
-    teacher = (
-        str(promoted_teacher.relative_to(root))
-        if promoted_teacher.is_file()
-        else "outputs/biochem/gnode10_sweep/gnode12_lane_a_promoted/biochem_teacher_best_high_mu.pth"
-    )
+    # GraphSAGE species pushforward checkpoint (biochem_deploy stack).
+    from src.biochem_gnn.config import global_ckpt_path
+
+    if promoted_species.is_file():
+        species = str(promoted_species.relative_to(root))
+    else:
+        canonical = global_ckpt_path()
+        try:
+            species = str(canonical.relative_to(root))
+        except ValueError:
+            species = str(canonical)
     clot = (
         str(promoted_clot.relative_to(root))
         if promoted_clot.is_file()
         else "outputs/biochem/passive_species_focus_compare/gnode12_lane_a_clotphi/clot_phi_best.pth"
     )
     return ClotBaselineRecipe(
-        teacher_ckpt=teacher,
+        species_ckpt=species,
         clot_phi_ckpt=clot,
-        init_teacher_ckpt="outputs/biochem/gnode10_sweep/K5_kine15_final/biochem_teacher_best_high_mu.pth",
         clot_phi_env=default_lane_a_clot_phi_env(),
     )
 

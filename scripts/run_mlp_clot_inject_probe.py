@@ -202,6 +202,7 @@ def _metrics_at_time(
     *,
     edge_index: torch.Tensor | None = None,
     node_mask: torch.Tensor | None = None,
+    gt_anchor_t: torch.Tensor | None = None,
 ) -> dict:
     mu_ch = STATE_CHANNEL_MU_EFF_ND
     pred_mu = phys.viscosity_nd_to_si(pred_t[:, mu_ch])
@@ -225,6 +226,7 @@ def _metrics_at_time(
                 edge_index=edge_index,
                 phys_cfg=phys,
                 node_mask=node_mask,
+                gt_anchor_state=gt_anchor_t,
             )
         )
     return out
@@ -259,6 +261,7 @@ def _eval_anchor(
         phys,
         edge_index=data.edge_index,
         node_mask=anchor_node_mask(data),
+        gt_anchor_t=gt[0],
     )
     try:
         from src.evaluation.clot_shape_score import compute_clot_shape_trajectory
@@ -281,11 +284,13 @@ def _eval_anchor(
             phi_gt_binary,
             supervision_region_mask,
         )
+        from src.core_physics.clot_phi_simple import gt_mu_anchor_cap_si
 
         mu_gt = phys.viscosity_nd_to_si(gt[ti][:, STATE_CHANNEL_MU_EFF_ND])
         mu_cap = cap_mu_eff_si(mu_gt)
         region = supervision_region_mask(data, device, mu_cap, phys)
-        clot_gate = phi_gt_binary(mu_cap, region, phys).reshape(-1).bool()
+        anchor = gt_mu_anchor_cap_si(data, phys, device)
+        clot_gate = phi_gt_binary(mu_cap, region, phys, mu_anchor_si=anchor).reshape(-1).bool()
         pred_mu = phys.viscosity_nd_to_si(pred[pred_ti][:, STATE_CHANNEL_MU_EFF_ND])
         if bool(clot_gate.any()):
             m["mu_log_mae_clot_gate"] = _mu_log_mae(pred_mu, mu_gt, clot_gate)

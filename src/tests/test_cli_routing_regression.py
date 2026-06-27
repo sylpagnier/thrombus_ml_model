@@ -47,7 +47,7 @@ def test_orchestrate_all_runs_kinematics_then_biochem_in_order(monkeypatch):
 
     assert calls == [
         "src.training.train_kinematics_predictor",
-        "src.training.train_biochem_corrector",
+        "src.training.train_biochem_gnn",
     ]
 
 

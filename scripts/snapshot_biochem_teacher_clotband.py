@@ -33,6 +33,7 @@ from src.core_physics.clot_phi_simple import (
     cap_mu_eff_si,
     clot_phi_mask_mode,
     clot_phi_mu_cap_si,
+    gt_mu_anchor_cap_si,
     phi_gt_binary,
     phi_gt_soft,
 )
@@ -91,11 +92,16 @@ def _scatter_panel(
     ax.axis("off")
 
 
-def _phi_from_mu_cap(mu_cap: torch.Tensor, mu_c: torch.Tensor, region: torch.Tensor, phys_cfg: PhysicsConfig) -> torch.Tensor:
+def _phi_from_mu_cap(
+    mu_cap: torch.Tensor,
+    mu_anchor: torch.Tensor,
+    region: torch.Tensor,
+    phys_cfg: PhysicsConfig,
+) -> torch.Tensor:
     use_soft = (os.environ.get("CLOT_PHI_SOFT_LABELS") or "0").strip().lower() in ("1", "true", "yes", "on")
     if use_soft:
-        return phi_gt_soft(mu_cap, mu_c, region)
-    return phi_gt_binary(mu_cap, region, phys_cfg)
+        return phi_gt_soft(mu_cap, mu_anchor, region)
+    return phi_gt_binary(mu_cap, region, phys_cfg, mu_anchor_si=mu_anchor)
 
 
 def main() -> int:
@@ -186,7 +192,8 @@ def main() -> int:
     pred_nd = pred[ti, :, STATE_CHANNEL_MU_EFF_ND].to(device=device, dtype=torch.float32)
     mu_pred_si = phys_cfg.viscosity_nd_to_si(pred_nd)
     mu_pred_cap = cap_mu_eff_si(mu_pred_si)
-    phi_pred = _phi_from_mu_cap(mu_pred_cap, step.mu_c_si, step.region, phys_cfg)
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
+    phi_pred = _phi_from_mu_cap(mu_pred_cap, mu_anchor, step.region, phys_cfg)
 
     pos = data.x[:, :2].detach().cpu().numpy()
     m = step.region.detach().cpu().numpy().astype(bool)

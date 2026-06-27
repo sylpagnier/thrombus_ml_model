@@ -106,7 +106,7 @@ def _eval_beta(
             bio_cfg=bio,
             device=device,
             anchor=anc,
-            soft_gelation=False,
+            soft_gelation=True,
         )
         masks = _region_masks(pack["data"], t_i, phys, device, mu_gt)
         growth = masks["growth"]
@@ -201,7 +201,7 @@ def main() -> int:
                 phys_cfg=phys,
                 bio_cfg=bio,
                 device=device,
-                soft_gelation=False,
+                soft_gelation=True,
             )
             masks = _region_masks(pack["data"], t_i, phys, device, mu_gt)
             if log_space:

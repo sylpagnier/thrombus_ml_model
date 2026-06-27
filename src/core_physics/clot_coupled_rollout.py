@@ -131,6 +131,14 @@ def rollout_temporal_phi_coupled(
     reset_temporal_kinematics_cache()
     _init_coupled_uv_from_frozen_kine(data, device)
 
+    # Step 5b/5c flow refresh: full DEQ re-solve (default) or the cheap trained local
+    # corrector diversion around the clot (BIOCHEM_CORRECTOR_COUPLING=1).
+    from src.inference.corrector_coupling import (
+        CorrectorCoupledFlow,
+        corrector_coupling_enabled,
+    )
+
+    corrector_flow = CorrectorCoupledFlow(device) if corrector_coupling_enabled() else None
     provider = kine_provider or KinematicsUvProvider(device)
     from src.core_physics.clot_continuous_time import feature_time_index
 
@@ -176,7 +184,10 @@ def rollout_temporal_phi_coupled(
             bio_cfg=bio_cfg,
         )
         batch = data.to(device)
-        u, v = provider.uv_nd_from_mu_si(batch, mu)
+        if corrector_flow is not None:
+            u, v = corrector_flow.couple(batch, mu, publish=False)
+        else:
+            u, v = provider.uv_nd_from_mu_si(batch, mu)
         set_coupled_uv_cache(data, u, v)
 
     return phi_by_t

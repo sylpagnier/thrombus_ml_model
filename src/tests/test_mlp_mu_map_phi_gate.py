@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.config import BiochemConfig, PhysicsConfig
+from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
 from src.core_physics.clot_phi_mu_inject import (
     ClotPhiMuInjector,
     assemble_committed_mu_map,
@@ -92,8 +92,13 @@ def test_assemble_gt_clot_mask_carreau_bulk(monkeypatch):
     region = torch.tensor([True, True, True, False])
     mu_gt = torch.tensor([0.10, 0.04, 0.04, 0.04])
     mu_cap = cap_mu_eff_si(mu_gt)
-    gate = phi_gt_binary(mu_cap, region, phys)
+    anchor = torch.full((4,), 0.04)
+    gate = phi_gt_binary(mu_cap, region, phys, mu_anchor_si=anchor)
     assert int(gate.sum().item()) == 1
+
+    y0 = torch.zeros(4, 4, dtype=torch.float32)
+    y0[:, STATE_CHANNEL_MU_EFF_ND] = phys.viscosity_si_to_nd(anchor)
+    graph = type("G", (), {"y": y0.unsqueeze(0)})()
 
     out = assemble_committed_mu_map(
         mu_c,
@@ -102,6 +107,7 @@ def test_assemble_gt_clot_mask_carreau_bulk(monkeypatch):
         region=region,
         mu_gt_cap_si=mu_cap,
         phys_cfg=phys,
+        graph_data=graph,
     )
     assert float(out[0].item()) == pytest.approx(0.10, rel=1e-4)
     assert float(out[1].item()) == pytest.approx(0.04, rel=1e-4)

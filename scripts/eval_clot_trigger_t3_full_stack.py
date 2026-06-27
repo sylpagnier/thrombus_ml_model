@@ -20,7 +20,7 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from src.architecture.gnode_biochem import biochem_truth_node_mask
+from src.utils.biochem_masks import biochem_truth_node_mask
 from src.config import BiochemConfig, PhysicsConfig, VesselConfig
 from src.core_physics.clot_phi_rollout import clot_phi_rollout_detach_carry
 from src.core_physics.clot_phi_simple import build_clot_phi_step, clot_phi_model_uses_mpnn

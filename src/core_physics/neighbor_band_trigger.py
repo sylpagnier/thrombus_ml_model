@@ -14,9 +14,11 @@ from typing import Any
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_simple import (
     cap_mu_eff_si,
     carreau_mu_si_from_uv,
+    gt_mu_anchor_cap_si,
     physics_mu_eff_si,
     physics_phi_from_mu,
     supervision_region_mask,
@@ -27,7 +29,7 @@ from src.training.biochem_supervision_masks import (
     compute_supervised_species_log_mae,
     resolve_data_bio_supervision_mask,
 )
-from src.architecture.gnode_biochem import biochem_truth_node_mask
+from src.utils.biochem_masks import biochem_truth_node_mask
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -159,7 +161,7 @@ def eval_neighbor_band_at_step(
     v_gt = y_gt[:, 1].reshape(-1).to(device=device, dtype=torch.float32)
 
     if species_log1p is None:
-        species_log1p = pred_y[t, :, 4:16].to(device=device, dtype=torch.float32)
+        species_log1p = pred_y[t, :, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32)
     else:
         species_log1p = species_log1p.to(device=device, dtype=torch.float32)
 
@@ -178,7 +180,7 @@ def eval_neighbor_band_at_step(
     elif mode in ("gt_species", "gt"):
         mu_pred = physics_mu_eff_si(
             mu_c,
-            y_gt[:, 4:16].to(device=device, dtype=torch.float32),
+            y_gt[:, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32),
             bio_cfg,
             device=device,
             data=data,
@@ -189,8 +191,13 @@ def eval_neighbor_band_at_step(
         raise ValueError(f"Unknown trigger_mode={trigger_mode!r}")
 
     use_soft = _env_bool("CLOT_PHI_SOFT_LABELS", default=True)
-    phi_gt = physics_phi_from_mu(mu_cap, mu_c, region, phys_cfg, soft=use_soft)
-    phi_pred = physics_phi_from_mu(mu_pred, mu_c, region, phys_cfg, soft=use_soft)
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
+    phi_gt = physics_phi_from_mu(
+        mu_cap, mu_c, region, phys_cfg, soft=use_soft, mu_anchor_si=mu_anchor
+    )
+    phi_pred = physics_phi_from_mu(
+        mu_pred, mu_c, region, phys_cfg, soft=use_soft, mu_anchor_si=mu_anchor
+    )
 
     n_nodes = int(data.num_nodes)
     truth_m = biochem_truth_node_mask(data, n_nodes, device)
@@ -227,6 +234,7 @@ def eval_neighbor_band_at_step(
         gt_state=gt_state,
         edge_index=data.edge_index.to(device=device),
         phys_cfg=phys_cfg,
+        gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
     )
 
     return NeighborBandStepMetrics(

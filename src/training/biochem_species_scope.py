@@ -7,27 +7,21 @@ from typing import Sequence
 
 import torch
 
-# Indices within ``y[..., 4:16]`` (12 bulk log1p channels).
-THROMBIN_CHANNEL = 5
-PROTHROMBIN_CHANNEL = 4
-FIBRINOGEN_CHANNEL = 7
-FI_CHANNEL = 8
-MAT_CHANNEL = 11
+from src.utils import species_channels as sc
 
-# Bulk slice index -> short name (y[:, 4:16] layout).
+# Indices within the 12-ch species block ``y[..., 4:16]`` (NOT full-y columns;
+# add 4 for the full-y column). Single-sourced from ``src.utils.species_channels``
+# so they cannot drift from the enums / channel schema.
+THROMBIN_CHANNEL = sc.block_index("T")        # 5
+PROTHROMBIN_CHANNEL = sc.block_index("PT")    # 4
+FIBRINOGEN_CHANNEL = sc.block_index("FG")     # 7
+FI_CHANNEL = sc.block_index("FI")             # 8
+MAT_CHANNEL = sc.block_index("Mat")           # 11
+
+# Species-block index -> short name (``y[:, 4:16]`` layout). Indices 9-11 are
+# wall species (M, Mas, Mat) despite the historical "bulk" label.
 BULK_CHANNEL_NAMES: dict[int, str] = {
-    0: "RP",
-    1: "AP",
-    2: "APR",
-    3: "APS",
-    4: "PT",
-    5: "T",
-    6: "AT",
-    7: "FG",
-    8: "FI",
-    9: "M",
-    10: "Mas",
-    11: "Mat",
+    i: sc.name_at_block_index(i) for i in range(sc.SPECIES_BLOCK_WIDTH)
 }
 
 FI_MAT_BASE_CHANNELS: tuple[int, ...] = (FI_CHANNEL, MAT_CHANNEL)
@@ -105,6 +99,8 @@ def scope_label_for_channels(channels: Sequence[int]) -> str:
     base = sorted(FI_MAT_BASE_CHANNELS)
     if ch == base:
         return "fi_mat"
+    if ch == [MAT_CHANNEL]:
+        return "mat"
     extras = [c for c in ch if c not in base]
     if len(extras) == 1 and extras[0] == THROMBIN_CHANNEL:
         return "fi_mat_thrombin"

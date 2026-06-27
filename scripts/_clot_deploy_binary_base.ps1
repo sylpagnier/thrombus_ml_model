@@ -23,7 +23,7 @@ $env:CLOT_PHI_DGAMMA_FEATURE_TIME = "current"
 $env:CLOT_PHI_HARD_SUPPORT_PROJECTION = "1"
 $env:CLOT_PHI_SUPPORT_BAND = "ceiling_growth"
 $env:CLOT_FORECAST_MASK = "ceiling_growth"
-$env:CLOT_PHI_CEILING_HOPS = "2"
+$env:CLOT_PHI_CEILING_HOPS = "3"
 $env:CLOT_PHI_GROWTH_SEED = "gt"
 
 # Full-mesh shape aux (off-band bulk suppression).

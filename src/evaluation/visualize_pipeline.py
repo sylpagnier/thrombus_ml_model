@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import os
 import sys
@@ -15,29 +17,14 @@ from matplotlib.widgets import Slider, Button
 from src.utils.paths import get_project_root, resolve_checkpoint
 from src.data_gen import MeshToGraphComplete, MeshToGraphPhase3, VesselGeneratorPhase3
 from src.architecture.ginodeq import GINO_DEQ
-from src.architecture.gnode_biochem import (
-    apply_biochem_forward_policy_from_checkpoint_meta,
-    biochem_forward_policy_from_checkpoint_meta,
-    format_biochem_forward_policy_summary,
-)
 from src.architecture.kinematics_model_config import (
     build_gino_deq_from_ctor,
     kinematics_checkpoint_tensors,
     resolve_gino_deq_ctor_kwargs,
 )
-from src.architecture.gnode_biochem import (
-    GNODE_Phase3,
-    restore_mlp_clot_inject_shell_env,
-    snapshot_mlp_clot_inject_shell_env,
-    _SPECIES_LOG1P_MAX,
-    _SPECIES_LOG1P_MIN,
-    _biochem_mu_disable_explicit_gelation,
-    _biochem_mu_simple_log_residual_enabled,
-    biochem_explicit_gelation_terms,
-    resolve_gnode_phase3_ctor_kwargs,
-)
 from src.architecture.lora_injection import inject_lora_to_spectral_linears
 from src.config import PhysicsConfig, BiochemConfig, STATE_CHANNEL_MU_EFF_ND, VesselConfig
+from src.utils import species_channels
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_model,
     build_clot_phi_step,
@@ -63,7 +50,6 @@ from src.core_physics.clot_phi_mu_inject import (
     resolve_clot_trigger_gate,
     resolve_mu_map_baselines_si,
 )
-from src.inference.clot_phi_inject_attach import attach_clot_phi_injector_to_teacher
 from src.inference.deploy_mu_map_env import wire_deploy_mu_map
 from src.evaluation.clot_phi_checkpoint_env import (
     apply_clot_phi_config_from_checkpoint,
@@ -167,21 +153,12 @@ def _viz_mu_si_clim(*arrays: np.ndarray) -> Tuple[float, float]:
 
 
 def _biochem_mu_viz_labels() -> Dict[str, str]:
-    """Panel titles aligned with the active forward ``μ_eff`` path."""
-    if _biochem_mu_simple_log_residual_enabled():
-        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout, $\mu_{\mathrm{kin}}\,e^{\Delta\log\mu}$) [Pa·s]"
-        gel_suffix = "effective μ₁/μ₂ in forward = 0 (simple log residual)"
-    elif _biochem_mu_disable_explicit_gelation():
-        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout) [Pa·s]"
-        gel_suffix = "effective μ₁/μ₂ in forward = 0"
-    else:
-        mu_dyn = r"$\mu_{\mathrm{eff}}$ (rollout) [Pa·s]"
-        gel_suffix = "effective μ₁/μ₂ in forward"
+    """Panel titles for biochem mu fields (GraphSAGE deploy)."""
     return {
-        "mu_dynamic": mu_dyn,
+        "mu_dynamic": r"$\mu_{\mathrm{eff}}$ (deploy) [Pa·s]",
         "mu1_product": r"$\mu_{\mathrm{blood}}\times\mu_1$ (effective) [Pa·s]",
         "mu2_trigger": r"$\mu_2$ (effective in forward) [-]",
-        "gelation_suffix": gel_suffix,
+        "gelation_suffix": "GraphSAGE deploy mu",
     }
 
 
@@ -804,7 +781,7 @@ def _committed_mu_single_frame_numpy(
             int(time_index),
             u_nd=pred_t[:, 0],
             v_nd=pred_t[:, 1],
-            species_log=pred_t[:, 4:16],
+            species_log=pred_t[:, species_channels.SPECIES_BLOCK],
             phys_cfg=phys_cfg,
             bio_cfg=bio_cfg,
             device=device,
@@ -836,7 +813,7 @@ def _committed_mu_mesh_series_numpy(
                 y_idx,
                 u_nd=pred_t[:, 0],
                 v_nd=pred_t[:, 1],
-                species_log=pred_t[:, 4:16],
+                species_log=pred_t[:, species_channels.SPECIES_BLOCK],
                 phys_cfg=phys_cfg,
                 bio_cfg=bio_cfg,
                 device=device,
@@ -1147,7 +1124,7 @@ def _comsol_style_rheology_fields(
     dtype = pred_t.dtype
     mu_blood = _carreau_mu_blood_torch(model, data, pred_t)
     sp_safe = torch.clamp(
-        pred_t[:, 4:16],
+        pred_t[:, species_channels.SPECIES_BLOCK],
         min=torch.tensor(_SPECIES_LOG1P_MIN, device=device, dtype=dtype),
         max=torch.tensor(_SPECIES_LOG1P_MAX, device=device, dtype=dtype),
     )
@@ -1176,7 +1153,7 @@ def _biochem_rollout_rheology_fields(
     ).squeeze(-1)
     mu_blood = _carreau_mu_blood_torch(model, data, pred_t)
     sp_safe = torch.clamp(
-        pred_t[:, 4:16],
+        pred_t[:, species_channels.SPECIES_BLOCK],
         min=_SPECIES_LOG1P_MIN,
         max=_SPECIES_LOG1P_MAX,
     )
@@ -1484,8 +1461,8 @@ def _precompute_clot_phi_mu_series(
         data_pred.y[ti, :, 0:3] = torch.as_tensor(
             frame[:, 0:3], device=data_pred.y.device, dtype=data_pred.y.dtype
         )
-        data_pred.y[ti, :, 4:16] = torch.as_tensor(
-            frame[:, 4:16], device=data_pred.y.device, dtype=data_pred.y.dtype
+        data_pred.y[ti, :, species_channels.SPECIES_BLOCK] = torch.as_tensor(
+            frame[:, species_channels.SPECIES_BLOCK], device=data_pred.y.device, dtype=data_pred.y.dtype
         )
         prev_mu = None
         if idx > 0:
@@ -1710,7 +1687,7 @@ def _precompute_mlp_commit_mask_series(
                 ti,
                 u_nd=pred_t[:, 0],
                 v_nd=pred_t[:, 1],
-                species_log=pred_t[:, 4:16],
+                species_log=pred_t[:, species_channels.SPECIES_BLOCK],
                 phys_cfg=phys_cfg,
                 bio_cfg=bio_cfg,
                 device=device,
@@ -1732,7 +1709,7 @@ def _precompute_mlp_commit_mask_series(
                 ti,
                 u_nd=pred_t[:, 0],
                 v_nd=pred_t[:, 1],
-                species_log=pred_t[:, 4:16],
+                species_log=pred_t[:, species_channels.SPECIES_BLOCK],
                 phys_cfg=phys_cfg,
                 bio_cfg=bio_cfg,
                 device=device,
@@ -2149,6 +2126,62 @@ def _show_biochem_temporal_slider(
     plt.show()
 
 
+def _run_phase_comparison_graphsage_redirect(
+    *, source: str, anchor_stem: Optional[str], time_index: int = -1
+) -> bool:
+    """Stage-A kinematics viz + GraphSAGE ``biochem_deploy`` deploy. Returns False.
+
+    Replaces the retired GNODE temporal/rheology comparison figures (removed in the
+    2026-06 GraphSAGE migration). Kinematics (GINO-DEQ) viz is unchanged; biochem
+    visualization routes to ``predict_species_gnn_deploy``.
+    """
+    if source == "synthetic":
+        print(
+            "[WARN] Synthetic biochem comparison viz was retired with the GNODE removal. "
+            "Use --steady-kin-only for kinematics, or pass a biochem anchor graph.",
+            flush=True,
+        )
+        return False
+    try:
+        stem = _resolve_anchor_stem(anchor_stem)
+    except FileNotFoundError as exc:
+        print(f"[WARN] {exc}", flush=True)
+        return False
+    anchor_path = _anchor_graph_dir() / f"{stem}.pt"
+    if not anchor_path.is_file():
+        print(f"[WARN] anchor graph missing: {anchor_path}", flush=True)
+        return False
+
+    print(f"[i]  Stage-A kinematics viz for {stem} (GINO-DEQ)", flush=True)
+    try:
+        run_steady_kinematics_viz(cases=[("patient", stem, anchor_path)], time_index=time_index)
+    except Exception as exc:  # viz is best-effort
+        print(f"[WARN] kinematics viz failed: {exc}", flush=True)
+
+    print(f"[i]  Biochem deploy via GraphSAGE biochem_deploy stack for {stem}", flush=True)
+    try:
+        from src.inference.predict_species_gnn_deploy import predict_species_gnn_deploy
+
+        result = predict_species_gnn_deploy(anchor_path, flow_source="kinematics")
+        print(
+            f"[OK]  GraphSAGE deploy {stem}: clot_F1@t_last={result['clot_f1_t_last']:.3f} "
+            f"health_pass={result['health_pass']} ckpt={Path(result['species_ckpt']).name}",
+            flush=True,
+        )
+        print(
+            "[i]  Full deploy metrics/JSON: "
+            f"python -m src.inference.predict_species_gnn_deploy --graph {anchor_path}",
+            flush=True,
+        )
+    except Exception as exc:  # deploy needs CUDA + a trained species ckpt
+        print(
+            f"[WARN] GraphSAGE biochem deploy unavailable ({exc}). "
+            "Run on a CUDA host with a trained species ckpt; see docs/BIOCHEM_GNN.md.",
+            flush=True,
+        )
+    return False
+
+
 def run_phase_comparison(
     source: str = "anchor",
     regenerate: bool = True,
@@ -2163,10 +2196,15 @@ def run_phase_comparison(
     show_gelation_triggers: Optional[bool] = None,
     deploy_mu_map: Optional[bool] = None,
 ):
-    root = get_project_root()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_anchor = source != "synthetic"
-    print(f" Using device: {device}")
+    """Stage-A kinematics viz + GraphSAGE biochem deploy (GNODE retired 2026-06).
+
+    GNODE-specific args (``biochem_checkpoint``, ``teacher_only``,
+    ``clot_phi_checkpoint``, ``show_gelation_triggers``, ``deploy_mu_map``,
+    ``sim_end_s``) are accepted for CLI back-compat but no longer used.
+    """
+    return _run_phase_comparison_graphsage_redirect(
+        source=source, anchor_stem=anchor_stem, time_index=-1
+    )
     if use_anchor:
         print(f"[i]  Data source: COMSOL biochem anchor graph")
     else:

@@ -94,6 +94,8 @@ Alias: `BiochemGNN = BiochemDeployStack`.
 
 Coupled mode is **not yet validated** against locked baseline F1 (~0.70).
 
+Baseline comparison table: [BIOCHEM_GNN_BASELINES.md](BIOCHEM_GNN_BASELINES.md).
+
 ## Species channels: only FI + Mat
 
 Deploy GNN uses ``STATE_DIM = 2``. Other species pinned to ``resting_species_log_nd`` at inference.

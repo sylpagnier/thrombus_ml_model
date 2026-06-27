@@ -36,6 +36,7 @@ from src.core_physics.species_snapshot_gnn import (
     wall_band_mask,
 )
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
+from src.config import NodeFeat
 from src.utils.paths import get_project_root
 
 DEFAULT_PUSHFORWARD_CKPT = "outputs/biochem/species_snapshot_s2/best.pth"
@@ -57,7 +58,7 @@ def pushforward_ckpt_path() -> Path:
 
 
 def pushforward_unroll_steps() -> int:
-    return max(int(float(os.environ.get("SPECIES_PUSHFORWARD_UNROLL", "5") or "5")), 1)
+    return max(int(float(os.environ.get("SPECIES_PUSHFORWARD_UNROLL", "10") or "10")), 1)
 
 
 def pushforward_step_stride() -> int:
@@ -225,6 +226,203 @@ def stagnation_feats_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def geom_feats_enabled() -> bool:
+    """Append deployable NON-FLOW geometry discriminators (width / expansion / wall curvature).
+
+    Distinct from flow/stagnation feats: these are STATIC geometry only (no kine solve), encoding
+    *where* recirculation/low-shear pockets form (expansions, stenoses, bends) -- signal the z_kin
+    latent carries only implicitly. The open precision-lever test (leg C) for wall false positives.
+    """
+    raw = (os.environ.get("SPECIES_GEOM_FEATS") or "0").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return geom_feats_rich_enabled()
+
+
+def geom_feats_rich_enabled() -> bool:
+    """Enrich the leg-C geometry block with the proven 2-hop commit-vs-eligible discriminators.
+
+    Adds ``width_grad_2hop`` and ``curvature_2hop`` on top of the 3 static channels. The probe
+    (docs/SPECIES_LEARNING_STRATEGY.md s6.13) found multi-hop expansion/curvature -- not the 1-hop
+    versions alone -- separate *committed* clot pockets from merely *eligible* wall nodes. Static,
+    clot-blind, no kine solve, so it stays deployable.
+    """
+    raw = (os.environ.get("SPECIES_GEOM_FEATS_RICH") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def flow_feats_enabled() -> bool:
+    """Full clot-aware flow feature set on band inputs: speed + shear + divergence + geometry.
+
+    The GraphSAGE input is otherwise `[z_kin, sdf]` -- a *clot-blind* latent -- so the teacher
+    has no channel that responds to a growing clot's flow diversion (proven by the `--gt-flow`
+    gate: feeding perfect velocity is a no-op). This feature set is meant to be **trained on the
+    clot-aware GT COMSOL velocity** (`SPECIES_FLOW_FEATS_SOURCE=gt`) and **deployed on the
+    corrector-coupled flow** (auto source), so flow accuracy finally maps to Mat localization.
+    Distinct from the clot-blind `SPECIES_STAGNATION_FEATS` proxy.
+    """
+    raw = (os.environ.get("SPECIES_FLOW_FEATS") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def flow_feats_source() -> str:
+    """Velocity source for the flow features.
+
+    * ``gt``   -- COMSOL ``data.y[t][:, 0:2]`` (clot-aware ground truth; training).
+    * ``kine`` -- frozen GINO-DEQ prediction (clot-blind).
+    * ``auto`` -- kine base flow, overridden by the corrector-coupled flow when coupling is on
+      (the deploy default; closes the loop with the running clot prediction).
+    """
+    return (os.environ.get("SPECIES_FLOW_FEATS_SOURCE") or "auto").strip().lower()
+
+
+def flow_feats_time() -> int:
+    """Representative GT time index for the (static) flow features; <0 = last (formed clot)."""
+    raw = (os.environ.get("SPECIES_FLOW_FEATS_TIME") or "-1").strip()
+    try:
+        return int(float(raw))
+    except ValueError:
+        return -1
+
+
+def flow_feats_ablate() -> bool:
+    """Verification knob: zero the flow feature block (keep its width) to test the latent leash.
+
+    A latent-leashed teacher that actually reads the explicit flow should LOSE F1 when these are
+    zeroed; a latent-dominant teacher is unaffected (the `+0.008` ceiling).
+    """
+    raw = (os.environ.get("SPECIES_FLOW_FEATS_ABLATE") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def flow_feats_dynamic() -> bool:
+    """Time-varying flow features (Trap C): recompute the flow block per rollout step from the
+    velocity at *that* step's time, instead of a single static (final-clot) snapshot.
+
+    When on, ``build_band_base_features`` also returns a per-time ``flow_series`` (from
+    ``data.y[t][:, 0:2]`` -- GT velocity in training/gate, per-step coupled velocity at deploy after
+    ``write_coupled_flow_into_y``); the rollout splices ``flow_series[t]`` into the flow columns each
+    step. The static base_feats flow block stays at the representative time for step-0 / fallback.
+    """
+    raw = (os.environ.get("SPECIES_FLOW_FEATS_DYNAMIC") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+@torch.no_grad()
+def _resolve_flow_uv(data, kine_model, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-graph velocity ``(u, v)`` (ND) for the flow features per ``SPECIES_FLOW_FEATS_SOURCE``."""
+    src = flow_feats_source()
+    if src == "gt" and getattr(data, "y", None) is not None and data.y.dim() == 3:
+        n_t = int(data.y.shape[0])
+        t = flow_feats_time()
+        ti = (n_t - 1) if t < 0 else min(int(t), n_t - 1)
+        y = data.y[ti].to(device=device, dtype=torch.float32)
+        return y[:, 0].reshape(-1), y[:, 1].reshape(-1)
+    from src.utils.kinematics_inference import predict_kinematics
+
+    try:
+        uv = predict_kinematics(kine_model, data.clone()).to(device=device)
+    except torch.cuda.OutOfMemoryError:
+        # Small-GPU safety. The flow-feature DEQ solve can OOM right after a clot-aware re-solve
+        # (Path A) on the same card. The usual cause is fragmentation (a small alloc fails while
+        # 100s of MiB are reserved-but-unallocated), so first defrag and RETRY ON GPU -- full speed.
+        # Only if that still fails do we drop to a (slow) CPU solve.
+        torch.cuda.empty_cache()
+        try:
+            uv = predict_kinematics(kine_model, data.clone()).to(device=device)
+            print("[i] flow-feature kine solve recovered on GPU after empty_cache.")
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print("[WARN] flow-feature kine solve OOM on CUDA; retrying on CPU.")
+            kine_cpu = kine_model.to("cpu")
+            uv = predict_kinematics(kine_cpu, data.clone().to("cpu")).to(device=device)
+            kine_model.to(device)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    u, v = uv[:, 0].reshape(-1), uv[:, 1].reshape(-1)
+    if src != "kine":  # auto: corrector-coupled override at deploy (Step F)
+        from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow
+
+        if corrector_coupling_enabled():
+            coupled = get_coupled_flow(data, device)
+            if coupled is not None:
+                u = coupled[0].reshape(-1).to(dtype=u.dtype)
+                v = coupled[1].reshape(-1).to(dtype=v.dtype)
+    return u, v
+
+
+FLOW_FEATS_DIM = 5  # [log1p(speed), log1p(shear), tanh(div), x_n, y_n]
+
+
+@torch.no_grad()
+def _flow_feats_from_uv(
+    data, u: torch.Tensor, v: torch.Tensor, device: torch.device, node_idx: torch.Tensor
+) -> torch.Tensor:
+    """The 5-ch flow proxy block for an explicit velocity field ``(u, v)`` on the band nodes.
+
+    * ``speed``      = ``|u|`` (stagnation when low).
+    * ``shear``      = mean neighbour speed-gradient magnitude (wall/clot shear layer).
+    * ``divergence`` = graph divergence of ``u`` (``sum_j (u_j-u_i).(x_j-x_i)/dist^2 / deg``),
+      ``tanh``-bounded; negative = converging/stagnating flow where mature clot accumulates.
+    """
+    u = u.reshape(-1).to(device=device)
+    v = v.reshape(-1).to(device=device)
+    speed = torch.sqrt(u * u + v * v)
+    pos = data.x[:, :2].to(device=device, dtype=speed.dtype)
+    row, col = data.edge_index.to(device=device)
+    diff = pos[row] - pos[col]
+    dist = diff.norm(dim=1).clamp(min=1e-6)
+    grad = (speed[row] - speed[col]).abs() / dist
+    div_edge = ((u[row] - u[col]) * diff[:, 0] + (v[row] - v[col]) * diff[:, 1]) / (dist * dist)
+    n = int(data.num_nodes)
+    acc_g = torch.zeros(n, device=device, dtype=speed.dtype)
+    acc_d = torch.zeros(n, device=device, dtype=speed.dtype)
+    deg = torch.zeros(n, device=device, dtype=speed.dtype)
+    acc_g.index_add_(0, row, grad)
+    acc_d.index_add_(0, row, div_edge)
+    deg.index_add_(0, row, torch.ones_like(grad))
+    shear_proxy = acc_g / deg.clamp(min=1.0)
+    divergence = acc_d / deg.clamp(min=1.0)
+    pn = (pos - pos.mean(0)) / pos.std(0).clamp(min=1e-6)
+    feats = torch.stack(
+        [
+            torch.log1p(speed.clamp(min=0)),
+            torch.log1p(shear_proxy.clamp(min=0)),
+            torch.tanh(divergence),
+            pn[:, 0],
+            pn[:, 1],
+        ],
+        dim=1,
+    )
+    return feats[node_idx]
+
+
+@torch.no_grad()
+def _flow_band_features(data, kine_model, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
+    """Static (single representative time) clot-aware flow proxies on band nodes.
+
+    Velocity per :func:`flow_feats_source` -- GT COMSOL in training, corrector-coupled at deploy.
+    """
+    u, v = _resolve_flow_uv(data, kine_model, device)
+    return _flow_feats_from_uv(data, u, v, device, node_idx)
+
+
+@torch.no_grad()
+def _flow_feats_series_from_y(data, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
+    """Per-time flow block ``[n_times, n_band, FLOW_FEATS_DIM]`` from the velocity in ``data.y``.
+
+    ``data.y[t][:, 0:2]`` holds the time-``t`` velocity: GT COMSOL (clot-aware) in training / the
+    gt-flow gate, or the per-step corrector-coupled field at deploy (see ``write_coupled_flow_into_y``).
+    This is the time-varying signal the static snapshot cannot represent (Trap C).
+    """
+    n_t = int(data.y.shape[0])
+    series = []
+    for ti in range(n_t):
+        y = data.y[ti].to(device=device, dtype=torch.float32)
+        series.append(_flow_feats_from_uv(data, y[:, 0], y[:, 1], device, node_idx))
+    return torch.stack(series, dim=0)
+
+
 @torch.no_grad()
 def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
     """Deployable stagnation proxies on band nodes: [log1p(speed), log1p(shear_proxy), x_norm, y_norm].
@@ -236,6 +434,14 @@ def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: 
 
     uv = predict_kinematics(kine_model, data.clone()).to(device=device)
     u, v = uv[:, 0], uv[:, 1]
+    # Corrector coupling: bend the base flow around the active clot so the deployable
+    # stagnation/shear proxies the GraphSAGE sees reflect the diverted field (Step F).
+    from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow
+
+    if corrector_coupling_enabled():
+        coupled = get_coupled_flow(data, device)
+        if coupled is not None:
+            u, v = coupled[0].to(dtype=u.dtype), coupled[1].to(dtype=v.dtype)
     speed = torch.sqrt(u * u + v * v)
     pos = data.x[:, :2].to(device=device, dtype=speed.dtype)
     row, col = data.edge_index.to(device=device)
@@ -255,14 +461,81 @@ def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: 
     return feats[node_idx]
 
 
+GEOM_FEATS_DIM = 3  # [width, width_gradient, wall_curvature]
+GEOM_FEATS_RICH_DIM = 5  # + [width_gradient_2hop, wall_curvature_2hop]
+
+
+def geom_feats_dim() -> int:
+    return GEOM_FEATS_RICH_DIM if geom_feats_rich_enabled() else GEOM_FEATS_DIM
+
+
+def _hop_mean(values: torch.Tensor, row: torch.Tensor, col: torch.Tensor, deg: torch.Tensor) -> torch.Tensor:
+    """One graph diffusion step: ``mean_j(values_j)`` over each node's neighbours."""
+    acc = torch.zeros_like(values)
+    acc.index_add_(0, row, values[col])
+    return acc / deg
+
+
+@torch.no_grad()
+def _geometry_band_features(data, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
+    """Deployable NON-FLOW geometry proxies on band nodes, per-band standardized.
+
+    Channels (all static, clot-blind, no kine solve):
+      * ``width``         = local lumen width (``NodeFeat.WIDTH_ND``); stenoses/expansions.
+      * ``width_grad``    = ``mean_j(width_j) - width_i`` over neighbours; signed expansion(>0) /
+        contraction(<0) -- recirculation forms just downstream of an expansion.
+      * ``curvature``     = ``mean_j (1 - cos(n_i, n_j))`` of adjacent wall normals; vessel bends
+        seed a low-shear pocket on one wall.
+
+    When ``SPECIES_GEOM_FEATS_RICH`` is set, append two further channels:
+      * ``width_grad_2hop`` = expansion measured over the 2-hop neighbourhood; captures the
+        *extent* of an expansion, the proven commit-vs-eligible discriminator.
+      * ``curvature_2hop``  = curvature smoothed over 2 hops; a sustained bend rather than a
+        single-edge normal flip.
+
+    These encode *where* coupled stagnation lives, which the z_kin latent carries only implicitly.
+    """
+    x = data.x.to(device)
+    n = int(data.num_nodes)
+    width = x[:, NodeFeat.WIDTH_ND].reshape(-1).to(torch.float32)
+    wn = x[:, NodeFeat.WALL_NORMAL].to(torch.float32)  # (n, 2) wall-normal direction
+    row, col = data.edge_index.to(device)
+    ones = torch.ones(row.shape[0], device=device, dtype=torch.float32)
+    deg = torch.zeros(n, device=device, dtype=torch.float32)
+    deg.index_add_(0, row, ones)
+    deg = deg.clamp(min=1.0)
+    nbr_w = _hop_mean(width, row, col, deg)
+    width_grad = nbr_w - width
+    dot = (wn[row] * wn[col]).sum(dim=1)
+    cacc = torch.zeros(n, device=device, dtype=torch.float32)
+    cacc.index_add_(0, row, (1.0 - dot))
+    curv = cacc / deg
+    channels = [width, width_grad, curv]
+    if geom_feats_rich_enabled():
+        width_2hop = _hop_mean(nbr_w, row, col, deg)
+        width_grad_2hop = width_2hop - width
+        curv_2hop = _hop_mean(curv, row, col, deg)
+        channels.extend([width_grad_2hop, curv_2hop])
+    feats = torch.stack(channels, dim=1)[node_idx]
+    mu = feats.mean(dim=0, keepdim=True)
+    sd = feats.std(dim=0, keepdim=True).clamp(min=1e-6)
+    return (feats - mu) / sd
+
+
 def build_band_base_features(
     data,
     kine_model,
     device: torch.device,
     *,
     wall_hops: int | None = None,
+    z_kin_override: torch.Tensor | None = None,
 ) -> dict:
-    """Wall-band subgraph + optional per-vessel ``z_kin`` standardization."""
+    """Wall-band subgraph + optional per-vessel ``z_kin`` standardization.
+
+    ``z_kin_override`` lets the caller supply a *clot-aware* DEQ latent (from a re-solve with
+    the clot ``mu`` injected into ``MU_PRIOR``) so the GraphSAGE teacher's primary flow input
+    reflects the rerouted field instead of the frozen clot-free latent.
+    """
     hops = snapshot_wall_hops() if wall_hops is None else int(wall_hops)
     data = data.to(device)
     n = int(data.num_nodes)
@@ -270,15 +543,36 @@ def build_band_base_features(
     node_idx, edge_sub, _ = induced_subgraph(band, data.edge_index)
     from src.utils.kinematics_inference import predict_kinematics_latent
 
-    z_kin = predict_kinematics_latent(kine_model, data)
+    if z_kin_override is not None:
+        z_kin = z_kin_override.to(device=device)
+    else:
+        z_kin = predict_kinematics_latent(kine_model, data)
     kin_mean = kin_std = None
     if kin_per_vessel_norm_enabled():
         kin_mean, kin_std = kinematic_latent_band_stats(z_kin, node_idx)
     sdf = sdf_nd_from_data(data, device, n)
     base_feats = build_snapshot_features(z_kin, sdf, kin_mean=kin_mean, kin_std=kin_std)[node_idx]
-    if stagnation_feats_enabled():
+    flow_series = None
+    flow_cols = None
+    if flow_feats_enabled():
+        flow_start = int(base_feats.shape[1])  # flow block follows [z_kin, sdf]
+        flow = _flow_band_features(data, kine_model, device, node_idx).to(dtype=base_feats.dtype)
+        if flow_feats_ablate():
+            flow = torch.zeros_like(flow)  # verification: width preserved, signal removed
+        base_feats = torch.cat([base_feats, flow], dim=1)
+        # Trap C: per-time flow block so the rollout can splice the time-varying field each step.
+        if flow_feats_dynamic() and getattr(data, "y", None) is not None and data.y.dim() == 3:
+            flow_series = _flow_feats_series_from_y(data, device, node_idx).to(dtype=base_feats.dtype)
+            if flow_feats_ablate():
+                flow_series = torch.zeros_like(flow_series)
+            flow_cols = (flow_start, int(flow.shape[1]))
+    elif stagnation_feats_enabled():
         stag = _stagnation_band_features(data, kine_model, device, node_idx).to(dtype=base_feats.dtype)
         base_feats = torch.cat([base_feats, stag], dim=1)
+    if geom_feats_enabled():
+        # Independent of flow/stagnation: append static non-flow geometry discriminators (leg C).
+        geom = _geometry_band_features(data, device, node_idx).to(dtype=base_feats.dtype)
+        base_feats = torch.cat([base_feats, geom], dim=1)
     pos_band = data.x[node_idx, :2].to(device=device, dtype=base_feats.dtype)
     return {
         "base_feats": base_feats,
@@ -289,6 +583,9 @@ def build_band_base_features(
         "n_times": int(data.y.shape[0]),
         "kin_mean": kin_mean,
         "kin_std": kin_std,
+        "latent_dim": int(z_kin.shape[1]),  # true z_kin width (first cols) for the latent leash
+        "flow_series": flow_series,  # [n_t, n_band, flow_dim] when dynamic, else None
+        "flow_cols": flow_cols,      # (start, width) of the flow block in base_feats, else None
     }
 
 

@@ -131,6 +131,7 @@ def _snapshot_one_leg(
         edge_index=data.edge_index,
         phys_cfg=phys,
         mu_thresh_si=thresh,
+        gt_anchor_state=gt[0],
     )
 
     fig3, axs3 = plt.subplots(1, 2, figsize=(14, 5.5))

@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.utils import species_channels as sc
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -253,8 +254,8 @@ def compute_supervised_species_log_mae(
             f"species val: pred_series T={t_pred} != target_series T={t_targ}; "
             "align GT with align_target_trajectory_to_eval_times() before calling"
         )
-    pred_bio = pred_series[:, node_mask, 4:16]
-    targ_bio = target_series[:, node_mask, 4:16].to(device=pred_bio.device, dtype=pred_bio.dtype)
+    pred_bio = pred_series[:, node_mask, sc.SPECIES_BLOCK]
+    targ_bio = target_series[:, node_mask, sc.SPECIES_BLOCK].to(device=pred_bio.device, dtype=pred_bio.dtype)
     fi_mae = (pred_bio[..., 8] - targ_bio[..., 8]).abs().mean()
     mat_mae = (pred_bio[..., 11] - targ_bio[..., 11]).abs().mean()
     return {

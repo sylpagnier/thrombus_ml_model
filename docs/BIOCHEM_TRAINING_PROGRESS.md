@@ -2473,6 +2473,15 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 - **Lesson:** pred-kine dump + target curriculum improves **full-mesh shape ~2.5x** vs GT-flow forecast (~0.034 vs ~0.011); mesh_bulk / deploy finetune does not fix global over-clot; target mask still needed for best spatial score (not deploy_pred alone).
 - **Next:** finetune `a04_target_long` -> `deploy_pred` with stronger bulk; or hybrid R1D head on dump anchors; gate on `clot_shape` + deploy_pred F1.
 
+### 187. Flow-aware leashed+dynamic teacher — gate ladder kills corrector path (`2026-06-22`)
+
+- **Config:** flow-aware sage species, `SPECIES_LATENT_DROPOUT=0.5`, dynamic flow feats, 75ep, warm-start from `locked/species_gnn_best.pth` -> `biochem_gnn/flow_aware_leashed_dynamic/sage/species/best.pth`, **`best_score=0.700`** (deploy_clot_score), deploy_clot_g 0.52->0.66 over the run. Teacher itself is healthy (~par with canonical deploy baseline).
+- **Gate ladder (p007 Mat-band Dice @ t200), full table in [LOCAL_KINEMATIC_CORRECTOR.md](LOCAL_KINEMATIC_CORRECTOR.md) Run #6:** ref **0.621**; **flow ABLATED 0.671 (+0.050)**; static GT ceiling 0.630 (+0.009); dynamic GT 0.626 (+0.005); oracle-mu 0.584 (-0.038); corrector 0.588 (-0.033); corrector+z_kin re-solve **0.467 (-0.154)**.
+- **Leash backfired:** zeroing the flow block *raised* F1 (no-flow 0.671 > GT-flow 0.630 > kine 0.621). Latent dominance was the correct equilibrium; `LATENT_DROPOUT=0.5` forced reliance on a net-noise channel for this metric.
+- **Corrector path = dead end for Mat localization:** perfect-flow ceiling only +0.009; every approximate-flow coupling regresses; clot-aware z_kin re-solve catastrophic (`max|div|_nd` 0.23->0.49, OOD latent).
+- **Actions:** drop the leash; retrain deploy teacher **unleashed** (likely without the flow block), confirm via real `deploy_ab_eval` clot-F1 (not band-Dice); keep `BIOCHEM_KINE_RESOLVE_ON_CLOT=0`.
+- **Infra:** `corrector_resolve` OOM on 4 GiB fixed GPU-side (free coupler model before second DEQ solve; `empty_cache`+GPU retry before CPU; `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`).
+
 ---
 
 ## References

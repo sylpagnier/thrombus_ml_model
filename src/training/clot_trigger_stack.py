@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_simple import (
     ClotPhiStepBatch,
     build_clot_phi_step,
@@ -37,7 +38,7 @@ class ClotTriggerStar(str, Enum):
     T1_GT_INPUTS = "t1"  # GT flow + GT species, train hybrid trigger
     T2_PRED_FLOW = "t2"  # pred kine + GT species
     T3_DUMPED_SPECIES = "t3"  # pred kine + cached teacher species dump
-    T4_LIVE_TEACHER = "t4"  # pred kine + live GNODE species rollout (frozen global ckpt)
+    T4_LIVE_TEACHER = "t4"  # pred kine + live GraphSAGE species rollout (frozen global ckpt)
     T5_DEPLOY_TEACHER = "t5"  # retrain teacher (pred kine, FI/Mat) + pred-flow species dump
     T6_COUPLED = "t6"  # T4/T5 stack + phi/mu -> GINO-DEQ feedback each macro step
 
@@ -283,7 +284,7 @@ def apply_clot_trigger_deploy_env() -> None:
     os.environ["CLOT_PHI_CLOT_SEED_SOURCE"] = "wall"
     os.environ["CLOT_PHI_DGAMMA_SLICE"] = "0"
     os.environ["CLOT_PHI_ORACLE_MU"] = "0"
-    os.environ.setdefault("CLOT_PHI_CEILING_HOPS", "2")
+    os.environ.setdefault("CLOT_PHI_CEILING_HOPS", "3")
     apply_clot_trigger_nucleation_env()
 
 
@@ -542,7 +543,7 @@ def apply_star4_live_teacher_env(
     kine_ckpt: str = "outputs/kinematics/kinematics_best.pth",
     teacher_ckpt: str | None = None,
 ) -> None:
-    """T4: pred kine + live GNODE teacher species rollout (slow; overnight path)."""
+    """T4: pred kine + live GraphSAGE species rollout (slow; overnight path)."""
     apply_star2_eval_env(kine_ckpt=kine_ckpt)
     os.environ["CLOT_TRIGGER_STAR"] = ClotTriggerStar.T4_LIVE_TEACHER.value
     os.environ["CLOT_TRIGGER_SPECIES_SOURCE"] = "live"
@@ -560,7 +561,7 @@ def apply_star5_deploy_teacher_eval_env(
     kine_ckpt: str = "outputs/kinematics/kinematics_best.pth",
     teacher_ckpt: str | None = None,
 ) -> None:
-    """T5 eval: pred kine + live/deploy-retrained GNODE teacher (``BIOCHEM_GT_KINE_VEL=0``)."""
+    """T5 eval: pred kine + live/deploy-retrained GraphSAGE species (``BIOCHEM_GT_KINE_VEL=0``)."""
     ckpt = teacher_ckpt or str(default_t5_deploy_teacher_checkpoint_path())
     apply_star4_live_teacher_env(kine_ckpt=kine_ckpt, teacher_ckpt=ckpt)
     os.environ["CLOT_TRIGGER_STAR"] = ClotTriggerStar.T5_DEPLOY_TEACHER.value
@@ -698,7 +699,7 @@ def build_clot_trigger_coupled_step(
     species_override = None
     if pred_species_series is not None:
         ti = max(0, min(int(time_index), int(pred_species_series.shape[0]) - 1))
-        species_override = pred_species_series[ti, :, 4:16]
+        species_override = pred_species_series[ti, :, sc.SPECIES_BLOCK]
     return build_clot_phi_step(
         data,
         time_index,
@@ -735,39 +736,53 @@ def load_trigger_model(ckpt_path: Path, device: torch.device) -> tuple[nn.Module
 
 
 def load_teacher_for_trigger(device: torch.device, teacher_ckpt: Path | None = None):
+    """Load the GraphSAGE species pushforward bundle used to seed the clot trigger.
+
+    Pre-2026-06 this built a GNODE teacher; the trigger now rolls species via the
+    ``biochem_deploy`` GraphSAGE stack. The first return value is the species
+    bundle (named ``teacher`` for back-compat with the trigger eval/viz scripts).
+    """
     from src.config import BiochemConfig, PhysicsConfig
-    from src.inference.biochem_teacher_loader import (
-        build_biochem_teacher,
-        resolve_rollout_mu_ratio_max,
+    from src.core_physics.species_gnn_clot_rollout import (
+        load_species_gnn_rollout_bundle,
+        species_gnn_rollout_ckpt,
     )
 
-    path = teacher_ckpt or default_teacher_checkpoint_path()
-    if not path.is_file():
-        raise FileNotFoundError(f"biochem teacher checkpoint not found: {path}")
     phys_cfg = PhysicsConfig(phase="biochem")
     bio_cfg = BiochemConfig(phase="biochem")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    mu_ratio = resolve_rollout_mu_ratio_max(bio_cfg, cli_value=None)
-    teacher = build_biochem_teacher(
-        ckpt,
-        phys_cfg=phys_cfg,
-        bio_cfg=bio_cfg,
-        device=device,
-        mu_ratio_max=mu_ratio,
-    )
-    return teacher, bio_cfg, phys_cfg, path
+    path = Path(teacher_ckpt) if teacher_ckpt else None
+    if path is None or not path.is_file():
+        from src.biochem_gnn.config import global_ckpt_path
+
+        path = global_ckpt_path()
+        if not path.is_file():
+            path = species_gnn_rollout_ckpt()
+    if not path.is_file():
+        raise FileNotFoundError(f"species GNN checkpoint not found: {path}")
+    bundle = load_species_gnn_rollout_bundle(path, device=device)
+    if bundle is None:
+        raise FileNotFoundError(f"failed to load species GNN bundle: {path}")
+    return bundle, bio_cfg, phys_cfg, path
 
 
 @torch.no_grad()
 def rollout_teacher_species_series(data, teacher, bio_cfg: BiochemConfig, device: torch.device) -> torch.Tensor:
-    """GNODE macro rollout; returns ``(T, N, C)`` aligned with ``data.y`` macro grid."""
-    from src.utils.nondim import to_t_nd
+    """GraphSAGE species pushforward; returns ``(T, N, 16)`` on the ``data.y`` macro grid.
 
-    eval_times = to_t_nd(bio_cfg.resolve_biochem_times(data, device), bio_cfg.t_final)
-    pred = teacher(data, eval_times)
-    if isinstance(pred, tuple):
-        pred = pred[0]
-    return pred
+    ``teacher`` is a ``SpeciesGnnRolloutBundle`` (see ``load_teacher_for_trigger``).
+    Only the species block (channels 4:16) is populated.
+    """
+    from src.config import PhysicsConfig
+    from src.core_physics.species_gnn_clot_rollout import (
+        prepare_species_gnn_rollout_static,
+        rollout_species_gnn_species_series,
+    )
+
+    phys_cfg = PhysicsConfig(phase="biochem")
+    static = prepare_species_gnn_rollout_static(data, device=device)
+    return rollout_species_gnn_species_series(
+        data, teacher, static, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device,
+    )
 
 
 def build_clot_trigger_step_at_time(
@@ -783,7 +798,7 @@ def build_clot_trigger_step_at_time(
     species_override = None
     if pred_species_series is not None:
         ti = max(0, min(int(time_index), int(pred_species_series.shape[0]) - 1))
-        species_override = pred_species_series[ti, :, 4:16]
+        species_override = pred_species_series[ti, :, sc.SPECIES_BLOCK]
     return build_clot_phi_step(
         data,
         time_index,

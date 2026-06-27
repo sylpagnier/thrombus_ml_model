@@ -1452,6 +1452,7 @@ def _shape_from_phi_at_time(
         edge_index=data.edge_index.to(device),
         phys_cfg=phys_cfg,
         node_mask=shape_mask,
+        gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
     )
     return {k: float(v) for k, v in shape.items() if isinstance(v, (int, float))}
 

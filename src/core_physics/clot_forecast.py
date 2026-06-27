@@ -12,6 +12,7 @@ import os
 import torch
 
 from src.config import STATE_CHANNEL_MU_EFF_ND, BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_growth_masks import resolve_ceiling_mask
 
 
@@ -180,7 +181,11 @@ def build_clot_forecast_pair_step(
 
     # Keep the same feature contract used by existing clot heads:
     # [x, u, v, mu_in, species_in(12)]
-    species_in = y_in[:, 4:16] if y_in.shape[1] >= 16 else torch.zeros(y_in.shape[0], 12, device=device)
+    species_in = (
+        y_in[:, sc.SPECIES_BLOCK]
+        if y_in.shape[1] >= sc.Y_WIDTH
+        else torch.zeros(y_in.shape[0], sc.SPECIES_BLOCK_WIDTH, device=device)
+    )
     features = torch.cat([x, u_in, v_in, mu_in_nd, species_in], dim=1)
 
     return ClotForecastPairStep(

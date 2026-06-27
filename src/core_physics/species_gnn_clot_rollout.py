@@ -17,6 +17,7 @@ from typing import Literal
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.core_physics.species_deploy_rollout import (
     alloc_species_y_series,
@@ -90,6 +91,8 @@ class SpeciesGnnRolloutStatic:
     band: torch.Tensor
     device: torch.device
     pos_band: torch.Tensor | None = None
+    flow_series: torch.Tensor | None = None  # [n_t, n_band, flow_dim] for dynamic flow (Trap C)
+    flow_cols: tuple[int, int] | None = None  # (start, width) of the flow block in base_feats
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,18 @@ def load_species_gnn_rollout_bundle(
         os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
     if bool(meta.get("vel_decay")):
         os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
+    if bool(meta.get("flow_feats")):
+        # Reproduce the trained clot-aware flow feature set; deploy source stays 'auto'
+        # (kine base + corrector-coupled override) -- do NOT inherit the training 'gt' source.
+        os.environ["SPECIES_FLOW_FEATS"] = "1"
+        os.environ.pop("SPECIES_FLOW_FEATS_SOURCE", None)
+        # Time-varying flow (Trap C): if the teacher trained on per-step flow, reproduce it at deploy
+        # (the per-step coupled velocity in data.y supplies the dynamic series).
+        if bool(meta.get("flow_dynamic")):
+            os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] = "1"
+    if bool(meta.get("geom_feats")):
+        # Leg C/D: reproduce the static non-flow geometry discriminator block at deploy.
+        os.environ["SPECIES_GEOM_FEATS"] = "1"
     if bool(meta.get("saturation_gate")):
         os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
     # Retired: do not re-enable temporal lambda gate from legacy checkpoint metadata.
@@ -188,10 +203,18 @@ def prepare_species_gnn_rollout_static(
     *,
     device: torch.device,
     wall_hops: int | None = None,
+    z_kin_override: torch.Tensor | None = None,
 ) -> SpeciesGnnRolloutStatic:
+    """Static band features for the species rollout.
+
+    ``z_kin_override`` injects a clot-aware DEQ latent (full re-solve) so the GraphSAGE teacher's
+    primary flow input tracks the rerouted flow once the clot is large enough to change it.
+    """
     hops = int(wall_hops if wall_hops is not None else snapshot_wall_hops())
     kine = load_kinematics_predictor(resolve_kinematics_checkpoint(), device)
-    stat = build_band_base_features(data, kine, device, wall_hops=hops)
+    stat = build_band_base_features(
+        data, kine, device, wall_hops=hops, z_kin_override=z_kin_override
+    )
     band = wall_band_mask(data, device, wall_hops=hops).reshape(-1).bool()
     return SpeciesGnnRolloutStatic(
         base_feats=stat["base_feats"],
@@ -200,6 +223,8 @@ def prepare_species_gnn_rollout_static(
         band=band,
         device=device,
         pos_band=stat.get("pos_band"),
+        flow_series=stat.get("flow_series"),
+        flow_cols=stat.get("flow_cols"),
     )
 
 
@@ -256,7 +281,7 @@ def rollout_species_gnn_species_series(
         for t in range(n_steps):
             sp = pin_species_block(data, t, dev, pin_other=pin_mode)  # type: ignore[arg-type]
             sp = _write_fimat_log_to_species(sp, log_state, stat.node_idx)
-            out[t, :, 4:16] = sp
+            out[t, :, sc.SPECIES_BLOCK] = sp
             if t >= n_steps - 1:
                 break
             pred_delta = predict_continuous_step_delta(
@@ -266,6 +291,10 @@ def rollout_species_gnn_species_series(
                 log_state,
                 training=False,
                 pos_band=stat.pos_band,
+                # only thread time when dynamic flow is active (preserves prior temporal-gate behavior)
+                time_index=(t if stat.flow_series is not None else None),
+                flow_series=stat.flow_series,
+                flow_cols=stat.flow_cols,
             )
             spd = (
                 band_speed_for_rollout(data, t + 1, dev, stat.node_idx)
@@ -307,7 +336,7 @@ def rollout_species_gnn_species_series(
         sp = pin_species_block(data, t, dev, pin_other=pin_mode)  # type: ignore[arg-type]
         log_state = _binary_state_to_log(state)
         sp = _write_fimat_log_to_species(sp, log_state, stat.node_idx)
-        out[t, :, 4:16] = sp
+        out[t, :, sc.SPECIES_BLOCK] = sp
         if t >= n_steps - 1:
             break
         feats = torch.cat([stat.base_feats, state], dim=-1)

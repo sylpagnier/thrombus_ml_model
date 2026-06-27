@@ -148,8 +148,11 @@ def main() -> int:
     mu_c_gt, mu_c_mlp = resolve_mu_map_baselines_si(data, y[:, 0], y[:, 1], phys)
     gd_gt = _gamma_dot_nd(data, y[:, 0], y[:, 1])
 
+    from src.core_physics.clot_phi_simple import gt_mu_anchor_cap_si
+
     step = build_clot_phi_step(data, ti, phys, bio, device, u_nd_override=y[:, 0], v_nd_override=y[:, 1])
-    gate = phi_gt_binary(step.mu_gt_cap, step.region, phys).bool()
+    anchor = gt_mu_anchor_cap_si(data, phys, device)
+    gate = phi_gt_binary(step.mu_gt_cap, step.region, phys, mu_anchor_si=anchor).bool()
     sdf = sdf_nd_from_data(data, device, int(data.num_nodes))
     lumen = (sdf > 0.002) & (~gate)
     bulk = ~gate

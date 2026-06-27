@@ -320,3 +320,97 @@ already encodes. **Actions:** (a) promote the flow-aware teacher as the new base
 the corrector; (b) if the corrector must matter, make the flow features **dynamic** -- recompute the
 speed/shear/divergence channels each rollout step from the current corrector-coupled flow -- since
 the static upper bound is already only +0.008, expectations should be modest.
+
+**2026-06-21 -- Latent leash (the input leash) implemented.** Diagnosis of the +0.008 ceiling: even
+with flow channels present, the teacher is free to lean 100% on the (clot-blind) `z_kin` latent and
+ignore the flow features ("latent dominance" / causal confusion). Fix = **latent dropout** during
+training so the model is forced to learn backup weights on the explicit flow:
+- `species_pushforward_continuous.py`: `species_latent_dropout_p()` (`SPECIES_LATENT_DROPOUT`, train
+  only) + `maybe_drop_latent(base_feats, model, training)` zeros the first `kin_latent_dim` columns
+  (the z_kin slice; sdf+flow untouched) with prob `p`, resampled per unrolled step. Applied in both
+  `predict_continuous_step_delta` and the `unroll_continuous_loss` step loop. No-op at eval/deploy.
+- Trainer sets `model.kin_latent_dim` (true z_kin width, now returned by `build_band_base_features`
+  as `latent_dim`) and `model.latent_dropout_p`; persists `latent_dropout` into meta.
+- Verification knob: `flow_feats_ablate()` (`SPECIES_FLOW_FEATS_ABLATE=1`) zeros the flow block while
+  preserving its width. A leashed teacher's baseline F1 should **drop** under ablation; a
+  latent-dominant teacher is unaffected (that is the whole tell).
+- Launcher: `scripts/go_species_flow_aware.ps1 -LatentDropout 0.5` -> separate
+  `outputs/biochem/biochem_gnn/flow_aware_leashed/...` (does not clobber the un-leashed ckpt).
+- Tests: `test_species_flow_feats.py` (`maybe_drop_latent` zeros z_kin / identity at eval/off,
+  `flow_feats_ablate` flag).
+
+**2026-06-21 -- Trap C: time-varying flow features (dynamic) + gate.** The flow channel was static
+(one representative time), so it cannot represent the corrector's *dynamic* diversion as the clot
+grows -- the static gt-flow upper bound is only +0.008. Fix = recompute the flow block per rollout
+step from the time-`t` velocity:
+- `species_pushforward_gnn.py`: `flow_feats_dynamic()` (`SPECIES_FLOW_FEATS_DYNAMIC=1`); refactor
+  extracts `_flow_feats_from_uv` + `_flow_feats_series_from_y` (per-time block `[n_t, n_band, 5]`
+  from `data.y[t][:, 0:2]` -- GT in train/gate, per-step coupled velocity at deploy). When dynamic,
+  `build_band_base_features` returns `flow_series` + `flow_cols=(start,width)`.
+- `species_pushforward_continuous.py`: `splice_dynamic_flow(base_feats, flow_series, flow_cols, ti)`
+  replaces the flow block with the time-`ti` slice; applied (current-state time) in the training
+  `unroll_continuous_loss`, the val `rollout_continuous_states`/`eval_continuous_window`, and the
+  deploy rollout. `predict_continuous_step_delta` gains `flow_time_index` (decoupled from the retired
+  temporal gate's `time_index`). `SpeciesGnnRolloutStatic` carries `flow_series`/`flow_cols`; trainer
+  persists `flow_dynamic` and the loader re-enables it at deploy.
+- Gate: `compare_coupled_mat_rollout --gt-flow-dynamic` (frozen z_kin, no corrector, per-step GT
+  flow). Run on a dynamic-trained teacher; **delta vs static `--gt-flow` = the temporal-sharpening
+  headroom** (Trap C's ceiling). Launcher: `go_species_flow_aware.ps1 -DynamicFlow`.
+- Tests: `flow_feats_dynamic` flag, time-varying `_flow_feats_series_from_y`, `splice_dynamic_flow`
+  (replace/clamp/no-op).
+
+**Path A/B reconciliation.** The user's "Hybrid Rollout Controller" (Path A macro re-solve + Path B
+per-step local corrector) is **already** implemented by `ClotAwareFlow` (`src/inference/
+corrector_coupling.py`): node-count + growth-factor trigger -> full DEQ re-solve via `MU_PRIOR`
+injection (Path A), else local-tiled corrector diversion every step (Path B). We deliberately did
+NOT swap the working `MU_PRIOR` re-solve for the proposed `SDF=0` occlusion trick: the kine model
+reads viscosity through `MU_PRIOR`, not "SDF=0 == wall", so the occlusion trick is unvalidated and
+risks an OOD latent. The missing lever was the **leash**, now added.
+
+**2026-06-22 -- Run #6 (full gate ladder, leashed p=0.5 + dynamic teacher): corrector path is a dead
+end for Mat localization; the leash BACKFIRED.** Trained a fresh flow-aware teacher (latent dropout
+0.5, dynamic flow, 75 ep, `outputs/biochem/biochem_gnn/flow_aware_leashed_dynamic/...`,
+`best_score=0.700`) then ran every diagnostic rung on p007 (Mat-band Dice @ t200). Table (ref = the
+flow-active reference baseline):
+
+| rung | F1 | vs ref | reading |
+|---|---|---|---|
+| ref baseline (flow on, kine) | 0.621 | -- | reference B |
+| **leash check: flow ABLATED** | **0.671** | **+0.050** | zeroing flow IMPROVES -> leash backfired |
+| #5  static GT ceiling | 0.630 | +0.009 | perfect static flow barely helps |
+| #5c dynamic GT ceiling | 0.626 | +0.005 | no temporal headroom (Trap C ~0) |
+| #5b oracle-mu (true clot loc) | 0.584 | -0.038 | approx flow at TRUE clot hurts |
+| #6a corrector, frozen z_kin | 0.588 | -0.033 | corrector diversion hurts |
+| #6b corrector + z_kin re-solve | 0.467 | -0.154 | clot-aware DEQ re-solve catastrophic |
+
+**Read.** Three findings, all negative for the corrector path:
+1. **Leash backfired.** Ablating the flow block (zeroing it) *raised* baseline F1 0.621 -> 0.671. The
+   leash (`SPECIES_LATENT_DROPOUT=0.5`) forced the teacher to lean on a flow channel that, at the
+   static-final representation, is *net noise* on this metric: no-flow (0.671) > perfect GT flow
+   (0.630) > kine flow (0.621). Latent dominance was the *correct* equilibrium here; the leash
+   pushed the model off it. **Drop the leash.**
+2. **Flow is a near-zero lever for Mat.** Perfect GT flow ceiling is only +0.009 static / +0.005
+   dynamic over ref. Stagnation localization is largely redundant with the geometry the teacher
+   already encodes (`z_kin`/SDF). There is no ROI to chase with a better corrector.
+3. **Every coupled variant regresses** (oracle-mu -0.038, corrector -0.033), and the **z_kin
+   re-solve is catastrophic** (-0.154): the clot-aware re-solve drives `max|div|_nd` 0.23 -> 0.49
+   (far out of the corrector's micro-clot training band) and regenerates a latent the teacher never
+   saw. **Keep `BIOCHEM_KINE_RESOLVE_ON_CLOT=0` always.**
+
+**Verdict.** The corrector coupling does not improve Mat-band species localization for this teacher
+and metric, even with oracle clot location or oracle flow. The +0.080 "win" from Run #5 was the
+richer *feature set* (speed/shear/divergence/geometry), not clot-awareness -- and pairing those
+features with the leash now makes them harmful. **Recommended next:** (a) retire the corrector
+coupling for Mat localization (it is a confirmed dead end on this probe); (b) retrain the deploy
+teacher **unleashed**, and likely **without the flow block** (or keep it un-leashed only if a clean
+A/B on the deploy clot-F1 metric -- not this band-Dice probe -- shows it does not hurt); (c) caveat
+(Trap D): this gate scores Mat-band Dice at a fixed threshold, NOT the headline swept deploy clot
+F1, so confirm the "drop flow features" decision with a real `deploy_ab_eval` before committing.
+
+**GPU OOM fix (resolved).** The `corrector_resolve` rung previously OOM'd on the 4 GiB card (two
+GINO-DEQ solves back-to-back: Path-A re-solve + flow-feature solve). Fixed without going to CPU:
+free the coupler's kine model before `prepare_species_gnn_rollout_static` loads its own
+(`compare_coupled_mat_rollout`), `empty_cache()` + **retry on GPU** before any CPU fallback in
+`_resolve_flow_uv` / `ClotAwareFlow.resolve_full`, and `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`
+(Windows-safe, set in `go_clot_flow_gate_ladder.ps1`). The standalone ladder then completed all
+seven rungs; the unified `go_clot_flow_gate_full.ps1` crashed only because it ran the pre-fix code.

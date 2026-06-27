@@ -96,26 +96,6 @@ def test_dual_x_metadata_and_alignment():
     assert biochem_encoder_x(data).shape == data.x_biochem.shape
 
 
-@pytest.mark.skipif(
-    not (__import__("pathlib").Path(__file__).resolve().parents[2] / "data" / "processed" / "graphs_biochem" / "vessel_0.pt").exists(),
-    reason="Synthetic biochem graphs missing.",
-)
-def test_biochem_encoder_x_legacy_synthetic_databatch():
-    """PyG DataBatch wraps x_schema in a list; legacy 15ch-only synthetics must still resolve."""
-    from pathlib import Path
-
-    from torch_geometric.loader import DataLoader
-
-    from src.training.train_biochem_corrector import PatientDataset
-
-    p = Path(__file__).resolve().parents[2] / "data" / "processed" / "graphs_biochem" / "vessel_0.pt"
-    ds = PatientDataset(".", [str(p)])
-    data = next(iter(DataLoader(ds, batch_size=1)))
-    assert isinstance(getattr(data, "x_schema", None), list)
-    enc = biochem_encoder_x(data)
-    assert enc.shape == data.x.shape
-
-
 def test_biochem_encoder_x_rejects_kine_only_graph():
     from torch_geometric.data import Data
 

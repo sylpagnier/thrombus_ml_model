@@ -28,6 +28,7 @@ from src.core_physics.clot_phi_simple import (
     clot_phi_mask_mode,
     clot_support_band_mode,
     clot_phi_thresh_si,
+    gt_mu_anchor_cap_si,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
     resolve_clot_support_band_for_step,
@@ -66,8 +67,9 @@ def _ensure_training_mask_env() -> None:
         os.environ.setdefault(key, val)
 
 
-def _clot_binary(mu_si: np.ndarray, thresh: float) -> np.ndarray:
-    return (mu_si.reshape(-1) >= float(thresh)).astype(np.float32)
+def _clot_binary(mu_si: np.ndarray, anchor_si: np.ndarray, thresh: float) -> np.ndarray:
+    growth = np.maximum(mu_si.reshape(-1) - anchor_si.reshape(-1), 0.0)
+    return (growth >= float(thresh)).astype(np.float32)
 
 
 def _resolve_forecast_t_in(t_out: int, t_steps: int) -> int:
@@ -563,23 +565,27 @@ def main() -> None:
     gt_pos = int((phi_gt[m] > 0.05).sum())
 
     y_sl = data.y[ti].to(device=device, dtype=torch.float32)
+    y0 = data.y[0].to(device=device, dtype=torch.float32)
     pred_state = y_sl.clone()
     pred_state[:, STATE_CHANNEL_MU_EFF_ND] = phys_cfg.viscosity_si_to_nd(
         torch.tensor(mu_pr, device=device, dtype=torch.float32)
     )
+    mu_anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
     shape_m = compute_clot_shape_metrics(
         pred_state=pred_state,
         gt_state=y_sl,
         edge_index=data.edge_index.to(device),
         phys_cfg=phys_cfg,
+        gt_anchor_state=y0,
     )
     thresh = clot_phi_thresh_si(phys_cfg)
+    anchor_np = mu_anchor.detach().cpu().numpy()
     proj_tag = " proj=1" if clot_phi_hard_support_projection_enabled() else ""
     print(
         f"[i]  t={ti} region_n={int(m.sum())} gt_pos_n={gt_pos} "
         f"mean_pred_phi={float(phi_pr[m].mean()) if m.any() else 0.0:.3f} "
         f"mean_gt_phi={float(phi_gt[m].mean()) if m.any() else 0.0:.3f} | "
-        f"clot_shape={shape_m['clot_shape']:.3f} (full mesh mu>={shape_m['clot_mu_thresh_si']:.3f}{proj_tag}) "
+        f"clot_shape={shape_m['clot_shape']:.3f} (growth mu>={shape_m['clot_mu_thresh_si']:.3f}{proj_tag}) "
         f"rec={shape_m['clot_recall']:.3f} pred_frac={shape_m['clot_pred_frac']:.3f} "
         f"gt_frac={shape_m['clot_gt_frac']:.3f}",
         flush=True,
@@ -594,8 +600,8 @@ def main() -> None:
         _plot_band_panels(fig, plot_i, args, pos, m, idx, phi_gt, phi_pr, mu_gt, mu_pr, ti, band, cap)
         fig.suptitle(f"clot_phi_simple — {args.anchor} (ckpt {ckpt_path.name})", fontsize=14)
     else:
-        gt_bin = _clot_binary(mu_gt, thresh)
-        pr_bin = _clot_binary(mu_pr, thresh)
+        gt_bin = _clot_binary(mu_gt, anchor_np, thresh)
+        pr_bin = _clot_binary(mu_pr, anchor_np, thresh)
         dot = float(args.scatter_size)
         dot_mu = max(dot, dot * 1.25)
         axes = fig.subplots(2, 2)
@@ -603,7 +609,7 @@ def main() -> None:
             axes[0, 0],
             pos,
             gt_bin,
-            f"GT clot (t={ti}) mu>={thresh:.3f} Pa*s",
+            f"GT clot (t={ti}) growth>={thresh:.3f} Pa*s",
             cmap="bwr",
             vmin=0,
             vmax=1,
@@ -658,7 +664,7 @@ def main() -> None:
         t0_m, support_m, ceiling_m = _resolve_support_ceiling_masks(
             data, ti, step, phys_cfg=phys_cfg, bio_cfg=bio_cfg, device=device
         )
-        pr_bin = _clot_binary(mu_pr, thresh)
+        pr_bin = _clot_binary(mu_pr, anchor_np, thresh)
         overlay_out = Path(args.mask_overlay_out)
         if not overlay_out.is_absolute():
             overlay_out = root / overlay_out

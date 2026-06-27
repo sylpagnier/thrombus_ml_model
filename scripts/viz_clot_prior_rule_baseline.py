@@ -108,6 +108,7 @@ def main() -> None:
         gt_state=y_sl,
         edge_index=data.edge_index.to(device),
         phys_cfg=phys_cfg,
+        gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
     )
 
     rule_label = str(meta.get("rule", rule.describe()))

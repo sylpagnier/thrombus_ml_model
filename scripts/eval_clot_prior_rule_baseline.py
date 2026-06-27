@@ -65,6 +65,7 @@ def eval_anchor(
         gt_state=y_sl,
         edge_index=data.edge_index.to(device),
         phys_cfg=phys,
+        gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
     )
     thr = clot_phi_thresh_si(phys)
     return {

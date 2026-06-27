@@ -12,6 +12,7 @@ from typing import Literal
 import torch
 
 from src.config import PhysicsConfig
+from src.utils import species_channels as sc
 from src.training.biochem_species_scope import (
     FI_CHANNEL,
     MAT_CHANNEL,
@@ -51,7 +52,7 @@ def species_rollout_vel_source() -> str:
 
 def species_train_vel_source() -> str:
     """Velocity for species unroll loss (may use GT to save VRAM during train)."""
-    raw = (os.environ.get("SPECIES_TRAIN_VEL_SOURCE") or "").strip()
+    raw = (os.environ.get("SPECIES_TRAIN_VEL_SOURCE") or "gt").strip()
     if raw:
         return _normalize_vel_source(raw)
     return species_rollout_vel_source()
@@ -142,6 +143,12 @@ def resolve_species_rollout_uv(
         coupled = get_coupled_uv(data, device)
         if coupled is not None:
             return coupled
+    from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow
+
+    if corrector_coupling_enabled():
+        coupled = get_coupled_flow(data, device)
+        if coupled is not None:
+            return coupled
     global _pred_uv_cache, _pred_uv_key, _kine_model
     key = _graph_key(data)
     if _pred_uv_cache is None or _pred_uv_key != key:
@@ -206,5 +213,5 @@ def pin_species_block(
     """Non-modeled species channels for one timestep."""
     mode = pin_other or species_rollout_pin_other()
     if mode == "gt":
-        return data.y[int(time_index), :, 4:16].to(device=device, dtype=torch.float32).clone()
+        return data.y[int(time_index), :, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32).clone()
     return resting_species_log_nd(data, device).clone()

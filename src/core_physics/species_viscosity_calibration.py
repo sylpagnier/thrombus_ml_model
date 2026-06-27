@@ -34,13 +34,13 @@ from src.core_physics.t0_mu_physics import (
     resolve_t0_flow_uv_nd,
     resolve_t0_gamma_mode,
 )
-from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
+from src.utils import species_channels as sc
 from src.utils.rheology import phi_clot_from_mat_fi
 from src.utils.paths import get_project_root
 
 DEFAULT_S35_DIR = "outputs/biochem/biochem_gnn/viscosity"
 DEFAULT_S34_GNN_CKPT = "outputs/biochem/biochem_gnn/species/best.pth"
-SPECIES_SLICE_START = 4
+SPECIES_SLICE_START = sc.SPECIES_BLOCK_START
 
 
 def viscosity_calibration_dir() -> Path:
@@ -123,7 +123,8 @@ class MatViscosityCalibrator(nn.Module):
 
 
 def _mat_slice_index() -> int:
-    return int(MAT_CHANNEL - SPECIES_SLICE_START)
+    """Index of Mat *within the 12-ch species block* ``y[..., 4:16]`` (== 11)."""
+    return sc.block_index("Mat")
 
 
 def apply_mat_beta_to_species_row(
@@ -133,7 +134,7 @@ def apply_mat_beta_to_species_row(
 ) -> torch.Tensor:
     """Boost Mat log1p ND on one ``(N, 16)`` species row (differentiable in beta)."""
     out = species_row.clone()
-    sp = out[:, SPECIES_SLICE_START : SPECIES_SLICE_START + 12].clone()
+    sp = out[:, sc.SPECIES_BLOCK].clone()
     mat_local = _mat_slice_index()
     mat_log = sp[:, mat_local]
     if isinstance(beta, torch.Tensor):
@@ -141,7 +142,7 @@ def apply_mat_beta_to_species_row(
     else:
         b = torch.tensor(float(beta), device=mat_log.device, dtype=mat_log.dtype)
     sp[:, mat_local] = _boost_mat_log(mat_log, b, bio_cfg)
-    out[:, SPECIES_SLICE_START : SPECIES_SLICE_START + 12] = sp
+    out[:, sc.SPECIES_BLOCK] = sp
     return out
 
 
@@ -199,9 +200,9 @@ def differentiable_clot_phi_from_full_y(
     row16: torch.Tensor,
     bio_cfg: BiochemConfig,
 ) -> torch.Tensor:
-    """Soft clot phi from full ``y`` row using FI/Mat channels 8 and 11."""
-    mat_si = mat_si_for_gelation_from_log1p(row16[:, MAT_CHANNEL], bio_cfg)
-    fi_si = fi_si_for_gelation_from_log1p(row16[:, FI_CHANNEL], bio_cfg)
+    """Soft clot phi from a full 16-ch ``y`` row using FI/Mat full-y cols 12 and 15."""
+    mat_si = mat_si_for_gelation_from_log1p(row16[:, sc.y_index("Mat")], bio_cfg)
+    fi_si = fi_si_for_gelation_from_log1p(row16[:, sc.y_index("FI")], bio_cfg)
     t_scale = max(float(bio_cfg.soft_step_T_scale), 1e-5)
     temp_scale = gelation_temperature_scale()
     temp_mat = max(float(bio_cfg.viscosity_gnode_temp_mat) * t_scale / temp_scale, 1e-8)
@@ -233,7 +234,7 @@ def predict_mu_soft_gelation_with_beta(
     t = int(time_index)
     ti = max(0, min(t, int(species_series.shape[0]) - 1))
     boosted_row = apply_mat_beta_to_species_row(species_series[ti], beta, bio_cfg)
-    gm = gamma_mode or (resolve_t0_gamma_mode(anchor) if anchor else "max")
+    gm = gamma_mode or resolve_t0_gamma_mode()
     mu_c = _carreau_baseline_mu_si(data, t, phys_cfg, device, gamma_mode=gm)
     phi = differentiable_clot_phi_from_full_y(boosted_row, bio_cfg)
     ratio = max(float(clot_phi_physics_mu_ratio_max(bio_cfg)), 1.0)
@@ -274,13 +275,13 @@ def predict_mu_at_time_with_beta(
     boosted = apply_mat_beta_to_species_series(
         species_series, beta, bio_cfg, time_index=time_index
     )
-    gm = gamma_mode or resolve_t0_gamma_mode(anchor) if anchor else "max"
+    gm = gamma_mode or resolve_t0_gamma_mode()
     step = predict_mu_si_at_time(
         data,
         int(time_index),
         phys_cfg,
         bio_cfg,
-        device,
+        device=device,
         gamma_mode=gm,
         flow_source="gt",
         pred_species_series=boosted,

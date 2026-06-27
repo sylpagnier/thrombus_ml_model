@@ -137,6 +137,8 @@ GLOBAL_TRAIN_RECIPE: dict[str, str] = {
     "SPECIES_ROLLOUT_VEL_SOURCE": "kinematics",
     "SPECIES_ROLLOUT_PIN_OTHER": "rest",
     "SPECIES_ROLLOUT_IC_SOURCE": "resting",
+    "SPECIES_SNAPSHOT_WALL_HOPS": "3",
+    "CLOT_PHI_CEILING_HOPS": "3",
 }
 
 DEPLOY_INFERENCE_ENV: dict[str, str] = {
@@ -156,6 +158,8 @@ DEPLOY_INFERENCE_ENV: dict[str, str] = {
     "SPECIES_ROLLOUT_VEL_SOURCE": "kinematics",
     "SPECIES_ROLLOUT_PIN_OTHER": "rest",
     "SPECIES_ROLLOUT_IC_SOURCE": "resting",
+    "SPECIES_SNAPSHOT_WALL_HOPS": "3",
+    "CLOT_PHI_CEILING_HOPS": "3",
 }
 
 CKPT_PHASE_ALIASES = frozenset({PHASE_CKPT, "clot_deploy_gnn", "species_gnn_deploy_baseline"})

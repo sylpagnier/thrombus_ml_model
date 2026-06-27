@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from src.config import STATE_CHANNEL_MU_EFF_ND, BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 
 _ROLLOUT_CACHE: dict[tuple, dict[int, dict[str, torch.Tensor]]] = {}
 
@@ -200,7 +201,7 @@ def rollout_t0_clot_phi(
         step = build_clot_phi_step(data, t, phys_cfg, bio_cfg, device)
         species_log1p = None
         if pred_species_series is not None:
-            species_log1p = pred_species_series[t, :, 4:16].to(device=device, dtype=torch.float32)
+            species_log1p = pred_species_series[t, :, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32)
         phi_raw, mu_raw = forward_physics_trigger_phi(
             step,
             data,
@@ -235,4 +236,54 @@ def rollout_t0_clot_phi(
         phi_prev = phi_proj.reshape(-1)
     del nucleation_hops
     return out
+
+
+def _mu_log_mae(
+    mu_pred: torch.Tensor,
+    mu_gt: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> float:
+    """Mean absolute log error between predicted and GT viscosity (Pa*s)."""
+    p = mu_pred.reshape(-1).clamp(min=1e-8)
+    t = mu_gt.reshape(-1).clamp(min=1e-8)
+    if mask is not None:
+        m = mask.reshape(-1).bool()
+        if not bool(m.any().item()):
+            return 0.0
+        p, t = p[m], t[m]
+    return float((torch.log(p) - torch.log(t)).abs().mean().item())
+
+
+def _pearson(mu_pred: torch.Tensor, mu_gt: torch.Tensor) -> float:
+    """Pearson r on flattened viscosity fields."""
+    p = mu_pred.reshape(-1).to(dtype=torch.float64)
+    t = mu_gt.reshape(-1).to(dtype=torch.float64)
+    if int(p.numel()) < 2:
+        return 0.0
+    p = p - p.mean()
+    t = t - t.mean()
+    denom = p.norm() * t.norm()
+    if float(denom) < 1e-12:
+        return 0.0
+    return float((p * t).sum().item() / float(denom))
+
+
+def _region_masks(
+    data,
+    time_index: int,
+    phys_cfg: PhysicsConfig,
+    device: torch.device,
+    mu_gt: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Evaluation region tags for viscosity calibration (growth / wall)."""
+    del mu_gt
+    from src.core_physics.clot_growth_masks import gt_growth_commit_mask_at_time
+
+    n = int(data.num_nodes)
+    growth = gt_growth_commit_mask_at_time(data, int(time_index), phys_cfg, device)
+    if hasattr(data, "mask_wall") and data.mask_wall is not None:
+        wall = data.mask_wall.view(-1).to(device=device).bool()
+    else:
+        wall = torch.zeros(n, dtype=torch.bool, device=device)
+    return {"growth": growth.reshape(-1).bool(), "wall": wall.reshape(-1).bool()}
 

@@ -259,6 +259,24 @@ def test_rollout_ic_phi_zero_at_t0(anchor_graph) -> None:
     assert float(phi0.sum().item()) <= 0.0 + 1e-6
 
 
+def test_gt_clot_phi_excludes_t0_baseline_without_growth(anchor_graph) -> None:
+    """Absolute mu threshold can count t=0 baseline nodes; growth mask must not."""
+    from src.core_physics.clot_phi_simple import cap_mu_eff_si, clot_phi_thresh_si
+
+    apply_clot_trigger_deploy_env()
+    device = torch.device("cpu")
+    phys = PhysicsConfig(phase="biochem")
+    tf = int(anchor_graph.y.shape[0]) - 1
+    y = anchor_graph.y[tf]
+    mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(y[:, STATE_CHANNEL_MU_EFF_ND]))
+    abs_clot = int((mu_cap >= clot_phi_thresh_si(phys)).sum().item())
+    growth_clot = int(
+        gt_growth_commit_mask_at_time(anchor_graph, tf, phys, device).sum().item()
+    )
+    assert growth_clot <= abs_clot
+    assert int(gt_growth_commit_mask_at_time(anchor_graph, 0, phys, device).sum().item()) == 0
+
+
 def test_gt_growth_commits_zero_at_t0_and_early(anchor_graph) -> None:
     apply_clot_trigger_deploy_env()
     device = torch.device("cpu")

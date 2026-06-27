@@ -13,9 +13,11 @@ from src.core_physics.clot_phi_simple import (
     cap_mu_eff_si,
     clot_phi_center_exclude_frac,
     clot_phi_thresh_si,
+    gt_mu_anchor_cap_si,
     neighbor_supervision_mask,
     supervision_region_mask,
 )
+from src.core_physics.clot_growth_masks import gt_growth_commit_mask_at_time
 from src.utils.paths import get_project_root
 
 REPO = get_project_root()
@@ -57,7 +59,7 @@ def test_dgamma_slice_raises_mask_precision_on_patient007(patient007, monkeypatc
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     base = supervision_region_mask(patient007, device, mu_cap, phys)
     monkeypatch.setenv("CLOT_PHI_DGAMMA_SLICE", "1")
     monkeypatch.setenv("CLOT_PHI_DGAMMA_REF_TIME", "0")
@@ -81,7 +83,7 @@ def test_shear_filter_keeps_wall_and_trims_low_shear_offwall(patient007, monkeyp
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     base = supervision_region_mask(patient007, device, mu_cap, phys)
     monkeypatch.setenv("CLOT_PHI_SHEAR_MIN_FRAC", "0")
     full = supervision_region_mask(patient007, device, mu_cap, phys)
@@ -99,7 +101,7 @@ def test_neighbor_mask_covers_all_gt_clot_nodes(patient007, monkeypatch):
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     region = supervision_region_mask(patient007, device, mu_cap, phys)
     from src.core_physics.clot_phi_simple import sdf_nd_from_data
 
@@ -121,7 +123,7 @@ def test_neighbor_mask_excludes_inflow_far_from_clot(patient007, monkeypatch):
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     region = neighbor_supervision_mask(patient007, device, clot)
     wall = patient007.mask_wall.view(-1).bool()
     near = clot.clone()
@@ -141,7 +143,7 @@ def test_neighbor_mask_no_halo_from_excluded_inner_clot(patient007, monkeypatch)
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     region = neighbor_supervision_mask(patient007, device, clot)
     wall = _wall_mask_from_data(patient007, device, int(patient007.num_nodes))
     from src.core_physics.clot_phi_simple import sdf_nd_from_data
@@ -163,7 +165,7 @@ def test_neighbor_mask_excludes_centerline_interior(patient007, monkeypatch):
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     region = neighbor_supervision_mask(patient007, device, clot)
     wall = _wall_mask_from_data(patient007, device, int(patient007.num_nodes))
     from src.core_physics.clot_phi_simple import sdf_nd_from_data
@@ -172,7 +174,7 @@ def test_neighbor_mask_excludes_centerline_interior(patient007, monkeypatch):
     lumen_all = (~wall) & (sdf > 1e-8)
     if int(lumen_all.sum()) > 0:
         thr = torch.quantile(sdf[lumen_all], 0.90)
-        clot = mu_cap >= clot_phi_thresh_si(phys)
+        clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
         inner = (~wall) & (sdf >= thr)
         inner_in_mask = region & inner
         assert int(inner_in_mask.sum()) == 0, "top 10% interior lumen nodes should be excluded from mask"
@@ -185,7 +187,7 @@ def test_neighbor_mask_has_fewer_inflow_nodes_than_sdf_shell(patient007, monkeyp
     device = torch.device("cpu")
     ti = int(patient007.y.shape[0]) - 1
     mu_cap = cap_mu_eff_si(phys.viscosity_nd_to_si(patient007.y[ti][:, STATE_CHANNEL_MU_EFF_ND]))
-    clot = mu_cap >= clot_phi_thresh_si(phys)
+    clot = gt_growth_commit_mask_at_time(patient007, ti, phys, device)
     region = neighbor_supervision_mask(patient007, device, clot)
     monkeypatch.setenv("CLOT_PHI_MASK_MODE", "sdf")
     from src.core_physics.clot_phi_simple import sdf_supervision_mask

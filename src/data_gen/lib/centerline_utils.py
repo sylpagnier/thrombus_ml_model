@@ -158,14 +158,21 @@ def load_sidecar_centerline_nd(
 
 
 def resolve_anchor_mesh_path(raw_dir: Path, stem: str) -> Optional[Path]:
-    """Prefer ``<stem>.msh``, else ``<stem>.nas`` (COMSOL anchors often ship NAS only)."""
+    """Prefer ``<stem>.msh``, else ``<stem>.nas`` (COMSOL anchors often ship NAS only).
+
+  Also tries ``vessel_<id>.{msh,nas}`` when ``stem`` is ``patient<id>`` (legacy Gmsh names).
+    """
     raw_dir = Path(raw_dir)
-    msh = raw_dir / f"{stem}.msh"
-    if msh.is_file():
-        return msh
-    nas = raw_dir / f"{stem}.nas"
-    if nas.is_file():
-        return nas
+    for name in (f"{stem}.msh", f"{stem}.nas"):
+        p = raw_dir / name
+        if p.is_file():
+            return p
+    if stem.startswith("patient") and stem[7:].isdigit():
+        vid = str(int(stem[7:]))
+        for name in (f"vessel_{vid}.msh", f"vessel_{vid}.nas"):
+            p = raw_dir / name
+            if p.is_file():
+                return p
     return None
 
 

@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_model,
     build_clot_phi_step,
@@ -42,6 +43,7 @@ from src.core_physics.clot_phi_simple import (
     carreau_mu_si_from_uv,
     clot_phi_hybrid_enabled,
     clot_phi_mu_cap_si,
+    gt_mu_anchor_cap_si,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
     neighbor_supervision_mask,
@@ -553,7 +555,8 @@ def resolve_neighbor_wall_mu_mask(
     mu_cap = cap_mu_eff_si(mu_gt)
     region = supervision_region_mask(data, device, mu_cap, phys_cfg)
     if mode == "gt_clot":
-        return phi_gt_binary(mu_cap, region, phys_cfg).reshape(-1).bool()
+        anchor = gt_mu_anchor_cap_si(data, phys_cfg, device)
+        return phi_gt_binary(mu_cap, region, phys_cfg, mu_anchor_si=anchor).reshape(-1).bool()
     return region.reshape(-1).bool()
 
 
@@ -628,8 +631,14 @@ def resolve_clot_trigger_gate(
     device = mu_c_si.device
 
     if mode == "gt_clot":
-        if mu_gt_cap_si is not None and region is not None and phys_cfg is not None:
-            gt = phi_gt_binary(mu_gt_cap_si, region, phys_cfg)
+        if (
+            mu_gt_cap_si is not None
+            and region is not None
+            and phys_cfg is not None
+            and graph_data is not None
+        ):
+            anchor = gt_mu_anchor_cap_si(graph_data, phys_cfg, device)
+            gt = phi_gt_binary(mu_gt_cap_si, region, phys_cfg, mu_anchor_si=anchor)
             return gt.reshape(-1, 1).to(dtype=dtype)
         mode = "adaptive_phi"
 
@@ -776,7 +785,7 @@ def committed_mu_mesh_from_clot_model(
     y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
     y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
     if mlp_clot_use_pred_species():
-        y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+        y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
     step = build_clot_phi_step(
         data,
         time_index,
@@ -831,7 +840,7 @@ def compute_mlp_commit_gates_at_rollout_frame(
     y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
     y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
     if mlp_clot_use_pred_species():
-        y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+        y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
     step = build_clot_phi_step(
         data,
         time_index,
@@ -982,7 +991,7 @@ def predict_mlp_fields_at_rollout_frame(
     y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
     y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
     if mlp_clot_use_pred_species():
-        y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+        y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
     step = build_clot_phi_step(
         data,
         time_index,
@@ -1158,7 +1167,7 @@ def diagnose_deploy_gate_rollout_series(
         frame = pred_series[idx]
         u_nd = frame[:, 0]
         v_nd = frame[:, 1]
-        species = frame[:, 4:16]
+        species = frame[:, sc.SPECIES_BLOCK]
         prev_mu = None
         if idx > 0:
             prev_mu = phys_cfg.viscosity_nd_to_si(pred_series[idx - 1][:, STATE_CHANNEL_MU_EFF_ND])
@@ -1320,7 +1329,7 @@ class ClotPhiMuInjector:
         y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
         y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
         if mlp_clot_use_pred_species():
-            y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+            y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
 
         step = build_clot_phi_step(
             data,
@@ -1352,7 +1361,7 @@ class ClotPhiMuInjector:
         y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
         y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
         if mlp_clot_use_pred_species():
-            y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+            y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
         return build_clot_phi_step(
             data,
             time_index,
@@ -1383,7 +1392,7 @@ class ClotPhiMuInjector:
         y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
         y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
         if mlp_clot_use_pred_species():
-            y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+            y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
         step = self._build_step(
             data,
             time_index,

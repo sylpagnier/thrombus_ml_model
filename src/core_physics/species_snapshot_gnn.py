@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_growth_masks import resolve_ceiling_mask
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.training.biochem_loss_policy import SpatialFocalLoss
@@ -58,7 +59,7 @@ def snapshot_ckpt_path() -> Path:
 
 
 def snapshot_wall_hops() -> int:
-    return max(int(float(os.environ.get("SPECIES_SNAPSHOT_WALL_HOPS", "2") or "2")), 0)
+    return max(int(float(os.environ.get("SPECIES_SNAPSHOT_WALL_HOPS", "3") or "3")), 0)
 
 
 def snapshot_time_s_default() -> float:
@@ -214,7 +215,7 @@ def species_log_targets(
 ) -> torch.Tensor:
     """GT log1p ND for active pushforward species channels, shape ``[N, C]``."""
     y = data.y[int(time_index)].to(device=device, dtype=torch.float32)
-    sp = y[:, 4:16]
+    sp = y[:, sc.SPECIES_BLOCK]
     bulk = bulk_channels if bulk_channels is not None else pushforward_state_bulk_indices()
     return torch.stack([sp[:, int(ch)] for ch in bulk], dim=-1)
 
@@ -239,7 +240,7 @@ def fi_mat_active_labels(
 
 
 def kin_per_vessel_norm_enabled() -> bool:
-    raw = (os.environ.get("SPECIES_KIN_PER_VESSEL_NORM") or "0").strip().lower()
+    raw = (os.environ.get("SPECIES_KIN_PER_VESSEL_NORM") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 

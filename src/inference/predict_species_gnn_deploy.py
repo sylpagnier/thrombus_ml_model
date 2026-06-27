@@ -26,7 +26,10 @@ from src.core_physics.species_gnn_clot_rollout import (
 from src.core_physics.species_snapshot_gnn import wall_band_mask
 from src.core_physics.t0_device import require_cuda_device
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time, predict_mu_si_at_time
-from src.core_physics.t0_rung4_ladder import species_log_mae_in_mask
+try:  # optional species log-MAE diagnostic (helper removed in a prior reorg)
+    from src.core_physics.t0_rung4_ladder import species_log_mae_in_mask
+except ImportError:  # pragma: no cover
+    species_log_mae_in_mask = None
 from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
 from src.inference.species_gnn_deploy_env import (
     load_deploy_manifest,
@@ -115,7 +118,11 @@ def predict_species_gnn_deploy(
         band = wall_band_mask(data, dev, wall_hops=1).reshape(-1).bool()
         mask = torch.ones(int(data.num_nodes), device=dev, dtype=torch.bool)
         t_last = times[-1]
-        sp_mae = species_log_mae_in_mask(species_series, data, t_last, band, dev)
+        sp_mae = (
+            species_log_mae_in_mask(species_series, data, t_last, band, dev)
+            if species_log_mae_in_mask is not None
+            else None
+        )
 
         clot_rows: list[dict] = []
         mu_rows: list[dict] = []

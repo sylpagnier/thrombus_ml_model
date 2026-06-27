@@ -439,11 +439,10 @@ class PatientDataExtractor:
         Training Metadata generation.
         """
         # 1. Path Setup and Mesh Loading
-        msh_path_nas = self.raw_dir / f"{stem}.nas"
-        msh_path_msh = self.raw_dir / f"{stem}.msh"
-        msh_path = msh_path_nas if msh_path_nas.exists() else msh_path_msh
+        from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 
-        if not msh_path.exists():
+        msh_path = resolve_anchor_mesh_path(self.raw_dir, stem)
+        if msh_path is None:
             print(f"[ERR] Skipping {stem}: Mesh file (.nas/.msh) not found.", flush=True)
             return
 
@@ -495,19 +494,19 @@ class PatientDataExtractor:
             mask_inlet=mask_inlet,
         )
 
-        # 4. Connectivity and Edge Construction
-        if "triangle" in mesh.cells_dict:
-            all_tris = mesh.cells_dict[ "triangle" ]
-        elif "triangle6" in mesh.cells_dict:
-            all_tris = mesh.cells_dict[ "triangle6" ][ :, :3 ]
-        else:
+        # 4. Connectivity and Edge Construction (P2 triangle6 uses mid-edge nodes)
+        from src.data_gen.lib.mesh_triangle6_edges import edge_index_from_mesh
+
+        try:
+            edge_index = edge_index_from_mesh(mesh)
+        except ValueError:
             print(f"[WARN] {stem}: Unsupported cell type.", flush=True)
             return
-
-        edges = np.unique(np.sort(np.vstack([
-            all_tris[ :, [ 0, 1 ] ], all_tris[ :, [ 1, 2 ] ], all_tris[ :, [ 2, 0 ] ]
-        ]), axis=1), axis=0)
-        edge_index = torch.tensor(np.hstack([ edges.T, edges[ :, [ 1, 0 ] ].T ]), dtype=torch.long)
+        print(
+            f"[i] {stem}: P2 triangle6 edges={edge_index.shape[1] // 2} "
+            f"nodes={len(mesh.points)}",
+            flush=True,
+        )
         row, col = edge_index
 
         needs_sidecar = (

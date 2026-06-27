@@ -1,4 +1,10 @@
-"""Chained inference: GNODE teacher rollout + clot-phi spatial readout."""
+"""Chained inference: GraphSAGE species rollout + clot-phi spatial readout.
+
+Deploy stack: the species temporal evolution comes from the GraphSAGE
+``biochem_deploy`` pushforward (``src.core_physics.species_gnn_clot_rollout``),
+and the learned clot-phi MLP reads the rolled-out species block to produce the
+deploy mu map. (Pre-2026-06 this used a GNODE teacher; that path is removed.)
+"""
 
 from __future__ import annotations
 
@@ -10,22 +16,33 @@ from typing import Any
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_rollout import ClotPhiRolloutState, clot_phi_rollout_enabled
 from src.core_physics.clot_phi_simple import (
     build_clot_phi_model,
     build_clot_phi_step,
+    clot_phi_hard_support_projection_enabled,
     clot_phi_hybrid_enabled,
     log_blend_mu_eff_si,
     mu_eff_from_delta_log_si,
     project_deploy_mu_with_support,
     resolve_clot_support_band_for_step,
 )
+from src.core_physics.species_gnn_clot_rollout import (
+    load_species_gnn_rollout_bundle,
+    prepare_species_gnn_rollout_static,
+    rollout_species_gnn_species_series,
+    species_gnn_rollout_ckpt,
+)
 from src.evaluation.clot_phi_checkpoint_env import (
     apply_clot_phi_config_from_checkpoint,
     apply_clot_phi_eval_defaults,
 )
-from src.inference.clot_phi_inject_attach import attach_clot_phi_injector_to_teacher
-from src.inference.deploy_mu_map_env import apply_deploy_mu_map_env, clear_oracle_mu_map_env
+from src.inference.deploy_mu_map_env import (
+    apply_deploy_mu_map_env,
+    apply_wired_deploy_mu_map_env,
+    clear_oracle_mu_map_env,
+)
 from src.inference.clot_baseline_recipe import (
     ClotBaselineRecipe,
     baseline_manifest_path,
@@ -33,7 +50,6 @@ from src.inference.clot_baseline_recipe import (
     load_manifest,
 )
 from src.utils.channel_schema import BIO_Y_SCHEMA, assert_graph_schema, build_y_valid_mask, infer_missing_schema
-from src.utils.nondim import to_t_nd
 from src.utils.paths import get_project_root
 
 
@@ -152,8 +168,26 @@ def predict_clot_phi_at_time(
     }
 
 
+def _resolve_species_ckpt(recipe: ClotBaselineRecipe, root: Path) -> Path | None:
+    """Resolve the GraphSAGE species checkpoint: recipe -> canonical -> env default."""
+    raw = (getattr(recipe, "species_ckpt", "") or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = root / p
+        if p.is_file():
+            return p
+    from src.biochem_gnn.config import global_ckpt_path
+
+    canonical = global_ckpt_path()
+    if canonical.is_file():
+        return canonical
+    fallback = species_gnn_rollout_ckpt()
+    return fallback if fallback.is_file() else None
+
+
 class ClotBaselinePredictor:
-    """Deploy model: GNODE temporal rollout then clot-phi map readout."""
+    """Deploy model: GraphSAGE species rollout then clot-phi map readout."""
 
     def __init__(
         self,
@@ -164,37 +198,35 @@ class ClotBaselinePredictor:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.root = get_project_root()
         paths = recipe.resolved_paths(self.root)
-        teacher_path = paths.get("teacher_ckpt")
         clot_path = paths.get("clot_phi_ckpt")
-        if not teacher_path or not teacher_path.is_file():
-            raise FileNotFoundError(f"Teacher checkpoint missing: {recipe.teacher_ckpt}")
+        species_path = _resolve_species_ckpt(recipe, self.root)
+        if species_path is None:
+            raise FileNotFoundError(
+                f"Species GNN checkpoint missing: {recipe.species_ckpt or '<canonical biochem_deploy>'}"
+            )
         if not clot_path or not clot_path.is_file():
             raise FileNotFoundError(f"Clot-phi checkpoint missing: {recipe.clot_phi_ckpt}")
 
-        self.teacher, _, self.mu_ratio_max = load_biochem_teacher_checkpoint(
-            teacher_path,
-            self.device,
-            mu_ratio_max=recipe.mu_ratio_max,
-            pred_kine=recipe.pred_kine,
-        )
+        self.species_ckpt = species_path
+        self.mu_ratio_max = recipe.mu_ratio_max
+        self.bundle = load_species_gnn_rollout_bundle(species_path, device=self.device)
+        if self.bundle is None:
+            raise FileNotFoundError(f"Failed to load species GNN bundle: {species_path}")
+
         deploy_env = getattr(recipe, "deploy_mu_map_env", None) or {}
         recipe_name = getattr(recipe, "name", "") or ""
         use_wired = recipe_name in ("lane_a_wired", "B_wired") or (
             str(deploy_env.get("BIOCHEM_MLP_MU_MAP_MASK", "")).strip().lower() == "mlp_band"
         )
+        # The clot-phi MLP is applied as a post-rollout readout (no GNODE forward to
+        # inject into), so the deploy mu-map env only configures the readout itself.
         if deploy_env or recipe_name in ("lane_b_deploy", "lane_a_wired", "B_wired"):
             clear_oracle_mu_map_env()
-            from src.inference.deploy_mu_map_env import (
-                apply_deploy_mu_map_env,
-                apply_wired_deploy_mu_map_env,
-            )
-
             if use_wired:
                 apply_wired_deploy_mu_map_env(deploy_env if deploy_env else None)
             else:
                 apply_deploy_mu_map_env(deploy_env if deploy_env else None)
             os.environ["BIOCHEM_MLP_CLOT_CKPT"] = str(clot_path)
-            attach_clot_phi_injector_to_teacher(self.teacher, self.device, clot_path)
             self.deploy_mu_map = True
         else:
             self.deploy_mu_map = False
@@ -209,29 +241,33 @@ class ClotBaselinePredictor:
 
     @torch.no_grad()
     def rollout_teacher(self, data) -> torch.Tensor:
-        """GNODE forward; returns pred_series same shape as ``data.y``."""
+        """GraphSAGE species pushforward; returns ``(T, N, 16)`` aligned to ``data.y``.
+
+        Only the species block (channels 4:16) is populated; flow channels (0:4)
+        are left for the clot-phi step to resolve from its own velocity source.
+        Method name kept for API back-compat with the former GNODE teacher path.
+        """
         data = infer_missing_schema(data, phase_hint="biochem")
         assert_graph_schema(data, expected_y_schema=(BIO_Y_SCHEMA,))
-        t_si = self.bio_cfg.resolve_biochem_times(data, self.device)
-        t_ref = float(getattr(self.bio_cfg, "t_final", 30000.0))
-        eval_t = to_t_nd(t_si, t_ref)
-        return self.teacher(
+        static = prepare_species_gnn_rollout_static(data, device=self.device)
+        return rollout_species_gnn_species_series(
             data,
-            eval_t,
-            y_true_trajectory=data.y,
-            teacher_forcing_ratio=1.0,
-            start_idx=0,
-            initial_species=None,
-            detach_macro_state=True,
+            self.bundle,
+            static,
+            phys_cfg=self.phys_cfg,
+            bio_cfg=self.bio_cfg,
+            device=self.device,
         )
 
     def apply_teacher_rollout(self, data, pred_series: torch.Tensor):
-        """Write teacher species + pred [u,v,p] into ``data.y`` (in-place on CPU copy)."""
+        """Write rolled-out species block into ``data.y`` (in-place on CPU copy).
+
+        The GraphSAGE rollout does not predict flow, so flow channels (``[u,v,p]``)
+        are kept as-is (the anchor graph's COMSOL/base flow) for the clot-phi readout.
+        """
         data_out = data.to("cpu")
         pred_cpu = pred_series.to("cpu")
-        data_out.y[:, :, 4:16] = pred_cpu[:, :, 4:16]
-        if self.recipe.pred_kine:
-            data_out.y[:, :, 0:3] = pred_cpu[:, :, 0:3]
+        data_out.y[:, :, sc.SPECIES_BLOCK] = pred_cpu[:, :, sc.SPECIES_BLOCK]
         if hasattr(data_out, "y_valid_mask") and torch.is_tensor(data_out.y_valid_mask):
             if tuple(data_out.y_valid_mask.shape) != tuple(data_out.y.shape):
                 data_out.y_valid_mask = build_y_valid_mask(
@@ -250,8 +286,9 @@ class ClotBaselinePredictor:
         """
         Full pipeline on one anchor graph.
 
-        If ``run_teacher``, rolls out GNODE and patches ``y`` before clot-phi.
-        If graph already has dumped pred species/vel, pass ``run_teacher=False``.
+        If ``run_teacher``, rolls out GraphSAGE species and patches ``y`` before
+        clot-phi. If the graph already has dumped pred species, pass
+        ``run_teacher=False``.
         """
         data = infer_missing_schema(data, phase_hint="biochem").to(self.device)
         if run_teacher:
@@ -310,7 +347,7 @@ class ClotBaselinePredictor:
 
 
 def _cli() -> None:
-    ap = argparse.ArgumentParser(description="Clot baseline predict (GNODE + clot-phi)")
+    ap = argparse.ArgumentParser(description="Clot baseline predict (GraphSAGE species + clot-phi)")
     ap.add_argument("--manifest", default="", help="manifest.json (default: outputs/biochem/clot_baseline/)")
     ap.add_argument("--anchor", default="patient007")
     ap.add_argument("--anchor-dir", default="", help="Override graph dir (default: recipe dump dir)")

@@ -37,6 +37,7 @@ from src.core_physics.species_pushforward_continuous import (
     parse_biochem_train_anchors,
     pushforward_train_t0_per_vessel,
     resolve_train_t0_max,
+    species_latent_dropout_p,
     DEFAULT_S34_CKPT,
     SpeciesDualHeadContinuousGNN,
     band_speed_series,
@@ -45,7 +46,12 @@ from src.core_physics.species_pushforward_continuous import (
     closed_loop_init_prob,
     continuous_channel_weights,
     continuous_feature_dim,
+    continuous_frontier_hops,
+    continuous_gate_temp,
     continuous_mature_fp_exempt,
+    continuous_nucleation_topk,
+    continuous_neighbor_commit_alpha,
+    continuous_neighbor_commit_gate,
     continuous_saturation_gate,
     continuous_temporal_gate,
     continuous_score_clot_weight,
@@ -99,7 +105,14 @@ from src.core_physics.species_pushforward_continuous import (
     tbptt_tail_steps,
     unroll_continuous_loss,
 )
-from src.core_physics.species_pushforward_gnn import build_band_base_features, pushforward_train_t0_min
+from src.core_physics.species_pushforward_gnn import (
+    build_band_base_features,
+    flow_feats_dynamic,
+    flow_feats_enabled,
+    geom_feats_enabled,
+    geom_feats_rich_enabled,
+    pushforward_train_t0_min,
+)
 from src.core_physics.species_snapshot_gnn import (
     DEFAULT_SNAPSHOT_CKPT,
     kin_per_vessel_norm_enabled,
@@ -209,6 +222,17 @@ def main() -> int:
         help="LOAO: drop val-anchor from training packs (train only on other vessels)",
     )
     ap.add_argument("--init", default="", help="Optional checkpoint to warm-start")
+    ap.add_argument(
+        "--no-init",
+        action="store_true",
+        help="Random init (skip default snapshot / continuous warm-start)",
+    )
+    ap.add_argument(
+        "--init-mode",
+        choices=("full", "backbone", "mat_readout"),
+        default="full",
+        help="Warm-start policy when --init is a fi_mat dual-head ckpt (mat recipe)",
+    )
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--grad-clip", type=float, default=None)
@@ -223,6 +247,26 @@ def main() -> int:
     ap.add_argument("--early-stop", type=int, default=25)
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument(
+        "--recipe",
+        choices=("default", "mat_growth_simple"),
+        default="default",
+        help="Training env recipe (mat_growth_simple = Mat-only single-head)",
+    )
+    mat_leg_choices = ("",)
+    try:
+        from src.biochem_gnn.mat_growth_simple import LADDER_LEG_ORDER
+
+        mat_leg_choices = ("", *tuple(LADDER_LEG_ORDER))
+    except Exception:
+        # Keep trainer usable even if mat-growth helper import fails.
+        mat_leg_choices = ("", "A_random", "B_backbone", "C_geom", "D_parity_single", "E_dual_mat", "F_single_fimat")
+    ap.add_argument(
+        "--leg",
+        choices=mat_leg_choices,
+        default="",
+        help="Mat-growth ladder leg (applies per-leg env overrides)",
+    )
+    ap.add_argument(
         "--arch",
         choices=("sage", "gnode"),
         default="",
@@ -235,7 +279,25 @@ def main() -> int:
     pushforward_arch = species_pushforward_arch()
 
     phase = "biochem_gnn"
-    apply_train_recipe_env()
+    if str(args.recipe).strip().lower() == "mat_growth_simple":
+        from src.biochem_gnn.mat_growth_simple import (
+            apply_mat_growth_leg_env,
+            apply_mat_growth_simple_recipe_env,
+            mat_growth_precision_selection_enabled,
+        )
+
+        if str(args.leg).strip():
+            apply_mat_growth_leg_env(str(args.leg).strip(), force=True)
+        else:
+            apply_mat_growth_simple_recipe_env(force=True)
+    else:
+        apply_train_recipe_env()
+    mat_growth_recipe = str(args.recipe).strip().lower() == "mat_growth_simple"
+    mat_precision_select = False
+    if mat_growth_recipe:
+        from src.biochem_gnn.mat_growth_simple import mat_growth_precision_selection_enabled
+
+        mat_precision_select = mat_growth_precision_selection_enabled()
     if args.unroll is None and not (os.environ.get("SPECIES_PUSHFORWARD_UNROLL") or "").strip():
         os.environ["SPECIES_PUSHFORWARD_UNROLL"] = "10"
     if args.unroll is not None:
@@ -315,9 +377,20 @@ def main() -> int:
     prev_in_dim = pushforward_feature_dim(latent_dim)
     in_dim = continuous_feature_dim(latent_dim)
     model = build_continuous_gnn(in_dim, hidden=hidden, arch=pushforward_arch).to(device)
+    # Latent leash: tell the model the z_kin slice width + dropout prob so the training forward can
+    # stochastically zero the (clot-blind) latent and force reliance on the explicit flow features.
+    model.kin_latent_dim = int(ref_static.get("latent_dim", 0) or 0)
+    model.latent_dropout_p = species_latent_dropout_p()
+    if model.latent_dropout_p > 0.0:
+        print(
+            f"[i] latent leash: dropout p={model.latent_dropout_p:.2f} on z_kin[:{model.kin_latent_dim}]",
+            flush=True,
+        )
 
-    init_ckpt = args.init.strip() or str(root / DEFAULT_S34_CKPT)
-    if pushforward_arch == "gnode":
+    init_ckpt = "" if bool(args.no_init) else (args.init.strip() or str(root / DEFAULT_S34_CKPT))
+    if bool(args.no_init):
+        print("[i] random init (--no-init)", flush=True)
+    elif pushforward_arch == "gnode":
         snap_path = args.init_s1.strip() or str(root / DEFAULT_SNAPSHOT_CKPT)
         if Path(snap_path).is_file():
             from src.core_physics.species_snapshot_gnn import load_snapshot_bundle
@@ -327,7 +400,9 @@ def main() -> int:
                 init_dual_head_from_continuous(model, snap.model, quiet=False)
                 print(f"[OK] gnode dual-head warm-start from snapshot {snap_path}", flush=True)
         elif init_ckpt and Path(init_ckpt).is_file():
-            bundle = load_continuous_bundle(init_ckpt, device=device, quiet=True, architecture="dual")
+            bundle = load_continuous_bundle(
+                init_ckpt, device=device, quiet=True, architecture="dual", apply_meta_env=False
+            )
             if bundle is not None:
                 init_dual_head_from_continuous(model, bundle.model, quiet=False)
                 print(f"[OK] gnode dual-head warm-start from continuous {init_ckpt}", flush=True)
@@ -338,20 +413,43 @@ def main() -> int:
             init_payload = torch.load(init_path, map_location="cpu", weights_only=False)
             init_meta = dict(init_payload.get("meta") or {})
         ckpt_is_dual = bool(init_meta.get("dual_head"))
-        arch = "single" if dual_head and not ckpt_is_dual else None
-        bundle = load_continuous_bundle(init_ckpt, device=device, quiet=True, architecture=arch)
-        if bundle is not None:
-            if dual_head and not ckpt_is_dual and isinstance(model, SpeciesDualHeadContinuousGNN):
-                init_dual_head_from_continuous(model, bundle.model)
-            else:
-                load_pushforward_state_dict_partial(
-                    model, bundle.model.state_dict(), quiet=False
-                )
-            print(f"[OK] warm-start from {init_ckpt}", flush=True)
+        init_mode = str(args.init_mode).strip().lower()
+        use_mat_warm = (
+            str(args.recipe).strip().lower() == "mat_growth_simple"
+            and not dual_head
+            and ckpt_is_dual
+            and init_mode in ("backbone", "mat_readout")
+        )
+        if use_mat_warm:
+            from src.biochem_gnn.mat_growth_simple import init_mat_single_from_fimat_ckpt
+
+            init_mat_single_from_fimat_ckpt(
+                model,
+                init_path,
+                device=device,
+                mode=init_mode,
+                quiet=False,
+            )
+            print(f"[OK] mat-growth warm-start ({init_mode}) from {init_ckpt}", flush=True)
+        else:
+            arch = "single" if dual_head and not ckpt_is_dual else None
+            bundle = load_continuous_bundle(
+                init_ckpt, device=device, quiet=True, architecture=arch, apply_meta_env=False
+            )
+            if bundle is not None:
+                if dual_head and not ckpt_is_dual and isinstance(model, SpeciesDualHeadContinuousGNN):
+                    init_dual_head_from_continuous(model, bundle.model)
+                else:
+                    load_pushforward_state_dict_partial(
+                        model, bundle.model.state_dict(), quiet=False
+                    )
+                print(f"[OK] warm-start from {init_ckpt}", flush=True)
     else:
         init_path = args.init_s1.strip() or str(root / DEFAULT_SNAPSHOT_CKPT)
         if Path(init_path).is_file():
             init_continuous_from_snapshot(model, init_path)
+    if str(args.recipe).strip().lower() == "mat_growth_simple" and str(args.leg).strip():
+        apply_mat_growth_leg_env(str(args.leg).strip(), force=True)
     # Bias readout toward small positive log-deltas (avoid zero-delta collapse).
     with torch.no_grad():
         bias_layers: list[torch.nn.Linear] = []
@@ -411,6 +509,16 @@ def main() -> int:
         "max_unroll": max_unroll,
         "tbptt_tail": tbptt_tail_steps(),
         "vel_decay": continuous_vel_decay_enabled(),
+        "flow_feats": flow_feats_enabled(),
+        "flow_dynamic": flow_feats_dynamic(),
+        "geom_feats": geom_feats_enabled(),
+        "geom_feats_rich": geom_feats_rich_enabled(),
+        "neighbor_commit_gate": continuous_neighbor_commit_gate(),
+        "neighbor_commit_alpha": continuous_neighbor_commit_alpha(),
+        "gate_temp": continuous_gate_temp(),
+        "frontier_hops": continuous_frontier_hops(),
+        "nucleation_topk": continuous_nucleation_topk(),
+        "latent_dropout": species_latent_dropout_p(),
         "saturation_gate": continuous_saturation_gate(),
         "saturation_scale": saturation_headroom_scale(),
         "mature_fp_exempt": continuous_mature_fp_exempt(),
@@ -522,6 +630,8 @@ def main() -> int:
                     tbptt_tail=tbptt_tail_steps(),
                     pos_band=static.get("pos_band"),
                     time_window=win_use,
+                    flow_series=static.get("flow_series"),
+                    flow_cols=static.get("flow_cols"),
                 )
                 if not loss.requires_grad:
                     continue
@@ -567,6 +677,8 @@ def main() -> int:
                     speed_fp_weight=continuous_speed_fp_weight(),
                     pos_band=static.get("pos_band"),
                     time_window=win_dep,
+                    flow_series=static.get("flow_series"),
+                    flow_cols=static.get("flow_cols"),
                 )
                 if loss_dep.requires_grad:
                     opt.zero_grad(set_to_none=True)
@@ -626,6 +738,8 @@ def main() -> int:
                     speed_series=speed_series,
                     physics_ctx=physics_ctx,
                     time_window=win,
+                    flow_series=static.get("flow_series"),
+                    flow_cols=static.get("flow_cols"),
                 )
                 val_state_f1.append(m["final_state_f1"])
                 val_mat_f1.append(m["final_state_mat_f1"])
@@ -646,7 +760,11 @@ def main() -> int:
                 )
                 deploy_mat_f1 = float(dep["deploy_mat_f1"])
                 deploy_fi_f1 = float(dep["deploy_fi_f1"])
-                need_clot = bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0
+                need_clot = (
+                    bool(args.exclude_val_from_train)
+                    or continuous_score_clot_weight() > 0.0
+                    or mat_precision_select
+                )
                 if need_clot:
                     from src.core_physics.species_deploy_rollout import reset_species_rollout_flow_cache
 
@@ -739,7 +857,7 @@ def main() -> int:
             row["deploy_fi_f1"] = deploy_fi_f1
             row["deploy_mat_f1_t53"] = deploy_mat_f1
             row["deploy_fi_f1_t53"] = deploy_fi_f1
-            if bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0:
+            if bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0 or mat_precision_select:
                 row["deploy_clot_f1"] = deploy_clot_f1
                 row["deploy_clot_f1_t53"] = deploy_clot_f1
                 row["deploy_clot_guiding"] = deploy_clot_guiding
@@ -756,7 +874,7 @@ def main() -> int:
         dep_msg = ""
         if True:
             dep_msg = f" deploy_mat_t={deploy_mat_f1:.3f} deploy_fi_t={deploy_fi_f1:.3f} t={t_deploy} unroll={cur_unroll}"
-            if bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0:
+            if bool(args.exclude_val_from_train) or continuous_score_clot_weight() > 0.0 or mat_precision_select:
                 dep_msg += (
                     f" deploy_clot_g={deploy_clot_guiding:.3f}"
                     f" f05={deploy_clot_relaxed_f05:.3f}"
@@ -788,6 +906,12 @@ def main() -> int:
                 + 0.10 * row["val_state_f1"]
                 + 0.10 * row["val_growth_f1"]
             )
+        elif mat_precision_select:
+            clot_w = continuous_score_clot_weight()
+            pos_tgt = 0.08
+            overpaint = max(0.0, deploy_clot_pred_pos_frac - pos_tgt)
+            mat_score = 0.40 * deploy_mat_f1 + 0.10 * row["val_growth_f1"]
+            score = clot_w * deploy_clot_score + (1.0 - clot_w) * mat_score - 0.25 * overpaint
         else:
             mat_score = (
                 0.70 * deploy_mat_f1

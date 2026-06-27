@@ -22,6 +22,7 @@ from src.biochem_gnn.config import (
     species_ckpt_for_anchor,
 )
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_rollout import KinematicsUvProvider
 from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.core_physics.coupled_shear_gnn import (
@@ -401,7 +402,7 @@ class BiochemDeployStack:
                         pin_other=self.cfg.pin_other_species,  # type: ignore[arg-type]
                     )
                     sp = embed_fimat_into_species12(sp, log_state, stat.node_idx)
-                    species_out[t, :, 4:16] = sp
+                    species_out[t, :, sc.SPECIES_BLOCK] = sp
 
                     phi_raw, step = predict_clot_phi_at_time(
                         data,

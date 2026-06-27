@@ -2,7 +2,7 @@
 
 import torch
 
-from src.architecture.gnode_biochem import biochem_truth_node_mask
+from src.utils.biochem_masks import biochem_truth_node_mask
 
 
 def test_localized_l2_velocity_in_clot_zone():

@@ -21,9 +21,12 @@ from src.core_physics.clot_phi_simple import (
     mat_si_for_gelation_from_log1p,
     species_log1p_nd_to_si,
 )
-from src.core_physics.species_pushforward_gnn import STATE_DIM
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time
-from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
+from src.training.biochem_species_scope import (
+    FI_CHANNEL,
+    MAT_CHANNEL,
+    pushforward_state_bulk_indices,
+)
 from src.utils.rheology import multiplicative_clot_mu_eff_nd, phi_clot_from_mat_fi
 
 
@@ -61,11 +64,12 @@ def band_log_state_to_species12(
     log_state: torch.Tensor,
     rest: torch.Tensor,
 ) -> torch.Tensor:
-    """Embed band FI/Mat log state into 12-ch species block (rest + updates)."""
+    """Embed band pushforward log state into 12-ch species block (rest + updates)."""
     out = rest.clone()
-    st = log_state.reshape(-1, STATE_DIM)
-    out[:, FI_CHANNEL] = st[:, 0]
-    out[:, MAT_CHANNEL] = st[:, 1]
+    bulk = pushforward_state_bulk_indices()
+    st = log_state.reshape(-1, len(bulk))
+    for local_i, bulk_ch in enumerate(bulk):
+        out[:, int(bulk_ch)] = st[:, local_i]
     return out.clamp(min=0.0)
 
 

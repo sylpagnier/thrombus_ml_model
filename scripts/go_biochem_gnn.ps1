@@ -28,6 +28,8 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 . (Join-Path $PSScriptRoot "_python_rc.ps1")
 $env:PYTHONUNBUFFERED = "1"
+$env:SPECIES_SNAPSHOT_WALL_HOPS = "3"
+$env:CLOT_PHI_CEILING_HOPS = "3"
 
 if ($Step -eq "global") { $Step = "species" }
 if ($Step -eq "beta") { $Step = "viscosity" }

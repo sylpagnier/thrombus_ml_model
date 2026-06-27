@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import BiochemConfig, NodeFeat, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.utils import species_channels as sc
 from src.core_physics.clot_kinematics_fields import adjacent_band_mask, compute_clot_kinematics_fields, compute_shear_rate
 from src.core_physics.kinematics_clot_prior import clot_prior_features, clot_prior_score_flat
 from src.utils.rheology import carreau_yasuda_viscosity
@@ -1066,7 +1067,7 @@ def physics_phi_from_mu(
         return phi * region.reshape(-1).to(dtype=torch.float32)
     if soft:
         return phi_gt_soft(mu_cap, mu_ref, region)
-    return phi_gt_binary(mu_cap, region, phys_cfg)
+    raise ValueError("physics_phi_from_mu requires mu_anchor_si for growth-only GT clot labels")
 
 def clot_phi_use_prior_features() -> bool:
     return _env_bool("CLOT_PHI_USE_PRIOR_FEATURES", False)
@@ -1130,9 +1131,11 @@ def rule_phi_from_mu_cap(
     mu_cap_si: torch.Tensor,
     region: torch.Tensor,
     phys_cfg: PhysicsConfig,
+    *,
+    mu_anchor_si: torch.Tensor,
 ) -> torch.Tensor:
-    """Sanity floor: φ=1 where capped μ_gt ≥ threshold inside the supervision shell."""
-    return phi_gt_binary(mu_cap_si, region, phys_cfg)
+    """Sanity floor: phi=1 where growth relu(mu - anchor) >= threshold inside the shell."""
+    return phi_gt_binary(mu_cap_si, region, phys_cfg, mu_anchor_si=mu_anchor_si)
 
 
 def clot_prior_rule_p_quantile() -> float:
@@ -1588,14 +1591,26 @@ def predict_prior_rule_deploy(
     return step, phi, mu, meta
 
 
+def mu_growth_clot_binary_mask(
+    mu_si: torch.Tensor,
+    mu_anchor_si: torch.Tensor,
+    thresh_si: float,
+) -> torch.Tensor:
+    """Growth-only clot mask: ``relu(mu - anchor) >= thresh``."""
+    growth = (mu_si.reshape(-1) - mu_anchor_si.reshape(-1)).clamp(min=0.0)
+    return growth >= float(thresh_si)
+
+
 def phi_gt_binary(
     mu_cap_si: torch.Tensor,
     region: torch.Tensor | None,
     phys_cfg: PhysicsConfig,
+    *,
+    mu_anchor_si: torch.Tensor,
 ) -> torch.Tensor:
-    """Binary clot label (threshold on capped mu). Region masks loss/viz band when set."""
+    """Binary GT clot: growth ``relu(mu - anchor) >= thresh``. Region masks band when set."""
     thr = clot_phi_thresh_si(phys_cfg)
-    phi = (mu_cap_si.reshape(-1) >= thr).to(dtype=torch.float32)
+    phi = mu_growth_clot_binary_mask(mu_cap_si, mu_anchor_si, thr).to(dtype=torch.float32)
     if region is None:
         return phi
     return phi * region.reshape(-1).to(dtype=torch.float32)
@@ -2223,7 +2238,7 @@ def build_clot_phi_step(
     )
     y_feat = y_gt.clone()
     if species_log_override is not None:
-        y_feat[:, 4:16] = species_log_override.to(device=device, dtype=torch.float32)
+        y_feat[:, sc.SPECIES_BLOCK] = species_log_override.to(device=device, dtype=torch.float32)
     elif y_slice_override is not None:
         y_feat = y.to(device=device, dtype=torch.float32)
     feats = node_features_from_gt(
@@ -2256,7 +2271,7 @@ def build_clot_phi_step(
             device=device,
             dtype=feats.dtype,
         )
-    species_log = y_feat[:, 4:16].to(device=device, dtype=torch.float32)
+    species_log = y_feat[:, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32)
     return ClotPhiStepBatch(
         features=feats,
         phi_gt=phi_gt,

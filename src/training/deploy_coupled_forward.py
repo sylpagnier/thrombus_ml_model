@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from src.config import BiochemConfig, PhysicsConfig
+from src.utils import species_channels as sc
 from src.core_physics.clot_phi_mu_inject import (
     mlp_clot_use_pred_species,
     resolve_clot_mu_commit_thresh_si,
@@ -61,7 +62,7 @@ def forward_mlp_fields_at_rollout_frame(
     y_slice[:, 0] = u_nd.reshape(-1).to(dtype=y_slice.dtype)
     y_slice[:, 1] = v_nd.reshape(-1).to(dtype=y_slice.dtype)
     if mlp_clot_use_pred_species():
-        y_slice[:, 4:16] = species_log.to(device=device, dtype=y_slice.dtype)
+        y_slice[:, sc.SPECIES_BLOCK] = species_log.to(device=device, dtype=y_slice.dtype)
     step = build_clot_phi_step(
         data,
         time_index,

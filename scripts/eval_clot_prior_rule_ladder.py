@@ -97,6 +97,7 @@ def _eval_pair(
         gt_state=y_sl,
         edge_index=data.edge_index.to(device),
         phys_cfg=phys,
+        gt_anchor_state=data.y[0].to(device=device, dtype=torch.float32),
     )
     return {
         "t_in": t_in,
