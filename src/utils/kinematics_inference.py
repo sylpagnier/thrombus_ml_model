@@ -92,14 +92,49 @@ def _kin_solver_kwargs() -> dict[str, object]:
 
 def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
     """Run one GINO-DEQ forward pass; returns ``(N, C)`` predictions."""
-    pred = model(data, **_kin_solver_kwargs())
-    return pred[0] if isinstance(pred, tuple) else pred
+    orig_device = next(model.parameters()).device
+    if orig_device.type == "cuda":
+        try:
+            pred = model(data.to(orig_device), **_kin_solver_kwargs())
+            return pred[0] if isinstance(pred, tuple) else pred
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            try:
+                pred = model(data.to(orig_device), **_kin_solver_kwargs())
+                return pred[0] if isinstance(pred, tuple) else pred
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print("[WARN] predict_kinematics OOM on CUDA; falling back to CPU solve.")
+                model.to("cpu")
+                pred = model(data.to("cpu"), **_kin_solver_kwargs())
+                model.to(orig_device)
+                res = pred[0] if isinstance(pred, tuple) else pred
+                return res.to(orig_device)
+    else:
+        pred = model(data, **_kin_solver_kwargs())
+        return pred[0] if isinstance(pred, tuple) else pred
 
 
 @torch.no_grad()
 def predict_kinematics_latent(model: GINO_DEQ, data: Data) -> torch.Tensor:
     """Frozen DEQ latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
-    return model.solve_latent(data, **_kin_solver_kwargs())
+    orig_device = next(model.parameters()).device
+    if orig_device.type == "cuda":
+        try:
+            return model.solve_latent(data.to(orig_device), **_kin_solver_kwargs())
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            try:
+                return model.solve_latent(data.to(orig_device), **_kin_solver_kwargs())
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print("[WARN] predict_kinematics_latent OOM on CUDA; falling back to CPU solve.")
+                model.to("cpu")
+                res = model.solve_latent(data.to("cpu"), **_kin_solver_kwargs())
+                model.to(orig_device)
+                return res.to(orig_device)
+    else:
+        return model.solve_latent(data, **_kin_solver_kwargs())
 
 
 # Canonical names (PMGP-DEQ Stage-A flow)

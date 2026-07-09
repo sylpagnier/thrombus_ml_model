@@ -277,6 +277,7 @@ class ActiveGrowthHuberLoss(nn.Module):
         target_delta: torch.Tensor,
         band_mask: torch.Tensor,
         current_log_state: torch.Tensor | None = None,
+        fp_weight_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         m = band_mask.reshape(-1).to(device=pred_delta.device).bool()
         if not bool(m.any().item()):
@@ -323,15 +324,20 @@ class ActiveGrowthHuberLoss(nn.Module):
                 mature = st[:, ch] >= (self.mature_frac * float(self.mature_max_log[ch]))
                 fp = fp & (~mature)
             if bool(fp.any().item()):
+                element_loss = F.huber_loss(
+                    p[fp, ch],
+                    torch.zeros_like(p[fp, ch]),
+                    delta=beta,
+                    reduction="none",
+                )
+                if fp_weight_scale is not None:
+                    scale_m = fp_weight_scale.reshape(-1)[m]
+                    scale_fp = scale_m[fp]
+                    element_loss = element_loss * scale_fp
                 losses.append(
                     ch_w[ch]
                     * self.fp_weight
-                    * F.huber_loss(
-                        p[fp, ch],
-                        torch.zeros_like(p[fp, ch]),
-                        delta=beta,
-                        reduction="mean",
-                    )
+                    * element_loss.mean()
                 )
         if not losses:
             return pred_delta.sum() * 0.0

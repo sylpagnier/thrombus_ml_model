@@ -295,6 +295,16 @@ def flow_feats_ablate() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def flow_feats_drop_xy() -> bool:
+    """Ablate only spatial coordinates from flow block while keeping dynamics channels.
+
+    Keeps ``[log_speed, log_shear, tanh_div]`` and zeroes ``[x_norm, y_norm]``. This targets
+    inlet/outlet spatial memorization without removing the physically meaningful flow cues.
+    """
+    raw = (os.environ.get("SPECIES_FLOW_FEATS_DROP_XY") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def flow_feats_dynamic() -> bool:
     """Time-varying flow features (Trap C): recompute the flow block per rollout step from the
     velocity at *that* step's time, instead of a single static (final-clot) snapshot.
@@ -335,7 +345,7 @@ def _resolve_flow_uv(data, kine_model, device: torch.device) -> tuple[torch.Tens
             torch.cuda.empty_cache()
             print("[WARN] flow-feature kine solve OOM on CUDA; retrying on CPU.")
             kine_cpu = kine_model.to("cpu")
-            uv = predict_kinematics(kine_cpu, data.clone().to("cpu")).to(device=device)
+            uv = predict_kinematics(kine_cpu, data.to("cpu").clone()).to(device=device)
             kine_model.to(device)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -384,16 +394,54 @@ def _flow_feats_from_uv(
     shear_proxy = acc_g / deg.clamp(min=1.0)
     divergence = acc_d / deg.clamp(min=1.0)
     pn = (pos - pos.mean(0)) / pos.std(0).clamp(min=1e-6)
-    feats = torch.stack(
-        [
+    xy = pn[:, :2]
+    if flow_feats_drop_xy():
+        xy = torch.zeros_like(xy)
+
+    use_shear = (
+        os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1"
+        or os.environ.get("SPECIES_FRONTIER_KINETICS") == "1"
+    )
+    if use_shear:
+        from src.utils.rheology import compute_shear_rate
+        if hasattr(data, "G_x") and hasattr(data, "G_y") and data.G_x is not None and data.G_y is not None:
+            du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1).to(dtype=torch.float32)).squeeze(1)
+            du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1).to(dtype=torch.float32)).squeeze(1)
+            dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1).to(dtype=torch.float32)).squeeze(1)
+            dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1).to(dtype=torch.float32)).squeeze(1)
+            gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6).to(dtype=speed.dtype)
+            if hasattr(data, "u_ref") and data.u_ref is not None:
+                if isinstance(data.u_ref, torch.Tensor) and data.u_ref.numel() == data.num_nodes:
+                    u_ref = data.u_ref.to(device=device, dtype=speed.dtype).reshape(-1)[:1]
+                    d_bar = data.d_bar.to(device=device, dtype=speed.dtype).reshape(-1)[:1]
+                else:
+                    u_ref = torch.as_tensor(data.u_ref, device=device, dtype=speed.dtype).reshape(1)
+                    d_bar = torch.as_tensor(data.d_bar, device=device, dtype=speed.dtype).reshape(1)
+                d_safe = torch.clamp(d_bar, min=1e-8)
+                scale_si = u_ref / d_safe
+                gamma_si = gamma_dot_nd * scale_si
+            else:
+                gamma_si = gamma_dot_nd
+        else:
+            gamma_si = torch.zeros(n, device=device, dtype=speed.dtype)
+
+        feats_list = [
             torch.log1p(speed.clamp(min=0)),
             torch.log1p(shear_proxy.clamp(min=0)),
             torch.tanh(divergence),
-            pn[:, 0],
-            pn[:, 1],
-        ],
-        dim=1,
-    )
+            xy[:, 0],
+            xy[:, 1],
+            gamma_si,
+        ]
+    else:
+        feats_list = [
+            torch.log1p(speed.clamp(min=0)),
+            torch.log1p(shear_proxy.clamp(min=0)),
+            torch.tanh(divergence),
+            xy[:, 0],
+            xy[:, 1],
+        ]
+    feats = torch.stack(feats_list, dim=1)
     return feats[node_idx]
 
 
@@ -574,6 +622,9 @@ def build_band_base_features(
         geom = _geometry_band_features(data, device, node_idx).to(dtype=base_feats.dtype)
         base_feats = torch.cat([base_feats, geom], dim=1)
     pos_band = data.x[node_idx, :2].to(device=device, dtype=base_feats.dtype)
+    from src.core_physics.clot_phi_simple import _wall_mask_from_data
+    wall_mask_full = _wall_mask_from_data(data, device, n)
+    wall_mask_band = wall_mask_full[node_idx]
     return {
         "base_feats": base_feats,
         "pos_band": pos_band,
@@ -586,6 +637,7 @@ def build_band_base_features(
         "latent_dim": int(z_kin.shape[1]),  # true z_kin width (first cols) for the latent leash
         "flow_series": flow_series,  # [n_t, n_band, flow_dim] when dynamic, else None
         "flow_cols": flow_cols,      # (start, width) of the flow block in base_feats, else None
+        "wall_mask_band": wall_mask_band,
     }
 
 

@@ -31,7 +31,7 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     rollout_species_gnn_phi_trajectory,
     species_gnn_rollout_ckpt,
 )
-from src.core_physics.species_gnn_ladder_viz import ladder_viz_times  # noqa: E402
+from src.core_physics.species_gnn_ladder_viz import ladder_viz_times, scatter_clot_error_panel  # noqa: E402
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
 from src.evaluation.viz_clot_phi_simple import _scatter_fullmesh_region  # noqa: E402
@@ -44,6 +44,11 @@ from src.inference.species_gnn_deploy_env import (  # noqa: E402
     species_gnn_deploy_env,
 )
 from src.utils.paths import get_project_root  # noqa: E402
+
+
+ROW_GT = "Ground truth (GT)"
+ROW_PRED = "Model prediction"
+ROW_ERR = "Error (FP=red, FN=blue)"
 
 
 def _viz_out_dir() -> Path:
@@ -143,6 +148,7 @@ def main() -> int:
     ap.add_argument("--flow", default="kinematics", choices=("gt", "kinematics"))
     ap.add_argument("--max-frames", type=int, default=10)
     ap.add_argument("--scatter-size", type=float, default=3.0)
+    ap.add_argument("--no-error-row", action="store_true")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -192,10 +198,12 @@ def main() -> int:
     print(f"[i] rollout {time.perf_counter() - t0:.1f}s", flush=True)
 
     manifest_name = Path(args.manifest).stem if args.manifest.strip() else "deploy"
-    row_labels = ["GT clot", "model pred"]
+    row_labels = [ROW_GT, ROW_PRED]
+    if not args.no_error_row:
+        row_labels.append(ROW_ERR)
     fig, axes = plt.subplots(
         len(row_labels), len(times),
-        figsize=(2.6 * len(times), 2.4 * len(row_labels)),
+        figsize=(2.7 * len(times), 2.5 * len(row_labels)),
         squeeze=False,
     )
     fig.suptitle(
@@ -235,6 +243,21 @@ def main() -> int:
         )
         axes[1, j].set_title(col_title, fontsize=10, pad=6)
         axes[1, j].title.set_fontweight("bold")
+        err_counts: dict[str, int] = {}
+        if not args.no_error_row:
+            err_counts = scatter_clot_error_panel(
+                axes[2, j],
+                pos,
+                phi_gt_np,
+                p_gnn_np,
+                row_labels[2] if j == 0 else "",
+                s=scatter_s,
+            )
+            axes[2, j].set_title(
+                f"FP={err_counts['fp']}  FN={err_counts['fn']}",
+                fontsize=8,
+                pad=4,
+            )
         frames.append({
             "time": int(t),
             "tau": tau,
@@ -243,6 +266,7 @@ def main() -> int:
             "gnn_f05": float(g_gnn["clot_relaxed_f05"]),
             "gnn_dil_iou": float(g_gnn["clot_dilation_iou"]),
             "nucleation_frac": float(p_nuc.mean().item()),
+            **{f"err_{k}": int(v) for k, v in err_counts.items()},
         })
 
     fig.tight_layout()
@@ -266,6 +290,7 @@ def main() -> int:
             "species_ckpt": str(ckpt_pick),
             "beta_override": str(beta_ov or beta_used),
             "manifest": str(args.manifest),
+            "rows": row_labels,
             "times": times,
             "frames": frames,
             "final_guiding": frames[-1]["gnn_guiding"] if frames else None,

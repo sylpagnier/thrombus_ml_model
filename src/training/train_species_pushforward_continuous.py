@@ -107,6 +107,7 @@ from src.core_physics.species_pushforward_continuous import (
 )
 from src.core_physics.species_pushforward_gnn import (
     build_band_base_features,
+    flow_feats_drop_xy,
     flow_feats_dynamic,
     flow_feats_enabled,
     geom_feats_enabled,
@@ -125,6 +126,7 @@ from src.utils.kinematics_inference import (
     resolve_kinematics_checkpoint,
 )
 from src.utils.paths import get_project_root
+from src.utils import species_channels as sc
 
 
 def _split_band_nodes(n_sub: int, val_frac: float, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -190,15 +192,30 @@ def _build_anchor_pack(
     )
     if max_windows > 0:
         windows = windows[: int(max_windows)]
+
+    # Move all static features, masks, and graphs to CPU to avoid GPU OOM
+    static_cpu = {}
+    for k, v in static.items():
+        if isinstance(v, torch.Tensor):
+            static_cpu[k] = v.to("cpu")
+        else:
+            static_cpu[k] = v
+    train_m = train_m.to("cpu")
+    val_m = val_m.to("cpu")
+    data = data.to("cpu")
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     return {
         "anchor": anchor.strip(),
         "data": data,
-        "static": static,
+        "static": static_cpu,
         "train_m": train_m,
         "val_m": val_m,
         "windows": windows,
         "train_t0_max": pack_t0_max,
-        "val_windows": _val_windows(static, unroll=unroll, stride=stride),
+        "val_windows": _val_windows(static_cpu, unroll=unroll, stride=stride),
         "phys": phys,
         "bio": bio,
     }
@@ -336,7 +353,8 @@ def main() -> int:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.core_physics.t0_device import require_cuda_device
+    device = require_cuda_device()
     root = get_project_root()
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
@@ -511,6 +529,7 @@ def main() -> int:
         "vel_decay": continuous_vel_decay_enabled(),
         "flow_feats": flow_feats_enabled(),
         "flow_dynamic": flow_feats_dynamic(),
+        "flow_drop_xy": flow_feats_drop_xy(),
         "geom_feats": geom_feats_enabled(),
         "geom_feats_rich": geom_feats_rich_enabled(),
         "neighbor_commit_gate": continuous_neighbor_commit_gate(),
@@ -563,6 +582,12 @@ def main() -> int:
         "train_t0_caps": {p["anchor"]: int(p["train_t0_max"]) for p in packs},
         "train_t0_min": pushforward_train_t0_min(),
         "arch": pushforward_arch,
+        "leg": str(args.leg).strip() if args.leg else "",
+        "env_overrides": (
+            dict(__import__("src.biochem_gnn.mat_growth_simple", fromlist=["mat_growth_leg_spec"]).mat_growth_leg_spec(str(args.leg).strip()).env_overrides)
+            if (str(args.recipe).strip().lower() == "mat_growth_simple" and str(args.leg).strip())
+            else {}
+        ),
     }
 
     best_score = -1.0
@@ -580,12 +605,20 @@ def main() -> int:
             wins = pack["windows"][:]
             random.shuffle(wins)
             static = pack["static"]
+            # Move static and data to GPU for training
+            static_gpu = {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in static.items()
+            }
+            pack_data_gpu = pack["data"].to(device)
+            train_m_gpu = pack["train_m"].to(device)
+
             for win in wins:
                 win_use = win[: cur_unroll + 1]
-                series = log_series_on_band(pack["data"], win_use, device, static["node_idx"])
+                series = log_series_on_band(pack_data_gpu, win_use, device, static_gpu["node_idx"])
                 speed_series = (
                     band_speed_series(
-                        pack["data"], win_use, device, static["node_idx"], for_training=True
+                        pack_data_gpu, win_use, device, static_gpu["node_idx"], for_training=True
                     )
                     if continuous_vel_decay_enabled()
                     else None
@@ -593,9 +626,9 @@ def main() -> int:
                 physics_ctx = None
                 if physics_on:
                     physics_ctx = build_species_physics_ctx(
-                        pack["data"],
+                        pack_data_gpu,
                         time_window=win_use,
-                        node_idx=static["node_idx"],
+                        node_idx=static_gpu["node_idx"],
                         phys_cfg=pack["phys"],
                         bio_cfg=pack["bio"],
                         device=device,
@@ -611,27 +644,32 @@ def main() -> int:
                 ):
                     log_state0 = rollout_prefix_log_state(
                         model,
-                        pack["data"],
-                        static,
+                        pack_data_gpu,
+                        static_gpu,
                         int(win_use[0]),
                         device,
                     )
+                velocity_series = [pack_data_gpu.y[ti, static_gpu["node_idx"], 0:2] for ti in win_use]
+                species_block_full = [pack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_use]
                 loss, _, _ = unroll_continuous_loss(
                     model,
-                    base_feats=static["base_feats"],
-                    edge_index=static["edge_index"],
+                    base_feats=static_gpu["base_feats"],
+                    edge_index=static_gpu["edge_index"],
                     log_series=series,
-                    train_mask=pack["train_m"],
+                    train_mask=train_m_gpu,
                     log_state0=log_state0,
                     speed_series=speed_series,
                     training=True,
                     physics_ctx=physics_ctx,
                     window_weight=w_t0,
                     tbptt_tail=tbptt_tail_steps(),
-                    pos_band=static.get("pos_band"),
+                    pos_band=static_gpu.get("pos_band"),
                     time_window=win_use,
-                    flow_series=static.get("flow_series"),
-                    flow_cols=static.get("flow_cols"),
+                    flow_series=static_gpu.get("flow_series"),
+                    flow_cols=static_gpu.get("flow_cols"),
+                    wall_mask_band=pack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(pack_data_gpu, "mask_wall") and pack_data_gpu.mask_wall is not None else None,
+                    species_block=species_block_full,
+                    velocity=velocity_series,
                 )
                 if not loss.requires_grad:
                     continue
@@ -641,6 +679,11 @@ def main() -> int:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
                 ep_losses.append(float(loss.item()))
+
+            # Cleanup GPU pack memory
+            del static_gpu, pack_data_gpu, train_m_gpu
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if True:
             h = deploy_horizon_steps()
@@ -658,27 +701,40 @@ def main() -> int:
                     continue
                 win_dep = list(range(0, t_end + 1))
                 static = vpack["static"]
-                series = log_series_on_band(vpack["data"], win_dep, device, static["node_idx"])
+                # Move to GPU for deploy horizon loss
+                static_gpu = {
+                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in static.items()
+                }
+                vpack_data_gpu = vpack["data"].to(device)
+                train_m_gpu = vpack["train_m"].to(device)
+
+                series = log_series_on_band(vpack_data_gpu, win_dep, device, static_gpu["node_idx"])
                 speed_series = band_speed_series(
-                    vpack["data"], win_dep, device, static["node_idx"], for_training=True
+                    vpack_data_gpu, win_dep, device, static_gpu["node_idx"], for_training=True
                 )
                 w_dep = 2.5 if vpack["anchor"] == val_anchor else 1.25
+                velocity_series = [vpack_data_gpu.y[ti, static_gpu["node_idx"], 0:2] for ti in win_dep]
+                species_block_full = [vpack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_dep]
                 loss_dep, _, _ = unroll_continuous_loss(
                     model,
-                    base_feats=static["base_feats"],
-                    edge_index=static["edge_index"],
+                    base_feats=static_gpu["base_feats"],
+                    edge_index=static_gpu["edge_index"],
                     log_series=series,
-                    train_mask=vpack["train_m"],
+                    train_mask=train_m_gpu,
                     log_state0=series[0],
                     speed_series=speed_series,
                     training=True,
                     window_weight=w_dep,
                     tbptt_tail=min(tbptt_tail_steps(), max(5, len(win_dep) // 5)),
                     speed_fp_weight=continuous_speed_fp_weight(),
-                    pos_band=static.get("pos_band"),
+                    pos_band=static_gpu.get("pos_band"),
                     time_window=win_dep,
-                    flow_series=static.get("flow_series"),
-                    flow_cols=static.get("flow_cols"),
+                    flow_series=static_gpu.get("flow_series"),
+                    flow_cols=static_gpu.get("flow_cols"),
+                    wall_mask_band=vpack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(vpack_data_gpu, "mask_wall") and vpack_data_gpu.mask_wall is not None else None,
+                    species_block=species_block_full,
+                    velocity=velocity_series,
                 )
                 if loss_dep.requires_grad:
                     opt.zero_grad(set_to_none=True)
@@ -687,6 +743,8 @@ def main() -> int:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     opt.step()
                     ep_losses.append(float(loss_dep.item()))
+
+                del static_gpu, vpack_data_gpu, train_m_gpu
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -710,36 +768,49 @@ def main() -> int:
         deploy_clot_score = 0.0
         deploy_clot_guiding_mid = 0.0
         with torch.no_grad():
+            # Move val pack to GPU
+            val_static_gpu = {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in val_pack["static"].items()
+            }
+            val_data_gpu = val_pack["data"].to(device)
+            val_m_gpu = val_pack["val_m"].to(device)
+
             for win in val_pack["val_windows"]:
                 static = val_pack["static"]
-                series = log_series_on_band(val_pack["data"], win, device, static["node_idx"])
+                series = log_series_on_band(val_data_gpu, win, device, val_static_gpu["node_idx"])
                 speed_series = (
-                    band_speed_series(val_pack["data"], win, device, static["node_idx"])
+                    band_speed_series(val_data_gpu, win, device, val_static_gpu["node_idx"])
                     if continuous_vel_decay_enabled()
                     else None
                 )
                 physics_ctx = None
                 if physics_on:
                     physics_ctx = build_species_physics_ctx(
-                        val_pack["data"],
+                        val_data_gpu,
                         time_window=win,
-                        node_idx=static["node_idx"],
+                        node_idx=val_static_gpu["node_idx"],
                         phys_cfg=val_pack["phys"],
                         bio_cfg=val_pack["bio"],
                         device=device,
                     )
+                velocity_series = [val_data_gpu.y[ti, val_static_gpu["node_idx"], 0:2] for ti in win]
+                species_block_full = [val_data_gpu.y[ti, val_static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win]
                 m = eval_continuous_window(
                     model,
-                    base_feats=static["base_feats"],
-                    edge_index=static["edge_index"],
+                    base_feats=val_static_gpu["base_feats"],
+                    edge_index=val_static_gpu["edge_index"],
                     log_series=series,
-                    mask=val_pack["val_m"],
+                    mask=val_m_gpu,
                     log_state0=series[0],
                     speed_series=speed_series,
                     physics_ctx=physics_ctx,
                     time_window=win,
-                    flow_series=static.get("flow_series"),
-                    flow_cols=static.get("flow_cols"),
+                    flow_series=val_static_gpu.get("flow_series"),
+                    flow_cols=val_static_gpu.get("flow_cols"),
+                    wall_mask_band=val_data_gpu.mask_wall[val_static_gpu["node_idx"]] if hasattr(val_data_gpu, "mask_wall") and val_data_gpu.mask_wall is not None else None,
+                    species_block=species_block_full,
+                    velocity=velocity_series,
                 )
                 val_state_f1.append(m["final_state_f1"])
                 val_mat_f1.append(m["final_state_mat_f1"])
@@ -749,12 +820,12 @@ def main() -> int:
                 val_pred_delta.append(m["mean_pred_delta"])
                 val_clot_phi_f1.append(m.get("clot_phi_f1", 0.0))
             if True:
-                n_val = int(val_pack["data"].y.shape[0])
+                n_val = int(val_data_gpu.y.shape[0])
                 t_deploy = deploy_eval_time_index(n_val)
                 dep = eval_full_rollout_fimat_f1(
                     model,
-                    val_pack["data"],
-                    val_pack["static"],
+                    val_data_gpu,
+                    val_static_gpu,
                     device,
                     time_index=t_deploy,
                 )
@@ -785,8 +856,8 @@ def main() -> int:
                     for t_clot in clot_times:
                         clf_by_t[int(t_clot)] = eval_deploy_clot_f1(
                             model,
-                            val_pack["data"],
-                            val_pack["static"],
+                            val_data_gpu,
+                            val_static_gpu,
                             val_pack["phys"],
                             val_pack["bio"],
                             device,
@@ -836,8 +907,11 @@ def main() -> int:
                         else:
                             os.environ[k] = v
                     reset_species_rollout_flow_cache()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+
+            # Cleanup GPU val memory
+            del val_static_gpu, val_data_gpu, val_m_gpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         row = {
             "epoch": ep,

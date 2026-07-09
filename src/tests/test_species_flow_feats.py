@@ -13,6 +13,7 @@ from src.core_physics.species_pushforward_gnn import (
     _geometry_band_features,
     _resolve_flow_uv,
     flow_feats_ablate,
+    flow_feats_drop_xy,
     flow_feats_dynamic,
     flow_feats_enabled,
     geom_feats_enabled,
@@ -182,6 +183,27 @@ def test_flow_feats_ablate_flag(monkeypatch):
     assert flow_feats_ablate() is False
     monkeypatch.setenv("SPECIES_FLOW_FEATS_ABLATE", "1")
     assert flow_feats_ablate() is True
+
+
+def test_flow_feats_drop_xy_flag(monkeypatch):
+    monkeypatch.delenv("SPECIES_FLOW_FEATS_DROP_XY", raising=False)
+    assert flow_feats_drop_xy() is False
+    monkeypatch.setenv("SPECIES_FLOW_FEATS_DROP_XY", "1")
+    assert flow_feats_drop_xy() is True
+
+
+def test_flow_band_features_drop_xy_zeros_coordinate_channels(monkeypatch):
+    monkeypatch.setenv("SPECIES_FLOW_FEATS_SOURCE", "gt")
+    monkeypatch.setenv("SPECIES_FLOW_FEATS_DROP_XY", "1")
+    dev = torch.device("cpu")
+    data = _line_graph(dev)
+    node_idx = torch.arange(4, device=dev)
+    feats = _flow_band_features(data, None, dev, node_idx)
+    assert feats.shape == (4, 5)
+    assert torch.allclose(feats[:, 3], torch.zeros(4))
+    assert torch.allclose(feats[:, 4], torch.zeros(4))
+    # dynamic channels remain informative
+    assert float(feats[:, 0].max()) > 0.0
 
 
 class _LeashModel:

@@ -128,7 +128,8 @@ def main() -> int:
     wall_hops = snapshot_wall_hops()
     hidden = snapshot_hidden_dim() if args.hidden is None else max(int(args.hidden), 16)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.core_physics.t0_device import require_cuda_device
+    device = require_cuda_device()
     root = get_project_root()
     graph_dir = root / VesselConfig(phase="biochem_anchors").graph_output_dir
     graph_path = graph_dir / f"{args.anchor.strip()}.pt"

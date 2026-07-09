@@ -113,10 +113,12 @@ def gt_gamma_dot_nd(data, time_index: int, device: torch.device) -> torch.Tensor
     u = y[:, 0]
     v = y[:, 1]
     u_col = u.reshape(-1, 1)
-    du_dx = torch.sparse.mm(data.G_x, u_col).squeeze(1)
-    du_dy = torch.sparse.mm(data.G_y, u_col).squeeze(1)
-    dv_dx = torch.sparse.mm(data.G_x, v.reshape(-1, 1)).squeeze(1)
-    dv_dy = torch.sparse.mm(data.G_y, v.reshape(-1, 1)).squeeze(1)
+    G_x = data.G_x.to(device=device)
+    G_y = data.G_y.to(device=device)
+    du_dx = torch.sparse.mm(G_x, u_col).squeeze(1)
+    du_dy = torch.sparse.mm(G_y, u_col).squeeze(1)
+    dv_dx = torch.sparse.mm(G_x, v.reshape(-1, 1)).squeeze(1)
+    dv_dy = torch.sparse.mm(G_y, v.reshape(-1, 1)).squeeze(1)
     return compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).clamp(min=1e-12)
 
 
@@ -269,6 +271,7 @@ def _graph_dilate(active: torch.Tensor, edge_index: torch.Tensor) -> torch.Tenso
     """One undirected hop on the biochem mesh (``edge_index`` is typically bidirectional)."""
     if not bool(active.any().item()):
         return active
+    edge_index = edge_index.to(device=active.device)
     row, col = edge_index[0], edge_index[1]
     out = active.clone()
     out[row[active[col]]] = True
@@ -477,10 +480,12 @@ def carreau_mu_si_from_uv(
     dtype = torch.float32
     u = u_nd.reshape(-1, 1).to(device=device, dtype=dtype)
     v = v_nd.reshape(-1, 1).to(device=device, dtype=dtype)
-    du_dx = torch.sparse.mm(data.G_x, u)
-    du_dy = torch.sparse.mm(data.G_y, u)
-    dv_dx = torch.sparse.mm(data.G_x, v)
-    dv_dy = torch.sparse.mm(data.G_y, v)
+    G_x = data.G_x.to(device=device)
+    G_y = data.G_y.to(device=device)
+    du_dx = torch.sparse.mm(G_x, u)
+    du_dy = torch.sparse.mm(G_y, u)
+    dv_dx = torch.sparse.mm(G_x, v)
+    dv_dy = torch.sparse.mm(G_y, v)
     gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy)
     mu_inf_nd = phys_cfg.mu_inf / phys_cfg.mu_viscosity_nd_scale
     mu_0_nd = phys_cfg.mu_0 / phys_cfg.mu_viscosity_nd_scale
@@ -498,12 +503,15 @@ def carreau_mu_si_from_uv(
 
 def gamma_dot_nd_graph_from_uv(data, u_nd: torch.Tensor, v_nd: torch.Tensor) -> torch.Tensor:
     """ND shear-rate invariant from sparse WLS gradients on ``u_nd``, ``v_nd``."""
-    u = u_nd.reshape(-1, 1).to(dtype=torch.float32)
-    v = v_nd.reshape(-1, 1).to(dtype=torch.float32)
-    du_dx = torch.sparse.mm(data.G_x, u)
-    du_dy = torch.sparse.mm(data.G_y, u)
-    dv_dx = torch.sparse.mm(data.G_x, v)
-    dv_dy = torch.sparse.mm(data.G_y, v)
+    device = u_nd.device
+    u = u_nd.reshape(-1, 1).to(device=device, dtype=torch.float32)
+    v = v_nd.reshape(-1, 1).to(device=device, dtype=torch.float32)
+    G_x = data.G_x.to(device=device)
+    G_y = data.G_y.to(device=device)
+    du_dx = torch.sparse.mm(G_x, u)
+    du_dy = torch.sparse.mm(G_y, u)
+    dv_dx = torch.sparse.mm(G_x, v)
+    dv_dy = torch.sparse.mm(G_y, v)
     return compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).reshape(-1)
 
 
@@ -1951,10 +1959,12 @@ def node_features_from_gt(
     fi = y_slice[:, 12].to(device=device, dtype=torch.float32)
     mat = y_slice[:, 15].to(device=device, dtype=torch.float32)
     u_col = u.reshape(-1, 1)
-    du_dx = torch.sparse.mm(data.G_x, u_col).squeeze(1)
-    du_dy = torch.sparse.mm(data.G_y, u_col).squeeze(1)
-    dv_dx = torch.sparse.mm(data.G_x, v.reshape(-1, 1)).squeeze(1)
-    dv_dy = torch.sparse.mm(data.G_y, v.reshape(-1, 1)).squeeze(1)
+    G_x = data.G_x.to(device=device)
+    G_y = data.G_y.to(device=device)
+    du_dx = torch.sparse.mm(G_x, u_col).squeeze(1)
+    du_dy = torch.sparse.mm(G_y, u_col).squeeze(1)
+    dv_dx = torch.sparse.mm(G_x, v.reshape(-1, 1)).squeeze(1)
+    dv_dy = torch.sparse.mm(G_y, v.reshape(-1, 1)).squeeze(1)
     gamma = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).clamp(min=1e-8)
     log_g = torch.log10(gamma)
     if clot_phi_minimal_features_enabled():

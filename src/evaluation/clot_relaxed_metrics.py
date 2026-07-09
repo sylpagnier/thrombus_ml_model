@@ -210,13 +210,15 @@ def compute_clot_relaxed_metrics(
     relax_hops: int | None = None,
     f_beta: float | None = None,
     phi_thresh: float = 0.5,
+    wall_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Full-vessel relaxed clot metrics from binary phi masks (entire mesh)."""
     hops = clot_guide_relax_hops() if relax_hops is None else max(int(relax_hops), 0)
     beta = clot_guide_f_beta() if f_beta is None else float(f_beta)
 
-    pred = phi_pred.reshape(-1).to(dtype=torch.float32)
-    gt = phi_gt.reshape(-1).to(dtype=torch.float32)
+    device = phi_pred.device
+    pred = phi_pred.reshape(-1).to(device=device, dtype=torch.float32)
+    gt = phi_gt.reshape(-1).to(device=device, dtype=torch.float32)
     if pred.shape[0] != gt.shape[0]:
         raise ValueError(f"phi_pred length {pred.shape[0]} != phi_gt {gt.shape[0]}")
 
@@ -260,7 +262,7 @@ def compute_clot_relaxed_metrics(
 
     guiding = clot_guiding_score(dilation_iou, relaxed_f_beta)
 
-    return {
+    res = {
         "clot_relaxed_prec": relaxed_prec,
         "clot_relaxed_rec": relaxed_rec,
         "clot_relaxed_f05": f_beta_score(relaxed_prec, relaxed_rec, beta=0.5),
@@ -281,6 +283,34 @@ def compute_clot_relaxed_metrics(
         "pred_pos_frac": _safe_div(float(n_pred), float(pred.numel())),
         "gt_pos_frac": _safe_div(float(n_gt), float(gt.numel())),
     }
+
+    if wall_mask is not None:
+        offwall = ~wall_mask.reshape(-1).to(device=pred_pos.device).bool()
+        n_pred_off = int((pred_pos & offwall).sum().item())
+        n_gt_off = int((gt_pos & offwall).sum().item())
+
+        tp_prec_off = int((pred_pos & gt_dil & offwall).sum().item())
+        tp_rec_off = int((gt_pos & pred_dil & offwall).sum().item())
+
+        relaxed_prec_off = _safe_div(float(tp_prec_off), float(n_pred_off))
+        relaxed_rec_off = _safe_div(float(tp_rec_off), float(n_gt_off))
+        relaxed_f1_off = f_beta_score(relaxed_prec_off, relaxed_rec_off, beta=beta)
+
+        strict_tp_off = int((pred_pos & gt_pos & offwall).sum().item())
+        strict_fp_off = int((pred_pos & ~gt_pos & offwall).sum().item())
+        strict_fn_off = int((~pred_pos & gt_pos & offwall).sum().item())
+        strict_prec_off = _safe_div(float(strict_tp_off), float(strict_tp_off + strict_fp_off))
+        strict_rec_off = _safe_div(float(strict_tp_off), float(strict_tp_off + strict_fn_off))
+        strict_f1_off = f_beta_score(strict_prec_off, strict_rec_off, beta=1.0)
+
+        res["offwall_relaxed_f1"] = relaxed_f1_off
+        res["offwall_strict_f1"] = strict_f1_off
+        res["offwall_relaxed_prec"] = relaxed_prec_off
+        res["offwall_relaxed_rec"] = relaxed_rec_off
+        res["offwall_n_pred"] = float(n_pred_off)
+        res["offwall_n_gt"] = float(n_gt_off)
+
+    return res
 
 
 def compute_clot_relaxed_metrics_full_mesh(
@@ -308,6 +338,12 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
         "clot_guiding": f"{prefix}clot_guiding",
         "clot_iou": f"{prefix}clot_iou",
         "pred_pos_frac": f"{prefix}clot_pred_pos_frac",
+        "offwall_relaxed_f1": f"{prefix}clot_offwall_relaxed_f1",
+        "offwall_strict_f1": f"{prefix}clot_offwall_strict_f1",
+        "offwall_relaxed_prec": f"{prefix}clot_offwall_relaxed_prec",
+        "offwall_relaxed_rec": f"{prefix}clot_offwall_relaxed_rec",
+        "offwall_n_pred": f"{prefix}clot_offwall_n_pred",
+        "offwall_n_gt": f"{prefix}clot_offwall_n_gt",
     }
     for src, dst in mapping.items():
         if src in m:

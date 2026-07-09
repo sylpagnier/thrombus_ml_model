@@ -1224,22 +1224,175 @@ old recall-heavy selection.
 **AB bug (fixed):** `band_log_state_to_species12` hardcoded `STATE_DIM=2`; mat-only is 1-ch.
 Fix in `species_gelation_readout.py` via `pushforward_state_bulk_indices()`.
 
-### 6.20 Promotion candidates (post-triage)
+### 6.20 Promotion candidates (post arch + physics triage)
+
+See **§6.22** for physics-triage winners. Arch-triage (§6.19) still applies for SeedFront
+fallbacks.
 
 | Tier | Leg / combo | Rationale | Next step |
 |------|-------------|-----------|-----------|
-| **A** | `W_mat_flow_stagnation` | Best clot_f1 + best score + low overpaint; matches P at 1/5 budget | **40 ep / all windows** |
-| **B** | `P_mat_plain` under precision-first recipe | Fair head-to-head vs W at same budget + selection | Re-run 20 ep triage or 40 ep full |
-| **C** | `W + frontier` (new leg) | Flow wins growth; SeedFront wins precision -- test `flow_feats + frontier_hops=1` | Wire `WX_mat_flow_frontier` one-off |
-| **D** | `U_mat_frontier_only` | Best precision fallback (clot_score 0.884, over/gt~0) if W over-grows at full budget | Hold as deploy-safe backup |
-| **E** | `N_mat_geom_rich` | Geometry-only control unfinished at full budget | Finish aborted overnight leg |
+| **A** | `W_mat_flow_stagnation` | Best clot_score; stagnation core | **40 ep / all windows** |
+| **A2** | `WC_mat_flow_dynamic` | Best cohort clot_f1 at physics triage | **40 ep** vs W |
+| **B** | `P_mat_plain` under precision-first recipe | Full-budget control | 40 ep |
+| **C** | `U_mat_frontier_only` | Precision fallback (clot_score 0.884, over/gt~0) | Hold if W over-grows |
+| **D** | `N_mat_geom_rich` | Geometry-only unfinished at full budget | Finish aborted leg |
 
-**Deprioritize:** X, Y, S, V, AB (unless gelation weights retuned), Q/R (subsumed by T).
+**Deprioritize:** X, Y, S, V, AB, **WD**, **WG**, WH alone, WX (frontier without top-k seed).
 
-**Suggested overnight queue:**
-1. `W` full budget (primary)
-2. `P` full budget with precision-first recipe (control)
-3. Optional `WX` or `W+frontier_hops=1` triage if W full-budget overpaint rises
+### 6.21 W-physics triage ladder (DESIGN 2026-06-26; ~6h GPU)
+
+**Thesis:** W won because stagnation flow feats encode the dominant COMSOL deposition gate
+(`sr<lss`, ~80%). The missing physics for full Mat growth is **autocatalysis** (~90% of
+`dMat/dt`), **activation/AP**, **vessel geometry**, and **time-varying diverted flow**. Each
+new leg keeps the W base (`SPECIES_FLOW_FEATS=1`) and adds **one deployable channel** mapped
+to a COMSOL term.
+
+| Leg | COMSOL mechanism | Added channel / knob |
+|-----|------------------|----------------------|
+| `W` (control) | stagnation gate | baseline flow feats |
+| `WA` | `k_aa·(Mas/Minf)·AP` autocatalysis | neighbor commit gate on spatial head |
+| `WB` | wall geometry / `L` | `SPECIES_GEOM_FEATS_RICH` (width, expansion, curvature) |
+| `WC` | flow diversion as clot grows | `SPECIES_FLOW_FEATS_DYNAMIC` |
+| `WD` | committed-neighbor growth topology | `frontier_hops=1`, `nucleation_topk=0` (not X) |
+| `WE` | AP / thrombin activation field | co-predict Mat+thrombin `[11,5]` |
+| `WF` | FG precursor / reaction-active | co-predict Mat+FG `[11,7]` |
+| `WG` | autocat + weak deposition boost | WA + underpred/crit focus (J recipe) |
+| `WH` | `mu1(Mat)` gelation feedback | light physics readout (phi=0.25, mu=0.05) |
+| `WI` | stagnation + autocat + shape | neighbor gate + rich geom |
+| `WJ` | max deployable bundle | gate + geom + dynamic flow |
+
+**Not in ladder (known bad / oracle-only):** graph `dsrx` separation gate; FI channel; full
+`AB` gelation weights; SeedFront top-k + flow (X anti-synergy).
+
+**Launcher:** `scripts/go_mat_physics_triage.ps1 -Fresh` (10 legs, ~4.7h) or `-IncludeControl`
+(11 legs with W, ~5.5h). Summary: `outputs/biochem/biochem_gnn/mat_physics_triage/`.
+
+**Promote rule:** beat W `deploy_clot_f1` (0.764 triage) with `over/gt <= 0.02`; prefer legs
+that add autocatalysis (WA/WG/WI) or activation (WE/WF) without AB-level overpaint.
+
+### 6.22 W-physics triage results (2026-06-26; 11/11 legs complete)
+
+**Budget:** same as §6.19 (20 ep / ES 12 / max_windows 64 / precision-first). ~28 min/leg,
+~5.1 h total with `-IncludeControl`. Summary:
+`outputs/biochem/biochem_gnn/mat_physics_triage/mat_physics_triage_summary.json`.
+
+**Baseline in compare:** locked fi_mat cohort mean **clot_f1=0.634**, **mat_f1=0.702**.
+
+| Leg | clot_f1 | d_clot | clot_score | mat_f1 | seedP | frontP | speed | over/gt |
+|-----|--------:|-------:|-----------:|-------:|------:|-------:|------:|--------:|
+| **WC_mat_flow_dynamic** | **0.772** | **+0.138** | 0.927 | 0.671 | 1.00 | 0.98 | 0.53 | **0.01** |
+| **W_mat_flow_stagnation** | 0.771 | +0.136 | **0.976** | 0.619 | 1.00 | 0.97 | 0.48 | **0.01** |
+| WF_mat_flow_fg | 0.767 | +0.133 | 0.947 | 0.637 | 1.00 | 0.99 | 0.49 | **0.00** |
+| WA_mat_flow_neighbor_gate | 0.761 | +0.127 | 0.915 | 0.638 | 1.00 | 0.93 | 0.54 | 0.04 |
+| WJ_mat_flow_stack | 0.757 | +0.117 | 0.915 | 0.660 | 1.00 | 0.98 | 0.51 | 0.01 |
+| WI_mat_flow_neighbor_geom | 0.750 | +0.109 | 0.915 | 0.644 | 1.00 | 0.96 | 0.52 | 0.02 |
+| WH_mat_flow_gelation_light | 0.745 | +0.111 | 0.878 | 0.676 | 1.00 | 0.95 | 0.56 | 0.03 |
+| WB_mat_flow_geom_rich | 0.734 | +0.094 | 0.863 | 0.695 | 1.00 | 0.95 | 0.59 | 0.04 |
+| WE_mat_flow_thrombin | 0.731 | +0.096 | 0.937 | 0.617 | 0.97 | 0.99 | 0.47 | 0.01 |
+| WG_mat_flow_neighbor_crit | 0.712 | +0.078 | 0.809 | **0.791** | 1.00 | 0.97 | **0.70** | 0.02 |
+| WD_mat_flow_frontier | 0.001 | +0.000 | 0.004 | 0.000 | 0.00 | 0.00 | 0.00 | 0.00 |
+
+**Headline:** **No leg beats W on checkpoint selection (`clot_score`).** `WC` edges W on
+cohort `clot_f1` (+0.001 vs this W re-run; +0.008 vs §6.19 W **0.764**) but trades
+precision score (0.927 vs **0.976**). All W-family legs beat locked fi_mat by **+0.08–0.14**
+clot_f1 with low overpaint except WA/WB (over/gt ~0.04).
+
+**Physics-channel lessons:**
+1. **Stagnation alone is still the lever** — COMSOL extensions are incremental, not breakthrough,
+   at 20 ep / 64 windows.
+2. **Dynamic flow (WC)** — best raw clot_f1; worth **40 ep** alongside W; eval uses static kine
+   flow at deploy (train/eval gap on per-step splice).
+3. **Autocatalysis proxy (WA/WI/WJ)** — +0.10–0.13 vs baseline but **below W**; neighbor gate
+   without underpred boost is not enough.
+4. **WG (autocat + underpred/crit)** — inflates **mat_f1** (0.791) and front speed (0.70) but
+   **hurts clot_score** (0.809) — recall-heavy, precision-first selection correctly rejects.
+5. **Co-state (WE/WF)** — FG path (WF) slightly cleaner than thrombin; neither beats W.
+6. **Light gelation (WH)** — trains (`clot_phi_f1~0.60` on val); deploy clot below W; no AB-style
+   overpaint (over/gt 0.03).
+7. **Rich geom alone (WB)** — helps **mat_f1** (+0.07 vs W) but weakest clot_f1 in family.
+8. **WD frontier-only** — **total failure** (deploy_mat_t=0 every epoch): cold-start with
+   `nucleation_topk=0` blocks all growth from resting IC — **do not promote**; any frontier
+   hybrid must keep top-k seed or teacher init.
+
+**Updated promotion (post-physics triage):**
+
+| Tier | Leg | Rationale | Next step |
+|------|-----|-----------|-----------|
+| **A** | `W_mat_flow_stagnation` | Best **clot_score** (0.976); stable vs §6.19 | **40 ep / all windows** |
+| **A2** | `WC_mat_flow_dynamic` | Best cohort **clot_f1** (0.772); low overpaint | **40 ep** head-to-head vs W |
+| **B** | `WF_mat_flow_fg` | Best co-state; over/gt **0.003** | Optional 40 ep if WC/W tie |
+| **Hold** | `WI` / `WJ` | Stack ≈ WA alone; no score gain | Skip unless WC/W fail at full budget |
+| **Kill** | `WD_mat_flow_frontier` | Zero deploy growth | Do not re-run without nucleation seed |
+
+**Deprioritize:** WG (mat recall without clot gain), WH (gelation aux marginal), WB/WE alone.
+
+**Suggested overnight queue (wired):**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_mat_w_wc_p_full.ps1 -Fresh
+```
+
+Runs `W_mat_flow_stagnation`, `WC_mat_flow_dynamic`, `P_mat_plain` at 40 ep / all windows (~12 h cap).
+Summary + winner: `outputs/biochem/biochem_gnn/mat_w_wc_p_full/mat_w_wc_p_full_summary.json`.
+Promote when `over/gt <= 0.02` and leg wins on `clot_score` then `clot_f1`.
+
+### 6.23 W/WC/P full-budget results (2026-06-29; 3/3 legs complete)
+
+Summary: `outputs/biochem/biochem_gnn/mat_w_wc_p_full/mat_w_wc_p_full_summary.json`
+
+| Leg | clot_f1 | d vs fi_mat | clot_score | over/gt | frontP | speed |
+|-----|--------:|-------------:|-----------:|--------:|-------:|------:|
+| **W_mat_flow_stagnation** | 0.792 | +0.158 | **0.981** | 0.002 | 0.995 | 0.47 |
+| WC_mat_flow_dynamic | **0.800** | +0.166 | 0.978 | 0.003 | 0.990 | 0.48 |
+| P_mat_plain | 0.798 | +0.164 | 0.946 | 0.004 | 0.991 | 0.50 |
+| locked fi_mat | 0.634 | — | 0.624 | 0.276 | 0.732 | 0.93 |
+
+**Decision:** **Promote `W_mat_flow_stagnation`** as canonical Mat deploy leg (best clot_score under
+pick rule; over/gt ~0). **WC** is optional F1 backup (+0.008 cohort F1, -0.003 score). **P** proves
+flow is not required for near-top clot maps under precision-first training.
+
+**vs triage (20 ep):** full budget lifts all legs ~+0.02 clot_f1; WC dynamic-flow gap vs W on score
+**closed** (0.927 -> 0.978) but W still leads selection.
+
+**Next:** cross-patient viz on W ckpt; hold WF only if W over-grows on weak anchors; wire dynamic
+`flow_series` into deploy eval before re-testing WC.
+
+### 6.24 W-fix sweep — FP timeline levers (2026-07-01; 8/9 legs)
+
+Launcher: `scripts/go_mat_w_fix_sweep_10h.ps1`. Summary:
+`outputs/biochem/biochem_gnn/mat_w_fix_sweep_10h/mat_w_fix_sweep_10h_summary.json`.
+
+| Lever tested | Leg(s) | Verdict |
+|--------------|--------|---------|
+| Dynamic flow | **WC** | **Best FP profile** among high-F1 legs (medFP 14, p90 34); F1 **0.803** |
+| Drop flow x/y | WK, WL | No FP gain; hurts score |
+| Tight FP loss | WL, (WM skipped) | WL did not beat W on medFP |
+| Seed-front | X, Y | **Undergrowth** (F1 0.42-0.50); low FP, high FN |
+| Neighbor+crit | WG | High mat_f1, low clot_f1 |
+| Full stack | WJ | Lowest medFP (9) but F1 0.757 |
+
+**Takeaway:** stagnation **score** winner remains **W**; stagnation **timeline-FP** winner is
+**WC**. Seed-front and dropxy-only are deprioritized. **Superseded by §6.25** (40 ep canonical).
+
+### 6.25 W/WC canonical baseline (2026-07-02; 2/2 legs)
+
+Launcher: `scripts/go_mat_w_wc_canonical.ps1 -Fresh`. Summary:
+`outputs/biochem/biochem_gnn/mat_w_wc_canonical/mat_w_wc_canonical_summary.json`.
+
+| Leg | clot_f1 | score | medFP | p90FP | medFN | over/gt |
+|-----|--------:|------:|------:|------:|------:|--------:|
+| W_mat_flow_stagnation | **0.795** | 0.921 | 56 | 99 | **5** | 0.01 |
+| **WC_mat_flow_dynamic** | 0.789 | **0.947** | **12** | **36** | 6 | **0.00** |
+
+**Decision:** **Promote `WC_mat_flow_dynamic`** as canonical Mat deploy (FP-aware pick + WC
+tie-break within F1 **0.008**). W retains cohort F1 edge **+0.006** but **2-3x worse** timeline FP
+at full budget; June §6.23 W promote is **retired** for deploy.
+
+**vs W-fix 28 ep:** W full-budget **worsens** FP (medFP 35→56); WC **stable** (14→12). Dynamic
+flow is not optional for inlet-blob control.
+
+**Promote:** `go_mat_w_wc_canonical.ps1 -EvalOnly -Promote` →
+`outputs/biochem/biochem_gnn/mat_canonical_deploy/species/best.pth`.
 
 ## 7. Open questions / before promoting
 - Confirm the Mat/AP-only path generalizes across patients (p007 -> others) before

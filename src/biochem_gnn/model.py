@@ -356,6 +356,15 @@ class BiochemDeployStack:
             meta={"decoupled": True, "pin_other_species": pin},
         )
 
+def recompute_sdf_euclidean(pos: torch.Tensor, new_wall_mask: torch.Tensor) -> torch.Tensor:
+    wall_pos = pos[new_wall_mask]
+    if wall_pos.size(0) == 0:
+        return torch.full((pos.size(0),), 99.0, device=pos.device, dtype=pos.dtype)
+    dist = torch.cdist(pos.unsqueeze(0), wall_pos.unsqueeze(0)).squeeze(0)
+    min_dist, _ = dist.min(dim=1)
+    return min_dist
+
+
     @torch.no_grad()
     def _rollout_coupled(
         self,
@@ -373,6 +382,11 @@ class BiochemDeployStack:
         n_steps = int(data.y.shape[0])
         gel_beta = self._gelation_beta()
         vel_alphas = model_vel_decay_alphas(model) if continuous_vel_decay_enabled() else None
+
+        # Backup original wall mask to restore after rollout
+        orig_mask_wall = getattr(data, "mask_wall", None)
+        if orig_mask_wall is not None:
+            data.mask_wall = orig_mask_wall.clone()
 
         prev_vel = os.environ.get("CLOT_TEMPORAL_VEL_SOURCE")
         os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "coupled"
@@ -433,20 +447,58 @@ class BiochemDeployStack:
                     phi_by_t[t] = phi
                     mu_by_t[t] = step.mu_pred_si
 
-                    if corrector is not None:
-                        # Frozen base flow + local diversion patch around clot nodes
-                        # (cheap, anisotropic) instead of a full global flow re-solve.
-                        u_next, v_next = self._apply_local_corrector(
-                            corrector, data, step.mu_pred_si, u0, v0
-                        )
+                    clotted = (phi.reshape(-1) >= 0.5)
+                    if os.environ.get("SPECIES_DYNAMIC_OCCLUSION") == "1":
+                        # 2. Append clotted nodes to wall mask
+                        if hasattr(data, "mask_wall") and data.mask_wall is not None:
+                            data.mask_wall = data.mask_wall.bool() | clotted
+                        
+                        # 3. Recompute SDF and update in data and stat.base_feats
+                        from src.config import NodeFeat
+                        new_sdf = recompute_sdf_euclidean(data.x[:, :2], data.mask_wall)
+                        data.x[:, NodeFeat.SDF.start] = new_sdf.to(dtype=data.x.dtype)
+                        
+                        latent_dim = int(getattr(model, "kin_latent_dim", 0) or 0)
+                        stat.base_feats[:, latent_dim] = new_sdf[stat.node_idx].to(dtype=stat.base_feats.dtype)
+                        
+                        # 4. Periodically trigger GINO-DEQ flow re-solve
+                        if t % 5 == 0:
+                            u_next, v_next = kine.uv_nd_from_mu_si(data, step.mu_pred_si)
+                        else:
+                            u_next, v_next = u0.clone(), v0.clone()
+                        
+                        # Zero out velocities at clotted nodes
+                        u_next[clotted] = 0.0
+                        v_next[clotted] = 0.0
+                        
+                        # Recompute flow features and update stat.base_feats
+                        from src.core_physics.species_pushforward_gnn import _flow_feats_from_uv
+                        new_flow = _flow_feats_from_uv(data, u_next, v_next, self.device, stat.node_idx)
+                        flow_start = latent_dim + 1
+                        flow_width = new_flow.shape[1]
+                        stat.base_feats[:, flow_start : flow_start + flow_width] = new_flow.to(dtype=stat.base_feats.dtype)
                     else:
-                        u_next, v_next = kine.uv_nd_from_mu_si(data, step.mu_pred_si)
+                        if corrector is not None:
+                            u_next, v_next = self._apply_local_corrector(
+                                corrector, data, step.mu_pred_si, u0, v0
+                            )
+                        else:
+                            u_next, v_next = kine.uv_nd_from_mu_si(data, step.mu_pred_si)
+                    
                     set_coupled_uv_cache(data, u_next, v_next)
+                    u0, v0 = u_next, v_next
 
                     if t >= n_steps - 1:
                         break
                     pred_delta = predict_continuous_step_delta(
-                        model, stat.base_feats, stat.edge_index, log_state, training=False
+                        model,
+                        stat.base_feats,
+                        stat.edge_index,
+                        log_state,
+                        training=False,
+                        wall_mask_band=(data.mask_wall[stat.node_idx] if hasattr(data, "mask_wall") and data.mask_wall is not None else None),
+                        species_block=sp,
+                        velocity=torch.stack([u_next[stat.node_idx], v_next[stat.node_idx]], dim=1),
                     )
                     spd = (
                         band_speed_from_uv(u_next, v_next, stat.node_idx)

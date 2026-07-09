@@ -10,7 +10,6 @@
 #   powershell ... -File .\scripts\go_mat_growth_ladder.ps1 -Fresh
 
 param(
-    [ValidateSet("A_random", "B_backbone", "C_geom", "D_parity_single", "E_dual_mat", "F_single_fimat", "G_dual_mat_neighbor_gate", "H_dual_mat_crit_focus", "I_dual_fimat_fi_aux", "J_dual_mat_neighbor_crit", "K_fimat_neighbor_gate", "L_fimat_geom_rich", "M_fimat_neighbor_geom_rich", "N_mat_geom_rich", "O_mat_neighbor_geom_rich", "P_mat_plain", "Q_mat_gate_sharp_fp", "R_mat_geom_gate_sharp_fp", "U_mat_frontier_only", "V_mat_frontier_geom", "W_mat_flow_stagnation", "X_mat_flow_seedfront", "Y_mat_tight_seed", "AB_mat_gelation_aux", "S_mat_frontier_nuc", "T_mat_frontier_sharp", "")]
     [string] $Leg = "",
     [int] $Epochs = 50,
     [int] $EarlyStop = 35,
@@ -92,10 +91,14 @@ if (-not $EvalOnly) {
     Invoke-PythonRcCheck -Label "mat_growth $Leg train" -PyArgs $pyArgs
 }
 
-Invoke-PythonRcCheck -Label "mat_growth $Leg eval" -PyArgs @(
-    "scripts/eval_mat_growth_simple.py",
-    "--ckpt", $Ckpt,
-    "--out", $CompareJson
-)
+    $evalArgs = @(
+        "scripts/eval_mat_growth_simple.py",
+        "--ckpt", $Ckpt,
+        "--out", $CompareJson
+    )
+    if ($Fast) {
+        $evalArgs += @("--anchors", $ValAnchor)
+    }
+    Invoke-PythonRcCheck -Label "mat_growth $Leg eval" -PyArgs $evalArgs
 
 Write-Host "[OK] leg=$Leg ckpt=$Ckpt compare=$CompareJson" -ForegroundColor Green

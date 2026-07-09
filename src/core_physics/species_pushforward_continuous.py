@@ -256,6 +256,16 @@ def saturation_headroom_scale() -> float:
         return 80.0
 
 
+def saturation_headroom_scale_offwall() -> float:
+    raw = os.environ.get("SPECIES_CONTINUOUS_SATURATION_SCALE_OFFWALL")
+    if raw is None:
+        return saturation_headroom_scale()
+    try:
+        return max(float(raw.strip()), 1.0)
+    except ValueError:
+        return saturation_headroom_scale()
+
+
 def mature_clot_frac() -> float:
     raw = (os.environ.get("SPECIES_CONTINUOUS_MATURE_FRAC") or "0.95").strip()
     try:
@@ -812,9 +822,39 @@ def build_continuous_step_features(
     *,
     training: bool = True,
     time_index: int | None = None,
+    velocity: torch.Tensor | None = None,
+    pos_band: torch.Tensor | None = None,
+    edge_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     state_norm = normalize_log_state(log_state)
     state_in = maybe_noise_log_state(state_norm, training=training)
+    
+    if os.environ.get("SPECIES_CONVECTION_AGGR") == "1" and velocity is not None and pos_band is not None and edge_index is not None:
+        mat_idx = _ch_mat()
+        if mat_idx is not None and 0 <= mat_idx < state_in.shape[1]:
+            row, col = edge_index
+            vel_from = velocity[row]  # [E, 2]
+            dx = pos_band[col, 0] - pos_band[row, 0]
+            dy = pos_band[col, 1] - pos_band[row, 1]
+            alignment = vel_from[:, 0] * dx + vel_from[:, 1] * dy
+            weight = F.relu(alignment)  # [E]
+            
+            mat_val = state_in[:, mat_idx]  # [n]
+            mat_from = mat_val[row]  # [E]
+            
+            num_nodes = state_in.shape[0]
+            accum = torch.zeros(num_nodes, device=state_in.device, dtype=state_in.dtype)
+            accum.scatter_add_(0, col, weight * mat_from)
+            
+            sum_w = torch.zeros(num_nodes, device=state_in.device, dtype=state_in.dtype)
+            sum_w.scatter_add_(0, col, weight)
+            
+            upwind_mat = accum / (sum_w + 1e-6)
+            
+            state_in = state_in.clone()
+            alpha = float(os.environ.get("SPECIES_CONVECTION_ALPHA", "0.5"))
+            state_in[:, mat_idx] = (1 - alpha) * state_in[:, mat_idx] + alpha * upwind_mat
+
     feats = torch.cat([base_feats, state_in], dim=-1)
     if continuous_saturation_gate():
         feats = torch.cat([feats, saturation_ratio_features(log_state)], dim=-1)
@@ -840,12 +880,21 @@ def align_continuous_feature_dim(feats: torch.Tensor, model: nn.Module) -> torch
 def apply_magnitude_headroom_clamp(
     magnitude: torch.Tensor,
     log_state: torch.Tensor,
+    wall_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Differentiable soft-clamp: crush delta when near species saturation ceiling."""
     st = log_state.reshape(-1, _sd())
     maxes = continuous_max_sat_log_vec(st.device, st.dtype)
     margin = maxes.unsqueeze(0) - st
-    scale = saturation_headroom_scale()
+    scale_wall = saturation_headroom_scale()
+    scale_offwall = saturation_headroom_scale_offwall()
+
+    if wall_mask is not None and scale_wall != scale_offwall:
+        w_mask = wall_mask.reshape(-1, 1).bool()
+        scale = torch.where(w_mask, scale_wall, scale_offwall)
+    else:
+        scale = scale_wall
+
     headroom = F.softplus(margin * scale) * continuous_delta_out_scale()
     return torch.minimum(magnitude.reshape(-1, _sd()), headroom)
 
@@ -911,6 +960,7 @@ def continuous_delta_loss(
     beta: float | None = None,
     channel_weight: tuple[float, float] | None = None,
     current_log_state: torch.Tensor | None = None,
+    fp_weight_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Delta step loss inside deployable ceiling ``mask`` (wall + hops, not GT clot)."""
     m = mask.reshape(-1).to(device=pred_delta.device).bool()
@@ -919,7 +969,13 @@ def continuous_delta_loss(
     if continuous_growth_only_loss():
         if not step_has_growth_supervision(tgt_delta, m):
             return None
-        loss = _growth_huber()(pred_delta, tgt_delta, m, current_log_state=current_log_state)
+        loss = _growth_huber()(
+            pred_delta,
+            tgt_delta,
+            m,
+            current_log_state=current_log_state,
+            fp_weight_scale=fp_weight_scale,
+        )
         return loss * continuous_loss_scale()
     b = continuous_huber_beta() if beta is None else float(beta)
     p = pred_delta[m]
@@ -1162,6 +1218,35 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                     nn.init.xavier_uniform_(m.weight, gain=0.5)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+
+        self.spatial_gate_heads = os.environ.get("SPECIES_SPATIAL_GATE_HEADS") == "1"
+        if self.spatial_gate_heads:
+            self.spatial_head_wall = nn.Sequential(
+                nn.Linear(gate_in, h),
+                nn.ReLU(),
+                nn.Linear(h, od),
+            )
+            self.magnitude_head_wall = nn.Sequential(
+                nn.Linear(fused, h),
+                nn.ReLU(),
+                nn.Linear(h, od),
+            )
+            self.spatial_head_offwall = nn.Sequential(
+                nn.Linear(gate_in, h),
+                nn.ReLU(),
+                nn.Linear(h, od),
+            )
+            self.magnitude_head_offwall = nn.Sequential(
+                nn.Linear(fused, h),
+                nn.ReLU(),
+                nn.Linear(h, od),
+            )
+            for head in (self.spatial_head_wall, self.magnitude_head_wall, self.spatial_head_offwall, self.magnitude_head_offwall):
+                for m in head.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight, gain=0.5)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
         self.temporal_gate: nn.Sequential | None = None
         if continuous_temporal_gate():
             self.temporal_gate = nn.Sequential(
@@ -1240,6 +1325,57 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
             k = min(max(int(math.ceil(topk * n)), 1), n)
             thr = torch.topk(logit_col, k).values.min()
             allowed = allowed | (logit_col >= thr)
+
+        # Physics-inspired nucleation prior for Hop >= 2 nodes
+        if os.environ.get("SPECIES_PHYSICS_NUCLEATION") == "1" and getattr(self, "velocity", None) is not None:
+            u = self.velocity[:, 0].to(device=dev, dtype=dt)
+            v = self.velocity[:, 1].to(device=dev, dtype=dt)
+            speed = torch.sqrt(u * u + v * v)
+
+            # BFS to compute hops from wall
+            hops = torch.full((n,), -1, dtype=torch.long, device=dev)
+            wall_m = getattr(self, "wall_mask_band", None)
+            if wall_m is not None:
+                wall_m = wall_m.to(device=dev).bool()
+                hops[wall_m] = 0
+                row, col = edge_index
+                current_mask = wall_m.clone()
+                current_hop = 0
+                while True:
+                    neighbor_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+                    neighbor_mask[col[current_mask[row]]] = True
+                    next_mask = neighbor_mask & (hops == -1)
+                    if not next_mask.any():
+                        break
+                    current_hop += 1
+                    hops[next_mask] = current_hop
+                    current_mask = next_mask
+            hops[hops == -1] = 99
+
+            # Compute shear proxy
+            pos_b = getattr(self, "pos_band", None)
+            if pos_b is not None:
+                pos = pos_b.to(device=dev, dtype=dt)
+                row, col = edge_index
+                diff = pos[row] - pos[col]
+                dist = diff.norm(dim=1).clamp(min=1e-6)
+                grad = (speed[row] - speed[col]).abs() / dist
+                deg = torch.zeros(n, device=dev, dtype=dt)
+                deg.index_add_(0, row, torch.ones_like(grad))
+                acc_g = torch.zeros(n, device=dev, dtype=dt)
+                acc_g.index_add_(0, row, grad)
+                shear_proxy = acc_g / deg.clamp(min=1.0)
+
+                speed_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SPEED_THRESH", "0.15"))
+                shear_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SHEAR_THRESH", "0.20"))
+
+                stagnant = speed < speed_thresh
+                low_shear = shear_proxy < shear_thresh
+                off_wall = hops >= 2
+
+                physics_eligible = stagnant & low_shear & off_wall
+                allowed = allowed | physics_eligible
+
         return allowed.to(dtype=dt).unsqueeze(-1).detach()
 
     def temporal_lambda_from_state(self, log_state: torch.Tensor) -> torch.Tensor:
@@ -1250,6 +1386,15 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
         raw = self.temporal_gate(feat).squeeze()
         lo, hi = temporal_lambda_bounds()
         return lo + torch.sigmoid(raw) * (hi - lo)
+
+    def _get_sdf_band(self) -> torch.Tensor | None:
+        if getattr(self, "pos_band", None) is not None and getattr(self, "wall_mask_band", None) is not None:
+            wall_pos = self.pos_band[self.wall_mask_band.bool()]
+            if wall_pos.numel() > 0:
+                dists = torch.cdist(self.pos_band.unsqueeze(0), wall_pos.unsqueeze(0)).squeeze(0)
+                sdf, _ = dists.min(dim=1)
+                return sdf
+        return None
 
     def forward_decoupled(
         self,
@@ -1263,23 +1408,86 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
         spatial_in = h_fused
         if continuous_neighbor_commit_gate() and log_state is not None:
             spatial_in = torch.cat([h_fused, self._neighbor_commit_feature(log_state, edge_index)], dim=-1)
-        spatial_logits = self.spatial_head(spatial_in)
-        gate_temp = continuous_gate_temp()
-        spatial_gate = torch.sigmoid(spatial_logits / gate_temp if gate_temp != 1.0 else spatial_logits)
-        if continuous_frontier_hops() > 0 and log_state is not None:
-            # Sparse nucleation + slow front: growth only at the predicted-committed frontier or a
-            # model-confidence seed (deployable; no GT). Suppresses arbitrary wall over-paint.
-            spatial_gate = spatial_gate * self._frontier_nucleation_mask(
-                spatial_logits, log_state, edge_index
-            )
-        mag_raw = self.magnitude_head(h_fused)
-        magnitude = F.softplus(mag_raw, beta=continuous_delta_softplus_beta()) * continuous_delta_out_scale()
-        if continuous_saturation_gate() and log_state is not None:
-            magnitude = apply_magnitude_headroom_clamp(magnitude, log_state)
-        if continuous_temporal_gate() and log_state is not None and self.temporal_gate is not None:
-            lam = self.temporal_lambda_from_state(log_state)
-            magnitude = magnitude * lam
-        pred_delta = spatial_gate * magnitude
+
+        if getattr(self, "spatial_gate_heads", False):
+            # Wall Spatial and Magnitude
+            spatial_logits_wall = self.spatial_head_wall(spatial_in)
+            gate_temp = continuous_gate_temp()
+            spatial_gate_wall = torch.sigmoid(spatial_logits_wall / gate_temp if gate_temp != 1.0 else spatial_logits_wall)
+            if continuous_frontier_hops() > 0 and log_state is not None:
+                spatial_gate_wall = spatial_gate_wall * self._frontier_nucleation_mask(
+                    spatial_logits_wall, log_state, edge_index
+                )
+            if os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1" and log_state is not None:
+                wall_m = getattr(self, "wall_mask_band", None)
+                if wall_m is not None:
+                    wall_m = wall_m.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
+                    st = log_state.reshape(-1, _sd())
+                    midx = _local_bulk_index(MAT_CHANNEL)
+                    if midx is not None and 0 <= midx < int(st.shape[1]):
+                        committed = (st[:, midx] > continuous_mat_commit_thresh()).reshape(-1).bool()
+                        from src.core_physics.clot_growth_masks import graph_dilate_hops
+                        neighbor = graph_dilate_hops(committed, edge_index, 1).to(device=x.device)
+                        allowed = (wall_m.reshape(-1).bool() | neighbor).to(dtype=x.dtype).unsqueeze(-1)
+                        spatial_gate_wall = spatial_gate_wall * allowed
+            mag_raw_wall = self.magnitude_head_wall(h_fused)
+            magnitude_wall = F.softplus(mag_raw_wall, beta=continuous_delta_softplus_beta()) * continuous_delta_out_scale()
+            if continuous_saturation_gate() and log_state is not None:
+                wall_m = getattr(self, "wall_mask_band", None)
+                magnitude_wall = apply_magnitude_headroom_clamp(magnitude_wall, log_state, wall_mask=wall_m)
+            pred_delta_wall = spatial_gate_wall * magnitude_wall
+
+            # Off-wall Spatial and Magnitude
+            spatial_logits_offwall = self.spatial_head_offwall(spatial_in)
+            spatial_gate_offwall = torch.sigmoid(spatial_logits_offwall / gate_temp if gate_temp != 1.0 else spatial_logits_offwall)
+            mag_raw_offwall = self.magnitude_head_offwall(h_fused)
+            magnitude_offwall = F.softplus(mag_raw_offwall, beta=continuous_delta_softplus_beta()) * continuous_delta_out_scale()
+            if continuous_saturation_gate() and log_state is not None:
+                magnitude_offwall = apply_magnitude_headroom_clamp(magnitude_offwall, log_state, wall_mask=None)
+            pred_delta_offwall = spatial_gate_offwall * magnitude_offwall
+
+            sdf = self._get_sdf_band()
+            if sdf is not None:
+                sdf_crit = float(os.environ.get("SPECIES_GATE_SDF_CRIT", "0.012"))
+                sdf_temp = float(os.environ.get("SPECIES_GATE_SDF_TEMP", "0.003"))
+                gate = torch.sigmoid((sdf - sdf_crit) / max(sdf_temp, 1e-5)).unsqueeze(-1)
+                pred_delta = gate * pred_delta_offwall + (1.0 - gate) * pred_delta_wall
+                spatial_logits = spatial_logits_offwall
+                magnitude = magnitude_offwall
+            else:
+                pred_delta = pred_delta_wall
+                spatial_logits = spatial_logits_wall
+                magnitude = magnitude_wall
+        else:
+            spatial_logits = self.spatial_head(spatial_in)
+            gate_temp = continuous_gate_temp()
+            spatial_gate = torch.sigmoid(spatial_logits / gate_temp if gate_temp != 1.0 else spatial_logits)
+            if continuous_frontier_hops() > 0 and log_state is not None:
+                spatial_gate = spatial_gate * self._frontier_nucleation_mask(
+                    spatial_logits, log_state, edge_index
+                )
+            if os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1" and log_state is not None:
+                wall_m = getattr(self, "wall_mask_band", None)
+                if wall_m is not None:
+                    wall_m = wall_m.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
+                    st = log_state.reshape(-1, _sd())
+                    midx = _local_bulk_index(MAT_CHANNEL)
+                    if midx is not None and 0 <= midx < int(st.shape[1]):
+                        committed = (st[:, midx] > continuous_mat_commit_thresh()).reshape(-1).bool()
+                        from src.core_physics.clot_growth_masks import graph_dilate_hops
+                        neighbor = graph_dilate_hops(committed, edge_index, 1).to(device=x.device)
+                        allowed = (wall_m.reshape(-1).bool() | neighbor).to(dtype=x.dtype).unsqueeze(-1)
+                        spatial_gate = spatial_gate * allowed
+            mag_raw = self.magnitude_head(h_fused)
+            magnitude = F.softplus(mag_raw, beta=continuous_delta_softplus_beta()) * continuous_delta_out_scale()
+            if continuous_saturation_gate() and log_state is not None:
+                wall_m = getattr(self, "wall_mask_band", None)
+                magnitude = apply_magnitude_headroom_clamp(magnitude, log_state, wall_mask=wall_m)
+            if continuous_temporal_gate() and log_state is not None and self.temporal_gate is not None:
+                lam = self.temporal_lambda_from_state(log_state)
+                magnitude = magnitude * lam
+            pred_delta = spatial_gate * magnitude
+
         if self.delta_residual is not None:
             alpha = continuous_delta_residual_alpha()
             pred_delta = pred_delta + alpha * self.delta_residual(h_fused)
@@ -1288,6 +1496,60 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
             pred_delta = pred_delta + off.squeeze(0) * (
                 continuous_temporal_offset_scale() * continuous_delta_out_scale()
             )
+
+        # Apply Skip-Hop GNN odd-hop node reconstruction
+        if os.environ.get("SPECIES_SKIP_HOP_GNN") == "1" and getattr(self, "wall_mask_band", None) is not None:
+            pred_delta = self._reconstruct_odd_nodes(pred_delta, edge_index)
+
+        # Apply readout shear gate
+        if os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1":
+            ld = int(getattr(self, "kin_latent_dim", 0) or 0)
+            if x.shape[1] > ld + 6:
+                gamma_si = x[:, ld + 6].reshape(-1, 1)
+                tau = getattr(self, "shear_gate_tau", None)
+                lss = getattr(self, "shear_gate_lss", None)
+                if tau is not None and lss is not None:
+                    gate = torch.sigmoid((lss - gamma_si) / torch.clamp(tau, min=1e-3))
+                    mat_idx = _local_mat_idx()
+                    if mat_idx is not None and mat_idx < pred_delta.shape[1]:
+                        mask = torch.ones_like(pred_delta)
+                        mask[:, mat_idx] = gate.squeeze(-1)
+                        pred_delta = pred_delta * mask
+
+        # Apply frontier kinetics
+        if os.environ.get("SPECIES_FRONTIER_KINETICS") == "1":
+            mat_idx = _local_mat_idx()
+            pos_band = getattr(self, "pos_band", None)
+            velocity = getattr(self, "velocity", None)
+            species_block = getattr(self, "species_block", None)
+            # Only apply on the band graph — skip when called with full-graph feats
+            n_graph = pred_delta.size(0)
+            band_size = pos_band.size(0) if pos_band is not None else -1
+            if (mat_idx is not None and pos_band is not None and velocity is not None
+                    and species_block is not None and log_state is not None
+                    and n_graph == band_size
+                    and species_block.size(0) == n_graph
+                    and velocity.size(0) == n_graph):
+                st = log_state.reshape(-1, _sd())
+                committed = (st[:, mat_idx] > continuous_mat_commit_thresh()).reshape(-1).bool()
+                from src.core_physics.clot_growth_masks import graph_dilate_hops
+                frontier = graph_dilate_hops(committed, edge_index, 1).to(device=x.device) & ~committed
+                from src.utils import species_channels as sc
+                ap = torch.expm1(species_block[:, sc.block_index("AP")].reshape(-1))
+                t_sp = torch.expm1(species_block[:, sc.block_index("T")].reshape(-1))
+                u_vel = velocity[:, 0].reshape(-1)
+                v_vel = velocity[:, 1].reshape(-1)
+                from src.core_physics.species_snapshot_gnn import compute_frontier_fluxes
+                flux_ap, flux_t = compute_frontier_fluxes(
+                    pos_band, u_vel, v_vel, edge_index, committed, frontier, ap, t_sp
+                )
+                k_ap = float(os.environ.get("SPECIES_FRONTIER_K_AP", "0.5"))
+                k_t = float(os.environ.get("SPECIES_FRONTIER_K_T", "0.5"))
+                K_kinetics = k_ap * flux_ap + k_t * flux_t
+                mask = torch.zeros_like(pred_delta)
+                mask[:, mat_idx] = K_kinetics
+                pred_delta = pred_delta + mask
+
         return pred_delta, spatial_logits, magnitude
 
     def forward(
@@ -1318,7 +1580,11 @@ def build_continuous_gnn(in_dim: int, *, hidden: int | None = None, arch: str | 
 
 def bind_band_geometry(model: nn.Module, static: dict) -> None:
     if hasattr(model, "set_band_geometry"):
-        model.set_band_geometry(static.get("pos_band"), static.get("edge_index"))
+        model.set_band_geometry(
+            static.get("pos_band"),
+            static.get("edge_index"),
+            static.get("wall_mask_band")
+        )
 
 
 def species_latent_dropout_p() -> float:
@@ -1380,6 +1646,24 @@ def maybe_drop_latent(base_feats: torch.Tensor, model: nn.Module, training: bool
     return out
 
 
+_OFFWALL_MODEL_CACHE = None
+
+def get_cached_offwall_model(device, in_dim, hidden, out_dim):
+    global _OFFWALL_MODEL_CACHE
+    if _OFFWALL_MODEL_CACHE is not None:
+        return _OFFWALL_MODEL_CACHE
+    ckpt_path = os.environ.get("SPECIES_OFFWALL_MODEL_CKPT")
+    if not ckpt_path:
+        raise ValueError("SPECIES_OFFWALL_MODEL_CKPT environment variable must be set when SPECIES_TWO_MODEL_MODE=1")
+    payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+    from src.core_physics.species_pushforward_continuous import SpeciesDualHeadContinuousGNN
+    offwall_model = SpeciesDualHeadContinuousGNN(in_dim=in_dim, hidden=hidden, out_dim=out_dim).to(device)
+    sd = payload.get("model_state") or payload.get("model_state_dict") or payload
+    offwall_model.load_state_dict(sd, strict=False)
+    offwall_model.eval()
+    _OFFWALL_MODEL_CACHE = offwall_model
+    return _OFFWALL_MODEL_CACHE
+
 def predict_continuous_step_delta(
     model: nn.Module,
     base_feats: torch.Tensor,
@@ -1392,28 +1676,69 @@ def predict_continuous_step_delta(
     flow_series: torch.Tensor | None = None,
     flow_cols: tuple[int, int] | None = None,
     flow_time_index: int | None = None,
+    wall_mask_band: torch.Tensor | None = None,
+    species_block: torch.Tensor | None = None,
+    velocity: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One closed-loop delta step (features + optional sat/temporal gates).
 
     ``time_index`` drives the (retired) temporal gate; ``flow_time_index`` selects the dynamic-flow
     snapshot (the current state's time) and falls back to ``time_index`` when not given.
     """
-    if hasattr(model, "set_band_geometry") and pos_band is not None:
-        model.set_band_geometry(pos_band, edge_index)
+    if hasattr(model, "set_band_geometry"):
+        model.set_band_geometry(pos_band, edge_index, wall_mask_band)
     flow_ti = flow_time_index if flow_time_index is not None else time_index
     base_feats = splice_dynamic_flow(base_feats, flow_series, flow_cols, flow_ti)
     base_feats = maybe_drop_latent(base_feats, model, training)
+
+    model.log_state = log_state
+    if species_block is not None:
+        model.species_block = species_block
+    model.velocity = velocity
+
     feats = build_continuous_step_features(
         base_feats,
         log_state,
         training=training,
         time_index=time_index,
+        velocity=velocity,
+        pos_band=pos_band,
+        edge_index=edge_index,
     )
     feats = align_continuous_feature_dim(feats, model)
-    if continuous_dual_head() and hasattr(model, "forward_decoupled"):
-        pred_delta, _, _ = model.forward_decoupled(feats, edge_index, log_state=log_state)
-        return pred_delta
-    return delta_readout(model(feats, edge_index))
+    use_edge_index = getattr(model, "augmented_edge_index", None)
+    if use_edge_index is None or os.environ.get("SPECIES_LONGRANGE_EDGES") != "1":
+        use_edge_index = edge_index
+
+    # Helper function to forward model
+    def _run_forward(m_obj, fts, e_idx, lst):
+        if continuous_dual_head() and hasattr(m_obj, "forward_decoupled"):
+            pd, _, _ = m_obj.forward_decoupled(fts, e_idx, log_state=lst)
+            return pd
+        return delta_readout(m_obj(fts, e_idx))
+
+    pred_delta = _run_forward(model, feats, use_edge_index, log_state)
+
+    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and wall_mask_band is not None:
+        try:
+            offwall_model = get_cached_offwall_model(
+                feats.device, model.in_dim, model.hidden, model.out_dim
+            )
+            # Set offwall model state
+            if hasattr(offwall_model, "set_band_geometry"):
+                offwall_model.set_band_geometry(pos_band, edge_index, wall_mask_band)
+            offwall_model.log_state = log_state
+            if species_block is not None:
+                offwall_model.species_block = species_block
+            offwall_model.velocity = velocity
+            
+            pred_delta_off = _run_forward(offwall_model, feats, use_edge_index, log_state)
+            w_m = wall_mask_band.reshape(-1, 1).to(device=feats.device, dtype=torch.bool)
+            pred_delta = torch.where(w_m, pred_delta, pred_delta_off)
+        except Exception as e:
+            print(f"[WARN] Failed to apply two-model offwall blend: {e}")
+
+    return pred_delta
 
 
 def growth_delta_labels(tgt_delta: torch.Tensor) -> torch.Tensor:
@@ -1433,16 +1758,68 @@ def dual_head_step_loss(
     train_mask: torch.Tensor,
     *,
     current_log_state: torch.Tensor | None = None,
+    fp_weight_scale: torch.Tensor | None = None,
+    hops: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     m = train_mask.reshape(-1).to(device=spatial_logits.device).bool()
     if not bool(m.any().item()):
         return None
     growth_tgt = growth_delta_labels(tgt_delta)
-    if not step_has_growth_supervision(tgt_delta, m):
-        return None
+
     alpha = pushforward_focal_alpha_vec()
     gamma = pushforward_focal_gamma_vec()
     ch_w = continuous_channel_weights_vec()
+    gate_temp = continuous_gate_temp()
+    gfw = continuous_gate_fp_weight()
+
+    isolate_offwall = os.environ.get("SPECIES_ISOLATE_OFFWALL_LOSS") == "1"
+    if isolate_offwall and hops is not None:
+        m_wall = m & (hops.to(device=m.device) <= 1)
+        m_offwall = m & (hops.to(device=m.device) >= 2)
+
+        # Helper to compute loss for a sub-mask
+        def _sub_loss(sub_m):
+            if not bool(sub_m.any().item()) or not step_has_growth_supervision(tgt_delta, sub_m):
+                return None
+            spatial_l = snapshot_loss(
+                spatial_logits, tgt_delta, growth_tgt, sub_m,
+                focal_alpha=alpha, focal_gamma=gamma, channel_weight=ch_w,
+            )
+            mag_l = _growth_huber()(
+                magnitude, tgt_delta, sub_m,
+                current_log_state=current_log_state, fp_weight_scale=fp_weight_scale,
+            )
+            sub_l = continuous_spatial_loss_weight() * spatial_l + mag_l
+            if gfw > 0.0:
+                logits_m = spatial_logits.reshape(-1, spatial_logits.shape[-1])[sub_m]
+                growth_m = growth_tgt.reshape(-1, growth_tgt.shape[-1])[sub_m]
+                gate_prob = torch.sigmoid(logits_m / gate_temp if gate_temp != 1.0 else logits_m)
+                inactive = (growth_m <= 0.5).float()
+                if bool(inactive.any().item()):
+                    bce = F.binary_cross_entropy(gate_prob, growth_m, reduction="none")
+                    if fp_weight_scale is not None:
+                        scale_m = fp_weight_scale.reshape(-1)[sub_m].unsqueeze(-1)
+                        bce = bce * scale_m
+                    sub_l = sub_l + gfw * (bce * inactive).sum() / inactive.sum().clamp(min=1.0)
+            return sub_l
+
+        loss_wall = _sub_loss(m_wall)
+        loss_offwall = _sub_loss(m_offwall)
+
+        if loss_wall is not None and loss_offwall is not None:
+            offwall_scale = float(os.environ.get("SPECIES_OFFWALL_LOSS_SCALE", "2.0"))
+            return 0.5 * loss_wall + 0.5 * offwall_scale * loss_offwall
+        elif loss_wall is not None:
+            return loss_wall
+        elif loss_offwall is not None:
+            offwall_scale = float(os.environ.get("SPECIES_OFFWALL_LOSS_SCALE", "2.0"))
+            return offwall_scale * loss_offwall
+        else:
+            return None
+
+    if not step_has_growth_supervision(tgt_delta, m):
+        return None
+
     spatial_l = snapshot_loss(
         spatial_logits,
         tgt_delta,
@@ -1452,17 +1829,24 @@ def dual_head_step_loss(
         focal_gamma=gamma,
         channel_weight=ch_w,
     )
-    mag_l = _growth_huber()(magnitude, tgt_delta, m, current_log_state=current_log_state)
+    mag_l = _growth_huber()(
+        magnitude,
+        tgt_delta,
+        m,
+        current_log_state=current_log_state,
+        fp_weight_scale=fp_weight_scale,
+    )
     loss = continuous_spatial_loss_weight() * spatial_l + mag_l
-    gfw = continuous_gate_fp_weight()
     if gfw > 0.0:
-        gate_temp = continuous_gate_temp()
         logits_m = spatial_logits.reshape(-1, spatial_logits.shape[-1])[m]
         growth_m = growth_tgt.reshape(-1, growth_tgt.shape[-1])[m]
         gate_prob = torch.sigmoid(logits_m / gate_temp if gate_temp != 1.0 else logits_m)
         inactive = (growth_m <= 0.5).float()
         if bool(inactive.any().item()):
             bce = F.binary_cross_entropy(gate_prob, growth_m, reduction="none")
+            if fp_weight_scale is not None:
+                scale_m = fp_weight_scale.reshape(-1)[m].unsqueeze(-1)
+                bce = bce * scale_m
             loss = loss + gfw * (bce * inactive).sum() / inactive.sum().clamp(min=1.0)
     return loss
 
@@ -1560,6 +1944,80 @@ def init_dual_head_from_continuous(
         print(f"[OK] dual-head partial warm-start ({copied} tensors)", flush=True)
 
 
+def smooth_hop1_log_targets(log_series: list[torch.Tensor], edge_index: torch.Tensor, wall_mask_band: torch.Tensor) -> list[torch.Tensor]:
+    if not log_series or edge_index is None or wall_mask_band is None:
+        return log_series
+    num_nodes = log_series[0].shape[0]
+    device = edge_index.device
+    hops = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+    wall_mask = wall_mask_band.to(device=device).bool()
+    hops[wall_mask] = 0
+    row, col = edge_index
+    current_mask = wall_mask.clone()
+    current_hop = 0
+    while True:
+        neighbor_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        neighbor_mask[col[current_mask[row]]] = True
+        next_mask = neighbor_mask & (hops == -1)
+        if not next_mask.any():
+            break
+        current_hop += 1
+        hops[next_mask] = current_hop
+        current_mask = next_mask
+        if current_hop >= 2:
+            break
+    hop1_mask = (hops == 1)
+    if not hop1_mask.any():
+        return log_series
+    source_mask = (hops == 0) | (hops == 2)
+    edge_mask = source_mask[row] & hop1_mask[col]
+    row_e = row[edge_mask]
+    col_e = col[edge_mask]
+    mat_idx = _ch_mat()
+    if mat_idx is None or mat_idx < 0:
+        return log_series
+    alpha = float(os.environ.get("SPECIES_HOP1_SMOOTH_ALPHA", "0.4"))
+    smoothed_series = []
+    for step_tensor in log_series:
+        st = step_tensor.clone()
+        mat_vals = st[:, mat_idx]
+        accum = torch.zeros(num_nodes, device=device, dtype=st.dtype)
+        accum.scatter_add_(0, col_e, mat_vals[row_e])
+        counts = torch.zeros(num_nodes, device=device, dtype=st.dtype)
+        counts.scatter_add_(0, col_e, torch.ones_like(col_e, dtype=st.dtype))
+        avg_neigh = torch.zeros_like(mat_vals)
+        avg_neigh[hop1_mask] = accum[hop1_mask] / (counts[hop1_mask] + 1e-6)
+        st[hop1_mask, mat_idx] = alpha * avg_neigh[hop1_mask] + (1 - alpha) * mat_vals[hop1_mask]
+        smoothed_series.append(st)
+    return smoothed_series
+
+
+def compute_hop_distances(
+    edge_index: torch.Tensor,
+    wall_mask_band: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
+    """BFS to compute the exact hop distance from the wall for all band nodes."""
+    dev = edge_index.device
+    hops = torch.full((num_nodes,), -1, dtype=torch.long, device=dev)
+    wall_m = wall_mask_band.to(device=dev).bool()
+    hops[wall_m] = 0
+    row, col = edge_index
+    current_mask = wall_m.clone()
+    current_hop = 0
+    while True:
+        neighbor_mask = torch.zeros(num_nodes, dtype=torch.bool, device=dev)
+        neighbor_mask[col[current_mask[row]]] = True
+        next_mask = neighbor_mask & (hops == -1)
+        if not next_mask.any():
+            break
+        current_hop += 1
+        hops[next_mask] = current_hop
+        current_mask = next_mask
+    hops[hops == -1] = 99
+    return hops
+
+
 def unroll_continuous_loss(
     model: nn.Module,
     *,
@@ -1578,13 +2036,22 @@ def unroll_continuous_loss(
     time_window: Sequence[int] | None = None,
     flow_series: torch.Tensor | None = None,
     flow_cols: tuple[int, int] | None = None,
+    wall_mask_band: torch.Tensor | None = None,
+    species_block: torch.Tensor | None = None,
+    velocity: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    if os.environ.get("SPECIES_HOP1_SMOOTH") == "1" and wall_mask_band is not None and edge_index is not None:
+        log_series = smooth_hop1_log_targets(log_series, edge_index, wall_mask_band)
     n_steps = len(log_series) - 1
     if n_steps <= 0:
         z = base_feats.sum() * 0.0
         return z, [], []
 
-    bind_band_geometry(model, {"pos_band": pos_band, "edge_index": edge_index})
+    bind_band_geometry(model, {
+        "pos_band": pos_band,
+        "edge_index": edge_index,
+        "wall_mask_band": wall_mask_band,
+    })
 
     if log_state0 is None:
         log_state = torch.zeros(base_feats.shape[0], _sd(), device=base_feats.device, dtype=base_feats.dtype)
@@ -1599,6 +2066,14 @@ def unroll_continuous_loss(
     pred_deltas: list[torch.Tensor] = []
     states: list[torch.Tensor] = [log_state.clone()]
 
+    midside_blind = os.environ.get("SPECIES_MIDSIDE_BLIND_LOSS")
+    phys_fp_gating = os.environ.get("SPECIES_PHYSICAL_FP_GATING") == "1"
+    sdf_fp_gating = os.environ.get("SPECIES_SDF_FP_GATING") == "1"
+    isolate_offwall = os.environ.get("SPECIES_ISOLATE_OFFWALL_LOSS") == "1"
+    hops = None
+    if (midside_blind is not None or phys_fp_gating or sdf_fp_gating or isolate_offwall) and wall_mask_band is not None and edge_index is not None:
+        hops = compute_hop_distances(edge_index, wall_mask_band, base_feats.shape[0])
+
     for step in range(n_steps):
         grad_step = (not training) or step >= loss_start
         ctx = torch.enable_grad() if grad_step else torch.no_grad()
@@ -1609,6 +2084,18 @@ def unroll_continuous_loss(
             flow_ti = int(time_window[step]) if time_window is not None and step < len(time_window) else step
             step_base_feats = splice_dynamic_flow(base_feats, flow_series, flow_cols, flow_ti)
             step_base_feats = maybe_drop_latent(step_base_feats, model, training and grad_step)
+
+            # Set stateful inputs on the model for readout gates / kinetics
+            model.log_state = log_state
+            if species_block is not None and step < len(species_block):
+                model.species_block = species_block[step]
+            else:
+                model.species_block = log_series[step]
+            if velocity is not None and step < len(velocity):
+                model.velocity = velocity[step]
+            else:
+                model.velocity = None
+
             feats = build_continuous_step_features(
                 step_base_feats,
                 log_state,
@@ -1618,25 +2105,93 @@ def unroll_continuous_loss(
                     if time_window is not None and step + 1 < len(time_window)
                     else step + 1
                 ),
+                velocity=velocity[step] if velocity is not None and step < len(velocity) else None,
+                pos_band=pos_band,
+                edge_index=edge_index,
             )
             feats = align_continuous_feature_dim(feats, model)
             tgt_delta = log_delta_targets(log_series[step], log_series[step + 1])
             gt_log = log_series[step]
+            use_edge_index = getattr(model, "augmented_edge_index", None)
+            if use_edge_index is None or os.environ.get("SPECIES_LONGRANGE_EDGES") != "1":
+                use_edge_index = edge_index
+
+            # Midside-blind loss masking
+            step_train_mask = train_mask
+            if midside_blind is not None and hops is not None:
+                step_train_mask = train_mask.clone()
+                if midside_blind == "all_odd":
+                    step_train_mask = step_train_mask & (hops % 2 == 0)
+                else:
+                    step_train_mask = step_train_mask & (hops != 1)
+
+            # Physical FP Gating
+            fp_weight_scale = None
+            if phys_fp_gating and hops is not None and velocity is not None and step < len(velocity):
+                vel_t = velocity[step]
+                if vel_t is not None:
+                    speed = vel_t.norm(dim=1)
+                    if pos_band is not None:
+                        pos = pos_band.to(device=edge_index.device, dtype=speed.dtype)
+                        row, col = edge_index
+                        diff = pos[row] - pos[col]
+                        dist = diff.norm(dim=1).clamp(min=1e-6)
+                        grad = (speed[row] - speed[col]).abs() / dist
+                        deg = torch.zeros(base_feats.shape[0], device=edge_index.device, dtype=speed.dtype)
+                        deg.index_add_(0, row, torch.ones_like(grad))
+                        acc_g = torch.zeros(base_feats.shape[0], device=edge_index.device, dtype=speed.dtype)
+                        acc_g.index_add_(0, row, grad)
+                        shear = acc_g / deg.clamp(min=1.0)
+
+                        s_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_CRIT", "0.05"))
+                        s_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_WIDTH", "0.01"))
+                        g_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_CRIT", "10.0"))
+                        g_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_WIDTH", "2.0"))
+                        w_min = float(os.environ.get("SPECIES_PHYSICAL_FP_MIN_WEIGHT", "0.1"))
+
+                        s_val = torch.sigmoid((speed - s_crit) / max(s_width, 1e-4))
+                        g_val = torch.sigmoid((shear - g_crit) / max(g_width, 1e-4))
+                        fp_weight_scale = w_min + (1.0 - w_min) * torch.max(s_val, g_val)
+
+            # SDF-Weighted FP Gating (Direction 4)
+            if os.environ.get("SPECIES_SDF_FP_GATING") == "1" and pos_band is not None and wall_mask_band is not None:
+                try:
+                    wall_pos = pos_band[wall_mask_band.bool()]
+                    if wall_pos.numel() > 0:
+                        dists = torch.cdist(pos_band.unsqueeze(0), wall_pos.unsqueeze(0)).squeeze(0)
+                        sdf_val, _ = dists.min(dim=1)
+                        decay_scale = float(os.environ.get("SPECIES_SDF_FP_DECAY_SCALE", "0.015"))
+                        min_weight = float(os.environ.get("SPECIES_SDF_FP_MIN", "0.1"))
+                        sdf_weight = torch.exp(-sdf_val / max(decay_scale, 1e-4))
+                        sdf_weight = torch.clamp(sdf_weight, min=min_weight, max=1.0)
+                        if fp_weight_scale is not None:
+                            fp_weight_scale = fp_weight_scale * sdf_weight
+                        else:
+                            fp_weight_scale = sdf_weight
+                except Exception as e:
+                    print(f"[WARN] Failed to compute SDF-weighted FP gating: {e}")
+
             if continuous_dual_head() and hasattr(model, "forward_decoupled"):
                 pred_delta, spatial_logits, magnitude = model.forward_decoupled(
-                    feats, edge_index, log_state=log_state
+                    feats, use_edge_index, log_state=log_state
                 )
                 step_loss = dual_head_step_loss(
                     spatial_logits,
                     magnitude,
                     tgt_delta,
-                    train_mask,
+                    step_train_mask,
                     current_log_state=gt_log,
+                    fp_weight_scale=fp_weight_scale,
+                    hops=hops,
                 )
             else:
-                pred_delta = delta_readout(model(feats, edge_index))
+                pred_delta = delta_readout(model(feats, use_edge_index))
                 step_loss = continuous_delta_loss(
-                    pred_delta, tgt_delta, train_mask, current_log_state=gt_log
+                    pred_delta,
+                    tgt_delta,
+                    step_train_mask,
+                    current_log_state=gt_log,
+                    fp_weight_scale=fp_weight_scale,
                 )
             pred_deltas.append(pred_delta)
             if step_loss is not None and grad_step:
@@ -1747,6 +2302,9 @@ def rollout_continuous_states(
     time_window: Sequence[int] | None = None,
     flow_series: torch.Tensor | None = None,
     flow_cols: tuple[int, int] | None = None,
+    wall_mask_band: torch.Tensor | None = None,
+    species_block: torch.Tensor | None = None,
+    velocity: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Returns log states, pred deltas, and binary readout states per step."""
     model.eval()
@@ -1776,6 +2334,9 @@ def rollout_continuous_states(
             flow_time_index=(
                 int(time_window[step]) if time_window is not None and step < len(time_window) else step
             ),
+            wall_mask_band=wall_mask_band,
+            species_block=species_block[step] if species_block is not None and step < len(species_block) else log_series[step],
+            velocity=velocity[step] if velocity is not None and step < len(velocity) else None,
         )
         deltas.append(pred_delta)
         spd = None
@@ -1811,9 +2372,12 @@ def rollout_prefix_log_state(
     log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
     pos_band = static.get("pos_band")
+    from src.core_physics.species_deploy_rollout import resolve_species_rollout_uv
     with torch.no_grad():
         for t in range(t_end):
             spd = band_speed_at_time(data, t + 1, device, node_idx, for_training=True)
+            u, v = resolve_species_rollout_uv(data, t + 1, device, for_training=True)
+            vel_val = torch.stack([u[node_idx], v[node_idx]], dim=1)
             pred_delta = predict_continuous_step_delta(
                 model,
                 static["base_feats"],
@@ -1822,6 +2386,7 @@ def rollout_prefix_log_state(
                 training=False,
                 pos_band=pos_band,
                 time_index=t + 1,
+                velocity=vel_val,
             )
             log_state = pushforward_log_state_step(
                 log_state,
@@ -1919,8 +2484,11 @@ def eval_full_rollout_fimat_f1(
     pos_band = static.get("pos_band")
     pred_actives = [log_state_to_active(log_state)]
     gt_actives = [log_state_to_active(species_log_targets(data, 0, device)[node_idx])]
+    from src.core_physics.species_deploy_rollout import resolve_species_rollout_uv
     for t in range(t_eval):
         spd = band_speed_at_time(data, t + 1, device, node_idx)
+        u, v = resolve_species_rollout_uv(data, t + 1, device, for_training=False)
+        vel_val = torch.stack([u[node_idx], v[node_idx]], dim=1)
         pred_delta = predict_continuous_step_delta(
             model,
             static["base_feats"],
@@ -1929,6 +2497,7 @@ def eval_full_rollout_fimat_f1(
             training=False,
             pos_band=pos_band,
             time_index=t + 1,
+            velocity=vel_val,
         )
         log_state = pushforward_log_state_step(
             log_state,
@@ -1975,6 +2544,7 @@ def eval_deploy_clot_f1(
         metrics_to_deploy_prefix,
     )
     from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
+    import os
 
     model.eval()
     bind_band_geometry(model, static)
@@ -1991,13 +2561,69 @@ def eval_deploy_clot_f1(
     log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
     pos_band = static.get("pos_band")
+
+    coupler = None
+    mu_bulk_si = None
+    if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
+        try:
+            # Run closed-loop coupling models on CPU to conserve GPU VRAM
+            flow_device = torch.device("cpu")
+            from src.inference.corrector_coupling import ClotAwareFlow, resolve_kinematics_checkpoint, resolve_corrector_checkpoint, reset_coupled_flow_registry
+            from src.core_physics.coupled_shear_gnn import LocalKinematicCorrector
+            from src.utils.kinematics_inference import load_kinematics_predictor
+            from src.core_physics.clot_growth_masks import resolve_bulk_carreau_mu_si
+            reset_coupled_flow_registry()
+            
+            global _CLOSED_LOOP_MODELS_CACHE
+            if "_CLOSED_LOOP_MODELS_CACHE" not in globals():
+                _CLOSED_LOOP_MODELS_CACHE = {}
+                
+            kine_ckpt = resolve_kinematics_checkpoint()
+            corr_ckpt = resolve_corrector_checkpoint()
+            cache_key = (kine_ckpt, corr_ckpt, "cpu")
+            
+            if cache_key in _CLOSED_LOOP_MODELS_CACHE:
+                kine, corr_model = _CLOSED_LOOP_MODELS_CACHE[cache_key]
+            else:
+                kine = load_kinematics_predictor(kine_ckpt, flow_device)
+                kine.eval()
+                for p in kine.parameters():
+                    p.requires_grad = False
+                from src.core_physics.coupled_shear_gnn import load_local_corrector
+                corr_model = load_local_corrector(corr_ckpt, flow_device)
+                corr_model.eval()
+                for p in corr_model.parameters():
+                    p.requires_grad = False
+                _CLOSED_LOOP_MODELS_CACHE[cache_key] = (kine, corr_model)
+                
+            coupler = ClotAwareFlow(flow_device, phys_cfg=phys_cfg)
+            coupler._kine = kine
+            coupler._corrector = corr_model
+            u0, v0 = coupler.base_flow(data)
+            mu_bulk_si = resolve_bulk_carreau_mu_si(data, 0, phys_cfg, flow_device, u_nd=u0, v_nd=v0).reshape(-1)
+        except Exception as e:
+            print(f"[WARN] Failed to initialize closed-loop flow coupler in eval_deploy_clot_f1: {e}")
+
     for t in range(n_times):
         sp = pin_species_block(data, t, device)
         sp = scatter_log_state_to_species_block(sp, log_state, node_idx)
         out[t, :, sc.SPECIES_BLOCK] = sp.clamp(min=0.0)
         if t >= n_times - 1:
             break
-        spd = band_speed_at_time(data, t + 1, device, node_idx)
+        from src.core_physics.species_deploy_rollout import resolve_species_rollout_uv
+        if coupler is not None:
+            from src.inference.corrector_coupling import get_coupled_flow
+            coupled = get_coupled_flow(data, device)
+            if coupled is not None:
+                u, v = coupled
+            else:
+                u, v = resolve_species_rollout_uv(data, t + 1, device, for_training=False)
+        else:
+            u, v = resolve_species_rollout_uv(data, t + 1, device, for_training=False)
+            
+        from src.core_physics.species_deploy_rollout import band_speed_from_uv
+        spd = band_speed_from_uv(u, v, node_idx)
+        vel_val = torch.stack([u[node_idx], v[node_idx]], dim=1)
         pred_delta = predict_continuous_step_delta(
             model,
             static["base_feats"],
@@ -2006,6 +2632,7 @@ def eval_deploy_clot_f1(
             training=False,
             pos_band=pos_band,
             time_index=t + 1,
+            velocity=vel_val,
         )
         log_state = pushforward_log_state_step(
             log_state,
@@ -2014,7 +2641,38 @@ def eval_deploy_clot_f1(
             wall_speed=spd,
             vel_decay_alphas=vel_alphas,
         )
+
+        if coupler is not None and t + 1 < n_times:
+            try:
+                from src.core_physics.species_gelation_readout import differentiable_clot_phi_from_species12, differentiable_mu_eff_from_species12
+                from src.core_physics.clot_phi_simple import comsol_carreau_mu_si_from_uv
+                from src.inference.corrector_coupling import write_coupled_flow_into_y, set_coupled_flow
+                
+                sp_next = pin_species_block(data, t + 1, device)
+                sp_next = scatter_log_state_to_species_block(sp_next, log_state, node_idx)
+                species_log12 = sp_next
+                
+                phi_clot = differentiable_clot_phi_from_species12(species_log12, bio_cfg)
+                u_t1 = data.y[t + 1, :, 0]
+                v_t1 = data.y[t + 1, :, 1]
+                gel_factor = torch.ones_like(u_t1)
+                mu_carreau_si = comsol_carreau_mu_si_from_uv(
+                    data,
+                    u_t1,
+                    v_t1,
+                    gel_factor,
+                    phys_cfg,
+                    device=device,
+                )
+                mu_eff_si = differentiable_mu_eff_from_species12(species_log12, mu_carreau_si, phi_clot, bio_cfg).reshape(-1)
+                
+                state = coupler.update(data, mu_eff_si, mu_bulk_si=mu_bulk_si, publish=False)
+                set_coupled_flow(data, state.u, state.v)
+                write_coupled_flow_into_y(data, state.u, state.v, time_index=t + 1)
+            except Exception as e:
+                print(f"[WARN] Failed to apply closed-loop flow coupling at eval step {t+1}: {e}")
     with t0_rung2_env():
+        nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
         traj = rollout_t0_clot_phi(
             data,
             phys_cfg,
@@ -2024,12 +2682,24 @@ def eval_deploy_clot_f1(
             flow_source=flow_source,
             pred_species_series=out,
             nucleation=True,
-            nucleation_hops=1,
+            nucleation_hops=nuc_hops,
         )
     phi_gt = gt_clot_phi_at_time(data, t_eval, phys_cfg, device)
     phi_pred = traj[t_eval]["phi"]
     edge_index = data.edge_index.to(device=device)
-    m = compute_clot_relaxed_metrics(phi_pred.reshape(-1), phi_gt.reshape(-1), edge_index)
+
+    wall_mask = None
+    if hasattr(data, "mask_wall") and data.mask_wall is not None:
+        wall_mask = data.mask_wall.bool().to(device=phi_pred.device)
+    elif hasattr(data, "wall_mask") and data.wall_mask is not None:
+        wall_mask = data.wall_mask.bool().to(device=phi_pred.device)
+
+    m = compute_clot_relaxed_metrics(
+        phi_pred.reshape(-1),
+        phi_gt.reshape(-1),
+        edge_index,
+        wall_mask=wall_mask,
+    )
     out = metrics_to_deploy_prefix(m)
     out["deploy_clot_score"] = clot_score_from_deploy_dict(out)
     out["time_index"] = int(t_eval)
@@ -2050,6 +2720,9 @@ def eval_continuous_window(
     time_window: Sequence[int] | None = None,
     flow_series: torch.Tensor | None = None,
     flow_cols: tuple[int, int] | None = None,
+    wall_mask_band: torch.Tensor | None = None,
+    species_block: torch.Tensor | None = None,
+    velocity: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Primary metric: final cumulative state F1 after soft-commit readout (ceiling mask)."""
     log_states, deltas, actives = rollout_continuous_states(
@@ -2062,6 +2735,9 @@ def eval_continuous_window(
         time_window=time_window,
         flow_series=flow_series,
         flow_cols=flow_cols,
+        wall_mask_band=wall_mask_band,
+        species_block=species_block,
+        velocity=velocity,
     )
     gt_active = log_state_to_active(log_series[-1])
     pred_active = actives[-1]
@@ -2216,6 +2892,20 @@ def load_pushforward_state_dict_partial(
     quiet: bool = False,
 ) -> int:
     """Load compatible tensors; copy overlapping output rows when scope/out_dim widens."""
+    # Warm-start Spatially-Gated Readout Heads (Direction 6.1)
+    if getattr(model, "spatial_gate_heads", False):
+        new_state_dict = {}
+        for key, val in state_dict.items():
+            if key.startswith("spatial_head."):
+                suffix = key[len("spatial_head."):]
+                new_state_dict["spatial_head_wall." + suffix] = val.clone()
+                new_state_dict["spatial_head_offwall." + suffix] = val.clone()
+            elif key.startswith("magnitude_head."):
+                suffix = key[len("magnitude_head."):]
+                new_state_dict["magnitude_head_wall." + suffix] = val.clone()
+                new_state_dict["magnitude_head_offwall." + suffix] = val.clone()
+        state_dict = {**state_dict, **new_state_dict}
+
     dst = dict(model.state_dict())
     copied = 0
     skipped: list[str] = []
@@ -2311,6 +3001,16 @@ def load_continuous_bundle(
             os.environ["SPECIES_GEOM_FEATS_RICH"] = "1" if bool(meta.get("geom_feats_rich")) else "0"
         if meta.get("flow_feats") is not None:
             os.environ["SPECIES_FLOW_FEATS"] = "1" if bool(meta.get("flow_feats")) else "0"
+        if meta.get("flow_dynamic") is not None:
+            os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] = "1" if bool(meta.get("flow_dynamic")) else "0"
+        if meta.get("flow_drop_xy") is not None:
+            os.environ["SPECIES_FLOW_FEATS_DROP_XY"] = "1" if bool(meta.get("flow_drop_xy")) else "0"
+        channels = meta.get("pushforward_species_channels") or meta.get("species_channels")
+        if channels:
+            if isinstance(channels, (list, tuple)):
+                os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(c)) for c in channels)
+            else:
+                os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
         if meta.get("neighbor_commit_gate") is not None:
             os.environ["SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE"] = (
                 "1" if bool(meta.get("neighbor_commit_gate")) else "0"

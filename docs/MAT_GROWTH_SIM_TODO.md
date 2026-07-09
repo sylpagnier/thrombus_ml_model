@@ -30,11 +30,13 @@ Triage launcher: `scripts/go_mat_arch_triage.ps1 -Fresh` (20 ep / 64 windows / ~
 
 ## Already done (full budget -- do not re-run unless promoting)
 
-| Leg | deploy_clot_f1 | Note |
-|-----|---------------:|------|
-| **P_mat_plain** | **0.762** | Leader (old recall-heavy selection) |
-| G_dual_mat_neighbor_gate | 0.724 | Full budget complete |
-| N_mat_geom_rich | aborted ~ep24 | Re-run at triage tier |
+| Leg | deploy_clot_f1 | deploy_clot_score | Note |
+|-----|---------------:|------------------:|------|
+| **W_mat_flow_stagnation** | **0.792** | **0.981** | **Canonical Mat deploy** (2026-06-29 full compare; **superseded 2026-07-02**) |
+| **WC_mat_flow_dynamic** | 0.789 | **0.947** | **Canonical Mat deploy** (2026-07-02 FP-aware pick) |
+| P_mat_plain | 0.798 | 0.946 | Precision-first control (was 0.762 old selection) |
+| G_dual_mat_neighbor_gate | 0.724 | — | Full budget complete |
+| N_mat_geom_rich | aborted ~ep24 | — | Re-run at triage tier |
 
 ---
 
@@ -84,29 +86,55 @@ Triage launcher: `scripts/go_mat_arch_triage.ps1 -Fresh` (20 ep / 64 windows / ~
 
 ---
 
-## PRIORITY NOW -- promote W (+ precision P control)
+## DONE -- W-physics triage (2026-06-26)
 
-**Triage complete (8/8 legs, 2026-06-26).** Winner: **W** clot_f1 **0.764** (+0.130 vs locked 0.441),
-clot_score **0.978**, over/gt **0.01**. Runner-up AB **0.671** but over/gt **0.20** (deprioritize).
-Summary: `outputs/biochem/biochem_gnn/mat_arch_triage/mat_arch_triage_summary.json`.
+Summary: `outputs/biochem/biochem_gnn/mat_physics_triage/mat_physics_triage_summary.json`
 
-| Tier | Candidate | clot_f1 | Why explore further |
-|------|-----------|--------:|---------------------|
-| **A** | `W_mat_flow_stagnation` | 0.764 | Primary -- matches full-budget P at 1/5 cost |
-| **B** | `P_mat_plain` + precision recipe | 0.762* | Fair control (*full budget, old selection) |
-| **C** | `WX` flow + frontier (new) | -- | Untested hybrid: W growth + U precision |
-| **D** | `U_mat_frontier_only` | 0.455 | Precision-safe fallback (score 0.884) |
-| **E** | `N_mat_geom_rich` | -- | Finish aborted full-budget geometry leg |
+| Leg | clot_f1 | clot_score | over/gt | Verdict |
+|-----|--------:|-----------:|--------:|---------|
+| **WC_mat_flow_dynamic** | **0.772** | 0.927 | 0.01 | **Promote A2** (40 ep) |
+| **W_mat_flow_stagnation** | 0.771 | **0.976** | 0.01 | **Promote A** (40 ep) |
+| WF_mat_flow_fg | 0.767 | 0.947 | 0.00 | Optional backup |
+| WA/WI/WJ | 0.75-0.76 | 0.91-0.92 | 0.01-0.04 | Incremental; skip full budget |
+| WG_mat_flow_neighbor_crit | 0.712 | 0.809 | 0.02 | Mat-heavy; deprioritize |
+| WD_mat_flow_frontier | 0.001 | 0.004 | 0.00 | **Kill** (cold-start starvation) |
 
-```powershell
-# Primary promotion (~5 h)
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_mat_growth_simple.ps1 -Fresh -Leg W_mat_flow_stagnation -Epochs 40 -MaxWindows 0
+## DONE -- W/WC/P full compare (2026-06-29)
 
-# Fair control: P under same precision-first recipe (~5 h)
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_mat_growth_simple.ps1 -Fresh -Leg P_mat_plain -Epochs 40 -MaxWindows 0
-```
+Summary: `outputs/biochem/biochem_gnn/mat_w_wc_p_full/mat_w_wc_p_full_summary.json`
 
-Triage ranking (deploy_clot_f1): **W 0.764 > AB 0.671 > T 0.497 > V 0.470 > U 0.455 > S 0.447 > X 0.443 > Y 0.415**.
+**Promoted:** `W_mat_flow_stagnation` -> `mat_growth_ladder/W_mat_flow_stagnation/species/best.pth`
+
+## DONE -- W-fix sweep (2026-07-01)
+
+Summary: `outputs/biochem/biochem_gnn/mat_w_fix_sweep_10h/mat_w_fix_sweep_10h_summary.json`
+
+8/9 legs @ 28 ep (~10.8 h). **WC** best timeline FP (medFP 14, p90 34); **W** best score 0.961.
+**X/Y seedfront fail** (undergrowth). **WK/WL dropxy fail**. **WM** not run (budget cap).
+
+## DONE -- W/WC canonical (2026-07-02)
+
+Summary: `outputs/biochem/biochem_gnn/mat_w_wc_canonical/mat_w_wc_canonical_summary.json`
+
+**Promoted:** `WC_mat_flow_dynamic` -> `mat_growth_ladder/WC_mat_flow_dynamic/species/best.pth`
+(FP-aware pick: medFP **12**, p90 **36**, F1 **0.789** vs W medFP **56** p90 **99** F1 **0.795**).
+
+Run `-Promote` to copy alias -> `mat_canonical_deploy/species/best.pth`.
+
+## BACKLOG -- post canonical
+
+| Task | Why |
+|------|-----|
+| Run **WM_mat_flow_seedfront_tightfp** (1 leg) | Only unfinished W-fix sweep leg |
+| FP-aware winner on prior summaries | Re-rank `mat_w_fix_sweep_10h` with new `--minimize-metrics` |
+
+## DEPRIORITIZE (W-fix evidence)
+
+| Leg / lever | Why |
+|-------------|-----|
+| X / Y seed-front (without flow) | F1 0.42-0.50; cold-start undergrowth |
+| WK / WL drop-x/y only | No FP improvement vs W |
+| WG neighbor+crit | mat_f1 up, clot_f1 down |
 
 ---
 
@@ -114,9 +142,8 @@ Triage ranking (deploy_clot_f1): **W 0.764 > AB 0.671 > T 0.497 > V 0.470 > U 0.
 
 | Tier | When | Recipe |
 |------|------|--------|
-| **Promote 1-2 winners** | Triage picks leg within ~0.02 of best on clot_f1 + lower overpaint | 40 ep / all windows (~5 h/leg) |
-| **Full ladder** | Triage inconclusive | `go_mat_only_full_overnight.ps1` (8-12 h cap) |
-| **New modules** | All wired legs plateau | Design A / GAT gate |
+| **go_mat_w_wc_canonical.ps1** | **Done 2026-07-02** | WC promoted @ 40 ep |
+| **WF_mat_flow_fg** | Only if W over-grows | 40 ep optional backup |
 
 ---
 
@@ -126,4 +153,5 @@ Triage ranking (deploy_clot_f1): **W 0.764 > AB 0.671 > T 0.497 > V 0.470 > U 0.
 2. ~~Does tighter top-2% seed (Y) beat default 5% (U)?~~ **No -- Y 0.415 < U 0.455.**
 3. ~~Does gelation aux (AB) improve ranking without overpaint?~~ **No -- AB 0.671 but over/gt 0.20.**
 4. ~~Does precision-first selection change the P vs G ranking?~~ **W matches P=0.762 at triage tier.**
-5. Does W hold at 40 ep / all windows? Does flow+frontier hybrid beat W alone?
+5. ~~Does W hold at 40 ep / all windows? Does **WC** beat W at full budget?~~ **WC wins** on FP-aware deploy pick (§191); W +0.006 F1 but 2-3x worse medFP/p90FP.
+6. ~~Does flow+frontier without top-k (WD) help topology?~~ **No -- WD dead at deploy.**

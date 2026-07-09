@@ -178,6 +178,26 @@ def load_species_gnn_rollout_bundle(
         os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
     # Retired: do not re-enable temporal lambda gate from legacy checkpoint metadata.
     os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "0"
+
+    # Restore leg spec overrides if present in metadata or inferred from path
+    overrides = meta.get("env_overrides")
+    if overrides:
+        for k, v in overrides.items():
+            os.environ[k] = str(v)
+    else:
+        path_s = str(path).replace("\\", "/")
+        if "mat_growth_ladder/" in path_s:
+            parts = path_s.split("mat_growth_ladder/")
+            if len(parts) > 1:
+                leg = parts[1].split("/")[0]
+                if leg:
+                    try:
+                        from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env
+                        apply_mat_growth_leg_env(leg, force=True)
+                    except Exception as e:
+                        if not quiet:
+                            print(f"[WARN] Failed to apply leg env for {leg} from path: {e}")
+
     label = _bundle_label_from_path(path, phase)
     if (
         "continuous" in phase
@@ -275,15 +295,38 @@ def rollout_species_gnn_species_series(
     if bundle.kind == "continuous":
         assert bundle.continuous is not None
         model = bundle.continuous.model
-        bind_band_geometry(model, {"pos_band": stat.pos_band, "edge_index": stat.edge_index})
+        wmask = data.mask_wall[stat.node_idx] if hasattr(data, "mask_wall") and data.mask_wall is not None else None
+        bind_band_geometry(model, {"pos_band": stat.pos_band, "edge_index": stat.edge_index, "wall_mask_band": wmask})
         log_state = deploy_fimat_log_init(data, dev, stat.node_idx)
         vel_alphas = model_vel_decay_alphas(model) if continuous_vel_decay_enabled() else None
+
+        coupler = None
+        mu_bulk_si = None
+        if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
+            try:
+                from src.inference.corrector_coupling import ClotAwareFlow, resolve_kinematics_checkpoint, resolve_corrector_checkpoint
+                from src.core_physics.coupled_shear_gnn import LocalKinematicCorrector
+                from src.utils.kinematics_inference import load_kinematics_predictor
+                from src.core_physics.clot_growth_masks import resolve_bulk_carreau_mu_si
+                kine = load_kinematics_predictor(resolve_kinematics_checkpoint(), dev)
+                corrector_ckpt = resolve_corrector_checkpoint()
+                from src.core_physics.coupled_shear_gnn import load_local_corrector
+                corr_model = load_local_corrector(corrector_ckpt, dev)
+                coupler = ClotAwareFlow(dev, phys_cfg=phys)
+                coupler._kine = kine
+                coupler._corrector = corr_model
+                u0, v0 = coupler.base_flow(data)
+                mu_bulk_si = resolve_bulk_carreau_mu_si(data, 0, phys, dev, u_nd=u0, v_nd=v0).reshape(-1)
+            except Exception as e:
+                print(f"[WARN] Failed to initialize closed-loop flow coupler: {e}")
+
         for t in range(n_steps):
             sp = pin_species_block(data, t, dev, pin_other=pin_mode)  # type: ignore[arg-type]
             sp = _write_fimat_log_to_species(sp, log_state, stat.node_idx)
             out[t, :, sc.SPECIES_BLOCK] = sp
             if t >= n_steps - 1:
                 break
+            vel_val = data.y[t, stat.node_idx, 0:2] if hasattr(data, "y") and data.y is not None and t < data.y.shape[0] else None
             pred_delta = predict_continuous_step_delta(
                 model,
                 stat.base_feats,
@@ -295,6 +338,9 @@ def rollout_species_gnn_species_series(
                 time_index=(t if stat.flow_series is not None else None),
                 flow_series=stat.flow_series,
                 flow_cols=stat.flow_cols,
+                wall_mask_band=wmask,
+                species_block=sp,
+                velocity=vel_val,
             )
             spd = (
                 band_speed_for_rollout(data, t + 1, dev, stat.node_idx)
@@ -308,6 +354,41 @@ def rollout_species_gnn_species_series(
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
             )
+
+            # If closed loop coupling is enabled, update velocity for t+1
+            if coupler is not None and t + 1 < n_steps:
+                try:
+                    from src.core_physics.species_gelation_readout import differentiable_clot_phi_from_species12, differentiable_mu_eff_from_species12
+                    from src.core_physics.clot_phi_simple import comsol_carreau_mu_si_from_uv
+                    from src.inference.corrector_coupling import write_coupled_flow_into_y
+                    
+                    sp_next = pin_species_block(data, t + 1, dev, pin_other=pin_mode)
+                    sp_next = _write_fimat_log_to_species(sp_next, log_state, stat.node_idx)
+                    species_log12 = sp_next
+                    
+                    phi_clot = differentiable_clot_phi_from_species12(species_log12, bio)
+                    u_t1 = data.y[t + 1, :, 0]
+                    v_t1 = data.y[t + 1, :, 1]
+                    gel_factor = torch.ones_like(u_t1)
+                    mu_carreau_si = comsol_carreau_mu_si_from_uv(
+                        data,
+                        u_t1,
+                        v_t1,
+                        gel_factor,
+                        phys,
+                        device=dev,
+                    )
+                    mu_eff_si = differentiable_mu_eff_from_species12(species_log12, mu_carreau_si, phi_clot, bio).reshape(-1)
+                    
+                    state = coupler.update(data, mu_eff_si, mu_bulk_si=mu_bulk_si, publish=False)
+                    write_coupled_flow_into_y(data, state.u, state.v, time_index=t + 1)
+                    
+                    if stat.flow_series is not None and stat.flow_cols is not None:
+                        from src.core_physics.species_pushforward_gnn import _flow_feats_from_uv
+                        flow_feats_next = _flow_feats_from_uv(data, state.u, state.v, dev, stat.node_idx)
+                        stat.flow_series[t + 1] = flow_feats_next
+                except Exception as e:
+                    print(f"[WARN] Failed to apply closed-loop flow coupling at step {t+1}: {e}")
         from src.core_physics.species_viscosity_calibration import (
             apply_mat_beta_to_species_series,
             load_viscosity_calibration,
@@ -375,11 +456,13 @@ def rollout_species_gnn_phi_trajectory(
 
     gel_beta = resolve_deploy_gelation_beta(dev)
     flow = _resolve_flow_source(flow_source)
+    import os
+    nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
     with t0_rung2_env():
         traj = rollout_t0_clot_phi(
             data, phys, bio, dev,
             gamma_mode=RUNG2_GAMMA_MODE, flow_source=flow,
-            pred_species_series=pred, nucleation=True, nucleation_hops=1,
+            pred_species_series=pred, nucleation=True, nucleation_hops=nuc_hops,
             gelation_beta=gel_beta,
         )
     return {int(t): v["phi"] for t, v in traj.items()}

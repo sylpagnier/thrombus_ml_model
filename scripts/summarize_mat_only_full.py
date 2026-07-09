@@ -28,6 +28,13 @@ METRICS = (
     "mat_front_speed_ratio",
     "mat_overpaint_frac",
     "mat_overpaint_per_gt",
+    "clot_fp_median",
+    "clot_fp_p90",
+    "clot_fp_max",
+    "clot_fn_median",
+    "clot_err_median",
+    "clot_err_p90",
+    "clot_fp_early_mean",
 )
 DEFAULT_LEGS = (
     "P_mat_plain",
@@ -43,10 +50,109 @@ DEFAULT_LEGS = (
 )
 
 
+def _pick_winner(
+    rows: list[dict],
+    *,
+    rank_by: list[str],
+    minimize_by: set[str] | None = None,
+    max_overpaint_per_gt: float | None,
+    max_clot_fp_p90: float | None,
+    max_clot_fp_early_mean: float | None,
+    prefer_leg: str | None = None,
+    tie_eps: float = 0.0,
+) -> dict | None:
+    eligible = rows
+    if max_overpaint_per_gt is not None:
+        eligible = [
+            r
+            for r in rows
+            if r["cohort_mean"].get("mat_overpaint_per_gt", 1.0) <= max_overpaint_per_gt
+        ]
+    if max_clot_fp_p90 is not None:
+        eligible = [r for r in eligible if r["cohort_mean"].get("clot_fp_p90", 1e9) <= max_clot_fp_p90]
+    if max_clot_fp_early_mean is not None:
+        eligible = [
+            r
+            for r in eligible
+            if r["cohort_mean"].get("clot_fp_early_mean", 1e9) <= max_clot_fp_early_mean
+        ]
+    if not eligible:
+        return None
+
+    min_set = minimize_by or set()
+
+    def sort_key(row: dict) -> tuple[float, ...]:
+        cm = row["cohort_mean"]
+        out: list[float] = []
+        for k in rank_by:
+            v = float(cm.get(k, 0.0))
+            out.append(-v if k in min_set else v)
+        return tuple(out)
+
+    best = max(eligible, key=sort_key)
+    pref = (prefer_leg or "").strip()
+    if pref and pref != best["leg"]:
+        cand = next((r for r in eligible if r["leg"] == pref), None)
+        if cand is not None and tie_eps > 0.0 and rank_by:
+            k0 = rank_by[0]
+            b0 = float(best["cohort_mean"].get(k0, 0.0))
+            c0 = float(cand["cohort_mean"].get(k0, 0.0))
+            if k0 in min_set:
+                if c0 <= b0 + tie_eps:
+                    return cand
+            elif c0 >= b0 - tie_eps:
+                return cand
+    return best
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize full-budget Mat-only legs vs locked baseline")
     ap.add_argument("--legs", default=",".join(DEFAULT_LEGS), help="comma list of leg codes")
     ap.add_argument("--out", default="outputs/biochem/biochem_gnn/mat_only_full/mat_only_full_summary.json")
+    ap.add_argument(
+        "--pick-winner",
+        action="store_true",
+        help="print and embed optimal leg (requires --rank-by; optional --max-overpaint-per-gt filter)",
+    )
+    ap.add_argument(
+        "--max-overpaint-per-gt",
+        type=float,
+        default=None,
+        help="exclude legs with mat_overpaint_per_gt above this threshold",
+    )
+    ap.add_argument(
+        "--rank-by",
+        default="deploy_clot_f1",
+        help="comma list of metrics; first metric breaks ties (descending)",
+    )
+    ap.add_argument(
+        "--max-clot-fp-p90",
+        type=float,
+        default=None,
+        help="exclude legs with clot_fp_p90 above this threshold",
+    )
+    ap.add_argument(
+        "--max-clot-fp-early-mean",
+        type=float,
+        default=None,
+        help="exclude legs with clot_fp_early_mean above this threshold",
+    )
+    ap.add_argument(
+        "--minimize-metrics",
+        default="",
+        help="comma metrics where lower is better (negated in rank sort)",
+    )
+    ap.add_argument(
+        "--prefer-leg",
+        default="",
+        help="when within --tie-eps on the first rank metric, prefer this leg",
+    )
+    ap.add_argument(
+        "--tie-eps",
+        type=float,
+        default=0.0,
+        help="tolerance on first rank metric for --prefer-leg override",
+    )
     args = ap.parse_args()
 
     legs = [s.strip() for s in args.legs.split(",") if s.strip()]
@@ -90,7 +196,7 @@ def main() -> int:
         )
     hdr = (
         f"  {'leg':<28}{'mat':>7}{'clot_f1':>9}{'d_clot':>8}{'score':>8}"
-        f"{'seedP':>8}{'frontP':>8}{'speed':>8}{'over/gt':>9}"
+        f"{'medFP':>7}{'p90FP':>7}{'medFN':>7}{'over/gt':>9}"
     )
     print(hdr, flush=True)
     print("  " + "-" * (len(hdr) - 2), flush=True)
@@ -99,12 +205,56 @@ def main() -> int:
         print(
             f"  {row['leg']:<28}{cm['deploy_mat_f1']:>7.3f}{cm['deploy_clot_f1']:>9.3f}"
             f"{dv['deploy_clot_f1']:>+8.3f}{cm['deploy_clot_score']:>8.3f}"
-            f"{cm.get('mat_seed_prec', 0.0):>8.3f}{cm.get('mat_front_prec', 0.0):>8.3f}"
-            f"{cm.get('mat_front_speed_ratio', 0.0):>8.2f}{cm.get('mat_overpaint_per_gt', 0.0):>9.2f}",
+            f"{cm.get('clot_fp_median', 0.0):>7.0f}{cm.get('clot_fp_p90', 0.0):>7.0f}"
+            f"{cm.get('clot_fn_median', 0.0):>7.0f}{cm.get('mat_overpaint_per_gt', 0.0):>9.2f}",
             flush=True,
         )
 
-    summary = {"baseline_locked_mean": baseline_mean, "legs": rows}
+    rank_by = [s.strip() for s in args.rank_by.split(",") if s.strip()]
+    minimize_by = {s.strip() for s in args.minimize_metrics.split(",") if s.strip()}
+    winner = None
+    if args.pick_winner:
+        winner = _pick_winner(
+            rows,
+            rank_by=rank_by,
+            minimize_by=minimize_by,
+            max_overpaint_per_gt=args.max_overpaint_per_gt,
+            max_clot_fp_p90=args.max_clot_fp_p90,
+            max_clot_fp_early_mean=args.max_clot_fp_early_mean,
+            prefer_leg=args.prefer_leg.strip() or None,
+            tie_eps=float(args.tie_eps),
+        )
+        if winner is None:
+            print(
+                "\n[WARN] no winner: no leg passed overpaint filter "
+                f"(max_overpaint_per_gt={args.max_overpaint_per_gt}, "
+                f"max_clot_fp_p90={args.max_clot_fp_p90}, "
+                f"max_clot_fp_early_mean={args.max_clot_fp_early_mean})",
+                flush=True,
+            )
+        else:
+            cm = winner["cohort_mean"]
+            print(
+                f"\n[WINNER] {winner['leg']} "
+                f"clot_score={cm['deploy_clot_score']:.3f} "
+                f"clot_f1={cm['deploy_clot_f1']:.3f} "
+                f"over/gt={cm.get('mat_overpaint_per_gt', 0.0):.2f} "
+                f"(rank: {', '.join(rank_by)})",
+                flush=True,
+            )
+
+    summary: dict = {"baseline_locked_mean": baseline_mean, "legs": rows}
+    if args.pick_winner:
+        summary["pick_config"] = {
+            "rank_by": rank_by,
+            "minimize_metrics": sorted(minimize_by),
+            "max_overpaint_per_gt": args.max_overpaint_per_gt,
+            "max_clot_fp_p90": args.max_clot_fp_p90,
+            "max_clot_fp_early_mean": args.max_clot_fp_early_mean,
+            "prefer_leg": args.prefer_leg.strip() or None,
+            "tie_eps": float(args.tie_eps),
+        }
+        summary["winner"] = winner
     out = Path(args.out)
     if not out.is_absolute():
         out = (REPO / out).resolve()

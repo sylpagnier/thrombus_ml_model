@@ -127,10 +127,11 @@ def resolve_growth_support_at_time(
     ceiling = resolve_ceiling_mask(data, device, bio_cfg, ceiling_hops=ceiling_hops)
     ei = data.edge_index.to(device=device)
 
+    dil_hops = int(os.environ.get("SPECIES_GROWTH_DILATION", "1"))
     if t <= 0:
         return t0 & ceiling
 
-    support = t0 | graph_dilate_hops(t0, ei, 1)
+    support = t0 | graph_dilate_hops(t0, ei, dil_hops)
     if t == 1:
         return support & ceiling
 
@@ -142,7 +143,7 @@ def resolve_growth_support_at_time(
         else:
             if phi_pred_by_time is None:
                 # No rollout history (viz/debug): static wall bootstrap only.
-                return (t0 | graph_dilate_hops(t0, ei, 1)) & ceiling
+                return (t0 | graph_dilate_hops(t0, ei, dil_hops)) & ceiling
             phi_m1 = phi_pred_by_time.get(k - 1)
             if phi_m1 is None:
                 new_clot = torch.zeros(int(data.num_nodes), device=device, dtype=torch.bool)
@@ -152,7 +153,7 @@ def resolve_growth_support_at_time(
                     new_clot = pred_clot_mask(phi_m1)
                 else:
                     new_clot = pred_clot_mask(phi_m1) & ~pred_clot_mask(phi_m2)
-        support = support | graph_dilate_hops(new_clot, ei, 1)
+        support = support | graph_dilate_hops(new_clot, ei, dil_hops)
 
     return support & ceiling
 

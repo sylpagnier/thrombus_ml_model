@@ -375,5 +375,14 @@ def apply_deploy_env(
         merged["BIOCHEM_GNN_LOAO_AUTO"] = str(m.get("loao_auto"))
     merged.update(pre)
     for k, v in merged.items():
+        if k in os.environ and k not in (overrides or {}) and k not in (
+            "SPECIES_GNN_CLOUT_CKPT",
+            "SPECIES_CONTINUOUS_CKPT",
+            "T0_R4_SPECIES_GNN_CKPT",
+            "SPECIES_VISCOSITY_CALIB_PATH",
+            "KINEMATICS_CHECKPOINT",
+        ):
+            continue
         os.environ[k] = str(v)
     return merged
+

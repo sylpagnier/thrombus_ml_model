@@ -167,6 +167,97 @@ def test_physical_guided_leg_specs():
     assert ab.env_overrides.get("SPECIES_CONTINUOUS_PHYSICS_READOUT") == "1"
 
 
+def test_w_physics_triage_leg_specs():
+    """WA-WJ: W base + one COMSOL-targeted channel each (physics triage ladder)."""
+    wa = mat_growth_leg_spec("WA_mat_flow_neighbor_gate")
+    wb = mat_growth_leg_spec("WB_mat_flow_geom_rich")
+    wc = mat_growth_leg_spec("WC_mat_flow_dynamic")
+    wd = mat_growth_leg_spec("WD_mat_flow_frontier")
+    we = mat_growth_leg_spec("WE_mat_flow_thrombin")
+    wf = mat_growth_leg_spec("WF_mat_flow_fg")
+    wg = mat_growth_leg_spec("WG_mat_flow_neighbor_crit")
+    wh = mat_growth_leg_spec("WH_mat_flow_gelation_light")
+    wi = mat_growth_leg_spec("WI_mat_flow_neighbor_geom")
+    wj = mat_growth_leg_spec("WJ_mat_flow_stack")
+    for leg in (wa, wb, wc, wd, we, wf, wg, wh, wi, wj):
+        assert leg.env_overrides.get("SPECIES_FLOW_FEATS") == "1"
+    assert wa.env_overrides.get("SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE") == "1"
+    assert wb.env_overrides.get("SPECIES_GEOM_FEATS_RICH") == "1"
+    assert wc.env_overrides.get("SPECIES_FLOW_FEATS_DYNAMIC") == "1"
+    assert wd.env_overrides.get("SPECIES_CONTINUOUS_FRONTIER_HOPS") == "1"
+    assert float(wd.env_overrides.get("SPECIES_CONTINUOUS_NUCLEATION_TOPK")) == 0.0
+    assert we.env_overrides.get("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS") == "11,5"
+    assert wf.env_overrides.get("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS") == "11,7"
+    assert wg.env_overrides.get("SPECIES_CONTINUOUS_UNDERPRED_WEIGHT") == "5.0"
+    assert wh.env_overrides.get("SPECIES_CONTINUOUS_PHYSICS_READOUT") == "1"
+    assert float(wh.env_overrides.get("SPECIES_CONTINUOUS_PHI_LOSS_WEIGHT")) == 0.25
+    assert wi.env_overrides.get("SPECIES_GEOM_FEATS_RICH") == "1"
+    assert wj.env_overrides.get("SPECIES_FLOW_FEATS_DYNAMIC") == "1"
+    assert wj.env_overrides.get("SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE") == "1"
+
+
+def test_eval_ckpt_recipe_is_deploy_faithful(monkeypatch):
+    """Mat-growth eval must not inherit GT flow/species pins from training env."""
+    from scripts.eval_mat_growth_simple import _apply_ckpt_recipe
+
+    monkeypatch.setenv("SPECIES_FLOW_FEATS_SOURCE", "gt")
+    monkeypatch.setenv("SPECIES_ROLLOUT_PIN_OTHER", "gt")
+    monkeypatch.setenv("SPECIES_ROLLOUT_IC_SOURCE", "gt")
+    _apply_ckpt_recipe(
+        {
+            "pushforward_species_scope": "mat",
+            "dual_head": True,
+            "flow_feats": True,
+            "flow_dynamic": True,
+            "pushforward_species_channels": [11, 5],
+        },
+        label="mat_growth_simple",
+    )
+    assert os.environ.get("SPECIES_FLOW_FEATS_SOURCE") is None
+    assert os.environ["SPECIES_ROLLOUT_DEPLOY_FAITHFUL"] == "1"
+    assert os.environ["SPECIES_ROLLOUT_PIN_OTHER"] == "rest"
+    assert os.environ["SPECIES_ROLLOUT_IC_SOURCE"] == "resting"
+    assert os.environ["SPECIES_ROLLOUT_VEL_SOURCE"] == "kinematics"
+    assert os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] == "11,5"
+    assert os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] == "1"
+    os.environ.pop("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS", None)
+    os.environ.pop("SPECIES_FLOW_FEATS_DYNAMIC", None)
+
+
+def test_continuous_bundle_restores_flow_dynamic_and_channels(monkeypatch, tmp_path):
+    """WC/WE eval must rebuild the same state width and dynamic-flow path as training."""
+    monkeypatch.delenv("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS", raising=False)
+    monkeypatch.delenv("SPECIES_FLOW_FEATS_DYNAMIC", raising=False)
+    monkeypatch.setenv("BIOCHEM_PUSHFORWARD_SPECIES_SCOPE", "mat")
+    in_dim = continuous_feature_dim(8)
+    model = SpeciesDualHeadContinuousGNN(in_dim, hidden=16, out_dim=2)
+    ckpt = tmp_path / "mat_th_meta.pth"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "in_dim": int(model.in_dim),
+            "hidden": int(model.hidden),
+            "meta": {
+                "dual_head": True,
+                "pushforward_species_scope": "mat",
+                "pushforward_species_channels": [11, 5],
+                "flow_feats": True,
+                "flow_dynamic": True,
+            },
+        },
+        ckpt,
+    )
+    bundle = load_continuous_bundle(ckpt, device=torch.device("cpu"), quiet=True)
+    assert bundle is not None
+    assert os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] == "11,5"
+    assert os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] == "1"
+    assert pushforward_state_bulk_indices() == [11, 5]
+    assert bundle.model.out_dim == 2
+    # load_continuous_bundle writes os.environ directly (not via monkeypatch).
+    os.environ.pop("BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS", None)
+    os.environ.pop("SPECIES_FLOW_FEATS_DYNAMIC", None)
+
+
 def test_continuous_bundle_restores_sparse_front_meta(monkeypatch, tmp_path):
     """Sparse-front deploy knobs are checkpoint metadata, not caller-side tribal knowledge."""
     monkeypatch.setenv("BIOCHEM_PUSHFORWARD_SPECIES_SCOPE", "mat")
