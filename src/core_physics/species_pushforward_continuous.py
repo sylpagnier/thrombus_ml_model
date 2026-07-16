@@ -1659,6 +1659,19 @@ def get_cached_offwall_model(device, in_dim, hidden, out_dim):
     from src.core_physics.species_pushforward_continuous import SpeciesDualHeadContinuousGNN
     offwall_model = SpeciesDualHeadContinuousGNN(in_dim=in_dim, hidden=hidden, out_dim=out_dim).to(device)
     sd = payload.get("model_state") or payload.get("model_state_dict") or payload
+    
+    # Pre-validate shapes to raise helpful size mismatch errors
+    model_sd = offwall_model.state_dict()
+    for name, param in sd.items():
+        if name in model_sd:
+            if param.shape != model_sd[name].shape:
+                raise ValueError(
+                    f"Dimension mismatch for parameter '{name}' in off-wall GNN: "
+                    f"checkpoint shape is {param.shape}, but model expects {model_sd[name].shape}. "
+                    f"Please ensure the off-wall growth model was trained with the same environment "
+                    f"settings (e.g. species scope, GNN features) as the main model."
+                )
+                
     offwall_model.load_state_dict(sd, strict=False)
     offwall_model.eval()
     _OFFWALL_MODEL_CACHE = offwall_model
