@@ -504,7 +504,7 @@ def ensure_anchor_mesh_from_comsol(
     try:
         m = meshio.read(nas_path)
         if int(m.points.shape[0]) >= 3 and int(m.points.shape[1]) >= 2:
-            meshio.write(msh_path, m)
+            meshio.write(msh_path, m, file_format="gmsh")
             logger.info("[OK] %s: wrote %s from NASTRAN export", stem, msh_path.name)
     except Exception as exc:
         logger.warning("[WARN] %s: .nas -> .msh conversion failed (%s); using .nas", stem, exc)

@@ -332,7 +332,7 @@ def pull_exports_via_mph_nodes(
 
             m = meshio.read(nas_path)
             if m.points.shape[0] >= 3:
-                meshio.write(msh_path, m)
+                meshio.write(msh_path, m, file_format="gmsh")
         except Exception as exc:
             logger.warning("[WARN] %s: .nas -> .msh failed (%s)", stem, exc)
 
