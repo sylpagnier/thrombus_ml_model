@@ -8,7 +8,7 @@ Set-Location $RepoRoot
 $env:PYTHONUNBUFFERED = "1"
 
 $Ckpt_v6 = "outputs/biochem/biochem_gnn/mat_growth_ladder/WC_v6_closed_loop_eval/species/best.pth"
-$Ckpt_blur = "outputs/biochem/offwall_model/best_blurring.pth"
+$Ckpt_blur = "outputs/biochem/offwall_model/best_blurring_v6.pth"
 
 if (-not (Test-Path $Ckpt_v6)) {
     throw "baseline checkpoint not found at: $Ckpt_v6"

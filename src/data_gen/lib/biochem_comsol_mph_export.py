@@ -335,6 +335,11 @@ def pull_exports_via_mph_nodes(
                 meshio.write(msh_path, m, file_format="gmsh")
         except Exception as exc:
             logger.warning("[WARN] %s: .nas -> .msh failed (%s)", stem, exc)
+            if msh_path.is_file():
+                try:
+                    msh_path.unlink()
+                except Exception:
+                    pass
 
     tmp_dir = label_dir / "_mph_export_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)

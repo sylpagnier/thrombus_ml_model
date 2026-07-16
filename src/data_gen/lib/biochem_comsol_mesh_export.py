@@ -508,6 +508,11 @@ def ensure_anchor_mesh_from_comsol(
             logger.info("[OK] %s: wrote %s from NASTRAN export", stem, msh_path.name)
     except Exception as exc:
         logger.warning("[WARN] %s: .nas -> .msh conversion failed (%s); using .nas", stem, exc)
+        if msh_path.is_file():
+            try:
+                msh_path.unlink()
+            except Exception:
+                pass
 
     scaffold_anchor_sidecars(raw_dir, unit="cm", force=False, dry_run=False)
     sidecar = raw_dir / f"{stem}.json"
