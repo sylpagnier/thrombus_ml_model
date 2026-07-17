@@ -445,51 +445,69 @@ class PatientDataExtractor:
         # 2. Load the numeric data (skipping comment lines)
         df_full = pd.read_csv(filepath, comment='%', sep=r'\s+', header=None)
 
-        # 3. Slice the wide dataframe into time blocks
-        time_blocks = {}
-        n_cols = df_full.shape[1]
-        n_times = len(times)
+        # 3. Parse the header line to map columns dynamically to variables for each time step
+        tokens = header_line.strip().split()
+        if len(tokens) < 3 or tokens[0] != '%' or tokens[1] != 'x' or tokens[2] != 'y':
+            raise ValueError(f"Unexpected header format in {filepath.name}: {header_line[:200]}")
 
-        # Determine if coordinates are repeated per time step (18 columns) or static (16 columns)
-        if n_cols == 2 + 18 * n_times:
-            vars_per_step = 18
-            coords_repeated = True
-        elif n_cols == 2 + 16 * n_times:
-            vars_per_step = 16
-            coords_repeated = False
-        else:
-            raise ValueError(
-                f"Unexpected number of columns in {filepath.name}: {n_cols}. "
-                f"For {n_times} time steps, expected either {2 + 18 * n_times} (repeated coords) "
-                f"or {2 + 16 * n_times} (static coords) columns."
-            )
+        # Map: (t_val, var_name) -> col_idx
+        col_mapping = {}
+        
+        # We start looking at tokens from index 3. They come in groups of 3: <name> @ t=<value>
+        for col_idx in range((len(tokens) - 3) // 3):
+            name = tokens[3 + col_idx * 3]
+            at_symbol = tokens[3 + col_idx * 3 + 1]
+            t_tag = tokens[3 + col_idx * 3 + 2]
+            
+            if at_symbol != '@' or not t_tag.startswith('t='):
+                continue
+                
+            try:
+                t_val = float(t_tag.split('=')[1])
+                # COMSOL can use 'spf.mu' or 'mu_effective'
+                if name == 'spf.mu':
+                    name = 'mu_effective'
+                col_mapping[(t_val, name)] = col_idx + 2
+            except (ValueError, IndexError):
+                continue
+
+        print(f"[i] Dynamic column parser: mapped {len(col_mapping)} variables across {len(times)} time steps for {filepath.name}.")
 
         static_x = df_full.iloc[:, 0].copy()
         static_y = df_full.iloc[:, 1].copy()
 
-        for i, t_val in enumerate(times):
-            # Base coords take columns. Step 0 starts at col 2.
-            start_col = 2 + (i * vars_per_step)
-            end_col = start_col + vars_per_step
+        # Standard variables list in expected output order
+        target_fields = [
+            'u', 'v', 'p', 'mu_effective',
+            'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
+        ]
 
-            # Extract the block
-            df_step = df_full.iloc[ :, start_col:end_col ].copy()
-
-            if coords_repeated:
-                # Assign consistent internal column names
-                df_step.columns = [
-                    'x', 'y', 'u', 'v', 'p', 'mu_effective',
-                    'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
-                ]
-            else:
-                # Assign consistent internal column names without x and y, then add them
-                df_step.columns = [
-                    'u', 'v', 'p', 'mu_effective',
-                    'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
-                ]
-                df_step.insert(0, 'y', static_y)
-                df_step.insert(0, 'x', static_x)
-            time_blocks[ t_val ] = df_step
+        time_blocks = {}
+        for t_val in times:
+            df_step = pd.DataFrame(index=df_full.index)
+            
+            # Static coordinates
+            df_step['x'] = static_x
+            df_step['y'] = static_y
+            
+            # Find and map each field for this time value
+            for f in target_fields:
+                col_key = (t_val, f)
+                if col_key in col_mapping:
+                    df_step[f] = df_full.iloc[:, col_mapping[col_key]]
+                else:
+                    if f in ('x', 'y'):
+                        continue
+                    # Fallback lookup in case of floating-point comparison issues
+                    closest_time = min(col_mapping.keys(), key=lambda k: abs(k[0] - t_val))
+                    if abs(closest_time[0] - t_val) < 1e-4 and closest_time[1] == f:
+                        df_step[f] = df_full.iloc[:, col_mapping[closest_time]]
+                    else:
+                        raise KeyError(
+                            f"Could not find column for variable '{f}' at t={t_val} in {filepath.name}. "
+                            f"Available variables at this step: {[k[1] for k in col_mapping if abs(k[0] - t_val) < 1e-4]}"
+                        )
+            time_blocks[t_val] = df_step
 
         return time_blocks
 

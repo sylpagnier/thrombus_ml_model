@@ -12,9 +12,11 @@ from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
 
 def _minimal_wide_txt(path, times_s: list[float], n_rows: int = 2) -> None:
     """Tiny COMSOL-style wide export: one header line + numeric rows (``vars_per_step`` = 18 per time)."""
-    parts = ["% x"]
+    vars_list = ["x", "y", "u", "v", "p", "mu_effective", "rp", "ap", "apr", "aps", "PT", "th", "at", "fg", "fi", "M", "Mas", "Mat"]
+    parts = ["% x", "y"]
     for t in times_s:
-        parts.append(f"x y u v p mu_effective rp ap apr aps PT th at fg fi M Mas Mat @ t={t}")
+        for v in vars_list:
+            parts.append(f"{v} @ t={t}")
     header = " ".join(parts) + "\n"
     n_times = len(times_s)
     n_cols = 2 + n_times * 18
