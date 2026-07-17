@@ -16,6 +16,7 @@
 
 - `check_biochem_gnn_gate.py`
 - `viz_species_gnn_deploy.py`
+- `go_customer_predict.ps1` — customer Predict app (geometry inbox + Re + time slider)
 
 ## Kinematics scripts kept active
 

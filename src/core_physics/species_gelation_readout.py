@@ -179,12 +179,22 @@ def gelation_phi_loss(
     m = mask.reshape(-1).to(device=pred_phi.device).bool()
     if not bool(m.any().item()):
         return pred_phi.sum() * 0.0
-    p = pred_phi[m].clamp(1e-6, 1.0 - 1.0e-6)
+    p = pred_phi[m]
     t = gt_phi[m].clamp(0.0, 1.0)
-    # Upweight transition band (pre-gelation desync lives here).
+    
+    # Support different loss types (e.g. mse, l1, bce)
+    loss_type = (os.environ.get("SPECIES_GELATION_PHI_LOSS_TYPE") or "bce").strip().lower()
+    
     boost = gelation_frontier_boost()
     w = 1.0 + (boost - 1.0) * (4.0 * t * (1.0 - t))
-    return (F.binary_cross_entropy(p, t, reduction="none") * w).mean()
+    
+    if loss_type == "mse":
+        return (F.mse_loss(p, t, reduction="none") * w).mean()
+    elif loss_type == "l1":
+        return (F.l1_loss(p, t, reduction="none") * w).mean()
+    else:
+        p_clamped = p.clamp(1e-6, 1.0 - 1.0e-6)
+        return (F.binary_cross_entropy(p_clamped, t, reduction="none") * w).mean()
 
 
 def gelation_mu_log_loss(

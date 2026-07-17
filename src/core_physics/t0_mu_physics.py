@@ -198,10 +198,17 @@ def rollout_t0_clot_phi(
     mu_anchor_si: torch.Tensor | None = None
 
     for t in range(n_steps):
-        step = build_clot_phi_step(data, t, phys_cfg, bio_cfg, device)
         species_log1p = None
         if pred_species_series is not None:
             species_log1p = pred_species_series[t, :, sc.SPECIES_BLOCK].to(device=device, dtype=torch.float32)
+        step = build_clot_phi_step(
+            data,
+            t,
+            phys_cfg,
+            bio_cfg,
+            device,
+            species_log_override=species_log1p,
+        )
         phi_raw, mu_raw = forward_physics_trigger_phi(
             step,
             data,

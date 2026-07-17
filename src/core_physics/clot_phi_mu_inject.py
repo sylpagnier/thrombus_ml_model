@@ -257,7 +257,11 @@ def init_deploy_supervision_vision_mask(
     bio = bio_cfg or BiochemConfig(phase="biochem")
     ti = deploy_vision_init_time_index(int(time_index))
     step = build_clot_phi_step(data, ti, phys, bio, device)
-    return step.region.reshape(-1).bool()
+    region = step.region.reshape(-1).bool()
+    if not region.any():
+        from src.core_physics.clot_phi_simple import wall_supervision_mask
+        region = wall_supervision_mask(data, device)
+    return region
 
 
 def init_seed_growth_allowed_mask(

@@ -1,7 +1,12 @@
-"""Deploy stack viz: GT clot | GNN clot map (+ nucleation E(t) overlay).
+"""Deploy stack viz: GT clot | GNN clot map | hop-colored error row.
 
 Uses ``species_gnn_deploy_env`` (species ckpt, beta, per-anchor overrides).
 Deploy flow is pred kinematics by default.
+
+Examples:
+    python scripts/viz_species_gnn_deploy.py --anchor patient007
+    python scripts/viz_species_gnn_deploy.py --all-anchors
+    python scripts/viz_species_gnn_deploy.py --legacy-six --max-frames 4
 """
 
 from __future__ import annotations
@@ -14,6 +19,9 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -32,6 +40,11 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     species_gnn_rollout_ckpt,
 )
 from src.core_physics.species_gnn_ladder_viz import ladder_viz_times, scatter_clot_error_panel  # noqa: E402
+from src.core_physics.species_pushforward_continuous import (  # noqa: E402
+    BIOCHEM_ANCHORS_6,
+    discover_biochem_anchors,
+    parse_biochem_train_anchors,
+)
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
 from src.evaluation.viz_clot_phi_simple import _scatter_fullmesh_region  # noqa: E402
@@ -141,62 +154,88 @@ def _scatter_clot_panel(
     )
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="GNN clot map deploy viz")
-    ap.add_argument("--anchor", default="patient007")
-    ap.add_argument("--manifest", default=DEFAULT_MANIFEST)
-    ap.add_argument("--flow", default="kinematics", choices=("gt", "kinematics"))
-    ap.add_argument("--max-frames", type=int, default=10)
-    ap.add_argument("--scatter-size", type=float, default=3.0)
-    ap.add_argument("--no-error-row", action="store_true")
-    ap.add_argument("--out", default="")
-    args = ap.parse_args()
+def _hop_error_legend(fig) -> None:
+    from matplotlib.patches import Patch
 
-    device = require_cuda_device()
+    legend_elements = [
+        Patch(facecolor="#800000", label="FP Wall (Hop 0)"),
+        Patch(facecolor="#d62728", label="FP Hop 1"),
+        Patch(facecolor="#ff7f0e", label="FP Hop 2"),
+        Patch(facecolor="#fd8d3c", label="FP Hop 3"),
+        Patch(facecolor="#feb24c", label="FP Hop 4+"),
+        Patch(facecolor="#084594", label="FN Wall (Hop 0)"),
+        Patch(facecolor="#1f77b4", label="FN Hop 1"),
+        Patch(facecolor="#4292c6", label="FN Hop 2"),
+        Patch(facecolor="#6baed6", label="FN Hop 3"),
+        Patch(facecolor="#9ecae1", label="FN Hop 4+"),
+    ]
+    fig.legend(
+        handles=legend_elements,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        ncol=1,
+        fontsize=8,
+        title="Error BFS Hops\nfrom Wall",
+        title_fontsize=9,
+    )
+
+
+def viz_anchor_deploy(
+    anchor: str,
+    *,
+    manifest: dict,
+    device: torch.device,
+    flow_source: str,
+    manifest_name: str,
+    max_frames: int,
+    scatter_size: float,
+    include_error_row: bool,
+    out: Path | None = None,
+) -> dict:
+    """Run one anchor: GT | pred | hop-colored error PNG + sidecar JSON."""
     root = get_project_root()
-    manifest = load_deploy_manifest(args.manifest.strip() or None)
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
     data = torch.load(
-        root / "data/processed/graphs_biochem_anchors" / f"{args.anchor}.pt",
+        root / "data/processed/graphs_biochem_anchors" / f"{anchor}.pt",
         map_location=device,
         weights_only=False,
     )
     pos = data.x[:, :2].detach().cpu().numpy()
     n_nodes = int(data.num_nodes)
-    
+
     from src.core_physics.clot_phi_simple import _wall_mask_from_data
     from src.core_physics.species_pushforward_continuous import compute_hop_distances
+
     wall_mask_full = _wall_mask_from_data(data, device, n_nodes)
     hop_distances_gpu = compute_hop_distances(data.edge_index, wall_mask_full, n_nodes)
     hop_distances_np = hop_distances_gpu.detach().cpu().numpy()
-    
-    times = ladder_viz_times(int(data.y.shape[0]), max_frames=int(args.max_frames))
+
+    times = ladder_viz_times(int(data.y.shape[0]), max_frames=int(max_frames))
     mask = torch.ones(n_nodes, device=device, dtype=torch.bool)
 
-    ckpt_pick = species_ckpt_for_anchor(args.anchor, manifest, prefer_loao=True)
-    beta_ov = (manifest.get("beta_overrides") or {}).get(args.anchor, "")
+    ckpt_pick = species_ckpt_for_anchor(anchor, manifest, prefer_loao=True)
+    beta_ov = (manifest.get("beta_overrides") or {}).get(anchor, "")
 
-    print(f"[i] CUDA: {torch.cuda.get_device_name(0)}", flush=True)
-    print(f"[i] anchor={args.anchor} flow={args.flow} ckpt={ckpt_pick}", flush=True)
+    print(f"[i] anchor={anchor} flow={flow_source} ckpt={ckpt_pick.name}", flush=True)
     if beta_ov:
         print(f"[i] beta_override={beta_ov}", flush=True)
 
     t0 = time.perf_counter()
     with species_gnn_deploy_env(
         manifest,
-        overrides={"T0_R4_FLOW_SOURCE": args.flow},
-        anchor=args.anchor,
+        overrides={"T0_R4_FLOW_SOURCE": flow_source},
+        anchor=anchor,
         prefer_loao=True,
     ):
         ckpt = Path(species_gnn_rollout_ckpt())
         bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
         if bundle is None:
-            raise SystemExit(f"[ERR] missing ckpt: {ckpt}")
+            raise FileNotFoundError(f"missing ckpt: {ckpt}")
         static = prepare_species_gnn_rollout_static(data, device=device)
         phi_gnn = rollout_species_gnn_phi_trajectory(
             data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=device,
-            flow_source=args.flow,
+            flow_source=flow_source,
         )
         beta_used = os.environ.get("SPECIES_GELATION_BETA_OVERRIDE", "")
     nuc_masks = _nucleation_masks_for_phi_trajectory(
@@ -208,9 +247,8 @@ def main() -> int:
     speed_note = f"ML Rollout Speed: {num_steps} steps in {elapsed:.2f}s ({ms_per_step:.1f} ms/step)"
     print(f"[i] {speed_note}", flush=True)
 
-    manifest_name = Path(args.manifest).stem if args.manifest.strip() else "deploy"
     row_labels = [ROW_GT, ROW_PRED]
-    if not args.no_error_row:
+    if include_error_row:
         row_labels.append(ROW_ERR)
     fig, axes = plt.subplots(
         len(row_labels), len(times),
@@ -218,7 +256,7 @@ def main() -> int:
         squeeze=False,
     )
     fig.suptitle(
-        f"biochem GNN deploy -- {_patient_label(args.anchor)} | {args.flow} flow | {manifest_name}\n{speed_note}",
+        f"biochem GNN deploy -- {_patient_label(anchor)} | {flow_source} flow | {manifest_name}\n{speed_note}",
         fontsize=11,
         y=1.02,
     )
@@ -240,7 +278,7 @@ def main() -> int:
         phi_gt_np = phi_gt.detach().cpu().numpy()
         p_gnn_np = p_gnn.detach().cpu().numpy()
         p_nuc_np = p_nuc.detach().cpu().numpy()
-        scatter_s = float(args.scatter_size)
+        scatter_s = float(scatter_size)
         _scatter_clot_panel(
             axes[0, j], pos, phi_gt_np,
             row_labels[0] if j == 0 else "",
@@ -255,7 +293,7 @@ def main() -> int:
         axes[1, j].set_title(col_title, fontsize=10, pad=6)
         axes[1, j].title.set_fontweight("bold")
         err_counts: dict[str, int] = {}
-        if not args.no_error_row:
+        if include_error_row:
             err_counts = scatter_clot_error_panel(
                 axes[2, j],
                 pos,
@@ -281,11 +319,12 @@ def main() -> int:
             **{f"err_{k}": int(v) for k, v in err_counts.items()},
         })
 
+    if include_error_row:
+        _hop_error_legend(fig)
+
     fig.tight_layout()
-    if args.out.strip():
-        out = Path(args.out)
-    else:
-        out = _viz_out_dir() / f"deploy_{args.anchor}_{args.flow}.png"
+    if out is None:
+        out = _viz_out_dir() / f"deploy_{anchor}_{flow_source}.png"
     if not out.is_absolute():
         out = root / out
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -293,32 +332,134 @@ def main() -> int:
     plt.close(fig)
     print(f"[save] {out}", flush=True)
 
+    payload = {
+        "anchor": anchor,
+        "patient_label": _patient_label(anchor),
+        "flow_source": flow_source,
+        "species_ckpt": str(ckpt_pick),
+        "beta_override": str(beta_ov or beta_used),
+        "ml_rollout_speed_note": speed_note,
+        "ml_rollout_elapsed_s": elapsed,
+        "ml_rollout_ms_per_step": ms_per_step,
+        "rows": row_labels,
+        "times": times,
+        "frames": frames,
+        "final_guiding": frames[-1]["gnn_guiding"] if frames else None,
+        "final_f05": frames[-1]["gnn_f05"] if frames else None,
+        "final_f1": frames[-1]["gnn_f1"] if frames else None,
+        "png": str(out.relative_to(root)).replace("\\", "/"),
+    }
     meta = out.with_suffix(".json")
-    meta.write_text(
-        json.dumps({
-            "anchor": args.anchor,
-            "patient_label": _patient_label(args.anchor),
-            "flow_source": args.flow,
-            "species_ckpt": str(ckpt_pick),
-            "beta_override": str(beta_ov or beta_used),
-            "manifest": str(args.manifest),
-            "rows": row_labels,
-            "times": times,
-            "frames": frames,
-            "final_guiding": frames[-1]["gnn_guiding"] if frames else None,
-            "final_f05": frames[-1]["gnn_f05"] if frames else None,
-            "final_f1": frames[-1]["gnn_f1"] if frames else None,
-        }, indent=2),
-        encoding="utf-8",
-    )
+    meta.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"[save] {meta}", flush=True)
     if frames:
         last = frames[-1]
         print(
-            f"[OK] t{last['time']} guiding={last['gnn_guiding']:.3f} "
+            f"[OK] {anchor} t{last['time']} guiding={last['gnn_guiding']:.3f} "
             f"F0.5={last['gnn_f05']:.3f} f1={last['gnn_f1']:.3f}",
             flush=True,
         )
+    return payload
+
+
+def _write_summary_md(rows: list[dict], out_path: Path) -> None:
+    lines = [
+        "# Anchor clot deploy visualizations",
+        "",
+        "Three rows per anchor: **GT clot** | **model prediction** | **error** (FP red / FN blue by BFS hop from wall).",
+        "",
+        "| Anchor | PNG | Final F0.5 | Final guiding | Rollout (s) |",
+        "| --- | --- | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['anchor']} | [{row['anchor']}]({row['png']}) | "
+            f"{row.get('final_f05', 0.0):.3f} | {row.get('final_guiding', 0.0):.3f} | "
+            f"{row.get('ml_rollout_elapsed_s', 0.0):.1f} |"
+        )
+    lines.extend([
+        "",
+        "## Run locally",
+        "",
+        "```powershell",
+        "python scripts/viz_species_gnn_deploy.py --all-anchors",
+        "```",
+    ])
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[save] {out_path}", flush=True)
+
+
+def _resolve_anchors(args, root: Path) -> list[str]:
+    if args.legacy_six:
+        return list(BIOCHEM_ANCHORS_6)
+    if args.anchor.strip() and not args.all_anchors and not args.anchors.strip():
+        return [args.anchor.strip()]
+    if args.anchors.strip():
+        return parse_biochem_train_anchors(args.anchors, all_anchors=False, root=root)
+    if args.all_anchors:
+        return discover_biochem_anchors(root)
+    return [args.anchor.strip() or "patient007"]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="GNN clot map deploy viz")
+    ap.add_argument("--anchor", default="patient007", help="Single anchor (default when no batch flag)")
+    ap.add_argument("--anchors", default="", help="Comma-separated anchor stems")
+    ap.add_argument("--all-anchors", action="store_true", help="All patient*.pt on disk")
+    ap.add_argument("--legacy-six", action="store_true", help="Legacy triangle6 anchors only")
+    ap.add_argument("--manifest", default=DEFAULT_MANIFEST)
+    ap.add_argument("--flow", default="kinematics", choices=("gt", "kinematics"))
+    ap.add_argument("--max-frames", type=int, default=6)
+    ap.add_argument("--scatter-size", type=float, default=3.0)
+    ap.add_argument("--no-error-row", action="store_true")
+    ap.add_argument("--out", default="", help="Output PNG (single anchor only)")
+    args = ap.parse_args()
+
+    device = require_cuda_device()
+    root = get_project_root()
+    manifest = load_deploy_manifest(args.manifest.strip() or None)
+    manifest_name = Path(args.manifest).stem if args.manifest.strip() else "deploy"
+    anchors = _resolve_anchors(args, root)
+
+    print(f"[i] CUDA: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"[i] anchors={len(anchors)} flow={args.flow} manifest={manifest_name}", flush=True)
+
+    summary_rows: list[dict] = []
+    failures: list[str] = []
+    for anchor in anchors:
+        print(f"\n[i] --- {anchor} ---", flush=True)
+        out_path = None
+        if args.out.strip() and len(anchors) == 1:
+            out_path = Path(args.out)
+        try:
+            payload = viz_anchor_deploy(
+                anchor,
+                manifest=manifest,
+                device=device,
+                flow_source=args.flow,
+                manifest_name=manifest_name,
+                max_frames=int(args.max_frames),
+                scatter_size=float(args.scatter_size),
+                include_error_row=not args.no_error_row,
+                out=out_path,
+            )
+            summary_rows.append(payload)
+        except Exception as exc:
+            print(f"[ERR] {anchor}: {exc}", flush=True)
+            failures.append(f"{anchor}: {exc}")
+
+    if len(anchors) > 1:
+        out_dir = _viz_out_dir()
+        summary_json = out_dir / "deploy_all_anchors_summary.json"
+        summary_json.write_text(
+            json.dumps({"anchors_ok": summary_rows, "failures": failures}, indent=2),
+            encoding="utf-8",
+        )
+        _write_summary_md(summary_rows, out_dir / "clot_visualizations.md")
+        print(f"\n[OK] saved {len(summary_rows)}/{len(anchors)} -> {out_dir}", flush=True)
+        if failures:
+            print(f"[WARN] {len(failures)} failures", flush=True)
+            return 1
     return 0
 
 

@@ -27,6 +27,10 @@ data/
 # Generated training artifacts (local runs; not versioned)
 outputs/
 
+# Customer inbox uploads (keep README only)
+customer_geometries/*
+!customer_geometries/README.txt
+
 # Ignore local heavy/generated directories
 comsol_models/
 notes/

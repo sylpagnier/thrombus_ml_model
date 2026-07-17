@@ -20,7 +20,8 @@ param(
     [switch] $Fresh,
     [switch] $SkipTrain,
     [switch] $Gate,
-    [switch] $Viz
+    [switch] $Viz,
+    [switch] $Budget1h
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,16 @@ $env:CLOT_PHI_CEILING_HOPS = "3"
 
 if ($Step -eq "global") { $Step = "species" }
 if ($Step -eq "beta") { $Step = "viscosity" }
+
+if ($Budget1h) {
+    Write-Output "[i] Applying 1-hour GPU budget overrides..."
+    $Epochs = 35
+    $EarlyStop = 20
+    $LoaoEpochs = 25
+    $LoaoEarlyStop = 12
+    $env:SPECIES_SNAPSHOT_HIDDEN = "64"
+    $env:SPECIES_PUSHFORWARD_MAX_UNROLL = "120"
+}
 
 $SpeciesCkpt = "outputs/biochem/biochem_gnn/species/best.pth"
 $BetaCkpt = "outputs/biochem/biochem_gnn/viscosity/beta.pth"

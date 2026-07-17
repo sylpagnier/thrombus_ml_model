@@ -389,6 +389,18 @@ def main() -> int:
                 bio=bio,
             )
         )
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Free the large kinematics model from GPU VRAM now that dataset loading is complete
+    del kine_model
+    import gc
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     val_pack = next((p for p in packs if p["anchor"] == val_anchor), packs[0])
     ref_static = packs[0]["static"]
     latent_dim = int(ref_static["base_feats"].shape[1] - 1)

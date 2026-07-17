@@ -109,9 +109,23 @@ def clot_phi_shear_ref_time_index(data) -> int:
 
 def gt_gamma_dot_nd(data, time_index: int, device: torch.device) -> torch.Tensor:
     """COMSOL GT shear rate ``gamma_dot`` [1/s] ND from ``y[ti]`` ``u,v`` and graph grads."""
-    y = data.y[time_index].to(device=device, dtype=torch.float32)
-    u = y[:, 0]
-    v = y[:, 1]
+    use_kine = False
+    if (
+        os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+    ):
+        use_kine = True
+    elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
+        use_kine = True
+
+    if use_kine:
+        from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
+    else:
+        y = data.y[time_index].to(device=device, dtype=torch.float32)
+        u = y[:, 0]
+        v = y[:, 1]
     u_col = u.reshape(-1, 1)
     G_x = data.G_x.to(device=device)
     G_y = data.G_y.to(device=device)
@@ -165,8 +179,23 @@ def gt_neg_dgamma_dx_phys(
     device: torch.device,
 ) -> torch.Tensor:
     """COMSOL-aligned ``max(0, -d(gamma)/dx)`` [1/(m*s)] from GT ``u,v`` (matches ``d(spf.sr,x)`` band)."""
-    y = data.y[time_index].to(device=device, dtype=torch.float32)
-    return pred_neg_dgamma_dx_phys(data, y[:, 0], y[:, 1], bio_cfg, device)
+    use_kine = False
+    if (
+        os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+    ):
+        use_kine = True
+    elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
+        use_kine = True
+
+    if use_kine:
+        from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
+        return pred_neg_dgamma_dx_phys(data, u, v, bio_cfg, device)
+    else:
+        y = data.y[time_index].to(device=device, dtype=torch.float32)
+        return pred_neg_dgamma_dx_phys(data, y[:, 0], y[:, 1], bio_cfg, device)
 
 
 def pred_neg_dgamma_dx_phys(
@@ -864,6 +893,9 @@ def clot_phi_physics_mu_blood_si(phys_cfg: PhysicsConfig) -> float:
 
 def gt_mu_anchor_cap_si(data, phys_cfg: PhysicsConfig, device: torch.device) -> torch.Tensor:
     """Per-node capped COMSOL mu_eff at macro t=0 (growth baseline for GT labels)."""
+    n = int(data.num_nodes)
+    if not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
+        return torch.full((n,), float(phys_cfg.viscosity_nd_to_si(0.0)), device=device, dtype=torch.float32)
     y0 = data.y[0].to(device)
     mu0 = phys_cfg.viscosity_nd_to_si(y0[:, STATE_CHANNEL_MU_EFF_ND])
     return cap_mu_eff_si(mu0)
@@ -1358,9 +1390,23 @@ def predict_phi_prior_rule(
     os.environ.setdefault("BIOCHEM_PRIOR_NORM_MASK", "adjacent")
 
     cfg = rule or default_prior_rule_config()
-    y_in = data.y[int(t_in)].to(device=device, dtype=torch.float32)
-    u = y_in[:, 0]
-    v = y_in[:, 1]
+    use_kine = False
+    if (
+        os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+    ):
+        use_kine = True
+    elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
+        use_kine = True
+
+    if use_kine:
+        from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
+        u, v = _resolve_uv_for_temporal_risk(data, int(t_in), device)
+    else:
+        y_in = data.y[int(t_in)].to(device=device, dtype=torch.float32)
+        u = y_in[:, 0]
+        v = y_in[:, 1]
     props = _anchor_flow_props(data, device)
     fields = compute_clot_kinematics_fields(data, u, v, bio_cfg, props)
     prior = clot_prior_score_flat(data, u, v, bio_cfg, props).reshape(-1)
@@ -1784,11 +1830,14 @@ def resolve_clot_support_band(
     """
     bio = bio_cfg or BiochemConfig(phase="biochem")
     if frozen_t0 or clot_support_band_mode() == "frozen_t0":
-        if hasattr(data, "y") and torch.is_tensor(data.y) and data.y.dim() == 3:
+        if hasattr(data, "y") and torch.is_tensor(data.y) and data.y.dim() == 3 and data.y.numel() > 0 and not bool((data.y == 0).all().item()):
             y0 = data.y[0].to(device)
             mu_seed_cap_si = cap_mu_eff_si(
                 phys_cfg.viscosity_nd_to_si(y0[:, STATE_CHANNEL_MU_EFF_ND])
             )
+        else:
+            n = int(data.num_nodes)
+            mu_seed_cap_si = torch.full((n,), float(phys_cfg.viscosity_nd_to_si(0.0)), device=device, dtype=torch.float32)
     mu_seed = mu_seed_cap_si.reshape(-1).to(device=device)
     thr = clot_phi_thresh_si(phys_cfg)
     clot_seed = mu_seed >= thr
@@ -2194,7 +2243,10 @@ def build_clot_phi_step(
         resolve_uv_for_rollout_step,
     )
 
-    y_gt = data.y[time_index].to(device)
+    if hasattr(data, "y") and data.y is not None and data.y.numel() > 0:
+        y_gt = data.y[time_index].to(device)
+    else:
+        y_gt = torch.zeros((int(data.num_nodes), 16), device=device, dtype=torch.float32)
     y = (
         y_slice_override.to(device)
         if y_slice_override is not None
@@ -2206,7 +2258,10 @@ def build_clot_phi_step(
         mu_for_kine = None
         if clot_phi_fixed_mu_from_phi_enabled():
             if rollout_state is not None and rollout_state.phi_prev is not None:
-                y_k = data.y[time_index].to(device)
+                if hasattr(data, "y") and data.y is not None and data.y.numel() > 0:
+                    y_k = data.y[time_index].to(device)
+                else:
+                    y_k = torch.zeros((int(data.num_nodes), 16), device=device, dtype=torch.float32)
                 mu_c_k = carreau_mu_si_from_uv(data, y_k[:, 0], y_k[:, 1], phys_cfg)
                 mu_for_kine = mu_eff_from_carried_phi(
                     mu_c_k, rollout_state.phi_prev, device=device
@@ -2218,7 +2273,7 @@ def build_clot_phi_step(
         )
     elif u_nd_override is not None and v_nd_override is not None:
         u, v = u_nd_override, v_nd_override
-    elif clot_phi_vel_source() == "kinematics":
+    elif clot_phi_vel_source(data) == "kinematics":
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
 
         u, v = _resolve_uv_for_temporal_risk(data, time_index, device)

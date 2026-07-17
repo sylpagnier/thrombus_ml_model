@@ -367,8 +367,15 @@ def rollout_species_gnn_species_series(
                     species_log12 = sp_next
                     
                     phi_clot = differentiable_clot_phi_from_species12(species_log12, bio)
-                    u_t1 = data.y[t + 1, :, 0]
-                    v_t1 = data.y[t + 1, :, 1]
+                    if (
+                        os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
+                        or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+                        or not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item())
+                    ):
+                        u_t1, v_t1 = u0, v0
+                    else:
+                        u_t1 = data.y[t + 1, :, 0]
+                        v_t1 = data.y[t + 1, :, 1]
                     gel_factor = torch.ones_like(u_t1)
                     mu_carreau_si = comsol_carreau_mu_si_from_uv(
                         data,

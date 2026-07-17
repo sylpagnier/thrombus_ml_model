@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any
 
 import torch
 
@@ -116,10 +116,17 @@ def resolve_carry_log_mu_feature(
     return None
 
 
-def clot_phi_vel_source() -> VelSource:
-    raw = (os.environ.get("CLOT_PHI_VEL_SOURCE") or "gt").strip().lower()
+def clot_phi_vel_source(data: Any | None = None) -> VelSource:
+    raw = (
+        os.environ.get("CLOT_PHI_VEL_SOURCE")
+        or os.environ.get("T0_R4_FLOW_SOURCE")
+        or "gt"
+    ).strip().lower()
     if raw in ("kin", "kinematics", "deq", "gino"):
         return "kinematics"
+    if data is not None:
+        if not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
+            return "kinematics"
     return "gt"
 
 
@@ -283,10 +290,14 @@ def resolve_uv_for_rollout_step(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (u_nd, v_nd, u_gt, v_gt) for feature building at ``time_index``."""
-    y = data.y[time_index].to(device=device)
-    u_gt = y[:, 0]
-    v_gt = y[:, 1]
-    src = clot_phi_vel_source()
+    if hasattr(data, "y") and data.y is not None and data.y.numel() > 0:
+        y = data.y[time_index].to(device=device)
+        u_gt = y[:, 0]
+        v_gt = y[:, 1]
+    else:
+        u_gt = torch.zeros(int(data.num_nodes), device=device, dtype=torch.float32)
+        v_gt = torch.zeros(int(data.num_nodes), device=device, dtype=torch.float32)
+    src = clot_phi_vel_source(data)
     if src == "gt" or mu_eff_si is None:
         return u_gt, v_gt, u_gt, v_gt
     global _kine_provider

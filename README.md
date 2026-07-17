@@ -36,8 +36,23 @@ Predicts localized velocity diversion residuals `[dU, dV]` induced by micro-clot
 
 ## 💻 Demos & Interactive Visuals
 
+### Vessel Simulation Desktop UI (Customer Predict App)
+For a comprehensive, radiology-inspired desktop experience, HemoGINO provides a dark-themed user interface to design parametric vessels or load custom geometries, run fluid flow and biochem coupling simulations, and scrub through the temporal clot-formation timeline.
+
+**Key Features:**
+*   **Left Control Rail**: Adjust vessel flow parameters (Reynolds number, simulation duration, etc.), load custom geometries from the `customer_geometries/` directory, and run simulation pipelines.
+*   **Parametric Editing**: Drag wall control points directly in the preview canvas to interactively reshape the vessel.
+*   **Dual viewports**: View ML-predicted velocity/pressure flow fields and biochemistry concentrations side-by-side.
+*   **Timeline Scrubber**: Scrub through transient simulation steps to visualize the dynamic evolution of thrombus/clot growth over time.
+
+To launch the app:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_customer_predict.ps1
+```
+*(Or run directly with: `python -m src.tools.customer_predict_app`)*
+
 ### Parametric Flow GUI Demo
-HemoGINO includes an interactive GUI that allows users to design arbitrary 2D vessels, drag wall control points in real-time, generate meshes via Gmsh, and watch the RGP-DEQ solver instantly predict fluid flow.
+HemoGINO also includes a lightweight interactive GUI that allows users to design arbitrary 2D vessels, drag wall control points in real-time, generate meshes via Gmsh, and watch the RGP-DEQ solver instantly predict fluid flow.
 
 Run the interactive flow demo:
 ```powershell
