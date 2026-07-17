@@ -164,6 +164,13 @@ def main() -> int:
     )
     pos = data.x[:, :2].detach().cpu().numpy()
     n_nodes = int(data.num_nodes)
+    
+    from src.core_physics.clot_phi_simple import _wall_mask_from_data
+    from src.core_physics.species_pushforward_continuous import compute_hop_distances
+    wall_mask_full = _wall_mask_from_data(data, device, n_nodes)
+    hop_distances_gpu = compute_hop_distances(data.edge_index, wall_mask_full, n_nodes)
+    hop_distances_np = hop_distances_gpu.detach().cpu().numpy()
+    
     times = ladder_viz_times(int(data.y.shape[0]), max_frames=int(args.max_frames))
     mask = torch.ones(n_nodes, device=device, dtype=torch.bool)
 
@@ -195,7 +202,11 @@ def main() -> int:
     nuc_masks = _nucleation_masks_for_phi_trajectory(
         data, phi_gnn, phys=phys, bio=bio, device=device,
     )
-    print(f"[i] rollout {time.perf_counter() - t0:.1f}s", flush=True)
+    elapsed = time.perf_counter() - t0
+    num_steps = len(phi_gnn)
+    ms_per_step = (elapsed / num_steps) * 1000 if num_steps > 0 else 0.0
+    speed_note = f"ML Rollout Speed: {num_steps} steps in {elapsed:.2f}s ({ms_per_step:.1f} ms/step)"
+    print(f"[i] {speed_note}", flush=True)
 
     manifest_name = Path(args.manifest).stem if args.manifest.strip() else "deploy"
     row_labels = [ROW_GT, ROW_PRED]
@@ -207,7 +218,7 @@ def main() -> int:
         squeeze=False,
     )
     fig.suptitle(
-        f"biochem GNN deploy -- {_patient_label(args.anchor)} | {args.flow} flow | {manifest_name}",
+        f"biochem GNN deploy -- {_patient_label(args.anchor)} | {args.flow} flow | {manifest_name}\n{speed_note}",
         fontsize=11,
         y=1.02,
     )
@@ -252,6 +263,7 @@ def main() -> int:
                 p_gnn_np,
                 row_labels[2] if j == 0 else "",
                 s=scatter_s,
+                hop_distances=hop_distances_np,
             )
             axes[2, j].set_title(
                 f"FP={err_counts['fp']}  FN={err_counts['fn']}",

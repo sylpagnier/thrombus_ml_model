@@ -1732,21 +1732,22 @@ def predict_continuous_step_delta(
 
     pred_delta = _run_forward(model, feats, use_edge_index, log_state)
 
-    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and wall_mask_band is not None:
+    w_mask = wall_mask_band if wall_mask_band is not None else getattr(model, "wall_mask_band", None)
+    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and w_mask is not None:
         try:
             offwall_model = get_cached_offwall_model(
                 feats.device, model.in_dim, model.hidden, model.out_dim
             )
             # Set offwall model state
             if hasattr(offwall_model, "set_band_geometry"):
-                offwall_model.set_band_geometry(pos_band, edge_index, wall_mask_band)
+                offwall_model.set_band_geometry(pos_band, edge_index, w_mask)
             offwall_model.log_state = log_state
             if species_block is not None:
                 offwall_model.species_block = species_block
             offwall_model.velocity = velocity
             
             pred_delta_off = _run_forward(offwall_model, feats, use_edge_index, log_state)
-            w_m = wall_mask_band.reshape(-1, 1).to(device=feats.device, dtype=torch.bool)
+            w_m = w_mask.reshape(-1, 1).to(device=feats.device, dtype=torch.bool)
             pred_delta = torch.where(w_m, pred_delta, pred_delta_off)
         except Exception as e:
             print(f"[WARN] Failed to apply two-model offwall blend: {e}")

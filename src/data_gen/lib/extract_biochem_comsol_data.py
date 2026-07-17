@@ -22,6 +22,57 @@ from src.data_gen.lib.kinematics_graph_builder import (
 )
 from src.utils.units import MESH_UNIT_CM, assert_mesh_unit
 
+def validate_graph_physical_integrity(data: Data, stem: str, avg_flux_imbalance: float) -> None:
+    """Sanity check that the exported graph fields fall within physical boundaries."""
+    # 1. Mass Flux Imbalance Check
+    if abs(avg_flux_imbalance) > 5.0:
+        raise ValueError(
+            f"[{stem}] CRITICAL MASS FLUX IMBALANCE: {avg_flux_imbalance:.2%}. "
+            f"This is highly non-physical and usually indicates that variable columns are swapped "
+            f"or misaligned in the COMSOL spreadsheet export. Expected < 500%."
+        )
+
+    # 2. Velocity Bounds Check (ND fields at index 0 and 1 of y)
+    u_max_nd = float(data.y[:, :, 0].abs().max().item())
+    v_max_nd = float(data.y[:, :, 1].abs().max().item())
+    if u_max_nd > 100.0 or v_max_nd > 100.0:
+        raise ValueError(
+            f"[{stem}] CRITICAL VELOCITY OUT OF BOUNDS: u_max_nd={u_max_nd:.3f}, v_max_nd={v_max_nd:.3f}. "
+            f"Expected ND velocity magnitudes < 100.0 (relative to u_ref)."
+        )
+
+    # 3. Viscosity Bounds Check (ND field at index 3 of y)
+    from src.config import PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+    phys_cfg = PhysicsConfig()
+    mu_si = phys_cfg.viscosity_nd_to_si(data.y[:, :, STATE_CHANNEL_MU_EFF_ND])
+    mu_min = float(mu_si.min().item())
+    mu_max = float(mu_si.max().item())
+    if mu_min <= 0.0:
+        raise ValueError(
+            f"[{stem}] CRITICAL VISCOSITY ERROR: Minimum viscosity is non-positive ({mu_min:.6g} Pa*s). "
+            f"Expected positive viscosity values."
+        )
+    if mu_max > 100.0:
+        raise ValueError(
+            f"[{stem}] CRITICAL VISCOSITY ERROR: Maximum viscosity exceeds limit ({mu_max:.3f} Pa*s). "
+            f"Expected viscosity < 100.0 Pa*s."
+        )
+
+    # 4. Species Concentration Bounds Check (log1p transformed at index 4-15 of y)
+    species_y = data.y[:, :, 4:16]
+    species_min = float(species_y.min().item())
+    species_max = float(species_y.max().item())
+    if species_min < -1e-5:
+        raise ValueError(
+            f"[{stem}] CRITICAL SPECIES ERROR: Negative concentration detected ({species_min:.6g}). "
+            f"Expected log1p non-negative values."
+        )
+    if species_max > 30.0:
+        raise ValueError(
+            f"[{stem}] CRITICAL SPECIES ERROR: Extreme concentration spike detected ({species_max:.3f}). "
+            f"Expected log1p values < 30.0."
+        )
+
 
 class PatientDataExtractor:
     """
@@ -396,7 +447,25 @@ class PatientDataExtractor:
 
         # 3. Slice the wide dataframe into time blocks
         time_blocks = {}
-        vars_per_step = 18  # x, y, u, v, p, mu, + 12 species
+        n_cols = df_full.shape[1]
+        n_times = len(times)
+
+        # Determine if coordinates are repeated per time step (18 columns) or static (16 columns)
+        if n_cols == 2 + 18 * n_times:
+            vars_per_step = 18
+            coords_repeated = True
+        elif n_cols == 2 + 16 * n_times:
+            vars_per_step = 16
+            coords_repeated = False
+        else:
+            raise ValueError(
+                f"Unexpected number of columns in {filepath.name}: {n_cols}. "
+                f"For {n_times} time steps, expected either {2 + 18 * n_times} (repeated coords) "
+                f"or {2 + 16 * n_times} (static coords) columns."
+            )
+
+        static_x = df_full.iloc[:, 0].copy()
+        static_y = df_full.iloc[:, 1].copy()
 
         for i, t_val in enumerate(times):
             # Base coords take columns. Step 0 starts at col 2.
@@ -406,11 +475,20 @@ class PatientDataExtractor:
             # Extract the block
             df_step = df_full.iloc[ :, start_col:end_col ].copy()
 
-            # Assign consistent internal column names
-            df_step.columns = [
-                'x', 'y', 'u', 'v', 'p', 'mu_effective',
-                'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
-            ]
+            if coords_repeated:
+                # Assign consistent internal column names
+                df_step.columns = [
+                    'x', 'y', 'u', 'v', 'p', 'mu_effective',
+                    'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
+                ]
+            else:
+                # Assign consistent internal column names without x and y, then add them
+                df_step.columns = [
+                    'u', 'v', 'p', 'mu_effective',
+                    'rp', 'ap', 'apr', 'aps', 'PT', 'th', 'at', 'fg', 'fi', 'M', 'Mas', 'Mat'
+                ]
+                df_step.insert(0, 'y', static_y)
+                df_step.insert(0, 'x', static_x)
             time_blocks[ t_val ] = df_step
 
         return time_blocks
@@ -824,6 +902,9 @@ class PatientDataExtractor:
         )
         data = attach_patient_anchor_graph_metadata(data, mask_wall=mask_wall)
         data.centerline_source = centerline_source
+
+        # Run physical boundaries and mass balance health check before saving
+        validate_graph_physical_integrity(data, stem, avg_flux_imbalance)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
         print(
