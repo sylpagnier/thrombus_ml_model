@@ -181,3 +181,17 @@ def test_write_coupled_flow_into_y():
     write_coupled_flow_into_y(data, u, v, time_index=None)
     assert torch.allclose(data.y[:, :, 0], u.unsqueeze(0).expand(3, 5))
     assert torch.allclose(data.y[:, :, 1], v.unsqueeze(0).expand(3, 5))
+
+
+def test_write_coupled_flow_on_clone_leaves_teacher_y_intact():
+    """Training val must mutate a clone; the held pack teacher UV stays COMSOL GT."""
+    data = _two_component_graph(torch.device("cpu"))
+    data.y = torch.zeros(3, 5, 16, dtype=torch.float32)
+    data.y[:, :, 0] = 1.5
+    data.y[:, :, 1] = -0.5
+    y_before = data.y.clone()
+    work = data.clone()
+    write_coupled_flow_into_y(work, torch.zeros(5), torch.ones(5), time_index=1)
+    assert torch.allclose(data.y, y_before)
+    assert torch.allclose(work.y[1, :, 0], torch.zeros(5))
+    assert torch.allclose(work.y[1, :, 1], torch.ones(5))

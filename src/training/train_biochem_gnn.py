@@ -9,7 +9,7 @@ Trains the multi-component deploy baseline:
   6. flow_coupling         - NOT YET (inference-time mu->kine feedback)
 
 This is the **deploy** biochem stack. It does **not** replace
-``train_biochem_corrector.py`` (GNODE_Phase3 full-mesh teacher / mu ladder).
+the retired GNODE ``train_biochem_corrector`` teacher/mu ladder (removed 2026-06).
 
 Usage::
 

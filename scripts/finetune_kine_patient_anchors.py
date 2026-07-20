@@ -82,6 +82,8 @@ def main() -> int:
     stage2 = 0
     adam_epochs = total_epochs
 
+    import subprocess
+
     argv = [
         sys.executable,
         "-m",
@@ -114,8 +116,8 @@ def main() -> int:
         f"(total_epochs={total_epochs}, resume_start={resume_start}) lr={args.lr} "
         f"synthetic_cap={args.synthetic_cap}"
     )
-    os.execv(sys.executable, argv)
-    return 0
+    # subprocess (not os.execv): Windows Store / embeddable Pythons often break overlay exec.
+    return int(subprocess.call(argv))
 
 
 if __name__ == "__main__":

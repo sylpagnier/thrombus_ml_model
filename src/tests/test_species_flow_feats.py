@@ -285,6 +285,30 @@ def test_resolve_flow_uv_auto_coupling_override(monkeypatch):
     reset_coupled_flow_registry()
 
 
+def test_resolve_flow_uv_prefers_u0_pred_without_deq(monkeypatch):
+    """Pack-build baseline UV must not trigger a second GINO-DEQ when u0_pred is present."""
+    monkeypatch.delenv("SPECIES_FLOW_FEATS_SOURCE", raising=False)  # default auto
+    monkeypatch.delenv("BIOCHEM_CORRECTOR_COUPLING", raising=False)
+    dev = torch.device("cpu")
+    data = _line_graph(dev)
+    data.u0_pred = torch.tensor([9.0, 8.0, 7.0, 6.0])
+    data.v0_pred = torch.tensor([1.0, 2.0, 3.0, 4.0])
+
+    import src.utils.kinematics_inference as ki
+
+    calls: list[int] = []
+
+    def _boom(model, d):
+        calls.append(1)
+        raise AssertionError("predict_kinematics must not run when u0_pred is set")
+
+    monkeypatch.setattr(ki, "predict_kinematics", _boom)
+    u, v = _resolve_flow_uv(data, object(), dev)
+    assert calls == []
+    assert torch.allclose(u, data.u0_pred)
+    assert torch.allclose(v, data.v0_pred)
+
+
 def test_flow_feats_dynamic_flag(monkeypatch):
     monkeypatch.delenv("SPECIES_FLOW_FEATS_DYNAMIC", raising=False)
     assert flow_feats_dynamic() is False

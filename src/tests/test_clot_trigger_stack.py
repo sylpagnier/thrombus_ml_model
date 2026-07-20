@@ -9,7 +9,7 @@ import torch
 
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.clot_phi_simple import build_clot_phi_model, build_clot_phi_step, clot_phi_feature_dim
-from src.training.clot_ml_step0_coef import discover_anchor_paths
+from src.core_physics.clot_anchor_survey import discover_anchor_paths
 from src.core_physics.clot_growth_masks import (
     gt_growth_commit_mask_at_time,
     growth_seed_mode,

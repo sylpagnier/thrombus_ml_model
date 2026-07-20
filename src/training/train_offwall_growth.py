@@ -1,9 +1,11 @@
-"""Train decoupled off-wall clot growth model on tiled subgraphs.
+"""Train decoupled clot-growth specialist on tiled subgraphs around existing clots.
 
-This script trains a GNN model to predict species (Mat) growth specifically on
-off-wall nodes. For each training window, it dynamically extracts a subgraph
-consisting of nodes within k=4 hops of any active clot node. The loss is computed
-only on the off-wall nodes in this subgraph.
+For each training window, extract a subgraph within ``--hops-k`` of any active clot,
+then supervise either:
+  * ``offwall``   - ~wall nodes only (legacy v6 blurring specialist)
+  * ``frontier``  - k-hop neighborhood of committed clots (wall + lumen growth)
+
+Warm-start from WC_v7 and use ``--loss-mode loss_blurring`` for the compound A/B recipe.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from src.core_physics.clot_growth_masks import (
     graph_dilate_hops,
 )
 from src.biochem_gnn.config import PHASE_CKPT, apply_deploy_env, apply_train_recipe_env
+from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env
 from src.training.biochem_species_scope import (
     pushforward_species_scope,
     pushforward_state_bulk_indices,
@@ -169,15 +172,16 @@ def _build_anchor_pack_offwall(
     windows = iter_pushforward_windows(n_times, unroll=unroll, stride=stride)
     pack_t0_max = resolve_train_t0_max(n_times)
     
-    # Filter windows that have some growth
+    # Filter windows that have some growth (CPU — avoid parking full graphs on a 4GB GPU)
     from src.core_physics.species_pushforward_continuous import filter_continuous_windows
-    # For filtering, we temporarily construct a dummy node_idx to satisfy the signature
-    dummy_node_idx = torch.arange(data.num_nodes, device=device)
+    cpu = torch.device("cpu")
+    dummy_node_idx = torch.arange(data.num_nodes, device=cpu)
     windows = filter_continuous_windows(
-        windows, data, dummy_node_idx, device, t0_max=pack_t0_max, min_delta_mag=1e-8
+        windows, data, dummy_node_idx, cpu, t0_max=pack_t0_max, min_delta_mag=1e-8
     )
     if max_windows > 0:
-        windows = windows[: int(max_windows)]
+        # Prefer late windows (early t0 often has no committed clot yet).
+        windows = windows[-int(max_windows) :]
         
     # Get wall mask
     from src.core_physics.clot_phi_simple import _wall_mask_from_data
@@ -243,56 +247,79 @@ def compute_shape_loss(
     loss_mode: str,
 ) -> torch.Tensor:
     """Compute shape-aware losses on the extracted subgraph.
-    
-    `mask` indicates off-wall nodes to supervise.
+
+    ``mask`` selects supervised nodes (off-wall and/or clot frontier).
     """
     p = pred_delta
     t = tgt_delta
-    
+
     # Configurable variables
     val_scale = continuous_delta_value_scale()
     huber_beta = continuous_huber_beta_growth()
     active_thresh = continuous_delta_threshold()
 
-    if loss_mode == "loss_blurring":
+    if loss_mode in ("loss_blurring", "loss_blurring_prec"):
         # Diffuse both prediction and target deltas to smooth out high-frequency misalignments
         p_blurred = diffuse_field(p, edge_index, num_nodes, hops=2)
         t_blurred = diffuse_field(t, edge_index, num_nodes, hops=2)
-        
+
         loss = F.huber_loss(
             p_blurred[mask] * val_scale,
             t_blurred[mask] * val_scale,
             delta=huber_beta,
             reduction="mean",
         )
+        if loss_mode == "loss_blurring":
+            return loss
+
+        # Precision term: penalize raw (unblurred) growth outside 2-hop of GT active deltas.
+        # Kept light vs spatial_tolerance's collapse (§203): shape term remains primary.
+        if t.dim() == 1:
+            active = t > active_thresh
+            pred_ch = p
+        else:
+            active = t[:, 0] > active_thresh
+            pred_ch = p[:, 0]
+        gt_dilated = graph_dilate_hops(active, edge_index, hops=2)
+        pred_active = pred_ch > active_thresh
+        fp_mask = pred_active & (~gt_dilated) & mask.reshape(-1)
+        if fp_mask.any():
+            fp_pred = p[fp_mask] * val_scale
+            fp_loss = F.huber_loss(
+                fp_pred,
+                torch.zeros_like(fp_pred),
+                delta=huber_beta,
+                reduction="mean",
+            )
+            loss = loss + 0.5 * fp_loss
         return loss
 
     elif loss_mode == "spatial_tolerance":
         # Identify active target growth channel (Mat)
         active = (t[:, 0] > active_thresh)
-        
+
         # Dilate active targets by 2 hops to define the tolerance region
         gt_dilated = graph_dilate_hops(active, edge_index, hops=2)
-        
+
         # FP nodes are where we predict delta but are completely outside dilated active zone
         pred_active = (p[:, 0] > active_thresh)
         fp_mask = pred_active & (~gt_dilated) & mask
-        
+
         losses = []
         active_mask = active & mask
         if active_mask.any():
             losses.append(F.huber_loss(p[active_mask] * val_scale, t[active_mask] * val_scale, delta=huber_beta, reduction="mean"))
-            
+
         if fp_mask.any():
             # False positives outside tolerance zone get penalized
             fp_loss = F.huber_loss(p[fp_mask] * val_scale, torch.zeros_like(p[fp_mask]), delta=huber_beta, reduction="mean")
             losses.append(2.0 * fp_loss)
-            
+
         # Volume conservation term: enforce matching total mass growth on off-wall nodes
         pred_vol = (p[mask] * val_scale).sum()
         tgt_vol = (t[mask] * val_scale).sum()
         vol_loss = F.l1_loss(pred_vol, tgt_vol)
-        
+
         base_loss = torch.stack(losses).mean() if losses else torch.tensor(0.0, device=p.device)
         return base_loss + 0.1 * vol_loss
 
@@ -306,6 +333,33 @@ def compute_shape_loss(
         )
         return loss
 
+
+def growth_specialist_ckpt_score(
+    *,
+    ckpt_metric: str,
+    clot_score: float,
+    offwall_relaxed_f1: float,
+    offwall_n_pred: float,
+    offwall_n_gt: float,
+) -> float:
+    """Checkpoint selection score for the decoupled growth specialist.
+
+    - ``clot_score``: legacy full deploy clot score (growth-alone; poor for specialists).
+    - ``offwall_relaxed``: maximize off-wall relaxed F1.
+    - ``offwall_balanced``: blend relaxed F1 with volume match vs GT (best-practice Arm C).
+    """
+    mode = (ckpt_metric or "clot_score").strip().lower()
+    if mode in ("offwall_relaxed", "offwall_relaxed_f1", "relaxed"):
+        return float(offwall_relaxed_f1)
+    if mode in ("offwall_balanced", "balanced", "offwall"):
+        n_gt = max(float(offwall_n_gt), 0.0)
+        n_pred = max(float(offwall_n_pred), 0.0)
+        if n_gt <= 0.0:
+            # No GT off-wall mass: prefer predicting nothing (avoid free FPs).
+            return float(offwall_relaxed_f1) - 0.1 * min(n_pred, 20.0)
+        vol_match = min(n_pred / n_gt, 1.0)
+        return 0.7 * float(offwall_relaxed_f1) + 0.3 * vol_match
+    return float(clot_score)
 
 def unroll_offwall_loss_custom(
     model: nn.Module,
@@ -461,22 +515,55 @@ def main() -> int:
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument("--hops-k", type=int, default=4, help="k-hops dilation around active clots for subgraphs")
     ap.add_argument(
+        "--frontier-hops",
+        type=int,
+        default=2,
+        help="When --supervise-mode=frontier, loss mask = dilate(clot, this many hops)",
+    )
+    ap.add_argument(
+        "--supervise-mode",
+        choices=("offwall", "frontier"),
+        default="offwall",
+        help="offwall=~wall only; frontier=growth near existing clots (wall+lumen)",
+    )
+    ap.add_argument(
         "--loss-mode",
-        choices=("standard", "spatial_tolerance", "loss_blurring"),
+        choices=("standard", "spatial_tolerance", "loss_blurring", "loss_blurring_prec"),
         default="standard",
-        help="Loss strategy for off-wall growth optimization"
+        help="Loss strategy: loss_blurring_prec = blurring + light FP outside dilate(GT,2)",
+    )
+    ap.add_argument(
+        "--ckpt-metric",
+        choices=("clot_score", "offwall_relaxed", "offwall_balanced"),
+        default="clot_score",
+        help="Checkpoint selection: offwall_balanced preferred for wall-route compound Arm C",
+    )
+    ap.add_argument(
+        "--cheap-val",
+        action="store_true",
+        help="Skip full deploy val (use -train_loss); for smoke tests on small GPUs",
+    )
+    ap.add_argument(
+        "--mat-leg",
+        default="",
+        help="Optional mat-growth leg env (e.g. WC_v7_clot_phi_mse) for feature compatibility",
     )
     args = ap.parse_args()
 
     apply_train_recipe_env()
-    
+
     # Parse early to apply meta env from initialization checkpoint
     init_ckpt = "" if bool(args.no_init) else (args.init.strip() or str(get_project_root() / DEFAULT_S34_CKPT))
     if init_ckpt and Path(init_ckpt).is_file():
         load_continuous_bundle(init_ckpt, quiet=True, apply_meta_env=True)
         print(f"[i] Applied meta environment overrides from {init_ckpt} early", flush=True)
-    
-    # Enforce off-wall scope by default
+
+    # Mat-leg last (force) so WC_v7 feature/physics knobs win over stale init meta.
+    if args.mat_leg.strip():
+        apply_mat_growth_leg_env(args.mat_leg.strip(), force=True)
+        print(f"[i] Applied mat-growth leg env: {args.mat_leg.strip()}", flush=True)
+
+    # Never wall-only gelation for a growth specialist
     os.environ["CLOT_PHI_PHYSICS_WALL_MAT_ONLY"] = "0"
     
     unroll = pushforward_unroll_steps() if args.unroll is None else int(args.unroll)
@@ -519,13 +606,29 @@ def main() -> int:
                 bio=bio,
             )
         )
+        # Pack tensors stay on CPU; free transient GPU from kinematics / flow series.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     val_pack = next((p for p in packs if p["anchor"] == val_anchor), packs[0])
-    
+
+    # Kinematics predictor is only needed for feature packing; free VRAM for the GNN.
+    del kine_model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    print(
+        f"[i] Packed {len(packs)} anchors on CPU "
+        f"(peak GPU after pack free: "
+        f"{(torch.cuda.memory_allocated() / (1024 ** 2)):.0f} MiB)"
+        if device.type == "cuda"
+        else f"[i] Packed {len(packs)} anchors",
+        flush=True,
+    )
+
     # Resolve dims using first pack
     ref_static = packs[0]["base_feats_global"]
     latent_dim = int(ref_static.shape[1] - 1)
     in_dim = continuous_feature_dim(latent_dim)
-    
+
     pushforward_arch_name = species_pushforward_arch()
     model = build_continuous_gnn(in_dim, hidden=hidden, arch=pushforward_arch_name).to(device)
     model.kin_latent_dim = latent_dim
@@ -539,6 +642,10 @@ def main() -> int:
         if bundle is not None:
             init_dual_head_from_continuous(model, bundle.model, quiet=False)
             print(f"[OK] warm-start GNN from {init_ckpt}", flush=True)
+            # Drop init teacher weights from VRAM (partial copy already applied).
+            del bundle
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             
     # Setup optimizer
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -554,12 +661,21 @@ def main() -> int:
     stale = 0
     t0 = time.perf_counter()
 
+    supervise_mode = str(args.supervise_mode).strip().lower()
+    frontier_hops = max(int(args.frontier_hops), 0)
+    ckpt_metric = str(args.ckpt_metric).strip().lower()
+    if supervise_mode == "frontier":
+        supervise_desc = f"FRONTIER dilate(clot,{frontier_hops}) including wall near commits"
+    else:
+        supervise_desc = "OFF-WALL nodes only (loss-masked)"
     print(
-        f"[i] Training decoupled off-wall growth model:\n"
+        f"[i] Training decoupled clot-growth specialist:\n"
         f"  epochs: {args.epochs}, lr: {lr:.1e}, early-stop limit: {args.early_stop}\n"
-        f"  dilation hops k: {args.hops_k}, unroll window: {unroll}\n"
-        f"  supervision: OFF-WALL nodes only (loss-masked)\n"
+        f"  subgraph hops k: {args.hops_k}, unroll window: {unroll}\n"
+        f"  supervision: {supervise_desc}\n"
         f"  loss mode: {args.loss_mode}\n"
+        f"  ckpt metric: {ckpt_metric}\n"
+        f"  mat-leg: {args.mat_leg.strip() or '(none)'}\n"
         f"  output: {out_path}",
         flush=True,
     )
@@ -574,69 +690,73 @@ def main() -> int:
         for pack in pack_order:
             wins = pack["windows"][:]
             random.shuffle(wins)
-            base_feats_global = pack["base_feats_global"].to(device)
-            wall_mask_full = pack["wall_mask_full"].to(device)
-            data_gpu = pack["data"].to(device)
+            # Keep full timeline graph on CPU (4GB GPUs OOM on data.to(cuda)).
+            data_cpu = pack["data"]
+            n_nodes = int(data_cpu.num_nodes)
+            edge_index = data_cpu.edge_index.to(device=device)
+            base_feats_global = pack["base_feats_global"].to(device=device)
+            wall_mask_full = pack["wall_mask_full"].to(device=device)
+            pos_cpu = data_cpu.x[:, :2]
 
             for win in wins:
                 win_use = win[: cur_unroll + 1]
-                
-                # 1. Compute active clot union across window
-                clot_union = torch.zeros(data_gpu.num_nodes, dtype=torch.bool, device=device)
+
+                # 1. Active clot union (GT helper streams y[t] only onto device).
+                clot_union = torch.zeros(n_nodes, dtype=torch.bool, device=device)
                 for ti in win_use:
-                    clot_t = gt_growth_commit_mask_at_time(data_gpu, ti, phys, device)
+                    clot_t = gt_growth_commit_mask_at_time(data_cpu, ti, phys, device)
                     clot_union |= clot_t
-                
+
                 if not clot_union.any():
-                    continue # skip window if there are absolutely no active clots
-                    
-                # 2. Dilate by k hops to build local subgraph mask
-                subgraph_mask = graph_dilate_hops(clot_union, data_gpu.edge_index, args.hops_k)
-                
-                # 3. Extract subgraph nodes and edge index
-                node_idx, edge_sub, remap = induced_subgraph(subgraph_mask, data_gpu.edge_index)
-                
-                # 4. Supervise only off-wall nodes within this neighborhood
+                    continue
+
+                # 2-3. Local subgraph around active clots
+                subgraph_mask = graph_dilate_hops(clot_union, edge_index, args.hops_k)
+                node_idx, edge_sub, remap = induced_subgraph(subgraph_mask, edge_index)
+
+                # 4. Supervision mask
                 wall_mask_sub = wall_mask_full[node_idx]
-                offwall_nodes = ~wall_mask_sub
-                if not offwall_nodes.any():
-                    continue # skip window if there are no off-wall nodes in this neighborhood
-                
-                # 5. Slice inputs to subgraph indices
+                if supervise_mode == "frontier":
+                    growth_zone_full = graph_dilate_hops(clot_union, edge_index, frontier_hops)
+                    train_mask = growth_zone_full[node_idx]
+                else:
+                    train_mask = ~wall_mask_sub
+                if not train_mask.any():
+                    continue
+
+                # 5. Slice inputs (CPU y -> device only for subgraph nodes / times)
+                node_idx_cpu = node_idx.detach().cpu()
                 base_feats_sub = base_feats_global[node_idx]
-                pos_sub = data_gpu.x[node_idx, :2].to(dtype=base_feats_sub.dtype)
-                
+                pos_sub = pos_cpu[node_idx_cpu].to(device=device, dtype=base_feats_sub.dtype)
+
                 series = []
                 for ti in win_use:
-                    y = data_gpu.y[ti].to(device=device, dtype=torch.float32)
+                    y = data_cpu.y[int(ti)].to(device=device, dtype=torch.float32)
                     sp = y[:, sc.SPECIES_BLOCK]
                     sp_sub = torch.stack([sp[:, int(ch)] for ch in bulk_channels], dim=-1)[node_idx]
                     series.append(sp_sub)
-                    
-                speed_series = None
-                if continuous_vel_decay_enabled():
-                    speed_series = []
-                    for ti in win_use:
-                        y = data_gpu.y[ti].to(device=device, dtype=torch.float32)
-                        vel = y[:, 0:2]
-                        speed = vel.norm(dim=1)
-                        speed_series.append(speed[node_idx])
-                
-                velocity_series = [data_gpu.y[ti, node_idx, 0:2] for ti in win_use]
-                species_block_full = [data_gpu.y[ti, node_idx, sc.SPECIES_BLOCK] for ti in win_use]
-                
-                # Dynamic flow features sliced
+
+                velocity_series = [
+                    data_cpu.y[int(ti), node_idx_cpu, 0:2].to(device=device, dtype=torch.float32)
+                    for ti in win_use
+                ]
+                species_block_full = [
+                    data_cpu.y[int(ti), node_idx_cpu, sc.SPECIES_BLOCK].to(
+                        device=device, dtype=torch.float32
+                    )
+                    for ti in win_use
+                ]
+
                 flow_series_sub = None
                 if pack["flow_series_global"] is not None:
-                    flow_series_sub = pack["flow_series_global"][:, node_idx.cpu()].to(device)
-                
-                # Custom off-wall shape loss
+                    flow_series_sub = pack["flow_series_global"][:, node_idx_cpu].to(device)
+
                 loss = unroll_offwall_loss_custom(
                     model,
                     base_feats=base_feats_sub,
                     edge_index=edge_sub,
                     log_series=series,
-                    train_mask=offwall_nodes,
+                    train_mask=train_mask,
                     pos_band=pos_sub,
                     time_window=win_use,
                     flow_series=flow_series_sub,
@@ -647,7 +767,7 @@ def main() -> int:
                     loss_mode=args.loss_mode,
                     device=device,
                 )
-                
+
                 if not loss.requires_grad:
                     continue
                 opt.zero_grad(set_to_none=True)
@@ -657,71 +777,100 @@ def main() -> int:
                 opt.step()
                 ep_losses.append(float(loss.item()))
 
-            # Cleanup
-            del base_feats_global, wall_mask_full, data_gpu
+            del base_feats_global, wall_mask_full, edge_index
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         mean_loss = sum(ep_losses) / max(len(ep_losses), 1)
+        if not ep_losses:
+            msg = (
+                f"epoch {ep}: no supervised windows produced a loss "
+                f"(check --max-windows / clot presence on train anchors)"
+            )
+            print(f"[WARN] {msg}", flush=True)
+            if ep == 1:
+                raise RuntimeError(msg)
 
-        # --- Validation Loop (Standard deploy metrics evaluation) ---
+        # --- Validation ---
         model.eval()
-        val_static = val_pack["base_feats_global"].to(device)
-        val_data = val_pack["data"].to(device)
-        
-        dummy_static = {
-            "node_idx": torch.arange(val_data.num_nodes, device=device),
-            "base_feats": val_static,
-            "edge_index": val_data.edge_index,
-            "pos_band": val_data.x[:, :2].to(dtype=val_static.dtype),
-        }
-        
-        n_val = int(val_data.y.shape[0])
-        t_deploy = deploy_eval_time_index(n_val)
-        
-        # Standard evaluate rollout F1
-        dep_f1 = eval_full_rollout_fimat_f1(
-            model,
-            val_data,
-            dummy_static,
-            device,
-            time_index=t_deploy,
-        )
-        
-        # Standard evaluate clot metrics (relaxed precision/recall/F1)
-        apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": "gt"})
-        clf = eval_deploy_clot_f1(
-            model,
-            val_data,
-            dummy_static,
-            phys,
-            bio,
-            device,
-            time_index=t_deploy,
-            flow_source="gt",
-        )
-        
-        val_score = float(clf.get("deploy_clot_score", 0.0))
-        offwall_relaxed_f1 = float(clf.get("deploy_clot_offwall_relaxed_f1", 0.0))
-        offwall_n_pred = float(clf.get("deploy_clot_offwall_n_pred", 0.0))
-        offwall_n_gt = float(clf.get("deploy_clot_offwall_n_gt", 0.0))
-        
+        if bool(args.cheap_val):
+            # Smoke path: avoid parking ~200MB y timelines on a 4GB GPU for deploy eval.
+            val_clot_score = 0.0
+            offwall_relaxed_f1 = 0.0
+            offwall_strict_f1 = 0.0
+            offwall_n_pred = 0.0
+            offwall_n_gt = 0.0
+            val_score = -float(mean_loss)
+        else:
+            val_static = val_pack["base_feats_global"].to(device)
+            val_data = val_pack["data"].to(device)
+            try:
+                dummy_static = {
+                    "node_idx": torch.arange(int(val_data.num_nodes), device=device),
+                    "base_feats": val_static,
+                    "edge_index": val_data.edge_index,
+                    "pos_band": val_data.x[:, :2].to(dtype=val_static.dtype),
+                }
+                n_val = int(val_data.y.shape[0])
+                t_deploy = deploy_eval_time_index(n_val)
+                _ = eval_full_rollout_fimat_f1(
+                    model,
+                    val_data,
+                    dummy_static,
+                    device,
+                    time_index=t_deploy,
+                )
+                apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": "gt"})
+                clf = eval_deploy_clot_f1(
+                    model,
+                    val_data,
+                    dummy_static,
+                    phys,
+                    bio,
+                    device,
+                    time_index=t_deploy,
+                    flow_source="gt",
+                )
+            finally:
+                del val_data, val_static
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            val_clot_score = float(clf.get("deploy_clot_score", 0.0))
+            offwall_relaxed_f1 = float(clf.get("deploy_clot_offwall_relaxed_f1", 0.0))
+            offwall_strict_f1 = float(clf.get("deploy_clot_offwall_strict_f1", 0.0))
+            offwall_n_pred = float(clf.get("deploy_clot_offwall_n_pred", 0.0))
+            offwall_n_gt = float(clf.get("deploy_clot_offwall_n_gt", 0.0))
+            val_score = growth_specialist_ckpt_score(
+                ckpt_metric=ckpt_metric,
+                clot_score=val_clot_score,
+                offwall_relaxed_f1=offwall_relaxed_f1,
+                offwall_n_pred=offwall_n_pred,
+                offwall_n_gt=offwall_n_gt,
+            )
+
         improved = False
         if val_score > best_score:
             best_score = val_score
             improved = True
             stale = 0
-            
+
             meta = {
                 "epoch": ep,
                 "val_score": val_score,
+                "val_clot_score": val_clot_score,
+                "ckpt_metric": ckpt_metric,
                 "offwall_relaxed_f1": offwall_relaxed_f1,
+                "offwall_strict_f1": offwall_strict_f1,
                 "offwall_n_pred": offwall_n_pred,
                 "offwall_n_gt": offwall_n_gt,
                 "unroll": unroll,
                 "hops_k": args.hops_k,
+                "frontier_hops": frontier_hops,
+                "supervise_mode": supervise_mode,
                 "arch": pushforward_arch_name,
                 "loss_mode": args.loss_mode,
+                "mat_leg": args.mat_leg.strip() or None,
                 "env_overrides": collect_active_env_overrides(),
             }
             save_continuous_checkpoint(out_path, model, meta)
@@ -730,8 +879,9 @@ def main() -> int:
 
         dt = time.perf_counter() - t0
         print(
-            f"Epoch {ep:02d} | Loss: {mean_loss:.4f} | Val Score: {val_score:.3f} "
-            f"| Off-wall Relaxed F1: {offwall_relaxed_f1:.3f} | Pred Off-wall: {offwall_n_pred:.1f}/{offwall_n_gt:.1f} "
+            f"Epoch {ep:02d} | Loss: {mean_loss:.4f} | CkptScore: {val_score:.3f} "
+            f"(clot={val_clot_score:.3f}) | Off-wall RelF1: {offwall_relaxed_f1:.3f} "
+            f"| Pred Off-wall: {offwall_n_pred:.1f}/{offwall_n_gt:.1f} "
             f"| {'[SAVED]' if improved else ''}",
             flush=True,
         )
@@ -741,7 +891,10 @@ def main() -> int:
                 "epoch": ep,
                 "loss": mean_loss,
                 "val_score": val_score,
+                "val_clot_score": val_clot_score,
+                "ckpt_metric": ckpt_metric,
                 "offwall_relaxed_f1": offwall_relaxed_f1,
+                "offwall_strict_f1": offwall_strict_f1,
                 "offwall_n_pred": offwall_n_pred,
                 "offwall_n_gt": offwall_n_gt,
                 "dt": dt

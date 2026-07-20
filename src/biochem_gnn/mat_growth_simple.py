@@ -44,6 +44,8 @@ MAT_GROWTH_SIMPLE_RECIPE: dict[str, str] = {
     "SPECIES_CONTINUOUS_SPEED_FP_WEIGHT": "6.0",
     "SPECIES_CONTINUOUS_GATE_FP_WEIGHT": "4.0",
     "SPECIES_FLOW_FEATS_DROP_XY": "0",
+    # Train static/dynamic flow block on COMSOL GT velocity (not a second GINO-DEQ solve).
+    "SPECIES_FLOW_FEATS_SOURCE": "gt",
     "SPECIES_CONTINUOUS_CLOUT_SCORE": "relaxed_prec_floor",
     "SPECIES_CLOUT_PREC_REC_FLOOR": "0.35",
     "SPECIES_CONTINUOUS_SCORE_CLOUT_W": "0.75",
@@ -989,6 +991,7 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "SPECIES_CONTINUOUS_TEACHER_BLUR": "0.25",
                 "SPECIES_CONTINUOUS_TBPTT_TAIL": "5",
                 "SPECIES_CONTINUOUS_CLOSED_LOOP_INIT": "0.45",
+                "BIOCHEM_KINE_RESOLVE_ON_CLOT": "0",
             },
         ),
         "WC_v7_clot_phi_mse": MatGrowthLegSpec(
@@ -1031,6 +1034,7 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "SPECIES_GELATION_PHI_LOSS_TYPE": "mse",
                 "SPECIES_CONTINUOUS_MU_LOSS_WEIGHT": "0.0",
                 "SPECIES_CONTINUOUS_LOSS_SCALE": "0.1",
+                "BIOCHEM_KINE_RESOLVE_ON_CLOT": "0",
             },
         ),
         "WC_v7_high_precision": MatGrowthLegSpec(
@@ -1073,6 +1077,7 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "SPECIES_CONTINUOUS_SPEED_FP_WEIGHT": "24.0",
                 "SPECIES_CONTINUOUS_UNDERPRED_WEIGHT": "0.5",
                 "SPECIES_CONTINUOUS_SPATIAL_LOSS_WEIGHT": "8.0",
+                "BIOCHEM_KINE_RESOLVE_ON_CLOT": "0",
             },
         ),
         "WC_v2_baseline": MatGrowthLegSpec(

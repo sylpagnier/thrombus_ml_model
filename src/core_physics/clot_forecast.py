@@ -72,6 +72,18 @@ def clot_forecast_pair_schedule() -> str:
     return (os.environ.get("CLOT_FORECAST_PAIR_SCHEDULE") or "rolling").strip().lower()
 
 
+def clot_forecast_input_mu_enabled() -> bool:
+    """Optional log(mu) input channel for one-step forecast features (legacy)."""
+    return _env_bool("CLOT_FORECAST_INPUT_MU", False)
+
+
+def clot_forecast_extra_feature_dim() -> int:
+    """Extra feature count appended when one-step forecast input-mu is enabled."""
+    if not clot_forecast_one_step_enabled():
+        return 0
+    return 1 if clot_forecast_input_mu_enabled() else 0
+
+
 def snapshot_clot_forecast_config() -> dict[str, object]:
     return {
         "one_step": clot_forecast_one_step_enabled(),
@@ -81,6 +93,8 @@ def snapshot_clot_forecast_config() -> dict[str, object]:
         "mask_mode": clot_forecast_mask_mode(),
         "pair_stride": clot_forecast_pair_stride(),
         "pair_schedule": clot_forecast_pair_schedule(),
+        "input_mu": clot_forecast_input_mu_enabled(),
+        "extra_feature_dim": clot_forecast_extra_feature_dim(),
     }
 
 

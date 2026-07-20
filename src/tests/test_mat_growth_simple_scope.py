@@ -55,6 +55,9 @@ def test_mat_growth_simple_recipe_knobs():
     assert os.environ["SPECIES_CONTINUOUS_CLOUT_SCORE"] == "relaxed_prec_floor"
     assert float(os.environ["SPECIES_CONTINUOUS_FP_WEIGHT"]) >= 16.0
     assert float(os.environ["SPECIES_CONTINUOUS_SCORE_CLOUT_W"]) >= 0.75
+    # Train flow block on COMSOL GT (avoid a second GINO-DEQ at pack build).
+    assert os.environ["SPECIES_FLOW_FEATS_SOURCE"] == "gt"
+    assert MAT_GROWTH_SIMPLE_RECIPE["SPECIES_FLOW_FEATS_SOURCE"] == "gt"
     # wall hops come from the global triangle6 recipe (applied first), not the mat-only overrides.
     assert os.environ["SPECIES_SNAPSHOT_WALL_HOPS"] == GLOBAL_TRAIN_RECIPE["SPECIES_SNAPSHOT_WALL_HOPS"]
 

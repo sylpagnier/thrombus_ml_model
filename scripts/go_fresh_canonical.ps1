@@ -28,6 +28,7 @@ if ($Fast) {
     $Epochs = 2
     $EarlyStop = 2
     $MaxWindows = 4
+    $Anchors = "patient007"
 }
 
 $Legs = @()
@@ -42,6 +43,7 @@ foreach ($l in $Legs) {
     Write-Host "[i] Starting training for Leg: $l" -ForegroundColor Magenta
     Write-Host "==================================================" -ForegroundColor Magenta
     
+    $Ckpt = "outputs/biochem/biochem_gnn/$l/species/best.pth"
     $trainArgs = @(
         "-m", "src.training.train_species_pushforward_continuous",
         "--leg", $l,
@@ -49,18 +51,23 @@ foreach ($l in $Legs) {
         "--epochs", "$Epochs",
         "--early-stop", "$EarlyStop",
         "--max-windows", "$MaxWindows",
-        "--recipe", "mat_growth_simple"
+        "--recipe", "mat_growth_simple",
+        "--out", $Ckpt
     )
-    if ($Fresh) { $trainArgs += "--fresh" }
+    if ($Fresh) { $trainArgs += "--no-init" }
     
     Invoke-PythonRcCheck -Label "train $l" -PyArgs $trainArgs
     
     Write-Host "[i] Evaluating Leg: $l ..." -ForegroundColor Cyan
-    Invoke-PythonRcCheck -Label "eval $l" -PyArgs @(
+    $Ckpt = "outputs/biochem/biochem_gnn/$l/species/best.pth"
+    $CompareJson = "outputs/biochem/biochem_gnn/$l/compare.json"
+    $evalArgs = @(
         "scripts/eval_mat_growth_simple.py",
-        "--leg", $l,
-        "--compare"
+        "--ckpt", $Ckpt,
+        "--out", $CompareJson,
+        "--anchors", $Anchors
     )
+    Invoke-PythonRcCheck -Label "eval $l" -PyArgs $evalArgs
 }
 
 Write-Host "`n[OK] go_fresh_canonical done." -ForegroundColor Green

@@ -1,6 +1,6 @@
 """Canonical deployable biochem stack (hybrid SciML pipeline).
 
-Historical import path ``src.biochem_gnn``; prefer ``src.biochem_deploy`` when available.
+Historical import path ``src.biochem_gnn``; prefer ``from src.biochem_deploy import …`` (thin alias).
 Stack id: ``biochem_deploy`` (legacy: biochem_gnn, clot_deploy_gnn).
 SciML taxonomy: ``docs/MODEL_NOMENCLATURE.md``.
 """

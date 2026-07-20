@@ -319,6 +319,31 @@ def flow_feats_dynamic() -> bool:
 
 
 @torch.no_grad()
+def _base_uv_from_data(data, kine_model, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Clot-blind base flow: prefer cached ``u0_pred``/``v0_pred``, else one GINO-DEQ solve (no clone)."""
+    if getattr(data, "u0_pred", None) is not None and getattr(data, "v0_pred", None) is not None:
+        u = data.u0_pred.to(device=device, dtype=torch.float32).reshape(-1)
+        v = data.v0_pred.to(device=device, dtype=torch.float32).reshape(-1)
+        return u, v
+    from src.utils.kinematics_inference import predict_kinematics
+
+    try:
+        # Do not clone: the UV/latent cache is keyed on ``data.x`` storage pointer.
+        uv = predict_kinematics(kine_model, data).to(device=device)
+    except torch.cuda.OutOfMemoryError as e:
+        torch.cuda.empty_cache()
+        try:
+            uv = predict_kinematics(kine_model, data).to(device=device)
+            print("[i] flow-feature kine solve recovered on GPU after empty_cache.")
+        except torch.cuda.OutOfMemoryError:
+            raise RuntimeError(
+                "flow-feature kine solve OOM on CUDA. Silent fallbacks to CPU are disabled "
+                "by Hardware Execution Policy to prevent hangs."
+            ) from e
+    return uv[:, 0].reshape(-1), uv[:, 1].reshape(-1)
+
+
+@torch.no_grad()
 def _resolve_flow_uv(data, kine_model, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """Full-graph velocity ``(u, v)`` (ND) for the flow features per ``SPECIES_FLOW_FEATS_SOURCE``."""
     src = flow_feats_source()
@@ -328,28 +353,7 @@ def _resolve_flow_uv(data, kine_model, device: torch.device) -> tuple[torch.Tens
         ti = (n_t - 1) if t < 0 else min(int(t), n_t - 1)
         y = data.y[ti].to(device=device, dtype=torch.float32)
         return y[:, 0].reshape(-1), y[:, 1].reshape(-1)
-    from src.utils.kinematics_inference import predict_kinematics
-
-    try:
-        uv = predict_kinematics(kine_model, data.clone()).to(device=device)
-    except torch.cuda.OutOfMemoryError:
-        # Small-GPU safety. The flow-feature DEQ solve can OOM right after a clot-aware re-solve
-        # (Path A) on the same card. The usual cause is fragmentation (a small alloc fails while
-        # 100s of MiB are reserved-but-unallocated), so first defrag and RETRY ON GPU -- full speed.
-        # Only if that still fails do we drop to a (slow) CPU solve.
-        torch.cuda.empty_cache()
-        try:
-            uv = predict_kinematics(kine_model, data.clone()).to(device=device)
-            print("[i] flow-feature kine solve recovered on GPU after empty_cache.")
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print("[WARN] flow-feature kine solve OOM on CUDA; retrying on CPU.")
-            kine_cpu = kine_model.to("cpu")
-            uv = predict_kinematics(kine_cpu, data.to("cpu").clone()).to(device=device)
-            kine_model.to(device)
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-    u, v = uv[:, 0].reshape(-1), uv[:, 1].reshape(-1)
+    u, v = _base_uv_from_data(data, kine_model, device)
     if src != "kine":  # auto: corrector-coupled override at deploy (Step F)
         from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow
 
@@ -478,10 +482,7 @@ def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: 
     Shear proxy = mean neighbour speed-gradient magnitude (a clot-free flow stagnation signal the
     z_kin latent encodes only implicitly). All from the kinematic flow + geometry -> deployable.
     """
-    from src.utils.kinematics_inference import predict_kinematics
-
-    uv = predict_kinematics(kine_model, data.clone()).to(device=device)
-    u, v = uv[:, 0], uv[:, 1]
+    u, v = _base_uv_from_data(data, kine_model, device)
     # Corrector coupling: bend the base flow around the active clot so the deployable
     # stagnation/shear proxies the GraphSAGE sees reflect the diverted field (Step F).
     from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow

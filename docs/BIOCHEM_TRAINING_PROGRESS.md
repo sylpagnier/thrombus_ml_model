@@ -1,6 +1,8 @@
 # Biochem training progress log
 
-Living notes for **Phase 3 biochem corrector** (`src/training/train_biochem_corrector.py`): what we tried, what mattered, and how far we are from a **full-complexity** run.
+> **Archive status (2026-07):** The GNODE teacher/corrector path (`train_biochem_corrector.py`) and its launchers were removed from the active script surface. This document remains as a historical run chronicle. **Active stack:** `biochem_deploy` / `go_biochem_gnn.ps1` / mat-growth — see `AGENTS.md` and `scripts/README.md`.
+
+Living notes for **Phase 3 biochem corrector** (`src/training/train_biochem_corrector.py`, retired): what we tried, what mattered, and how far we were from a **full-complexity** run.
 
 **Training plan (milestones, X/Y/XY isolation, Phase I teacher vs Phase II synthetic):** [BIOCHEM_TRAINING_PLAN.md](BIOCHEM_TRAINING_PLAN.md).
 
@@ -3023,6 +3025,21 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
    - Strict F1 fell to **0.0171** (from 0.1604). This drop confirms that while the general *shape and volume* are correct, the predictions suffer from minor sub-grid coordinate misalignments, which is exactly why standard coordinate-specific losses fail.
 4. **Overall Clot F1 Trade-off:**
    - The overall clot F1 dropped slightly from 0.7938 to 0.7425. This minor decrease is a natural trade-off: the baseline had almost zero off-wall predictions, meaning it generated zero false-positives off the wall. The combined model generates actual off-wall clot structures, leading to minor precision trade-offs in exchange for the massive increase in recall.
+
+---
+
+### 205. Promote WC_v7_clot_phi_mse as canonical mat-growth deploy (`2026-07-19`)
+
+- **Trigger:** `go_fresh_canonical_finish` three-leg compare; leg 2 (`WC_v7_clot_phi_mse`) won on cohort clot score.
+- **Cohort mean (`compare.json`):** clot score **0.791**, clot F1 **0.767**, mat F1 **0.714** (vs fresh_canonical 0.785 / 0.757 / 0.716; vs high_precision 0.764 / 0.691 / 0.659).
+- **Promotion (synced, same SHA256):**
+  - Source: `WC_v7_clot_phi_mse/species/best.pth`
+  - **Locked (source of truth):** `locked/species_gnn_best.pth`
+  - Aliases: `mat_canonical_deploy/species/best.pth`, `species/best.pth`
+  - Manifests: `data/reference/biochem_gnn_baseline.json`, `data/reference/mat_canonical_deploy.json`, `locked/manifest.json`
+- **Code defaults:** `customer_pipeline` `DEFAULT_MAT_LEG=WC_v7_clot_phi_mse`, wall ckpt → locked; eval baseline prefers locked. Two-model offwall opt-in only (`CUSTOMER_OFFWALL_CKPT`) — WC_v7 is unified wall+off-wall.
+- **Prior retired for warm-start:** `WC_v2_dilation` (2026-07-06).
+- **Next:** new mat-growth improvements init from locked / `species/best.pth` with `WC_v7_clot_phi_mse` env overrides.
 
 ---
 

@@ -1394,6 +1394,10 @@ flow is not optional for inlet-blob control.
 **Promote:** `go_mat_w_wc_canonical.ps1 -EvalOnly -Promote` →
 `outputs/biochem/biochem_gnn/mat_canonical_deploy/species/best.pth`.
 
+> **Superseded 2026-07-19:** canonical is now **`WC_v7_clot_phi_mse`** →
+> `locked/species_gnn_best.pth` (aliases: `mat_canonical_deploy/`, `species/best.pth`).
+> See [MAT_GROWTH_SIM_TODO.md](MAT_GROWTH_SIM_TODO.md) and BIOCHEM_TRAINING_PROGRESS §205.
+
 ## 7. Open questions / before promoting
 - Confirm the Mat/AP-only path generalizes across patients (p007 -> others) before
   retiring the data-driven `predict_phi_prior_rule` baseline.

@@ -3,7 +3,20 @@
 Living queue for clot Mat architecture experiments. **Selection metric:** all-anchor
 `deploy_clot_f1` and `deploy_clot_relaxed_prec` in each leg's `compare.json`.
 
-Locked reference: fi_mat baseline **0.634** (`outputs/biochem/biochem_gnn/species/best.pth`).
+## Current canonical (2026-07-19)
+
+| | |
+|--|--|
+| **Leg** | **`WC_v7_clot_phi_mse`** (leg 2 of `go_fresh_canonical_finish`) |
+| **Locked ckpt** | `outputs/biochem/biochem_gnn/locked/species_gnn_best.pth` |
+| **Aliases** | `mat_canonical_deploy/species/best.pth`, `species/best.pth` |
+| **Manifest** | `data/reference/biochem_gnn_baseline.json`, `data/reference/mat_canonical_deploy.json` |
+| **Cohort** | clot score **~0.791**, clot F1 **~0.767**, mat F1 **~0.714** |
+| **Prior** | `WC_v2_dilation` (2026-07-06; retired for warm-start) |
+
+New improvements **warm-start from locked** (or `species/best.pth`). Apply leg env via `mat_growth_leg_spec("WC_v7_clot_phi_mse")`.
+
+Locked reference (historical fi_mat baseline): **0.634** (`triangle6_wall3hop_20260624`).
 
 Partial full-budget log:
 `outputs/biochem/biochem_gnn/mat_only_full/mat_only_partial_summary.json`
@@ -121,10 +134,13 @@ Summary: `outputs/biochem/biochem_gnn/mat_w_wc_canonical/mat_w_wc_canonical_summ
 
 Run `-Promote` to copy alias -> `mat_canonical_deploy/species/best.pth`.
 
+> **Superseded 2026-07-19** by **`WC_v7_clot_phi_mse`** (see Current canonical above).
+
 ## BACKLOG -- post canonical
 
 | Task | Why |
 |------|-----|
+| **Resume go_wc_v7_compound_growth_abc_9h.ps1 -EvalOnly -SkipC** | Arm B train done (~9.6 h / 35 anchors; best ep16 clot=0.483). C cancelled. Full A/B/C is ~20-26 h not 9 h; A+B eval alone ~2-6 h. |
 | Run **WM_mat_flow_seedfront_tightfp** (1 leg) | Only unfinished W-fix sweep leg |
 | FP-aware winner on prior summaries | Re-rank `mat_w_fix_sweep_10h` with new `--minimize-metrics` |
 

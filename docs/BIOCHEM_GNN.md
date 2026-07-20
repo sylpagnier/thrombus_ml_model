@@ -2,21 +2,19 @@
 
 > **Naming:** Stack id **`biochem_deploy`** = frozen **RGP-DEQ** (`pmgp_deq_kine`) + **GraphSAGE pushforward** + **gelation_beta** + **mechanistic clot readout**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
 
-## Two biochem training paths (do not conflate)
+## Two biochem training paths (historical)
 
-| | **biochem_deploy** (deploy baseline) | **train_biochem_corrector** (GNODE research) |
+| | **biochem_deploy** (canonical, active) | **train_biochem_corrector** (GNODE, **retired 2026-06**) |
 |---|--------------------------------------|-----------------------------------------------|
-| Entry | `python -m src.bin.main train biochem-deploy` | `python -m src.bin.main train biochem` |
-| Model | GraphSAGE pushforward + physics clot readout | `GNODE_Phase3` graph neural ODE |
+| Entry | `python -m src.bin.main train biochem-deploy` | removed (`go_biochem_gnn.ps1` is the active path) |
+| Model | GraphSAGE pushforward + physics clot readout | `GNODE_Phase3` graph neural ODE (deleted) |
 | Mesh scope | Ceiling / wall band (~1-hop) | Full vessel graph |
-| Flow | External frozen `pmgp_deq_kine` (RGP-DEQ) | Learned / GT kine in-graph |
-| Mu | Physics gelation from species (`gelation_beta`) | Learned mu heads, K10 ladder |
-| Clot | `clot_trigger_physics` (mechanistic + nucleation) | Clot-phi probes, MLP injectors |
-| Loss | Species delta Huber + deploy F1 eval | L_Data_Bio, MU_LOG, Kendall PDE, ADR |
-| Deploy | Yes (no GT species at inference) | Teacher-only / research |
-| Flow coupling | **Not yet** (planned component) | Partial (passive ADR, step-2 bridge) |
+| Flow | External frozen RGP-DEQ / GINO-DEQ | Learned / GT kine in-graph |
+| Mu | Physics gelation from species (`gelation_beta`) | Learned mu heads |
+| Clot | `clot_trigger_physics` + mat-growth | Clot-phi probes, MLP injectors |
+| Deploy | Yes (no GT species at inference) | Research only (archived) |
 
-**Do not replace `train_biochem_corrector.py`** with the deploy stack until flow coupling and mu objectives are unified.
+GNODE teacher/corrector launchers and modules were removed from the active surface; see `docs/archive/2026-06-16-biochem-cleanup.md` and `AGENTS.md`.
 
 ## Components
 
@@ -32,12 +30,16 @@ pmgp_deq_kine           [frozen RGP-DEQ ckpt, Stage A]
 
 ```
 outputs/biochem/biochem_gnn/          # active artifact tree today
-  species/best.pth
+  locked/species_gnn_best.pth         # CANONICAL (WC_v7_clot_phi_mse, 2026-07-19)
+  mat_canonical_deploy/species/best.pth  # synced alias
+  species/best.pth                    # synced warm-start alias
   viscosity/beta.pth
   loao/holdout_*/
-  locked/
-data/reference/biochem_gnn_baseline.json   # or biochem_deploy_baseline.json when promoted
+data/reference/biochem_gnn_baseline.json
+data/reference/mat_canonical_deploy.json
 ```
+
+Canonical leg: **`WC_v7_clot_phi_mse`**. New mat-growth improvements warm-start from `locked/species_gnn_best.pth`.
 
 Legacy ladders and aliases were archived from the active surface; see `BIOCHEM_LEGACY_LESSONS.md` and `archive/2026-06-16-biochem-cleanup.md`.
 

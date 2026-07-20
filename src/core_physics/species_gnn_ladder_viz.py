@@ -44,53 +44,40 @@ def scatter_clot_error_panel(
     s: float = 3.0,
     hop_distances: np.ndarray | None = None,
 ) -> dict[str, int]:
-    """FP=red overpaint, FN=blue missed clot; gray bulk elsewhere. Can color-code by hop."""
+    """FP=red, FN=blue; gray elsewhere. Color-coded by hop distance from wall (-x: FN, +x: FP)."""
+    import matplotlib.colors as mcolors
     gt = phi_gt.reshape(-1) >= float(thresh)
     pr = phi_pred.reshape(-1) >= float(thresh)
     fp = pr & ~gt
     fn = ~pr & gt
     
-    # Gray background
+    n_nodes = pos.shape[0]
+    error_vals = np.zeros(n_nodes, dtype=float)
+    
+    if hop_distances is not None:
+        hops = hop_distances.reshape(-1)
+        # FP: positive (hop + 1)
+        error_vals[fp] = np.clip(hops[fp] + 1, 1, 5)
+        # FN: negative -(hop + 1)
+        error_vals[fn] = np.clip(-(hops[fn] + 1), -5, -1)
+    else:
+        error_vals[fp] = 2.0  # fallback to standard red (Hop 1 equivalent)
+        error_vals[fn] = -2.0 # fallback to standard blue (Hop 1 equivalent)
+
+    colors = [
+        "#9ecae1", "#6baed6", "#4292c6", "#1f77b4", "#084594",
+        "#d9d9d9",
+        "#800000", "#d62728", "#ff7f0e", "#fd8d3c", "#feb24c"
+    ]
+    cmap = mcolors.ListedColormap(colors)
+    bounds = np.arange(-5.5, 6.5, 1.0)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    
     ax.scatter(
-        pos[:, 0], pos[:, 1], c="#d9d9d9", s=s, linewidths=0, alpha=0.55, zorder=1,
+        pos[:, 0], pos[:, 1], c=error_vals, cmap=cmap, norm=norm,
+        s=s, linewidths=0, alpha=0.92, zorder=3
     )
     
-    # FP coloring
-    if fp.any():
-        if hop_distances is not None:
-            hops = hop_distances.reshape(-1)[fp]
-            for hop_val in range(5):
-                mask = (hops == hop_val) if hop_val < 4 else (hops >= 4)
-                if mask.any():
-                    color = FP_COLORS[hop_val]
-                    ax.scatter(
-                        pos[fp][mask, 0], pos[fp][mask, 1], c=color, s=max(s * 1.15, 2.5),
-                        linewidths=0, alpha=0.92, zorder=3,
-                    )
-        else:
-            ax.scatter(
-                pos[fp, 0], pos[fp, 1], c="#d62728", s=max(s * 1.15, 2.5),
-                linewidths=0, alpha=0.92, zorder=3,
-            )
-            
-    # FN coloring
-    if fn.any():
-        if hop_distances is not None:
-            hops = hop_distances.reshape(-1)[fn]
-            for hop_val in range(5):
-                mask = (hops == hop_val) if hop_val < 4 else (hops >= 4)
-                if mask.any():
-                    color = FN_COLORS[hop_val]
-                    ax.scatter(
-                        pos[fn][mask, 0], pos[fn][mask, 1], c=color, s=max(s * 1.15, 2.5),
-                        linewidths=0, alpha=0.92, zorder=3,
-                    )
-        else:
-            ax.scatter(
-                pos[fn, 0], pos[fn, 1], c="#1f77b4", s=max(s * 1.15, 2.5),
-                linewidths=0, alpha=0.92, zorder=3,
-            )
-            
     ax.set_aspect("equal")
     ax.axis("off")
     if row_label:

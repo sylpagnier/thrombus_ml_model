@@ -31,6 +31,16 @@
   - `src/clot_deploy_gnn/*`
 - Legacy ladder docs (superseded by canonical baseline docs and this archive record)
 
+## Follow-up trim (2026-07-19)
+
+Additional dead surface removed after GraphSAGE migration left GNODE-era scripts broken:
+
+- Slimmed `src/evaluation/visualize_pipeline.py` (~3k → ~600 lines): steady-kin + GraphSAGE deploy smoke only.
+- Deleted scripts importing removed modules (`train_biochem_corrector`, `gnode_biochem`, `biochem_teacher_loader`, `train_clot_phi_simple`, `clot_ml_*`).
+- Deleted broken stubs: `go_visc3h`, `go_health10h`, `go_mu_complexity_6h`, `go_mlp_*`, `go_rung6*`, clot-ML train/eval/viz trees, T0 diagnose, orphan `_clot_deploy_*_base.ps1`.
+- Removed empty `src/clot_deploy_gnn/` husk; restored `src/biochem_deploy/` as a thin re-export of `src.biochem_gnn`.
+- Rewrote `AGENTS.md` / `scripts/README.md` to match the active surface.
+
 ## Notes
 
 - This archive keeps history discoverable without keeping old ladders in the active script/doc surface.

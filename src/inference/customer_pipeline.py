@@ -30,11 +30,12 @@ from src.inference.corrector_coupling import CorrectorCoupledFlow
 from src.inference.species_gnn_deploy_env import load_deploy_manifest, species_gnn_deploy_env
 from src.utils.paths import get_project_root
 
-DEFAULT_WALL_CKPT = Path("outputs/biochem/biochem_gnn/mat_canonical_deploy/species/best.pth")
-DEFAULT_OFFWALL_CKPT = Path(
-    "outputs/biochem/biochem_gnn/mat_growth_ladder/WC_pivot3_occlusion/species/best.pth"
-)
-DEFAULT_MAT_LEG = "WC_v2_dilation"
+# Canonical = WC_v7_clot_phi_mse (promoted 2026-07-19). locked/ is the source of truth;
+# mat_canonical_deploy/ and species/best.pth are synced aliases.
+DEFAULT_WALL_CKPT = Path("outputs/biochem/biochem_gnn/locked/species_gnn_best.pth")
+# Unified WC_v7 already covers off-wall; two-model offwall is opt-in via CUSTOMER_OFFWALL_CKPT.
+DEFAULT_OFFWALL_CKPT: Path | None = None
+DEFAULT_MAT_LEG = "WC_v7_clot_phi_mse"
 
 
 @dataclass
@@ -81,7 +82,11 @@ def _resolve_wall_ckpt(explicit: Path | str | None = None) -> Path:
 
 def _resolve_offwall_ckpt(explicit: Path | str | None = None) -> Path | None:
     raw = str(explicit or os.environ.get("CUSTOMER_OFFWALL_CKPT") or "").strip()
-    p = _abs(raw) if raw else _abs(DEFAULT_OFFWALL_CKPT)
+    if not raw:
+        if DEFAULT_OFFWALL_CKPT is None:
+            return None
+        raw = str(DEFAULT_OFFWALL_CKPT)
+    p = _abs(raw)
     return p if p.is_file() else None
 
 
@@ -111,6 +116,11 @@ def _customer_deploy_env(
     if offwall_ckpt is not None:
         overrides["SPECIES_TWO_MODEL_MODE"] = "1"
         overrides["SPECIES_OFFWALL_MODEL_CKPT"] = str(offwall_ckpt).replace("\\", "/")
+        overrides.setdefault("SPECIES_TWO_MODEL_ROUTE", os.environ.get("SPECIES_TWO_MODEL_ROUTE", "frontier"))
+        overrides.setdefault(
+            "SPECIES_TWO_MODEL_FRONTIER_HOPS",
+            os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS", "2"),
+        )
     else:
         overrides.setdefault("SPECIES_TWO_MODEL_MODE", "0")
 
@@ -120,6 +130,8 @@ def _customer_deploy_env(
         "T0_R4_SPECIES_GNN_CKPT",
         "SPECIES_OFFWALL_MODEL_CKPT",
         "SPECIES_TWO_MODEL_MODE",
+        "SPECIES_TWO_MODEL_ROUTE",
+        "SPECIES_TWO_MODEL_FRONTIER_HOPS",
         "BIOCHEM_CORRECTOR_COUPLING",
         "T0_R4_FLOW_SOURCE",
     }
@@ -163,7 +175,7 @@ class CustomerDeployPipeline:
         if not self.wall_ckpt.is_file():
             raise FileNotFoundError(
                 f"Wall/species checkpoint missing: {self.wall_ckpt}. "
-                "Train or promote mat_canonical_deploy first."
+                "Promote WC_v7_clot_phi_mse to locked/species_gnn_best.pth first."
             )
         with _customer_deploy_env(
             wall_ckpt=self.wall_ckpt,

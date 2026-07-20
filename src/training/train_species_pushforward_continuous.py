@@ -122,7 +122,6 @@ from src.core_physics.species_snapshot_gnn import (
 )
 from src.utils.kinematics_inference import (
     load_kinematics_predictor,
-    predict_kinematics_latent,
     resolve_kinematics_checkpoint,
 )
 from src.utils.paths import get_project_root
@@ -147,6 +146,13 @@ def _split_band_nodes(n_sub: int, val_frac: float, seed: int) -> tuple[torch.Ten
 @torch.no_grad()
 def _prepare_static(data, *, device: torch.device, kine_model, wall_hops: int) -> dict:
     return build_band_base_features(data, kine_model, device, wall_hops=wall_hops)
+
+
+def _release_pack_to_cpu(pack: dict) -> None:
+    """PyG ``Data.to`` is in-place; move held training graphs back to CPU between packs."""
+    data = pack.get("data")
+    if data is not None and hasattr(data, "to"):
+        pack["data"] = data.to("cpu")
 
 
 def _val_windows(static: dict, *, unroll: int, stride: int) -> list[list[int]]:
@@ -181,7 +187,23 @@ def _build_anchor_pack(
 ) -> dict:
     graph_path = root / VesselConfig(phase="biochem_anchors").graph_output_dir / f"{anchor.strip()}.pt"
     data = torch.load(graph_path, map_location="cpu", weights_only=False)
-    static = _prepare_static(data, device=device, kine_model=kine_model, wall_hops=wall_hops)
+
+    # One GINO-DEQ solve per vessel: UV baseline + z_kin (joint cache). Local corrector uses UV later.
+    from src.utils.kinematics_inference import predict_kinematics_and_latent
+
+    data_dev = data.to(device)
+    with torch.no_grad():
+        pred_uv, z_kin = predict_kinematics_and_latent(kine_model, data_dev)
+    data.u0_pred = pred_uv[:, 0].to("cpu").clone()
+    data.v0_pred = pred_uv[:, 1].to("cpu").clone()
+
+    static = build_band_base_features(
+        data,
+        kine_model,
+        device,
+        wall_hops=wall_hops,
+        z_kin_override=z_kin,
+    )
     train_m, val_m = _split_band_nodes(static["n_band"], val_frac, seed)
     train_m = train_m.to(device=device)
     val_m = val_m.to(device=device)
@@ -203,9 +225,6 @@ def _build_anchor_pack(
     train_m = train_m.to("cpu")
     val_m = val_m.to("cpu")
     data = data.to("cpu")
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
     return {
         "anchor": anchor.strip(),
@@ -368,7 +387,7 @@ def main() -> int:
 
     kine_ckpt = str(resolve_kinematics_checkpoint())
     kine_model = load_kinematics_predictor(
-        kine_ckpt, device, phys_cfg=PhysicsConfig(phase="kinematics")
+        kine_ckpt, device, phys_cfg=PhysicsConfig(phase="kinematics"), cache=False
     )
 
     packs: list[dict] = []
@@ -391,10 +410,11 @@ def main() -> int:
         )
         import gc
         gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     # Free the large kinematics model from GPU VRAM now that dataset loading is complete
+    from src.utils.kinematics_inference import clear_kinematics_predictor_cache
+
+    clear_kinematics_predictor_cache()
     del kine_model
     import gc
     gc.collect()
@@ -692,10 +712,9 @@ def main() -> int:
                 opt.step()
                 ep_losses.append(float(loss.item()))
 
-            # Cleanup GPU pack memory
+            # Cleanup GPU pack memory (Data.to is in-place; restore CPU residency)
             del static_gpu, pack_data_gpu, train_m_gpu
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            _release_pack_to_cpu(pack)
 
         if True:
             h = deploy_horizon_steps()
@@ -757,8 +776,7 @@ def main() -> int:
                     ep_losses.append(float(loss_dep.item()))
 
                 del static_gpu, vpack_data_gpu, train_m_gpu
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _release_pack_to_cpu(vpack)
 
         model.eval()
         val_state_f1: list[float] = []
@@ -920,10 +938,9 @@ def main() -> int:
                             os.environ[k] = v
                     reset_species_rollout_flow_cache()
 
-            # Cleanup GPU val memory
+            # Cleanup GPU val memory (keep packs on CPU for the next epoch)
             del val_static_gpu, val_data_gpu, val_m_gpu
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _release_pack_to_cpu(val_pack)
 
         row = {
             "epoch": ep,
@@ -1020,8 +1037,6 @@ def main() -> int:
             if stale >= int(args.early_stop):
                 print(f"[i] early stop @ ep {ep} (best_score={best_score:.3f})", flush=True)
                 break
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     print(f"[OK] best_score={best_score:.3f} elapsed={time.perf_counter() - t0:.1f}s ckpt={out_path}", flush=True)
     return 0

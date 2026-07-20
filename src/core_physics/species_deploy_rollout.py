@@ -149,6 +149,10 @@ def resolve_species_rollout_uv(
         coupled = get_coupled_flow(data, device)
         if coupled is not None:
             return coupled
+            
+    if hasattr(data, "u0_pred") and data.u0_pred is not None:
+        return data.u0_pred.to(device=device, dtype=torch.float32), data.v0_pred.to(device=device, dtype=torch.float32)
+        
     global _pred_uv_cache, _pred_uv_key, _kine_model
     key = _graph_key(data)
     if _pred_uv_cache is None or _pred_uv_key != key:

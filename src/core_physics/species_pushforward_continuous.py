@@ -1602,6 +1602,10 @@ def species_latent_dropout_p() -> float:
         return 0.0
 
 
+_SPLICE_SCRATCH: torch.Tensor | None = None
+_SPLICE_SCRATCH_KEY: tuple | None = None
+
+
 def splice_dynamic_flow(
     base_feats: torch.Tensor,
     flow_series: torch.Tensor | None,
@@ -1613,6 +1617,9 @@ def splice_dynamic_flow(
     No-op unless dynamic flow is active (``flow_series``/``flow_cols`` present) and a time index is
     given. ``flow_cols = (start, width)`` is the flow block span produced by
     ``build_band_base_features``; ``flow_series`` is ``[n_times, n_band, width]``. Time is clamped.
+
+    Under ``torch.no_grad()`` (eval/deploy), reuses a scratch buffer to avoid per-step allocs.
+    With grads enabled, clones so autograd graphs stay intact across unroll steps.
     """
     if flow_series is None or flow_cols is None or time_index is None:
         return base_feats
@@ -1621,10 +1628,19 @@ def splice_dynamic_flow(
         return base_feats
     n_t = int(flow_series.shape[0])
     ti = max(0, min(int(time_index), n_t - 1))
-    out = base_feats.clone()
-    out[:, start : start + width] = flow_series[ti].to(device=out.device, dtype=out.dtype)
-    return out
-
+    src = flow_series[ti].to(device=base_feats.device, dtype=base_feats.dtype)
+    if torch.is_grad_enabled():
+        out = base_feats.clone()
+        out[:, start : start + width] = src
+        return out
+    global _SPLICE_SCRATCH, _SPLICE_SCRATCH_KEY
+    key = (tuple(base_feats.shape), str(base_feats.device), base_feats.dtype)
+    if _SPLICE_SCRATCH is None or _SPLICE_SCRATCH_KEY != key:
+        _SPLICE_SCRATCH = base_feats.new_empty(base_feats.shape)
+        _SPLICE_SCRATCH_KEY = key
+    _SPLICE_SCRATCH.copy_(base_feats)
+    _SPLICE_SCRATCH[:, start : start + width] = src
+    return _SPLICE_SCRATCH
 
 def maybe_drop_latent(base_feats: torch.Tensor, model: nn.Module, training: bool) -> torch.Tensor:
     """Stochastically zero the z_kin slice of ``base_feats`` (the latent leash). No-op at eval.
@@ -1647,19 +1663,43 @@ def maybe_drop_latent(base_feats: torch.Tensor, model: nn.Module, training: bool
 
 
 _OFFWALL_MODEL_CACHE = None
+_OFFWALL_MODEL_CACHE_PATH: str | None = None
+
+
+def clear_offwall_model_cache() -> None:
+    """Drop cached growth specialist (needed between A/B evals with different ckpts)."""
+    global _OFFWALL_MODEL_CACHE, _OFFWALL_MODEL_CACHE_PATH
+    _OFFWALL_MODEL_CACHE = None
+    _OFFWALL_MODEL_CACHE_PATH = None
+
+
+def two_model_route() -> str:
+    """``wall`` = legacy wall vs ~wall; ``frontier`` = growth specialist on clot neighborhood."""
+    raw = (os.environ.get("SPECIES_TWO_MODEL_ROUTE") or "wall").strip().lower()
+    if raw in ("frontier", "growth", "committed", "existing"):
+        return "frontier"
+    return "wall"
+
+
+def two_model_frontier_hops() -> int:
+    """BFS hops around committed Mat where the growth specialist owns the delta."""
+    try:
+        return max(int(float(os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS", "2") or "2")), 0)
+    except ValueError:
+        return 2
+
 
 def get_cached_offwall_model(device, in_dim, hidden, out_dim):
-    global _OFFWALL_MODEL_CACHE
-    if _OFFWALL_MODEL_CACHE is not None:
-        return _OFFWALL_MODEL_CACHE
+    global _OFFWALL_MODEL_CACHE, _OFFWALL_MODEL_CACHE_PATH
     ckpt_path = os.environ.get("SPECIES_OFFWALL_MODEL_CKPT")
     if not ckpt_path:
         raise ValueError("SPECIES_OFFWALL_MODEL_CKPT environment variable must be set when SPECIES_TWO_MODEL_MODE=1")
+    if _OFFWALL_MODEL_CACHE is not None and _OFFWALL_MODEL_CACHE_PATH == ckpt_path:
+        return _OFFWALL_MODEL_CACHE
     payload = torch.load(ckpt_path, map_location=device, weights_only=False)
-    from src.core_physics.species_pushforward_continuous import SpeciesDualHeadContinuousGNN
     offwall_model = SpeciesDualHeadContinuousGNN(in_dim=in_dim, hidden=hidden, out_dim=out_dim).to(device)
     sd = payload.get("model_state") or payload.get("model_state_dict") or payload
-    
+
     # Pre-validate shapes to raise helpful size mismatch errors
     model_sd = offwall_model.state_dict()
     for name, param in sd.items():
@@ -1671,11 +1711,46 @@ def get_cached_offwall_model(device, in_dim, hidden, out_dim):
                     f"Please ensure the off-wall growth model was trained with the same environment "
                     f"settings (e.g. species scope, GNN features) as the main model."
                 )
-                
+
     offwall_model.load_state_dict(sd, strict=False)
     offwall_model.eval()
     _OFFWALL_MODEL_CACHE = offwall_model
+    _OFFWALL_MODEL_CACHE_PATH = ckpt_path
     return _OFFWALL_MODEL_CACHE
+
+
+def _two_model_blend_mask(
+    *,
+    route: str,
+    wall_mask: torch.Tensor,
+    log_state: torch.Tensor,
+    edge_index: torch.Tensor,
+) -> torch.Tensor:
+    """True where the *wall/canonical* model keeps ownership; False -> growth specialist.
+
+    - ``wall``: canonical on wall nodes (nucleation + wall paint); growth on ~wall.
+    - ``frontier``: growth on k-hop neighborhood of committed Mat (wall or lumen);
+      canonical elsewhere (bare-wall nucleation before any clot exists).
+    """
+    w_m = wall_mask.reshape(-1).bool()
+    if route != "frontier":
+        return w_m
+
+    from src.core_physics.clot_growth_masks import graph_dilate_hops
+    from src.training.biochem_species_scope import pushforward_local_index
+
+    st = log_state.reshape(-1, log_state.shape[-1])
+    try:
+        midx = int(pushforward_local_index("mat"))
+    except (KeyError, ValueError):
+        midx = 0 if st.shape[1] == 1 else min(1, st.shape[1] - 1)
+    committed = (st[:, midx] > continuous_mat_commit_thresh()).reshape(-1).bool()
+    if not bool(committed.any().item()):
+        return torch.ones_like(w_m)
+    growth_zone = graph_dilate_hops(committed, edge_index, two_model_frontier_hops())
+    # Canonical owns nodes outside the committed neighborhood (nucleation / idle lumen).
+    return ~growth_zone.to(device=w_m.device)
+
 
 def predict_continuous_step_delta(
     model: nn.Module,
@@ -1697,6 +1772,9 @@ def predict_continuous_step_delta(
 
     ``time_index`` drives the (retired) temporal gate; ``flow_time_index`` selects the dynamic-flow
     snapshot (the current state's time) and falls back to ``time_index`` when not given.
+
+    When ``SPECIES_TWO_MODEL_MODE=1``, blends the wall/canonical model with a growth specialist
+    (``SPECIES_OFFWALL_MODEL_CKPT``) using ``SPECIES_TWO_MODEL_ROUTE`` (``wall`` or ``frontier``).
     """
     if hasattr(model, "set_band_geometry"):
         model.set_band_geometry(pos_band, edge_index, wall_mask_band)
@@ -1733,7 +1811,7 @@ def predict_continuous_step_delta(
     pred_delta = _run_forward(model, feats, use_edge_index, log_state)
 
     w_mask = wall_mask_band if wall_mask_band is not None else getattr(model, "wall_mask_band", None)
-    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and w_mask is not None:
+    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and w_mask is not None and log_state is not None:
         try:
             offwall_model = get_cached_offwall_model(
                 feats.device, model.in_dim, model.hidden, model.out_dim
@@ -1745,10 +1823,15 @@ def predict_continuous_step_delta(
             if species_block is not None:
                 offwall_model.species_block = species_block
             offwall_model.velocity = velocity
-            
+
             pred_delta_off = _run_forward(offwall_model, feats, use_edge_index, log_state)
-            w_m = w_mask.reshape(-1, 1).to(device=feats.device, dtype=torch.bool)
-            pred_delta = torch.where(w_m, pred_delta, pred_delta_off)
+            keep_wall = _two_model_blend_mask(
+                route=two_model_route(),
+                wall_mask=w_mask,
+                log_state=log_state,
+                edge_index=use_edge_index,
+            ).reshape(-1, 1).to(device=feats.device)
+            pred_delta = torch.where(keep_wall, pred_delta, pred_delta_off)
         except Exception as e:
             print(f"[WARN] Failed to apply two-model offwall blend: {e}")
 
@@ -2562,6 +2645,9 @@ def eval_deploy_clot_f1(
 
     model.eval()
     bind_band_geometry(model, static)
+    # Isolate training packs: closed-loop coupling writes diverted UV into data.y in-place.
+    if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1" and hasattr(data, "clone"):
+        data = data.clone()
     node_idx = static["node_idx"]
     n_times = int(data.y.shape[0])
     t_eval = resolve_deploy_eval_time_index(n_times, time_index=time_index)
@@ -2580,8 +2666,7 @@ def eval_deploy_clot_f1(
     mu_bulk_si = None
     if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
         try:
-            # Run closed-loop coupling models on CPU to conserve GPU VRAM
-            flow_device = torch.device("cpu")
+            flow_device = device
             from src.inference.corrector_coupling import ClotAwareFlow, resolve_kinematics_checkpoint, resolve_corrector_checkpoint, reset_coupled_flow_registry
             from src.core_physics.coupled_shear_gnn import LocalKinematicCorrector
             from src.utils.kinematics_inference import load_kinematics_predictor
@@ -2594,21 +2679,34 @@ def eval_deploy_clot_f1(
                 
             kine_ckpt = resolve_kinematics_checkpoint()
             corr_ckpt = resolve_corrector_checkpoint()
-            cache_key = (kine_ckpt, corr_ckpt, "cpu")
             
-            if cache_key in _CLOSED_LOOP_MODELS_CACHE:
-                kine, corr_model = _CLOSED_LOOP_MODELS_CACHE[cache_key]
+            if os.environ.get("BIOCHEM_KINE_RESOLVE_ON_CLOT") == "1":
+                cache_key = (kine_ckpt, corr_ckpt, str(flow_device))
+                if cache_key in _CLOSED_LOOP_MODELS_CACHE:
+                    kine, corr_model = _CLOSED_LOOP_MODELS_CACHE[cache_key]
+                else:
+                    kine = load_kinematics_predictor(kine_ckpt, flow_device)
+                    kine.eval()
+                    for p in kine.parameters():
+                        p.requires_grad = False
+                    from src.core_physics.coupled_shear_gnn import load_local_corrector
+                    corr_model = load_local_corrector(corr_ckpt, flow_device)
+                    corr_model.eval()
+                    for p in corr_model.parameters():
+                        p.requires_grad = False
+                    _CLOSED_LOOP_MODELS_CACHE[cache_key] = (kine, corr_model)
             else:
-                kine = load_kinematics_predictor(kine_ckpt, flow_device)
-                kine.eval()
-                for p in kine.parameters():
-                    p.requires_grad = False
-                from src.core_physics.coupled_shear_gnn import load_local_corrector
-                corr_model = load_local_corrector(corr_ckpt, flow_device)
-                corr_model.eval()
-                for p in corr_model.parameters():
-                    p.requires_grad = False
-                _CLOSED_LOOP_MODELS_CACHE[cache_key] = (kine, corr_model)
+                kine = None
+                corr_cache_key = (corr_ckpt, str(flow_device))
+                if corr_cache_key in _CLOSED_LOOP_MODELS_CACHE:
+                    corr_model = _CLOSED_LOOP_MODELS_CACHE[corr_cache_key]
+                else:
+                    from src.core_physics.coupled_shear_gnn import load_local_corrector
+                    corr_model = load_local_corrector(corr_ckpt, flow_device)
+                    corr_model.eval()
+                    for p in corr_model.parameters():
+                        p.requires_grad = False
+                    _CLOSED_LOOP_MODELS_CACHE[corr_cache_key] = corr_model
                 
             coupler = ClotAwareFlow(flow_device, phys_cfg=phys_cfg)
             coupler._kine = kine
@@ -2684,7 +2782,9 @@ def eval_deploy_clot_f1(
                 set_coupled_flow(data, state.u, state.v)
                 write_coupled_flow_into_y(data, state.u, state.v, time_index=t + 1)
             except Exception as e:
+                import traceback
                 print(f"[WARN] Failed to apply closed-loop flow coupling at eval step {t+1}: {e}")
+                traceback.print_exc()
     with t0_rung2_env():
         nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
         traj = rollout_t0_clot_phi(

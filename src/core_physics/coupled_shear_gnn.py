@@ -163,18 +163,34 @@ def save_local_corrector(
     )
 
 
+_LOCAL_CORRECTOR_CACHE: dict[tuple[str, str], "LocalKinematicCorrector"] = {}
+
+
 def load_local_corrector(
-    path: Path | str, device: torch.device | None = None
+    path: Path | str, device: torch.device | None = None, *, cache: bool = True
 ) -> LocalKinematicCorrector:
+    """Load the local kinematic corrector; session-caches by ``(path, device)`` when ``cache``."""
     dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pl = torch.load(path, map_location=dev, weights_only=False)
+    ckpt = Path(path).resolve()
+    key = (str(ckpt), str(dev))
+    if cache and key in _LOCAL_CORRECTOR_CACHE:
+        return _LOCAL_CORRECTOR_CACHE[key]
+    pl = torch.load(ckpt, map_location=dev, weights_only=False)
     m = LocalKinematicCorrector(
         in_channels=int(pl.get("in_channels", 6)),
         hidden_dim=int(pl.get("hidden_dim", 64)),
         heads=int(pl.get("heads", 4)),
     )
-    m.load_state_dict(pl["model_state"]); m.to(dev); m.eval()
+    m.load_state_dict(pl["model_state"])
+    m.to(dev)
+    m.eval()
+    if cache:
+        _LOCAL_CORRECTOR_CACHE[key] = m
     return m
+
+
+def clear_local_corrector_cache() -> None:
+    _LOCAL_CORRECTOR_CACHE.clear()
 
 
 def save_checkpoint(path: Path | str, model: CoupledShearGNN, meta: dict[str, Any]) -> None:

@@ -143,7 +143,7 @@ def validate_isolate_key(key: str) -> None:
             f"{DEPRECATED_ISOLATE_KEYS[k]} See {_DOC}. "
             "Set BIOCHEM_LEGACY_LOSSES=1 to reproduce old sweeps."
         )
-    # Unknown keys still handled by train_biochem_corrector valid list.
+    # Unknown keys are ignored by callers that filter against this policy.
 
 
 def check_deprecated_preset(preset: str) -> bool:

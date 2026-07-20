@@ -456,41 +456,10 @@ class GINO_DEQ(nn.Module):
             jac_loss = torch.tensor(0.0, device=z_eq.device)
         return z_eq, jac_loss
 
-    @torch.no_grad()
-    def solve_latent(
-        self,
-        data,
-        solver: str = "anderson",
-        anderson_beta: float = 0.8,
-        anderson_warmup_iters: int = 5,
-    ) -> torch.Tensor:
-        """Frozen inference: DEQ equilibrium latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
-        was_training = self.training
-        self.eval()
-        z, _ = self._solve_equilibrium_z(
-            data,
-            solver=solver,
-            anderson_beta=anderson_beta,
-            anderson_warmup_iters=anderson_warmup_iters,
-        )
-        if was_training:
-            self.train()
-        return z
-
-    @torch.enable_grad()
-    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5, current_n=None):
-        z, jac_loss = self._solve_equilibrium_z(
-            data,
-            solver=solver,
-            anderson_beta=anderson_beta,
-            anderson_warmup_iters=anderson_warmup_iters,
-        )
-
-        def decode_mu(latent_state):
-            mu_raw_state = self.mu_decoder(latent_state)
-            return self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw_state)
-
-        mu = decode_mu(z)
+    def _decode_pred_from_z(self, data, z: Tensor) -> Tensor:
+        """Decode kinematics (+ mu, wss) from an equilibrium latent ``z``."""
+        mu_raw_state = self.mu_decoder(z)
+        mu = self.mu_inf_nd + (self.mu_0_nd - self.mu_inf_nd) * torch.sigmoid(mu_raw_state)
 
         if self.siren_decoder is not None:
             pos_nd = getattr(data, "pos_nd", None)
@@ -524,6 +493,58 @@ class GINO_DEQ(nn.Module):
             wss_pred = self.wss_decoder(torch.cat([z, u_v_p, mu], dim=1))
         else:
             wss_pred = self.wss_decoder(z)
-        pred = torch.cat([u_v_p, mu, wss_pred], dim=1)
+        return torch.cat([u_v_p, mu, wss_pred], dim=1)
 
+    @torch.no_grad()
+    def solve_latent(
+        self,
+        data,
+        solver: str = "anderson",
+        anderson_beta: float = 0.8,
+        anderson_warmup_iters: int = 5,
+    ) -> torch.Tensor:
+        """Frozen inference: DEQ equilibrium latent ``z_kin`` per node, shape ``[N, latent_dim]``."""
+        was_training = self.training
+        self.eval()
+        z, _ = self._solve_equilibrium_z(
+            data,
+            solver=solver,
+            anderson_beta=anderson_beta,
+            anderson_warmup_iters=anderson_warmup_iters,
+        )
+        if was_training:
+            self.train()
+        return z
+
+    @torch.no_grad()
+    def predict_uv_and_latent(
+        self,
+        data,
+        solver: str = "anderson",
+        anderson_beta: float = 0.8,
+        anderson_warmup_iters: int = 5,
+    ) -> tuple[Tensor, Tensor]:
+        """One DEQ solve -> ``(pred [N, C], z_kin [N, latent_dim])`` (inference only)."""
+        was_training = self.training
+        self.eval()
+        z, _ = self._solve_equilibrium_z(
+            data,
+            solver=solver,
+            anderson_beta=anderson_beta,
+            anderson_warmup_iters=anderson_warmup_iters,
+        )
+        pred = self._decode_pred_from_z(data, z)
+        if was_training:
+            self.train()
+        return pred, z
+
+    @torch.enable_grad()
+    def forward(self, data, solver="anderson", anderson_beta=0.8, anderson_warmup_iters=5, current_n=None):
+        z, jac_loss = self._solve_equilibrium_z(
+            data,
+            solver=solver,
+            anderson_beta=anderson_beta,
+            anderson_warmup_iters=anderson_warmup_iters,
+        )
+        pred = self._decode_pred_from_z(data, z)
         return (pred, jac_loss) if self.training else pred

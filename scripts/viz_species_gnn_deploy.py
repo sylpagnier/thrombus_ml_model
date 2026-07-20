@@ -153,32 +153,37 @@ def _scatter_clot_panel(
         zorder=3,
     )
 
-
 def _hop_error_legend(fig) -> None:
+    """Create a legend for error hop distances with dynamic colors.
+    Colors are defined in src.core_physics.species_gnn_ladder_viz as FP_COLORS and FN_COLORS.
+    Positive values (FP) use FP_COLORS, negative values (FN) use FN_COLORS.
+    """
     from matplotlib.patches import Patch
-
-    legend_elements = [
-        Patch(facecolor="#800000", label="FP Wall (Hop 0)"),
-        Patch(facecolor="#d62728", label="FP Hop 1"),
-        Patch(facecolor="#ff7f0e", label="FP Hop 2"),
-        Patch(facecolor="#fd8d3c", label="FP Hop 3"),
-        Patch(facecolor="#feb24c", label="FP Hop 4+"),
-        Patch(facecolor="#084594", label="FN Wall (Hop 0)"),
-        Patch(facecolor="#1f77b4", label="FN Hop 1"),
-        Patch(facecolor="#4292c6", label="FN Hop 2"),
-        Patch(facecolor="#6baed6", label="FN Hop 3"),
-        Patch(facecolor="#9ecae1", label="FN Hop 4+"),
-    ]
+    # Import color dictionaries
+    from src.core_physics.species_gnn_ladder_viz import FP_COLORS, FN_COLORS
+    # Determine max hop indices from the dictionaries
+    max_fp_hop = max(FP_COLORS.keys())
+    max_fn_hop = max(FN_COLORS.keys())
+    legend_elements = []
+    # Positive (FP) entries
+    for hop in range(0, max_fp_hop + 1):
+        color = FP_COLORS[hop]
+        label = f"+{hop}: FP Hop {hop}" if hop > 0 else f"+0: FP Wall (Hop 0)"
+        legend_elements.append(Patch(facecolor=color, label=label))
+    # Negative (FN) entries
+    for hop in range(0, max_fn_hop + 1):
+        color = FN_COLORS[hop]
+        label = f"-{hop}: FN Hop {hop}" if hop > 0 else f"-0: FN Wall (Hop 0)"
+        legend_elements.append(Patch(facecolor=color, label=label))
     fig.legend(
         handles=legend_elements,
         loc="center left",
         bbox_to_anchor=(1.01, 0.5),
         ncol=1,
         fontsize=8,
-        title="Error BFS Hops\nfrom Wall",
+        title="Error Hop Distance\n(-x: FN, +x: FP)",
         title_fontsize=9,
     )
-
 
 def viz_anchor_deploy(
     anchor: str,
@@ -191,8 +196,13 @@ def viz_anchor_deploy(
     scatter_size: float,
     include_error_row: bool,
     out: Path | None = None,
+    bundle_cache: dict | None = None,
 ) -> dict:
-    """Run one anchor: GT | pred | hop-colored error PNG + sidecar JSON."""
+    """Run one anchor: GT | pred | hop-colored error PNG + sidecar JSON.
+
+    ``bundle_cache`` is an optional ``{ckpt_path_str: SpeciesGnnRolloutBundle}`` shared across
+    anchors so multi-anchor viz does not reload the same species weights from disk each time.
+    """
     root = get_project_root()
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
@@ -229,7 +239,14 @@ def viz_anchor_deploy(
         prefer_loao=True,
     ):
         ckpt = Path(species_gnn_rollout_ckpt())
-        bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
+        ckpt_key = str(ckpt.resolve())
+        bundle = None
+        if bundle_cache is not None and ckpt_key in bundle_cache:
+            bundle = bundle_cache[ckpt_key]
+        else:
+            bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
+            if bundle is not None and bundle_cache is not None:
+                bundle_cache[ckpt_key] = bundle
         if bundle is None:
             raise FileNotFoundError(f"missing ckpt: {ckpt}")
         static = prepare_species_gnn_rollout_static(data, device=device)
@@ -322,7 +339,7 @@ def viz_anchor_deploy(
     if include_error_row:
         _hop_error_legend(fig)
 
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 0.9, 0.98])
     if out is None:
         out = _viz_out_dir() / f"deploy_{anchor}_{flow_source}.png"
     if not out.is_absolute():
@@ -426,6 +443,7 @@ def main() -> int:
 
     summary_rows: list[dict] = []
     failures: list[str] = []
+    bundle_cache: dict = {}
     for anchor in anchors:
         print(f"\n[i] --- {anchor} ---", flush=True)
         out_path = None
@@ -442,6 +460,7 @@ def main() -> int:
                 scatter_size=float(args.scatter_size),
                 include_error_row=not args.no_error_row,
                 out=out_path,
+                bundle_cache=bundle_cache,
             )
             summary_rows.append(payload)
         except Exception as exc:

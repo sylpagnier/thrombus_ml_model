@@ -68,6 +68,13 @@ from src.utils.paths import get_project_root
 
 RolloutKind = Literal["continuous", "binary"]
 
+# Session cache for closed-loop kine/corrector handles (eval/viz multi-vessel).
+_CLOSED_LOOP_MODELS_CACHE: dict[tuple, object] = {}
+
+
+def clear_species_gnn_closed_loop_cache() -> None:
+    _CLOSED_LOOP_MODELS_CACHE.clear()
+
 
 def species_gnn_rollout_ckpt() -> Path:
     raw = (
@@ -224,17 +231,46 @@ def prepare_species_gnn_rollout_static(
     device: torch.device,
     wall_hops: int | None = None,
     z_kin_override: torch.Tensor | None = None,
+    kine_model=None,
 ) -> SpeciesGnnRolloutStatic:
     """Static band features for the species rollout.
 
     ``z_kin_override`` injects a clot-aware DEQ latent (full re-solve) so the GraphSAGE teacher's
     primary flow input tracks the rerouted flow once the clot is large enough to change it.
+
+    When ``u0_pred``/``v0_pred`` are missing, runs one joint GINO-DEQ solve and stores them on
+    ``data`` so closed-loop coupling does not re-solve the baseline later.
     """
     hops = int(wall_hops if wall_hops is not None else snapshot_wall_hops())
-    kine = load_kinematics_predictor(resolve_kinematics_checkpoint(), device)
+    kine = kine_model
+    if kine is None:
+        kine = load_kinematics_predictor(resolve_kinematics_checkpoint(), device)
+    z_use = z_kin_override
+    if z_use is None and (
+        getattr(data, "u0_pred", None) is None or getattr(data, "v0_pred", None) is None
+    ):
+        from src.utils.kinematics_inference import predict_kinematics_and_latent
+
+        pred_uv, z_use = predict_kinematics_and_latent(kine, data.to(device))
+        data.u0_pred = pred_uv[:, 0].detach().to(device="cpu").clone()
+        data.v0_pred = pred_uv[:, 1].detach().to(device="cpu").clone()
+    elif z_use is None:
+        z_use = predict_kinematics_latent(kine, data.to(device))
     stat = build_band_base_features(
-        data, kine, device, wall_hops=hops, z_kin_override=z_kin_override
+        data, kine, device, wall_hops=hops, z_kin_override=z_use
     )
+    return species_gnn_static_from_band_dict(stat, data, device=device, wall_hops=hops)
+
+
+def species_gnn_static_from_band_dict(
+    stat: dict,
+    data,
+    *,
+    device: torch.device,
+    wall_hops: int | None = None,
+) -> SpeciesGnnRolloutStatic:
+    """Wrap a ``build_band_base_features`` dict without reloading kinematics / re-solving DEQ."""
+    hops = int(wall_hops if wall_hops is not None else snapshot_wall_hops())
     band = wall_band_mask(data, device, wall_hops=hops).reshape(-1).bool()
     return SpeciesGnnRolloutStatic(
         base_feats=stat["base_feats"],
@@ -304,14 +340,33 @@ def rollout_species_gnn_species_series(
         mu_bulk_si = None
         if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
             try:
-                from src.inference.corrector_coupling import ClotAwareFlow, resolve_kinematics_checkpoint, resolve_corrector_checkpoint
-                from src.core_physics.coupled_shear_gnn import LocalKinematicCorrector
-                from src.utils.kinematics_inference import load_kinematics_predictor
+                from src.inference.corrector_coupling import (
+                    ClotAwareFlow,
+                    resolve_kinematics_checkpoint,
+                    resolve_corrector_checkpoint,
+                )
                 from src.core_physics.clot_growth_masks import resolve_bulk_carreau_mu_si
-                kine = load_kinematics_predictor(resolve_kinematics_checkpoint(), dev)
-                corrector_ckpt = resolve_corrector_checkpoint()
                 from src.core_physics.coupled_shear_gnn import load_local_corrector
-                corr_model = load_local_corrector(corrector_ckpt, dev)
+
+                kine_ckpt = resolve_kinematics_checkpoint()
+                corr_ckpt = resolve_corrector_checkpoint()
+                resolve_on = os.environ.get("BIOCHEM_KINE_RESOLVE_ON_CLOT") == "1"
+                if resolve_on:
+                    cache_key = ("resolve", str(kine_ckpt), str(corr_ckpt), str(dev))
+                    if cache_key in _CLOSED_LOOP_MODELS_CACHE:
+                        kine, corr_model = _CLOSED_LOOP_MODELS_CACHE[cache_key]  # type: ignore[misc]
+                    else:
+                        kine = load_kinematics_predictor(kine_ckpt, dev)
+                        corr_model = load_local_corrector(corr_ckpt, dev)
+                        _CLOSED_LOOP_MODELS_CACHE[cache_key] = (kine, corr_model)
+                else:
+                    kine = None
+                    corr_cache_key = ("corr", str(corr_ckpt), str(dev))
+                    if corr_cache_key in _CLOSED_LOOP_MODELS_CACHE:
+                        corr_model = _CLOSED_LOOP_MODELS_CACHE[corr_cache_key]  # type: ignore[assignment]
+                    else:
+                        corr_model = load_local_corrector(corr_ckpt, dev)
+                        _CLOSED_LOOP_MODELS_CACHE[corr_cache_key] = corr_model
                 coupler = ClotAwareFlow(dev, phys_cfg=phys)
                 coupler._kine = kine
                 coupler._corrector = corr_model

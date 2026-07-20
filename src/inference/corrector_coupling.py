@@ -399,8 +399,12 @@ class CorrectorCoupledFlow:
     @torch.no_grad()
     def base_flow(self, data) -> tuple[torch.Tensor, torch.Tensor]:
         """Step A: frozen GINO-DEQ base flow ``(u0, v0)`` (ND), cached per graph."""
-        key = _graph_key(data)
-        if self._base_flow is not None and self._base_key == key:
+        if self._base_flow is not None:
+            return self._base_flow
+        if hasattr(data, "u0_pred") and data.u0_pred is not None:
+            u0 = data.u0_pred.to(device=self.device, dtype=torch.float32).contiguous()
+            v0 = data.v0_pred.to(device=self.device, dtype=torch.float32).contiguous()
+            self._base_flow = (u0, v0)
             return self._base_flow
         if self._kine is None:
             ckpt = resolve_kinematics_checkpoint(self._kine_ckpt)
@@ -409,7 +413,6 @@ class CorrectorCoupledFlow:
         u0 = pred[:, 0].contiguous()
         v0 = pred[:, 1].contiguous()
         self._base_flow = (u0, v0)
-        self._base_key = key
         return self._base_flow
 
     @torch.no_grad()
@@ -510,13 +513,11 @@ class ClotAwareFlow(CorrectorCoupledFlow):
     @torch.no_grad()
     def frozen_latent(self, data) -> torch.Tensor:
         """Clot-free DEQ latent ``z_kin`` (the default GraphSAGE primary input), cached."""
-        key = _graph_key(data)
-        if self._frozen_latent is not None and self._frozen_latent_key == key:
+        if self._frozen_latent is not None:
             return self._frozen_latent
         self.base_flow(data)  # ensures the kine model is loaded
         assert self._kine is not None
         self._frozen_latent = predict_kinematics_latent(self._kine, data.to(self.device))
-        self._frozen_latent_key = key
         return self._frozen_latent
 
     @torch.no_grad()
@@ -532,26 +533,20 @@ class ClotAwareFlow(CorrectorCoupledFlow):
         assert self._kine is not None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+        from src.utils.kinematics_inference import predict_kinematics_and_latent
+
         try:
             data_k = inject_mu_prior(data.to(self.device), mu_eff_si.to(self.device), self.phys_cfg)
-            z_kin = predict_kinematics_latent(self._kine, data_k)
-            pred = predict_kinematics(self._kine, data_k)
-        except torch.cuda.OutOfMemoryError:
+            pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
+        except torch.cuda.OutOfMemoryError as e:
             # Fragmentation is the usual cause -- defrag and RETRY ON GPU (full speed) before CPU.
             torch.cuda.empty_cache()
             try:
                 data_k = inject_mu_prior(data.to(self.device), mu_eff_si.to(self.device), self.phys_cfg)
-                z_kin = predict_kinematics_latent(self._kine, data_k)
-                pred = predict_kinematics(self._kine, data_k)
+                pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
                 print("[i] DEQ re-solve recovered on GPU after empty_cache.")
             except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                print("[WARN] DEQ re-solve OOM on CUDA; retrying clot-aware solve on CPU.")
-                kine_cpu = self._kine.to("cpu")
-                data_k = inject_mu_prior(data.to("cpu"), mu_eff_si.to("cpu"), self.phys_cfg)
-                z_kin = predict_kinematics_latent(kine_cpu, data_k)
-                pred = predict_kinematics(kine_cpu, data_k)
-                self._kine = kine_cpu.to(self.device)  # restore for the cached base-flow path
+                raise RuntimeError("DEQ re-solve OOM on CUDA. Silent fallbacks to CPU are disabled by Hardware Execution Policy to prevent hangs.") from e
         return (
             z_kin.to(self.device),
             pred[:, 0].contiguous().to(self.device),

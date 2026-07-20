@@ -1,7 +1,7 @@
 """Persist and resolve ``GINO_DEQ`` constructor kwargs from checkpoints and reference manifests.
 
 Checkpoints written by ``train_kinematics_predictor`` embed ``model_config`` so
-``train_biochem_corrector``, visualization, and agents can rebuild the same
+``train_biochem_gnn``, visualization, and agents can rebuild the same
 architecture without guessing from env flags.
 """
 from __future__ import annotations
