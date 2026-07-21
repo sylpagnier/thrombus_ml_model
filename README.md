@@ -41,6 +41,14 @@ Deploy evaluation is **GT-species-free** at inference (resting ICs, predicted ki
 
 ---
 
+## Example: clot prediction over time
+
+Deploy rollout on **patient007** with the locked **WC_v7** `biochem_gnn` baseline (frozen RGP-DEQ kinematics). Rows are ground truth, model prediction, and error (FP / FN by wall-hop). Columns advance through the COMSOL timeline (`t = 0 … 200`).
+
+![Clot prediction timeline on patient007 — GT vs model vs error across time](docs/assets/clot_prediction_timeline_patient007.png)
+
+---
+
 ## Results (reference)
 
 | Stage | Metric | Value | Notes |
@@ -110,7 +118,7 @@ pytest src/tests/
 ```text
 src/                   Library: architecture, physics, training, tools, tests
 scripts/               Supported launchers (+ scripts/archive/ for retired ladders)
-docs/                  Active design docs (+ docs/archive/ for chronicles)
+docs/                  Active design docs (+ docs/archive/, docs/assets/)
 data/reference/        Small JSON manifests (tracked)
 customer_geometries/   Inbox README only (uploads stay local)
 outputs/               LOCAL — checkpoints, logs, figures (gitignored)

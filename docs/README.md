@@ -34,6 +34,7 @@ Active design and operator docs for **HemoRGP**. Lab notebooks, sweep logs, and 
 | [../scripts/README.md](../scripts/README.md) | Supported launchers |
 | [../AGENTS.md](../AGENTS.md) | Short agent / contributor cheat sheet |
 | [../data/reference/README.md](../data/reference/README.md) | Tracked baseline manifests |
+| [assets/](assets/) | README figures (e.g. clot timeline) |
 
 ## Archive
 

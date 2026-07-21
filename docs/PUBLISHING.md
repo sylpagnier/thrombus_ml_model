@@ -10,6 +10,7 @@ This repository is meant to be **publicly pushable**: source, docs, and small re
 | `scripts/` (active) + `scripts/README.md` | Supported launchers |
 | `scripts/archive/` | Retired launchers (not the default surface) |
 | `docs/` (active) + `docs/archive/` | Design docs + historical notebooks |
+| `docs/assets/` | Small README / paper figures (tracked) |
 | `data/reference/` | Small baseline / architecture JSON + README |
 | `customer_geometries/README.txt` | Inbox instructions only |
 | `README.md`, `AGENTS.md`, `requirements.txt`, `pytest.ini` | Project entry |
