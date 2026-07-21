@@ -1,4 +1,4 @@
-"""Canonical SciML model identifiers for HemoGINO.
+"""Canonical SciML model identifiers for HemoRGP.
 
 Single source of truth for stack/component IDs, SciML categories, and legacy aliases.
 Human-readable rationale: docs/MODEL_NOMENCLATURE.md
@@ -38,8 +38,8 @@ class SciMLModel:
 
 # --- Stage A: kinematics flow surrogate (RGP-DEQ) ---
 
-PMGP_DEQ_KINE = SciMLModel(
-    id="pmgp_deq_kine",
+RGP_DEQ_KINE = SciMLModel(
+    id="rgp_deq_kine",
     acronym="RGP-DEQ",
     display_name="mu-coupled rheology-guided graph-perceiver DEQ (Stage A flow)",
     sciml_category="rheology-coupled graph DEQ with physics-modulated attention",
@@ -49,7 +49,7 @@ PMGP_DEQ_KINE = SciMLModel(
         "(adv/rheo/curvature log-modulators on edge attention) + Perceiver-style "
         "global token cross-attention; SIREN or linear decode [u,v,p]; sigmoid mu head"
     ),
-    code_class="GINO_DEQ",
+    code_class="RGP_DEQ",
     distinguishing_features=(
         "physics-modulated GAT: edge attention logits biased by advection, "
         "wall-rheology, and curvature priors (SDF-decayed)",
@@ -59,8 +59,6 @@ PMGP_DEQ_KINE = SciMLModel(
         "equilibrium step (rheology-coupled fixed point, not post-hoc mu head only)",
     ),
     legacy_ids=(
-        "rgp_deq_kine",
-        "rgp-deq-kine",
         "pmgp_deq_kine",
         "pmgp-deq-kine",
         "pmgp-deq",
@@ -72,11 +70,15 @@ PMGP_DEQ_KINE = SciMLModel(
         "pi-gnn-deq",
         "kinematics",
         "stage_a_kine",
+        "rgp-deq-kine",
+        "rgp_deq",
+        "rgp-deq",
     ),
 )
 
-# Backward-compatible alias for imports predating RGP naming
-GINO_DEQ_KINE = PMGP_DEQ_KINE
+# Backward-compatible aliases for imports predating RGP naming
+PMGP_DEQ_KINE = RGP_DEQ_KINE
+GINO_DEQ_KINE = RGP_DEQ_KINE
 
 # --- Deploy biochem: learned species operator ---
 
@@ -117,39 +119,68 @@ CLOT_TRIGGER_PHYSICS = SciMLModel(
 
 FLOW_COUPLING = SciMLModel(
     id="flow_coupling",
-    display_name="Closed-loop mu -> flow refresh",
-    sciml_category="hybrid coupling stage (planned, not trained in baseline)",
+    display_name="Closed-loop clot -> flow refresh",
+    sciml_category="hybrid coupling stage (optional at deploy)",
     architecture=(
-        "Predicted mu_eff_si fed back into RGP-DEQ as MU_PRIOR for refreshed [u,v]"
+        "Preferred deploy path: local_kinematic_corrector patches [u,v] around clot nodes "
+        "on frozen RGP-DEQ base flow. Alternate / future: mu_eff_si -> RGP-DEQ MU_PRIOR re-solve "
+        "(viscosity injection is OOD; geometry occlusion + local residual is preferred)."
     ),
     code_class=None,
     legacy_ids=("flow_coupling_adr",),
 )
 
-# --- Full deploy stack ---
-
-BIOCHEM_DEPLOY_STACK = SciMLModel(
-    id="biochem_deploy",
-    display_name="Hybrid biochem deploy pipeline",
-    sciml_category="composable hybrid SciML (multi-module, not one nn.Module)",
+LOCAL_KINEMATIC_CORRECTOR = SciMLModel(
+    id="local_kinematic_corrector",
+    display_name="Local k-hop clot velocity diversion corrector",
+    sciml_category="local residual GNN on frozen RGP-DEQ flow (optional deploy coupling)",
     architecture=(
-        "pmgp_deq_kine (frozen) -> species_graphsage (trained) -> gelation_beta (trained) "
-        "-> clot_trigger_physics (equations) -> [future] flow_coupling"
+        "3x GATv2Conv (heads=4, hidden=64) + MLP readout predicting [dU, dV] on a k-hop "
+        "subgraph around clot nodes; residual on frozen RGP-DEQ base UV; trained on COMSOL "
+        "Patch Factory residuals; features [dx, dy, dist_to_wall, u0, v0, delta_mu]"
     ),
-    code_class="BiochemDeployStack",
-    legacy_ids=("biochem_gnn", "clot_deploy_gnn", "species_gnn_deploy", "species_gnn_deploy_baseline"),
+    code_class="LocalKinematicCorrector",
+    legacy_ids=(
+        "local_corrector",
+        "kinematic_corrector",
+        "clot_velocity_diversion",
+        "patch_factory_corrector",
+    ),
 )
 
-# --- Research biochem (GNODE path) ---
+# --- Full deploy stack ---
+
+BIOCHEM_GNN_STACK = SciMLModel(
+    id="biochem_gnn",
+    display_name="Hybrid biochem GNN deploy pipeline",
+    sciml_category="composable hybrid SciML (multi-module, not one nn.Module)",
+    architecture=(
+        "rgp_deq_kine (frozen) -> species_graphsage (trained) -> gelation_beta (trained) "
+        "-> clot_trigger_physics (equations) -> [optional] local_kinematic_corrector / flow_coupling"
+    ),
+    code_class="BiochemGNN",
+    legacy_ids=(
+        "biochem_deploy",
+        "biochem-deploy",
+        "clot_deploy_gnn",
+        "species_gnn_deploy",
+        "species_gnn_deploy_baseline",
+    ),
+)
+
+# Backward-compatible alias
+BIOCHEM_DEPLOY_STACK = BIOCHEM_GNN_STACK
+
+# --- Research biochem (GNODE path, retired) ---
 
 GNODE_BIOCHEM = SciMLModel(
     id="gnode_biochem",
-    display_name="Graph Neural ODE biochem corrector",
+    display_name="Graph Neural ODE biochem corrector (retired)",
     sciml_category="graph neural ODE (continuous-time latent dynamics)",
     architecture=(
         "Full-mesh GNODE_Phase3: torchdiffeq odeint on latent state; derivative block reuses "
-        "PMGP-style physics-modulated GAT (legacy GINOBlock); frozen or co-trained kine "
-        "backbone; learned mu/species heads and PDE/ADR losses"
+        "RGP-style physics-modulated GAT (legacy GINOBlock / RGPBlock); frozen or co-trained "
+        "kine backbone; learned mu/species heads and PDE/ADR losses"
     ),
     code_class="GNODE_Phase3",
     legacy_ids=("biochem_corrector", "gnode_phase3", "train_biochem", "t3"),
@@ -157,12 +188,13 @@ GNODE_BIOCHEM = SciMLModel(
 
 # Registry for lookup helpers
 _ALL_MODELS: tuple[SciMLModel, ...] = (
-    PMGP_DEQ_KINE,
+    RGP_DEQ_KINE,
     SPECIES_GRAPHSAGE,
     GELATION_BETA,
     CLOT_TRIGGER_PHYSICS,
     FLOW_COUPLING,
-    BIOCHEM_DEPLOY_STACK,
+    LOCAL_KINEMATIC_CORRECTOR,
+    BIOCHEM_GNN_STACK,
     GNODE_BIOCHEM,
 )
 
@@ -183,28 +215,32 @@ def resolve_model_id(name: str, *, default: str | None = None) -> str:
 
 
 def is_legacy_kine_id(name: str) -> bool:
-    """True when ``name`` is a pre-PMGP alias (``gino_deq_kine``, etc.)."""
+    """True when ``name`` is a pre-RGP alias (``gino_deq_kine``, ``pmgp_deq_kine``, etc.)."""
     key = (name or "").strip().lower()
-    if not key or key == PMGP_DEQ_KINE.id.lower():
+    if not key or key == RGP_DEQ_KINE.id.lower():
         return False
-    return PMGP_DEQ_KINE.matches(key) and key != PMGP_DEQ_KINE.id.lower()
+    return RGP_DEQ_KINE.matches(key) and key != RGP_DEQ_KINE.id.lower()
 
 
 def is_legacy_stack_id(name: str) -> bool:
     """True when ``name`` is a known alias, not the canonical stack id."""
     key = (name or "").strip().lower()
-    return bool(key) and key != BIOCHEM_DEPLOY_STACK.id.lower() and BIOCHEM_DEPLOY_STACK.matches(key)
+    return bool(key) and key != BIOCHEM_GNN_STACK.id.lower() and BIOCHEM_GNN_STACK.matches(key)
 
 
 def stack_display_line() -> str:
     """One-line stack summary for logs and manifests."""
     return (
-        f"{BIOCHEM_DEPLOY_STACK.id}: "
-        f"{PMGP_DEQ_KINE.id} ({PMGP_DEQ_KINE.acronym}) + {SPECIES_GRAPHSAGE.id} + "
+        f"{BIOCHEM_GNN_STACK.id}: "
+        f"{RGP_DEQ_KINE.id} ({RGP_DEQ_KINE.acronym}) + {SPECIES_GRAPHSAGE.id} + "
         f"{GELATION_BETA.id} + {CLOT_TRIGGER_PHYSICS.id}"
     )
 
 
-def pmgp_deq_feature_lines() -> tuple[str, ...]:
+def rgp_deq_feature_lines() -> tuple[str, ...]:
     """Bullet lines for training banners / paper methods (ASCII-safe)."""
-    return PMGP_DEQ_KINE.distinguishing_features
+    return RGP_DEQ_KINE.distinguishing_features
+
+
+# Backward-compatible alias
+pmgp_deq_feature_lines = rgp_deq_feature_lines

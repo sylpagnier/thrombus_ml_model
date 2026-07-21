@@ -1,11 +1,11 @@
 """
-RGP-DEQ Stage-A flow trainer (canonical id: ``pmgp_deq_kine``).
+RGP-DEQ Stage-A flow trainer (canonical id: ``rgp_deq_kine``).
 
 mu-coupled physics-modulated GAT + Perceiver DEQ for steady [u,v,p,mu] on vessel graphs.
 Carreau curriculum, dynamic dataset swapping, and loss isolation.
 
-Model class: ``GINO_DEQ`` (legacy class name; see ``docs/MODEL_NOMENCLATURE.md``).
-CLI: ``python -m src.bin.main train pmgp-deq-kine`` (alias: ``gino-deq-kine``).
+Model class: ``RGP_DEQ`` (legacy alias ``GINO_DEQ``; see ``docs/MODEL_NOMENCLATURE.md``).
+CLI: ``python -m src.bin.main train rgp-deq-kine`` (aliases: ``pmgp-deq-kine``, ``gino-deq-kine``).
 """
 import argparse
 import json
@@ -25,13 +25,16 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, Sequ
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.ginodeq import GINO_DEQ, RGP_DEQ
 from src.architecture.kinematics_model_config import (
     build_gino_deq_from_ctor,
+    build_rgp_deq_from_ctor,
     kinematics_checkpoint_tensors,
     resolve_gino_deq_ctor_kwargs,
+    resolve_rgp_deq_ctor_kwargs,
     save_kinematics_checkpoint_file,
     snapshot_gino_deq_model_config,
+    snapshot_rgp_deq_model_config,
     write_kinematics_architecture_manifest,
 )
 from src.config import VesselConfig, PhysicsConfig, PredChannels
@@ -585,8 +588,8 @@ def train_kinematics(
 
     phys_cfg = PhysicsConfig(phase="kinematics")  # Kinematics supports Carreau
     kernels = PhysicsKernels(phys_cfg=phys_cfg)
-    default_ctor = resolve_gino_deq_ctor_kwargs(None, {})
-    model = build_gino_deq_from_ctor(phys_cfg, default_ctor).to(device)
+    default_ctor = resolve_rgp_deq_ctor_kwargs(None, {})
+    model = build_rgp_deq_from_ctor(phys_cfg, default_ctor).to(device)
     training_manifest = {
         "epochs": int(epochs),
         "adam_epochs": int(adam_epochs),
@@ -610,7 +613,7 @@ def train_kinematics(
             "l0l1_only_epochs": int(geometry_cfg.l0l1_only_epochs),
         },
         "finetune_lr": finetune_lr,
-        "model_config": snapshot_gino_deq_model_config(model),
+        "model_config": snapshot_rgp_deq_model_config(model),
     }
 
     # Legacy checkpoint field only; PDE terms use fixed 1:1 weights in compute_step_loss.
@@ -644,10 +647,10 @@ def train_kinematics(
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             resume_meta, resume_state = kinematics_checkpoint_tensors(ckpt)
-            resume_ctor = resolve_gino_deq_ctor_kwargs(resume_meta, resume_state)
+            resume_ctor = resolve_rgp_deq_ctor_kwargs(resume_meta, resume_state)
             if resume_meta.get("model_config"):
-                print("[kin] GINO_DEQ architecture from checkpoint model_config.")
-            model = build_gino_deq_from_ctor(phys_cfg, resume_ctor).to(device)
+                print("[kin] RGP_DEQ architecture from checkpoint model_config.")
+            model = build_rgp_deq_from_ctor(phys_cfg, resume_ctor).to(device)
             opt_params = list(model.parameters())
             optimizer = optim.AdamW(opt_params, lr=1e-4, weight_decay=1e-5)
             warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warm_up_epochs)
@@ -1032,7 +1035,7 @@ def train_kinematics(
             state_payload = {
                 "epoch": int(epoch),
                 "model_state_dict": model.state_dict(),
-                "model_config": snapshot_gino_deq_model_config(model),
+                "model_config": snapshot_rgp_deq_model_config(model),
                 "training_manifest": dict(training_manifest),
                 "optimizer_state_dict": (
                     optimizer.state_dict()
@@ -1148,7 +1151,7 @@ def train_kinematics(
                     training_manifest=training_manifest,
                 )
                 manifest_path = write_kinematics_architecture_manifest(
-                    snapshot_gino_deq_model_config(model),
+                    snapshot_rgp_deq_model_config(model),
                     best_epoch=int(epoch),
                     rel_l2=rel_l2,
                     continuity=continuity,

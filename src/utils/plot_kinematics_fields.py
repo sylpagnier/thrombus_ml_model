@@ -74,6 +74,8 @@ def plot_wall_outline(
     fixed_top: set[int] | frozenset[int] | None = None,
     fixed_bot: set[int] | frozenset[int] | None = None,
     return_artists: bool = False,
+    fill_facecolor: str = "lightblue",
+    fill_alpha: float = 0.35,
 ):
     """Draw top/bot wall polylines and lumen fill; optional handle scatter."""
     top = np.asarray(top_coords, dtype=float)
@@ -84,7 +86,13 @@ def plot_wall_outline(
     top_line, = ax.plot(top_draw[:, 0], top_draw[:, 1], "b-", lw=1.4, label="top wall")
     bot_line, = ax.plot(bot_draw[:, 0], bot_draw[:, 1], "r-", lw=1.4, label="bot wall")
     ring = np.vstack([top_draw, bot_draw[::-1]])
-    fill = ax.fill(ring[:, 0], ring[:, 1], facecolor="lightblue", alpha=0.35, edgecolor="none")[0]
+    fill = ax.fill(
+        ring[:, 0],
+        ring[:, 1],
+        facecolor=fill_facecolor,
+        alpha=float(fill_alpha),
+        edgecolor="none",
+    )[0]
     from src.data_gen.lib.vessel_geometry import default_fixed_wall_indices
 
     n = top.shape[0]

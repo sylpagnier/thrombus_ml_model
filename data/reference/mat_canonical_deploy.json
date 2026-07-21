@@ -1,0 +1,18 @@
+{
+  "stack": "mat_growth_simple",
+  "leg": "WC_v7_clot_phi_mse",
+  "label": "WC v7 Clot Phi MSE (leg 2 of go_fresh_canonical_finish)",
+  "promoted_at": "2026-07-19T16:30:00Z",
+  "source_ckpt": "outputs/biochem/biochem_gnn/WC_v7_clot_phi_mse/species/best.pth",
+  "canonical_ckpt": "outputs/biochem/biochem_gnn/mat_canonical_deploy/species/best.pth",
+  "locked_alias": "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth",
+  "prior_canonical": "WC_v2_dilation (2026-07-06)",
+  "cohort_mean": {
+    "deploy_clot_score": 0.7914805990876854,
+    "deploy_clot_f1": 0.766850387549026,
+    "deploy_mat_f1": 0.7141582763014511
+  },
+  "val_anchor": "patient007",
+  "compare_json": "outputs/biochem/biochem_gnn/WC_v7_clot_phi_mse/compare.json",
+  "note": "Unified wall+off-wall mat-growth model. New improvements warm-start from locked/species_gnn_best.pth (or species/best.pth / mat_canonical_deploy)."
+}

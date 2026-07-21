@@ -350,19 +350,21 @@ def write_wide_domain_txt(
                 f"time {t}: expected fields shape ({n_rows}, {len(DOMAIN_FIELD_NAMES)}), got {arr.shape}"
             )
 
-    header_parts = ["% x"]
+    # Match PatientDataExtractor.load_comsol_trajectory: "% x y name @ t=... ..."
+    # with body columns [x, y, ...fields per time in header order].
+    header_tokens = ["%", "x", "y"]
     for t in times_s:
-        names = " ".join(["x", "y", *DOMAIN_FIELD_NAMES])
-        header_parts.append(f"{names} @ t={t}")
-    header = " ".join(header_parts) + "\n"
+        for name in DOMAIN_FIELD_NAMES:
+            header_tokens.extend([name, "@", f"t={t}"])
+    header = " ".join(header_tokens) + "\n"
 
     body_lines: list[str] = []
     for i in range(n_rows):
-        # COMSOL wide exports reserve two leading numeric columns before the first @ t= block.
-        row_vals: list[float] = [0.0, 0.0]
+        row_vals: list[float] = [
+            float(coords_xy_cm[i, 0]),
+            float(coords_xy_cm[i, 1]),
+        ]
         for t in times_s:
-            row_vals.append(float(coords_xy_cm[i, 0]))
-            row_vals.append(float(coords_xy_cm[i, 1]))
             row_vals.extend(float(x) for x in fields_by_time[float(t)][i, :])
         body_lines.append(" ".join(f"{v:.8g}" for v in row_vals) + "\n")
 

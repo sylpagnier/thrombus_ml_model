@@ -1,32 +1,31 @@
-HemoGINO: Practical AI Coding Rules
+HemoRGP: Practical AI Coding Rules
 
 Project Reality
-- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_gen/` (pipelines at package root; mesh/COMSOL/graph **lib** under `data_gen/lib/`), `src/training/`, `src/evaluation/`, `src/utils/`, and `src/tests/`.
-- The codebase mixes model training, mesh/graph preprocessing, physics kernels, COMSOL extraction, and validation tooling.
-- Large binary and generated artifacts: `data/` (`data_root()`), `outputs/stage_a` / `outputs/stage_b` (checkpoints), `outputs/reports/` (`reports_dir()`), and `comsol_models/`; do not treat them as source code.
+- Source is organized by domain: `src/core_physics/`, `src/architecture/`, `src/data_gen/` (pipelines at package root; mesh/COMSOL/graph **lib** under `data_gen/lib/`), `src/training/`, `src/evaluation/`, `src/utils/`, `src/biochem_gnn/`, and `src/tests/`.
+- Active stacks: Stage-A **RGP-DEQ** (`train_kinematics_predictor` / `rgp_deq_kine`) and deploy **biochem_gnn** (`train_biochem_gnn` + mat-growth). See `docs/MODEL_NOMENCLATURE.md` and `docs/PUBLISHING.md`.
+- Large binary and generated artifacts: bulk `data/` (except tracked `data/reference/`), `outputs/`, and `comsol_models/` — local only; do not treat them as source code.
 
-Tier Definitions (authoritative)
-- Tier 1 (`src/training/train_t1_predictor.py`): Newtonian hemodynamics baseline only (Stage A predictor warm-up).
-- Tier 2 (`src/training/train_t2_predictor.py`): adds non-Newtonian rheology (Carreau-Yasuda style behavior; Stage A predictor).
-- Tier 3 (`src/training/train_t3_corrector.py`): adds biochemical clot dynamics/coupling on top of flow backbone (Stage B corrector).
-- Orchestrator: `python -m src.main {a|b|all}` chains Stage A (predictor) and Stage B (corrector) training.
-- Do not assume Tier 3 is the primary stage for kinematic gains; major velocity quality should come from Tier 1/2.
+Training entry points (authoritative)
+- Kinematics (Stage A): `python -m src.bin.main train rgp-deq-kine` or `scripts/go_kinematics_*.ps1`.
+- Biochem deploy: `python -m src.bin.main train biochem-gnn` or `scripts/go_biochem_gnn.ps1` / mat-growth launchers in `scripts/README.md`.
+- Do not revive retired GNODE / clot-ML / T0 trainers without restoring modules from git history (`AGENTS.md` retired table).
 
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
-- Keep boundaries clear: shared physics lives in `core_physics`; GNODE/DEQ/LoRA in `architecture`; graphs/meshes/datagen in `data_gen`.
+- Keep boundaries clear: shared physics lives in `core_physics`; RGP-DEQ in `architecture`; graphs/meshes/datagen in `data_gen`; deploy stack in `biochem_gnn`.
 - Prefer small, local changes over broad refactors unless explicitly requested.
 - Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
 
 Physics and Modeling Guardrails
 - Carreau-Yasuda rheology and Navier-Stokes consistency are central; avoid edits that weaken these constraints without justification.
 - For DEQ-related changes, preserve solver stability and convergence behavior.
-- For Tier 3 work, preserve the intended split between trainable adaptation layers and physics kernels unless asked otherwise.
+- Prefer geometry occlusion + optional `local_kinematic_corrector` over viscosity injection into frozen RGP-DEQ.
 
 Data and File Hygiene
-- Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints).
+- Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints under `outputs/`).
 - Do not create duplicate source files with mixed path separators (for example both `src/file.py` and `src\file.py` variants).
 - Keep reusable logic in `src/`; interactive diagnostics live under `src/tools/`; automated tests under `src/tests/`.
+- Do not commit root junk dumps, one-off census JSON, or customer uploads; see `docs/PUBLISHING.md`.
 
 Testing Expectations
 - Any meaningful logic change should include or update focused pytest coverage.
@@ -36,4 +35,5 @@ Testing Expectations
 Documentation and Readability
 - Prefer concise docstrings/comments that explain why (not obvious what).
 - Keep equations plain text or LaTeX-compatible text where helpful, but prioritize clarity over notation density.
-- When behavior changes, update nearby docs or comments so phase/tier intent stays clear.
+- When behavior changes, update nearby docs or comments so stack intent stays clear (`biochem_gnn` / RGP-DEQ).
+- Historical chronicles live under `docs/archive/`; do not expand them as the default progress log for mat-growth work.

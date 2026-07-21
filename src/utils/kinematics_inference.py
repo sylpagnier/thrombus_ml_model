@@ -1,7 +1,7 @@
-"""Shared PMGP-DEQ (Stage-A) checkpoint resolution and inference.
+"""Shared RGP-DEQ (Stage-A) checkpoint resolution and inference.
 
-Flow model = ``GINO_DEQ`` class (canonical id ``pmgp_deq_kine`` / PMGP-DEQ).
-Prefer ``load_pmgp_deq_kine`` / ``resolve_pmgp_deq_kine_ckpt``; legacy ``load_gino_deq_kine`` aliases retained.
+Flow model = ``RGP_DEQ`` class (canonical id ``rgp_deq_kine`` / RGP-DEQ).
+Prefer ``load_rgp_deq_kine`` / ``resolve_rgp_deq_kine_ckpt``; legacy ``load_gino_deq_kine`` aliases retained.
 
 Inference helpers share one DEQ solve per graph: UV predictions and ``z_kin`` are cached together
 so pack-build / coupling paths never pay for a second Anderson solve on the same vessel.
@@ -16,11 +16,11 @@ from typing import Any
 import torch
 from torch_geometric.data import Data
 
-from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.ginodeq import GINO_DEQ, RGP_DEQ
 from src.architecture.kinematics_model_config import (
-    build_gino_deq_from_ctor,
+    build_rgp_deq_from_ctor,
     kinematics_checkpoint_tensors,
-    resolve_gino_deq_ctor_kwargs,
+    resolve_rgp_deq_ctor_kwargs,
 )
 from src.config import PhysicsConfig
 from src.utils.paths import resolve_checkpoint
@@ -63,11 +63,11 @@ def _load_torch_checkpoint(path: Path) -> Any:
 
 
 # Session cache: eval/viz reload the same Stage-A ckpt many times; training should clear after pack build.
-_KINE_MODEL_CACHE: dict[tuple[str, str, int], GINO_DEQ] = {}
+_KINE_MODEL_CACHE: dict[tuple[str, str, int], RGP_DEQ] = {}
 
 
 def clear_kinematics_predictor_cache() -> None:
-    """Drop cached GINO-DEQ handles (frees VRAM once callers drop their refs)."""
+    """Drop cached RGP-DEQ handles (frees VRAM once callers drop their refs)."""
     _KINE_MODEL_CACHE.clear()
 
 
@@ -78,8 +78,8 @@ def load_kinematics_predictor(
     phys_cfg: PhysicsConfig | None = None,
     max_iters: int = 25,
     cache: bool = True,
-) -> GINO_DEQ:
-    """Load GINO-DEQ from a kinematics checkpoint with training-default architecture.
+) -> RGP_DEQ:
+    """Load RGP-DEQ from a kinematics checkpoint with training-default architecture.
 
     When ``cache=True`` (default), the same ``(ckpt, device, max_iters)`` returns the same
     eval-mode module so multi-vessel eval/viz does not reload weights from disk each time.
@@ -94,10 +94,10 @@ def load_kinematics_predictor(
 
     raw = _load_torch_checkpoint(ckpt_path)
     meta, state = kinematics_checkpoint_tensors(raw)
-    ctor = resolve_gino_deq_ctor_kwargs(meta, state)
+    ctor = resolve_rgp_deq_ctor_kwargs(meta, state)
     ctor["max_iters"] = max(3, int(max_iters))
     cfg = phys_cfg or PhysicsConfig(phase="kinematics")
-    model = build_gino_deq_from_ctor(cfg, ctor).to(dev)
+    model = build_rgp_deq_from_ctor(cfg, ctor).to(dev)
     model.load_state_dict(state, strict=False)
     model.eval()
     if cache:
@@ -125,17 +125,17 @@ def _graph_key(data) -> tuple[int, int, int]:
     return (n, e, ptr)
 
 
-def _cache_hit(model: GINO_DEQ, key: tuple[int, int, int]) -> bool:
+def _cache_hit(model: RGP_DEQ, key: tuple[int, int, int]) -> bool:
     return getattr(model, "_cache_key", None) == key
 
 
-def _store_joint_cache(model: GINO_DEQ, key: tuple[int, int, int], pred: torch.Tensor, z: torch.Tensor) -> None:
+def _store_joint_cache(model: RGP_DEQ, key: tuple[int, int, int], pred: torch.Tensor, z: torch.Tensor) -> None:
     model._cache_key = key
     model._cache_pred = pred
     model._cache_latent = z
 
 
-def _run_joint_solve(model: GINO_DEQ, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
+def _run_joint_solve(model: RGP_DEQ, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
     """One Anderson solve on ``data``; returns ``(pred, z_kin)``."""
     orig_device = next(model.parameters()).device
     kwargs = _kin_solver_kwargs()
@@ -155,7 +155,7 @@ def _run_joint_solve(model: GINO_DEQ, data: Data) -> tuple[torch.Tensor, torch.T
 
 
 @torch.no_grad()
-def predict_kinematics_and_latent(model: GINO_DEQ, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
+def predict_kinematics_and_latent(model: RGP_DEQ, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
     """One GINO-DEQ solve; returns ``(pred [N, C], z_kin [N, latent_dim])`` and fills both caches."""
     key = _graph_key(data)
     if (
@@ -170,8 +170,8 @@ def predict_kinematics_and_latent(model: GINO_DEQ, data: Data) -> tuple[torch.Te
     return pred, z
 
 
-def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
-    """Run one GINO-DEQ forward pass; returns ``(N, C)`` predictions (joint-caches ``z_kin``)."""
+def predict_kinematics(model: RGP_DEQ, data: Data) -> torch.Tensor:
+    """Run one RGP-DEQ forward pass; returns ``(N, C)`` predictions (joint-caches ``z_kin``)."""
     key = _graph_key(data)
     if _cache_hit(model, key) and getattr(model, "_cache_pred", None) is not None:
         return model._cache_pred
@@ -180,7 +180,7 @@ def predict_kinematics(model: GINO_DEQ, data: Data) -> torch.Tensor:
 
 
 @torch.no_grad()
-def predict_kinematics_latent(model: GINO_DEQ, data: Data) -> torch.Tensor:
+def predict_kinematics_latent(model: RGP_DEQ, data: Data) -> torch.Tensor:
     """Frozen DEQ latent ``z_kin`` per node, shape ``[N, latent_dim]`` (joint-caches UV pred)."""
     key = _graph_key(data)
     if _cache_hit(model, key) and getattr(model, "_cache_latent", None) is not None:
@@ -189,15 +189,20 @@ def predict_kinematics_latent(model: GINO_DEQ, data: Data) -> torch.Tensor:
     return z
 
 
-# Canonical names (PMGP-DEQ Stage-A flow)
-resolve_pmgp_deq_kine_ckpt = resolve_kinematics_checkpoint
-load_pmgp_deq_kine = load_kinematics_predictor
-predict_pmgp_deq_flow = predict_kinematics
-predict_pmgp_deq_latent = predict_kinematics_latent
-predict_pmgp_deq_flow_and_latent = predict_kinematics_and_latent
-# Legacy GINO-DEQ aliases
-resolve_gino_deq_kine_ckpt = resolve_pmgp_deq_kine_ckpt
-load_gino_deq_kine = load_pmgp_deq_kine
-predict_gino_deq_flow = predict_pmgp_deq_flow
-predict_gino_deq_latent = predict_pmgp_deq_latent
-predict_gino_deq_flow_and_latent = predict_pmgp_deq_flow_and_latent
+# Canonical names (RGP-DEQ Stage-A flow)
+resolve_rgp_deq_kine_ckpt = resolve_kinematics_checkpoint
+load_rgp_deq_kine = load_kinematics_predictor
+predict_rgp_deq_flow = predict_kinematics
+predict_rgp_deq_latent = predict_kinematics_latent
+predict_rgp_deq_flow_and_latent = predict_kinematics_and_latent
+# Legacy PMGP / GINO aliases
+resolve_pmgp_deq_kine_ckpt = resolve_rgp_deq_kine_ckpt
+load_pmgp_deq_kine = load_rgp_deq_kine
+predict_pmgp_deq_flow = predict_rgp_deq_flow
+predict_pmgp_deq_latent = predict_rgp_deq_latent
+predict_pmgp_deq_flow_and_latent = predict_rgp_deq_flow_and_latent
+resolve_gino_deq_kine_ckpt = resolve_rgp_deq_kine_ckpt
+load_gino_deq_kine = load_rgp_deq_kine
+predict_gino_deq_flow = predict_rgp_deq_flow
+predict_gino_deq_latent = predict_rgp_deq_latent
+predict_gino_deq_flow_and_latent = predict_rgp_deq_flow_and_latent

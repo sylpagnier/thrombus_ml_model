@@ -140,7 +140,8 @@ Run `-Promote` to copy alias -> `mat_canonical_deploy/species/best.pth`.
 
 | Task | Why |
 |------|-----|
-| **Resume go_wc_v7_compound_growth_abc_9h.ps1 -EvalOnly -SkipC** | Arm B train done (~9.6 h / 35 anchors; best ep16 clot=0.483). C cancelled. Full A/B/C is ~20-26 h not 9 h; A+B eval alone ~2-6 h. |
+| **Run `go_wc_v7_firewall_fix_seq.ps1 -Fresh`** | Firewall sequence: WC_v7_fw1_blind_sat finetune; hop>=2 lumen-shape specialist; optional isolate/skiphop. Hop-stratified offwall metrics. |
+| **Run `go_wc_v7_compound_growth_abc_orig10_9h.ps1 -Fresh`** | True ~9 h A/B/C on original anchors 1–8,10,11. Revised B: `loss_blurring_prec` + `offwall_balanced` (35-anchor B overgrew; clot=0.483). No skiphop Arm D. Old all-anchor B ckpt kept under `wc_v7_compound_abc_9h/`. |
 | Run **WM_mat_flow_seedfront_tightfp** (1 leg) | Only unfinished W-fix sweep leg |
 | FP-aware winner on prior summaries | Re-rank `mat_w_fix_sweep_10h` with new `--minimize-metrics` |
 

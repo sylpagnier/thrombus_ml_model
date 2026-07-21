@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Biochem training progress log
 
-When the user shares **biochem corrector** training outcomes (console logs, `metrics.jsonl`, val μ lines, “how did the run go”, hyperparameter experiments), **update** [docs/BIOCHEM_TRAINING_PROGRESS.md](docs/BIOCHEM_TRAINING_PROGRESS.md) in the same session unless they explicitly say not to.
+When the user shares **biochem** training outcomes (console logs, metrics, val lines, “how did the run go”, hyperparameter experiments), **update** [docs/archive/BIOCHEM_TRAINING_PROGRESS.md](docs/archive/BIOCHEM_TRAINING_PROGRESS.md) only if the run is on a **legacy GNODE** path worth chronicling. For the active `biochem_gnn` / mat-growth stack, prefer [docs/MAT_GROWTH_SIM_TODO.md](docs/MAT_GROWTH_SIM_TODO.md) or [docs/BIOCHEM_GNN_BASELINES.md](docs/BIOCHEM_GNN_BASELINES.md) unless they explicitly ask to extend the archive chronicle.
 
 ## What to update
 

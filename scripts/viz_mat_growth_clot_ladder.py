@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ if str(REPO) not in sys.path:
 
 from scripts.eval_mat_growth_simple import _apply_ckpt_recipe  # noqa: E402
 from src.biochem_gnn.config import apply_deploy_env  # noqa: E402
-from src.biochem_gnn.mat_growth_simple import leg_out_ckpt  # noqa: E402
+from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env, leg_out_ckpt  # noqa: E402
 from src.config import BiochemConfig, PhysicsConfig  # noqa: E402
 from src.core_physics.clot_continuous_time import macro_tau_at_index  # noqa: E402
 from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
@@ -34,7 +35,11 @@ from src.core_physics.species_gnn_ladder_viz import (  # noqa: E402
     ladder_viz_times,
     scatter_clot_error_panel,
 )
-from src.core_physics.species_pushforward_continuous import train_deploy_eval_flow_source  # noqa: E402
+from src.core_physics.species_pushforward_continuous import (  # noqa: E402
+    clear_offwall_model_cache,
+    compute_hop_distances,
+    train_deploy_eval_flow_source,
+)
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
 from src.evaluation.clot_relaxed_metrics import compute_clot_relaxed_metrics  # noqa: E402
@@ -53,6 +58,29 @@ def _viz_out_dir() -> Path:
     p = get_project_root() / "outputs/biochem/viz/mat_growth"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _hop_error_legend(fig) -> None:
+    from matplotlib.patches import Patch
+
+    from src.core_physics.species_gnn_ladder_viz import FN_COLORS, FP_COLORS
+
+    legend_elements = []
+    for hop in range(0, max(FP_COLORS.keys()) + 1):
+        label = f"+{hop}: FP Hop {hop}" if hop > 0 else "+0: FP Wall (Hop 0)"
+        legend_elements.append(Patch(facecolor=FP_COLORS[hop], label=label))
+    for hop in range(0, max(FN_COLORS.keys()) + 1):
+        label = f"-{hop}: FN Hop {hop}" if hop > 0 else "-0: FN Wall (Hop 0)"
+        legend_elements.append(Patch(facecolor=FN_COLORS[hop], label=label))
+    fig.legend(
+        handles=legend_elements,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        ncol=1,
+        fontsize=8,
+        title="Error Hop Distance\n(-x: FN, +x: FP)",
+        title_fontsize=9,
+    )
 
 
 def _scatter_clot_panel(
@@ -83,7 +111,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Mat-growth clot ladder (GT | pred | error)")
     ap.add_argument("--anchor", default="patient007")
     ap.add_argument("--leg", default=DEFAULT_LEG, help="mat_growth_ladder leg code")
+    ap.add_argument("--mat-leg", default="", help="Apply mat_growth_simple leg env (e.g. WC_v7_clot_phi_mse)")
     ap.add_argument("--ckpt", default="", help="override ckpt path")
+    ap.add_argument("--offwall-ckpt", default="", help="Growth specialist for two-model compound rollout")
+    ap.add_argument(
+        "--two-model-route",
+        default="",
+        choices=("", "wall", "frontier", "growth"),
+        help="Two-model routing when --offwall-ckpt is set (default: frontier)",
+    )
+    ap.add_argument("--two-model-frontier-hops", type=int, default=2)
+    ap.add_argument("--arm-label", default="", help="Title tag (e.g. Arm_A_canonical)")
     ap.add_argument("--flow", default="kinematics", choices=("gt", "kinematics"))
     ap.add_argument("--max-frames", type=int, default=10)
     ap.add_argument("--scatter-size", type=float, default=3.0)
@@ -97,9 +135,29 @@ def main() -> int:
     if not ckpt.is_file():
         raise SystemExit(f"[ERR] missing ckpt: {ckpt}")
 
+    clear_offwall_model_cache()
     payload = torch.load(ckpt, map_location="cpu", weights_only=False)
     meta = dict(payload.get("meta") or {})
     _apply_ckpt_recipe(meta, label="mat_growth_simple")
+    if args.mat_leg.strip():
+        apply_mat_growth_leg_env(args.mat_leg.strip(), force=True)
+    offwall_raw = args.offwall_ckpt.strip()
+    if offwall_raw:
+        offwall_path = Path(offwall_raw)
+        if not offwall_path.is_absolute():
+            offwall_path = root / offwall_path
+        if not offwall_path.is_file():
+            raise SystemExit(f"[ERR] missing --offwall-ckpt: {offwall_path}")
+        route = args.two_model_route.strip() or "frontier"
+        os.environ["SPECIES_TWO_MODEL_MODE"] = "1"
+        os.environ["SPECIES_OFFWALL_MODEL_CKPT"] = str(offwall_path).replace("\\", "/")
+        os.environ["SPECIES_TWO_MODEL_ROUTE"] = route
+        os.environ["SPECIES_TWO_MODEL_FRONTIER_HOPS"] = str(int(args.two_model_frontier_hops))
+        two_model_note = f"two-model route={route}"
+    else:
+        os.environ["SPECIES_TWO_MODEL_MODE"] = "0"
+        os.environ.pop("SPECIES_OFFWALL_MODEL_CKPT", None)
+        two_model_note = "single-model"
     flow_eval = train_deploy_eval_flow_source()
     apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": args.flow if args.flow != "kinematics" else flow_eval})
 
@@ -112,11 +170,16 @@ def main() -> int:
     )
     pos = data.x[:, :2].detach().cpu().numpy()
     n_nodes = int(data.num_nodes)
+    from src.core_physics.clot_phi_simple import _wall_mask_from_data
+
+    wall_mask_full = _wall_mask_from_data(data, device, n_nodes)
+    hop_distances_np = compute_hop_distances(data.edge_index, wall_mask_full, n_nodes).detach().cpu().numpy()
     times = ladder_viz_times(int(data.y.shape[0]), max_frames=int(args.max_frames))
     mask = torch.ones(n_nodes, device=device, dtype=torch.bool)
 
     print(f"[i] CUDA: {torch.cuda.get_device_name(0)}", flush=True)
-    print(f"[i] leg={args.leg} ckpt={ckpt} flow={args.flow}", flush=True)
+    arm_tag = args.arm_label.strip() or args.leg.strip() or DEFAULT_LEG
+    print(f"[i] arm={arm_tag} ckpt={ckpt} flow={args.flow} {two_model_note}", flush=True)
 
     t0 = time.perf_counter()
     bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
@@ -144,9 +207,9 @@ def main() -> int:
         figsize=(2.7 * len(times), 2.5 * len(row_labels)),
         squeeze=False,
     )
-    leg_tag = args.leg.strip() or DEFAULT_LEG
+    leg_tag = arm_tag
     fig.suptitle(
-        f"Mat growth clot -- {args.anchor} | {leg_tag} | {args.flow} flow",
+        f"Mat growth clot -- {args.anchor} | {leg_tag} | {args.flow} flow | {two_model_note}",
         fontsize=11,
         y=1.01,
     )
@@ -184,6 +247,7 @@ def main() -> int:
                 phi_pred_np,
                 row_labels[2] if j == 0 else "",
                 s=scatter_s,
+                hop_distances=hop_distances_np,
             )
             axes[2, j].set_title(
                 f"FP={err_counts['fp']}  FN={err_counts['fn']}",
@@ -202,7 +266,9 @@ def main() -> int:
         })
 
     timeline_summary = summarize_clot_timeline(frames)
-    fig.tight_layout()
+    if not args.no_error_row:
+        _hop_error_legend(fig)
+    fig.tight_layout(rect=[0, 0, 0.9, 0.98])
     if args.out.strip():
         out = Path(args.out)
     else:
@@ -219,6 +285,10 @@ def main() -> int:
         json.dumps({
             "anchor": args.anchor,
             "leg": leg_tag,
+            "arm_label": arm_tag,
+            "mat_leg": args.mat_leg.strip(),
+            "two_model": two_model_note,
+            "offwall_ckpt": offwall_raw,
             "ckpt": str(ckpt),
             "flow_source": args.flow,
             "rows": row_labels,

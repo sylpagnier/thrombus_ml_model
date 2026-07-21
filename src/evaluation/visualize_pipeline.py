@@ -394,7 +394,7 @@ def _nearest_time_indices(times_si: torch.Tensor, query_times: List[float]) -> L
 def _run_phase_comparison_graphsage_redirect(
     *, source: str, anchor_stem: Optional[str], time_index: int = -1
 ) -> None:
-    """Stage-A kinematics viz + GraphSAGE ``biochem_deploy`` deploy smoke."""
+    """Stage-A kinematics viz + GraphSAGE ``biochem_gnn`` deploy smoke."""
     if source == "synthetic":
         print(
             "[WARN] Synthetic biochem comparison viz was retired with the GNODE removal. "
@@ -418,7 +418,7 @@ def _run_phase_comparison_graphsage_redirect(
     except Exception as exc:  # viz is best-effort
         print(f"[WARN] kinematics viz failed: {exc}", flush=True)
 
-    print(f"[i]  Biochem deploy via GraphSAGE biochem_deploy stack for {stem}", flush=True)
+    print(f"[i]  Biochem deploy via GraphSAGE biochem_gnn stack for {stem}", flush=True)
     try:
         from src.inference.predict_species_gnn_deploy import predict_species_gnn_deploy
 

@@ -15,7 +15,7 @@ Windows PowerShell (especially 5.x / default console code pages) often **mangles
 4. Keep **identifiers and env var names** ASCII (`BIOCHEM_MU_*`, `mu_eff`); Unicode only in docs if needed, not in runtime console strings.
 5. When cleaning legacy output, use `scripts/strip_console_unicode.py` (emoji only); do not bulk-replace Greek letters across whole source files.
 6. **`Invoke-PythonRc`** must not pipe `python` through `Write-Host` (line buffering breaks tqdm `\r` one-line bars).
-7. Biochem Phase 3 bar: `src/utils/biochem_console.py` (`ascii=True`, compact postfix on Windows). `BIOCHEM_TQDM=0` or `BIOCHEM_QUIET=1` disables the bar.
+7. Prefer ASCII tqdm / compact postfix on Windows for long training bars. `BIOCHEM_TQDM=0` or `BIOCHEM_QUIET=1` disables progress bars where supported.
 
 ## Reference
 

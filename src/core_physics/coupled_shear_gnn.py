@@ -67,7 +67,7 @@ class CoupledShearGNN(nn.Module):
 class LocalKinematicCorrector(nn.Module):
     """Local k-hop kinematic corrector for velocity diversion around micro-clots.
 
-    Predicts a per-node residual ``[dU, dV]`` added to the frozen GINO-DEQ base
+    Predicts a per-node residual ``[dU, dV]`` added to the frozen RGP-DEQ base
     flow on the subgraph extracted around nucleating clot nodes. A GATv2 stack is
     used so attention can learn the anisotropic diversion (flow reroutes over and
     around a clot far more than it reverses behind it).

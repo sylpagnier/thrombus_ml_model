@@ -14,7 +14,7 @@ the retired GNODE ``train_biochem_corrector`` teacher/mu ladder (removed 2026-06
 Usage::
 
     python -m src.training.train_biochem_gnn --step species
-    python -m src.bin.main train biochem-deploy -- --step all
+    python -m src.bin.main train biochem-gnn -- --step all
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def train_species(
         cmd.extend(["--anchors", anchors])
     else:
         cmd.append("--all-anchors")
-    _run(cmd, label="biochem_deploy species_gnn")
+    _run(cmd, label="biochem_gnn species_gnn")
 
 
 def _p007_deploy_time_index(root: Path) -> int:
@@ -144,7 +144,7 @@ def train_viscosity_beta(
             "--out",
             rel_path(out_beta),
         ],
-        label="biochem_deploy gelation_beta",
+        label="biochem_gnn gelation_beta",
     )
 
 
@@ -168,7 +168,7 @@ def train_loao(
             "--out-root",
             rel_path(out_root),
         ],
-        label="biochem_deploy loao",
+        label="biochem_gnn loao",
     )
 
 
@@ -244,7 +244,7 @@ def main() -> int:
             out_root=loao_root,
         )
 
-    print(f"[OK] biochem_deploy step={args.step}", flush=True)
+    print(f"[OK] biochem_gnn step={args.step}", flush=True)
     print(f"[i] species={rel_path(species_out)} beta={rel_path(beta_out)} loao={rel_path(loao_root)}", flush=True)
     return 0
 

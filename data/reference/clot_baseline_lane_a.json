@@ -1,0 +1,27 @@
+{
+  "name": "lane_a",
+  "description": "Pred-kine GNODE teacher (mu-unlock, mu_ratio_max=20) + species dump + hybrid clot-phi h32/d2",
+  "mu_ratio_max": 20.0,
+  "pred_kine": true,
+  "june_anchor_dir": "outputs/biochem/gnode_8h_ladder/anchors_stride_72",
+  "dump_anchor_dir": "outputs/biochem/gnode10_sweep/anchors_gnode12_predkine_uvp",
+  "init_teacher_ckpt": "outputs/biochem/gnode10_sweep/K5_kine15_final/biochem_teacher_best_high_mu.pth",
+  "clot_leg": "gnode12_lane_a_clotphi",
+  "mu_unlock_epochs": 6,
+  "clot_epochs": 35,
+  "clot_phi_env": {
+    "CLOT_PHI_MODEL": "mlp",
+    "CLOT_PHI_HIDDEN": "32",
+    "CLOT_PHI_MLP_DEPTH": "2",
+    "CLOT_PHI_DROPOUT": "0.15",
+    "CLOT_PHI_HYBRID": "1",
+    "CLOT_PHI_MINIMAL_FEATURES": "1",
+    "CLOT_PHI_JOINT_BIO": "1",
+    "CLOT_PHI_JOINT_USE_PRED_SPECIES": "1",
+    "CLOT_PHI_PHYSICS_BLEND": "1",
+    "CLOT_PHI_PHYSICS_BLEND_ALPHA": "0.75",
+    "CLOT_PHI_DGAMMA_FEATURE_TIME": "current",
+    "CLOT_PHI_VEL_SOURCE": "gt",
+    "CLOT_PHI_DGAMMA_SLICE": "1"
+  }
+}

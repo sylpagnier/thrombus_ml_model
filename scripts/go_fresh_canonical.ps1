@@ -1,4 +1,4 @@
-# Powershell script to train HemoGINO v7 Biochem GNN legs.
+# Powershell script to train HemoRGP v7 Biochem GNN legs.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_fresh_canonical.ps1 -Fresh

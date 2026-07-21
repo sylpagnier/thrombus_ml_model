@@ -1,4 +1,4 @@
-# HemoGINO Customer Predict App
+# HemoRGP Customer Predict App
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_customer_predict.ps1
 #   powershell ... -Cpu
@@ -18,7 +18,7 @@ if (-not (Test-Path $Inbox)) {
     New-Item -ItemType Directory -Path $Inbox | Out-Null
 }
 
-Write-Host "[i] HemoGINO Predict" -ForegroundColor Cyan
+Write-Host "[i] HemoRGP Predict" -ForegroundColor Cyan
 Write-Host "[i] Geometries folder: $Inbox" -ForegroundColor DarkGray
 Write-Host "[i] Use Open folder or Browse (starts in that folder)" -ForegroundColor DarkGray
 

@@ -1,8 +1,8 @@
-"""Canonical deployable biochem stack (hybrid SciML pipeline).
+"""Canonical deployable biochem GNN stack (hybrid SciML pipeline).
 
-Historical import path ``src.biochem_gnn``; prefer ``from src.biochem_deploy import …`` (thin alias).
-Stack id: ``biochem_deploy`` (legacy: biochem_gnn, clot_deploy_gnn).
+Stack id: ``biochem_gnn`` (legacy alias: ``biochem_deploy``).
 SciML taxonomy: ``docs/MODEL_NOMENCLATURE.md``.
+Thin re-export also available as ``src.biochem_deploy``.
 """
 
 from src.biochem_gnn.config import (
@@ -14,6 +14,7 @@ from src.biochem_gnn.config import (
     COMPONENT_GELATION_BETA,
     COMPONENT_GINO_DEQ_KINE,
     COMPONENT_PMGP_DEQ_KINE,
+    COMPONENT_RGP_DEQ_KINE,
     COMPONENT_SPECIES,
     COMPONENT_SPECIES_GNN,
     COMPONENT_VISCOSITY,
@@ -67,6 +68,7 @@ __all__ = [
     "COMPONENT_SPECIES_GNN",
     "COMPONENT_GELATION_BETA",
     "COMPONENT_CLOT_TRIGGER_PHYSICS",
+    "COMPONENT_RGP_DEQ_KINE",
     "COMPONENT_PMGP_DEQ_KINE",
     "COMPONENT_GINO_DEQ_KINE",
     "COMPONENT_FLOW_COUPLING",
@@ -86,13 +88,13 @@ __all__ = [
     "normalize_train_phase",
     "is_biochem_gnn_checkpoint_phase",
     "is_deploy_gnn_checkpoint_phase",
+    "BiochemGNN",
     "BiochemDeployStack",
     "BiochemDeployConfig",
-    "BiochemDeployRollout",
-    "BiochemGNN",
     "BiochemGNNConfig",
+    "BiochemDeployRollout",
     "BiochemGNNRollout",
     "FlowMode",
-    "N_MODELED_SPECIES",
     "MODELED_SPECIES_NAMES",
+    "N_MODELED_SPECIES",
 ]

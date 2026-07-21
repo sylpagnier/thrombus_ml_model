@@ -121,15 +121,14 @@ class SpeciesGnnRolloutBundle:
 def _bundle_label_from_path(path: Path, phase: str) -> str:
     path_s = str(path).replace("\\", "/")
     if (
-        "biochem_deploy" in phase
-        or "biochem_gnn" in phase
+        "biochem_gnn" in phase
+        or "biochem_deploy" in phase
         or "clot_deploy_gnn" in phase
-        or "biochem_deploy" in path_s
         or "biochem_gnn" in path_s
+        or "biochem_deploy" in path_s
         or "clot_deploy_gnn" in path_s
+        or "continuous" in phase
     ):
-        return "biochem_deploy"
-    if "continuous" in phase or "biochem_gnn" in phase or "clot_deploy_gnn" in phase:
         return "biochem_gnn"
     if "s2" in phase or "pushforward" in phase:
         return "s2"

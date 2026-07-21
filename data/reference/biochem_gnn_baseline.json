@@ -1,0 +1,148 @@
+{
+  "name": "biochem_gnn",
+  "version": 2,
+  "promoted_at": "2026-07-19T16:30:00Z",
+  "promoted_from": "WC_v7_clot_phi_mse (leg 2 of go_fresh_canonical_finish)",
+  "prior_canonical": "WC_v2_dilation (mat_canonical_deploy, 2026-07-06)",
+  "description": "Canonical biochem_gnn stack: species_graphsage + gelation_beta + clot_trigger_physics. Flow uses frozen rgp_deq_kine (flow_coupling not trained yet). Promoted from WC_v7_clot_phi_mse; locked/species_gnn_best.pth is the source of truth for new warm-starts.",
+  "canonical_leg": "WC_v7_clot_phi_mse",
+  "cohort_mean": {
+    "deploy_clot_score": 0.7914805990876854,
+    "deploy_clot_f1": 0.766850387549026,
+    "deploy_mat_f1": 0.7141582763014511,
+    "compare_json": "outputs/biochem/biochem_gnn/WC_v7_clot_phi_mse/compare.json"
+  },
+  "compare_against": {
+    "prior_mat_canonical": "WC_v2_dilation",
+    "prior_clot_baseline": "R4.s0 inc40 rules",
+    "prior_f1_patient007_t53": 0.408
+  },
+  "stack": [
+    "rgp_deq_kine (RGP-DEQ kinematics_best.pth)",
+    "species_graphsage (wall-band GraphSAGE pushforward)",
+    "gelation_beta.pth",
+    "clot_trigger_physics (Carreau + gelation + nucleation)"
+  ],
+  "training_sources": {
+    "species_global": "outputs/biochem/species_snapshot_s34/best.pth",
+    "viscosity_beta": "outputs/biochem/species_snapshot_s35/beta.pth",
+    "loao_folds": "outputs/biochem/species_gnn_loao"
+  },
+  "baseline": {
+    "phase": "biochem_gnn_baseline",
+    "stack": "biochem_gnn",
+    "mat_leg": "WC_v7_clot_phi_mse",
+    "promoted_from": "WC_v7_clot_phi_mse",
+    "species_gnn_ckpt": "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth",
+    "viscosity_beta": "outputs/biochem/biochem_gnn/locked/viscosity_beta.pth",
+    "kinematics_ckpt": "outputs/kinematics/kinematics_best.pth",
+    "loao_dir": "outputs/biochem/biochem_gnn/locked/loao",
+    "train_val_anchor": "patient007",
+    "flow_modes": "gt,kinematics",
+    "gamma_mode": "max",
+    "deploy_horizon": "full",
+    "components": {
+      "pmgp_deq_kine": "frozen_external",
+      "species_graphsage": "trained",
+      "gelation_beta": "trained",
+      "clot_trigger_physics": "physics_nucleation",
+      "flow_coupling": "external_kinematics"
+    },
+    "loao_preferred": [
+      "patient001",
+      "patient002",
+      "patient003",
+      "patient004",
+      "patient006"
+    ],
+    "ckpt_overrides": {
+      "patient001": "outputs/biochem/biochem_gnn/locked/loao/holdout_patient001/best.pth",
+      "patient002": "outputs/biochem/biochem_gnn/locked/loao/holdout_patient002/best.pth",
+      "patient003": "outputs/biochem/biochem_gnn/locked/loao/holdout_patient003/best.pth",
+      "patient004": "outputs/biochem/biochem_gnn/locked/loao/holdout_patient004/best.pth",
+      "patient006": "outputs/biochem/biochem_gnn/locked/loao/holdout_patient006/best.pth",
+      "patient007": "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth"
+    },
+    "beta_overrides": {
+      "patient006": "0.15"
+    }
+  },
+  "eval": {
+    "eval_json": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_gnn_deploy\\loao_eval_final.json",
+    "mean_holdout_clot_f1_t_last_gt": 0.5229139496928604,
+    "mean_holdout_clot_f1_t53_gt": 0.5229139496928604,
+    "mean_holdout_delta_vs_s0_gt": 0.3305627461855279,
+    "patient007_clot_f1_t_last": 0.7008196721311475,
+    "patient007_clot_f1_t53": 0.7008196721311475,
+    "patient007_s0_f1_t_last": 0.40760869565217395,
+    "patient007_s0_f1_t53": 0.40760869565217395,
+    "per_anchor": [
+      {
+        "anchor": "patient001",
+        "flow": "gt",
+        "clot_f1_t_last": 0.9605263157894737,
+        "clot_f1_t53": 0.9605263157894737,
+        "s0_f1_t_last": 0.6016260162601627,
+        "s0_f1_t53": 0.6016260162601627,
+        "delta_vs_s0": 0.358900299529311,
+        "health_pass": true,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_gnn_loao\\holdout_patient001\\best.pth"
+      },
+      {
+        "anchor": "patient002",
+        "flow": "gt",
+        "clot_f1_t_last": 0.6271186440677966,
+        "clot_f1_t53": 0.6271186440677966,
+        "s0_f1_t_last": 0.11814345991561183,
+        "s0_f1_t53": 0.11814345991561183,
+        "delta_vs_s0": 0.5089751841521848,
+        "health_pass": false,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_gnn_loao\\holdout_patient002\\best.pth"
+      },
+      {
+        "anchor": "patient003",
+        "flow": "gt",
+        "clot_f1_t_last": 0.5571428571428572,
+        "clot_f1_t53": 0.5571428571428572,
+        "s0_f1_t_last": 0.06866952789699571,
+        "s0_f1_t53": 0.06866952789699571,
+        "delta_vs_s0": 0.48847332924586145,
+        "health_pass": true,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_gnn_loao\\holdout_patient003\\best.pth"
+      },
+      {
+        "anchor": "patient004",
+        "flow": "gt",
+        "clot_f1_t_last": 0.33644859813084116,
+        "clot_f1_t53": 0.33644859813084116,
+        "s0_f1_t_last": 0.1627906976744186,
+        "s0_f1_t53": 0.1627906976744186,
+        "delta_vs_s0": 0.17365790045642257,
+        "health_pass": false,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_snapshot_s34\\best.pth"
+      },
+      {
+        "anchor": "patient006",
+        "flow": "gt",
+        "clot_f1_t_last": 0.13333333333333333,
+        "clot_f1_t53": 0.13333333333333333,
+        "s0_f1_t_last": 0.010526315789473684,
+        "s0_f1_t53": 0.010526315789473684,
+        "delta_vs_s0": 0.12280701754385964,
+        "health_pass": true,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_gnn_loao\\holdout_patient006\\best.pth"
+      },
+      {
+        "anchor": "patient007",
+        "flow": "gt",
+        "clot_f1_t_last": 0.7008196721311475,
+        "clot_f1_t53": 0.7008196721311475,
+        "s0_f1_t_last": 0.40760869565217395,
+        "s0_f1_t53": 0.40760869565217395,
+        "delta_vs_s0": 0.29321097647897354,
+        "health_pass": true,
+        "ckpt": "C:\\Users\\pgssy\\thrombus_ml_model\\outputs\\biochem\\species_snapshot_s34\\best.pth"
+      }
+    ]
+  }
+}

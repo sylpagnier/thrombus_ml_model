@@ -1,12 +1,12 @@
-# HemoGINO — project context (agents & contributors)
+# HemoRGP — project context (agents & contributors)
 
 This document gives **enough structure** to navigate the repo without re-reading the whole tree: terminology, **architecture**, entry points, artifacts, and where to change behavior safely.
 
 ## Goal
 
-**HemoGINO** is a **mesh-agnostic** surrogate that predicts **velocity, pressure, viscosity, and clot-related fields** on vessel graphs faster than COMSOL, with physics-informed losses and a DEQ-style core.
+**HemoRGP** is a **mesh-agnostic** surrogate that predicts **velocity, pressure, viscosity, and clot-related fields** on vessel graphs faster than COMSOL, with physics-informed losses and a DEQ-style core.
 
-Domain adaptation from synthetic to real patient geometries uses **LoRA**. During Biochem phase, LoRA bridges the sim-to-real gap across a diverse population of meshes, enabling zero-shot inference on new, unseen patient scans without retraining.
+The canonical biochem path uses a **frozen RGP-DEQ** flow checkpoint plus a trained **species GraphSAGE** pushforward stack (`biochem_gnn`); see [BIOCHEM_GNN.md](BIOCHEM_GNN.md).
 
 ## Terminology: Tier vs Stage
 
@@ -17,9 +17,8 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 
 ### Model and physics
 
-- **`GINO_DEQ`** (`src/architecture/ginodeq.py`): Stage-A **RGP-DEQ** — μ-coupled rheology-guided graph-perceiver DEQ on vessel graphs. Canonical id: **`pmgp_deq_kine`**. Train: `python -m src.bin.main train pmgp-deq-kine` (alias: `gino-deq-kine`).
-- **`biochem_deploy` stack** (`src/biochem_gnn/`): hybrid pipeline — frozen **`pmgp_deq_kine`** (**RGP-DEQ**) + **`species_graphsage`** + **`gelation_beta`** + **`clot_trigger_physics`**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
-- **LoRA** adapters: `src/architecture/lora_injection.py` (spectral / low-rank hooks used where config enables LoRA for sim-to-real).
+- **`RGP_DEQ`** (`src/architecture/ginodeq.py`): Stage-A **RGP-DEQ** — μ-coupled rheology-guided graph-perceiver DEQ on vessel graphs. Canonical id: **`rgp_deq_kine`**. Train: `python -m src.bin.main train rgp-deq-kine` (alias: `gino-deq-kine`).
+- **`biochem_gnn` stack** (`src/biochem_gnn/`): hybrid pipeline — frozen **`rgp_deq_kine`** (**RGP-DEQ**) + **`species_graphsage`** + **`gelation_beta`** + **`clot_trigger_physics`**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
 - **`PhysicsKernels`** (`src/core_physics/physics_kernels.py`): residual / BC / rheology interfaces shared by training and tests.
 - **Kinematics losses** align with `src/utils/kinematics_physics_terms.py` (not legacy standalone `kinematics` wrappers).
 
@@ -30,11 +29,9 @@ Domain adaptation from synthetic to real patient geometries uses **LoRA**. Durin
 - **Node features (Kinematics/2)** — `NodeFeat` slices: positions, SDF, wall normals, priors, optional hydraulic width `D(x)` and derivatives for geometric priors.
 - **Biochem node features** — `BiochemNodeFeat` for clot/chemistry graphs.
 
-### Clot-phi simple baseline (wall-local probe)
+### Active clot path
 
-Separate from the full GNODE biochem stack: a **tiny hybrid head** on GT kinematics + capped `mu_eff` with a dgamma-sliced neighbor mask. Use it to validate masks/features before multitask biochem. Record and metrics: [CLOT_PHI_BASELINE.md](CLOT_PHI_BASELINE.md). Entry: `scripts/go_clot_phi_simple.ps1`.
-
-Related clot/T0 ladders: [T0_RUNG_LADDER.md](T0_RUNG_LADDER.md), [CLOT_TRIGGER_LADDER.md](CLOT_TRIGGER_LADDER.md), [CLOT_ML_DEPLOY_TRAINING_PLAN.md](CLOT_ML_DEPLOY_TRAINING_PLAN.md), [CLOT_ML_LADDER_V2.md](CLOT_ML_LADDER_V2.md). COMSOL mu/rheology alignment: [COMSOL_MU_RHEOLOGY_CHECKLIST.md](COMSOL_MU_RHEOLOGY_CHECKLIST.md).
+Canonical clot footprint comes from the **`biochem_gnn`** stack (species GraphSAGE + gelation + clot trigger) and mat-growth research; see [BIOCHEM_GNN.md](BIOCHEM_GNN.md) and [MAT_GROWTH_SIM_TODO.md](MAT_GROWTH_SIM_TODO.md). Optional flow diversion: [LOCAL_KINEMATIC_CORRECTOR.md](LOCAL_KINEMATIC_CORRECTOR.md). COMSOL mu/rheology alignment: [COMSOL_MU_RHEOLOGY_CHECKLIST.md](COMSOL_MU_RHEOLOGY_CHECKLIST.md).
 
 ### Biochem "Clot" Semantics
 
@@ -74,10 +71,9 @@ Training is driven by **self-contained scripts** that own dataloading loops, sch
 
 | Script | Role |
 |--------|------|
-| `src.training.train_kinematics_predictor` | **RGP-DEQ** Stage-A flow trainer (`train gino-deq-kine`) |
-| `src.training.train_biochem_gnn` | **biochem_deploy** stack trainer (`train biochem-deploy`) |
-| `src.training.train_biochem_corrector` | Biochem phase: GNODE coupled corrector (research) |
-| `src.training.physics_curriculum` | Curriculum helpers consumed by training scripts |
+| `src.training.train_kinematics_predictor` | **RGP-DEQ** Stage-A flow trainer (`train rgp-deq-kine`) |
+| `src.training.train_biochem_gnn` | **biochem_gnn** stack trainer (`train biochem-gnn`) |
+| `src.training.train_local_kinematic_corrector` | Optional local clot-flow diversion patch |
 
 `python -m src.bin.main train kinematics` runs the same module as `train_kinematics_predictor` (see `MODULE_MAP` in `src/bin/main.py`).
 
@@ -85,8 +81,8 @@ Training is driven by **self-contained scripts** that own dataloading loops, sch
 
 | Module | Role |
 |--------|------|
-| `python -m src.bin.orchestrate {a\|b\|all}` | Runs Kine phase (`train_kinematics_predictor`) and/or Biochem phase (`train_biochem_corrector`) |
-| `python -m src.bin.main <group> <target> [-- …]` | Stable CLI map to training, datagen, eval, inspection (`MODULE_MAP` in `src/bin/main.py`) |
+| `python -m src.bin.orchestrate {a\|b\|all}` | Chains Stage-A kinematics and/or biochem_gnn training |
+| `python -m src.bin.main <group> <target> [-- …]` | Stable CLI map (`MODULE_MAP` in `src/bin/main.py`) |
 
 There is **no** separate `src.main` package for training; use **`src.bin.orchestrate`** or **`src.bin.main`** above.
 
@@ -99,10 +95,9 @@ There is **no** separate `src.main` package for training; use **`src.bin.orchest
 | Action | Command / module |
 |--------|------------------|
 | Chain training (recommended) | `python -m src.bin.orchestrate {a\|b\|all}` |
-| Unified RGP-DEQ (Stage A) | `python -m src.bin.main train gino-deq-kine` or `train kinematics` |
-| Biochem corrector (GNODE) | `python -m src.bin.main train biochem` or `train t3` |
-| Biochem deploy stack | `python -m src.bin.main train biochem-deploy` |
-| Kinematics/2 datagen | `python -m src.data_gen.pipeline_kinematics` |
+| Unified RGP-DEQ (Stage A) | `python -m src.bin.main train rgp-deq-kine` or `train kinematics` |
+| Biochem deploy stack | `python -m src.bin.main train biochem-gnn` |
+| Kinematics datagen | `python -m src.data_gen.pipeline_kinematics` |
 | Biochem datagen | `python -m src.data_gen.pipeline_biochem` |
 
 Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` keeps backward-compatible reads from legacy `stage_a` / `stage_b` runs). Kinematics `.pth` files embed **`model_config`** (see `src/architecture/kinematics_model_config.py`); canonical best-run manifest: `data/reference/kinematics_best_20260426T184600Z.json` and [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md).
@@ -126,9 +121,9 @@ Checkpoints: `outputs/kinematics/` and `outputs/biochem/` (`resolve_checkpoint` 
 ## Source map
 
 - **`src/core_physics/`** — PDE-consistent building blocks (fluid kinematics, rheology, biochem kernels, Anderson). Shared by training and tests.
-- **`src/architecture/`** — `GINO_DEQ` (RGP-DEQ class), DEQ loop, LoRA, SIREN decoder, Biochem model variants.
+- **`src/architecture/`** — `RGP_DEQ` (RGP-DEQ class), DEQ loop, spectral layers, SIREN decoder.
 - **`src/data_gen/`** — Top-level **pipelines** (`pipeline_kinematics`, `pipeline_biochem`); **`lib/`** holds mesh/COMSOL/graph builders imported by those pipelines and re-exported from `src.data_gen`.
-- **`src/training/`** — Predictor and corrector **scripts** (`train_kinematics_predictor`, `train_biochem_corrector`), `physics_curriculum.py`; import LoRA helpers from `src.architecture.lora_injection` when needed.
+- **`src/training/`** — Predictor and biochem-deploy **scripts** (`train_kinematics_predictor`, `train_biochem_gnn`, mat-growth trainers).
 - **`src/evaluation/`** — Benchmark drivers, phase comparison plots (may reference checkpoint paths).
 - **`src/utils/`** — `paths`, `metrics`, `batching`, `rheology`, `units`, kinematics helpers (`kinematics_physics_terms`), training diary, inference helpers aligned with training.
 - **`src/bin/`** — `main.py` (unified CLI router), `orchestrate.py` (phase runner).

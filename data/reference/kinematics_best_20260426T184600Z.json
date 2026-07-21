@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "record_type": "kinematics_best_training_run",
+  "source_project": "LadHyX_ml_cfd_thrombus_predictions",
+  "source_run_id": "20260426T184600Z",
+  "source_run_dir": "outputs/reports/training/kinematics/20260426T184600Z",
+  "source_checkpoint_legacy": "outputs/stage_a/kinematics_best.pth",
+  "trained_at_utc": "2026-04-26T18:46:00Z",
+  "purpose": "architecture_and_training_flags_only",
+  "notes": "Canonical GINO_DEQ recipe for biochem Stage-A alignment. Weights live in LadHyX; this file records constructor kwargs and curriculum only. Best Adam epoch before L-BFGS NaN (84, 0-based).",
+  "best_checkpoint": {
+    "epoch": 84,
+    "stage": 3,
+    "rheology": "carreau",
+    "carreau_n": 0.358,
+    "carreau_mu0_nd": 0.056,
+    "rel_l2": 0.1007,
+    "continuity_mean_div_u": 0.157,
+    "composite": 15.797
+  },
+  "model_config": {
+    "schema": 1,
+    "model_class": "GINO_DEQ",
+    "in_channels": 15,
+    "out_channels": 5,
+    "latent_dim": 256,
+    "max_iters": 25,
+    "outer_iters": 3,
+    "num_fourier_freqs": 16,
+    "activation_fn": "silu",
+    "fourier_base": 2.0,
+    "use_hard_bcs": true,
+    "use_siren_decoder": true,
+    "use_width_priors": true,
+    "num_global_tokens": 16,
+    "phase": "kinematics"
+  },
+  "training_recipe": {
+    "epochs": 100,
+    "adam_epochs": 85,
+    "stage1_end_epoch": 40,
+    "stage2_end_epoch": 60,
+    "accum_steps": 2,
+    "weight_data": 500.0,
+    "weight_mu": 10.0,
+    "weight_wss": 10.0,
+    "max_lbfgs_graphs": 4,
+    "optimizer_adam": "AdamW",
+    "lr": 0.0001,
+    "weight_decay": 1e-5,
+    "warm_up_epochs": 5,
+    "curriculum": {
+      "stage1": { "rheology": "newtonian", "n": 1.0, "mu0_nd": 0.0035 },
+      "stage2": { "rheology": "newtonian", "n_ramp": [1.0, 0.6], "mu0_ramp_nd": [0.0035, 0.035] },
+      "stage3": { "rheology": "carreau", "n": 0.3568, "mu0_nd": 0.056 }
+    }
+  },
+  "biochem_alignment": {
+    "kin_encoder_maps_from": ["encoder", "core", "kinematics_decoder", "siren_decoder", "mu_encoder", "mu_decoder", "z_prior_proj"],
+    "expected_kin_encoder_in_features": 178,
+    "comment": "178 = 15 + 10*16 Fourier + 3 width priors; matches gnode_biochem kin_encoder when BIOCHEM_FOURIER_BANDS=16 and latent 256."
+  }
+}

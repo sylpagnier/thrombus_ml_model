@@ -1,6 +1,23 @@
-# Large data files
-data/raw/*.nas
-data/raw/**/*.nas
+# Large / generated data (never push) — ignore contents, not the dir itself,
+# so we can carve out small public reference manifests.
+data/*
+!data/reference/
+!data/reference/**
+# Sweep / ablation leftovers stay local
+data/reference_local/
+
+# Generated training / eval artifacts (local runs)
+outputs/
+
+# Heavy COMSOL sources
+comsol_models/
+
+# Customer inbox uploads (keep README only)
+customer_geometries/*
+!customer_geometries/README.txt
+
+# Local notes scratchpad
+notes/
 
 # Python
 __pycache__/
@@ -8,29 +25,35 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 env/
 venv/
 ENV/
-.venv
+.venv/
 
-# IDE
+# Checkpoints / tensors if ever dropped outside outputs/
+*.pth
+*.pt
+*.ckpt
+!customer_geometries/README.txt
+
+# COMSOL / mesh binaries if ever outside comsol_models/
+*.mph
+*.nas
+*.msh
+
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
-data/
 
-# Generated training artifacts (local runs; not versioned)
-outputs/
-
-# Customer inbox uploads (keep README only)
-customer_geometries/*
-!customer_geometries/README.txt
-
-# Ignore local heavy/generated directories
-comsol_models/
-notes/
+# Root junk / local dumps (never re-add)
+/test_legend.png
+/test_legend.json
+/check_nodes_out.txt
+*.log

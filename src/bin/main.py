@@ -24,6 +24,8 @@ MODULE_MAP: dict[tuple[str, str], str] = {
     ("train", "biochem_gnn"): "src.training.train_biochem_gnn",
     ("train", "biochem-deploy"): "src.training.train_biochem_gnn",
     ("train", "biochem_deploy"): "src.training.train_biochem_gnn",
+    ("train", "rgp-deq-kine"): "src.training.train_kinematics_predictor",
+    ("train", "rgp_deq_kine"): "src.training.train_kinematics_predictor",
     ("train", "pmgp-deq-kine"): "src.training.train_kinematics_predictor",
     ("train", "pmgp_deq_kine"): "src.training.train_kinematics_predictor",
     ("train", "gino-deq-kine"): "src.training.train_kinematics_predictor",
@@ -98,16 +100,16 @@ def main(argv: list[str] | None = None) -> None:
         valid_targets = sorted(k[1] for k in MODULE_MAP if k[0] == ns.group)
         parser.error(f"unknown target '{ns.target}' for group '{ns.group}'. valid: {valid_targets}")
 
-    if ns.group == "train" and ns.target in {"t1", "t2", "explore"}:
-        canonical = "pmgp-deq-kine"
+    if ns.group == "train" and ns.target in {"t1", "t2", "explore", "gino-deq-kine", "gino_deq_kine", "pmgp-deq-kine", "pmgp_deq_kine"}:
+        canonical = "rgp-deq-kine"
         print(
             f"[WARN] Deprecated train target '{ns.target}'. "
             f"Use 'train {canonical}' instead."
         )
-    if ns.group == "train" and ns.target in {"biochem-gnn", "biochem_gnn"}:
+    if ns.group == "train" and ns.target in {"biochem-deploy", "biochem_deploy"}:
         print(
             "[WARN] Deprecated train target "
-            f"'{ns.target}'. Use 'train biochem-deploy' instead."
+            f"'{ns.target}'. Use 'train biochem-gnn' instead."
         )
 
     if ns.group == "orchestrate":

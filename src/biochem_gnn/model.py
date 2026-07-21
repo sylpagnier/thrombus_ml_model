@@ -1,7 +1,7 @@
-"""Hybrid biochem deploy pipeline (canonical stack: ``biochem_deploy``).
+"""Hybrid biochem GNN pipeline (canonical stack: ``biochem_gnn``).
 
 Composable SciML stack (not one nn.Module):
-  PMGP-DEQ kine -> GraphSAGE species pushforward -> gelation_beta -> clot_trigger_physics.
+  RGP-DEQ kine -> GraphSAGE species pushforward -> gelation_beta -> clot_trigger_physics.
 """
 
 from __future__ import annotations
@@ -134,15 +134,15 @@ class BiochemDeployRollout:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-class BiochemDeployStack:
-    """Deploy biochem pipeline (not a single nn.Module).
+class BiochemGNN:
+    """Biochem GNN deploy pipeline (not a single nn.Module).
 
     Components (SciML-accurate ids):
-      - pmgp_deq_kine: frozen PMGP-DEQ flow checkpoint (``GINO_DEQ`` class)
+      - rgp_deq_kine: frozen RGP-DEQ flow checkpoint (``RGP_DEQ`` class)
       - species_graphsage: wall-band GraphSAGE pushforward (learned)
       - gelation_beta: global Mat scale (learned scalar)
       - clot_trigger_physics: Carreau + gelation mu + nucleation phi (equations)
-      - flow_coupling: optional mu -> PMGP-DEQ refresh via ``KinematicsUvProvider``
+      - flow_coupling: optional mu -> RGP-DEQ refresh via ``KinematicsUvProvider``
     """
 
     def __init__(
@@ -170,7 +170,7 @@ class BiochemDeployStack:
         anchor: str | None = None,
         device: torch.device | None = None,
         flow_mode: FlowMode = FlowMode.FROZEN_KINE,
-    ) -> BiochemDeployStack:
+    ) -> BiochemGNN:
         dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         m = manifest or load_manifest()
         ckpt = species_ckpt_for_anchor(anchor or "", m, prefer_loao=True)
@@ -198,7 +198,7 @@ class BiochemDeployStack:
         kinematics_ckpt: str | Path | None = None,
         device: torch.device | None = None,
         flow_mode: FlowMode = FlowMode.FROZEN_KINE,
-    ) -> BiochemDeployStack:
+    ) -> BiochemGNN:
         dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = Path(species_ckpt)
         bundle = load_species_gnn_rollout_bundle(ckpt, device=dev)
@@ -545,7 +545,7 @@ def recompute_sdf_euclidean(pos: torch.Tensor, new_wall_mask: torch.Tensor) -> t
         )
 
 
-# Backward-compatible aliases (pre-2026-06 rename)
-BiochemGNN = BiochemDeployStack
+# Backward-compatible aliases
+BiochemDeployStack = BiochemGNN
 BiochemGNNConfig = BiochemDeployConfig
 BiochemGNNRollout = BiochemDeployRollout

@@ -36,6 +36,8 @@ class WallControlPointEditor:
         max_wall_displacement_m: float | None = None,
         drag_sigma_stations: float = 8.5,
         pick_radius_px: float = 28.0,
+        fill_facecolor: str = "lightblue",
+        fill_alpha: float = 0.35,
     ) -> None:
         self.fig = fig
         self.ax = ax
@@ -46,6 +48,8 @@ class WallControlPointEditor:
         self.max_wall_displacement_m = max_wall_displacement_m
         self.drag_sigma_stations = float(drag_sigma_stations)
         self.pick_radius_px = pick_radius_px
+        self.fill_facecolor = fill_facecolor
+        self.fill_alpha = float(fill_alpha)
         self.geom = geom
         self.handle_indices = subsample_handle_indices(geom.n)
         n = geom.n
@@ -104,6 +108,8 @@ class WallControlPointEditor:
             fixed_top=self.fixed_top,
             fixed_bot=self.fixed_bot,
             return_artists=True,
+            fill_facecolor=self.fill_facecolor,
+            fill_alpha=self.fill_alpha,
         )
         (
             self._top_line,

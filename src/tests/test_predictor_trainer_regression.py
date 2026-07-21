@@ -171,8 +171,8 @@ def test_fast_forward_curriculum_three_epochs(monkeypatch):
         def step(self):
             return None
 
-    def _fake_load_dataset(phase, rheology=None, limit=None):
-        _ = limit
+    def _fake_load_dataset(phase, rheology=None, limit=None, shuffle_graphs=False, **_kwargs):
+        _ = (limit, shuffle_graphs, _kwargs)
         loaded.append((phase, rheology))
         return [_SimpleGraph(False), _SimpleGraph(False)]
 

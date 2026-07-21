@@ -1,7 +1,7 @@
 """Chained inference: GraphSAGE species rollout + clot-phi spatial readout.
 
 Deploy stack: the species temporal evolution comes from the GraphSAGE
-``biochem_deploy`` pushforward (``src.core_physics.species_gnn_clot_rollout``),
+``biochem_gnn`` pushforward (``src.core_physics.species_gnn_clot_rollout``),
 and the learned clot-phi MLP reads the rolled-out species block to produce the
 deploy mu map. (Pre-2026-06 this used a GNODE teacher; that path is removed.)
 """

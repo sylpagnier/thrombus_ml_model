@@ -265,6 +265,12 @@ def _eval_ckpt(
             "deploy_clot_offwall_strict_f1": float(clot_m.get("deploy_clot_offwall_strict_f1", 0.0)),
             "deploy_clot_offwall_n_pred": float(clot_m.get("deploy_clot_offwall_n_pred", 0.0)),
             "deploy_clot_offwall_n_gt": float(clot_m.get("deploy_clot_offwall_n_gt", 0.0)),
+            "deploy_clot_offwall_n_pred_hop2": float(clot_m.get("deploy_clot_offwall_n_pred_hop2", 0.0)),
+            "deploy_clot_offwall_n_pred_hop3": float(clot_m.get("deploy_clot_offwall_n_pred_hop3", 0.0)),
+            "deploy_clot_offwall_n_pred_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0)),
+            "deploy_clot_offwall_n_gt_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0)),
+            "deploy_clot_offwall_strict_f1_hop2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop2", 0.0)),
+            "deploy_clot_offwall_strict_f1_hop_ge2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0)),
             **{k: float(v) for k, v in timeline_summary.items()},
         }
     keys = (
@@ -275,6 +281,12 @@ def _eval_ckpt(
         "deploy_clot_offwall_strict_f1",
         "deploy_clot_offwall_n_pred",
         "deploy_clot_offwall_n_gt",
+        "deploy_clot_offwall_n_pred_hop2",
+        "deploy_clot_offwall_n_pred_hop3",
+        "deploy_clot_offwall_n_pred_hop_ge2",
+        "deploy_clot_offwall_n_gt_hop_ge2",
+        "deploy_clot_offwall_strict_f1_hop2",
+        "deploy_clot_offwall_strict_f1_hop_ge2",
         "mat_seed_prec",
         "mat_seed_count",
         "mat_front_prec",
@@ -424,6 +436,9 @@ def main() -> int:
             "deploy_clot_offwall_strict_f1",
             "deploy_clot_offwall_n_pred",
             "deploy_clot_offwall_n_gt",
+            "deploy_clot_offwall_n_pred_hop_ge2",
+            "deploy_clot_offwall_n_gt_hop_ge2",
+            "deploy_clot_offwall_strict_f1_hop_ge2",
         ):
             print(f"  {k}: {mean.get(k, 0.0):.4f}", flush=True)
         return 0

@@ -1,7 +1,7 @@
 """Customer geometry inbox + load helpers for the Predict app.
 
 Supports:
-  - existing HemoGINO ``.pt`` graphs
+  - existing HemoRGP ``.pt`` graphs
   - tagged Gmsh ``.msh`` / ``.nas`` with a same-stem sidecar ``.json``
   - parametric vessel build (caller supplies mesh+meta via ``graph_from_mesh_meta``)
 

@@ -285,12 +285,22 @@ def compute_clot_relaxed_metrics(
     }
 
     if wall_mask is not None:
+        # Off-wall relaxed metrics must only reward off-wall predictions.
+        # The previous implementation used relax dilation computed from the full
+        # prediction mask, allowing wall predictions to "rescue" off-wall recall.
         offwall = ~wall_mask.reshape(-1).to(device=pred_pos.device).bool()
-        n_pred_off = int((pred_pos & offwall).sum().item())
-        n_gt_off = int((gt_pos & offwall).sum().item())
+        pred_pos_off = pred_pos & offwall
+        gt_pos_off = gt_pos & offwall
 
-        tp_prec_off = int((pred_pos & gt_dil & offwall).sum().item())
-        tp_rec_off = int((gt_pos & pred_dil & offwall).sum().item())
+        n_pred_off = int(pred_pos_off.sum().item())
+        n_gt_off = int(gt_pos_off.sum().item())
+
+        # Build relaxed neighborhoods from off-wall-only pred/GT masks.
+        gt_dil_off = graph_dilate_hops(gt_pos_off, edge_index, hops)
+        pred_dil_off = graph_dilate_hops(pred_pos_off, edge_index, hops)
+
+        tp_prec_off = int((pred_pos_off & gt_dil_off).sum().item())
+        tp_rec_off = int((gt_pos_off & pred_dil_off).sum().item())
 
         relaxed_prec_off = _safe_div(float(tp_prec_off), float(n_pred_off))
         relaxed_rec_off = _safe_div(float(tp_rec_off), float(n_gt_off))
@@ -310,7 +320,59 @@ def compute_clot_relaxed_metrics(
         res["offwall_n_pred"] = float(n_pred_off)
         res["offwall_n_gt"] = float(n_gt_off)
 
+        # Hop-stratified off-wall counts (metric discipline for firewall work).
+        hop_dist = _bfs_hops_from_wall(edge_index, wall_mask.reshape(-1).bool(), int(pred_pos.numel()))
+        for h in (1, 2, 3, 4):
+            at_h = hop_dist == int(h)
+            res[f"offwall_n_pred_hop{h}"] = float((pred_pos & at_h).sum().item())
+            res[f"offwall_n_gt_hop{h}"] = float((gt_pos & at_h).sum().item())
+            tp_h = int((pred_pos & gt_pos & at_h).sum().item())
+            fp_h = int((pred_pos & ~gt_pos & at_h).sum().item())
+            fn_h = int((~pred_pos & gt_pos & at_h).sum().item())
+            prec_h = _safe_div(float(tp_h), float(tp_h + fp_h))
+            rec_h = _safe_div(float(tp_h), float(tp_h + fn_h))
+            res[f"offwall_strict_f1_hop{h}"] = f_beta_score(prec_h, rec_h, beta=1.0)
+        lumen = hop_dist >= 2
+        n_pred_lumen = int((pred_pos & lumen).sum().item())
+        n_gt_lumen = int((gt_pos & lumen).sum().item())
+        tp_lumen = int((pred_pos & gt_pos & lumen).sum().item())
+        fp_lumen = int((pred_pos & ~gt_pos & lumen).sum().item())
+        fn_lumen = int((~pred_pos & gt_pos & lumen).sum().item())
+        res["offwall_n_pred_hop_ge2"] = float(n_pred_lumen)
+        res["offwall_n_gt_hop_ge2"] = float(n_gt_lumen)
+        res["offwall_strict_f1_hop_ge2"] = f_beta_score(
+            _safe_div(float(tp_lumen), float(tp_lumen + fp_lumen)),
+            _safe_div(float(tp_lumen), float(tp_lumen + fn_lumen)),
+            beta=1.0,
+        )
+
     return res
+
+
+def _bfs_hops_from_wall(
+    edge_index: torch.Tensor,
+    wall_mask: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
+    """BFS hop distance from wall nodes (unreachable -> 99). Local to avoid import cycles."""
+    device = edge_index.device
+    hops = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+    wall_m = wall_mask.to(device=device).bool().reshape(-1)
+    hops[wall_m] = 0
+    row, col = edge_index
+    current = wall_m.clone()
+    cur_h = 0
+    while True:
+        nbr = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        nbr[col[current[row]]] = True
+        nxt = nbr & (hops == -1)
+        if not bool(nxt.any().item()):
+            break
+        cur_h += 1
+        hops[nxt] = cur_h
+        current = nxt
+    hops[hops == -1] = 99
+    return hops
 
 
 def compute_clot_relaxed_metrics_full_mesh(
@@ -344,6 +406,14 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
         "offwall_relaxed_rec": f"{prefix}clot_offwall_relaxed_rec",
         "offwall_n_pred": f"{prefix}clot_offwall_n_pred",
         "offwall_n_gt": f"{prefix}clot_offwall_n_gt",
+        "offwall_n_pred_hop1": f"{prefix}clot_offwall_n_pred_hop1",
+        "offwall_n_pred_hop2": f"{prefix}clot_offwall_n_pred_hop2",
+        "offwall_n_pred_hop3": f"{prefix}clot_offwall_n_pred_hop3",
+        "offwall_n_pred_hop_ge2": f"{prefix}clot_offwall_n_pred_hop_ge2",
+        "offwall_n_gt_hop_ge2": f"{prefix}clot_offwall_n_gt_hop_ge2",
+        "offwall_strict_f1_hop2": f"{prefix}clot_offwall_strict_f1_hop2",
+        "offwall_strict_f1_hop3": f"{prefix}clot_offwall_strict_f1_hop3",
+        "offwall_strict_f1_hop_ge2": f"{prefix}clot_offwall_strict_f1_hop_ge2",
     }
     for src, dst in mapping.items():
         if src in m:

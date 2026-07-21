@@ -12,6 +12,7 @@ from src.utils.boundary_flux import (
     fd_inlet_flux_ref_from_re_nd,
     flux_debug_from_graph_data,
 )
+from src.utils.channel_schema import BIO_X_SCHEMA
 
 
 def _channel_mesh():
@@ -98,6 +99,7 @@ def test_flux_debug_from_graph_data():
         mask_wall=mask_wall,
         u_inlet_bc=vel.clone(),
         u_ref=torch.tensor([u_ref]),
+        x_schema=BIO_X_SCHEMA,
     )
     dbg = flux_debug_from_graph_data(data, vel)
     assert dbg["Q_flow_ratio"] == pytest.approx(1.0, rel=1e-2)
@@ -142,6 +144,7 @@ def test_flux_debug_resolves_u_ref_from_phys_cfg():
         mask_wall=mask_wall,
         d_bar=torch.tensor([d_bar]),
         u_inlet_bc=vel.clone(),
+        x_schema=BIO_X_SCHEMA,
     )
     data.x[:, :2] = pos
     dbg = flux_debug_from_graph_data(data, vel, phys_cfg=cfg)

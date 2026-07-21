@@ -739,7 +739,7 @@ def load_teacher_for_trigger(device: torch.device, teacher_ckpt: Path | None = N
     """Load the GraphSAGE species pushforward bundle used to seed the clot trigger.
 
     Pre-2026-06 this built a GNODE teacher; the trigger now rolls species via the
-    ``biochem_deploy`` GraphSAGE stack. The first return value is the species
+    ``biochem_gnn`` GraphSAGE stack. The first return value is the species
     bundle (named ``teacher`` for back-compat with the trigger eval/viz scripts).
     """
     from src.config import BiochemConfig, PhysicsConfig

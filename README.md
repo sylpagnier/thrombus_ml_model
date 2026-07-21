@@ -1,13 +1,13 @@
-# HemoGINO
+# HemoRGP
 
-**HemoGINO** is a state-of-the-art **Scientific Machine Learning (SciML)** framework that acts as a mesh-agnostic graph neural surrogate for vascular blood flow (hemodynamics) and coupled biochemistry (thrombosis/clotting). By combining physics-informed losses, deep equilibrium networks, and graph operators, HemoGINO provides real-time predictions of velocity, pressure, viscosity, and clot growth dynamics on complex vascular structures, running orders of magnitude faster than conventional Computational Fluid Dynamics (CFD) solvers.
+**HemoRGP** is a state-of-the-art **Scientific Machine Learning (SciML)** framework that acts as a mesh-agnostic graph neural surrogate for vascular blood flow (hemodynamics) and coupled biochemistry (thrombosis/clotting). By combining physics-informed losses, deep equilibrium networks, and graph operators, HemoRGP provides real-time predictions of velocity, pressure, viscosity, and clot growth dynamics on complex vascular structures, running orders of magnitude faster than conventional Computational Fluid Dynamics (CFD) solvers.
 
 ---
 
 ## 🚀 Key Architectural Features
 
 ### 1. Rheology-Guided Graph-Perceiver DEQ (RGP-DEQ)
-At the core of the kinematics solver is **RGP-DEQ** (`pmgp_deq_kine`), a Deep Equilibrium (DEQ) graph architecture that models steady non-Newtonian flow (`[u, v, p, μ_eff]`) on unstructured vessel graphs:
+At the core of the kinematics solver is **RGP-DEQ** (`rgp_deq_kine`), a Deep Equilibrium (DEQ) graph architecture that models steady non-Newtonian flow (`[u, v, p, μ_eff]`) on unstructured vessel graphs:
 *   **Physics-Modulated GAT (`MultiHeadPhysicsGATConv`)**: Edge attention logits are dynamically biased by physical priors (advection, curvature, wall normals, and Signed Distance Fields).
 *   **Perceiver Global Mixing (`AttentionGlobalMixingBlock`)**: Fixed global latent tokens cross-attend the mesh nodes, enabling long-range pressure-velocity coupling without requiring deep stacks of local message passing.
 *   **Rheology-Coupled Fixed-Point Solve**: Fluid viscosity feedback is evaluated *inside* the DEQ loop (using Picard or Anderson acceleration), ensuring the non-Newtonian rheology (Carreau model) is satisfied at the fixed-point equilibrium.
@@ -17,17 +17,12 @@ Training blends supervised CFD labels with analytical physics constraints:
 *   **50/50 Anchor Mix**: Optimizes training by mixing 50% supervised nodes (COMSOL anchors) and 50% unsupervised nodes (non-anchors).
 *   **PDE Residual Losses**: Enforces mass conservation (divergence-free flow `∇·u = 0`), momentum conservation (Navier-Stokes residuals), and wall boundary conditions (no-slip) across unsupervised regions, serving as a powerful regularizer for out-of-distribution generalization.
 
-### 3. Sim-to-Real Domain Adaptation via LoRA
-Adapts models trained on synthetic vascular geometries to real clinical scans:
-*   **Low-Rank Adaptation (LoRA)**: Intercepts GNN and MLP weight projections with parameter-efficient spectral/low-rank adapters.
-*   **Zero-Shot Inference**: Bridges the sim-to-real gap, enabling rapid adaptation to diverse patient cohorts without catastrophic forgetting or expensive retraining.
-
-### 4. Coupled Biochemistry Stack (`biochem_deploy`)
+### 3. Coupled Biochemistry Stack (`biochem_gnn`)
 A modular pipeline modeling clot growth and species transport:
 *   **GraphSAGE Pushforward (`species_graphsage`)**: A 3-layer GraphSAGE operator that predicts temporal species transport (Autologous Fibrin / Platelets) on the wall-band subgraph.
 *   **Gelation Calibration & Readout**: Integrates a learned scalar calibration (`gelation_beta`) and a mechanistic physics closure (`clot_trigger_physics`) to map chemical concentrations to physical thrombus formation and dynamic flow occlusion.
 
-### 5. Local Kinematic Corrector
+### 4. Local Kinematic Corrector
 Predicts localized velocity diversion residuals `[dU, dV]` induced by micro-clots:
 *   **Local GATv2 Attention**: Instead of re-solving the expensive global flow field when a clot forms, a local k-hop GNN patch routes flow around/over the clot.
 *   **Energy-Normalized Loss**: Trained on COMSOL "Patch Factory" simulations using a relative loss function that prevents small-signal/low-shear regions from degrading accuracy.
@@ -37,7 +32,7 @@ Predicts localized velocity diversion residuals `[dU, dV]` induced by micro-clot
 ## 💻 Demos & Interactive Visuals
 
 ### Vessel Simulation Desktop UI (Customer Predict App)
-For a comprehensive, radiology-inspired desktop experience, HemoGINO provides a dark-themed user interface to design parametric vessels or load custom geometries, run fluid flow and biochem coupling simulations, and scrub through the temporal clot-formation timeline.
+For a comprehensive, radiology-inspired desktop experience, HemoRGP provides a dark-themed user interface to design parametric vessels or load custom geometries, run fluid flow and biochem coupling simulations, and scrub through the temporal clot-formation timeline.
 
 **Key Features:**
 *   **Left Control Rail**: Adjust vessel flow parameters (Reynolds number, simulation duration, etc.), load custom geometries from the `customer_geometries/` directory, and run simulation pipelines.
@@ -52,7 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_customer_predic
 *(Or run directly with: `python -m src.tools.customer_predict_app`)*
 
 ### Parametric Flow GUI Demo
-HemoGINO also includes a lightweight interactive GUI that allows users to design arbitrary 2D vessels, drag wall control points in real-time, generate meshes via Gmsh, and watch the RGP-DEQ solver instantly predict fluid flow.
+HemoRGP also includes a lightweight interactive GUI that allows users to design arbitrary 2D vessels, drag wall control points in real-time, generate meshes via Gmsh, and watch the RGP-DEQ solver instantly predict fluid flow.
 
 Run the interactive flow demo:
 ```powershell
@@ -90,7 +85,7 @@ python -m src.bin.orchestrate all
 python -m src.bin.main train kinematics
 
 # Train biochem deploy stack only
-python -m src.bin.main train biochem-deploy
+python -m src.bin.main train biochem-gnn
 ```
 
 ### 4. Running Tests
@@ -119,18 +114,18 @@ pytest src/tests/ --suite=biochem
 ## 📁 Repository Structure
 
 ```text
-├── src/
-│   ├── architecture/     # RGP-DEQ, DEQ solvers, LoRA, GNN layers
-│   ├── core_physics/     # PDE kernels, Navier-Stokes residuals, rheology models
-│   ├── data_gen/         # Mesh processors, quad-patch generator, graph builders
-│   ├── training/         # Dataloaders, curriculum schedules, trainers
-│   ├── bin/              # Unified CLI main router and pipeline orchestrator
-│   ├── tools/            # Interactive Matplotlib GUIs, live inspectors
-│   └── tests/            # Deterministic regression and unit tests
-├── docs/                 # In-depth architectural designs and log sweeps
-├── comsol_models/        # Reference COMSOL Multiphysics source files
-├── requirements.txt      # Dependency specification
-└── README.md             # Landing page
+├── src/                  # Library code (RGP-DEQ, biochem_gnn, physics, training, tools)
+├── scripts/              # Supported launchers (see scripts/README.md)
+│   └── archive/          # Retired ladders (not the default surface)
+├── docs/                 # Active design docs + docs/archive/ chronicles
+├── data/reference/       # Small JSON manifests (tracked); bulk data/ is local-only
+├── customer_geometries/  # Inbox README only (uploads stay local)
+├── outputs/              # LOCAL: checkpoints, logs, viz (gitignored)
+├── comsol_models/        # LOCAL: COMSOL .mph (gitignored)
+├── requirements.txt
+└── README.md
 ```
 
-For a deeper dive into terminology, data channels, and implementation details, see [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md).
+**What is public vs local:** see [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
+
+For terminology and implementation details, see [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md) and [`docs/MODEL_NOMENCLATURE.md`](docs/MODEL_NOMENCLATURE.md).

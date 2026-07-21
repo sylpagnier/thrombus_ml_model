@@ -1,4 +1,4 @@
-"""Persist and resolve ``GINO_DEQ`` constructor kwargs from checkpoints and reference manifests.
+"""Persist and resolve ``RGP_DEQ`` constructor kwargs from checkpoints and reference manifests.
 
 Checkpoints written by ``train_kinematics_predictor`` embed ``model_config`` so
 ``train_biochem_gnn``, visualization, and agents can rebuild the same
@@ -14,12 +14,15 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from src.architecture.ginodeq import GINO_DEQ
+from src.architecture.ginodeq import GINO_DEQ, RGP_DEQ
 from src.utils.paths import data_root, get_project_root, kinematics_dir
 
 KINEMATICS_MODEL_CONFIG_SCHEMA = 1
 KINEMATICS_REFERENCE_REL = Path("reference") / "kinematics_best_20260426T184600Z.json"
 KINEMATICS_ARCH_MANIFEST_NAME = "kinematics_architecture.json"
+
+# Accepted model_class strings in checkpoint / reference JSON
+_RGP_MODEL_CLASS_NAMES = frozenset({"RGP_DEQ", "GINO_DEQ", "PMGP_DEQ"})
 
 
 def kinematics_reference_path() -> Path:
@@ -39,11 +42,11 @@ def load_kinematics_reference_record() -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def snapshot_gino_deq_model_config(model: GINO_DEQ) -> dict[str, Any]:
-    """Serializable constructor recipe for ``GINO_DEQ`` (schema v1)."""
+def snapshot_rgp_deq_model_config(model: RGP_DEQ) -> dict[str, Any]:
+    """Serializable constructor recipe for ``RGP_DEQ`` (schema v1)."""
     return {
         "schema": KINEMATICS_MODEL_CONFIG_SCHEMA,
-        "model_class": "GINO_DEQ",
+        "model_class": "RGP_DEQ",
         "in_channels": 15,
         "out_channels": 5,
         "latent_dim": int(model.encoder[0].out_features),
@@ -61,6 +64,10 @@ def snapshot_gino_deq_model_config(model: GINO_DEQ) -> dict[str, Any]:
         "num_global_tokens": 16,
         "phase": "kinematics",
     }
+
+
+# Backward-compatible alias
+snapshot_gino_deq_model_config = snapshot_rgp_deq_model_config
 
 
 def infer_use_siren_decoder_from_state_dict(state_dict: Mapping[str, Any]) -> bool | None:
@@ -121,7 +128,7 @@ def infer_num_fourier_freqs_from_state_dict(
     return bands if bands >= 1 else None
 
 
-def resolve_gino_deq_ctor_kwargs(
+def resolve_rgp_deq_ctor_kwargs(
     meta: Mapping[str, Any] | None,
     state_dict: Mapping[str, Any],
     *,
@@ -134,7 +141,7 @@ def resolve_gino_deq_ctor_kwargs(
     fourier_base_default: float = 2.0,
     activation_fn_default: str = "silu",
 ) -> dict[str, Any]:
-    """Build ``GINO_DEQ`` kwargs from checkpoint metadata, reference JSON, or tensor shapes."""
+    """Build ``RGP_DEQ`` kwargs from checkpoint metadata, reference JSON, or tensor shapes."""
     saved = dict((meta or {}).get("model_config") or {})
     if int(saved.get("schema", 0)) != KINEMATICS_MODEL_CONFIG_SCHEMA:
         ref = load_kinematics_reference_record()
@@ -217,8 +224,8 @@ def kinematics_checkpoint_tensors(raw: Any) -> tuple[dict[str, Any], dict[str, t
     raise TypeError(f"Unsupported kinematics checkpoint type: {type(raw)!r}")
 
 
-def build_gino_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> GINO_DEQ:
-    return GINO_DEQ(
+def build_rgp_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> RGP_DEQ:
+    return RGP_DEQ(
         in_channels=int(ctor["in_channels"]),
         out_channels=int(ctor["out_channels"]),
         latent_dim=int(ctor["latent_dim"]),
@@ -238,6 +245,11 @@ def build_gino_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> GINO_DEQ
     )
 
 
+# Backward-compatible aliases
+resolve_gino_deq_ctor_kwargs = resolve_rgp_deq_ctor_kwargs
+build_gino_deq_from_ctor = build_rgp_deq_from_ctor
+
+
 def save_kinematics_checkpoint_file(
     path: Path | str,
     model: nn.Module,
@@ -253,7 +265,7 @@ def save_kinematics_checkpoint_file(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    model_config = snapshot_gino_deq_model_config(model) if isinstance(model, GINO_DEQ) else None
+    model_config = snapshot_rgp_deq_model_config(model) if isinstance(model, RGP_DEQ) else None
     payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
         "checkpoint_role": checkpoint_role,

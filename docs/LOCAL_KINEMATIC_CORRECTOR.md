@@ -1,12 +1,12 @@
 # Local kinematic corrector (clot velocity diversion)
 
 A local, k-hop GNN that predicts the velocity diversion `[dU, dV]` a micro-clot induces,
-as a **residual on the frozen GINO-DEQ base flow**. Instead of re-solving the global flow
+as a **residual on the frozen RGP-DEQ base flow**. Instead of re-solving the global flow
 when a clot appears, we patch the base field locally around the clot nodes (cheap,
 anisotropic). Trained on synthetic COMSOL "Patch Factory" residuals.
 
 ## Why
-The deploy GINO-DEQ kine model is accurate on healthy hemodynamics but OOD on the extreme
+The deploy RGP-DEQ kine model is accurate on healthy hemodynamics but OOD on the extreme
 `mu` spikes a clot imposes. Rather than retrain the global model, we learn a *local*
 correction so flow reroutes over/around the clot, supplying the shear/stagnation structure
 the biochem clot model needs.
@@ -57,7 +57,7 @@ From the Stage-A kinematics curriculum ([docs/KINEMATICS_BEST_ARCHITECTURE.md](K
 - Eval (held-out vs COMSOL truth): `python -m src.tools.eval_local_corrector --patch-dir data/processed/cfd_results_patch_factory --corrector outputs/kinematics/local_corrector/local_kinematic_corrector_best.pth`
   - Global + per-sample relL2; truth/pred/error maps (best/median/worst) ->
     `outputs/reports/figures/kinematics/local_corrector_eval.png`.
-- Live (overlay on GINO-DEQ, dummy clot on a patient graph): `python -m src.tools.verify_local_corrector_live --graph data/processed/graphs_biochem_anchors/patient007.pt --corrector .../local_kinematic_corrector_best.pth --num-hops 5 --clot-mu 3.0`
+- Live (overlay on RGP-DEQ, dummy clot on a patient graph): `python -m src.tools.verify_local_corrector_live --graph data/processed/graphs_biochem_anchors/patient007.pt --corrector .../local_kinematic_corrector_best.pth --num-hops 5 --clot-mu 3.0`
   - Panels: base | corrected | overlay (shared arrow scale) ->
     `outputs/reports/figures/kinematics/local_corrector_diversion.png`.
 
@@ -115,12 +115,12 @@ tercile 24.4%**. Remaining levers (diminishing returns -- decide if <12% global 
    regressing (`--hard-bias` data gen, `--hard-boost` sampler). Not indicated now.
 
 Target: global relL2 <~12% with p95 well under 100% before wiring into the biochem deploy
-rollout (`BiochemDeployStack.set_local_corrector` / `local_corrector_ckpt`).
+rollout (`BiochemGNN.set_local_corrector` / `local_corrector_ckpt`).
 
 ## Deploy coupling (intercept the flow in the rollout loop)
 `src/inference/corrector_coupling.py` is the single source of truth for dynamically bending
 the frozen base flow around a growing clot before it is fed to the biochem model (Steps A-F):
-- **A** base flow `[u0, v0]` from the frozen GINO-DEQ kine pass (cached per graph).
+- **A** base flow `[u0, v0]` from the frozen RGP-DEQ kine pass (cached per graph).
 - **B** clot nodes = `delta_mu_si > BIOCHEM_CORRECTOR_MU_THRESH` (default 1e-3 Pa.s), where
   `delta_mu = mu_eff - mu_bulk_carreau` (clot elevation over the *clot-free Carreau bulk*, not
   over `mu_inf` -- see the 2026-06-20 confound fix; the bulk ref keeps Δμ~0 away from the clot,
@@ -147,7 +147,7 @@ predict_kinematics_latent(kine, data)` that is the GraphSAGE teacher's primary f
   cheap local diversion on `u, v`; latent stays frozen.
 - **resolved** -- significant clot (node count or `BIOCHEM_KINE_RESOLVE_MIN_BAND_FRAC`) -> the
   kine model **updates itself**: the clot `mu` is injected into `data.x[:, MU_PRIOR]` and the
-  GINO-DEQ is re-solved, regenerating **both** the velocity field **and** `z_kin`. Hysteresis
+  RGP-DEQ is re-solved, regenerating **both** the velocity field **and** `z_kin`. Hysteresis
   (`BIOCHEM_KINE_RESOLVE_GROWTH_FACTOR`, default 1.5x growth since last solve) avoids a global
   solve every step.
 
@@ -408,7 +408,7 @@ A/B on the deploy clot-F1 metric -- not this band-Dice probe -- shows it does no
 F1, so confirm the "drop flow features" decision with a real `deploy_ab_eval` before committing.
 
 **GPU OOM fix (resolved).** The `corrector_resolve` rung previously OOM'd on the 4 GiB card (two
-GINO-DEQ solves back-to-back: Path-A re-solve + flow-feature solve). Fixed without going to CPU:
+RGP-DEQ solves back-to-back: Path-A re-solve + flow-feature solve). Fixed without going to CPU:
 free the coupler's kine model before `prepare_species_gnn_rollout_static` loads its own
 (`compare_coupled_mat_rollout`), `empty_cache()` + **retry on GPU** before any CPU fallback in
 `_resolve_flow_uv` / `ClotAwareFlow.resolve_full`, and `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`

@@ -1,10 +1,10 @@
-"""Canonical biochem deploy stack (hybrid SciML pipeline).
+"""Canonical biochem GNN stack (hybrid SciML pipeline).
 
-Architecture (locked 2026-06): see docs/MODEL_NOMENCLATURE.md
-  pmgp_deq_kine (PMGP-DEQ) -> species_graphsage -> gelation_beta -> clot_trigger_physics
+Architecture (locked): see docs/MODEL_NOMENCLATURE.md
+  rgp_deq_kine (RGP-DEQ) -> species_graphsage -> gelation_beta -> clot_trigger_physics
   -> [future] flow_coupling
 
-Import path ``src.biochem_gnn`` is legacy; artifact dirs unchanged.
+Stack id: ``biochem_gnn`` (legacy alias: ``biochem_deploy``).
 """
 
 from __future__ import annotations
@@ -15,18 +15,19 @@ from pathlib import Path
 from typing import Any
 
 from src.model_nomenclature import (
-    BIOCHEM_DEPLOY_STACK,
+    BIOCHEM_GNN_STACK,
     CLOT_TRIGGER_PHYSICS,
     FLOW_COUPLING,
     GELATION_BETA,
-    PMGP_DEQ_KINE,
+    LOCAL_KINEMATIC_CORRECTOR,
+    RGP_DEQ_KINE,
     SPECIES_GRAPHSAGE,
 )
 from src.utils.paths import get_project_root
 
 # --- identity (canonical SciML ids; legacy aliases still resolve) ---
-STACK_NAME = BIOCHEM_DEPLOY_STACK.id
-PHASE_TRAIN = BIOCHEM_DEPLOY_STACK.id
+STACK_NAME = BIOCHEM_GNN_STACK.id
+PHASE_TRAIN = BIOCHEM_GNN_STACK.id
 PHASE_CKPT = "biochem_gnn"
 PHASE_MANIFEST = "biochem_gnn_baseline"
 PHASE_LOAO_INDEX = "biochem_gnn_loao"
@@ -83,8 +84,9 @@ LEGACY_STAGING_PICK = Path("outputs/biochem/species_gnn_deploy/ckpt_pick.json")
 LEGACY_VIZ = Path("outputs/biochem/viz/species_gnn_deploy")
 
 # Component keys (canonical SciML ids + legacy aliases for manifests)
-COMPONENT_PMGP_DEQ_KINE = PMGP_DEQ_KINE.id
-COMPONENT_GINO_DEQ_KINE = COMPONENT_PMGP_DEQ_KINE  # legacy export name
+COMPONENT_RGP_DEQ_KINE = RGP_DEQ_KINE.id
+COMPONENT_PMGP_DEQ_KINE = COMPONENT_RGP_DEQ_KINE  # legacy export name
+COMPONENT_GINO_DEQ_KINE = COMPONENT_RGP_DEQ_KINE  # legacy export name
 COMPONENT_SPECIES_GNN = SPECIES_GRAPHSAGE.id
 COMPONENT_SPECIES = SPECIES_GRAPHSAGE.legacy_ids[0]  # species_gnn
 COMPONENT_GELATION_BETA = GELATION_BETA.id
@@ -93,6 +95,8 @@ COMPONENT_CLOT_TRIGGER_PHYSICS = CLOT_TRIGGER_PHYSICS.id
 COMPONENT_CLOT = CLOT_TRIGGER_PHYSICS.legacy_ids[0]  # clot_phi
 COMPONENT_FLOW_COUPLING = FLOW_COUPLING.id
 COMPONENT_FLOW = FLOW_COUPLING.id  # not implemented
+COMPONENT_LOCAL_KINEMATIC_CORRECTOR = LOCAL_KINEMATIC_CORRECTOR.id
+COMPONENT_LOCAL_CORRECTOR = LOCAL_KINEMATIC_CORRECTOR.legacy_ids[0]  # local_corrector
 
 GLOBAL_TRAIN_RECIPE: dict[str, str] = {
     "SPECIES_CONTINUOUS_GROWTH_ONLY_LOSS": "1",
@@ -273,7 +277,7 @@ def default_manifest_payload() -> dict[str, Any]:
         "gamma_mode": "max",
         "deploy_horizon": "full",
         "components": {
-            COMPONENT_PMGP_DEQ_KINE: "frozen_external",
+            COMPONENT_RGP_DEQ_KINE: "frozen_external",
             COMPONENT_SPECIES_GNN: "trained",
             COMPONENT_GELATION_BETA: "trained",
             COMPONENT_CLOT_TRIGGER_PHYSICS: "physics_nucleation",

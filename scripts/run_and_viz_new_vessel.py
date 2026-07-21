@@ -61,7 +61,7 @@ def main():
     steps_to_plot = [0, traj.n_steps // 3, 2 * traj.n_steps // 3, traj.n_steps - 1]
     
     fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    fig.suptitle(f"HemoGINO Forecast on New Vessel (Leg: {leg})", fontsize=14, fontweight="bold")
+    fig.suptitle(f"HemoRGP Forecast on New Vessel (Leg: {leg})", fontsize=14, fontweight="bold")
     
     pos = traj.pos
     

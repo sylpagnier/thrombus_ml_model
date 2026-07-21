@@ -1,15 +1,12 @@
-"""Architecture package (lazy ``lora_injection`` avoids import cycles with ``architecture.ginodeq``)."""
+"""Architecture package (RGP-DEQ, spectral layers, decoders)."""
 
-from src.architecture.lora_injection import (
-    LoRAParametrization,
-    SpectralLinear,
-    inject_lora_to_kinematics,
-    inject_lora_to_spectral_linears,
-)
+from src.architecture.ginodeq import GINO_DEQ, GINOBlock, RGP_DEQ, RGPBlock
+from src.architecture.spectral_linear import SpectralLinear
 
 __all__ = [
-    "LoRAParametrization",
+    "RGP_DEQ",
+    "RGPBlock",
+    "GINO_DEQ",
+    "GINOBlock",
     "SpectralLinear",
-    "inject_lora_to_kinematics",
-    "inject_lora_to_spectral_linears",
 ]

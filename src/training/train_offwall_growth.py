@@ -245,10 +245,14 @@ def compute_shape_loss(
     edge_index: torch.Tensor,
     num_nodes: int,
     loss_mode: str,
+    *,
+    hop_dist: torch.Tensor | None = None,
+    lumen_shape_weight: float = 2.0,
 ) -> torch.Tensor:
     """Compute shape-aware losses on the extracted subgraph.
 
     ``mask`` selects supervised nodes (off-wall and/or clot frontier).
+    ``loss_lumen_shape`` = blurring_prec + soft Dice favoring hop>=2 GT shape.
     """
     p = pred_delta
     t = tgt_delta
@@ -258,7 +262,7 @@ def compute_shape_loss(
     huber_beta = continuous_huber_beta_growth()
     active_thresh = continuous_delta_threshold()
 
-    if loss_mode in ("loss_blurring", "loss_blurring_prec"):
+    if loss_mode in ("loss_blurring", "loss_blurring_prec", "loss_lumen_shape"):
         # Diffuse both prediction and target deltas to smooth out high-frequency misalignments
         p_blurred = diffuse_field(p, edge_index, num_nodes, hops=2)
         t_blurred = diffuse_field(t, edge_index, num_nodes, hops=2)
@@ -292,6 +296,19 @@ def compute_shape_loss(
                 reduction="mean",
             )
             loss = loss + 0.5 * fp_loss
+
+        if loss_mode == "loss_lumen_shape" and hop_dist is not None:
+            lumen = (hop_dist.reshape(-1) >= 2) & mask.reshape(-1)
+            if bool(lumen.any().item()) and bool((active & lumen).any().item()):
+                pred_s = torch.sigmoid((pred_ch[lumen] - active_thresh) * 8.0)
+                gt_s = active[lumen].to(dtype=pred_s.dtype)
+                inter = (pred_s * gt_s).sum()
+                pred_sum = pred_s.sum()
+                gt_sum = gt_s.sum()
+                fn_w = float(os.environ.get("SPECIES_LUMEN_SHAPE_FN_W", "2.5"))
+                fp_w = float(os.environ.get("SPECIES_LUMEN_SHAPE_FP_W", "1.0"))
+                dice = (2.0 * inter) / (fp_w * pred_sum + fn_w * gt_sum + 1e-6)
+                loss = loss + float(lumen_shape_weight) * (1.0 - dice)
         return loss
 
     elif loss_mode == "spatial_tolerance":
@@ -341,16 +358,29 @@ def growth_specialist_ckpt_score(
     offwall_relaxed_f1: float,
     offwall_n_pred: float,
     offwall_n_gt: float,
+    hop_ge2_strict_f1: float = 0.0,
+    hop_ge2_n_pred: float = 0.0,
+    hop_ge2_n_gt: float = 0.0,
 ) -> float:
     """Checkpoint selection score for the decoupled growth specialist.
 
     - ``clot_score``: legacy full deploy clot score (growth-alone; poor for specialists).
     - ``offwall_relaxed``: maximize off-wall relaxed F1.
     - ``offwall_balanced``: blend relaxed F1 with volume match vs GT (best-practice Arm C).
+    - ``hop_ge2_balanced``: prioritize hop>=2 strict F1 + lumen volume match.
     """
     mode = (ckpt_metric or "clot_score").strip().lower()
     if mode in ("offwall_relaxed", "offwall_relaxed_f1", "relaxed"):
         return float(offwall_relaxed_f1)
+    if mode in ("hop_ge2_balanced", "lumen_balanced", "hop2"):
+        n_gt = max(float(hop_ge2_n_gt), 0.0)
+        n_pred = max(float(hop_ge2_n_pred), 0.0)
+        if n_gt <= 0.0:
+            return float(hop_ge2_strict_f1) - 0.1 * min(n_pred, 20.0)
+        vol_match = min(n_pred / n_gt, 1.0)
+        overshoot = max(0.0, (n_pred - n_gt) / max(n_gt, 1.0))
+        vol_match = max(0.0, vol_match - 0.25 * overshoot)
+        return 0.65 * float(hop_ge2_strict_f1) + 0.35 * vol_match
     if mode in ("offwall_balanced", "balanced", "offwall"):
         n_gt = max(float(offwall_n_gt), 0.0)
         n_pred = max(float(offwall_n_pred), 0.0)
@@ -377,6 +407,8 @@ def unroll_offwall_loss_custom(
     velocity: list[torch.Tensor] | None,
     loss_mode: str,
     device: torch.device,
+    hop_dist: torch.Tensor | None = None,
+    lumen_shape_weight: float = 2.0,
 ) -> torch.Tensor:
     """Sequence unroller with customized shape loss function."""
     from src.core_physics.species_pushforward_continuous import (
@@ -460,6 +492,8 @@ def unroll_offwall_loss_custom(
                 edge_index,
                 base_feats.shape[0],
                 loss_mode,
+                hop_dist=hop_dist,
+                lumen_shape_weight=lumen_shape_weight,
             )
             
             # Decay state for next step
@@ -522,21 +556,27 @@ def main() -> int:
     )
     ap.add_argument(
         "--supervise-mode",
-        choices=("offwall", "frontier"),
+        choices=("offwall", "frontier", "hop_ge2"),
         default="offwall",
-        help="offwall=~wall only; frontier=growth near existing clots (wall+lumen)",
+        help="offwall=~wall; frontier=dilate(clot); hop_ge2=BFS hops>=2 lumen only",
     )
     ap.add_argument(
         "--loss-mode",
-        choices=("standard", "spatial_tolerance", "loss_blurring", "loss_blurring_prec"),
+        choices=("standard", "spatial_tolerance", "loss_blurring", "loss_blurring_prec", "loss_lumen_shape"),
         default="standard",
-        help="Loss strategy: loss_blurring_prec = blurring + light FP outside dilate(GT,2)",
+        help="loss_lumen_shape = blurring_prec + soft Dice on hop>=2 GT shape",
     )
     ap.add_argument(
         "--ckpt-metric",
-        choices=("clot_score", "offwall_relaxed", "offwall_balanced"),
+        choices=("clot_score", "offwall_relaxed", "offwall_balanced", "hop_ge2_balanced"),
         default="clot_score",
-        help="Checkpoint selection: offwall_balanced preferred for wall-route compound Arm C",
+        help="hop_ge2_balanced prefers lumen hop>=2 localization",
+    )
+    ap.add_argument(
+        "--lumen-shape-weight",
+        type=float,
+        default=2.0,
+        help="Weight on soft Dice lumen-shape term (loss_lumen_shape)",
     )
     ap.add_argument(
         "--cheap-val",
@@ -664,8 +704,11 @@ def main() -> int:
     supervise_mode = str(args.supervise_mode).strip().lower()
     frontier_hops = max(int(args.frontier_hops), 0)
     ckpt_metric = str(args.ckpt_metric).strip().lower()
+    lumen_shape_weight = float(args.lumen_shape_weight)
     if supervise_mode == "frontier":
         supervise_desc = f"FRONTIER dilate(clot,{frontier_hops}) including wall near commits"
+    elif supervise_mode == "hop_ge2":
+        supervise_desc = "HOP>=2 lumen nodes only (firewall target region)"
     else:
         supervise_desc = "OFF-WALL nodes only (loss-masked)"
     print(
@@ -675,6 +718,7 @@ def main() -> int:
         f"  supervision: {supervise_desc}\n"
         f"  loss mode: {args.loss_mode}\n"
         f"  ckpt metric: {ckpt_metric}\n"
+        f"  lumen_shape_weight: {lumen_shape_weight}\n"
         f"  mat-leg: {args.mat_leg.strip() or '(none)'}\n"
         f"  output: {out_path}",
         flush=True,
@@ -716,9 +760,13 @@ def main() -> int:
 
                 # 4. Supervision mask
                 wall_mask_sub = wall_mask_full[node_idx]
+                hop_full = compute_hop_distances(edge_index, wall_mask_full, n_nodes)
+                hop_sub = hop_full[node_idx]
                 if supervise_mode == "frontier":
                     growth_zone_full = graph_dilate_hops(clot_union, edge_index, frontier_hops)
                     train_mask = growth_zone_full[node_idx]
+                elif supervise_mode == "hop_ge2":
+                    train_mask = hop_sub >= 2
                 else:
                     train_mask = ~wall_mask_sub
                 if not train_mask.any():
@@ -766,6 +814,8 @@ def main() -> int:
                     velocity=velocity_series,
                     loss_mode=args.loss_mode,
                     device=device,
+                    hop_dist=hop_sub,
+                    lumen_shape_weight=lumen_shape_weight,
                 )
 
                 if not loss.requires_grad:
@@ -841,12 +891,18 @@ def main() -> int:
             offwall_strict_f1 = float(clf.get("deploy_clot_offwall_strict_f1", 0.0))
             offwall_n_pred = float(clf.get("deploy_clot_offwall_n_pred", 0.0))
             offwall_n_gt = float(clf.get("deploy_clot_offwall_n_gt", 0.0))
+            hop_ge2_strict_f1 = float(clf.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0))
+            hop_ge2_n_pred = float(clf.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0))
+            hop_ge2_n_gt = float(clf.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0))
             val_score = growth_specialist_ckpt_score(
                 ckpt_metric=ckpt_metric,
                 clot_score=val_clot_score,
                 offwall_relaxed_f1=offwall_relaxed_f1,
                 offwall_n_pred=offwall_n_pred,
                 offwall_n_gt=offwall_n_gt,
+                hop_ge2_strict_f1=hop_ge2_strict_f1,
+                hop_ge2_n_pred=hop_ge2_n_pred,
+                hop_ge2_n_gt=hop_ge2_n_gt,
             )
 
         improved = False

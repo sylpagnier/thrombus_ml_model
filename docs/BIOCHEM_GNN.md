@@ -1,15 +1,15 @@
-# Biochem deploy baseline (`biochem_deploy`)
+# Biochem deploy baseline (`biochem_gnn`)
 
-> **Naming:** Stack id **`biochem_deploy`** = frozen **RGP-DEQ** (`pmgp_deq_kine`) + **GraphSAGE pushforward** + **gelation_beta** + **mechanistic clot readout**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
+> **Naming:** Stack id **`biochem_gnn`** = frozen **RGP-DEQ** (`rgp_deq_kine`) + **GraphSAGE pushforward** + **gelation_beta** + **mechanistic clot readout**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
 
 ## Two biochem training paths (historical)
 
-| | **biochem_deploy** (canonical, active) | **train_biochem_corrector** (GNODE, **retired 2026-06**) |
+| | **biochem_gnn** (canonical, active) | **train_biochem_corrector** (GNODE, **retired 2026-06**) |
 |---|--------------------------------------|-----------------------------------------------|
-| Entry | `python -m src.bin.main train biochem-deploy` | removed (`go_biochem_gnn.ps1` is the active path) |
+| Entry | `python -m src.bin.main train biochem-gnn` | removed (`go_biochem_gnn.ps1` is the active path) |
 | Model | GraphSAGE pushforward + physics clot readout | `GNODE_Phase3` graph neural ODE (deleted) |
 | Mesh scope | Ceiling / wall band (~1-hop) | Full vessel graph |
-| Flow | External frozen RGP-DEQ / GINO-DEQ | Learned / GT kine in-graph |
+| Flow | External frozen RGP-DEQ | Learned / GT kine in-graph |
 | Mu | Physics gelation from species (`gelation_beta`) | Learned mu heads |
 | Clot | `clot_trigger_physics` + mat-growth | Clot-phi probes, MLP injectors |
 | Deploy | Yes (no GT species at inference) | Research only (archived) |
@@ -19,7 +19,7 @@ GNODE teacher/corrector launchers and modules were removed from the active surfa
 ## Components
 
 ```
-pmgp_deq_kine           [frozen RGP-DEQ ckpt, Stage A]
+rgp_deq_kine           [frozen RGP-DEQ ckpt, Stage A]
   -> species_graphsage  [trained]  wall-band GraphSAGE pushforward (FI/Mat)
   -> gelation_beta      [trained]  global Mat gelation scale
   -> clot_trigger_physics [equations] Carreau + gelation + nucleation phi
@@ -50,7 +50,7 @@ Legacy ladders and aliases were archived from the active surface; see `BIOCHEM_L
 powershell -File .\scripts\go_biochem_gnn.ps1 -Step all -Gate -Viz
 
 # Python trainer
-python -m src.bin.main train biochem-deploy -- --step all --all-anchors
+python -m src.bin.main train biochem-gnn -- --step all --all-anchors
 python -m src.training.train_biochem_gnn --step species
 ```
 
@@ -83,16 +83,16 @@ Set automatically by ``apply_deploy_env()``:
 | `SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL` | `1` | Score deploy metrics at each graph's last macro-step |
 | `SPECIES_PUSHFORWARD_MAX_UNROLL` | `200` | Training unroll VRAM cap (not eval time) |
 
-## `BiochemDeployStack` (Python)
+## `BiochemGNN` (Python)
 
 ```python
-from src.biochem_deploy import BiochemDeployStack, FlowMode
+from src.biochem_gnn import BiochemGNN, FlowMode
 
-model = BiochemDeployStack.from_manifest(anchor="patient007", flow_mode=FlowMode.COUPLED)
+model = BiochemGNN.from_manifest(anchor="patient007", flow_mode=FlowMode.COUPLED)
 out = model.rollout(data)  # out.phi_by_time, out.mu_by_time, out.species_series
 ```
 
-Alias: `BiochemGNN = BiochemDeployStack`.
+Legacy alias: `BiochemDeployStack = BiochemGNN` (also re-exported from `src.biochem_deploy`).
 
 Coupled mode is **not yet validated** against locked baseline F1 (~0.70).
 

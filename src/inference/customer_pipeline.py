@@ -50,6 +50,10 @@ class CustomerTrajectory:
     elapsed_s: float = 0.0
     n_steps: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
+    mask_wall: np.ndarray | None = None
+    mask_inlet: np.ndarray | None = None
+    mask_outlet: np.ndarray | None = None
+    hop_from_wall: np.ndarray | None = None
 
     def frame(self, index: int) -> dict[str, np.ndarray | float]:
         i = int(max(0, min(index, self.n_steps - 1)))
@@ -60,6 +64,22 @@ class CustomerTrajectory:
             "mu_eff_si": self.mu_eff_si[i],
             "phi": self.phi[i],
         }
+
+    def interior_mask(self) -> np.ndarray:
+        """Nodes that are neither inlet nor outlet (wall + lumen)."""
+        n = int(self.pos.shape[0])
+        interior = np.ones(n, dtype=bool)
+        if self.mask_inlet is not None:
+            interior &= ~np.asarray(self.mask_inlet, dtype=bool).reshape(-1)
+        if self.mask_outlet is not None:
+            interior &= ~np.asarray(self.mask_outlet, dtype=bool).reshape(-1)
+        return interior
+
+    def has_velocity_at(self, index: int) -> bool:
+        idxs = (self.meta or {}).get("velocity_indices")
+        if idxs is None:
+            return bool((self.meta or {}).get("include_velocity", False))
+        return int(index) in {int(i) for i in idxs}
 
 
 def _abs(path: Path | str) -> Path:
@@ -254,21 +274,57 @@ class CustomerDeployPipeline:
         mu_all: dict[int, np.ndarray] = {}
         phi_all: dict[int, np.ndarray] = {}
         t_keys = sorted(traj.keys())
+        # Customer UI only needs first/last velocity (Clot+Velocity bookends + light Scientific).
+        velocity_indices: list[int] = []
+        if include_velocity and t_keys:
+            velocity_indices = [int(t_keys[0])]
+            if len(t_keys) > 1:
+                velocity_indices.append(int(t_keys[-1]))
+            velocity_indices = sorted(set(velocity_indices))
+
         if include_velocity:
-            log("[i] Coupling local kinematic corrector...")
+            log(
+                f"[i] Coupling local kinematic corrector at "
+                f"{len(velocity_indices)} bookend step(s)..."
+            )
             for ti in t_keys:
-                mu_eff_si = traj[ti]["mu"].to(self.device)
-                u, v = self._flow_provider.couple(data, mu_eff_si, publish=False)
-                vel_all[ti] = torch.sqrt(u**2 + v**2).detach().cpu().numpy()
                 mu_all[ti] = traj[ti]["mu"].detach().cpu().numpy()
                 phi_all[ti] = traj[ti]["phi"].detach().cpu().numpy()
+                if int(ti) in velocity_indices:
+                    mu_eff_si = traj[ti]["mu"].to(self.device)
+                    u, v = self._flow_provider.couple(data, mu_eff_si, publish=False)
+                    vel_all[ti] = torch.sqrt(u**2 + v**2).detach().cpu().numpy()
+                else:
+                    vel_all[ti] = np.zeros_like(phi_all[ti], dtype=np.float32)
         else:
             log("[i] Skipping velocity corrector (clot-only mode)...")
             for ti in t_keys:
                 mu_all[ti] = traj[ti]["mu"].detach().cpu().numpy()
                 phi_all[ti] = traj[ti]["phi"].detach().cpu().numpy()
-                # Placeholder so scrubber APIs stay uniform
                 vel_all[ti] = np.zeros_like(phi_all[ti], dtype=np.float32)
+
+        def _mask_np(name: str) -> np.ndarray | None:
+            m = getattr(data, name, None)
+            if m is None:
+                return None
+            return m.reshape(-1).bool().detach().cpu().numpy()
+
+        hop_from_wall: np.ndarray | None = None
+        try:
+            from src.core_physics.species_pushforward_continuous import compute_hop_distances
+
+            wall_t = getattr(data, "mask_wall", None)
+            ei = getattr(data, "edge_index", None)
+            if wall_t is not None and ei is not None:
+                hop_from_wall = (
+                    compute_hop_distances(ei, wall_t.reshape(-1).bool(), int(pos.shape[0]))
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+        except Exception as exc:
+            log(f"[WARN] wall-hop distances unavailable: {exc}")
 
         elapsed = time.perf_counter() - t0
         t_sec = data.t.detach().cpu().numpy().astype(np.float64)
@@ -294,5 +350,11 @@ class CustomerDeployPipeline:
                 "t_final_s": t_end,
                 "two_model": self.offwall_ckpt is not None,
                 "include_velocity": bool(include_velocity),
+                "velocity_indices": velocity_indices,
+                "velocity_mode": "bookends" if include_velocity else "none",
             },
+            mask_wall=_mask_np("mask_wall"),
+            mask_inlet=_mask_np("mask_inlet"),
+            mask_outlet=_mask_np("mask_outlet"),
+            hop_from_wall=hop_from_wall,
         )

@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Union
 from torch import Tensor
 
 from src.core_physics.anderson import anderson_acceleration
-from src.architecture.lora_injection import LoRAParametrization, SpectralLinear
+from src.architecture.spectral_linear import SpectralLinear
 from src.architecture.siren_decoder import SIRENDecoder
 from src.config import NodeFeat, PhysicsConfig, PredChannels
 from src.utils.batching import get_batch_tensor
@@ -93,7 +93,7 @@ class MultiHeadPhysicsGATConv(MessagePassing):
 
     Edge attention logits receive additive (or multiplicative) biases from
     advection, wall-rheology, and curvature priors before softmax.
-    Core of PMGP-DEQ; see ``docs/MODEL_NOMENCLATURE.md``.
+    Core of RGP-DEQ; see ``docs/MODEL_NOMENCLATURE.md``.
     """
 
     def __init__(
@@ -165,10 +165,10 @@ class MultiHeadPhysicsGATConv(MessagePassing):
         return x_j * alpha
 
 
-class GINOBlock(nn.Module):
-    """One PMGP-DEQ equilibrium step: PM-GAT + Perceiver global mixing + residual.
+class RGPBlock(nn.Module):
+    """One RGP-DEQ equilibrium step: PM-GAT + Perceiver global mixing + residual.
 
-    Legacy name ``GINOBlock`` (not Li et al. GINO). Prefer ``PMGPBlock`` in new docs.
+    Legacy alias: ``GINOBlock`` (not Li et al. GINO).
     """
 
     def __init__(
@@ -199,13 +199,17 @@ class GINOBlock(nn.Module):
         return self.norm(self.activation(z + local_out + global_out))
 
 
-class GINO_DEQ(nn.Module):
-    """Stage-A flow surrogate: PMGP-DEQ (mu-coupled PM-GAT-Perceiver DEQ).
+# Backward-compatible alias (not Li et al. GINO)
+GINOBlock = RGPBlock
+
+
+class RGP_DEQ(nn.Module):
+    """Stage-A flow surrogate: RGP-DEQ (mu-coupled PM-GAT-Perceiver DEQ).
 
     Equilibrium: z* = f(z*, mu(z*)) via Anderson/Picard; each step uses
-    ``GINOBlock`` (physics-modulated GAT + Perceiver global tokens).
+    ``RGPBlock`` (physics-modulated GAT + Perceiver global tokens).
 
-    Canonical id: ``pmgp_deq_kine`` (acronym PMGP-DEQ). Code class ``GINO_DEQ`` is legacy.
+    Canonical id: ``rgp_deq_kine`` (acronym RGP-DEQ). Legacy class alias: ``GINO_DEQ``.
     See ``docs/MODEL_NOMENCLATURE.md``.
     """
 
@@ -308,7 +312,7 @@ class GINO_DEQ(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        self.core = GINOBlock(
+        self.core = RGPBlock(
             latent_dim,
             edge_dim=3,
             activation_fn=self.activation_fn,
@@ -329,15 +333,6 @@ class GINO_DEQ(nn.Module):
         self.mu_encoder = nn.Linear(1, latent_dim)
         # Prior injector: maps [u_prior, v_prior, p_prior, mu_prior] into latent warm start.
         self.z_prior_proj = SpectralLinear(4, latent_dim)
-
-    def prepare_for_biochem_lora(self, rank: int = 4, alpha: float = 1.0):
-        """
-        Iterates through the model's architecture and dynamically injects LoRA
-        into all SpectralLinear modules while rigorously maintaining Lipschitz bounds.
-        """
-        for module in self.modules():
-            if isinstance(module, SpectralLinear):
-                module.inject_lora(rank=rank, alpha=alpha)
 
     def _apply_fourier_encoding(self, x, pos_nd=None):
         # Canonical Phase-1 layout is 15 channels; optional width priors append three more (see NodeFeat).
@@ -548,3 +543,7 @@ class GINO_DEQ(nn.Module):
         )
         pred = self._decode_pred_from_z(data, z)
         return (pred, jac_loss) if self.training else pred
+
+# Backward-compatible alias (not Li et al. GINO)
+GINO_DEQ = RGP_DEQ
+

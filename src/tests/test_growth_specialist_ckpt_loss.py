@@ -50,6 +50,30 @@ def test_ckpt_score_legacy_clot():
     assert abs(s - 0.77) < 1e-6
 
 
+def test_ckpt_score_hop_ge2_balanced_prefers_localization():
+    low = growth_specialist_ckpt_score(
+        ckpt_metric="hop_ge2_balanced",
+        clot_score=0.9,
+        offwall_relaxed_f1=0.9,
+        offwall_n_pred=20.0,
+        offwall_n_gt=20.0,
+        hop_ge2_strict_f1=0.05,
+        hop_ge2_n_pred=50.0,
+        hop_ge2_n_gt=20.0,
+    )
+    high = growth_specialist_ckpt_score(
+        ckpt_metric="hop_ge2_balanced",
+        clot_score=0.5,
+        offwall_relaxed_f1=0.5,
+        offwall_n_pred=5.0,
+        offwall_n_gt=20.0,
+        hop_ge2_strict_f1=0.40,
+        hop_ge2_n_pred=18.0,
+        hop_ge2_n_gt=20.0,
+    )
+    assert high > low
+
+
 def test_loss_blurring_prec_penalizes_far_fp(monkeypatch):
     monkeypatch.setenv("SPECIES_CONTINUOUS_DELTA_VALUE_SCALE", "1.0")
     monkeypatch.setenv("SPECIES_CONTINUOUS_HUBER_BETA_GROWTH", "1.0")
