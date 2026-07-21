@@ -1,89 +1,49 @@
-# Biochem deploy baseline (`biochem_gnn`)
+# Biochem deploy stack (`biochem_gnn`)
 
-> **Naming:** Stack id **`biochem_gnn`** = frozen **RGP-DEQ** (`rgp_deq_kine`) + **GraphSAGE pushforward** + **gelation_beta** + **mechanistic clot readout**. See [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md).
+Canonical Stage-B pipeline: frozen **RGP-DEQ** flow + wall-band **GraphSAGE** species pushforward + **gelation** scale + mechanistic **clot** readout.
 
-## Two biochem training paths (historical)
-
-| | **biochem_gnn** (canonical, active) | **train_biochem_corrector** (GNODE, **retired 2026-06**) |
-|---|--------------------------------------|-----------------------------------------------|
-| Entry | `python -m src.bin.main train biochem-gnn` | removed (`go_biochem_gnn.ps1` is the active path) |
-| Model | GraphSAGE pushforward + physics clot readout | `GNODE_Phase3` graph neural ODE (deleted) |
-| Mesh scope | Ceiling / wall band (~1-hop) | Full vessel graph |
-| Flow | External frozen RGP-DEQ | Learned / GT kine in-graph |
-| Mu | Physics gelation from species (`gelation_beta`) | Learned mu heads |
-| Clot | `clot_trigger_physics` + mat-growth | Clot-phi probes, MLP injectors |
-| Deploy | Yes (no GT species at inference) | Research only (archived) |
-
-GNODE teacher/corrector launchers and modules were removed from the active surface; see `docs/archive/2026-06-16-biochem-cleanup.md` and `AGENTS.md`.
+Naming: [MODEL_NOMENCLATURE.md](MODEL_NOMENCLATURE.md). Baseline metrics: [MAT_GROWTH.md](MAT_GROWTH.md).
 
 ## Components
 
-```
-rgp_deq_kine           [frozen RGP-DEQ ckpt, Stage A]
-  -> species_graphsage  [trained]  wall-band GraphSAGE pushforward (FI/Mat)
-  -> gelation_beta      [trained]  global Mat gelation scale
-  -> clot_trigger_physics [equations] Carreau + gelation + nucleation phi
-  -> flow_coupling      [future]   mu -> RGP-DEQ MU_PRIOR refresh
+```text
+rgp_deq_kine              [frozen RGP-DEQ, Stage A]
+  -> species_graphsage    [trained]  wall-band GraphSAGE (FI / Mat)
+  -> gelation_beta        [trained]  global Mat scale
+  -> clot_trigger_physics [equations] Carreau + gelation + nucleation
+  -> local_kinematic_corrector [optional] k-hop [dU, dV]
 ```
 
-## Paths (legacy dirs still resolve)
+## Artifact layout (local)
 
-```
-outputs/biochem/biochem_gnn/          # active artifact tree today
-  locked/species_gnn_best.pth         # CANONICAL (WC_v7_clot_phi_mse, 2026-07-19)
-  mat_canonical_deploy/species/best.pth  # synced alias
-  species/best.pth                    # synced warm-start alias
+```text
+outputs/biochem/biochem_gnn/
+  locked/species_gnn_best.pth     # canonical (WC_v7_clot_phi_mse, 2026-07-19)
+  mat_canonical_deploy/species/best.pth
+  species/best.pth
   viscosity/beta.pth
-  loao/holdout_*/
 data/reference/biochem_gnn_baseline.json
 data/reference/mat_canonical_deploy.json
 ```
 
-Canonical leg: **`WC_v7_clot_phi_mse`**. New mat-growth improvements warm-start from `locked/species_gnn_best.pth`.
-
-Legacy ladders and aliases were archived from the active surface; see `BIOCHEM_LEGACY_LESSONS.md` and `archive/2026-06-16-biochem-cleanup.md`.
-
 ## Commands
 
 ```powershell
-# Full baseline pipeline
 powershell -File .\scripts\go_biochem_gnn.ps1 -Step all -Gate -Viz
 
-# Python trainer
 python -m src.bin.main train biochem-gnn -- --step all --all-anchors
 python -m src.training.train_biochem_gnn --step species
 ```
 
-## Deploy horizon convention
+Promote / lock: `python scripts/promote_biochem_gnn.py`.
 
-Deploy metrics, gelation-beta calibration, and checkpoint gates use **each graph's last macro-step** (full COMSOL timeline), not a fixed index.
+## Deploy conventions
 
-| Concept | Meaning |
-|---------|---------|
-| **Default eval** | `deploy_eval_time_index(n_times)` -> `n_times - 1` |
-| **Legacy capped regime** | ~53 consecutive macro-steps on patient007 8ks export (~2.2 h physical); F1 ~0.70-0.73 at that checkpoint |
-| **Override** | `SPECIES_CONTINUOUS_DEPLOY_HORIZON=N` caps eval/aux unroll to step N |
-| **Unroll VRAM cap** | `SPECIES_PUSHFORWARD_MAX_UNROLL` (default 200) limits training curriculum length, not eval time |
+- Metrics and gates use each graph's **last macro-step** (full COMSOL timeline) unless `SPECIES_CONTINUOUS_DEPLOY_HORIZON` caps the horizon.
+- Deploy-faithful rollout (via `apply_deploy_env()`): resting FI/Mat ICs, pin other species to rest, velocity from predicted kinematics.
+- Only **FI + Mat** are learned (`STATE_DIM = 2`); other species stay at resting IC at inference.
 
-Helpers: `graph_last_time_index`, `default_deploy_metric_times`, `LEGACY_CAPPED_DEPLOY_HORIZON` (53) in `species_pushforward_continuous.py`.
-
-Eval scripts (`eval_t0_rung4_species_gnn_loao.py`, `predict_species_gnn_deploy`) default to per-graph times `[0, 27, legacy_cap, last]` when `--times` is omitted.
-
-## Deploy-faithful rollout
-
-Set automatically by ``apply_deploy_env()``:
-
-| Env | Default | Meaning |
-|-----|---------|---------|
-| `SPECIES_ROLLOUT_IC_SOURCE` | `resting` | FI/Mat t=0 from plasma IC |
-| `SPECIES_ROLLOUT_PIN_OTHER` | `rest` | non-FI/Mat pinned to resting |
-| `SPECIES_ROLLOUT_VEL_SOURCE` | `kinematics` | vel-decay uses pred GINO-DEQ |
-| `SPECIES_ROLLOUT_DEPLOY_FAITHFUL` | `1` | Enable above defaults |
-| `SPECIES_CONTINUOUS_DEPLOY_HORIZON` | `0` | Per-graph last step; set `>0` to cap eval horizon |
-| `SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL` | `1` | Score deploy metrics at each graph's last macro-step |
-| `SPECIES_PUSHFORWARD_MAX_UNROLL` | `200` | Training unroll VRAM cap (not eval time) |
-
-## `BiochemGNN` (Python)
+## Python API
 
 ```python
 from src.biochem_gnn import BiochemGNN, FlowMode
@@ -92,12 +52,8 @@ model = BiochemGNN.from_manifest(anchor="patient007", flow_mode=FlowMode.COUPLED
 out = model.rollout(data)  # out.phi_by_time, out.mu_by_time, out.species_series
 ```
 
-Legacy alias: `BiochemDeployStack = BiochemGNN` (also re-exported from `src.biochem_deploy`).
+Legacy: `BiochemDeployStack = BiochemGNN` (also `src.biochem_deploy`).
 
-Coupled mode is **not yet validated** against locked baseline F1 (~0.70).
+## Historical note
 
-Baseline comparison table: [BIOCHEM_GNN_BASELINES.md](BIOCHEM_GNN_BASELINES.md).
-
-## Species channels: only FI + Mat
-
-Deploy GNN uses ``STATE_DIM = 2``. Other species pinned to ``resting_species_log_nd`` at inference.
+The GNODE teacher/corrector path (`train_biochem_corrector`) is **retired**. Condensed lessons: [BIOCHEM_LEGACY_LESSONS.md](BIOCHEM_LEGACY_LESSONS.md). Detailed leaderboards: [archive/BIOCHEM_GNN_BASELINES.md](archive/BIOCHEM_GNN_BASELINES.md).

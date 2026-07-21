@@ -1,6 +1,6 @@
 # Kinematics best-model architecture (Stage A)
 
-Canonical architecture and training flags for the production **RGP-DEQ** run (`RGP_DEQ` class, `rgp_deq_kine` id) that biochem should match when building the frozen kinematics backbone. Weights are not required in this repo; the committed reference JSON is the source of truth for constructor kwargs and curriculum.
+Canonical architecture and training flags for the production **RGP-DEQ** run (`RGP_DEQ`, id `rgp_deq_kine`). Biochem deploy freezes this backbone. Weights are local-only; the committed reference JSON holds constructor kwargs and curriculum.
 
 ## Reference files
 

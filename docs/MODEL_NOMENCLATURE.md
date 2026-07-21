@@ -122,5 +122,7 @@ New manifests and logs should prefer **`rgp_deq_kine` / RGP-DEQ** and **`biochem
 ## Related docs
 
 - [BIOCHEM_GNN.md](BIOCHEM_GNN.md)
+- [MAT_GROWTH.md](MAT_GROWTH.md)
 - [KINEMATICS_BEST_ARCHITECTURE.md](KINEMATICS_BEST_ARCHITECTURE.md)
 - [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md)
+- [README.md](README.md) — documentation index

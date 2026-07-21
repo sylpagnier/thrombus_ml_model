@@ -1073,7 +1073,7 @@ class PredictApp:
 
         fig, axes = plt.subplots(3, 1, figsize=(9.0, 8.0), sharex=True, facecolor="white")
         try:
-            fig.canvas.manager.set_window_title("HemoGINO Scientific metrics")  # type: ignore[union-attr]
+            fig.canvas.manager.set_window_title("HemoRGP Scientific metrics")  # type: ignore[union-attr]
         except Exception:
             pass
         ax0, ax1, ax2 = axes
@@ -1352,7 +1352,7 @@ def _log_startup_device(*, require_cuda: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="HemoGINO customer predict app")
+    ap = argparse.ArgumentParser(description="HemoRGP customer predict app")
     ap.add_argument("--cpu", action="store_true", help="Allow CPU (slow; CUDA recommended)")
     args = ap.parse_args(argv)
     require_cuda = not args.cpu

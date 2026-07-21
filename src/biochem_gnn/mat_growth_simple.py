@@ -299,7 +299,7 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
             },
         ),
         # ---- Precision sweep (in-training levers; vs baseline_fast dual fi_mat) ----
-        # Hypothesis (docs/SPECIES_LEARNING_STRATEGY.md s6.13): geometry+kine is near its
+        # Hypothesis (docs/archive/SPECIES_LEARNING_STRATEGY.md s6.13): geometry+kine is near its
         # deployable ranking ceiling, so the remaining gains come from (a) keeping the
         # autocatalytic neighbour coupling but on the *dual fi_mat* head (not Mat-only), and
         # (b) enriching the static geometry context with the proven 2-hop commit-vs-eligible

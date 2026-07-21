@@ -8,7 +8,7 @@ Project Reality
 Training entry points (authoritative)
 - Kinematics (Stage A): `python -m src.bin.main train rgp-deq-kine` or `scripts/go_kinematics_*.ps1`.
 - Biochem deploy: `python -m src.bin.main train biochem-gnn` or `scripts/go_biochem_gnn.ps1` / mat-growth launchers in `scripts/README.md`.
-- Do not revive retired GNODE / clot-ML / T0 trainers without restoring modules from git history (`AGENTS.md` retired table).
+- Do not revive retired GNODE / clot-ML / T0 trainers without restoring modules from git history (`docs/BIOCHEM_LEGACY_LESSONS.md`).
 
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.

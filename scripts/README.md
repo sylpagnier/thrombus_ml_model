@@ -1,5 +1,8 @@
 # Scripts
 
+Supported launchers for **HemoRGP**. Retired ladders live under [`archive/`](archive/).
+Publishing policy: [`docs/PUBLISHING.md`](../docs/PUBLISHING.md).
+
 ## Canonical biochem deploy
 
 - `go_biochem_gnn.ps1` — train/eval/promote for `biochem_gnn` (GraphSAGE species + gelation + clot trigger).
@@ -50,7 +53,8 @@ Retired GNODE / clot-ML / T0 / graybox launchers live under **`scripts/archive/`
 
 Also see:
 
+- `docs/MAT_GROWTH.md` — canonical mat-growth baseline
 - `docs/BIOCHEM_LEGACY_LESSONS.md`
 - `docs/archive/2026-06-16-biochem-cleanup.md`
 - `docs/PUBLISHING.md` — public vs local artifact policy
-- `AGENTS.md` (retired table)
+- `AGENTS.md`

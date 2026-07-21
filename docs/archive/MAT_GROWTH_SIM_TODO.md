@@ -1,5 +1,7 @@
 # Mat-growth simulation to-do
 
+> **Active summary:** [../MAT_GROWTH.md](../MAT_GROWTH.md). This file is an archived experiment queue.
+
 Living queue for clot Mat architecture experiments. **Selection metric:** all-anchor
 `deploy_clot_f1` and `deploy_clot_relaxed_prec` in each leg's `compare.json`.
 

@@ -1,6 +1,8 @@
 # Biochem GNN baselines
 
-Canonical comparison table for deploy stack (`biochem_deploy`) runs. Use these rows when judging faster iteration legs.
+> **Active summary:** [../MAT_GROWTH.md](../MAT_GROWTH.md) and [../BIOCHEM_GNN.md](../BIOCHEM_GNN.md). This file is an archived leaderboard notebook.
+
+Canonical comparison table for deploy stack (`biochem_gnn`) runs. Use these rows when judging faster iteration legs.
 
 ## Active baselines
 

@@ -1,9 +1,9 @@
 # Local kinematic corrector (clot velocity diversion)
 
-A local, k-hop GNN that predicts the velocity diversion `[dU, dV]` a micro-clot induces,
-as a **residual on the frozen RGP-DEQ base flow**. Instead of re-solving the global flow
-when a clot appears, we patch the base field locally around the clot nodes (cheap,
-anisotropic). Trained on synthetic COMSOL "Patch Factory" residuals.
+Optional Stage-A companion: a local k-hop GNN predicts velocity diversion `[dU, dV]` as a
+**residual on frozen RGP-DEQ flow**. Instead of re-solving the global field when a clot
+appears, the patch reroutes flow around clot nodes. Trained on synthetic COMSOL
+"Patch Factory" residuals. Not required for the locked WC_v7 species baseline.
 
 ## Why
 The deploy RGP-DEQ kine model is accurate on healthy hemodynamics but OOD on the extreme

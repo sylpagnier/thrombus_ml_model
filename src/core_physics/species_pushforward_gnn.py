@@ -243,7 +243,7 @@ def geom_feats_rich_enabled() -> bool:
     """Enrich the leg-C geometry block with the proven 2-hop commit-vs-eligible discriminators.
 
     Adds ``width_grad_2hop`` and ``curvature_2hop`` on top of the 3 static channels. The probe
-    (docs/SPECIES_LEARNING_STRATEGY.md s6.13) found multi-hop expansion/curvature -- not the 1-hop
+    (docs/archive/SPECIES_LEARNING_STRATEGY.md s6.13) found multi-hop expansion/curvature -- not the 1-hop
     versions alone -- separate *committed* clot pockets from merely *eligible* wall nodes. Static,
     clot-blind, no kine solve, so it stays deployable.
     """

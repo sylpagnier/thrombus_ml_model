@@ -1,30 +1,21 @@
 ---
-description: Keep BIOCHEM_TRAINING_PROGRESS.md current when biochem training runs or results are discussed
+description: Where to log biochem / mat-growth training outcomes
 alwaysApply: true
 ---
 
-# Biochem training progress log
+# Biochem / mat-growth progress logging
 
-When the user shares **biochem** training outcomes (console logs, metrics, val lines, “how did the run go”, hyperparameter experiments), **update** [docs/archive/BIOCHEM_TRAINING_PROGRESS.md](docs/archive/BIOCHEM_TRAINING_PROGRESS.md) only if the run is on a **legacy GNODE** path worth chronicling. For the active `biochem_gnn` / mat-growth stack, prefer [docs/MAT_GROWTH_SIM_TODO.md](docs/MAT_GROWTH_SIM_TODO.md) or [docs/BIOCHEM_GNN_BASELINES.md](docs/BIOCHEM_GNN_BASELINES.md) unless they explicitly ask to extend the archive chronicle.
+When the user shares **biochem_gnn or mat-growth** training outcomes (console logs, `compare.json`, cohort F1, “how did the run go”), update **[docs/MAT_GROWTH.md](docs/MAT_GROWTH.md)** only if the **locked baseline** or canonical leg changed (promote / new WC leg numbers). For detailed experiment tables, append to **[docs/archive/MAT_GROWTH_SIM_TODO.md](docs/archive/MAT_GROWTH_SIM_TODO.md)** or **[docs/archive/BIOCHEM_GNN_BASELINES.md](docs/archive/BIOCHEM_GNN_BASELINES.md)** unless they ask not to.
 
-## What to update
+Legacy GNODE / corrector chronicles: **[docs/archive/BIOCHEM_TRAINING_PROGRESS.md](docs/archive/BIOCHEM_TRAINING_PROGRESS.md)** — update only if the run is on a restored legacy path.
 
-1. **Run log table** (bottom): append one row — date, short config, val `logMAE` (all / wall / high-μ), `r`, one-line note.
-2. **Gate checklist**: flip Status only when evidence is clear (Pass / Fail / In progress).
-3. **Chronicle**: add a numbered entry only for **new** lessons (symptom → cause → fix), not every run.
-4. **“Where we are now”**: adjust distance-to-full-run bullets if a gate changed materially.
+## Metrics to prefer
 
-## Metrics to prefer (ignore misleading ones)
-
-- **Use**: val `mu_log_mae`, wall / high-μ subsets, `mu_pearson`, train `L_tot`/`L_Back` under `BIOCHEM_LOSS_ISOLATE`, preflight median. Prefer `runs_index.jsonl` or per-run `run.jsonl` (`event=val`) over legacy `metrics.jsonl` / `training_diary_main.jsonl`.
-- **Do not** treat train `L_kine` or collapsing `L_bio` alone as μ success.
+- **Use**: deploy clot F1 / clot score / relaxed precision, wall / off-wall hop metrics, `mu_log_mae` when applicable.
+- **Do not** treat collapsing aux losses alone as deploy success.
 
 ## Edit style
 
-- Surgical edits; do not wipe the chronicle or ladder.
-- Record env knobs that mattered (`LOSS_ISOLATE`, `TEACHER_FORCE_MIN`, `TEACHER_MU_RATIO_MAX`, `VAL_TIME_STRIDE`, preset name).
-- If the user only asks a quick question with no new run data, answer without editing the doc.
-
-## Complexity reference
-
-Full multitask = `BIOCHEM_COMPLEXITY_STEP=3`. Full pipeline = `thrombus_corona` + `STOP_AFTER_TEACHER=0`. See the doc’s ladder table.
+- Surgical edits; do not wipe archive chronicles.
+- Record env knobs that mattered.
+- If the user only asks a quick question with no new run data, answer without editing docs.

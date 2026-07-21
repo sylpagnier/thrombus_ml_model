@@ -1,30 +1,29 @@
-# Biochem Legacy Lessons (Consolidated)
+# Biochem legacy lessons
 
-This file preserves the main lessons from legacy ladders (S ladder, T0 ladder, rules ladder, GNODE ladder, passive/m3 ladders) after repository cleanup.
+Condensed takeaways from retired ladders (GNODE, clot-ML rules, T0, graybox S0–S3). Do not treat archived launchers as the supported surface.
 
 ## Canonical baseline going forward
 
-- Use `biochem_deploy` as the default stack.
-- Lock artifacts in `outputs/biochem/biochem_gnn/locked/`.
-- Use `data/reference/biochem_gnn_baseline.json` as the canonical reference.
+- Stack id: **`biochem_gnn`** (`src/biochem_gnn/`; alias `src.biochem_deploy`)
+- Lock artifacts under `outputs/biochem/biochem_gnn/locked/` (local)
+- Reference: `data/reference/biochem_gnn_baseline.json`
+- Design: [BIOCHEM_GNN.md](BIOCHEM_GNN.md), [MAT_GROWTH.md](MAT_GROWTH.md)
 
 ## Lessons worth keeping
 
-- **Global time normalization:** use one static `t_ref` (`t_final`, 30000s default), never per-graph max.
-- **Deploy-faithful evaluation:** no oracle GT clot bands in training/eval gates for deploy claims.
-- **Small, cheap gates first:** short smoke passes on one anchor before long ladders.
-- **Physics consistency over metric hacks:** avoid settings that improve one metric while breaking spatial clot behavior.
-- **Alias control:** legacy names can exist for compatibility, but baseline ownership must be canonical (`biochem_deploy`).
+- **Global time normalization:** one static `t_ref` (default `t_final`), never per-graph max.
+- **Deploy-faithful evaluation:** no oracle GT clot bands in gates used for deploy claims.
+- **Small gates first:** short smoke on one anchor before long ladders.
+- **Physics consistency over metric hacks:** avoid settings that improve one number while breaking spatial clot behavior.
+- **Alias control:** legacy names may resolve for compatibility; ownership stays on `biochem_gnn`.
 
-## Why legacy ladders were archived
+## Why ladders were archived
 
-- Large overlap and duplicated launchers caused maintenance overhead.
-- Historical ladders remained useful for provenance, but they were cluttering active baseline work.
-- Cleanup goal: preserve learnings in one place and keep only active baseline scripts/docs in top-level paths.
+- Overlapping launchers and duplicated trainers raised maintenance cost.
+- Provenance still matters; clutter does not. Active scripts: [`scripts/README.md`](../scripts/README.md).
 
-## If we need to resurrect an archived path
+## Resurrecting an archived path
 
-- Use the cleanup archive record in `docs/archive/2026-06-16-biochem-cleanup.md`.
-- Restore from git history by file path and commit.
-- Re-add only the minimum scripts needed for the immediate experiment.
-
+1. Read [archive/2026-06-16-biochem-cleanup.md](archive/2026-06-16-biochem-cleanup.md).
+2. Restore the minimum files from git history.
+3. Prefer re-implementing against `src/biochem_gnn/` when possible.

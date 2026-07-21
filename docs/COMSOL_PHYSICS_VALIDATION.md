@@ -7,13 +7,13 @@ system is correctly identified.
 
 - Source data: `data/reference/comsol_calibration/patient007_calibration_{wall,domain}.txt`
   (COMSOL 6.4, `phase2_nowound_007.mph`, exported 2026-06-18).
-- Validator: `scripts/validate_comsol_calibration.py`
-  → `outputs/reports/comsol_validation/patient007_validation.json`
+- Validator (archived launcher): `scripts/archive/validate_comsol_calibration.py`
+  → `outputs/reports/comsol_validation/patient007_validation.json` (local)
 - Model assumptions audited: `src/config.py` (`BiochemConfig`),
   `src/core_physics/biochem_physics_kernels.py` (`biochem_wall_residual`).
 - Canonical law (single source of truth): `src/core_physics/comsol_surface_deposition.py`,
   pinned by `src/tests/test_comsol_wall_deposition_calibration.py` (`Da=1e-4` vs exports).
-- **Strategy that follows from this validation:** [docs/SPECIES_LEARNING_STRATEGY.md](SPECIES_LEARNING_STRATEGY.md)
+- **Strategy that followed from this validation:** [archive/SPECIES_LEARNING_STRATEGY.md](archive/SPECIES_LEARNING_STRATEGY.md) (historical); active stack: [BIOCHEM_GNN.md](BIOCHEM_GNN.md)
   (Mat-centric gray-box; fibrin dropped; learn AP + Mat autocatalysis).
 
 The exports are COMSOL wide-format spreadsheets:

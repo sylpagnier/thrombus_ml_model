@@ -1,6 +1,6 @@
 """Coupled wall-shear surrogate GNN: (mesh geometry + clot occlusion + kine-flow prior) -> COMSOL spf.sr.
 
-Why this exists (docs/SPECIES_LEARNING_STRATEGY.md S6.6): the exact COMSOL coupled spf.sr gate hits
+Why this exists (docs/archive/SPECIES_LEARNING_STRATEGY.md S6.6): the exact COMSOL coupled spf.sr gate hits
 ~0.75 F1, but the deployable kine surrogate + geometry occlusion only supports ~0.38 read with ANY
 local operator (learned readout == wallfunc). The gap is flow fidelity, not the readout: per-node
 features lack the global momentum balance. This GNN adds a global mesh receptive field (message

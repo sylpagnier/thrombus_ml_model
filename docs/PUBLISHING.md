@@ -1,16 +1,16 @@
-# Publishing / public vs local policy (HemoRGP)
+# Publishing policy (HemoRGP)
 
-This repository is meant to be **publishable**: source, docs, and small reference manifests are versioned. Heavy data, checkpoints, and COMSOL models stay on the machine that trains.
+This repository is meant to be **publicly pushable**: source, docs, and small reference manifests are versioned. Heavy data, checkpoints, and COMSOL models stay on the machine that trains.
 
-## Track in git (public)
+## Track in git
 
 | Path | Why |
 |------|-----|
-| `src/` | All library / training / tools code |
+| `src/` | Library, training, tools, tests |
 | `scripts/` (active) + `scripts/README.md` | Supported launchers |
-| `scripts/archive/` | Retired launchers kept for archaeology (not the default surface) |
-| `docs/` (active) + `docs/archive/` | Design docs + historical chronicles |
-| `data/reference/*.json` | Small baseline / architecture manifests |
+| `scripts/archive/` | Retired launchers (not the default surface) |
+| `docs/` (active) + `docs/archive/` | Design docs + historical notebooks |
+| `data/reference/` | Small baseline / architecture JSON + README |
 | `customer_geometries/README.txt` | Inbox instructions only |
 | `README.md`, `AGENTS.md`, `requirements.txt`, `pytest.ini` | Project entry |
 
@@ -19,27 +19,28 @@ This repository is meant to be **publishable**: source, docs, and small referenc
 | Path | Why |
 |------|-----|
 | `data/raw/`, `data/processed/`, `data/benchmark/` | Large meshes / graphs / CFD extracts |
-| `outputs/` | Checkpoints, logs, viz PNGs, run dumps |
+| `data/reference_local/` | Sweep leftovers (gitignored) |
+| `outputs/` | Checkpoints, logs, viz |
 | `comsol_models/` | `.mph` sources |
-| `customer_geometries/*` (except README) | User uploads (`.pt`, meshes, images) |
-| `*.pth`, `*.pt`, `*.ckpt` | Model weights |
+| `customer_geometries/*` (except README) | User uploads |
+| `*.pth`, `*.pt`, `*.ckpt` | Weights |
 | `.venv/`, `__pycache__/`, `.pytest_cache/`, `.idea/` | Environment / IDE |
 
-## Do not re-add junk
+## Do not re-add
 
-- Root dumps (`test_legend.png`, `check_nodes_out.txt`, probe `.txt` logs)
+- Root dumps (`test_legend.png`, `check_nodes_out.txt`, probe logs)
 - One-off census / compare JSON under `outputs/`
 - Personal notes under `notes/`
 
-## After clone (developer setup)
+## After clone
 
-1. Create a venv and `pip install -r requirements.txt`.
-2. Place COMSOL / graph data under `data/` and `comsol_models/` as needed (not from git).
-3. Optional: pull promoted checkpoints into `outputs/biochem/biochem_gnn/locked/` and `outputs/kinematics/` from your private artifact store.
-4. Reference manifests in `data/reference/` describe which checkpoints are canonical.
+1. `pip install -r requirements.txt` (venv recommended).
+2. Place COMSOL / graph data under `data/` and `comsol_models/` as needed.
+3. Optional: copy promoted checkpoints into `outputs/biochem/biochem_gnn/locked/` and `outputs/kinematics/` from your private artifact store.
+4. Use `data/reference/*.json` to see which runs are canonical.
 
 ## Script surface
 
-- **Supported:** only what `scripts/README.md` lists.
-- **Archived:** `scripts/archive/` — retired GNODE / clot-ML / T0 / graybox ladders.
-- Prefer not adding new one-off `analyze_*.py` / `_print_*.py` to the repo root of `scripts/` unless documented in the README.
+- **Supported:** only what [`scripts/README.md`](../scripts/README.md) lists.
+- **Archived:** `scripts/archive/`.
+- Prefer not adding one-off `analyze_*.py` / `_print_*.py` to the active `scripts/` root unless documented in that README.
