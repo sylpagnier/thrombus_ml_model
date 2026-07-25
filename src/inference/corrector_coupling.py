@@ -272,6 +272,11 @@ def couple_flow_with_corrector(
     n = int(data.num_nodes)
     u_coupled = u0_nd.reshape(-1).clone()
     v_coupled = v0_nd.reshape(-1).clone()
+    if int(u_coupled.numel()) != n or int(v_coupled.numel()) != n:
+        raise ValueError(
+            f"Base flow size ({int(u_coupled.numel())}) does not match data.num_nodes ({n}). "
+            "Invalidate CorrectorCoupledFlow base cache after remesh."
+        )
 
     nodes = clot_nodes if clot_nodes is not None else clot_nodes_from_delta_mu(
         delta_mu_si, min_delta_mu_si=min_delta_mu_si
@@ -386,6 +391,11 @@ class CorrectorCoupledFlow:
         self._base_flow: tuple[torch.Tensor, torch.Tensor] | None = None
         self._base_key: tuple[int, int, int] | None = None
 
+    def invalidate_base_cache(self) -> None:
+        """Drop cached base flow (call after remesh / geometry change)."""
+        self._base_flow = None
+        self._base_key = None
+
     def _ensure_corrector(self) -> LocalKinematicCorrector:
         if self._corrector is None:
             if not self._corrector_ckpt.is_file():
@@ -399,13 +409,26 @@ class CorrectorCoupledFlow:
     @torch.no_grad()
     def base_flow(self, data) -> tuple[torch.Tensor, torch.Tensor]:
         """Step A: frozen GINO-DEQ base flow ``(u0, v0)`` (ND), cached per graph."""
-        if self._base_flow is not None:
+        key = _graph_key(data)
+        n = int(data.num_nodes)
+        if (
+            self._base_flow is not None
+            and self._base_key == key
+            and int(self._base_flow[0].numel()) == n
+        ):
             return self._base_flow
+
+        # New / remeshed geometry: do not reuse a prior mesh's base flow.
+        self._base_flow = None
+        self._base_key = None
+
         if hasattr(data, "u0_pred") and data.u0_pred is not None:
-            u0 = data.u0_pred.to(device=self.device, dtype=torch.float32).contiguous()
-            v0 = data.v0_pred.to(device=self.device, dtype=torch.float32).contiguous()
-            self._base_flow = (u0, v0)
-            return self._base_flow
+            u0 = data.u0_pred.to(device=self.device, dtype=torch.float32).contiguous().reshape(-1)
+            v0 = data.v0_pred.to(device=self.device, dtype=torch.float32).contiguous().reshape(-1)
+            if int(u0.numel()) == n and int(v0.numel()) == n:
+                self._base_flow = (u0, v0)
+                self._base_key = key
+                return self._base_flow
         if self._kine is None:
             ckpt = resolve_kinematics_checkpoint(self._kine_ckpt)
             self._kine = load_kinematics_predictor(ckpt, self.device, phys_cfg=self.phys_cfg)
@@ -413,6 +436,7 @@ class CorrectorCoupledFlow:
         u0 = pred[:, 0].contiguous()
         v0 = pred[:, 1].contiguous()
         self._base_flow = (u0, v0)
+        self._base_key = key
         return self._base_flow
 
     @torch.no_grad()
@@ -513,11 +537,20 @@ class ClotAwareFlow(CorrectorCoupledFlow):
     @torch.no_grad()
     def frozen_latent(self, data) -> torch.Tensor:
         """Clot-free DEQ latent ``z_kin`` (the default GraphSAGE primary input), cached."""
-        if self._frozen_latent is not None:
+        key = _graph_key(data)
+        n = int(data.num_nodes)
+        if (
+            self._frozen_latent is not None
+            and self._frozen_latent_key == key
+            and int(self._frozen_latent.shape[0]) == n
+        ):
             return self._frozen_latent
+        self._frozen_latent = None
+        self._frozen_latent_key = None
         self.base_flow(data)  # ensures the kine model is loaded
         assert self._kine is not None
         self._frozen_latent = predict_kinematics_latent(self._kine, data.to(self.device))
+        self._frozen_latent_key = key
         return self._frozen_latent
 
     @torch.no_grad()

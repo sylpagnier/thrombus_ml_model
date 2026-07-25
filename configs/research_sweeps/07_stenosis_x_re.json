@@ -1,0 +1,35 @@
+{
+  "id": "07_stenosis_x_re",
+  "title": "Stenosis x Reynolds interaction vs research parameters",
+  "model": "locked_canonical",
+  "axis": "stenosis_x_re",
+  "description": "Low/mid/high stenosis crossed with Re in {300, 450, 900} on a straight vessel.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "path_loc_frac": 0.5,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/07_stenosis_x_re",
+  "arms": [
+    {"name": "occ0.25_re300", "axis_value": 0.25, "re_target": 300.0, "geometry": {"stenosis_occlusion": 0.25}, "labels": {"stenosis_occlusion": 0.25, "re_target": 300.0}},
+    {"name": "occ0.25_re450", "axis_value": 0.25, "re_target": 450.0, "geometry": {"stenosis_occlusion": 0.25}, "labels": {"stenosis_occlusion": 0.25, "re_target": 450.0}},
+    {"name": "occ0.25_re900", "axis_value": 0.25, "re_target": 900.0, "geometry": {"stenosis_occlusion": 0.25}, "labels": {"stenosis_occlusion": 0.25, "re_target": 900.0}},
+    {"name": "occ0.50_re300", "axis_value": 0.5, "re_target": 300.0, "geometry": {"stenosis_occlusion": 0.5}, "labels": {"stenosis_occlusion": 0.5, "re_target": 300.0}},
+    {"name": "occ0.50_re450", "axis_value": 0.5, "re_target": 450.0, "geometry": {"stenosis_occlusion": 0.5}, "labels": {"stenosis_occlusion": 0.5, "re_target": 450.0}},
+    {"name": "occ0.50_re900", "axis_value": 0.5, "re_target": 900.0, "geometry": {"stenosis_occlusion": 0.5}, "labels": {"stenosis_occlusion": 0.5, "re_target": 900.0}},
+    {"name": "occ0.75_re300", "axis_value": 0.75, "re_target": 300.0, "geometry": {"stenosis_occlusion": 0.75}, "labels": {"stenosis_occlusion": 0.75, "re_target": 300.0}},
+    {"name": "occ0.75_re450", "axis_value": 0.75, "re_target": 450.0, "geometry": {"stenosis_occlusion": 0.75}, "labels": {"stenosis_occlusion": 0.75, "re_target": 450.0}},
+    {"name": "occ0.75_re900", "axis_value": 0.75, "re_target": 900.0, "geometry": {"stenosis_occlusion": 0.75}, "labels": {"stenosis_occlusion": 0.75, "re_target": 900.0}}
+  ]
+}

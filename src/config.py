@@ -193,18 +193,27 @@ class VesselConfig:
     curvature_amplitude: float = 0.0025  # [m]
 
     # Pathology Constraints (Gaussian depth scales vs nominal ``width``; not a lumen floor)
-    stenosis_factor_min: float = 0.1
-    stenosis_factor_max: float = 0.2
-    # Hard floor on local lumen width vs nominal ``width`` (mesh / degeneracy guard; noise stacks on pathology)
-    min_lumen_width_fraction: float = 0.2
-    aneurysm_factor_min: float = 0.15
-    aneurysm_factor_max: float = 0.2
-    # Max pathology targets (``pathology_mode=max_stenosis`` / ``max_aneurysm``; all phases)
-    max_stenosis_diameter_occlusion: float = 0.75  # symmetric both-wall peak (~75% diameter reduction)
-    max_aneurysm_factor: float = 0.4  # max_aneurysm mode cap (2x ``aneurysm_factor_max``)
-    stenosis_pro_thrombotic_mult: float = 1.2  # L2 random-sampling stenosis boost
-    aneurysm_pro_thrombotic_mult: float = 1.5  # L2 random-sampling / max_aneurysm boost
+    # Stenosis factor = |peak wall offset| / width; both walls -> diameter occlusion ~= 2 * factor.
+    stenosis_factor_min: float = 0.15
+    stenosis_factor_max: float = 0.4  # both walls -> up to max_stenosis_diameter_occlusion
+    # Hard floor on local lumen width vs nominal ``width`` (mesh guard; must sit below max-stenosis lumen)
+    min_lumen_width_fraction: float = 0.15
+    # Aneurysm factor = peak wall offset / width; both walls -> local width = (1 + 2*factor) * inlet.
+    aneurysm_factor_min: float = 0.25
+    aneurysm_factor_max: float = 1.0  # both walls -> up to max_aneurysm_width_scale
+    # Max pathology targets (``pathology_mode=max_stenosis`` / ``max_aneurysm`` / ``straight_max``)
+    max_stenosis_diameter_occlusion: float = 0.80  # symmetric both-wall peak (~80% diameter reduction)
+    max_aneurysm_factor: float = 1.0  # both walls -> local width = 3x inlet (see max_aneurysm_width_scale)
+    # Chance that random stenosis/aneurysm sampling snaps to the configured max (both walls).
+    pathology_max_hit_prob: float = 0.25
+    stenosis_pro_thrombotic_mult: float = 1.2  # L2 random-sampling stenosis boost (capped at max)
+    aneurysm_pro_thrombotic_mult: float = 1.5  # L2 random-sampling aneurysm boost (capped at max)
     num_ctrl_pts: int = 50
+
+    @property
+    def max_aneurysm_width_scale(self) -> float:
+        """Peak local lumen / inlet width when ``max_aneurysm_factor`` is applied on both walls."""
+        return 1.0 + 2.0 * float(self.max_aneurysm_factor)
 
     def max_stenosis_wall_offset(self, width: float) -> float:
         """Negative wall offset at Gaussian peak (both walls) for ``max_stenosis_diameter_occlusion``."""
@@ -213,9 +222,13 @@ class VesselConfig:
         return (lumen_frac - 1.0) * float(width) / 2.0
 
     def max_aneurysm_wall_offset(self, width: float, *, pro_thrombotic: bool = False) -> float:
-        """Positive wall offset at Gaussian peak for ``max_aneurysm`` mode."""
-        mult = self.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
-        return float(self.max_aneurysm_factor * mult * width)
+        """Positive wall offset at Gaussian peak for ``max_aneurysm`` (absolute 3x-width cap).
+
+        ``pro_thrombotic`` is retained for API compatibility but does not exceed
+        ``max_aneurysm_factor`` (strongest configured aneurysm).
+        """
+        del pro_thrombotic  # absolute cap; L2 must not exceed max_aneurysm_width_scale
+        return float(self.max_aneurysm_factor * width)
 
     # ND hydraulic priors (``graph_velocity_priors``): characteristic half-width and worst-case radius
     # fraction vs nominal (e.g. severe stenosis). Used to set a physical floor on inferred R_nd.

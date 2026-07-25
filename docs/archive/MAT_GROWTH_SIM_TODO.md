@@ -142,7 +142,8 @@ Run `-Promote` to copy alias -> `mat_canonical_deploy/species/best.pth`.
 
 | Task | Why |
 |------|-----|
-| **Run `go_wc_v7_firewall_fix_seq.ps1 -Fresh`** | Firewall sequence: WC_v7_fw1_blind_sat finetune; hop>=2 lumen-shape specialist; optional isolate/skiphop. Hop-stratified offwall metrics. |
+| ~~**Run `go_wc_v7_firewall_fix_seq.ps1 -Fresh`**~~ | **Done 2026-07-22** — Step1 wall OK / hop_ge2=0; Step2 train val 61/99 but compound deploy hop_ge2=0.4 strict=0. See [MAT_GROWTH.md](../MAT_GROWTH.md) run log. Next: deploy-gap diagnose, frontier-route re-eval, optional Step3. |
+| **Firewall follow-up** | Re-eval `growth_hop_ge2_lumen_shape` with `--two-model-route frontier`; align specialist val with deploy horizon/thresh; optional `-IncludeStep3`. |
 | **Run `go_wc_v7_compound_growth_abc_orig10_9h.ps1 -Fresh`** | True ~9 h A/B/C on original anchors 1–8,10,11. Revised B: `loss_blurring_prec` + `offwall_balanced` (35-anchor B overgrew; clot=0.483). No skiphop Arm D. Old all-anchor B ckpt kept under `wc_v7_compound_abc_9h/`. |
 | Run **WM_mat_flow_seedfront_tightfp** (1 leg) | Only unfinished W-fix sweep leg |
 | FP-aware winner on prior summaries | Re-rank `mat_w_fix_sweep_10h` with new `--minimize-metrics` |

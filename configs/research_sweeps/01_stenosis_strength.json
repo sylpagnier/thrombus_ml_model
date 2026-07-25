@@ -1,0 +1,31 @@
+{
+  "id": "01_stenosis_strength",
+  "title": "Straight channel: stenosis strength vs research parameters",
+  "model": "locked_canonical",
+  "axis": "stenosis_occlusion",
+  "description": "Vary diameter occlusion fraction on a straight mid-width vessel at Re=450.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "path_loc_frac": 0.5,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/01_stenosis_strength",
+  "arms": [
+    {"name": "occ_0.00", "axis_value": 0.0, "geometry": {"stenosis_occlusion": 0.0}},
+    {"name": "occ_0.25", "axis_value": 0.25, "geometry": {"stenosis_occlusion": 0.25}},
+    {"name": "occ_0.50", "axis_value": 0.5, "geometry": {"stenosis_occlusion": 0.5}},
+    {"name": "occ_0.75", "axis_value": 0.75, "geometry": {"stenosis_occlusion": 0.75}},
+    {"name": "occ_0.80", "axis_value": 0.8, "geometry": {"stenosis_occlusion": 0.8}}
+  ]
+}

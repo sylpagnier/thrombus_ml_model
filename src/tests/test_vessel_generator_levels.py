@@ -75,21 +75,26 @@ def test_normalize_pathology_mode_aliases():
     assert normalize_pathology_mode("random") is None
     assert normalize_pathology_mode("max-stenosis") == "max_stenosis"
     assert normalize_pathology_mode("max_aneurysm") == "max_aneurysm"
+    assert normalize_pathology_mode("straight-max") == "straight_max"
+    assert normalize_pathology_mode("max_straight") == "straight_max"
 
 
-def test_sample_params_max_stenosis_targets_occlusion():
-    cfg = VesselConfig(phase="biochem")
-    gen_cfg = {
+def _gen_cfg(cfg: VesselConfig) -> dict:
+    return {
         "num_ctrl_pts": cfg.num_ctrl_pts,
         "base_length": cfg.base_length,
         "min_lumen_width_fraction": cfg.min_lumen_width_fraction,
         "unit": "m",
     }
+
+
+def test_sample_params_max_stenosis_targets_occlusion():
+    cfg = VesselConfig(phase="biochem")
     rng = np.random.default_rng(0)
     p = _sample_params(0, 1, cfg, rng, pathology_mode="max_stenosis")
     assert p["v_type"] == "stenosis"
     assert p["path_loc"] == 2
-    geom = compute_geometry_from_params(p, gen_cfg)
+    geom = compute_geometry_from_params(p, _gen_cfg(cfg))
     widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
     peak_lumen = float(np.min(widths))
     nominal = float(p["width"])
@@ -102,21 +107,80 @@ def test_sample_params_max_aneurysm_uses_config_cap():
     rng = np.random.default_rng(1)
     p = _sample_params(0, 2, cfg, rng, pathology_mode="max_aneurysm")
     assert p["v_type"] == "aneurysm"
+    assert p["path_loc"] == 2
     offsets = np.asarray(p["offsets"], dtype=float)
     width = float(p["width"])
     expected_peak = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=True)
     assert float(np.max(offsets)) == pytest.approx(expected_peak, rel=0.02)
+    geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+    widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
+    peak_lumen = float(np.max(widths))
+    assert peak_lumen / width == pytest.approx(cfg.max_aneurysm_width_scale, rel=0.02)
 
 
-def test_max_aneurysm_factor_is_double_nominal_cap():
+def test_max_aneurysm_factor_targets_triple_inlet_width():
     cfg = VesselConfig(phase="biochem")
-    assert cfg.max_aneurysm_factor == pytest.approx(2.0 * cfg.aneurysm_factor_max)
+    assert cfg.max_aneurysm_factor == pytest.approx(1.0)
+    assert cfg.max_aneurysm_width_scale == pytest.approx(3.0)
+    assert cfg.aneurysm_factor_max == pytest.approx(cfg.max_aneurysm_factor)
 
 
 def test_stenosis_wall_offset_for_occlusion_math():
     cfg = VesselConfig(phase="kinematics")
     width = 0.01
     mag = cfg.max_stenosis_wall_offset(width)
-    assert mag == pytest.approx(-0.00375)
-    assert width + 2.0 * mag == pytest.approx(0.25 * width)
+    assert cfg.max_stenosis_diameter_occlusion == pytest.approx(0.80)
+    assert mag == pytest.approx(-0.004)
+    assert width + 2.0 * mag == pytest.approx(0.20 * width)
     assert stenosis_wall_offset_for_occlusion(width, cfg) == mag
+
+
+def test_sample_params_straight_max_is_straight_extreme():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(3)
+    seen = set()
+    for i in range(40):
+        p = _sample_params(i, 1, cfg, rng, pathology_mode="straight_max")
+        assert p["curve_type"] == "straight"
+        assert p["angle_span"] == 0.0
+        assert p["amplitude"] == 0.0
+        assert p["path_loc"] == 2
+        assert p["v_type"] in ("stenosis", "aneurysm")
+        assert all(abs(x) < 1e-15 for x in p["tortuosity"])
+        assert all(abs(x) < 1e-15 for x in p["noise_top"])
+        assert all(abs(x) < 1e-15 for x in p["noise_bot"])
+        seen.add(p["v_type"])
+        geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+        widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
+        nominal = float(p["width"])
+        if p["v_type"] == "stenosis":
+            occlusion = 1.0 - (float(np.min(widths)) / nominal)
+            assert occlusion == pytest.approx(cfg.max_stenosis_diameter_occlusion, abs=0.03)
+        else:
+            assert float(np.max(widths)) / nominal == pytest.approx(
+                cfg.max_aneurysm_width_scale, rel=0.02
+            )
+    assert seen == {"stenosis", "aneurysm"}
+
+
+def test_random_sampling_can_reach_configured_maxes():
+    cfg = VesselConfig(phase="kinematics", pathology_max_hit_prob=1.0)
+    rng = np.random.default_rng(11)
+    stenosis_hits = 0
+    aneurysm_hits = 0
+    for i in range(80):
+        p = _sample_params(i, 0, cfg, rng)
+        if p["v_type"] == "stenosis":
+            geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+            widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
+            occlusion = 1.0 - (float(np.min(widths)) / float(p["width"]))
+            if abs(occlusion - cfg.max_stenosis_diameter_occlusion) < 0.03:
+                stenosis_hits += 1
+        elif p["v_type"] == "aneurysm":
+            geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+            widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
+            scale = float(np.max(widths)) / float(p["width"])
+            if abs(scale - cfg.max_aneurysm_width_scale) < 0.05:
+                aneurysm_hits += 1
+    assert stenosis_hits >= 1
+    assert aneurysm_hits >= 1

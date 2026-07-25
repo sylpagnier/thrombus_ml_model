@@ -206,7 +206,8 @@ def cohort_levels(
     return out
 
 
-_PATHOLOGY_MODE_CHOICES = ("random", "max_stenosis", "max_aneurysm")
+_PATHOLOGY_MODE_CHOICES = ("random", "max_stenosis", "max_aneurysm", "straight_max")
+_FORCED_MAX_PATHOLOGY_MODES = frozenset({"max_stenosis", "max_aneurysm", "straight_max"})
 
 
 def normalize_pathology_mode(mode: str | None) -> str | None:
@@ -224,6 +225,10 @@ def normalize_pathology_mode(mode: str | None) -> str | None:
         "max_aneurysm": "max_aneurysm",
         "maxaneurysm": "max_aneurysm",
         "aneurysm_max": "max_aneurysm",
+        "straight_max": "straight_max",
+        "straightmax": "straight_max",
+        "max_straight": "straight_max",
+        "straight_max_pathology": "straight_max",
     }
     resolved = aliases.get(raw, raw)
     if resolved == "random":
@@ -233,6 +238,28 @@ def normalize_pathology_mode(mode: str | None) -> str | None:
             f"Unknown pathology_mode {mode!r}; use one of: {', '.join(_PATHOLOGY_MODE_CHOICES)}"
         )
     return resolved
+
+
+def prompt_pathology_mode() -> Optional[str]:
+    """Interactive pathology-class picker shared by kinematics and biochem datagen."""
+    print(
+        "\nPathology class:\n"
+        "  1 = random mix (default)\n"
+        "  2 = max stenosis (~80% diameter occlusion at peak)\n"
+        "  3 = max aneurysm (local width up to 3x inlet)\n"
+        "  4 = straight max (straight x-vessel, no bend; max stenosis or aneurysm)\n"
+    )
+    while True:
+        raw = input("Pathology class [1/2/3/4] [1]: ").strip()
+        if raw in ("", "1"):
+            return None
+        if raw == "2":
+            return "max_stenosis"
+        if raw == "3":
+            return "max_aneurysm"
+        if raw == "4":
+            return "straight_max"
+        print("  Enter 1, 2, 3, or 4.")
 
 
 def stenosis_wall_offset_for_occlusion(
@@ -262,60 +289,83 @@ def _sample_params(
     # Level-driven mode: 2 => pro-thrombotic cohort shaping.
     pro_thrombotic = (level == 2)
     pathology_mode = normalize_pathology_mode(pathology_mode)
+    straight_max = pathology_mode == "straight_max"
+    forced_max = pathology_mode in _FORCED_MAX_PATHOLOGY_MODES
 
-    if pro_thrombotic:
-        # Eliminate straight vessels; favor sharp turns and hooks
-        active = {"straight": 0.0, "arc": 0.20, "s_curve": 0.40, "hook": 0.40}
+    if straight_max:
+        # Dedicated class: straight along x, no bendiness, extreme pathology.
+        curve_type = "straight"
+        v_type = str(rng.choice(["stenosis", "aneurysm"]))
+        magnitude_mode = "max_stenosis" if v_type == "stenosis" else "max_aneurysm"
     else:
-        weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
-        active = {k: v for k, v in weights_map.items() if v > 0}
+        if pro_thrombotic:
+            # Eliminate straight vessels; favor sharp turns and hooks
+            active = {"straight": 0.0, "arc": 0.20, "s_curve": 0.40, "hook": 0.40}
+        else:
+            weights_map = _CURVE_WEIGHTS.get(min(level, 1), _CURVE_WEIGHTS)
+            active = {k: v for k, v in weights_map.items() if v > 0}
 
-    keys = list(active.keys())
-    probs = np.array(list(active.values()), dtype=float)
-    probs /= probs.sum()
-    curve_type = str(rng.choice(keys, p=probs))
+        keys = list(active.keys())
+        probs = np.array(list(active.values()), dtype=float)
+        probs /= probs.sum()
+        curve_type = str(rng.choice(keys, p=probs))
 
-    if pathology_mode == "max_stenosis":
-        v_type = "stenosis"
-    elif pathology_mode == "max_aneurysm":
-        v_type = "aneurysm"
-    elif pro_thrombotic:
-        # Guarantee a pathology. Aneurysms (stagnation) and Stenosis (downstream deceleration)
-        v_type = str(rng.choice(["stenosis", "aneurysm"], p=[0.3, 0.7]))
-    else:
-        v_type = str(rng.choice(["straight", "stenosis", "aneurysm"]))
+        if pathology_mode == "max_stenosis":
+            v_type = "stenosis"
+            magnitude_mode = "max_stenosis"
+        elif pathology_mode == "max_aneurysm":
+            v_type = "aneurysm"
+            magnitude_mode = "max_aneurysm"
+        elif pro_thrombotic:
+            # Guarantee a pathology. Aneurysms (stagnation) and Stenosis (downstream deceleration)
+            v_type = str(rng.choice(["stenosis", "aneurysm"], p=[0.3, 0.7]))
+            magnitude_mode = None
+        else:
+            v_type = str(rng.choice(["straight", "stenosis", "aneurysm"]))
+            magnitude_mode = None
 
     width = float(rng.uniform(cfg.width_min, cfg.width_max))
     n = cfg.num_ctrl_pts
     L = cfg.base_length
     t = np.linspace(0, 1, n)
+    hit_configured_max = False
 
     # 1. Main Clinical Pathology
     offsets = np.zeros(n)
     if v_type != "straight":
-        if pathology_mode == "max_stenosis":
+        if magnitude_mode == "max_stenosis":
             mag = cfg.max_stenosis_wall_offset(width)
-        elif pathology_mode == "max_aneurysm":
+            hit_configured_max = True
+        elif magnitude_mode == "max_aneurysm":
             mag = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=pro_thrombotic)
+            hit_configured_max = True
         elif v_type in ("stenosis", "occlusion"):
             mult = cfg.stenosis_pro_thrombotic_mult if pro_thrombotic else 1.0
-            mag = -float(
-                rng.uniform(
-                    cfg.stenosis_factor_min * width,
-                    min(0.9, cfg.stenosis_factor_max * mult) * width,
-                )
-            )
+            stenosis_cap = 0.5 * float(cfg.max_stenosis_diameter_occlusion)
+            if float(rng.random()) < float(cfg.pathology_max_hit_prob):
+                mag = cfg.max_stenosis_wall_offset(width)
+                hit_configured_max = True
+            else:
+                hi = min(float(cfg.stenosis_factor_max) * mult, stenosis_cap)
+                lo = min(float(cfg.stenosis_factor_min), hi)
+                mag = -float(rng.uniform(lo * width, hi * width))
         else:
             mult = cfg.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
-            mag = float(rng.uniform(cfg.aneurysm_factor_min * width, cfg.aneurysm_factor_max * mult * width))
+            if float(rng.random()) < float(cfg.pathology_max_hit_prob):
+                mag = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=pro_thrombotic)
+                hit_configured_max = True
+            else:
+                hi = min(float(cfg.aneurysm_factor_max) * mult, float(cfg.max_aneurysm_factor))
+                lo = min(float(cfg.aneurysm_factor_min), hi)
+                mag = float(rng.uniform(lo * width, hi * width))
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
-        if pathology_mode in ("max_stenosis", "max_aneurysm"):
+        if forced_max or hit_configured_max:
             peak = int(min_idx + 0.5 * (max_idx - min_idx))
         else:
             peak = int(rng.integers(min_idx, max_idx))
 
-        if pathology_mode == "max_stenosis" or pro_thrombotic:
+        if magnitude_mode == "max_stenosis" or pro_thrombotic:
             # Sharper geometric transition to trigger sr_grad_flow < -750 (sgt)
             std_dev = float(rng.uniform(0.02 * n, 0.05 * n))
         else:
@@ -323,7 +373,7 @@ def _sample_params(
 
         x_idx = np.arange(n)
         gauss = np.exp(-0.5 * ((x_idx - peak) / std_dev) ** 2)
-        if pathology_mode in ("max_stenosis", "max_aneurysm"):
+        if forced_max or hit_configured_max:
             skew = np.ones(n, dtype=float)
         else:
             skew_factor = float(rng.uniform(-0.3, 0.3))
@@ -332,24 +382,30 @@ def _sample_params(
 
     if v_type == "straight":
         path_loc = 2
-    elif pathology_mode == "max_stenosis":
-        path_loc = 2  # symmetric both-wall narrowing for target occlusion
+    elif magnitude_mode in ("max_stenosis", "max_aneurysm") or hit_configured_max:
+        path_loc = 2  # both walls so occlusion / 3x-width targets are well-defined
     else:
-        path_loc = int(rng.choice([0, 1, 2]))
+        # Bias toward both-wall pathology so random draws reach the configured maxes more often.
+        path_loc = int(rng.choice([0, 1, 2], p=[0.2, 0.2, 0.6]))
 
-    # 2. Universal Centerline Tortuosity
-    f1, f2 = rng.uniform(0.5, 1.5), rng.uniform(1.5, 2.5)
-    meander = np.sin(2 * np.pi * f1 * t + rng.uniform(0, 2 * np.pi)) + \
-              0.5 * np.sin(2 * np.pi * f2 * t + rng.uniform(0, 2 * np.pi))
+    # 2. Universal Centerline Tortuosity (disabled for straight_max / clean forced maxes)
+    if straight_max or forced_max:
+        tortuosity: List[float] = [0.0] * max(0, n - 4)
+    else:
+        f1, f2 = rng.uniform(0.5, 1.5), rng.uniform(1.5, 2.5)
+        meander = np.sin(2 * np.pi * f1 * t + rng.uniform(0, 2 * np.pi)) + \
+                  0.5 * np.sin(2 * np.pi * f2 * t + rng.uniform(0, 2 * np.pi))
 
-    # Higher tortuosity triggers separation on inner radii
-    max_meander = (0.15 if pro_thrombotic else 0.10) * width
-    meander = (meander / max(1e-9, float(np.max(np.abs(meander))))) * max_meander
-    meander *= np.sin(np.pi * t)
-    tortuosity = meander[2:n - 2].tolist()
+        # Higher tortuosity triggers separation on inner radii
+        max_meander = (0.15 if pro_thrombotic else 0.10) * width
+        meander = (meander / max(1e-9, float(np.max(np.abs(meander))))) * max_meander
+        meander *= np.sin(np.pi * t)
+        tortuosity = meander[2:n - 2].tolist()
 
-    # 3. Independent Wall Roughness
+    # 3. Independent Wall Roughness (zero at configured max so lumen targets stay exact)
     def get_wall_noise():
+        if forced_max or hit_configured_max:
+            return [0.0] * n
         if pro_thrombotic:
             # Higher frequency and amplitude to create local micro-cavities (sr < 25)
             f_h1, f_h2 = rng.uniform(2.0, 4.0), rng.uniform(4.0, 6.0)
@@ -389,7 +445,7 @@ def _sample_params(
 
     bend_mode = resolve_bend_sign_mode()
     bend_sign = 1.0
-    if level >= 1:
+    if level >= 1 and not straight_max:
         if curve_type in ("arc", "hook"):
             bend_sign = (
                 1.0
@@ -418,6 +474,7 @@ def _sample_params(
         "noise_bot": noise_bot,
         "offsets": offsets.tolist(),
         "path_loc": path_loc,
+        "pathology_mode": pathology_mode or "random",
     }
 
 
@@ -440,6 +497,7 @@ def recompute_pathology_offsets(
     strength = float(np.clip(strength, 0.0, 1.0))
 
     offsets = np.zeros(n)
+    at_max = False
     if v_type != "straight" and strength > 0.0:
         if v_type in ("stenosis", "occlusion"):
             mult = cfg.stenosis_pro_thrombotic_mult if pro_thrombotic else 1.0
@@ -447,12 +505,10 @@ def recompute_pathology_offsets(
             if at_max:
                 mag = cfg.max_stenosis_wall_offset(width)
             else:
-                mag = -float(
-                    rng.uniform(
-                        cfg.stenosis_factor_min * width,
-                        min(0.9, cfg.stenosis_factor_max * mult) * width,
-                    )
-                )
+                stenosis_cap = 0.5 * float(cfg.max_stenosis_diameter_occlusion)
+                hi = min(float(cfg.stenosis_factor_max) * mult, stenosis_cap)
+                lo = min(float(cfg.stenosis_factor_min), hi)
+                mag = -float(rng.uniform(lo * width, hi * width))
                 mag *= strength
         else:
             mult = cfg.aneurysm_pro_thrombotic_mult if pro_thrombotic else 1.0
@@ -460,12 +516,9 @@ def recompute_pathology_offsets(
             if at_max:
                 mag = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=pro_thrombotic)
             else:
-                mag = float(
-                    rng.uniform(
-                        cfg.aneurysm_factor_min * width,
-                        cfg.aneurysm_factor_max * mult * width,
-                    )
-                )
+                hi = min(float(cfg.aneurysm_factor_max) * mult, float(cfg.max_aneurysm_factor))
+                lo = min(float(cfg.aneurysm_factor_min), hi)
+                mag = float(rng.uniform(lo * width, hi * width))
                 mag *= strength
 
         min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
@@ -488,8 +541,10 @@ def recompute_pathology_offsets(
     out["offsets"] = offsets.tolist()
     if v_type == "straight":
         out["path_loc"] = 2
+    elif at_max:
+        out["path_loc"] = 2
     elif "path_loc" not in out:
-        out["path_loc"] = int(rng.choice([0, 1, 2]))
+        out["path_loc"] = int(rng.choice([0, 1, 2], p=[0.2, 0.2, 0.6]))
     return out
 
 
@@ -715,6 +770,7 @@ class VesselGenerator:
             "aneurysm_factor_max": self.cfg.aneurysm_factor_max,
             "max_stenosis_diameter_occlusion": self.cfg.max_stenosis_diameter_occlusion,
             "max_aneurysm_factor": self.cfg.max_aneurysm_factor,
+            "pathology_max_hit_prob": self.cfg.pathology_max_hit_prob,
             "stenosis_pro_thrombotic_mult": self.cfg.stenosis_pro_thrombotic_mult,
             "aneurysm_pro_thrombotic_mult": self.cfg.aneurysm_pro_thrombotic_mult,
             "TAGS":               dict(self.cfg.TAGS),
@@ -811,8 +867,9 @@ class VesselGenerator:
         start_idx   : first vessel index ``vessel_{idx}.*``. If ``None``, appends after the
                       highest existing index in ``output_dir`` (no overwrite). Pass ``0`` to
                       fill from the beginning (may overwrite existing files).
-        pathology_mode : ``None``/``random`` (default), ``max_stenosis`` (~75% diameter
-                         occlusion at peak), or ``max_aneurysm`` (maximum expansion).
+        pathology_mode : ``None``/``random`` (default), ``max_stenosis`` (~80% diameter
+                         occlusion at peak), ``max_aneurysm`` (local width up to 3x inlet),
+                         or ``straight_max`` (straight vessel + max stenosis or aneurysm).
         """
         pathology_mode = normalize_pathology_mode(pathology_mode)
         phys_cores  = os.cpu_count() or 1
@@ -1257,6 +1314,15 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
         help="Start vessel indices at 0. Default is to append after existing meshes.",
     )
     p.add_argument(
+        "--pathology-mode",
+        choices=("random", "max_stenosis", "max_aneurysm", "straight_max"),
+        default="random",
+        help=(
+            "Pathology sampling: random (default), max_stenosis (~80%% occlusion), "
+            "max_aneurysm (up to 3x inlet width), or straight_max (straight + max pathology)."
+        ),
+    )
+    p.add_argument(
         "--show-vessel-plot",
         action="store_true",
         help="Show matplotlib preview of saved meshes (default: skip; avoids blocking on plot windows).",
@@ -1286,6 +1352,7 @@ if __name__ == "__main__":
         start_idx = 0 if args.overwrite else None
         show_vessel_plot = bool(args.show_vessel_plot)
         unit_choice = str(args.unit).lower()
+        pathology_mode = normalize_pathology_mode(args.pathology_mode)
     else:
         phase_n = _prompt_int_choice("Dataset (1=kinematics, 2=biochem)", (1, 2))
         level = _prompt_int_choice("Level (0=straight, 1=curved, 2=pro-clot)", (0, 1, 2))
@@ -1316,6 +1383,7 @@ if __name__ == "__main__":
             overwrite = True if args.overwrite else _prompt_write_mode_vessel()
         default_n = 50 if n_on_disk > 0 else 500
         n_vessels = _prompt_positive_int("How many vessels to generate", default_n)
+        pathology_mode = prompt_pathology_mode()
         start_idx = 0 if overwrite else None
         show_vessel_plot = bool(args.show_vessel_plot) or _prompt_yes_no(
             "Show matplotlib preview of generated meshes after this run?",
@@ -1338,6 +1406,7 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         start_idx=start_idx,
         unit=unit_choice,
+        pathology_mode=pathology_mode,
     )
 
     if show_vessel_plot:

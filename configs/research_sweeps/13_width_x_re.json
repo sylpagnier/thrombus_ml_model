@@ -1,0 +1,33 @@
+{
+  "id": "13_width_x_re",
+  "title": "Inlet width x Reynolds interaction vs research parameters",
+  "model": "locked_canonical",
+  "axis": "width_x_re",
+  "description": "Width {0.008, 0.012, 0.020} m crossed with Re {300, 450, 900} on a straight vessel.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/13_width_x_re",
+  "arms": [
+    {"name": "w0.008_re300", "axis_value": 0.008, "re_target": 300.0, "geometry": {"width": 0.008}, "labels": {"width": 0.008, "re_target": 300.0}},
+    {"name": "w0.008_re450", "axis_value": 0.008, "re_target": 450.0, "geometry": {"width": 0.008}, "labels": {"width": 0.008, "re_target": 450.0}},
+    {"name": "w0.008_re900", "axis_value": 0.008, "re_target": 900.0, "geometry": {"width": 0.008}, "labels": {"width": 0.008, "re_target": 900.0}},
+    {"name": "w0.012_re300", "axis_value": 0.012, "re_target": 300.0, "geometry": {"width": 0.012}, "labels": {"width": 0.012, "re_target": 300.0}},
+    {"name": "w0.012_re450", "axis_value": 0.012, "re_target": 450.0, "geometry": {"width": 0.012}, "labels": {"width": 0.012, "re_target": 450.0}},
+    {"name": "w0.012_re900", "axis_value": 0.012, "re_target": 900.0, "geometry": {"width": 0.012}, "labels": {"width": 0.012, "re_target": 900.0}},
+    {"name": "w0.020_re300", "axis_value": 0.02, "re_target": 300.0, "geometry": {"width": 0.02}, "labels": {"width": 0.02, "re_target": 300.0}},
+    {"name": "w0.020_re450", "axis_value": 0.02, "re_target": 450.0, "geometry": {"width": 0.02}, "labels": {"width": 0.02, "re_target": 450.0}},
+    {"name": "w0.020_re900", "axis_value": 0.02, "re_target": 900.0, "geometry": {"width": 0.02}, "labels": {"width": 0.02, "re_target": 900.0}}
+  ]
+}

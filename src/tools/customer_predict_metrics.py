@@ -100,6 +100,30 @@ def max_lumen_hop_occlusion_pct(
     }
 
 
+def _axial_third_masks(
+    pos: np.ndarray, interior: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Proximal / mid / distal thirds along vessel axis (interior nodes only)."""
+    n = int(interior.shape[0])
+    prox = np.zeros(n, dtype=bool)
+    mid = np.zeros(n, dtype=bool)
+    dist = np.zeros(n, dtype=bool)
+    if not interior.any():
+        return prox, mid, dist
+    s = vessel_axis_coordinate(pos)
+    s_int = s[interior]
+    lo, hi = float(s_int.min()), float(s_int.max())
+    if hi - lo < 1e-12:
+        mid[interior] = True
+        return prox, mid, dist
+    a1 = lo + (hi - lo) / 3.0
+    a2 = lo + 2.0 * (hi - lo) / 3.0
+    prox[interior & (s <= a1)] = True
+    mid[interior & (s > a1) & (s <= a2)] = True
+    dist[interior & (s > a2)] = True
+    return prox, mid, dist
+
+
 def frame_scientific_metrics(
     *,
     pos: np.ndarray,
@@ -114,6 +138,7 @@ def frame_scientific_metrics(
 ) -> dict[str, float]:
     """Compute one-step scientific summary for CSV / plotting."""
     phi = np.asarray(phi, dtype=np.float64).reshape(-1)
+    pos = np.asarray(pos, dtype=np.float64)
     n = int(phi.shape[0])
     wall = _as_bool(mask_wall, n)
     inlet = _as_bool(mask_inlet, n)
@@ -128,21 +153,26 @@ def frame_scientific_metrics(
     wall_clot = int((wall & clot).sum())
     vessel_clot = int((interior & clot).sum())
     lumen_clot = int((lumen & clot).sum())
+    open_lumen = lumen & ~clot
+    n_open_lumen = int(open_lumen.sum())
 
     wall_pct = 100.0 * wall_clot / max(n_wall, 1)
     vessel_pct = 100.0 * vessel_clot / max(n_interior, 1)
     lumen_pct = 100.0 * lumen_clot / max(n_lumen, 1)
+    open_lumen_pct = 100.0 * n_open_lumen / max(n_lumen, 1)
 
     if hop_from_wall is not None and hop_from_wall.size == n:
+        hops = np.asarray(hop_from_wall, dtype=np.int32).reshape(-1)
         hop_stats = max_lumen_hop_occlusion_pct(
             phi,
-            hop_from_wall=hop_from_wall,
+            hop_from_wall=hops,
             mask_wall=wall,
             mask_inlet=inlet,
             mask_outlet=outlet,
             threshold=threshold,
         )
     else:
+        hops = None
         hop_stats = {
             "max_occlusion_pct": 0.0,
             "max_clot_lumen_hop": 0.0,
@@ -152,26 +182,102 @@ def frame_scientific_metrics(
     mean_phi = float(phi[interior].mean()) if n_interior else 0.0
     mean_phi_clot = float(phi[interior & clot].mean()) if vessel_clot else 0.0
 
+    # Hop histogram among interior clot nodes (firewall / off-wall growth).
+    n_hop0 = n_hop1 = n_hop_ge2 = 0
+    if hops is not None and vessel_clot > 0:
+        clot_h = hops[interior & clot]
+        n_hop0 = int((clot_h == 0).sum())
+        n_hop1 = int((clot_h == 1).sum())
+        n_hop_ge2 = int((clot_h >= 2).sum())
+    denom_clot = max(vessel_clot, 1)
+    clot_frac_hop0 = 100.0 * n_hop0 / denom_clot if vessel_clot else 0.0
+    clot_frac_hop1 = 100.0 * n_hop1 / denom_clot if vessel_clot else 0.0
+    clot_frac_hop_ge2 = 100.0 * n_hop_ge2 / denom_clot if vessel_clot else 0.0
+
+    # Remaining open-lumen radial depth (max hop still open); 0 if fully occluded.
+    if hops is not None and open_lumen.any():
+        open_h = hops[open_lumen & (hops > 0) & (hops < 99)]
+        max_open_lumen_hop = float(open_h.max()) if open_h.size else 0.0
+    else:
+        max_open_lumen_hop = 0.0
+    max_lumen_hop = float(hop_stats["max_lumen_hop"])
+    open_lumen_residual_pct = (
+        100.0 * max_open_lumen_hop / max_lumen_hop if max_lumen_hop > 0 else 0.0
+    )
+
+    # Along-axis clot mass (fraction of vessel clot in each third) + local coverage.
+    prox_m, mid_m, dist_m = _axial_third_masks(pos, interior)
+    n_clot_prox = int((prox_m & clot).sum())
+    n_clot_mid = int((mid_m & clot).sum())
+    n_clot_dist = int((dist_m & clot).sum())
+    if vessel_clot > 0:
+        clot_mass_prox_pct = 100.0 * n_clot_prox / vessel_clot
+        clot_mass_mid_pct = 100.0 * n_clot_mid / vessel_clot
+        clot_mass_dist_pct = 100.0 * n_clot_dist / vessel_clot
+    else:
+        clot_mass_prox_pct = clot_mass_mid_pct = clot_mass_dist_pct = 0.0
+    clot_cov_prox_pct = 100.0 * n_clot_prox / max(int(prox_m.sum()), 1)
+    clot_cov_mid_pct = 100.0 * n_clot_mid / max(int(mid_m.sum()), 1)
+    clot_cov_dist_pct = 100.0 * n_clot_dist / max(int(dist_m.sum()), 1)
+
+    # Axial span of clot along vessel PCA axis, normalized by vessel length.
+    s = vessel_axis_coordinate(pos)
+    if interior.any():
+        s_lo = float(s[interior].min())
+        s_hi = float(s[interior].max())
+        vessel_span = max(s_hi - s_lo, 1e-12)
+    else:
+        s_lo = 0.0
+        vessel_span = 1.0
+    if vessel_clot > 0:
+        s_clot = s[interior & clot]
+        clot_axis_span_norm = float((s_clot.max() - s_clot.min()) / vessel_span)
+        clot_axis_centroid_norm = float((float(s_clot.mean()) - s_lo) / vessel_span)
+    else:
+        clot_axis_span_norm = 0.0
+        clot_axis_centroid_norm = float("nan")
+
     out: dict[str, float] = {
         "t_s": float(t_sec),
         "t_h": float(t_sec) / DEFAULT_SECONDS_PER_UI_HOUR,
         "wall_clot_pct": wall_pct,
         "vessel_clot_pct": vessel_pct,
         "lumen_clot_pct": lumen_pct,
+        "open_lumen_pct": open_lumen_pct,
         "max_occlusion_pct": float(hop_stats["max_occlusion_pct"]),
         "max_clot_lumen_hop": float(hop_stats["max_clot_lumen_hop"]),
-        "max_lumen_hop": float(hop_stats["max_lumen_hop"]),
+        "max_lumen_hop": max_lumen_hop,
+        "max_open_lumen_hop": max_open_lumen_hop,
+        "open_lumen_residual_pct": open_lumen_residual_pct,
         "mean_phi_interior": mean_phi,
         "mean_phi_clot_nodes": mean_phi_clot,
         "n_clot_nodes": float(vessel_clot),
         "n_wall_clot_nodes": float(wall_clot),
+        "n_lumen_clot_nodes": float(lumen_clot),
+        "n_open_lumen_nodes": float(n_open_lumen),
+        "has_wall_clot": 1.0 if wall_clot > 0 else 0.0,
+        "has_lumen_clot": 1.0 if lumen_clot > 0 else 0.0,
+        "clot_frac_hop0_pct": clot_frac_hop0,
+        "clot_frac_hop1_pct": clot_frac_hop1,
+        "clot_frac_hop_ge2_pct": clot_frac_hop_ge2,
+        "n_clot_hop0": float(n_hop0),
+        "n_clot_hop1": float(n_hop1),
+        "n_clot_hop_ge2": float(n_hop_ge2),
+        "clot_mass_prox_pct": clot_mass_prox_pct,
+        "clot_mass_mid_pct": clot_mass_mid_pct,
+        "clot_mass_dist_pct": clot_mass_dist_pct,
+        "clot_cov_prox_pct": clot_cov_prox_pct,
+        "clot_cov_mid_pct": clot_cov_mid_pct,
+        "clot_cov_dist_pct": clot_cov_dist_pct,
+        "clot_axis_span_norm": clot_axis_span_norm,
+        "clot_axis_centroid_norm": clot_axis_centroid_norm,
         # Always present so bookend-only velocity rows share one CSV schema.
         "mean_vel_open_lumen": float("nan"),
         "mean_vel_lumen": float("nan"),
+        "vel_open_lumen_drop_pct": float("nan"),
     }
     if vel_mag is not None:
         vel = np.asarray(vel_mag, dtype=np.float64).reshape(-1)
-        open_lumen = lumen & ~clot
         if open_lumen.any():
             out["mean_vel_open_lumen"] = float(vel[open_lumen].mean())
         else:
@@ -213,6 +319,32 @@ def trajectory_scientific_table(
         )
         row["t_h"] = float(fr["t_sec"]) / float(seconds_per_ui_hour)
         rows.append(row)
+
+    # Velocity drop vs first available open-lumen velocity bookend.
+    v0 = float("nan")
+    for row in rows:
+        v = float(row.get("mean_vel_open_lumen", float("nan")))
+        if np.isfinite(v) and v > 0:
+            v0 = v
+            break
+    for row in rows:
+        v = float(row.get("mean_vel_open_lumen", float("nan")))
+        if np.isfinite(v0) and v0 > 1e-12 and np.isfinite(v):
+            row["vel_open_lumen_drop_pct"] = 100.0 * (v0 - v) / v0
+        else:
+            row["vel_open_lumen_drop_pct"] = float("nan")
+
+    # Instantaneous axial front speed (d span / d t_h); first row NaN.
+    for i, row in enumerate(rows):
+        if i == 0:
+            row["clot_front_speed_per_h"] = float("nan")
+            continue
+        dt = float(rows[i]["t_h"]) - float(rows[i - 1]["t_h"])
+        if dt <= 1e-12:
+            row["clot_front_speed_per_h"] = float("nan")
+            continue
+        dspan = float(rows[i]["clot_axis_span_norm"]) - float(rows[i - 1]["clot_axis_span_norm"])
+        row["clot_front_speed_per_h"] = dspan / dt
     return rows
 
 

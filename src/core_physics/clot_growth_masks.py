@@ -47,6 +47,65 @@ def graph_dilate_hops(active: torch.Tensor, edge_index: torch.Tensor, hops: int)
     return out
 
 
+def bool_mask_connected_components(
+    mask: torch.Tensor,
+    edge_index: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Undirected connected components of a boolean node mask on ``edge_index``.
+
+    Returns one bool mask per uninterrupted region (same shape as ``mask``).
+    Empty / all-False input yields ``[]``.
+    """
+    m = mask.reshape(-1).bool()
+    if not bool(m.any().item()):
+        return []
+    n = int(m.numel())
+    device = m.device
+    ei = edge_index.to(device=device)
+    row = ei[0].long()
+    col = ei[1].long()
+    # Restrict adjacency to nodes inside the mask.
+    keep = m[row] & m[col]
+    row = row[keep]
+    col = col[keep]
+
+    # CSR-ish neighbor lists on CPU for BFS (small active sets).
+    active_idx = m.nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+    if not active_idx:
+        return []
+    from collections import defaultdict
+
+    nbrs: dict[int, list[int]] = defaultdict(list)
+    if row.numel() > 0:
+        r_cpu = row.detach().cpu().tolist()
+        c_cpu = col.detach().cpu().tolist()
+        for a, b in zip(r_cpu, c_cpu):
+            nbrs[int(a)].append(int(b))
+            nbrs[int(b)].append(int(a))
+
+    seen: set[int] = set()
+    comps: list[torch.Tensor] = []
+    for start in active_idx:
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        members = [start]
+        while stack:
+            u = stack.pop()
+            for v in nbrs.get(u, ()):
+                if v not in seen and m[v].item():
+                    seen.add(v)
+                    stack.append(v)
+                    members.append(v)
+        comp = torch.zeros(n, dtype=torch.bool, device=device)
+        comp[torch.tensor(members, dtype=torch.long, device=device)] = True
+        comps.append(comp)
+    # Largest first (stable exploratory preference).
+    comps.sort(key=lambda c: int(c.sum().item()), reverse=True)
+    return comps
+
+
 def resolve_t0_dgamma_wall_mask(
     data,
     device: torch.device,

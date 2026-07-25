@@ -1,0 +1,31 @@
+{
+  "id": "10_pathology_length",
+  "title": "Stenosis axial length (Gaussian width) vs research parameters",
+  "model": "locked_canonical",
+  "axis": "pathology_std_frac",
+  "description": "Fixed 50% peak occlusion; vary narrow/default/broad pathology Gaussian.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "stenosis_occlusion": 0.5,
+      "path_loc": 2,
+      "path_loc_frac": 0.5,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/10_pathology_length",
+  "arms": [
+    {"name": "narrow", "axis_value": 0.03, "geometry": {"pathology_std_frac": 0.03}},
+    {"name": "default", "axis_value": 0.06, "geometry": {"pathology_std_frac": 0.06}},
+    {"name": "broad", "axis_value": 0.12, "geometry": {"pathology_std_frac": 0.12}}
+  ]
+}

@@ -30,6 +30,8 @@ from src.config import VesselConfig
 from src.data_gen.lib.customer_geometry_import import (
     DEFAULT_RE,
     CustomerGeometryError,
+    CustomerMaxPathology,
+    apply_customer_max_pathology,
     build_parametric_customer_graph,
     copy_into_inbox,
     ensure_inbox,
@@ -329,6 +331,8 @@ class PredictApp:
         self.drag_editor: WallControlPointEditor | None = None
         self._param_sliders: dict[str, Slider] = {}
         self._param_axes: list[Any] = []
+        self._param_pathology_btns: list[Any] = []
+        self._param_pathology: CustomerMaxPathology | None = None
         self._suppress_param_cb = False
 
         _seed_inbox_demo()
@@ -476,8 +480,22 @@ class PredictApp:
             _style_slider(s)
             s.on_changed(self._on_param_slider)
 
+        ax_max_sten = self.fig.add_axes([0.035, 0.385, 0.108, 0.028])
+        ax_max_aneur = self.fig.add_axes([0.152, 0.385, 0.108, 0.028])
+        self.btn_max_stenosis = Button(ax_max_sten, "Max stenosis")
+        self.btn_max_aneurysm = Button(ax_max_aneur, "Max aneurysm")
+        for b in (self.btn_max_stenosis, self.btn_max_aneurysm):
+            _style_button(b)
+            b.label.set_fontsize(8)
+        self.btn_max_stenosis.on_clicked(lambda _e: self._on_max_pathology("max_stenosis"))
+        self.btn_max_aneurysm.on_clicked(lambda _e: self._on_max_pathology("max_aneurysm"))
+        self._param_pathology_btns = [ax_max_sten, ax_max_aneur]
+        self._rail_widgets["max_stenosis"] = ax_max_sten
+        self._rail_widgets["max_aneurysm"] = ax_max_aneur
+
         self.param_hint = self.fig.text(
             0.035, 0.40,
+            "Max stenosis ~80% occlusion; max aneurysm ~3x width.\n"
             "S-amp > 0: S-curve (overrides bend). Drag handles to edit.",
             fontsize=7.5, color=C["muted"], va="top",
         )
@@ -578,9 +596,15 @@ class PredictApp:
             for i, key in enumerate(("width", "bend", "amp")):
                 cursor -= _SLIDER_SLOT_H
                 self._place_shape_slider(key, i, cursor)
+            # Cursor is the bottom of the S-amp track; step fully below it before buttons.
+            # (Button y is the bottom edge, so placing at the track bottom would overlap upward.)
+            btn_h = 0.028
+            cursor -= 0.014 + btn_h
+            self._rail_widgets["max_stenosis"].set_position([0.035, cursor, 0.108, btn_h])
+            self._rail_widgets["max_aneurysm"].set_position([0.152, cursor, 0.108, btn_h])
             cursor -= 0.010
             self.param_hint.set_position((0.035, cursor))
-            cursor -= 0.024  # one-line hint
+            cursor -= 0.038  # two-line hint
 
         self._set_section_fig_y("conditions", cursor)
         cursor -= 0.032  # header clearance before first caption
@@ -645,11 +669,52 @@ class PredictApp:
         show = self.geom_mode == "Parametric"
         for ax in self._param_axes:
             ax.set_visible(show)
+        for ax in self._param_pathology_btns:
+            ax.set_visible(show)
         self.param_hint.set_visible(show)
         self._section_labels["shape"].set_visible(show)
         for key in ("width", "bend", "amp"):
             self._slider_captions[key].set_visible(show)
         self._layout_rail(parametric=show)
+        self._style_pathology_buttons()
+
+    def _style_pathology_buttons(self) -> None:
+        """Highlight the active max-pathology preset in Parametric mode."""
+        sten_on = self._param_pathology == "max_stenosis"
+        aneur_on = self._param_pathology == "max_aneurysm"
+        _style_button(self.btn_max_stenosis, primary=sten_on)
+        _style_button(self.btn_max_aneurysm, primary=aneur_on)
+        self.btn_max_stenosis.label.set_fontsize(8)
+        self.btn_max_aneurysm.label.set_fontsize(8)
+
+    def _on_max_pathology(self, kind: CustomerMaxPathology) -> None:
+        if self.geom_mode != "Parametric":
+            self._set_status("Switch to Parametric mode to generate max pathology.", tone="warn")
+            return
+        # Toggle off if the same preset is clicked again.
+        if self._param_pathology == kind:
+            self._param_pathology = None
+            self._style_pathology_buttons()
+            self._invalidate_results()
+            self._rebuild_parametric_geom(from_sliders=True)
+            self._set_status("Cleared max pathology preset.", tone="accent")
+            return
+        self._param_pathology = kind
+        self._style_pathology_buttons()
+        self._invalidate_results()
+        self._rebuild_parametric_geom(from_sliders=True)
+        if kind == "max_stenosis":
+            occ = 100.0 * float(self.vessel_cfg.max_stenosis_diameter_occlusion)
+            self._set_status(
+                f"Max stenosis applied (~{occ:.0f}% diameter occlusion at peak).",
+                tone="ok",
+            )
+        else:
+            scale = float(self.vessel_cfg.max_aneurysm_width_scale)
+            self._set_status(
+                f"Max aneurysm applied (local width up to {scale:.0f}x inlet).",
+                tone="ok",
+            )
 
     # --- inbox ------------------------------------------------------------------
 
@@ -698,7 +763,7 @@ class PredictApp:
         self._refresh_preview()
         if label == "Parametric":
             self._set_status(
-                "Parametric mode: edit wall handles, then run a prediction.",
+                "Parametric mode: use Max stenosis / Max aneurysm, edit walls, then run.",
                 tone="accent",
             )
         else:
@@ -822,6 +887,10 @@ class PredictApp:
             else:
                 overrides["curve_type"] = "straight"
             params = make_vessel_params(idx=0, level=0, cfg=self.vessel_cfg, **overrides)
+            if self._param_pathology is not None:
+                params = apply_customer_max_pathology(
+                    params, self.vessel_cfg, self._param_pathology
+                )
             geom = compute_geometry_from_params(params, self.cfg_dict)
             self.param_geom = geom
             self.baseline_geom = compute_geometry_from_params(params, self.cfg_dict)

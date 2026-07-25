@@ -34,6 +34,7 @@ from src.data_gen.lib.mesh_to_graph_biochem import MeshToGraphPhase3
 from src.data_gen.lib.vessel_generator import (
     VesselGeneratorPhase3,
     normalize_pathology_mode,
+    prompt_pathology_mode,
     summarize_vessel_mesh_inventory,
     _prompt_int_choice as _vg_prompt_int_choice,
     _prompt_positive_int as _vg_prompt_positive_int,
@@ -41,25 +42,6 @@ from src.data_gen.lib.vessel_generator import (
 )
 from src.tools.prepare_biochem_anchors import scaffold_anchor_sidecars
 from src.utils.paths import data_root
-
-
-def _prompt_pathology_mode() -> Optional[str]:
-    """Return ``max_stenosis``, ``max_aneurysm``, or ``None`` for random pathology sampling."""
-    print(
-        "\nPathology strength:\n"
-        "  1 = random mix (default)\n"
-        "  2 = max stenosis (~75% diameter occlusion at peak)\n"
-        "  3 = max aneurysm (deepest configured expansion)\n"
-    )
-    while True:
-        raw = input("Pathology strength [1/2/3] [1]: ").strip()
-        if raw in ("", "1"):
-            return None
-        if raw == "2":
-            return "max_stenosis"
-        if raw == "3":
-            return "max_aneurysm"
-        print("  Enter 1, 2, or 3.")
 
 
 def _prompt_yes_no(label: str, default: bool = True) -> bool:
@@ -141,7 +123,7 @@ def run_interactive_pipeline() -> None:
         default_n = 50 if n_on_disk > 0 else 200
         n_vessels = _vg_prompt_positive_int("How many vessels to generate", default_n)
         no_plot = _prompt_yes_no("Skip matplotlib preview?", default=True)
-        pathology_mode = _prompt_pathology_mode()
+        pathology_mode = prompt_pathology_mode()
         start_idx = 0 if overwrite else int(inv["next_idx"])
 
         print("\n--- Running VesselGeneratorPhase3 ---\n")
@@ -182,7 +164,7 @@ def run_interactive_pipeline() -> None:
         overwrite = _vg_prompt_write_mode_vessel()
         default_n = 25 if n_on_disk > 0 else 100
         n_vessels = _vg_prompt_positive_int("How many anchor-candidate meshes to generate", default_n)
-        pathology_mode = _prompt_pathology_mode()
+        pathology_mode = prompt_pathology_mode()
         start_idx = 0 if overwrite else int(inv["next_idx"])
 
         print("\n--- Running VesselGeneratorPhase3 (unit=cm) ---\n")
@@ -246,9 +228,12 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p.add_argument("--max-mesh-files", type=int, default=None, help="Synthetic: cap meshes for MeshToGraphPhase3.")
     p.add_argument(
         "--pathology-mode",
-        choices=("random", "max_stenosis", "max_aneurysm"),
+        choices=("random", "max_stenosis", "max_aneurysm", "straight_max"),
         default="random",
-        help="Pathology sampling: random (default), max_stenosis (~75%% occlusion), or max_aneurysm.",
+        help=(
+            "Pathology sampling: random (default), max_stenosis (~80%% occlusion), "
+            "max_aneurysm (up to 3x inlet width), or straight_max (straight + max pathology)."
+        ),
     )
     args = p.parse_args(argv)
     if not args.batch:

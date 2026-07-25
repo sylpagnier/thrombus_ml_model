@@ -74,6 +74,30 @@ def test_ckpt_score_hop_ge2_balanced_prefers_localization():
     assert high > low
 
 
+def test_ckpt_score_hop_ge2_recall_prefers_covering_gt():
+    under = growth_specialist_ckpt_score(
+        ckpt_metric="hop_ge2_recall",
+        clot_score=0.9,
+        offwall_relaxed_f1=0.9,
+        offwall_n_pred=1.0,
+        offwall_n_gt=20.0,
+        hop_ge2_strict_f1=0.10,
+        hop_ge2_n_pred=2.0,
+        hop_ge2_n_gt=97.0,
+    )
+    cover = growth_specialist_ckpt_score(
+        ckpt_metric="hop_ge2_recall",
+        clot_score=0.5,
+        offwall_relaxed_f1=0.5,
+        offwall_n_pred=1.0,
+        offwall_n_gt=20.0,
+        hop_ge2_strict_f1=0.12,
+        hop_ge2_n_pred=70.0,
+        hop_ge2_n_gt=97.0,
+    )
+    assert cover > under
+
+
 def test_loss_blurring_prec_penalizes_far_fp(monkeypatch):
     monkeypatch.setenv("SPECIES_CONTINUOUS_DELTA_VALUE_SCALE", "1.0")
     monkeypatch.setenv("SPECIES_CONTINUOUS_HUBER_BETA_GROWTH", "1.0")

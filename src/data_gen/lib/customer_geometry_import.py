@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import meshio
 import numpy as np
@@ -36,9 +36,49 @@ SUPPORTED_SUFFIXES = (".pt", ".msh", ".nas")
 DEFAULT_N_STEPS = 60
 DEFAULT_RE = 450.0
 
+CustomerMaxPathology = Literal["max_stenosis", "max_aneurysm"]
+
 
 class CustomerGeometryError(ValueError):
     """User-facing geometry / tag / sidecar failure."""
+
+
+def apply_customer_max_pathology(
+    params: dict[str, Any],
+    cfg: VesselConfig | None = None,
+    kind: CustomerMaxPathology = "max_stenosis",
+) -> dict[str, Any]:
+    """Overlay a mid-vessel max stenosis or max aneurysm on parametric vessel params.
+
+    Uses both-wall peak offsets so stenosis hits ``max_stenosis_diameter_occlusion``
+    and aneurysm hits ``max_aneurysm_width_scale`` (3x inlet). Wall noise is cleared
+    so the preview matches the configured strength.
+    """
+    cfg = cfg or VesselConfig(phase="kinematics")
+    if kind not in ("max_stenosis", "max_aneurysm"):
+        raise ValueError(f"Unknown max pathology kind {kind!r}")
+
+    out = dict(params)
+    width = float(out.get("width", cfg.width_min))
+    n = int(cfg.num_ctrl_pts)
+    if kind == "max_stenosis":
+        mag = float(cfg.max_stenosis_wall_offset(width))
+        out["v_type"] = "stenosis"
+    else:
+        mag = float(cfg.max_aneurysm_wall_offset(width))
+        out["v_type"] = "aneurysm"
+
+    min_idx, max_idx = max(3, int(n * 0.2)), min(n - 4, int(n * 0.8))
+    peak = int(min_idx + 0.5 * (max_idx - min_idx))
+    std_dev = max(1.0, 0.035 * n)
+    x_idx = np.arange(n, dtype=float)
+    gauss = np.exp(-0.5 * ((x_idx - peak) / std_dev) ** 2)
+    out["offsets"] = (mag * gauss).tolist()
+    out["path_loc"] = 2
+    out["noise_top"] = [0.0] * n
+    out["noise_bot"] = [0.0] * n
+    out["pathology_mode"] = kind
+    return out
 
 
 def inbox_dir(root: Path | None = None) -> Path:

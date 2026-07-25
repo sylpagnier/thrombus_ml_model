@@ -13,6 +13,7 @@ Short cheat sheet for agents and contributors. Full orientation: [docs/PROJECT_C
 
 - **Promote biochem:** `python scripts/promote_biochem_gnn.py` → `outputs/biochem/biochem_gnn/locked/` + `data/reference/biochem_gnn_baseline.json`
 - **Locked mat baseline:** `WC_v7_clot_phi_mse` (2026-07-19); cohort clot F1 **~0.767**, clot score **~0.791**
+- **Precision Frontier-ge2 (~8 h):** `go_wc_v7_frontier_ge2_prec_8h.ps1` (viz: `go_wc_v7_frontier_ge2_prec_viz.ps1`) — see [docs/MAT_GROWTH.md](docs/MAT_GROWTH.md)
 - **Customer UI:** `scripts/go_customer_predict.ps1`
 - **Import:** `from src.biochem_gnn import BiochemGNN` (alias package `src.biochem_deploy`)
 

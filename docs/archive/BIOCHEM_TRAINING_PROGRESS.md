@@ -2420,6 +2420,8 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 | 2026-07-06 | **off-wall V2 sweep** (`go_offwall_v2_sweep.ps1 -Fresh`, 6 legs, ES15) | n/a | — | — | Smooth (F1 **0.823** score **0.969**) + Dilation (F1 **0.811** score **0.957**) win; firewall intact; §196 |
 | 2026-07-06 | **off-wall V3 sweep** (`go_offwall_v3_sweep.ps1 -Fresh`, 6 legs, ES12) | n/a | — | — | Widenet wins: score **0.815** clot_f1 **0.785**; offwall_rel_f1 **0.374** (all legs); masking bug fixed; §198 |
 | 2026-07-06 | **off-wall V4 sweep** (`go_offwall_v4_sweep.ps1 -Fresh`, 4 legs, ES12) | n/a | — | — | Sat30 wins: score **0.818** clot_f1 **0.797**; offwall_rel_f1 **0.474** (+0.10); n_pred remains ~1.1; §199 |
+| 2026-07-22 | **firewall fix seq** (`go_wc_v7_firewall_fix_seq -Fresh`, steps 1+2, orig10) | n/a | — | — | Step1 clot **0.771** hop_ge2=0; Step2 train val 61/99 but compound hop_ge2 **0.4** strict=0; §206 |
+| 2026-07-23 | **FrontierLumen 6h** (`go_wc_v7_frontier_lumen_6h -Fresh`, orig10) | n/a | — | — | hop_ge2 **0→5** strict **0.017**; wall clot **0.769→0.738** (floor fail); verdict lumen_up_wall_regress; §207 |
 
 ---
 
@@ -3040,6 +3042,18 @@ $env:BIOCHEM_STOCK_DEFAULTS = "0"   # or explicit env
 - **Code defaults:** `customer_pipeline` `DEFAULT_MAT_LEG=WC_v7_clot_phi_mse`, wall ckpt → locked; eval baseline prefers locked. Two-model offwall opt-in only (`CUSTOMER_OFFWALL_CKPT`) — WC_v7 is unified wall+off-wall.
 - **Prior retired for warm-start:** `WC_v2_dilation` (2026-07-06).
 - **Next:** new mat-growth improvements init from locked / `species/best.pth` with `WC_v7_clot_phi_mse` env overrides.
+
+### 206. Firewall fix sequence 1→2 fails deploy lumen gate (`2026-07-22`)
+
+- **Symptom:** `go_wc_v7_firewall_fix_seq.ps1 -Fresh` — Step1 `WC_v7_fw1_blind_sat` keeps clot F1 (~0.771) but `hop_ge2 n_pred=0`. Step2 lumen-shape specialist reaches train-val offwall **61/99**, yet compound wall-route deploy stays ~**1.2** offwall preds / `hop_ge2=0.4` / strict F1=0 (A: clot 0.769, hop_ge2=0).
+- **Cause (confirmed by p007 probe):** train-val was non-reproducible (val static omitted `wall_mask_band`; forced GT flow). Reloading the same `best.pth` under production eval → **growth-alone clot/mat F1 = 0**. Compound wall ≈ A because the `~wall` specialist is dead; it also erases A’s rare offwall hits (p006 6→0). Not primarily a blend-mask bug.
+- **Fix / next:** logged in `docs/MAT_GROWTH.md`; fixed `train_offwall_growth` val to bind wall mask + kinematics deploy + hop_ge2 logging. Retune with wall-protected / compound-aware ckpt selection before Step3. Do **not** promote Step1 or S over locked WC_v7.
+
+### 207. FrontierLumen orig10 scale-up: lumen up, wall regress (`2026-07-23`)
+
+- **Symptom:** `go_wc_v7_frontier_lumen_6h.ps1 -Fresh` — hop_ge2 n_pred **0→5**, strict **0→0.017**; wall clot F1 **0.769→0.738** (misses A−0.03 floor). Verdict `lumen_up_wall_regress`. Signal mostly patient007 (strict 0.168); 004/008 spray with strict 0.
+- **Cause:** Extreme lumen objective + cheap-val (−loss) ckpt selection; freeze-backbone does not stop ~wall FP from hurting clot F1 under compound wall-route.
+- **Fix / next:** compound/deploy-aware saves + softer FN; do not promote. Limit-2h FrontierLumen signal is real but not yet production-ready.
 
 ---
 

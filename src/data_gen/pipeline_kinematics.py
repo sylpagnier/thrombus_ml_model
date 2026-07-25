@@ -20,7 +20,9 @@ from src.data_gen.lib.mesh_to_graph import MeshToGraph
 from src.data_gen.lib.vessel_generator import (
     VesselGenerator,
     default_level_mix,
+    normalize_pathology_mode,
     parse_level_mix,
+    prompt_pathology_mode,
     summarize_vessel_mesh_inventory,
     _prompt_int_choice as _vg_prompt_int_choice,
     _prompt_write_mode_vessel as _vg_prompt_write_mode_vessel,
@@ -94,6 +96,7 @@ class PhaseInteractivePlan:
     run_vessel: bool
     level: Optional[int]
     level_mix: Optional[dict[int, int]]
+    pathology_mode: Optional[str]
     overwrite: Optional[bool]
     n_vessels: Optional[int]
     seed: Optional[int]
@@ -168,6 +171,7 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
 
     level: Optional[int] = None
     level_mix: Optional[dict[int, int]] = None
+    pathology_mode: Optional[str] = None
     overwrite: Optional[bool] = None
     seed: Optional[int] = None
     num_workers: Optional[int] = None
@@ -194,6 +198,7 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
                     "  Level 2: pro-thrombotic shapes (sharp turns, aneurysm/stenosis) "
                     "for high-μ biochem-style CFD anchors.\n"
                 )
+        pathology_mode = prompt_pathology_mode()
         if n_on_disk == 0:
             overwrite = True
             print("  No meshes on disk — starting indices at 0 (overwrite).\n")
@@ -255,6 +260,7 @@ def _prompt_phase_interactive_plan(rheology_n: int) -> PhaseInteractivePlan:
         run_vessel=run_vessel,
         level=level,
         level_mix=level_mix,
+        pathology_mode=pathology_mode,
         overwrite=overwrite,
         n_vessels=n_vessels if run_vessel else None,
         seed=seed,
@@ -290,6 +296,7 @@ def _execute_phase_interactive_plan(
             num_workers=plan.num_workers,
             chunk_size=plan.chunk_size,
             start_idx=start_idx,
+            pathology_mode=plan.pathology_mode,
         )
 
     if plan.run_anchors:
@@ -417,6 +424,15 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
         default=None,
         metavar="N0,N1,N2",
         help="Explicit per-level counts (must sum to -n); implies mixed cohort.",
+    )
+    p.add_argument(
+        "--pathology-mode",
+        choices=("random", "max_stenosis", "max_aneurysm", "straight_max"),
+        default="random",
+        help=(
+            "Pathology sampling: random (default), max_stenosis (~80%% occlusion), "
+            "max_aneurysm (up to 3x inlet width), or straight_max (straight + max pathology)."
+        ),
     )
     p.add_argument(
         "-n",
@@ -606,9 +622,11 @@ def _run_batch_for_phase(
         if args.bend_sign_mode:
             os.environ["KINEMATICS_BEND_SIGN_MODE"] = str(args.bend_sign_mode)
         bend_label = os.environ.get("KINEMATICS_BEND_SIGN_MODE", "bidirectional")
+        pathology_mode = normalize_pathology_mode(args.pathology_mode)
         print(
             f"--- Vessel generation: rheology={rheology} levels={level_label} n={num_vessels} "
-            f"seed={vessel_seed!r} bend_sign_mode={bend_label} ---\n"
+            f"seed={vessel_seed!r} bend_sign_mode={bend_label} "
+            f"pathology={args.pathology_mode} ---\n"
         )
         vg.run_pipeline(
             n=num_vessels,
@@ -618,6 +636,7 @@ def _run_batch_for_phase(
             num_workers=args.num_workers,
             chunk_size=args.chunk_size,
             start_idx=start_idx,
+            pathology_mode=pathology_mode,
         )
         if args.show_vessel_plot:
             saved_indices = sorted(

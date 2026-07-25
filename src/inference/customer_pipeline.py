@@ -116,8 +116,13 @@ def _customer_deploy_env(
     wall_ckpt: Path,
     offwall_ckpt: Path | None,
     mat_leg: str = DEFAULT_MAT_LEG,
+    extra_env: dict[str, str] | None = None,
 ) -> Iterator[dict[str, str]]:
-    """Apply deploy + mat-growth env, then restore."""
+    """Apply deploy + mat-growth env, then restore.
+
+    ``extra_env`` is applied last so research-sweep stack knobs can override
+    mat-leg defaults (e.g. corrector / dynamic occlusion ablations).
+    """
     manifest = load_deploy_manifest()
     overrides: dict[str, str] = {
         "T0_R4_FLOW_SOURCE": "kinematics",
@@ -144,6 +149,9 @@ def _customer_deploy_env(
     else:
         overrides.setdefault("SPECIES_TWO_MODEL_MODE", "0")
 
+    if extra_env:
+        overrides.update({str(k): str(v) for k, v in extra_env.items()})
+
     keys = set(overrides) | {
         "SPECIES_GNN_CLOUT_CKPT",
         "SPECIES_CONTINUOUS_CKPT",
@@ -153,6 +161,8 @@ def _customer_deploy_env(
         "SPECIES_TWO_MODEL_ROUTE",
         "SPECIES_TWO_MODEL_FRONTIER_HOPS",
         "BIOCHEM_CORRECTOR_COUPLING",
+        "SPECIES_DYNAMIC_OCCLUSION",
+        "BIOCHEM_ROLLOUT_DYNAMIC_OCCLUSION",
         "T0_R4_FLOW_SOURCE",
     }
     saved = {k: os.environ.get(k) for k in keys}
@@ -214,8 +224,13 @@ class CustomerDeployPipeline:
         t_final_s: float | None = None,
         progress: Callable[[str], None] | None = None,
         include_velocity: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> CustomerTrajectory:
-        """Species + clot-phi trajectory; optionally couple local corrector for velocity."""
+        """Species + clot-phi trajectory; optionally couple local corrector for velocity.
+
+        ``extra_env`` overrides mat-leg / default deploy knobs for this run only
+        (research stack ablations).
+        """
         # Avoid tqdm/signal handlers that break when called outside the main UI path.
         os.environ.setdefault("BIOCHEM_TQDM", "0")
         os.environ.setdefault("BIOCHEM_QUIET", "1")
@@ -240,6 +255,7 @@ class CustomerDeployPipeline:
             wall_ckpt=self.wall_ckpt,
             offwall_ckpt=self.offwall_ckpt,
             mat_leg=self.mat_leg,
+            extra_env=extra_env,
         ):
             log("[i] Preparing band features (kinematics)...")
             static = prepare_species_gnn_rollout_static(data, device=self.device)
@@ -287,6 +303,8 @@ class CustomerDeployPipeline:
                 f"[i] Coupling local kinematic corrector at "
                 f"{len(velocity_indices)} bookend step(s)..."
             )
+            # Remesh / parametric edits change node count; never reuse prior mesh base flow.
+            self._flow_provider.invalidate_base_cache()
             for ti in t_keys:
                 mu_all[ti] = traj[ti]["mu"].detach().cpu().numpy()
                 phi_all[ti] = traj[ti]["phi"].detach().cpu().numpy()
@@ -352,6 +370,7 @@ class CustomerDeployPipeline:
                 "include_velocity": bool(include_velocity),
                 "velocity_indices": velocity_indices,
                 "velocity_mode": "bookends" if include_velocity else "none",
+                "extra_env": dict(extra_env) if extra_env else {},
             },
             mask_wall=_mask_np("mask_wall"),
             mask_inlet=_mask_np("mask_inlet"),

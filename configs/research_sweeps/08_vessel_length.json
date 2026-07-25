@@ -1,0 +1,27 @@
+{
+  "id": "08_vessel_length",
+  "title": "Vessel length scale vs research parameters",
+  "model": "locked_canonical",
+  "axis": "base_length",
+  "description": "Straight mid-width vessel; vary axial base_length (m) at Re=450.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/08_vessel_length",
+  "arms": [
+    {"name": "L_0.05", "axis_value": 0.05, "geometry": {"base_length": 0.05}},
+    {"name": "L_0.10", "axis_value": 0.1, "geometry": {"base_length": 0.1}},
+    {"name": "L_0.15", "axis_value": 0.15, "geometry": {"base_length": 0.15}}
+  ]
+}

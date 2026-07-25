@@ -1,0 +1,36 @@
+{
+  "id": "11_aneurysm_x_re",
+  "title": "Aneurysm x Reynolds interaction vs research parameters",
+  "model": "locked_canonical",
+  "axis": "aneurysm_x_re",
+  "description": "Low/mid/high aneurysm factor crossed with Re in {300, 450, 900}.",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "path_loc": 2,
+      "path_loc_frac": 0.5,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/11_aneurysm_x_re",
+  "arms": [
+    {"name": "af0.15_re300", "axis_value": 0.15, "re_target": 300.0, "geometry": {"aneurysm_factor": 0.15}, "labels": {"aneurysm_factor": 0.15, "re_target": 300.0}},
+    {"name": "af0.15_re450", "axis_value": 0.15, "re_target": 450.0, "geometry": {"aneurysm_factor": 0.15}, "labels": {"aneurysm_factor": 0.15, "re_target": 450.0}},
+    {"name": "af0.15_re900", "axis_value": 0.15, "re_target": 900.0, "geometry": {"aneurysm_factor": 0.15}, "labels": {"aneurysm_factor": 0.15, "re_target": 900.0}},
+    {"name": "af0.25_re300", "axis_value": 0.25, "re_target": 300.0, "geometry": {"aneurysm_factor": 0.25}, "labels": {"aneurysm_factor": 0.25, "re_target": 300.0}},
+    {"name": "af0.25_re450", "axis_value": 0.25, "re_target": 450.0, "geometry": {"aneurysm_factor": 0.25}, "labels": {"aneurysm_factor": 0.25, "re_target": 450.0}},
+    {"name": "af0.25_re900", "axis_value": 0.25, "re_target": 900.0, "geometry": {"aneurysm_factor": 0.25}, "labels": {"aneurysm_factor": 0.25, "re_target": 900.0}},
+    {"name": "af0.40_re300", "axis_value": 0.4, "re_target": 300.0, "geometry": {"aneurysm_factor": 0.4}, "labels": {"aneurysm_factor": 0.4, "re_target": 300.0}},
+    {"name": "af0.40_re450", "axis_value": 0.4, "re_target": 450.0, "geometry": {"aneurysm_factor": 0.4}, "labels": {"aneurysm_factor": 0.4, "re_target": 450.0}},
+    {"name": "af0.40_re900", "axis_value": 0.4, "re_target": 900.0, "geometry": {"aneurysm_factor": 0.4}, "labels": {"aneurysm_factor": 0.4, "re_target": 900.0}}
+  ]
+}

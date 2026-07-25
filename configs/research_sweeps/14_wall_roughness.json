@@ -1,0 +1,29 @@
+{
+  "id": "14_wall_roughness",
+  "title": "Wall roughness amplitude vs research parameters",
+  "model": "locked_canonical",
+  "axis": "wall_roughness_amp",
+  "description": "Straight mid-width vessel; deterministic wall roughness amp as fraction of width (0, 2%, 5%, 8%).",
+  "control": {
+    "re_target": 450.0,
+    "t_final_s": 30000.0,
+    "n_steps": 120,
+    "include_velocity": false,
+    "geometry": {
+      "width": 0.012,
+      "curve_type": "straight",
+      "angle_span": 0.0,
+      "amplitude": 0.0,
+      "base_length": 0.1,
+      "seed": 42,
+      "level": 0
+    }
+  },
+  "output_dir": "outputs/research_sweeps/14_wall_roughness",
+  "arms": [
+    {"name": "rough_0", "axis_value": 0.0, "geometry": {"wall_roughness_amp": 0.0}},
+    {"name": "rough_0.02w", "axis_value": 0.00024, "geometry": {"wall_roughness_amp": 0.00024}, "labels": {"rough_frac_width": 0.02}},
+    {"name": "rough_0.05w", "axis_value": 0.0006, "geometry": {"wall_roughness_amp": 0.0006}, "labels": {"rough_frac_width": 0.05}},
+    {"name": "rough_0.08w", "axis_value": 0.00096, "geometry": {"wall_roughness_amp": 0.00096}, "labels": {"rough_frac_width": 0.08}}
+  ]
+}

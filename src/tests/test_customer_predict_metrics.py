@@ -67,6 +67,12 @@ def test_frame_scientific_metrics_wall_and_vessel_pct(tmp_path):
     # Clot on wall only (hops 0) -> no lumen penetration.
     assert row["max_clot_lumen_hop"] == 0.0
     assert row["max_occlusion_pct"] == 0.0
+    assert row["has_wall_clot"] == 1.0
+    assert row["has_lumen_clot"] == 0.0
+    assert abs(row["clot_frac_hop0_pct"] - 100.0) < 1e-6
+    assert "clot_mass_prox_pct" in row
+    assert "open_lumen_residual_pct" in row
+    assert "clot_axis_span_norm" in row
     assert "mean_vel_open_lumen" in row
     assert np.isnan(row["mean_vel_open_lumen"])
 
@@ -90,6 +96,7 @@ def test_frame_scientific_metrics_wall_and_vessel_pct(tmp_path):
     rows = trajectory_scientific_table(_Traj(), seconds_per_ui_hour=3750.0)
     assert len(rows) == 1
     assert abs(rows[0]["t_h"] - 8.0) < 1e-9
+    assert "clot_front_speed_per_h" in rows[0]
 
     out = tmp_path / "m.csv"
     write_scientific_csv(out, rows)
@@ -98,6 +105,11 @@ def test_frame_scientific_metrics_wall_and_vessel_pct(tmp_path):
     assert "max_occlusion_pct" in text
     assert "max_clot_lumen_hop" in text
     assert "mean_vel_open_lumen" in text
+    assert "clot_frac_hop_ge2_pct" in text
+    assert "clot_mass_mid_pct" in text
+    assert "open_lumen_residual_pct" in text
+    assert "clot_axis_span_norm" in text
+    assert "has_wall_clot" in text
 
 
 def test_bookend_velocity_csv_schema_stable(tmp_path):

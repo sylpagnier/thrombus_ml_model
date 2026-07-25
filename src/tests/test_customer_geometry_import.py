@@ -109,3 +109,46 @@ def test_mesh_without_sidecar_errors(tmp_path: Path) -> None:
     msh.write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n", encoding="utf-8")
     with pytest.raises(CustomerGeometryError, match="sidecar"):
         load_customer_geometry(msh, re_target=450.0)
+
+
+def test_apply_customer_max_pathology_targets() -> None:
+    import numpy as np
+
+    from src.config import VesselConfig
+    from src.data_gen.lib.customer_geometry_import import apply_customer_max_pathology
+    from src.data_gen.lib.vessel_generator import make_vessel_params
+    from src.data_gen.lib.vessel_geometry import compute_geometry_from_params
+
+    cfg = VesselConfig(phase="kinematics")
+    gen_cfg = {
+        "num_ctrl_pts": cfg.num_ctrl_pts,
+        "base_length": cfg.base_length,
+        "min_lumen_width_fraction": cfg.min_lumen_width_fraction,
+        "unit": "m",
+    }
+    base = make_vessel_params(
+        idx=0,
+        level=0,
+        cfg=cfg,
+        width=0.01,
+        curve_type="straight",
+        angle_span=0.0,
+        amplitude=0.0,
+    )
+
+    sten = apply_customer_max_pathology(base, cfg, "max_stenosis")
+    assert sten["v_type"] == "stenosis"
+    assert sten["path_loc"] == 2
+    geom_s = compute_geometry_from_params(sten, gen_cfg)
+    widths_s = np.linalg.norm(geom_s.top_coords - geom_s.bot_coords, axis=1)
+    occ = 1.0 - (float(np.min(widths_s)) / float(sten["width"]))
+    assert occ == pytest.approx(cfg.max_stenosis_diameter_occlusion, abs=0.03)
+
+    aneur = apply_customer_max_pathology(base, cfg, "max_aneurysm")
+    assert aneur["v_type"] == "aneurysm"
+    assert aneur["path_loc"] == 2
+    geom_a = compute_geometry_from_params(aneur, gen_cfg)
+    widths_a = np.linalg.norm(geom_a.top_coords - geom_a.bot_coords, axis=1)
+    scale = float(np.max(widths_a)) / float(aneur["width"])
+    assert scale == pytest.approx(cfg.max_aneurysm_width_scale, rel=0.02)
+
