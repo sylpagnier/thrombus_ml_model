@@ -33,7 +33,9 @@ from src.data_gen.lib.extract_biochem_comsol_data import PatientDataExtractor
 from src.data_gen.lib.mesh_to_graph_biochem import MeshToGraphPhase3
 from src.data_gen.lib.vessel_generator import (
     VesselGeneratorPhase3,
+    normalize_aneurysm_wall_mode,
     normalize_pathology_mode,
+    prompt_aneurysm_wall_mode,
     prompt_pathology_mode,
     summarize_vessel_mesh_inventory,
     _prompt_int_choice as _vg_prompt_int_choice,
@@ -124,6 +126,7 @@ def run_interactive_pipeline() -> None:
         n_vessels = _vg_prompt_positive_int("How many vessels to generate", default_n)
         no_plot = _prompt_yes_no("Skip matplotlib preview?", default=True)
         pathology_mode = prompt_pathology_mode()
+        aneurysm_wall_mode = prompt_aneurysm_wall_mode(pathology_mode)
         start_idx = 0 if overwrite else int(inv["next_idx"])
 
         print("\n--- Running VesselGeneratorPhase3 ---\n")
@@ -132,6 +135,7 @@ def run_interactive_pipeline() -> None:
             level=level,
             start_idx=start_idx,
             pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
         )
 
         if not no_plot:
@@ -165,6 +169,7 @@ def run_interactive_pipeline() -> None:
         default_n = 25 if n_on_disk > 0 else 100
         n_vessels = _vg_prompt_positive_int("How many anchor-candidate meshes to generate", default_n)
         pathology_mode = prompt_pathology_mode()
+        aneurysm_wall_mode = prompt_aneurysm_wall_mode(pathology_mode)
         start_idx = 0 if overwrite else int(inv["next_idx"])
 
         print("\n--- Running VesselGeneratorPhase3 (unit=cm) ---\n")
@@ -174,6 +179,7 @@ def run_interactive_pipeline() -> None:
             start_idx=start_idx,
             unit="cm",
             pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
         )
 
     else:
@@ -235,6 +241,15 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
             "max_aneurysm (up to 3x inlet width), or straight_max (straight + max pathology)."
         ),
     )
+    p.add_argument(
+        "--aneurysm-wall",
+        choices=("mirrored", "one"),
+        default="mirrored",
+        help=(
+            "Max-strength aneurysm placement: mirrored/both walls (default) or one wall "
+            "(max wall offset on top or bottom)."
+        ),
+    )
     args = p.parse_args(argv)
     if not args.batch:
         return None
@@ -252,15 +267,18 @@ def run_batch_pipeline(args: argparse.Namespace) -> None:
         inv = summarize_vessel_mesh_inventory(vg.output_dir)
         start_idx = 0 if args.overwrite else int(inv["next_idx"])
         pathology_mode = normalize_pathology_mode(args.pathology_mode)
+        aneurysm_wall_mode = normalize_aneurysm_wall_mode(args.aneurysm_wall)
         print(
             f"--- VesselGeneratorPhase3 (synthetic): n={args.num_vessels} level={level} "
-            f"start={start_idx} pathology={args.pathology_mode} ---\n"
+            f"start={start_idx} pathology={args.pathology_mode} "
+            f"aneurysm_wall={aneurysm_wall_mode} ---\n"
         )
         vg.run_pipeline(
             n=int(args.num_vessels),
             level=level,
             start_idx=start_idx,
             pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
         )
         if args.show_vessel_plot:
             saved_indices = sorted(
@@ -278,9 +296,11 @@ def run_batch_pipeline(args: argparse.Namespace) -> None:
         inv = summarize_vessel_mesh_inventory(vg.output_dir)
         start_idx = 0 if args.overwrite else int(inv["next_idx"])
         pathology_mode = normalize_pathology_mode(args.pathology_mode)
+        aneurysm_wall_mode = normalize_aneurysm_wall_mode(args.aneurysm_wall)
         print(
             f"--- VesselGeneratorPhase3 (anchor meshes, cm): n={args.num_vessels} "
-            f"level={level} start={start_idx} pathology={args.pathology_mode} ---\n"
+            f"level={level} start={start_idx} pathology={args.pathology_mode} "
+            f"aneurysm_wall={aneurysm_wall_mode} ---\n"
         )
         vg.run_pipeline(
             n=int(args.num_vessels),
@@ -288,6 +308,7 @@ def run_batch_pipeline(args: argparse.Namespace) -> None:
             start_idx=start_idx,
             unit="cm",
             pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
         )
         if args.show_vessel_plot:
             saved_indices = sorted(

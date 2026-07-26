@@ -208,6 +208,7 @@ def cohort_levels(
 
 _PATHOLOGY_MODE_CHOICES = ("random", "max_stenosis", "max_aneurysm", "straight_max")
 _FORCED_MAX_PATHOLOGY_MODES = frozenset({"max_stenosis", "max_aneurysm", "straight_max"})
+_ANEURYSM_WALL_MODE_CHOICES = ("mirrored", "one")
 
 
 def normalize_pathology_mode(mode: str | None) -> str | None:
@@ -240,6 +241,34 @@ def normalize_pathology_mode(mode: str | None) -> str | None:
     return resolved
 
 
+def normalize_aneurysm_wall_mode(mode: str | None) -> str:
+    """Return ``mirrored`` (both walls) or ``one`` (single wall max bulge)."""
+    if mode is None:
+        return "mirrored"
+    raw = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "": "mirrored",
+        "default": "mirrored",
+        "both": "mirrored",
+        "both_walls": "mirrored",
+        "symmetric": "mirrored",
+        "mirror": "mirrored",
+        "mirrored": "mirrored",
+        "one": "one",
+        "single": "one",
+        "one_wall": "one",
+        "single_wall": "one",
+        "asymmetric": "one",
+    }
+    resolved = aliases.get(raw, raw)
+    if resolved not in _ANEURYSM_WALL_MODE_CHOICES:
+        raise ValueError(
+            f"Unknown aneurysm_wall_mode {mode!r}; use one of: "
+            f"{', '.join(_ANEURYSM_WALL_MODE_CHOICES)}"
+        )
+    return resolved
+
+
 def prompt_pathology_mode() -> Optional[str]:
     """Interactive pathology-class picker shared by kinematics and biochem datagen."""
     print(
@@ -262,6 +291,25 @@ def prompt_pathology_mode() -> Optional[str]:
         print("  Enter 1, 2, 3, or 4.")
 
 
+def prompt_aneurysm_wall_mode(pathology_mode: str | None = None) -> str:
+    """Ask mirrored vs one-wall when the cohort can include max aneurysms."""
+    mode = normalize_pathology_mode(pathology_mode)
+    if mode not in ("max_aneurysm", "straight_max"):
+        return "mirrored"
+    print(
+        "\nAneurysm wall placement (max-strength aneurysms):\n"
+        "  1 = mirrored / both walls (default; peak lumen up to 3x inlet)\n"
+        "  2 = one wall only (max wall offset on top or bottom)\n"
+    )
+    while True:
+        raw = input("Aneurysm walls [1/2] [1]: ").strip()
+        if raw in ("", "1"):
+            return "mirrored"
+        if raw == "2":
+            return "one"
+        print("  Enter 1 or 2.")
+
+
 def stenosis_wall_offset_for_occlusion(
     width: float,
     cfg: VesselConfig,
@@ -281,6 +329,7 @@ def _sample_params(
         cfg: VesselConfig,
         rng: np.random.Generator,
         pathology_mode: str | None = None,
+        aneurysm_wall_mode: str | None = None,
 ) -> Dict[str, Any]:
     """
     Draw ALL random numbers for one vessel and return a plain picklable dict.
@@ -289,6 +338,7 @@ def _sample_params(
     # Level-driven mode: 2 => pro-thrombotic cohort shaping.
     pro_thrombotic = (level == 2)
     pathology_mode = normalize_pathology_mode(pathology_mode)
+    aneurysm_wall_mode = normalize_aneurysm_wall_mode(aneurysm_wall_mode)
     straight_max = pathology_mode == "straight_max"
     forced_max = pathology_mode in _FORCED_MAX_PATHOLOGY_MODES
 
@@ -383,7 +433,16 @@ def _sample_params(
     if v_type == "straight":
         path_loc = 2
     elif magnitude_mode in ("max_stenosis", "max_aneurysm") or hit_configured_max:
-        path_loc = 2  # both walls so occlusion / 3x-width targets are well-defined
+        # Max stenosis always uses both walls so diameter-occlusion targets stay exact.
+        # Max aneurysm: mirrored (both walls -> up to 3x inlet) or one-wall max offset.
+        if (
+            v_type == "aneurysm"
+            and aneurysm_wall_mode == "one"
+            and (magnitude_mode == "max_aneurysm" or hit_configured_max)
+        ):
+            path_loc = int(rng.choice([0, 1]))
+        else:
+            path_loc = 2  # both walls so occlusion / 3x-width targets are well-defined
     else:
         # Bias toward both-wall pathology so random draws reach the configured maxes more often.
         path_loc = int(rng.choice([0, 1, 2], p=[0.2, 0.2, 0.6]))
@@ -475,6 +534,7 @@ def _sample_params(
         "offsets": offsets.tolist(),
         "path_loc": path_loc,
         "pathology_mode": pathology_mode or "random",
+        "aneurysm_wall_mode": aneurysm_wall_mode,
     }
 
 
@@ -539,10 +599,16 @@ def recompute_pathology_offsets(
         offsets = mag * gauss * skew
 
     out["offsets"] = offsets.tolist()
+    wall_mode = normalize_aneurysm_wall_mode(out.get("aneurysm_wall_mode"))
+    out["aneurysm_wall_mode"] = wall_mode
     if v_type == "straight":
         out["path_loc"] = 2
     elif at_max:
-        out["path_loc"] = 2
+        if v_type == "aneurysm" and wall_mode == "one":
+            if int(out.get("path_loc", -1)) not in (0, 1):
+                out["path_loc"] = int(rng.choice([0, 1]))
+        else:
+            out["path_loc"] = 2
     elif "path_loc" not in out:
         out["path_loc"] = int(rng.choice([0, 1, 2], p=[0.2, 0.2, 0.6]))
     return out
@@ -747,13 +813,21 @@ class VesselGenerator:
         level: int,
         rng: np.random.Generator,
         pathology_mode: str | None = None,
+        aneurysm_wall_mode: str | None = None,
     ) -> Dict[str, Any]:
         """Sample one vessel parameter dict.
 
         Subclasses (e.g. ``BoundaryLayerPatchGenerator``) override this to swap in a
         different parameter sampler while reusing the shared ``run_pipeline`` driver.
         """
-        return _sample_params(idx, level, self.cfg, rng, pathology_mode=pathology_mode)
+        return _sample_params(
+            idx,
+            level,
+            self.cfg,
+            rng,
+            pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
+        )
 
     def _cfg_dict(self) -> Dict[str, Any]:
         return {
@@ -849,6 +923,7 @@ class VesselGenerator:
         start_idx: Optional[int] = None,
         unit: str = "m",
         pathology_mode: str | None = None,
+        aneurysm_wall_mode: str | None = None,
     ) -> None:
         """
         Parallel batch vessel generation.
@@ -870,8 +945,11 @@ class VesselGenerator:
         pathology_mode : ``None``/``random`` (default), ``max_stenosis`` (~80% diameter
                          occlusion at peak), ``max_aneurysm`` (local width up to 3x inlet),
                          or ``straight_max`` (straight vessel + max stenosis or aneurysm).
+        aneurysm_wall_mode : ``mirrored`` (default, both walls) or ``one`` (max aneurysm
+                             offset on a single wall). Applies to max-strength aneurysms.
         """
         pathology_mode = normalize_pathology_mode(pathology_mode)
+        aneurysm_wall_mode = normalize_aneurysm_wall_mode(aneurysm_wall_mode)
         phys_cores  = os.cpu_count() or 1
         num_workers = max(1, phys_cores - 1) if num_workers is None else num_workers
         num_workers = min(num_workers, n)
@@ -894,6 +972,8 @@ class VesselGenerator:
             )
         if pathology_mode:
             logger.info("Pathology mode: %s", pathology_mode)
+        if aneurysm_wall_mode != "mirrored":
+            logger.info("Aneurysm wall mode: %s", aneurysm_wall_mode)
 
         cfg_d   = self._cfg_dict()
         cfg_d["unit"] = unit
@@ -908,6 +988,7 @@ class VesselGenerator:
                 per_vessel_levels[i],
                 rng,
                 pathology_mode=pathology_mode,
+                aneurysm_wall_mode=aneurysm_wall_mode,
             )
             for i in range(n)
         ]
@@ -988,6 +1069,7 @@ class VesselGenerator:
                     int(failed_p.get("level", level)),
                     rng,
                     pathology_mode=pathology_mode,
+                    aneurysm_wall_mode=aneurysm_wall_mode,
                 )
                 for failed_p in failed_params
             ]
@@ -1052,6 +1134,7 @@ class VesselGeneratorPhase3(VesselGenerator):
         start_idx: Optional[int] = None,
         unit: str = "m",
         pathology_mode: str | None = None,
+        aneurysm_wall_mode: str | None = None,
     ) -> None:
         if start_idx is None:
             start_idx = 0
@@ -1065,6 +1148,7 @@ class VesselGeneratorPhase3(VesselGenerator):
             start_idx=start_idx,
             unit=unit,
             pathology_mode=pathology_mode,
+            aneurysm_wall_mode=aneurysm_wall_mode,
         )
 
 
@@ -1194,8 +1278,10 @@ class BoundaryLayerPatchGenerator(VesselGenerator):
         level: int,
         rng: np.random.Generator,
         pathology_mode: str | None = None,
+        aneurysm_wall_mode: str | None = None,
     ) -> Dict[str, Any]:
-        # Patch cohort ignores level / pathology_mode: every sample is a flat clot box.
+        # Patch cohort ignores level / pathology_mode / aneurysm_wall_mode: flat clot box.
+        del pathology_mode, aneurysm_wall_mode
         return _sample_patch_params(idx, self.cfg, rng)
 
 
@@ -1323,6 +1409,15 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--aneurysm-wall",
+        choices=("mirrored", "one"),
+        default="mirrored",
+        help=(
+            "Max-strength aneurysm placement: mirrored/both walls (default) or one wall "
+            "(max wall offset on top or bottom)."
+        ),
+    )
+    p.add_argument(
         "--show-vessel-plot",
         action="store_true",
         help="Show matplotlib preview of saved meshes (default: skip; avoids blocking on plot windows).",
@@ -1353,6 +1448,7 @@ if __name__ == "__main__":
         show_vessel_plot = bool(args.show_vessel_plot)
         unit_choice = str(args.unit).lower()
         pathology_mode = normalize_pathology_mode(args.pathology_mode)
+        aneurysm_wall_mode = normalize_aneurysm_wall_mode(args.aneurysm_wall)
     else:
         phase_n = _prompt_int_choice("Dataset (1=kinematics, 2=biochem)", (1, 2))
         level = _prompt_int_choice("Level (0=straight, 1=curved, 2=pro-clot)", (0, 1, 2))
@@ -1384,6 +1480,7 @@ if __name__ == "__main__":
         default_n = 50 if n_on_disk > 0 else 500
         n_vessels = _prompt_positive_int("How many vessels to generate", default_n)
         pathology_mode = prompt_pathology_mode()
+        aneurysm_wall_mode = prompt_aneurysm_wall_mode(pathology_mode)
         start_idx = 0 if overwrite else None
         show_vessel_plot = bool(args.show_vessel_plot) or _prompt_yes_no(
             "Show matplotlib preview of generated meshes after this run?",
@@ -1407,6 +1504,7 @@ if __name__ == "__main__":
         start_idx=start_idx,
         unit=unit_choice,
         pathology_mode=pathology_mode,
+        aneurysm_wall_mode=aneurysm_wall_mode,
     )
 
     if show_vessel_plot:

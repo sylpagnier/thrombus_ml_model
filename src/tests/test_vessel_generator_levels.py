@@ -5,6 +5,7 @@ from src.data_gen.lib.vessel_generator import (
     _sample_params,
     cohort_levels,
     default_level_mix,
+    normalize_aneurysm_wall_mode,
     normalize_pathology_mode,
     parse_level_mix,
     resolve_bend_sign_mode,
@@ -79,6 +80,13 @@ def test_normalize_pathology_mode_aliases():
     assert normalize_pathology_mode("max_straight") == "straight_max"
 
 
+def test_normalize_aneurysm_wall_mode_aliases():
+    assert normalize_aneurysm_wall_mode(None) == "mirrored"
+    assert normalize_aneurysm_wall_mode("both") == "mirrored"
+    assert normalize_aneurysm_wall_mode("one-wall") == "one"
+    assert normalize_aneurysm_wall_mode("single") == "one"
+
+
 def _gen_cfg(cfg: VesselConfig) -> dict:
     return {
         "num_ctrl_pts": cfg.num_ctrl_pts,
@@ -108,6 +116,7 @@ def test_sample_params_max_aneurysm_uses_config_cap():
     p = _sample_params(0, 2, cfg, rng, pathology_mode="max_aneurysm")
     assert p["v_type"] == "aneurysm"
     assert p["path_loc"] == 2
+    assert p["aneurysm_wall_mode"] == "mirrored"
     offsets = np.asarray(p["offsets"], dtype=float)
     width = float(p["width"])
     expected_peak = cfg.max_aneurysm_wall_offset(width, pro_thrombotic=True)
@@ -116,6 +125,57 @@ def test_sample_params_max_aneurysm_uses_config_cap():
     widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
     peak_lumen = float(np.max(widths))
     assert peak_lumen / width == pytest.approx(cfg.max_aneurysm_width_scale, rel=0.02)
+
+
+def test_sample_params_max_aneurysm_one_wall():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(5)
+    seen_walls = set()
+    for i in range(30):
+        p = _sample_params(
+            i,
+            1,
+            cfg,
+            rng,
+            pathology_mode="max_aneurysm",
+            aneurysm_wall_mode="one",
+        )
+        assert p["v_type"] == "aneurysm"
+        assert p["aneurysm_wall_mode"] == "one"
+        assert p["path_loc"] in (0, 1)
+        seen_walls.add(p["path_loc"])
+        width = float(p["width"])
+        offsets = np.asarray(p["offsets"], dtype=float)
+        expected_peak = cfg.max_aneurysm_wall_offset(width)
+        assert float(np.max(offsets)) == pytest.approx(expected_peak, rel=0.02)
+        # One-wall: only one side gets the offset -> peak lumen = inlet + max factor*inlet.
+        top = offsets if p["path_loc"] in (0, 2) else np.zeros_like(offsets)
+        bot = offsets if p["path_loc"] in (1, 2) else np.zeros_like(offsets)
+        peak_lumen = float(np.max(width + top + bot))
+        assert peak_lumen / width == pytest.approx(1.0 + float(cfg.max_aneurysm_factor), rel=0.02)
+    assert seen_walls == {0, 1}
+
+
+def test_sample_params_straight_max_one_wall_aneurysm():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(9)
+    aneur_count = 0
+    for i in range(60):
+        p = _sample_params(
+            i,
+            1,
+            cfg,
+            rng,
+            pathology_mode="straight_max",
+            aneurysm_wall_mode="one",
+        )
+        assert p["curve_type"] == "straight"
+        if p["v_type"] == "aneurysm":
+            aneur_count += 1
+            assert p["path_loc"] in (0, 1)
+        else:
+            assert p["path_loc"] == 2  # max stenosis stays both-wall
+    assert aneur_count >= 1
 
 
 def test_max_aneurysm_factor_targets_triple_inlet_width():
