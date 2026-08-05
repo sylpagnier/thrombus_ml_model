@@ -237,7 +237,7 @@ class VesselConfig:
     
     # Wound Site Configuration
     wound_probability: float = 0.0  # Probability a vessel gets wound(s) (overridden by --wound flag)
-    wound_count_range: tuple[int, int] = (1, 2)  # (min, max) wound sites per vessel
+    wound_count_range: tuple[int, int] = (1, 1)  # (min, max) wound sites per vessel
     wound_center_frac_range: tuple[float, float] = (0.3, 0.7)  # Allowed location range along vessel
     wound_half_width_frac_range: tuple[float, float] = (0.02, 0.08)  # Half-width as fraction of length
 
