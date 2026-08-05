@@ -87,22 +87,62 @@ def _env_int(name: str, default: int) -> int:
 
 
 def clot_guide_relax_hops() -> int:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.scoring.guide_relax_hops), 0)
+    except Exception:
+        pass
     return max(_env_int("CLOT_GUIDE_RELAX_HOPS", 2), 0)
 
 
 def clot_guide_f_beta() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.guide_f_beta), 1e-6)
+    except Exception:
+        pass
     return max(_env_float("CLOT_GUIDE_F_BETA", 0.5), 1e-6)
 
 
 def clot_guide_iou_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.guide_iou_w), 0.0)
+    except Exception:
+        pass
     return max(_env_float("CLOT_GUIDE_IOU_W", 0.5), 0.0)
 
 
 def clot_guide_fbeta_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.guide_f05_w), 0.0)
+    except Exception:
+        pass
     return max(_env_float("CLOT_GUIDE_F05_W", 0.5), 0.0)
 
 
 def species_continuous_clout_score_mode() -> str:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.scoring.clout_score_mode:
+            return str(rt.scoring.clout_score_mode).strip().lower()
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_CLOUT_SCORE") or "guiding").strip().lower()
     if raw in ("legacy", "legacy_f1", "f1", "strict"):
         return "legacy_f1"
@@ -117,6 +157,14 @@ def species_continuous_clout_score_mode() -> str:
 
 def clot_prec_recall_floor() -> float:
     """Min relaxed recall required before precision is rewarded at full weight."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.clout_prec_rec_floor), 0.0)
+    except Exception:
+        pass
     return max(_env_float("SPECIES_CLOUT_PREC_REC_FLOOR", 0.30), 0.0)
 
 
@@ -137,36 +185,61 @@ def relaxed_prec_floor_score(relaxed_prec: float, relaxed_rec: float) -> float:
     return p * (r / floor)
 
 
+def clot_empty_gt_fp_tol() -> float:
+    """False-positive tolerance (in nodes) for grading predictions on clot-free GT.
+
+    Without GT positives precision/recall are undefined, so the strict formulas collapse to
+    0.0 for *any* non-empty prediction -- a cliff that scores a 2-node blip identically to a
+    full spray. This tolerance turns the cliff into a decay: ``n_pred == tol`` scores 0.5.
+    """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.empty_gt_fp_tol), 1e-6)
+    except Exception:
+        pass
+    return max(_env_float("CLOT_EMPTY_GT_FP_TOL", 8.0), 1e-6)
+
+
+def empty_gt_match_score(n_pred: int, *, tol: float | None = None) -> float:
+    """Graded agreement where GT has no clot: 1.0 for predicting nothing, decaying with FPs.
+
+    A handful of predicted nodes on a clot-free region is a near miss; spraying hundreds is a
+    real failure. Monotonically decreasing in ``n_pred`` so shape quality is still ranked.
+    """
+    t = clot_empty_gt_fp_tol() if tol is None else max(float(tol), 1e-6)
+    return 1.0 / (1.0 + max(float(n_pred), 0.0) / t)
+
+
 def _safe_div(num: float, den: float) -> float:
     if den <= 0.0:
         return 0.0
     return float(num / den)
 
 
-def _vacuous_clot_match_metrics(*, relax_hops: int, beta: float) -> dict[str, float]:
-    """Both pred and GT empty: perfect agreement (not a failure)."""
-    return {
-        "clot_relaxed_prec": 1.0,
-        "clot_relaxed_rec": 1.0,
-        "clot_relaxed_f05": 1.0,
-        "clot_relaxed_f_beta": 1.0,
-        "clot_dilation_iou": 1.0,
-        "clot_guiding": 1.0,
-        "clot_prec": 1.0,
-        "clot_rec": 1.0,
-        "clot_f1": 1.0,
-        "clot_iou": 1.0,
-        "clot_tp": 0.0,
-        "clot_fp": 0.0,
-        "clot_fn": 0.0,
-        "clot_pred_pos": 0.0,
-        "clot_gt_pos": 0.0,
-        "clot_relax_hops": float(relax_hops),
-        "clot_f_beta": float(beta),
-        "pred_pos_frac": 0.0,
-        "gt_pos_frac": 0.0,
-        "clot_vacuous_match": 1.0,
-    }
+# Score-bearing fields that must be graded (not zeroed) when GT holds no clot.
+_EMPTY_GT_SCORE_KEYS = (
+    "clot_relaxed_prec",
+    "clot_relaxed_rec",
+    "clot_relaxed_f05",
+    "clot_relaxed_f_beta",
+    "clot_dilation_iou",
+    "clot_guiding",
+    "clot_prec",
+    "clot_rec",
+    "clot_f1",
+    "clot_iou",
+    "clot_score_true",
+)
+
+_EMPTY_GT_OFFWALL_SCORE_KEYS = (
+    "offwall_relaxed_f1",
+    "offwall_strict_f1",
+    "offwall_relaxed_prec",
+    "offwall_relaxed_rec",
+)
 
 
 def f_beta_score(precision: float, recall: float, *, beta: float) -> float:
@@ -185,6 +258,21 @@ def clot_guiding_score(dilation_iou: float, relaxed_f_beta: float) -> float:
     if norm <= 0.0:
         return 0.5 * float(dilation_iou) + 0.5 * float(relaxed_f_beta)
     return (iw * float(dilation_iou) + fw * float(relaxed_f_beta)) / norm
+
+
+def clot_score_true(strict_f1: float, near_f1: float) -> float:
+    """Honest single-number deploy score: mean of dilation-free F1 and 1-hop-tolerant F1.
+
+    The legacy ``clot_guiding`` score is
+    ``0.5*dilation_iou(3 hop) + 0.5*f_beta(beta=0.5, 3 hop)``. Both terms are 3-hop tolerant and
+    ``beta=0.5`` weights precision 4x over recall, so a model that predicts a little very
+    precisely outranks one that predicts the right amount -- it structurally rewards
+    under-committing, which is the drift seen in every WC leg.
+
+    This score instead uses ``beta=1.0`` (over- and under-prediction cost the same) and caps
+    spatial tolerance at 1 hop (mesh jitter is forgiven, being in the neighbourhood is not).
+    """
+    return 0.5 * float(strict_f1) + 0.5 * float(near_f1)
 
 
 def clot_score_from_deploy_dict(m: dict[str, float]) -> float:
@@ -227,12 +315,6 @@ def compute_clot_relaxed_metrics(
     n_pred = int(pred_pos.sum().item())
     n_gt = int(gt_pos.sum().item())
 
-    if n_pred == 0 and n_gt == 0:
-        return _vacuous_clot_match_metrics(
-            relax_hops=hops,
-            beta=beta,
-        )
-
     gt_dil = graph_dilate_hops(gt_pos, edge_index, hops)
     pred_dil = graph_dilate_hops(pred_pos, edge_index, hops)
 
@@ -262,6 +344,15 @@ def compute_clot_relaxed_metrics(
 
     guiding = clot_guiding_score(dilation_iou, relaxed_f_beta)
 
+    # Tight 1-hop, precision/recall-balanced agreement: forgives mesh jitter but not
+    # "somewhere in the neighbourhood", and does not saturate the way 3-hop does.
+    gt_dil1 = graph_dilate_hops(gt_pos, edge_index, 1)
+    pred_dil1 = graph_dilate_hops(pred_pos, edge_index, 1)
+    near_prec = _safe_div(float(int((pred_pos & gt_dil1).sum().item())), float(n_pred))
+    near_rec = _safe_div(float(int((gt_pos & pred_dil1).sum().item())), float(n_gt))
+    near_f1 = f_beta_score(near_prec, near_rec, beta=1.0)
+    score_true = clot_score_true(strict_f1, near_f1)
+
     res = {
         "clot_relaxed_prec": relaxed_prec,
         "clot_relaxed_rec": relaxed_rec,
@@ -278,11 +369,28 @@ def compute_clot_relaxed_metrics(
         "clot_fn": float(strict_fn),
         "clot_pred_pos": float(n_pred),
         "clot_gt_pos": float(n_gt),
+        "clot_score_true": score_true,
+        "clot_near_prec": near_prec,
+        "clot_near_rec": near_rec,
+        "clot_near_f1": near_f1,
+        # Predicted-vs-GT mass. 1.0 = right amount, <1 under-commits, >1 over-paints. Reported
+        # because relaxed prec/rec both saturate at 1.000 while badly under-predicting: hops=3
+        # tolerance let a 65-node prediction score 1.000/0.945 against 123 GT nodes.
+        "clot_mass_ratio": _safe_div(float(n_pred), float(n_gt)),
         "clot_relax_hops": float(hops),
         "clot_f_beta": float(beta),
         "pred_pos_frac": _safe_div(float(n_pred), float(pred.numel())),
         "gt_pos_frac": _safe_div(float(n_gt), float(gt.numel())),
+        "clot_vacuous_match": 1.0 if (n_pred == 0 and n_gt == 0) else 0.0,
+        "clot_empty_gt": 1.0 if n_gt == 0 else 0.0,
     }
+
+    if n_gt == 0:
+        # Clot-free vessel: rank by closeness to empty instead of collapsing to zero.
+        empty_score = empty_gt_match_score(n_pred)
+        for key in _EMPTY_GT_SCORE_KEYS:
+            res[key] = empty_score
+        res["clot_empty_gt_score"] = empty_score
 
     if wall_mask is not None:
         # Off-wall relaxed metrics must only reward off-wall predictions.
@@ -320,6 +428,16 @@ def compute_clot_relaxed_metrics(
         res["offwall_n_pred"] = float(n_pred_off)
         res["offwall_n_gt"] = float(n_gt_off)
 
+        if n_gt_off == 0:
+            # No off-wall GT clot: a few off-wall FPs is a near miss, a spray is not.
+            off_empty_score = empty_gt_match_score(n_pred_off)
+            for key in _EMPTY_GT_OFFWALL_SCORE_KEYS:
+                res[key] = off_empty_score
+            res["offwall_empty_gt"] = 1.0
+            res["offwall_empty_gt_score"] = off_empty_score
+        else:
+            res["offwall_empty_gt"] = 0.0
+
         # Hop-stratified off-wall counts (metric discipline for firewall work).
         hop_dist = _bfs_hops_from_wall(edge_index, wall_mask.reshape(-1).bool(), int(pred_pos.numel()))
         for h in (1, 2, 3, 4):
@@ -345,6 +463,38 @@ def compute_clot_relaxed_metrics(
             _safe_div(float(tp_lumen), float(tp_lumen + fn_lumen)),
             beta=1.0,
         )
+
+        # Temporary metrics: Wall-only predictions
+        wall = wall_mask.reshape(-1).to(device=pred_pos.device).bool()
+        pred_pos_wall = pred_pos & wall
+        gt_pos_wall = gt_pos & wall
+        n_pred_wall = int(pred_pos_wall.sum().item())
+        n_gt_wall = int(gt_pos_wall.sum().item())
+
+        if n_gt_wall == 0:
+            wall_score = empty_gt_match_score(n_pred_wall)
+        else:
+            gt_dil_w = graph_dilate_hops(gt_pos_wall, edge_index, hops)
+            pred_dil_w = graph_dilate_hops(pred_pos_wall, edge_index, hops)
+            tp_prec_w = int((pred_pos_wall & gt_dil_w).sum().item())
+            tp_rec_w = int((gt_pos_wall & pred_dil_w).sum().item())
+            r_prec_w = _safe_div(float(tp_prec_w), float(n_pred_wall))
+            r_rec_w = _safe_div(float(tp_rec_w), float(n_gt_wall))
+            r_fb_w = f_beta_score(r_prec_w, r_rec_w, beta=beta)
+            dil_i_w = int((pred_dil_w & gt_dil_w).sum().item())
+            dil_u_w = int((pred_dil_w | gt_dil_w).sum().item())
+            d_iou_w = _safe_div(float(dil_i_w), float(dil_u_w))
+            wall_score = clot_guiding_score(d_iou_w, r_fb_w)
+
+        strict_tp_w = int((pred_pos & gt_pos & wall).sum().item())
+        strict_fp_w = int((pred_pos & ~gt_pos & wall).sum().item())
+        strict_fn_w = int((~pred_pos & gt_pos & wall).sum().item())
+        strict_prec_w = _safe_div(float(strict_tp_w), float(strict_tp_w + strict_fp_w))
+        strict_rec_w = _safe_div(float(strict_tp_w), float(strict_tp_w + strict_fn_w))
+        strict_f1_w = f_beta_score(strict_prec_w, strict_rec_w, beta=1.0)
+        
+        res["wall_score"] = float(wall_score)
+        res["wall_strict_f1"] = float(strict_f1_w)
 
     return res
 
@@ -400,10 +550,19 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
         "clot_guiding": f"{prefix}clot_guiding",
         "clot_iou": f"{prefix}clot_iou",
         "pred_pos_frac": f"{prefix}clot_pred_pos_frac",
+        "clot_mass_ratio": f"{prefix}clot_mass_ratio",
+        "clot_pred_pos": f"{prefix}clot_pred_pos",
+        "clot_gt_pos": f"{prefix}clot_gt_pos",
+        "clot_fp": f"{prefix}clot_fp",
+        "clot_fn": f"{prefix}clot_fn",
+        "clot_score_true": f"{prefix}clot_score_true",
+        "clot_near_f1": f"{prefix}clot_near_f1",
         "offwall_relaxed_f1": f"{prefix}clot_offwall_relaxed_f1",
         "offwall_strict_f1": f"{prefix}clot_offwall_strict_f1",
         "offwall_relaxed_prec": f"{prefix}clot_offwall_relaxed_prec",
         "offwall_relaxed_rec": f"{prefix}clot_offwall_relaxed_rec",
+        "clot_empty_gt_score": f"{prefix}clot_empty_gt_score",
+        "offwall_empty_gt_score": f"{prefix}clot_offwall_empty_gt_score",
         "offwall_n_pred": f"{prefix}clot_offwall_n_pred",
         "offwall_n_gt": f"{prefix}clot_offwall_n_gt",
         "offwall_n_pred_hop1": f"{prefix}clot_offwall_n_pred_hop1",
@@ -414,6 +573,8 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
         "offwall_strict_f1_hop2": f"{prefix}clot_offwall_strict_f1_hop2",
         "offwall_strict_f1_hop3": f"{prefix}clot_offwall_strict_f1_hop3",
         "offwall_strict_f1_hop_ge2": f"{prefix}clot_offwall_strict_f1_hop_ge2",
+        "wall_score": f"{prefix}wall_score",
+        "wall_strict_f1": f"{prefix}wall_strict_f1",
     }
     for src, dst in mapping.items():
         if src in m:

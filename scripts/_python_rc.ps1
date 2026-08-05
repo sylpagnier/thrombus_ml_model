@@ -11,12 +11,20 @@ function Invoke-PythonRc {
     )
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    if ($Quiet) {
-        & python -u @PyArgs 2>&1 | Out-Null
-    } else {
-        # Write-Host keeps console output off the success stream (so $rc = ... gets only exit code).
-        # tqdm \\r bars may render as one line per refresh vs direct python stdout.
-        & python -u @PyArgs 2>&1 | ForEach-Object { Write-Host $_ }
+    $myPid = $PID
+    try {
+        if ($Quiet) {
+            & python -u @PyArgs 2>&1 | Out-Null
+        } else {
+            # Write-Host keeps console output off the success stream (so $rc = ... gets only exit code).
+            # tqdm \r bars may render as one line per refresh vs direct python stdout.
+            & python -u @PyArgs 2>&1 | ForEach-Object { Write-Host $_ }
+        }
+    } finally {
+        # Cleanup any orphaned python.exe that is a child of this powershell process
+        Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $myPid -and $_.Name -match "python" } | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
     }
     $rc = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
     $ErrorActionPreference = $prevEap

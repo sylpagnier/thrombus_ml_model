@@ -12,6 +12,8 @@ from src.core_physics.species_pushforward_gnn import (
     _flow_feats_series_from_y,
     _geometry_band_features,
     _resolve_flow_uv,
+    band_feats_cache_tag,
+    build_flow_feats_series,
     flow_feats_ablate,
     flow_feats_drop_xy,
     flow_feats_dynamic,
@@ -73,6 +75,89 @@ def test_geom_feats_rich_flag_and_dim(monkeypatch):
     assert torch.allclose(rich[:, :GEOM_FEATS_DIM], base, atol=1e-5)
 
 
+def test_band_extras_widen_continuous_feature_dim_and_cache_tag():
+    """Geom/flux must grow in_dim and change pack-cache fingerprint (no silent reuse)."""
+    from dataclasses import replace
+
+    from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
+    from src.core_physics.species_pushforward_gnn import (
+        FLOW_FEATS_DIM,
+        FLUX_STAG_DIM,
+        GEOM_FEATS_RICH_DIM,
+        band_extra_feature_dim,
+        band_feats_cache_tag,
+    )
+
+    base = PushforwardConfig(
+        flow_feats=True,
+        flow_feats_drop_xy=True,
+        saturation_gate=True,
+        time_context=True,
+        time_fourier_freqs=8,
+        species_scope="mat",
+        dual_head=True,
+    )
+    latent = 16
+    with use_pushforward_config(base):
+        d0 = continuous_feature_dim(latent)
+        e0 = band_extra_feature_dim()
+        t0 = band_feats_cache_tag()
+        assert e0 == FLOW_FEATS_DIM
+        assert "flow" in t0 and "geom" not in t0
+    with use_pushforward_config(replace(base, geom_feats=True, geom_feats_rich=True)):
+        d1 = continuous_feature_dim(latent)
+        e1 = band_extra_feature_dim()
+        t1 = band_feats_cache_tag()
+        assert e1 == FLOW_FEATS_DIM + GEOM_FEATS_RICH_DIM
+        assert d1 == d0 + GEOM_FEATS_RICH_DIM
+        assert "geom" in t1 and t1 != t0
+    with use_pushforward_config(replace(base, flux_stag_feat=True)):
+        d2 = continuous_feature_dim(latent)
+        assert band_extra_feature_dim() == FLOW_FEATS_DIM + FLUX_STAG_DIM
+        assert d2 == d0 + FLUX_STAG_DIM
+        assert "flux" in band_feats_cache_tag()
+
+
+def test_partial_load_widens_input_before_state_tail():
+    """Warm-start inserts zero columns for new band extras before state/sat/time."""
+    from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
+    from src.core_physics.species_pushforward_continuous import (
+        continuous_tail_feature_dim,
+        load_pushforward_state_dict_partial,
+    )
+
+    cfg = PushforwardConfig(
+        flow_feats=True,
+        saturation_gate=True,
+        time_context=True,
+        time_fourier_freqs=4,
+        species_scope="mat",
+        dual_head=True,
+    )
+    latent = 8
+    with use_pushforward_config(cfg):
+        old_in = continuous_feature_dim(latent)
+        tail = continuous_tail_feature_dim()
+        # Simulate +5 geom extras on a wider model.
+        new_in = old_in + 5
+        insert_at = old_in - tail
+        narrow = SpeciesDualHeadContinuousGNN(old_in, hidden=16, out_dim=1)
+        wide = SpeciesDualHeadContinuousGNN(new_in, hidden=16, out_dim=1)
+        # Mark a known value at the first state column of conv1.
+        with torch.no_grad():
+            narrow.conv1.lin_l.weight.zero_()
+            narrow.conv1.lin_l.weight[:, insert_at] = 1.0
+        load_pushforward_state_dict_partial(
+            wide, narrow.state_dict(), quiet=True, src_in_dim=old_in
+        )
+        w = wide.conv1.lin_l.weight.detach()
+        assert w.shape[1] == new_in
+        # Shared prefix preserved; inserted block near-zero; old state column moved by +5.
+        assert torch.allclose(w[:, :insert_at], narrow.conv1.lin_l.weight.detach()[:, :insert_at])
+        assert float(w[:, insert_at : insert_at + 5].abs().max()) < 1e-6
+        assert float(w[:, insert_at + 5].abs().max()) > 0.5
+
+
 def test_gate_temp_sharpens_spatial_gate(monkeypatch):
     """GATE_TEMP < 1 pushes sigmoid(logits/T) toward 0/1 vs the T=1 baseline (sparser support)."""
     monkeypatch.delenv("SPECIES_CONTINUOUS_GATE_TEMP", raising=False)
@@ -99,41 +184,60 @@ def test_gate_temp_sharpens_spatial_gate(monkeypatch):
 def test_frontier_nucleation_mask_is_deployable_and_local(monkeypatch):
     """Frontier mask: derives from PREDICTED log_state + the model's own gate logits only (no GT),
     confines growth to the k-hop neighbourhood of committed mass, and seeds via top-k confidence."""
+    from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
+
     monkeypatch.delenv("SPECIES_CONTINUOUS_FRONTIER_HOPS", raising=False)
     monkeypatch.delenv("SPECIES_CONTINUOUS_NUCLEATION_TOPK", raising=False)
-    assert continuous_frontier_hops() == 0 and continuous_nucleation_topk() == 0.0
+    # Clear any leftover typed bind from prior tests (typed config wins over env).
+    with use_pushforward_config(None):
+        assert continuous_frontier_hops() == 0 and continuous_nucleation_topk() == 0.0
 
     dev = torch.device("cpu")
-    from src.training.biochem_species_scope import MAT_CHANNEL
     monkeypatch.setenv("BIOCHEM_PUSHFORWARD_SPECIES_SCOPE", "mat")
     monkeypatch.setenv("SPECIES_CONTINUOUS_DUAL_HEAD", "1")
     monkeypatch.setenv("SPECIES_CONTINUOUS_FRONTIER_HOPS", "1")
     monkeypatch.setenv("SPECIES_CONTINUOUS_MAT_COMMIT_THRESH", "0.5")
     monkeypatch.setenv("SPECIES_CONTINUOUS_NUCLEATION_TOPK", "0.0")  # frontier-only for this check
 
-    latent_dim = 8
-    in_dim = continuous_feature_dim(latent_dim)
-    model = SpeciesDualHeadContinuousGNN(in_dim, hidden=16).to(dev)
-    # 5-node chain; only node 0 is committed (predicted Mat above thresh).
-    ei = torch.tensor([[0, 1, 1, 2, 2, 3, 3, 4], [1, 0, 2, 1, 3, 2, 4, 3]], dtype=torch.long)
-    log_state = torch.zeros(5, 1)
-    log_state[0, 0] = 1.0  # committed seed (PREDICTED state, not GT)
-    logits = torch.zeros(5, 1)
-    mask = model._frontier_nucleation_mask(logits, log_state, ei)
-    assert mask.shape == (5, 1)
-    m = mask.reshape(-1).bool()
-    # committed node 0 and its 1-hop neighbour node 1 are allowed; far nodes 3,4 are not.
-    assert bool(m[0]) and bool(m[1])
-    assert not bool(m[3]) and not bool(m[4])
-    # the mask is detached (a structural gate, not a grad path).
-    assert not mask.requires_grad
+    # Prefer typed config for the physical assertion (matches train/deploy path).
+    cfg = PushforwardConfig(
+        dual_head=True,
+        species_scope="mat",
+        frontier_hops=1,
+        nucleation_topk=0.0,
+        mat_commit_thresh=0.5,
+    )
+    with use_pushforward_config(cfg):
+        latent_dim = 8
+        in_dim = continuous_feature_dim(latent_dim)
+        model = SpeciesDualHeadContinuousGNN(in_dim, hidden=16).to(dev)
+        # 5-node chain; only node 0 is committed (predicted Mat above thresh).
+        ei = torch.tensor([[0, 1, 1, 2, 2, 3, 3, 4], [1, 0, 2, 1, 3, 2, 4, 3]], dtype=torch.long)
+        log_state = torch.zeros(5, 1)
+        log_state[0, 0] = 1.0  # committed seed (PREDICTED state, not GT)
+        logits = torch.zeros(5, 1)
+        mask = model._frontier_nucleation_mask(logits, log_state, ei)
+        assert mask.shape == (5, 1)
+        m = mask.reshape(-1).bool()
+        # committed node 0 and its 1-hop neighbour node 1 are allowed; far nodes 3,4 are not.
+        assert bool(m[0]) and bool(m[1])
+        assert not bool(m[3]) and not bool(m[4])
+        # the mask is detached (a structural gate, not a grad path).
+        assert not mask.requires_grad
 
-    # top-k nucleation seeds from the model's own logits even with NO committed mass (deployable t0).
-    monkeypatch.setenv("SPECIES_CONTINUOUS_NUCLEATION_TOPK", "0.2")  # ~1 of 5 nodes
-    cold = torch.zeros(5, 1)  # nothing committed yet (phi=0 at deploy t0)
-    strong = torch.tensor([[-9.0], [-9.0], [5.0], [-9.0], [-9.0]])  # node 2 most confident
-    seed_mask = model._frontier_nucleation_mask(strong, cold, ei).reshape(-1).bool()
-    assert bool(seed_mask[2])  # confident node nucleates without any GT
+        # top-k nucleation seeds from the model's own logits even with NO committed mass (deployable t0).
+        cfg_topk = PushforwardConfig(
+            dual_head=True,
+            species_scope="mat",
+            frontier_hops=1,
+            nucleation_topk=0.2,
+            mat_commit_thresh=0.5,
+        )
+    with use_pushforward_config(cfg_topk):
+        cold = torch.zeros(5, 1)  # nothing committed yet (phi=0 at deploy t0)
+        strong = torch.tensor([[-9.0], [-9.0], [5.0], [-9.0], [-9.0]])  # node 2 most confident
+        seed_mask = model._frontier_nucleation_mask(strong, cold, ei).reshape(-1).bool()
+        assert bool(seed_mask[2])  # confident node nucleates without any GT
 
 
 def test_flow_feats_flag(monkeypatch):
@@ -327,6 +431,58 @@ def test_flow_feats_series_is_time_varying():
     assert torch.allclose(series[0, :, 0], torch.zeros(4))
     assert float(series[-1, :, 0].max()) > 0.0
     assert not torch.allclose(series[0], series[-1])
+
+
+def test_build_flow_feats_series_auto_ignores_poisoned_gt_y():
+    """auto/kine seed from u0_pred — must not track poisoned COMSOL y UV."""
+    from dataclasses import replace
+
+    from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
+
+    dev = torch.device("cpu")
+    data = _line_graph(dev, n_times=3)
+    # Poison GT UV so any y-read would be huge; deploy path uses u0_pred.
+    data.y[:, :, 0] = 99.0
+    data.y[:, :, 1] = -99.0
+    data.u0_pred = torch.full((4,), 0.25, device=dev)
+    data.v0_pred = torch.full((4,), -0.1, device=dev)
+    node_idx = torch.arange(4, device=dev)
+    gt_series = _flow_feats_series_from_y(data, dev, node_idx)
+
+    cfg = PushforwardConfig(flow_feats=True, flow_feats_dynamic=True, flow_feats_source="auto")
+    with use_pushforward_config(cfg):
+        auto_series = build_flow_feats_series(data, object(), dev, node_idx)
+        tag = band_feats_cache_tag()
+    assert auto_series.shape == gt_series.shape
+    # Broadcast seed: all times equal (no GT time variation).
+    assert torch.allclose(auto_series[0], auto_series[-1], atol=1e-5)
+    assert not torch.allclose(auto_series[-1], gt_series[-1], atol=1.0)
+    assert "nofgty" in tag
+    assert "srcauto" in tag
+
+    with use_pushforward_config(replace(cfg, flow_feats_source="gt")):
+        gt_built = build_flow_feats_series(data, object(), dev, node_idx)
+        tag_gt = band_feats_cache_tag()
+    assert torch.allclose(gt_built, gt_series, atol=1e-5)
+    assert "nofgty" not in tag_gt
+    assert "srcgt" in tag_gt
+
+
+def test_band_feats_cache_tag_nofgty_for_non_gt_source():
+    from dataclasses import replace
+
+    from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
+
+    base = PushforwardConfig(flow_feats=True, flow_feats_dynamic=True, flow_feats_source="auto")
+    with use_pushforward_config(base):
+        t_auto = band_feats_cache_tag()
+    with use_pushforward_config(replace(base, flow_feats_source="kine")):
+        t_kine = band_feats_cache_tag()
+    with use_pushforward_config(replace(base, flow_feats_source="gt")):
+        t_gt = band_feats_cache_tag()
+    assert "nofgty" in t_auto and "nofgty" in t_kine
+    assert "nofgty" not in t_gt
+    assert t_auto != t_gt
 
 
 def test_splice_dynamic_flow_replaces_block_and_clamps():

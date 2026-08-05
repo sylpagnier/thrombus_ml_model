@@ -1,0 +1,159 @@
+{
+  "stack": "compound_deploy",
+  "leg": "C0_compound_front_offwall_h0p5",
+  "label": "C0 compound: WC_v7 wall + frontier-offwall-h0p5 lumen specialist",
+  "promoted_at": "2026-07-28T09:48:00Z",
+  "wall_ckpt": "outputs/biochem/biochem_gnn/locked/species_gnn_best.pth",
+  "wall_leg": "WC_v7_clot_phi_mse",
+  "wall_note": "Locked WC_v7 remains the wall backbone and strong wall-only deploy. Compound stacks growth specialist on top via two-model routing.",
+  "growth_ckpt": "outputs/biochem/biochem_gnn/locked/compound_growth_best.pth",
+  "growth_source": "outputs/biochem/biochem_gnn/locked/compound_growth_best.pth",
+  "deploy": {
+    "SPECIES_TWO_MODEL_MODE": "1",
+    "SPECIES_TWO_MODEL_ROUTE": "frontier_offwall",
+    "SPECIES_TWO_MODEL_FRONTIER_HOPS": "0.5",
+    "SPECIES_CONTINUOUS_VEL_DECAY": "1",
+    "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": "1",
+    "mat_leg": "WC_v7_clot_phi_mse"
+  },
+  "eval_json": "outputs/biochem/biochem_gnn/compound_deploy/eval_orig10_frontier_offwall_h0p5.json",
+  "compound_gates": {
+    "mean_f1": 0.745275744273424,
+    "mean_score": 0.8118137174736472,
+    "mean_offwall_relaxed_f1": 0.4726451363742544,
+    "mean_hop_ge2_strict": 0.17975356260994463,
+    "sum_ge2_pred": 136.0,
+    "sum_ge2_gt": 185.0,
+    "ge2_recall": 0.7351351351351352,
+    "focus": {
+      "patient001": {
+        "f1": 0.8475247524752475,
+        "score": 0.9535490605427974,
+        "relaxed_prec": 1.0,
+        "offwall_relaxed_f1": 0.9744408945686902,
+        "hop_ge2_strict": 0.6976744186046512,
+        "ge2_pred": 61.0,
+        "ge2_gt": 68.0,
+        "ge2_recall": 0.8970588235294118
+      },
+      "patient002": {
+        "f1": 0.9076923076923077,
+        "score": 0.9405628581058308,
+        "relaxed_prec": 0.9855072463768116,
+        "offwall_relaxed_f1": 0.7594936708860759,
+        "hop_ge2_strict": 0.0,
+        "ge2_pred": 0.0,
+        "ge2_gt": 0.0,
+        "ge2_recall": null
+      },
+      "patient007": {
+        "f1": 0.7680250783699061,
+        "score": 0.930815258040389,
+        "relaxed_prec": 1.0,
+        "offwall_relaxed_f1": 0.9041292243232814,
+        "hop_ge2_strict": 0.38167938931297707,
+        "ge2_pred": 34.0,
+        "ge2_gt": 97.0,
+        "ge2_recall": 0.35051546391752575
+      },
+      "patient008": {
+        "f1": 0.3931623931623932,
+        "score": 0.44055882054919443,
+        "relaxed_prec": 0.4838709677419355,
+        "offwall_relaxed_f1": 0.0,
+        "hop_ge2_strict": 0.0,
+        "ge2_pred": 0.0,
+        "ge2_gt": 0.0,
+        "ge2_recall": null
+      },
+      "patient010": {
+        "f1": 0.6666666666666666,
+        "score": 0.8437609357270867,
+        "relaxed_prec": 0.9619047619047619,
+        "offwall_relaxed_f1": 0.650887573964497,
+        "hop_ge2_strict": 0.31818181818181823,
+        "ge2_pred": 32.0,
+        "ge2_gt": 12.0,
+        "ge2_recall": 2.6666666666666665
+      }
+    },
+    "idle_detail": {
+      "patient002": {
+        "ok": true,
+        "reason": "clean",
+        "f1": 0.9076923076923077,
+        "score": 0.9405628581058308,
+        "relaxed_prec": 0.9855072463768116,
+        "offwall_relaxed_f1": 0.7594936708860759,
+        "hop_ge2_strict": 0.0,
+        "ge2_pred": 0.0,
+        "ge2_gt": 0.0,
+        "ge2_recall": null
+      },
+      "patient004": {
+        "ok": true,
+        "reason": "clean",
+        "f1": 0.7149321266968326,
+        "score": 0.7119919635703996,
+        "relaxed_prec": 0.7686567164179104,
+        "offwall_relaxed_f1": 0.0,
+        "hop_ge2_strict": 0.0,
+        "ge2_pred": 0.0,
+        "ge2_gt": 0.0,
+        "ge2_recall": null
+      },
+      "patient008": {
+        "ok": true,
+        "reason": "clean",
+        "f1": 0.3931623931623932,
+        "score": 0.44055882054919443,
+        "relaxed_prec": 0.4838709677419355,
+        "offwall_relaxed_f1": 0.0,
+        "hop_ge2_strict": 0.0,
+        "ge2_pred": 0.0,
+        "ge2_gt": 0.0,
+        "ge2_recall": null
+      }
+    },
+    "gates": {
+      "primary_score_ok": true,
+      "primary_offwall_relaxed_ok": true,
+      "lumen_teachers_open": true,
+      "lumen_ge2_strict_up": true,
+      "idle_precision_ok": true,
+      "wall_guardrail_ok": true
+    },
+    "spray_clean": true,
+    "target_hit": true,
+    "wall_floor_f1": null,
+    "wall_floor_threshold": null,
+    "thresholds": {
+      "min_clot_score": 0.78,
+      "min_offwall_relaxed_f1": 0.4,
+      "wall_floor_delta": 0.04,
+      "idle_min_f1": 0.7,
+      "idle_min_relaxed_prec": 0.85
+    },
+    "anchors": [
+      "patient001",
+      "patient002",
+      "patient003",
+      "patient004",
+      "patient005",
+      "patient006",
+      "patient007",
+      "patient008",
+      "patient010",
+      "patient011"
+    ]
+  },
+  "prior_wall_canonical": "WC_v7_clot_phi_mse (2026-07-19)",
+  "prior_growth_lineage": "wc_v7_wall_lumen_target_9h/growth_C (Prec8h FP polish, WALL_ONLY)",
+  "cohort_mean": {
+    "deploy_clot_f1": 0.745275744273424,
+    "deploy_clot_score": 0.8118137174736472,
+    "deploy_clot_offwall_relaxed_f1": 0.4726451363742544,
+    "deploy_clot_offwall_strict_f1_hop_ge2": 0.17975356260994463,
+    "ge2_recall": 0.7351351351351352
+  }
+}

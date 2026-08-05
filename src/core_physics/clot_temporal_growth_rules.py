@@ -79,16 +79,18 @@ def _resolve_uv_for_temporal_risk(
     data,
     t_in: int,
     device: torch.device,
+    vel_source: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Flow [u,v] ND for shear-risk features (steady pred when deploy mode)."""
     ti = max(0, min(int(t_in), int(data.y.shape[0]) - 1))
     y = data.y[ti].to(device=device, dtype=torch.float32)
     u_gt = y[:, 0]
     v_gt = y[:, 1]
-    if temporal_vel_source() == "gt":
+    vel_source = vel_source or temporal_vel_source()
+    if vel_source == "gt":
         return u_gt, v_gt
 
-    if temporal_vel_source() == "coupled":
+    if vel_source == "coupled":
         from src.core_physics.clot_coupled_rollout import get_coupled_uv
 
         coupled = get_coupled_uv(data, device)
@@ -896,7 +898,7 @@ def compute_spatial_risk_score(
     spatial_rule: ClotPriorRuleConfig | None = None,
 ) -> torch.Tensor:
     n = int(data.num_nodes)
-    u, v = _resolve_uv_for_temporal_risk(data, t_in, device)
+    u, v = _resolve_uv_for_temporal_risk(data, t_in, device, vel_source=vel_source)
     props = _anchor_flow_props(data, device)
     fields = compute_clot_kinematics_fields(data, u, v, bio_cfg, props)
     prior = clot_prior_score_flat(data, u, v, bio_cfg, props).reshape(-1)
@@ -959,7 +961,7 @@ def compute_localized_risk_score(
 ) -> torch.Tensor:
     """Risk with tunable shear channels, then optional per-half renormalization."""
     n = int(data.num_nodes)
-    u, v = _resolve_uv_for_temporal_risk(data, t_in, device)
+    u, v = _resolve_uv_for_temporal_risk(data, t_in, device, vel_source=vel_source)
     props = _anchor_flow_props(data, device)
     fields = compute_clot_kinematics_fields(data, u, v, bio_cfg, props)
     prior = clot_prior_score_flat(data, u, v, bio_cfg, props).reshape(-1)

@@ -242,13 +242,13 @@ def normalize_pathology_mode(mode: str | None) -> str | None:
 
 
 def normalize_aneurysm_wall_mode(mode: str | None) -> str:
-    """Return ``mirrored`` (both walls) or ``one`` (single wall max bulge)."""
+    """Return ``one`` (single wall max bulge, default) or ``mirrored`` (both walls)."""
     if mode is None:
-        return "mirrored"
+        return "one"
     raw = str(mode).strip().lower().replace("-", "_")
     aliases = {
-        "": "mirrored",
-        "default": "mirrored",
+        "": "one",
+        "default": "one",
         "both": "mirrored",
         "both_walls": "mirrored",
         "symmetric": "mirrored",
@@ -292,21 +292,21 @@ def prompt_pathology_mode() -> Optional[str]:
 
 
 def prompt_aneurysm_wall_mode(pathology_mode: str | None = None) -> str:
-    """Ask mirrored vs one-wall when the cohort can include max aneurysms."""
+    """Ask one-wall vs mirrored when the cohort can include max aneurysms."""
     mode = normalize_pathology_mode(pathology_mode)
     if mode not in ("max_aneurysm", "straight_max"):
-        return "mirrored"
+        return "one"
     print(
         "\nAneurysm wall placement (max-strength aneurysms):\n"
-        "  1 = mirrored / both walls (default; peak lumen up to 3x inlet)\n"
-        "  2 = one wall only (max wall offset on top or bottom)\n"
+        "  1 = one wall only (default; max wall offset on top or bottom)\n"
+        "  2 = mirrored / both walls (peak lumen up to 3x inlet)\n"
     )
     while True:
         raw = input("Aneurysm walls [1/2] [1]: ").strip()
         if raw in ("", "1"):
-            return "mirrored"
-        if raw == "2":
             return "one"
+        if raw == "2":
+            return "mirrored"
         print("  Enter 1 or 2.")
 
 
@@ -330,6 +330,7 @@ def _sample_params(
         rng: np.random.Generator,
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
+        wound_probability: float | None = None,
 ) -> Dict[str, Any]:
     """
     Draw ALL random numbers for one vessel and return a plain picklable dict.
@@ -434,11 +435,12 @@ def _sample_params(
         path_loc = 2
     elif magnitude_mode in ("max_stenosis", "max_aneurysm") or hit_configured_max:
         # Max stenosis always uses both walls so diameter-occlusion targets stay exact.
-        # Max aneurysm: mirrored (both walls -> up to 3x inlet) or one-wall max offset.
+        # Forced max aneurysm: one-wall (default) or mirrored (both walls -> up to 3x inlet).
+        # Random pathology_max_hit snaps stay both-wall so the 3x lumen target remains defined.
         if (
             v_type == "aneurysm"
             and aneurysm_wall_mode == "one"
-            and (magnitude_mode == "max_aneurysm" or hit_configured_max)
+            and magnitude_mode == "max_aneurysm"
         ):
             path_loc = int(rng.choice([0, 1]))
         else:
@@ -517,6 +519,16 @@ def _sample_params(
             else:
                 amplitude = abs(float(amplitude))
 
+    # 5. Wound Sites
+    wound_sites = []
+    wound_prob = wound_probability if wound_probability is not None else cfg.wound_probability
+    if float(rng.random()) < wound_prob:
+        n_wounds = int(rng.integers(cfg.wound_count_range[0], cfg.wound_count_range[1] + 1))
+        for _ in range(n_wounds):
+            center = float(rng.uniform(*cfg.wound_center_frac_range))
+            half_w = float(rng.uniform(*cfg.wound_half_width_frac_range))
+            wound_sites.append({"center_frac": center, "half_width_frac": half_w})
+
     return {
         "idx": idx,
         "level": level,
@@ -535,6 +547,7 @@ def _sample_params(
         "path_loc": path_loc,
         "pathology_mode": pathology_mode or "random",
         "aneurysm_wall_mode": aneurysm_wall_mode,
+        "wound_sites": wound_sites,
     }
 
 
@@ -599,7 +612,11 @@ def recompute_pathology_offsets(
         offsets = mag * gauss * skew
 
     out["offsets"] = offsets.tolist()
-    wall_mode = normalize_aneurysm_wall_mode(out.get("aneurysm_wall_mode"))
+    # Missing key => legacy both-wall max (research / recompute callers).
+    if "aneurysm_wall_mode" in out:
+        wall_mode = normalize_aneurysm_wall_mode(out.get("aneurysm_wall_mode"))
+    else:
+        wall_mode = "mirrored"
     out["aneurysm_wall_mode"] = wall_mode
     if v_type == "straight":
         out["path_loc"] = 2
@@ -696,6 +713,26 @@ def _build_and_mesh(
         return idx, False, str(exc)
 
 
+def _split_wall_at_wounds(n: int, wound_sites: list) -> list[tuple[int, int, bool]]:
+    """Split control-point array into segments: [(start, end, is_wound), ...]."""
+    segments = []
+    cursor = 0
+    for ws in sorted(wound_sites, key=lambda w: w.center_frac):
+        i_lo = max(1, int((ws.center_frac - ws.half_width_frac) * n))
+        i_hi = min(n - 2, int((ws.center_frac + ws.half_width_frac) * n))
+        # Enforce minimum size for wound segment (3 points) to prevent degenerate splines
+        if i_hi - i_lo < 2:
+            i_lo = max(1, i_lo - 1)
+            i_hi = min(n - 2, i_hi + 1)
+        if cursor < i_lo:
+            segments.append((cursor, i_lo, False))
+        segments.append((i_lo, i_hi, True))
+        cursor = i_hi
+    if cursor < n - 1:
+        segments.append((cursor, n - 1, False))
+    return segments
+
+
 def _mesh_geometry(
     geom,
     cfg_dict: Dict[str, Any],
@@ -718,13 +755,41 @@ def _mesh_geometry(
 
         top_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in top_coords]
         bot_tags = [gmsh.model.geo.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in bot_coords]
+        
+        wound_sites = getattr(geom, "wound_sites", [])
+        top_segments = _split_wall_at_wounds(len(top_tags), wound_sites)
+        
+        s_top_list = []
+        healthy_top_curves = []
+        wound_top_curves = []
+        for (start, end, is_wound) in top_segments:
+            pts = top_tags[start:end+1]
+            curve = gmsh.model.geo.addBSpline(pts)
+            s_top_list.append(curve)
+            if is_wound:
+                wound_top_curves.append(curve)
+            else:
+                healthy_top_curves.append(curve)
+                
+        # Bottom is reversed, so we create the curves in reverse order of the segments
+        s_bot_list = []
+        healthy_bot_curves = []
+        wound_bot_curves = []
+        for (start, end, is_wound) in reversed(top_segments):
+            # reverse the points for the bottom curve
+            pts = list(reversed(bot_tags[start:end+1]))
+            curve = gmsh.model.geo.addBSpline(pts)
+            s_bot_list.append(curve)
+            if is_wound:
+                wound_bot_curves.append(curve)
+            else:
+                healthy_bot_curves.append(curve)
 
-        s_top = gmsh.model.geo.addBSpline(top_tags)
         l_out = gmsh.model.geo.addLine(top_tags[-1], bot_tags[-1])
-        s_bot = gmsh.model.geo.addBSpline(list(reversed(bot_tags)))
         l_in = gmsh.model.geo.addLine(bot_tags[0], top_tags[0])
 
-        cl = gmsh.model.geo.addCurveLoop([s_top, l_out, s_bot, l_in])
+        cl_components = s_top_list + [l_out] + s_bot_list + [l_in]
+        cl = gmsh.model.geo.addCurveLoop(cl_components)
         s = gmsh.model.geo.addPlaneSurface([cl])
         gmsh.model.geo.synchronize()
 
@@ -737,10 +802,13 @@ def _mesh_geometry(
         # no-slip on the bottom (where the clot attaches) and slip/symmetry on the top
         # (unperturbed freestream). Standard vessels keep the single lumped "Walls" group.
         if "Wall_Bottom" in tags and "Slip_Boundary" in tags:
-            gmsh.model.addPhysicalGroup(1, [s_bot], tags["Wall_Bottom"], name="Wall_Bottom")
-            gmsh.model.addPhysicalGroup(1, [s_top], tags["Slip_Boundary"], name="Slip_Boundary")
+            gmsh.model.addPhysicalGroup(1, healthy_bot_curves, tags["Wall_Bottom"], name="Wall_Bottom")
+            gmsh.model.addPhysicalGroup(1, healthy_top_curves, tags["Slip_Boundary"], name="Slip_Boundary")
         else:
-            gmsh.model.addPhysicalGroup(1, [s_top, s_bot], tags["Walls"], name="Walls")
+            gmsh.model.addPhysicalGroup(1, healthy_top_curves + healthy_bot_curves, tags["Walls"], name="Walls")
+            
+        if "Wound" in tags and (wound_top_curves or wound_bot_curves):
+            gmsh.model.addPhysicalGroup(1, wound_top_curves + wound_bot_curves, tags["Wound"], name="Wound")
 
         gmsh.model.mesh.generate(2)
 
@@ -814,6 +882,7 @@ class VesselGenerator:
         rng: np.random.Generator,
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
+        wound_probability: float | None = None,
     ) -> Dict[str, Any]:
         """Sample one vessel parameter dict.
 
@@ -827,6 +896,7 @@ class VesselGenerator:
             rng,
             pathology_mode=pathology_mode,
             aneurysm_wall_mode=aneurysm_wall_mode,
+            wound_probability=wound_probability,
         )
 
     def _cfg_dict(self) -> Dict[str, Any]:
@@ -924,6 +994,7 @@ class VesselGenerator:
         unit: str = "m",
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
+        wound_probability: float | None = None,
     ) -> None:
         """
         Parallel batch vessel generation.
@@ -945,8 +1016,8 @@ class VesselGenerator:
         pathology_mode : ``None``/``random`` (default), ``max_stenosis`` (~80% diameter
                          occlusion at peak), ``max_aneurysm`` (local width up to 3x inlet),
                          or ``straight_max`` (straight vessel + max stenosis or aneurysm).
-        aneurysm_wall_mode : ``mirrored`` (default, both walls) or ``one`` (max aneurysm
-                             offset on a single wall). Applies to max-strength aneurysms.
+        aneurysm_wall_mode : ``one`` (default, max offset on a single wall) or
+                             ``mirrored`` (both walls). Applies to max-strength aneurysms.
         """
         pathology_mode = normalize_pathology_mode(pathology_mode)
         aneurysm_wall_mode = normalize_aneurysm_wall_mode(aneurysm_wall_mode)
@@ -972,7 +1043,7 @@ class VesselGenerator:
             )
         if pathology_mode:
             logger.info("Pathology mode: %s", pathology_mode)
-        if aneurysm_wall_mode != "mirrored":
+        if aneurysm_wall_mode != "one":
             logger.info("Aneurysm wall mode: %s", aneurysm_wall_mode)
 
         cfg_d   = self._cfg_dict()
@@ -989,6 +1060,7 @@ class VesselGenerator:
                 rng,
                 pathology_mode=pathology_mode,
                 aneurysm_wall_mode=aneurysm_wall_mode,
+                wound_probability=wound_probability,
             )
             for i in range(n)
         ]
@@ -1070,6 +1142,7 @@ class VesselGenerator:
                     rng,
                     pathology_mode=pathology_mode,
                     aneurysm_wall_mode=aneurysm_wall_mode,
+                    wound_probability=wound_probability,
                 )
                 for failed_p in failed_params
             ]
@@ -1135,6 +1208,7 @@ class VesselGeneratorPhase3(VesselGenerator):
         unit: str = "m",
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
+        wound_probability: float | None = None,
     ) -> None:
         if start_idx is None:
             start_idx = 0
@@ -1149,6 +1223,7 @@ class VesselGeneratorPhase3(VesselGenerator):
             unit=unit,
             pathology_mode=pathology_mode,
             aneurysm_wall_mode=aneurysm_wall_mode,
+            wound_probability=wound_probability,
         )
 
 
@@ -1411,16 +1486,21 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--aneurysm-wall",
         choices=("mirrored", "one"),
-        default="mirrored",
+        default="one",
         help=(
-            "Max-strength aneurysm placement: mirrored/both walls (default) or one wall "
-            "(max wall offset on top or bottom)."
+            "Max-strength aneurysm placement: one wall (default; max wall offset on top "
+            "or bottom) or mirrored/both walls."
         ),
     )
     p.add_argument(
         "--show-vessel-plot",
         action="store_true",
         help="Show matplotlib preview of saved meshes (default: skip; avoids blocking on plot windows).",
+    )
+    p.add_argument(
+        "--wound",
+        action="store_true",
+        help="Enable synthetic wound sites (adds Wound tag to random boundary segments).",
     )
     p.add_argument("--no-plot", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -1449,6 +1529,7 @@ if __name__ == "__main__":
         unit_choice = str(args.unit).lower()
         pathology_mode = normalize_pathology_mode(args.pathology_mode)
         aneurysm_wall_mode = normalize_aneurysm_wall_mode(args.aneurysm_wall)
+        wound_probability = 1.0 if args.wound else 0.0
     else:
         phase_n = _prompt_int_choice("Dataset (1=kinematics, 2=biochem)", (1, 2))
         level = _prompt_int_choice("Level (0=straight, 1=curved, 2=pro-clot)", (0, 1, 2))
@@ -1486,6 +1567,7 @@ if __name__ == "__main__":
             "Show matplotlib preview of generated meshes after this run?",
             default=False,
         )
+        wound_probability = 1.0 if (args.wound or _prompt_yes_no("Add wound sites to vessels?", default=False)) else 0.0
 
     if all(trio):
         vg = VesselGenerator(phase=phase)
@@ -1505,6 +1587,7 @@ if __name__ == "__main__":
         unit=unit_choice,
         pathology_mode=pathology_mode,
         aneurysm_wall_mode=aneurysm_wall_mode,
+        wound_probability=wound_probability,
     )
 
     if show_vessel_plot:

@@ -20,6 +20,13 @@ class GeometryValidationError(ValueError):
 
 
 @dataclass
+class WoundSiteSpec:
+    """One wound site: arc-length fraction along the wall."""
+    center_frac: float   # fraction of arc length, ∈ (0,1)
+    half_width_frac: float  # half-width as fraction of total length
+
+
+@dataclass
 class VesselGeometry:
     idx: int
     n: int
@@ -36,6 +43,7 @@ class VesselGeometry:
     bot_wall_normals: np.ndarray
     meta: Dict[str, Any] = field(default_factory=dict)
     base_length: float = 0.0
+    wound_sites: list[WoundSiteSpec] = field(default_factory=list)
 
 
 def _wall_tangents_normals(top_coords: np.ndarray, bot_coords: np.ndarray):
@@ -63,6 +71,7 @@ def _build_meta(
     bot_tangents: np.ndarray,
     top_normals: np.ndarray,
     bot_normals: np.ndarray,
+    wound_sites: list[WoundSiteSpec] | None = None,
 ) -> Dict[str, Any]:
     curve_type = str(params.get("curve_type", "straight"))
     v_type = str(params.get("v_type", "straight"))
@@ -100,6 +109,12 @@ def _build_meta(
             meta[key] = float(params[key])
     if "clot_shape" in params:
         meta["clot_shape"] = str(params["clot_shape"])
+        
+    if wound_sites:
+        meta["wound_sites"] = [
+            {"center_frac": ws.center_frac, "half_width_frac": ws.half_width_frac}
+            for ws in wound_sites
+        ]
 
     return meta
 
@@ -158,6 +173,14 @@ def compute_geometry_from_params(params: Dict[str, Any], cfg_dict: Dict[str, Any
 
     top_t, bot_t, top_n, bot_n = _wall_tangents_normals(top_coords, bot_coords)
     d_inlet = float(np.linalg.norm(top_coords[0] - bot_coords[0]))
+    
+    wound_sites = []
+    for ws_dict in params.get("wound_sites", []):
+        wound_sites.append(WoundSiteSpec(
+            center_frac=ws_dict["center_frac"],
+            half_width_frac=ws_dict["half_width_frac"]
+        ))
+        
     meta = _build_meta(
         idx=idx,
         params=params,
@@ -172,6 +195,7 @@ def compute_geometry_from_params(params: Dict[str, Any], cfg_dict: Dict[str, Any
         bot_tangents=bot_t,
         top_normals=top_n,
         bot_normals=bot_n,
+        wound_sites=wound_sites,
     )
 
     geom = VesselGeometry(
@@ -190,6 +214,7 @@ def compute_geometry_from_params(params: Dict[str, Any], cfg_dict: Dict[str, Any
         bot_wall_normals=bot_n,
         meta=meta,
         base_length=L,
+        wound_sites=wound_sites,
     )
     validate_geometry(geom, cfg_dict, reference_width=width * unit_scale)
     return geom
@@ -218,8 +243,15 @@ def compute_geometry_from_walls(
     d_bar = float(np.mean(cross_widths))
     d_inlet = float(np.linalg.norm(top_coords[0] - bot_coords[0]))
     top_t, bot_t, top_n, bot_n = _wall_tangents_normals(top_coords, bot_coords)
-
+    
+    wound_sites = []
     p = dict(params or {})
+    for ws_dict in p.get("wound_sites", []):
+        wound_sites.append(WoundSiteSpec(
+            center_frac=ws_dict["center_frac"],
+            half_width_frac=ws_dict["half_width_frac"]
+        ))
+
     p.setdefault("curve_type", "edited")
     p.setdefault("v_type", "edited")
     p.setdefault("level", 0)
@@ -237,6 +269,7 @@ def compute_geometry_from_walls(
         bot_tangents=bot_t,
         top_normals=top_n,
         bot_normals=bot_n,
+        wound_sites=wound_sites,
     )
     L = float(base_length) if base_length is not None else float(np.max(pts[:, 0]) - np.min(pts[:, 0]) + 1e-9)
     return VesselGeometry(
@@ -255,6 +288,7 @@ def compute_geometry_from_walls(
         bot_wall_normals=bot_n,
         meta=meta,
         base_length=L,
+        wound_sites=wound_sites,
     )
 
 

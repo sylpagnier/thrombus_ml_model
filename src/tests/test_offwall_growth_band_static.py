@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from src.training.train_offwall_growth import _band_static_to_device
@@ -20,6 +22,19 @@ def test_band_static_to_device_moves_tensors_only():
     assert out["n_band"] == 4
     assert out["flow_cols"] == (1, 5)
     assert int(out["node_idx"].numel()) == 4
+
+
+def test_train_feat_source_band_is_default():
+    import argparse
+    from src.training import train_offwall_growth as mod
+
+    # Ensure CLI default stays on band (eval-matched features).
+    ap = argparse.ArgumentParser()
+    # Re-parse only the relevant flag by invoking main's parser construction is heavy;
+    # assert the default string embedded in help/choices path via module source contract.
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    assert '--train-feat-source"' in src or "--train-feat-source" in src
+    assert 'default="band"' in src
 
 
 def test_compound_val_requires_band_static_key():

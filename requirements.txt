@@ -7,7 +7,6 @@ pytest
 
 torch
 torch-geometric
-torchdiffeq
 
 meshio
 gmsh

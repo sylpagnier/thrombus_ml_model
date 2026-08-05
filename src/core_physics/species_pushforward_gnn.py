@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from src.architecture.pushforward_config import PushforwardConfig, resolve_config
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -49,7 +50,10 @@ def _sd() -> int:
     return pushforward_state_dim()
 
 
-def pushforward_ckpt_path() -> Path:
+def pushforward_ckpt_path(config: PushforwardConfig | None = None) -> Path:
+    config = resolve_config(config)
+    if config is not None:
+        return config.ckpt
     raw = (os.environ.get("SPECIES_PUSHFORWARD_CKPT") or DEFAULT_PUSHFORWARD_CKPT).strip()
     p = Path(raw)
     if not p.is_absolute():
@@ -57,15 +61,27 @@ def pushforward_ckpt_path() -> Path:
     return p
 
 
-def pushforward_unroll_steps() -> int:
+def pushforward_unroll_steps(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        # prefer .unroll if present (may be added concurrently); never use max_unroll here
+        u = getattr(config, "unroll", None)
+        if u is not None:
+            return max(int(u), 1)
     return max(int(float(os.environ.get("SPECIES_PUSHFORWARD_UNROLL", "10") or "10")), 1)
 
 
-def pushforward_step_stride() -> int:
+def pushforward_step_stride(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.step_stride
     return max(int(float(os.environ.get("SPECIES_PUSHFORWARD_STEP_STRIDE", "1") or "1")), 1)
 
 
-def pushforward_input_noise() -> float:
+def pushforward_input_noise(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.input_noise
     raw = (os.environ.get("SPECIES_PUSHFORWARD_INPUT_NOISE") or "0.05").strip()
     try:
         return max(float(raw), 0.0)
@@ -75,16 +91,24 @@ def pushforward_input_noise() -> float:
 
 def pushforward_focal_alpha_channels() -> tuple[float, float]:
     """Higher default alpha for sparse growth-front targets."""
+    from src.architecture.pushforward_config import resolve_config
     from src.core_physics.species_snapshot_gnn import _env_float_channel
 
+    cfg = resolve_config()
+    if cfg is not None:
+        return float(cfg.focal_alpha_fi), float(cfg.focal_alpha_mat)
     fi = _env_float_channel("SPECIES_PUSHFORWARD_FOCAL_ALPHA_FI", 0.95)
     mat = _env_float_channel("SPECIES_PUSHFORWARD_FOCAL_ALPHA_MAT", 0.92)
     return fi, mat
 
 
 def pushforward_focal_gamma_channels() -> tuple[float, float]:
+    from src.architecture.pushforward_config import resolve_config
     from src.core_physics.species_snapshot_gnn import _env_float_channel, snapshot_focal_gamma
 
+    cfg = resolve_config()
+    if cfg is not None:
+        return float(cfg.focal_gamma_fi), float(cfg.focal_gamma_mat)
     base = snapshot_focal_gamma()
     fi = _env_float_channel("SPECIES_PUSHFORWARD_FOCAL_GAMMA_FI", base)
     mat = _env_float_channel("SPECIES_PUSHFORWARD_FOCAL_GAMMA_MAT", base)
@@ -108,7 +132,10 @@ def pushforward_growth_thresholds() -> tuple[float, float]:
     return fi, mat
 
 
-def pushforward_train_t0_max() -> int | None:
+def pushforward_train_t0_max(config: PushforwardConfig | None = None) -> int | None:
+    config = resolve_config(config)
+    if config is not None:
+        return config.train_t0_max
     raw = (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MAX") or "").strip()
     if not raw:
         return None
@@ -118,7 +145,10 @@ def pushforward_train_t0_max() -> int | None:
         return None
 
 
-def pushforward_train_t0_min() -> int | None:
+def pushforward_train_t0_min(config: PushforwardConfig | None = None) -> int | None:
+    config = resolve_config(config)
+    if config is not None:
+        return config.train_t0_min
     raw = (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_MIN") or "").strip()
     if not raw:
         return None
@@ -128,7 +158,10 @@ def pushforward_train_t0_min() -> int | None:
         return None
 
 
-def pushforward_tau_center() -> int:
+def pushforward_tau_center(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.tau_center
     raw = (os.environ.get("SPECIES_PUSHFORWARD_TAU_CENTER") or "25").strip()
     try:
         return int(float(raw))
@@ -136,7 +169,10 @@ def pushforward_tau_center() -> int:
         return 25
 
 
-def pushforward_tau_sigma() -> float:
+def pushforward_tau_sigma(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.tau_sigma
     raw = (os.environ.get("SPECIES_PUSHFORWARD_TAU_SIGMA") or "6").strip()
     try:
         return max(float(raw), 1.0)
@@ -156,15 +192,20 @@ def pushforward_window_t0_weight(t0: int) -> float:
     return floor + (1.0 - floor) * bump
 
 
-def pushforward_val_score_weights() -> tuple[float, float]:
-    try:
-        gw = float(os.environ.get("SPECIES_PUSHFORWARD_SCORE_GROWTH_W", "0.75") or "0.75")
-    except ValueError:
-        gw = 0.75
-    try:
-        sw = float(os.environ.get("SPECIES_PUSHFORWARD_SCORE_STATE_W", "0.25") or "0.25")
-    except ValueError:
-        sw = 0.25
+def pushforward_val_score_weights(config: PushforwardConfig | None = None) -> tuple[float, float]:
+    config = resolve_config(config)
+    if config is not None:
+        gw = float(config.score_growth_w)
+        sw = float(config.score_state_w)
+    else:
+        try:
+            gw = float(os.environ.get("SPECIES_PUSHFORWARD_SCORE_GROWTH_W", "0.75") or "0.75")
+        except ValueError:
+            gw = 0.75
+        try:
+            sw = float(os.environ.get("SPECIES_PUSHFORWARD_SCORE_STATE_W", "0.25") or "0.25")
+        except ValueError:
+            sw = 0.25
     norm = max(gw + sw, 1e-6)
     return gw / norm, sw / norm
 
@@ -206,8 +247,12 @@ def filter_pushforward_windows(
     return out
 
 
-def step_loss_weights(n_steps: int) -> list[float]:
-    mode = (os.environ.get("SPECIES_PUSHFORWARD_STEP_LOSS") or "linear").strip().lower()
+def step_loss_weights(n_steps: int, config: PushforwardConfig | None = None) -> list[float]:
+    config = resolve_config(config)
+    if config is not None:
+        mode = str(config.step_loss or "linear").strip().lower()
+    else:
+        mode = (os.environ.get("SPECIES_PUSHFORWARD_STEP_LOSS") or "linear").strip().lower()
     if mode in ("uniform", "flat", "1"):
         return [1.0] * max(n_steps, 1)
     # linear: weight later unroll steps more (error accumulation)
@@ -215,18 +260,71 @@ def step_loss_weights(n_steps: int) -> list[float]:
     return [(step + 1) / denom for step in range(n_steps)]
 
 
+STAGNATION_FEATS_DIM = 4  # [log1p(speed), log1p(shear), x_n, y_n]
+
+
+def band_extra_feature_dim() -> int:
+    """Channels appended to ``[z_kin, sdf]`` in ``build_band_base_features`` (before state)."""
+    n = 0
+    if flow_feats_enabled():
+        n += FLOW_FEATS_DIM
+    elif stagnation_feats_enabled():
+        n += STAGNATION_FEATS_DIM
+    if geom_feats_enabled():
+        n += geom_feats_dim()
+    if flux_stag_feats_enabled():
+        n += FLUX_STAG_DIM
+    # Trailing block -- must stay last so warm-start column widening aligns.
+    if flow_feats_enabled() and flow_feats_multihop_enabled():
+        n += FLOW_MULTIHOP_DIM
+    return int(n)
+
+
+def band_feats_cache_tag() -> str:
+    """Pack-cache fingerprint so geom/flux/flow legs do not reuse control ``base_feats``."""
+    parts: list[str] = []
+    if flow_feats_enabled():
+        parts.append(f"flow{FLOW_FEATS_DIM}")
+        if flow_feats_drop_xy():
+            parts.append("dropxy")
+        if flow_feats_dynamic():
+            parts.append("dyn")
+        src = flow_feats_source()
+        parts.append(f"src{src}")
+        # Deploy-faithful packs must not reuse GT-baked dynamic series.
+        if src != "gt":
+            parts.append("nofgty")
+    elif stagnation_feats_enabled():
+        parts.append(f"stag{STAGNATION_FEATS_DIM}")
+    if geom_feats_enabled():
+        parts.append(f"geom{geom_feats_dim()}")
+    if flux_stag_feats_enabled():
+        parts.append(f"flux{FLUX_STAG_DIM}")
+    if flow_feats_enabled() and flow_feats_multihop_enabled():
+        parts.append(f"mh{FLOW_MULTIHOP_DIM}")
+    return "_".join(parts) if parts else "nofeat"
+
+
 def pushforward_feature_dim(latent_dim: int, *, state_dim: int | None = None) -> int:
+    """``[z_kin, sdf, band_extras..., state_norm]`` width (continuous step adds sat/time later)."""
     sd = _sd() if state_dim is None else int(state_dim)
-    return int(latent_dim) + 1 + sd
+    return int(latent_dim) + 1 + band_extra_feature_dim() + sd
 
 
-def stagnation_feats_enabled() -> bool:
+def stagnation_feats_enabled(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.stagnation_feats
     """Move 4: append deployable low-shear/stagnation proxy features to band inputs."""
     raw = (os.environ.get("SPECIES_STAGNATION_FEATS") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def geom_feats_enabled() -> bool:
+def geom_feats_enabled(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return bool(config.geom_feats or config.geom_feats_rich)
     """Append deployable NON-FLOW geometry discriminators (width / expansion / wall curvature).
 
     Distinct from flow/stagnation feats: these are STATIC geometry only (no kine solve), encoding
@@ -247,11 +345,23 @@ def geom_feats_rich_enabled() -> bool:
     versions alone -- separate *committed* clot pockets from merely *eligible* wall nodes. Static,
     clot-blind, no kine solve, so it stays deployable.
     """
+    try:
+        from src.architecture.pushforward_config import get_active_config
+
+        cfg = get_active_config()
+        if cfg is not None:
+            return bool(cfg.geom_feats_rich)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_GEOM_FEATS_RICH") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def flow_feats_enabled() -> bool:
+def flow_feats_enabled(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.flow_feats
     """Full clot-aware flow feature set on band inputs: speed + shear + divergence + geometry.
 
     The GraphSAGE input is otherwise `[z_kin, sdf]` -- a *clot-blind* latent -- so the teacher
@@ -265,19 +375,19 @@ def flow_feats_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-def flow_feats_source() -> str:
-    """Velocity source for the flow features.
+def flow_feats_source(config: PushforwardConfig | None = None) -> str:
 
-    * ``gt``   -- COMSOL ``data.y[t][:, 0:2]`` (clot-aware ground truth; training).
-    * ``kine`` -- frozen GINO-DEQ prediction (clot-blind).
-    * ``auto`` -- kine base flow, overridden by the corrector-coupled flow when coupling is on
-      (the deploy default; closes the loop with the running clot prediction).
-    """
+    config = resolve_config(config)
+    if config is not None:
+        return config.flow_feats_source
     return (os.environ.get("SPECIES_FLOW_FEATS_SOURCE") or "auto").strip().lower()
 
 
-def flow_feats_time() -> int:
-    """Representative GT time index for the (static) flow features; <0 = last (formed clot)."""
+def flow_feats_time(config: PushforwardConfig | None = None) -> int:
+
+    config = resolve_config(config)
+    if config is not None:
+        return int(config.flow_feats_time)
     raw = (os.environ.get("SPECIES_FLOW_FEATS_TIME") or "-1").strip()
     try:
         return int(float(raw))
@@ -285,35 +395,29 @@ def flow_feats_time() -> int:
         return -1
 
 
-def flow_feats_ablate() -> bool:
-    """Verification knob: zero the flow feature block (keep its width) to test the latent leash.
+def flow_feats_ablate(config: PushforwardConfig | None = None) -> bool:
 
-    A latent-leashed teacher that actually reads the explicit flow should LOSE F1 when these are
-    zeroed; a latent-dominant teacher is unaffected (the `+0.008` ceiling).
-    """
+    config = resolve_config(config)
+    if config is not None:
+        return config.flow_feats_ablate
     raw = (os.environ.get("SPECIES_FLOW_FEATS_ABLATE") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def flow_feats_drop_xy() -> bool:
-    """Ablate only spatial coordinates from flow block while keeping dynamics channels.
+def flow_feats_drop_xy(config: PushforwardConfig | None = None) -> bool:
 
-    Keeps ``[log_speed, log_shear, tanh_div]`` and zeroes ``[x_norm, y_norm]``. This targets
-    inlet/outlet spatial memorization without removing the physically meaningful flow cues.
-    """
+    config = resolve_config(config)
+    if config is not None:
+        return config.flow_feats_drop_xy
     raw = (os.environ.get("SPECIES_FLOW_FEATS_DROP_XY") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def flow_feats_dynamic() -> bool:
-    """Time-varying flow features (Trap C): recompute the flow block per rollout step from the
-    velocity at *that* step's time, instead of a single static (final-clot) snapshot.
+def flow_feats_dynamic(config: PushforwardConfig | None = None) -> bool:
 
-    When on, ``build_band_base_features`` also returns a per-time ``flow_series`` (from
-    ``data.y[t][:, 0:2]`` -- GT velocity in training/gate, per-step coupled velocity at deploy after
-    ``write_coupled_flow_into_y``); the rollout splices ``flow_series[t]`` into the flow columns each
-    step. The static base_feats flow block stays at the representative time for step-0 / fallback.
-    """
+    config = resolve_config(config)
+    if config is not None:
+        return config.flow_feats_dynamic
     raw = (os.environ.get("SPECIES_FLOW_FEATS_DYNAMIC") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -366,6 +470,37 @@ def _resolve_flow_uv(data, kine_model, device: torch.device) -> tuple[torch.Tens
 
 
 FLOW_FEATS_DIM = 5  # [log1p(speed), log1p(shear), tanh(div), x_n, y_n]
+FLOW_MULTIHOP_DIM = 2  # [log1p(hop1_speed), log1p(hop2_speed)]
+
+
+def flow_feats_multihop_enabled() -> bool:
+    """Append hop-2/hop-3 neighbourhood mean speed to the flow block."""
+    from src.architecture.pushforward_config import resolve_config
+
+    cfg = resolve_config()
+    if cfg is not None:
+        return bool(cfg.flow_feats_multihop)
+    return (os.environ.get("SPECIES_FLOW_FEATS_MULTIHOP") or "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _nonzero_neighbor_mean(
+    vals: torch.Tensor, row: torch.Tensor, col: torch.Tensor, n: int
+) -> torch.Tensor:
+    """Mean of a node's neighbours, counting only neighbours with non-zero value.
+
+    Wall nodes are no-slip (``speed == 0``), so a plain neighbour mean over a wall-hugging
+    band is dominated by structural zeros and washes the signal out. Masking to non-zero
+    neighbours makes hop-k a real measure of *nearby moving fluid*.
+    """
+    v = vals.reshape(-1)[col]
+    m = (v > 1e-9).to(dtype=v.dtype)
+    s = torch.zeros(n, device=v.device, dtype=v.dtype)
+    c = torch.zeros(n, device=v.device, dtype=v.dtype)
+    s.index_add_(0, row, v * m)
+    c.index_add_(0, row, m)
+    return s / c.clamp(min=1.0)
 
 
 @torch.no_grad()
@@ -402,9 +537,16 @@ def _flow_feats_from_uv(
     if flow_feats_drop_xy():
         xy = torch.zeros_like(xy)
 
+    from src.architecture.pushforward_config import resolve_config
+
+    _cfg = resolve_config()
     use_shear = (
-        os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1"
-        or os.environ.get("SPECIES_FRONTIER_KINETICS") == "1"
+        (bool(_cfg.shear_readout_gate) or bool(_cfg.frontier_kinetics))
+        if _cfg is not None
+        else (
+            os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1"
+            or os.environ.get("SPECIES_FRONTIER_KINETICS") == "1"
+        )
     )
     if use_shear:
         from src.utils.rheology import compute_shear_rate
@@ -450,6 +592,37 @@ def _flow_feats_from_uv(
 
 
 @torch.no_grad()
+def _flow_multihop_band_features(
+    data, u: torch.Tensor, v: torch.Tensor, device: torch.device, node_idx: torch.Tensor
+) -> torch.Tensor:
+    """``[log1p(hop1_speed), log1p(hop2_speed)]`` on band nodes.
+
+    Hop set chosen by `scripts/probe_multihop_flow.py` (leave-one-vessel-out, n=32):
+    hop1 alone 0.512 (chance), hop2 alone 0.632, **hop1+hop2 0.643**, hop1+2+3 0.612 --
+    hop3 over-smooths and measurably hurts. Note hop1 here is the non-zero-masked
+    neighbour mean *speed*, which the existing 5-ch flow block does not carry: its own
+    speed channel is identically 0 on wall nodes (no-slip).
+
+    Kept as its own trailing block (appended *after* geom / flux_stag) rather than folded
+    into the 5-ch flow block. ``load_pushforward_state_dict_partial`` widens a warm-start
+    by inserting zero columns at ``old_in - tail``, i.e. immediately before the
+    state/sat/time tail -- so new channels must sit at the end of the band extras or every
+    geom and flux column silently shifts.
+    """
+    u = u.reshape(-1).to(device=device)
+    v = v.reshape(-1).to(device=device)
+    speed = torch.sqrt(u * u + v * v)
+    n = int(data.num_nodes)
+    row, col = data.edge_index.to(device=device)
+    h1 = _nonzero_neighbor_mean(speed, row, col, n)
+    h2 = _nonzero_neighbor_mean(h1, row, col, n)
+    feats = torch.stack(
+        [torch.log1p(h1.clamp(min=0)), torch.log1p(h2.clamp(min=0))], dim=1
+    )
+    return feats[node_idx]
+
+
+@torch.no_grad()
 def _flow_band_features(data, kine_model, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
     """Static (single representative time) clot-aware flow proxies on band nodes.
 
@@ -461,11 +634,10 @@ def _flow_band_features(data, kine_model, device: torch.device, node_idx: torch.
 
 @torch.no_grad()
 def _flow_feats_series_from_y(data, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
-    """Per-time flow block ``[n_times, n_band, FLOW_FEATS_DIM]`` from the velocity in ``data.y``.
+    """Per-time flow block ``[n_times, n_band, FLOW_FEATS_DIM]`` from UV in ``data.y``.
 
-    ``data.y[t][:, 0:2]`` holds the time-``t`` velocity: GT COMSOL (clot-aware) in training / the
-    gt-flow gate, or the per-step corrector-coupled field at deploy (see ``write_coupled_flow_into_y``).
-    This is the time-varying signal the static snapshot cannot represent (Trap C).
+    Used only for explicit ``flow_feats_source=gt`` crutch legs / GT ceiling diagnostics.
+    Deploy-faithful ``auto``/``kine`` paths use :func:`build_flow_feats_series` instead.
     """
     n_t = int(data.y.shape[0])
     series = []
@@ -473,6 +645,99 @@ def _flow_feats_series_from_y(data, device: torch.device, node_idx: torch.Tensor
         y = data.y[ti].to(device=device, dtype=torch.float32)
         series.append(_flow_feats_from_uv(data, y[:, 0], y[:, 1], device, node_idx))
     return torch.stack(series, dim=0)
+
+
+@torch.no_grad()
+def build_flow_feats_series(
+    data,
+    kine_model,
+    device: torch.device,
+    node_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Per-time flow block gated by ``flow_feats_source``.
+
+    * ``gt``: COMSOL / ``data.y`` UV (crutch A/B only).
+    * ``kine`` / ``auto``: one deployable UV via :func:`_resolve_flow_uv` (RGP-DEQ /
+      ``u0_pred``, optional coupled override), broadcast across ``T``. Cold deploy then
+      overwrites ``t+1`` online via the local corrector.
+    """
+    src = flow_feats_source()
+    if src == "gt" and getattr(data, "y", None) is not None and data.y.dim() == 3:
+        return _flow_feats_series_from_y(data, device, node_idx)
+    n_t = (
+        int(data.y.shape[0])
+        if getattr(data, "y", None) is not None and data.y.dim() == 3
+        else 1
+    )
+    u, v = _resolve_flow_uv(data, kine_model, device)
+    feat = _flow_feats_from_uv(data, u, v, device, node_idx)
+    return feat.unsqueeze(0).expand(max(n_t, 1), -1, -1).contiguous()
+
+
+@torch.no_grad()
+def flow_feats_series_from_band_velocity(
+    data,
+    device: torch.device,
+    node_idx: torch.Tensor,
+    band_uv_list: list[torch.Tensor],
+) -> torch.Tensor:
+    """Build ``[len(list), n_band, FLOW_FEATS_DIM]`` from band UV ``(N_band, 2)``.
+
+    Matches ``model.velocity`` / ``band_uv_for_model``. Off-band nodes keep ``u0_pred``
+    (or zeros) so full-graph shear/div at the band edge stay well-defined.
+    """
+    n = int(data.num_nodes)
+    idx = node_idx.reshape(-1).to(device=device)
+    if getattr(data, "u0_pred", None) is not None and getattr(data, "v0_pred", None) is not None:
+        u_base = data.u0_pred.to(device=device, dtype=torch.float32).reshape(-1)
+        v_base = data.v0_pred.to(device=device, dtype=torch.float32).reshape(-1)
+    else:
+        u_base = torch.zeros(n, device=device, dtype=torch.float32)
+        v_base = torch.zeros(n, device=device, dtype=torch.float32)
+    out: list[torch.Tensor] = []
+    for uv in band_uv_list:
+        uv_b = uv.to(device=device, dtype=torch.float32).reshape(-1, 2)
+        u = u_base.clone()
+        v = v_base.clone()
+        u[idx] = uv_b[:, 0]
+        v[idx] = uv_b[:, 1]
+        out.append(_flow_feats_from_uv(data, u, v, device, node_idx))
+    return torch.stack(out, dim=0)
+
+
+@torch.no_grad()
+def overlay_flow_series_for_window(
+    base_series: torch.Tensor | None,
+    data,
+    device: torch.device,
+    node_idx: torch.Tensor,
+    time_window: list[int] | tuple[int, ...],
+    band_uv_list: list[torch.Tensor],
+) -> torch.Tensor | None:
+    """Overwrite absolute timeline rows in ``base_series`` with UV-matched window feats.
+
+    ``splice_dynamic_flow`` indexes by absolute ``time_window[step]``, so the series must
+    stay length ``n_times``. No-op when ``flow_feats_source == "gt"`` (keep COMSOL pack).
+    """
+    if not band_uv_list or not time_window:
+        return base_series
+    if flow_feats_source() == "gt":
+        return base_series
+    win_feats = flow_feats_series_from_band_velocity(data, device, node_idx, band_uv_list)
+    if base_series is None:
+        n_t = (
+            int(data.y.shape[0])
+            if getattr(data, "y", None) is not None and data.y.dim() == 3
+            else max(int(max(time_window)) + 1, len(band_uv_list))
+        )
+        base = win_feats[0].unsqueeze(0).expand(n_t, -1, -1).contiguous().clone()
+    else:
+        base = base_series.clone()
+    for i, ti in enumerate(time_window):
+        t = int(ti)
+        if 0 <= t < int(base.shape[0]) and i < int(win_feats.shape[0]):
+            base[t] = win_feats[i]
+    return base
 
 
 @torch.no_grad()
@@ -512,6 +777,21 @@ def _stagnation_band_features(data, kine_model, device: torch.device, node_idx: 
 
 GEOM_FEATS_DIM = 3  # [width, width_gradient, wall_curvature]
 GEOM_FEATS_RICH_DIM = 5  # + [width_gradient_2hop, wall_curvature_2hop]
+
+
+FLUX_STAG_DIM = 1  # single channel: is_low_shear * (1 + beta * residence)
+
+
+def flux_stag_feats_enabled() -> bool:
+    try:
+        from src.architecture.pushforward_config import get_active_config
+
+        cfg = get_active_config()
+        if cfg is not None:
+            return bool(cfg.flux_stag_feat)
+    except Exception:
+        pass
+    return (os.environ.get("SPECIES_FLUX_STAG_FEAT") or "0").strip() in ("1", "true", "yes", "on")
 
 
 def geom_feats_dim() -> int:
@@ -571,6 +851,76 @@ def _geometry_band_features(data, device: torch.device, node_idx: torch.Tensor) 
     return (feats - mu) / sd
 
 
+@torch.no_grad()
+def _flux_stag_band_features(data, kine_model, device: torch.device, node_idx: torch.Tensor) -> torch.Tensor:
+    u, v = _base_uv_from_data(data, kine_model, device)
+    from src.inference.corrector_coupling import corrector_coupling_enabled, get_coupled_flow
+
+    if corrector_coupling_enabled():
+        coupled = get_coupled_flow(data, device)
+        if coupled is not None:
+            u, v = coupled[0].to(dtype=u.dtype), coupled[1].to(dtype=v.dtype)
+            
+    speed = torch.sqrt(u * u + v * v)
+    pos = data.x[:, :2].to(device=device, dtype=speed.dtype)
+    row, col = data.edge_index.to(device=device)
+    dist = (pos[row] - pos[col]).norm(dim=1).clamp(min=1e-6)
+    grad = (speed[row] - speed[col]).abs() / dist
+    n = int(data.num_nodes)
+    acc = torch.zeros(n, device=device, dtype=speed.dtype)
+    deg = torch.zeros(n, device=device, dtype=speed.dtype)
+    acc.index_add_(0, row, grad)
+    deg.index_add_(0, row, torch.ones_like(grad))
+    shear_proxy = acc / deg.clamp(min=1.0)
+    
+    lss_thresh = 0.1
+    T_ls = 0.02
+    is_low_shear = torch.sigmoid((lss_thresh - shear_proxy) / T_ls)
+    residence = torch.exp(-speed.clamp(0, 10))
+    flux_stag = is_low_shear * (1.0 + 0.5 * residence)
+    
+    feats = flux_stag.unsqueeze(1)[node_idx]
+    mu = feats.mean(dim=0, keepdim=True)
+    sd = feats.std(dim=0, keepdim=True).clamp(min=1e-6)
+    return (feats - mu) / sd
+
+
+def ensure_band_mesh_priors(static: dict, data) -> dict:
+    """Fill mesh normal/SDF/edge_attr band caches on older pack snapshots."""
+    if static is None or data is None:
+        return static
+    node_idx = static.get("node_idx")
+    if node_idx is None or not hasattr(data, "x") or data.x is None:
+        return static
+    # data.x is KINE_X_SCHEMA (NodeFeat); BiochemNodeFeat is for data.x_biochem only.
+    need = (
+        static.get("wall_normals_band") is None
+        or static.get("sdf_band") is None
+        or static.get("edge_attr_band") is None
+    )
+    if not need:
+        return static
+    x = data.x
+    if static.get("wall_normals_band") is None:
+        static["wall_normals_band"] = x[node_idx, NodeFeat.WALL_NORMAL].detach().clone()
+    if static.get("sdf_band") is None:
+        static["sdf_band"] = x[node_idx, NodeFeat.SDF].reshape(-1).detach().clone()
+    if static.get("edge_attr_band") is None:
+        edge_index = static.get("edge_index")
+        pos = static.get("pos_band")
+        if getattr(data, "edge_attr", None) is not None and data.edge_attr.numel() > 0:
+            band = torch.zeros(int(data.num_nodes), dtype=torch.bool)
+            band[node_idx] = True
+            row, col = data.edge_index
+            keep = band[row] & band[col]
+            static["edge_attr_band"] = data.edge_attr[keep].detach().clone()
+        elif edge_index is not None and pos is not None:
+            from src.core_physics.species_physics_gat import geometric_edge_attr
+
+            static["edge_attr_band"] = geometric_edge_attr(edge_index, pos)
+    return static
+
+
 def build_band_base_features(
     data,
     kine_model,
@@ -610,8 +960,11 @@ def build_band_base_features(
             flow = torch.zeros_like(flow)  # verification: width preserved, signal removed
         base_feats = torch.cat([base_feats, flow], dim=1)
         # Trap C: per-time flow block so the rollout can splice the time-varying field each step.
+        # Source-gated: gt reads data.y; auto/kine seed from RGP-DEQ / u0_pred (nofgty).
         if flow_feats_dynamic() and getattr(data, "y", None) is not None and data.y.dim() == 3:
-            flow_series = _flow_feats_series_from_y(data, device, node_idx).to(dtype=base_feats.dtype)
+            flow_series = build_flow_feats_series(
+                data, kine_model, device, node_idx
+            ).to(dtype=base_feats.dtype)
             if flow_feats_ablate():
                 flow_series = torch.zeros_like(flow_series)
             flow_cols = (flow_start, int(flow.shape[1]))
@@ -622,10 +975,32 @@ def build_band_base_features(
         # Independent of flow/stagnation: append static non-flow geometry discriminators (leg C).
         geom = _geometry_band_features(data, device, node_idx).to(dtype=base_feats.dtype)
         base_feats = torch.cat([base_feats, geom], dim=1)
+    if flux_stag_feats_enabled():
+        fstag = _flux_stag_band_features(data, kine_model, device, node_idx).to(dtype=base_feats.dtype)
+        base_feats = torch.cat([base_feats, fstag], dim=1)
+    if flow_feats_enabled() and flow_feats_multihop_enabled():
+        # Trailing block (see _flow_multihop_band_features): keep last for warm-start.
+        mu_, mv_ = _resolve_flow_uv(data, kine_model, device)
+        mh = _flow_multihop_band_features(data, mu_, mv_, device, node_idx).to(dtype=base_feats.dtype)
+        base_feats = torch.cat([base_feats, mh], dim=1)
     pos_band = data.x[node_idx, :2].to(device=device, dtype=base_feats.dtype)
     from src.core_physics.clot_phi_simple import _wall_mask_from_data
+
     wall_mask_full = _wall_mask_from_data(data, device, n)
     wall_mask_band = wall_mask_full[node_idx]
+    # Mesh wall normals + SDF for physics_gat (Stage-A faithful); never estimate when present.
+    # data.x is KINE_X_SCHEMA — use NodeFeat, not BiochemNodeFeat (that is x_biochem).
+    x_full = data.x.to(device=device, dtype=base_feats.dtype)
+    wall_normals_band = x_full[node_idx, NodeFeat.WALL_NORMAL]
+    sdf_band = x_full[node_idx, NodeFeat.SDF].reshape(-1)
+    row_f, col_f = data.edge_index.to(device=device)
+    keep_e = band[row_f] & band[col_f]
+    if getattr(data, "edge_attr", None) is not None and data.edge_attr.numel() > 0:
+        edge_attr_band = data.edge_attr.to(device=device, dtype=base_feats.dtype)[keep_e]
+    else:
+        from src.core_physics.species_physics_gat import geometric_edge_attr
+
+        edge_attr_band = geometric_edge_attr(edge_sub, pos_band)
     return {
         "base_feats": base_feats,
         "pos_band": pos_band,
@@ -639,6 +1014,9 @@ def build_band_base_features(
         "flow_series": flow_series,  # [n_t, n_band, flow_dim] when dynamic, else None
         "flow_cols": flow_cols,      # (start, width) of the flow block in base_feats, else None
         "wall_mask_band": wall_mask_band,
+        "wall_normals_band": wall_normals_band,
+        "sdf_band": sdf_band,
+        "edge_attr_band": edge_attr_band,
     }
 
 
@@ -703,8 +1081,8 @@ def maybe_noise_state(state: torch.Tensor, *, training: bool) -> torch.Tensor:
 class SpeciesPushforwardGNN(SpeciesSnapshotGNN):
     """Phase 2 GNN: same GraphSAGE + residual readout, wider input for prior state."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
-        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None, arch: str = "sage"):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim, arch=arch)
 
 
 def iter_pushforward_windows(

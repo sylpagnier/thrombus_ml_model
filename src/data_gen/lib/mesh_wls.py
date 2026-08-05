@@ -43,11 +43,12 @@ def precompute_wls_operators(edge_index: torch.Tensor, num_nodes: int, pos_tenso
     return V, W, M_inv
 
 
-def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build inlet / outlet / wall boolean masks from Gmsh line physical tags."""
+def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build inlet / outlet / wall / wound boolean masks from Gmsh line physical tags."""
     mask_inlet = torch.zeros(num_nodes, dtype=torch.bool)
     mask_outlet = torch.zeros(num_nodes, dtype=torch.bool)
     mask_wall = torch.zeros(num_nodes, dtype=torch.bool)
+    mask_wound = torch.zeros(num_nodes, dtype=torch.bool)
 
     line_cells = []
     line_tags = []
@@ -55,6 +56,7 @@ def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tupl
     t_in = tags["Inlet"]
     t_out = tags["Outlet_1"]
     t_wall = tags["Walls"]
+    t_wound = tags.get("Wound")
 
     try:
         if "line" in mesh.cells_dict:
@@ -104,9 +106,12 @@ def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tupl
             mask_outlet[idx] = True
         elif tag == t_wall:
             mask_wall[idx] = True
+        elif t_wound is not None and tag == t_wound:
+            mask_wound[idx] = True
 
-    mask_inlet = mask_inlet & (~mask_wall)
-    mask_outlet = mask_outlet & (~mask_wall)
+    mask_wall = mask_wall & (~mask_wound)
+    mask_inlet = mask_inlet & (~mask_wall) & (~mask_wound)
+    mask_outlet = mask_outlet & (~mask_wall) & (~mask_wound)
 
     unique_tags = sorted({int(t) for t in line_tags})
     tag_msg = f"Unique gmsh:physical line tags present in mesh: {unique_tags}. " f"Expected Inlet={t_in}, Outlet_1={t_out}, Walls={t_wall}."
@@ -137,7 +142,7 @@ def gmsh_line_boundary_masks(mesh, num_nodes: int, tags: Dict[str, int]) -> Tupl
             "carving (tags overlap on shared vertices). Fix boundary curve tagging in Gmsh."
         )
 
-    return mask_inlet, mask_outlet, mask_wall
+    return mask_inlet, mask_outlet, mask_wall, mask_wound
 
 
 __all__ = ["precompute_wls_operators", "gmsh_line_boundary_masks"]

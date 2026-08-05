@@ -119,6 +119,7 @@ def forward_physics_trigger_phi(
     apply_region: bool = True,
     time_index: int | None = None,
     mu_anchor_si: torch.Tensor | None = None,
+    gelation_beta: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Explicit Mat/FI gelation trigger (no learned head)."""
     sp = species_log1p if species_log1p is not None else step.species_log_gt
@@ -133,6 +134,7 @@ def forward_physics_trigger_phi(
             v_nd=step.v_flow_nd,
             phys_cfg=phys_cfg,
             time_index=time_index,
+            gelation_beta=gelation_beta,
         )
     )
     region = step.region if apply_region else None

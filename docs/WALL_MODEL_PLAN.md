@@ -1,0 +1,1354 @@
+# Wall Model Plan — deploy clot score >0.5 (stretch >0.6) on unseen vessels
+
+Active working plan as of **2026-08-05 (rev 4)**. Supersedes the "next step" sections of
+[`GENERALIZATION_PLAN.md`](GENERALIZATION_PLAN.md), which remains the historical record
+and the source for EDA / eval-protocol background.
+
+**Rev 2 retracted rev 1's §2.2 multi-hop-feature diagnosis** — the 6 GPU-h sweep tested it
+and it was wrong (§3a). **Rev 3** executed the pocket gate (§2.7), tested and falsified
+the "different trigger" explanation for why it fails on some vessels (§2.9 — same
+physics, but the trained checkpoint ties a true and false pocket at identical flow
+depth), and proposed commitment-timing as an untested second signal to break that tie
+(§2.10, Plan Step 1b).
+
+**Rev 4 retracts two rev-3 readings and opens a parallel sub-cohort track (§9):**
+Step 1b is **DONE and negative** — commit-order does not separate the tie on either
+vessel tested, and the §2.9 "tied at 0.048 vs 0.047" claim itself conflated two different
+statistics (§4 Step 1b). More consequentially, **the 0.500 → 0.887 selection ceiling is
+`patient020`-specific, not a cohort constant** — on `patient037` oracle selection tops out
+at 0.521 because a third of the true pocket's own mass is impure, and on `patient041` GT
+coverage is 24%. See the corrections table (§3) for both retractions. Rev 4 also opens
+**§9**, a narrower parallel question: on the 6-vessel stenosis/aneurysm cohort
+(`039`–`044`), the zero-shot floor (no cohort training at all) already clears both the
+0.50 target and the 0.60 stretch on the held-out vessel, and the diagnosed gap there is
+recall, not selection — the opposite of what motivated most of §2–§4.
+
+---
+
+## 0. Scope — read this before proposing anything
+
+1. **Wall model only.** We are tuning the `WC_v7_clot_phi_mse` wall component of the
+   two-model compound (`C0_compound_front_offwall_h0p5`). The off-wall growth
+   specialist is **shelved**. Do not propose lumen/off-wall work.
+2. **Wall clots only.** Success is measured on clot inside the 3-hop wall band.
+   On the primary holdout `patient020` the graded GT is `hop0=110, hop2=13`, and
+   `deploy_clot_offwall_n_gt = 0` — there is genuinely no off-wall clot to find.
+3. **Small cohort on purpose.** We iterate on 3–12 vessels for turnaround, not because
+   more data is wrong. Expanding is legitimate whenever it demonstrably helps.
+4. **Target: `deploy_clot_f1` > 0.50 on `patient020`, stretch > 0.60**, at a defensible
+   `deploy_clot_mass_ratio`. Hardware: 4 GB GPU, one deploy-faithful rollout is
+   ~25–30 min/anchor. Budget experiments accordingly.
+
+### What "the score" is
+
+The graded clot label is a viscosity-rise threshold
+([`gt_clot_phi_at_time`](../src/core_physics/t0_mu_physics.py)):
+
+```
+clot(t) = relu(mu_eff(t) - mu_eff(0)) >= CLOT_PHI_THRESH_SI      # default 0.055 Pa.s
+```
+
+The *predicted* side thresholds a soft phi at 0.5, which reduces to
+`mu_c * (1 + beta*(mu_ratio_max-1)*sigma) > sqrt(mu_solid * mu_ref)` where
+`sigma = sigmoid((Mat_si - mat_crit)/temp)`. **Beta enters only as the product
+`beta * sigma`** — it is a reparameterisation of the Mat decision boundary, not an
+independent degree of freedom. This is why §2's old beta hypothesis failed.
+
+---
+
+## 1. Current state
+
+| Checkpoint | `deploy_clot_f1` | mass | recall | precision | note |
+|---|---|---|---|---|---|
+| `wall_gen_clotrich_nplus/WG_clotrich_nplus/best.pth` (ep1, 12 vessels) | **0.500** | 2.418 | **85.5%** | 35.3% | best F1 ever recorded |
+| `wall_gen_prec_iter/WG_prec_iter/best.pth` (ep9, 3 vessels) | 0.371 | 1.109 | 39.1% | 35.3% | the "floor" recent legs warm-start from |
+
+Verified on `patient020` (`gt=110, pred=266, TP=94, FP=172, FN=16`).
+
+```
+mat_seed_prec = 1.000   mat_seed_count = 1.0    <- first commitment is ONE node, and it is correct
+mat_front_speed_ratio = 1.330
+deploy_clot_mass_ratio = 2.418
+```
+
+---
+
+## 2. Diagnosis (rev 2, 2026-08-05 — measured post-sweep)
+
+**The model grows clot correctly but commits to far too many pockets. Its predicted
+connected components are nearly pure; it simply produces 39 of them where ground truth
+has 2. Keeping only the correct pockets scores F1 0.887 against the current 0.500.
+This is a SELECTION failure, not a growth, perception, or calibration failure.**
+
+### 2.1 Connected-component structure on `patient020`
+
+```
+GT clot    n=110   2 components   sizes [82, 28]
+PRED all   n=266  39 components   sizes [53, 33, 25, 16, 15, 15, ...]
+TP         n= 94   6 components
+FP         n=172  35 components   largest 33
+```
+
+The predicted components are **pure**, not smeared:
+
+| comp | size | GT overlap | purity |
+|---|---|---|---|
+| 0 | 53 | 53 | **1.00** |
+| 1 | 33 | 0 | 0.00 |
+| 2 | 25 | 0 | 0.00 |
+| 3 | 16 | 16 | **1.00** |
+| 4 | 15 | 9 | 0.60 |
+| 7 | 13 | 13 | **1.00** |
+
+Where the model grows, it grows right. It also grows 33 pockets that never clot.
+
+### 2.2 The measured ceiling
+
+Keeping only components that touch GT:
+
+```
+kept 6/39 components   TP=94  FP=8  FN=16
+precision 0.9216   recall 0.8545   F1 0.8868      (current 0.500)
+```
+
+**Selection alone is worth +0.387 F1** — more than every architecture and loss change
+attempted across ~60 arms combined.
+
+### 2.3 What ranks the pockets
+
+Component-level features, true (6) vs false (33) pockets on `patient020`
+(AUC; distance from 0.5 is the signal):
+
+| feature | TRUE mean | FALSE mean | AUC | \|sep\| |
+|---|---|---|---|---|
+| **`h2min`** (min hop-2 speed in component) | 0.1029 | 0.2646 | **0.020** | **0.960** |
+| `h2` (mean hop-2 speed) | 0.1632 | 0.3044 | 0.071 | 0.859 |
+| `size` | 17.0 | 5.0 | 0.773 | 0.545 |
+| `mat` (model's own output) | 0.00200 | 0.00200 | 0.417 | 0.167 |
+| `matmax` | 0.00200 | 0.00200 | **0.500** | **0.000** |
+
+**The model's own `Mat` field carries zero ranking information** (AUC 0.500 — both true
+and false pockets are fully saturated). The discriminating signal is external flow,
+and it only appears when aggregated *over a component*. That is precisely why the
+node-level multi-hop feature failed (§3a): a per-node channel cannot express
+"minimum flow anywhere in my connected component", and components form dynamically
+during rollout.
+
+### 2.4 A one-parameter rule nearly reaches the ceiling
+
+Keep predicted component iff `min(hop-2 speed) < thr`, on `patient020`:
+
+| thr | ncomp | TP | FP | FN | prec | rec | F1 |
+|---|---|---|---|---|---|---|---|
+| 0.10 | 3 | 70 | 0 | 40 | 1.000 | 0.636 | 0.778 |
+| **0.12** | 6 | 92 | 8 | 18 | **0.920** | **0.836** | **0.876** |
+| 0.15 | 11 | 94 | 92 | 16 | 0.505 | 0.855 | 0.635 |
+| 1.00 (= today) | 39 | 94 | 172 | 16 | 0.353 | 0.855 | 0.500 |
+
+**Caveat, stated plainly: this threshold was fitted on `patient020`, the holdout.** It is
+a 1-parameter fit on the test set and the optimum is sharp (0.876 at 0.12 → 0.635 at
+0.15). The number is a ceiling estimate, not a result. A deployable rule must set the
+threshold from each vessel's own flow distribution (a percentile), never a global
+constant — the burden spread is 28.8×.
+
+### 2.5 Cross-vessel validation of the mechanism (free, no model)
+
+`scripts/probe_pocket_ranking.py` builds candidate stagnation pockets from low-flow wall
+nodes (a superset of what the model would predict) and asks whether the ones that clot
+have lower flow than the ones that do not. Across **28 vessels**:
+
+| component feature | mean AUC | \|separation\| |
+|---|---|---|
+| **`h2min`** | 0.213 | **0.723** |
+| `h2mean` | 0.217 | 0.683 |
+| `size` | 0.610 | 0.523 |
+| `srmin` (graph shear rate) | 0.304 | 0.452 |
+
+The mechanism generalises. Two notes:
+
+- **Speed beats shear rate** (0.723 vs 0.452) even though
+  [`COMSOL_PHYSICS_VALIDATION.md`](COMSOL_PHYSICS_VALIDATION.md) identifies the
+  low-shear stagnation gate (`spf.sr < lss`, on for 79.7% of growing nodes) as the true
+  driver. That document also warns graph operators **under-resolve** the shear gradient,
+  which is the likely explanation: hop-2 speed is a better-conditioned proxy for the same
+  physics than the graph's own shear estimate.
+- **Not universal.** `patient024` (AUC 1.000), `036` (0.750), `001` (0.667) and `011`
+  (0.625) invert — the same stagnation-vs-inverted regime split the Stage-A probe found
+  (11 stagnation / 7 inverted). Any global rule will fail on those vessels.
+
+### 2.6 Clot initiation is unseeded (confirmed with the user, 2026-08-05)
+
+COMSOL prescribes **no wound or injury site**. Clot location emerges purely from geometry
+and flow. So the information needed to locate clot *is* present in the model's inputs —
+this is not a missing-input problem, which makes selection the right lever.
+
+## 3. Corrections — claims that measurement has KILLED
+
+Do not re-derive or re-propose these.
+
+| Claim | Status |
+|---|---|
+| "The readout gain `gelation_beta` is stale and explains the 2.42× mass" | **Dead.** Swept β over the full valid range 0.2–1.3: `deploy_clot_f1` **bit-identical at every value** (0.5000, mass 2.418, FP=172, FN=16). Both TP and FP sit at `sigma = 1.0` (p05 = p95 = 1.0), AUC(σ: TP vs FP) = **0.5000 exactly**. There are no marginal nodes for a gain to move. |
+| "β is a post-hoc rescale, so each value needs its own rollout" | **Dead** as motivation. β entered the graded path nowhere at all: `rollout_t0_clot_phi` accepted `gelation_beta` and immediately `del`'d it. Every historical number was graded at effective β = 1.0. |
+| "`mass_ratio` 2.42 is readout amplification of a 1.33× Mat over-extent" | **Dead.** `mass_ratio` is `n_pred/n_gt` (266/110), a raw node count. It is wrong-pocket volume, not gain. |
+| "Closed-loop occlusion feedback will make growth self-arrest" | **Dead for now.** The corrector is **directionally inverted**: on real clot nodes it makes flow *faster* (+30% to +215%, non-monotonic in severity) where GT slows them **−41.7%**. Its input mask is also ~97.6% phantom (§7.1). |
+| "FPs are the low-speed halo around the true clot; a speed-based FP penalty cannot separate them. Confirmed category error." (old §5, `WG_prec_physfp`) | **Dead — both clauses false.** FPs are distant (median 56 hops), not a halo, and flow *does* separate them at hop 2 (AUC 0.94). |
+| "The model cannot see the flow signal; add multi-hop flow features" (rev 1 §2.2) | **Dead.** Feature was 99.4% collinear with the existing speed channel; delta −0.0013. See §3a. |
+| "The distant FPs are one coherent second pocket / a second seed" | **Dead.** They are **35 separate components**, largest 33 nodes. It is spray across many pockets, not one wrong blob. |
+| "The model's own confidence can rank its pockets" | **Dead.** Component-mean `Mat` AUC 0.417, `matmax` AUC **0.500**. Both true and false pockets are fully saturated. Ranking must come from external flow. |
+| "Per-vessel burden is predictable from deployable conditioning" | **Dead.** On clot-rich vessels (n=35), ridge LOO-CV R² = **−0.062**, permutation p = 0.44 — worse than predicting the mean. Off-wall share: LOO R² = −0.162, p = 1.00. |
+| "Burden spans 6.5×" | **Understated.** Across all 35 clot-rich anchors it is **28.8×** (0.50%–14.42%). |
+| "~47% of `patient020`'s target is at hop 2–3" | **Wrong.** `p020` is `h0=89.4%, h1=0%, h2=10.6%` — a thin wall skin. |
+| "The N+ cohort is burden-matched to the holdout" | **Wrong.** N+ 7.26% vs holdout 5.63%; off-wall 23.8% vs 10.6%. |
+| "The `midside_blind` bug drops 13.6% of training clot signal" | **Overstated.** Hop-1 is 0% of `patient020`. Still a real bug (§7.3), now minor. |
+| "The 0.500 → 0.887 selection ceiling (§2.2) generalizes to other vessels" | **Wrong, vessel-specific.** Oracle selection on `patient021` is 0.840 (purity 0.833); on `patient037` it is only **0.521** (purity **0.500** — a third of the true pocket's own mass is impure) because `h2min` ranks the vessel's two mass-carrying components **backwards** (size-weighted AUC 0.276, not the 0.538 the unweighted distribution-minima comparison suggested — see next row). `patient020`'s 0.887 was the best case measured, not the ceiling. |
+| "`patient037`'s true/false pockets are tied at h2min 0.048 vs 0.047" (§2.9) | **Conflated two statistics.** 0.048/0.047 are the *distribution minima across all 46 components*, not the mass-carrying 40/40 pair — that pair is `TRUE h2min=0.084` vs `FALSE h2min=0.073`, **inverted** (the false pocket is 14% more stagnant), not tied. Consequence is the same (no threshold helps) but the mechanism is wrong: this vessel isn't a coin-flip tie, it's in the inverted-flow regime alongside `024/036/001/011` (§2.5). |
+| "Commitment order breaks the flow-depth tie on hard vessels" (§2.10, Step 1b hypothesis) | **Dead, tested.** `AUC(commit_t)` on flow-tied pairs is 0.676 on `037` but an unscored single pair on `021`; simulating the combined rule (flow gate then commit-time tiebreak) costs `037` (−0.009) and barely moves `021` (+0.014). `mat_seed_prec=1.000` holds only where flow already works — it is a property of where the checkpoint already succeeds, not an independent second signal. See §4 Step 1b. |
+| "Gate-friendliness is a (checkpoint, vessel) interaction, not predictable from vessel physics or geometry" (§2.9) | **OVERTURNED (§10.4).** §2.9 compared `021` vs `037` on *candidate-pocket* statistics and found them alike. It never tested the vessel's own **t=0 flow distribution**. Across 32 clot-rich vessels, `band_speed_q25` (25th-pct near-wall speed at t=0, fully deployable) separates stagnation-regime from inverted-regime vessels at **93.8% accuracy / 90.6% leave-one-vessel-out**, and it puts `021` (0.051, normal) and `037` (0.085, inverted) on opposite sides — exactly the pair §2.9 could not tell apart. Regime *is* predictable in advance; §2.9's pessimistic corollary ("no adaptive rule can fire on 021-like and back off on 037-like without knowing the answer") is false. |
+
+### Method note on the burden result
+
+The first pass gave LOO R² = +0.065 (p=0.018) and looked like a weak positive. It was
+an artifact: `*_mirror_y` vessels are the same vessel as their twins, so each sat in its
+own LOO training fold. With mirrors dropped and the 8 zero-burden vessels excluded, the
+signal is gone. In-sample R² was 0.497 — which is exactly why the headline must be
+cross-validated.
+
+---
+
+## 2.7 Pocket gate: real gains, but not a free lunch (2026-08-05, post-diagnosis)
+
+`diag_pocket_gate_sweep.py` swept the percentile on 4 of the 12 N+ training vessels
+(021, 032, 035, 037 -- legitimate, per §4 Step 1: fit on train, apply once to holdout).
+
+| vessel | off F1 | best F1 | at pct | delta |
+|---|---|---|---|---|
+| patient021 | 0.345 | 0.796 | 5 | **+0.451** |
+| patient035 | 0.480 | 0.794 | 5 | +0.314 |
+| patient032 | 0.613 | 0.621 | 25 | +0.008 |
+| patient037 | 0.285 | 0.285 (off) | -- | **-0.186 at pct 5** |
+
+**Do not use the naive mean-best percentile (pct=5, mean F1 0.481).** It is driven by
+two large wins swamping one large loss in a 4-vessel average — the same
+average-hides-the-failure-mode mistake §3's burden-R² and mass-ratio corrections both
+caught. The **minimax** percentile (worst single-vessel delta, not the mean) is
+**pct ≈ 25–30**, where three vessels are flat-to-positive and one is negative at -0.113
+(patient037: F1 0.285 → 0.172, a **40% relative drop for that vessel**) instead of
+catastrophically negative (-0.378) at the mean-optimal pct=5.
+
+**Correction to an earlier framing: minimax bounds the worst case, it does not eliminate
+harm.** Any global percentile will make some fraction of vessels worse than doing
+nothing. "Widening the training-vessel sweep" was floated as a next step on the
+assumption that more vessels would either find a percentile that's safe everywhere or at
+least improve the minimax estimate meaningfully. §2.9 tests this directly and the answer
+is: it would refine the *estimate* of where the minimax point sits, but it would not
+produce a rule for predicting which real, unseen vessels benefit — see §2.9. That
+materially lowers the value of spending GPU time on it.
+
+**Root cause on `patient037`, confirmed by `diag_pocket037_mechanism.py`
+(rollout + component-level TP/FP h2min, not threshold tuning):**
+
+```
+patient021: AUC(TP h2min < FP h2min) = 0.990   <- clean separation, gate is decisive
+patient037: AUC(TP h2min < FP h2min) = 0.538   <- chance level, no threshold can help
+```
+
+TP mean h2min (0.101) and FP mean h2min (0.106) on `patient037` are statistically
+indistinguishable. This is **not** a threshold-tuning failure and not "marginal true
+fragments sitting at moderately higher flow" (the fragments' h2min is not systematically
+higher than the false positives' — both are scattered the same way). For this
+(checkpoint, vessel) pair, the feature simply carries no ranking information.
+
+**Consequence: this cannot be made self-diagnosing at deploy time.** Detecting "the gate
+won't work on this vessel" requires computing the same TP/FP AUC, which requires GT —
+unavailable for a genuinely unseen vessel. There is no adaptive rule that fires hard on
+021-like vessels and backs off on 037-like ones without already knowing the answer. A
+global, conservative minimax percentile is therefore not a stopgap — **it is the ceiling
+of what a flow-only post-process gate can do.** Some fraction of vessels will get little
+or nothing from this mechanism regardless of tuning.
+
+## 2.9 Is gate-friendliness predictable in advance? (2026-08-05, tested)
+
+The user's question, tested directly rather than assumed: does `patient037` fail because
+its clot comes from a different mechanical/biochem trigger than stagnation?
+
+**No — falsified.** The physics-only candidate probe (`probe_pocket_ranking.py`, no
+model, no rollout: does GT clot correlate with low flow at all) gives **identical**
+results for both vessels:
+
+```
+patient037: n_true=1  n_false=4   h2min AUC=0.0   (PERFECT separation)
+patient021: n_true=1  n_false=5   h2min AUC=0.0   (PERFECT separation)
+```
+
+Stagnation explains `patient037`'s clot exactly as cleanly as `patient021`'s. Same
+mechanism, same strength. The vessel does not have measurably more natural "decoy"
+stagnant regions either (`n_false` 4 vs 5) — the raw physics and the raw vessel geometry
+are not what's different.
+
+**What's actually different is the trained checkpoint's own behaviour on that vessel**,
+confirmed by `diag_pocket037_mechanism.py` (rollout, component-level h2min, labelled by
+GT):
+
+```
+patient037: a 40-node TRUE component and a 40-node FALSE component,
+            min hop-2 speed 0.048 vs 0.047 -- statistically tied.
+patient021: TP components max out at 0.065; FP components don't start until 0.062
+            -- clean gap, no overlap.
+```
+
+The model isn't confused about *whether* a region is stagnant on `patient037` — it's
+producing two equally-sized, equally-stagnant candidate commitments and flow depth alone
+cannot break the tie, because both really are that stagnant.
+
+**Consequence for "can we predict which vessels benefit": no, not from vessel-level
+features alone.** The discriminator is a property of the *(checkpoint, vessel)*
+interaction — how many comparably-plausible stagnant sites this specific trained model
+chooses to commit clot to — not a property of the vessel's physics or geometry, both of
+which look the same for the vessel that works and the vessel that doesn't. Detecting it
+requires labelling components as TP/FP, which requires GT. This is why §2.7's
+"widen the training sweep" recommendation is now downgraded: more vessels would sharpen
+the minimax percentile estimate, but there is no vessel-level rule to discover that
+would let the gate adapt itself per vessel without already knowing the answer.
+
+## 2.10 Candidate second signal: commitment order (untested, proposed next)
+
+One regularity has held on **every** checkpoint examined this session — the original
+`WG_clotrich_nplus` baseline, `WG_multihop`, `WG_multihop_ctrl`, and both vessels in the
+§2.9 diagnosis: **`mat_seed_prec = 1.000`. The model's first commitment is always
+correct.**
+
+Flow depth cannot break the `patient037` tie because both candidate pockets are equally
+stagnant. But if growth genuinely originates from one true event and a second, false
+pocket nucleates *independently*, they need not start growing at the same rollout step.
+**Commitment timing is a signal orthogonal to flow depth** — untested for exactly this
+purpose, but motivated by a pattern that has not failed once so far.
+
+This is a hypothesis, not a result, and it carries the same open question the flow
+feature did before validation: does "first-committing node is correct" extend to
+"earlier-committing *components* rank above later ones" across a whole rollout with many
+concurrent pockets, or is the guarantee specific to the single very first seed? That is
+exactly what a component-level commit-time AUC (same methodology as §2.3/§2.9's h2min
+AUC, but timed) would answer, and it targets the specific residual failure §2.9 just
+identified: **ties in flow depth**, not the general FP/TP split flow already handles.
+
+Practical framing for §4: this is not a replacement for the flow gate (§2.4–2.7 already
+show flow alone removes the bulk of clearly-non-stagnant false pockets on vessels like
+`patient021`/`035`). It is a candidate *second* feature to break the residual ties flow
+leaves behind on vessels like `patient037` — most naturally combined with the flow gate,
+not run instead of it.
+
+## 3a. RETRACTED — the multi-hop feature hypothesis (rev 1 §2.2)
+
+Rev 1 claimed the model could not *see* the flow signal that distinguishes the true clot
+pocket from a wrong one, because the label sits on wall nodes where `u = v = 0` by no-slip
+and the flow block aggregates one hop. A 6 GPU-h sweep (`go_wall_multihop_sweep.ps1`,
+2026-08-05) added hop-1/hop-2 neighbourhood speed as a trailing feature block and
+retrained with a matched control.
+
+**Result: feature-attributable delta −0.0013.**
+
+| arm | F1 | mass | FP | FN | distant-FP |
+|---|---|---|---|---|---|
+| `WG_multihop` | 0.4897 | 2.527 | 183 | 15 | 97.8% |
+| `WG_multihop_ctrl` | 0.4910 | 2.518 | 182 | 15 | 97.8% |
+
+**Why it was wrong:** the two arms' losses matched to **1e-4 at every epoch** — they were
+the same run. `corr(log1p(hop1), log1p(speed)) = 0.9936` and `corr(hop2, speed) = 0.9862`
+over the band. The new channels were near-duplicates of a channel the model already had.
+The warm-started columns did learn (0 → 20% of a typical column's magnitude), but adding a
+redundant input changes nothing.
+
+**The reasoning error, for the record:** the hop-2 AUC measurements were real, but they
+were taken *at wall nodes*, where `speed ≡ 0` makes the existing channel degenerate
+(AUC exactly 0.500, and `corr` literally `nan` for zero variance). "Absent at this node"
+was mistaken for "absent from the model's inputs" — but a 3-layer GraphSAGE aggregates
+over the band, so the signal was already reachable one hop away. **Check reachability,
+not just presence at the label's node.**
+
+**What survives:** receptive field is *not* the bottleneck — a genuine negative that
+closes a direction. And the failure mode is stable: both arms independently converged to
+FP ≈ 182, distant-fraction 97.8%, `seed_prec` 1.000, `seed_n` 2.
+
+**Secondary finding:** fine-tuning at `lr = 2e-5` for 6 epochs is nearly inert — loss
+moved 0.09% and both arms landed *below* the 0.500 baseline they warm-started from. Any
+future arm needs an lr/epoch sweep, or it measures the perturbation rather than the change.
+
+---
+
+## 4. Plan (rev 4 — Step 1b resolved)
+
+Everything below targets **pocket selection on the N+ cohort** (§2). The
+`patient020` ceiling (0.500 → 0.887) is a best case, not a cohort constant (§3) — a
+different, narrower question is tracked separately in **§9** (stenosis/aneurysm
+sub-cohort), where the diagnosed gap is recall, not selection.
+
+### Step 1 — DONE. Percentile-based pocket gate as a deploy post-process
+
+Executed (§2.7–2.9). Real, substantial gains on 2 of 4 training vessels tested
+(+0.451, +0.314), ~flat on a third, and a genuine loss on a fourth that no threshold
+fixes (§2.9: the model ties a true and a false 40-node pocket at identical flow depth).
+Minimax percentile ≈ 25–30. **Not applied to the real holdout yet** — see Step 1b.
+
+### Step 1b — Commitment-order probe — **DONE, negative (2026-08-05)**
+
+Tested §2.10 with `scripts/probe_commit_order.py` (§8): one instrumented rollout per
+vessel (`patient037`, the flow-tied vessel; `patient021`, the control), no training.
+Instrumentation is `deploy_clot_phi_trajectory` in
+[`species_pushforward_continuous.py`](../src/core_physics/species_pushforward_continuous.py) —
+the full graded phi timeline, of which `deploy_clot_phi_fields` is now just the `t_eval`
+slice, so commit times are read from the identical field the score thresholds. Component
+splitting reuses `apply_pocket_gate`'s construction.
+
+**Result — drop this direction:**
+
+| anchor | `AUC(commit_t)` all pairs | `AUC(commit_t)` on flow-tied pairs | combined-rule ΔF1 (flow gate + commit tiebreak vs flow gate alone) |
+|---|---|---|---|
+| `patient037` | 0.643 | 0.676 | **−0.009** |
+| `patient021` | 0.712 | 0.000 (1 tied pair only — not a reliable estimate) | +0.014 |
+
+Simulating the actual combined rule (flow gate at pct 25, then keep the
+earlier-committing half of survivors) **costs the vessel it was designed to fix and
+barely moves the one that didn't need it.** The earliest-committing components on
+`patient037` are four separate false pockets (`t=22,23,40,44`); on `patient021` the
+earliest commit is the one true 38-node pocket (`t=18`). `mat_seed_prec=1.000` holds
+exactly where flow already works and fails exactly where it doesn't — commitment order is
+a symptom of the same (checkpoint, vessel) interaction §2.9 identified, not an
+independent second signal. Accept the flow-only minimax gate as the practical ceiling for
+the N+ cohort; apply it once to the `patient020` holdout when Step 2 is ready to spend
+that shot (unchanged from rev 3 — still not spent).
+
+Also corrected in this run: the §2.9 "tied at 0.048 vs 0.047" claim conflated the
+per-vessel distribution minima with the actual mass-carrying 40/40 pair, which is
+**inverted** (TRUE h2min 0.084 vs FALSE 0.073), not tied — see the §3 corrections table.
+
+### Step 2 — Fold selection into training, N+ cohort (flow-only signal — Step 1b found nothing to add to it)
+
+Post-processing proves the ceiling is reachable; it does not make the model *learn* not to
+seed spurious pockets, and it cannot recover the mass those pockets consumed during the
+rollout. Step 1b closed negative, so the signal to fold in is flow alone (the minimax
+percentile gate), not flow + commit-time. Also now known (§3): the oracle ceiling this
+would chase varies by vessel (0.887 on `patient020`, 0.521 on `patient037` — purity-
+and coverage-capped, not selection-capped there), so **re-measure the oracle ceiling on
+whatever vessels back this training run before setting a target**, rather than reusing
+0.887. Two candidate mechanisms, cheapest first:
+
+1. **Rollout-time nucleation gate** — block nucleation in high-flow pockets during the
+   rollout, so spurious pockets never grow and never consume budget. Closest to the
+   physics (`COMSOL_PHYSICS_VALIDATION.md`: deposition is gated by low-shear stagnation).
+2. **Pocket-level training loss** — penalise committed mass in high-flow components.
+   Note `WG_prec_pocket` already attempted something adjacent and is mis-wired (§7.4);
+   rewrite rather than resurrect.
+
+Run with a **matched control arm** and an lr sweep — §3a showed `lr = 2e-5` / 6 epochs is
+too inert to attribute anything.
+
+### Step 3 — The inverted-regime vessels
+
+`024`, `036`, `001`, `011` rank *backwards* (clot in high flow), and the Stage-A probe
+found 7 such vessels against 11 stagnation-regime. A global gate will damage these. Decide
+explicitly whether the deliverable is (a) a stagnation-regime model with a documented
+scope limit, or (b) a regime-conditioned model. Do not silently average over both — the
+cohort mean will hide it. All three honest holdouts (`020`, `043`, `044`) are
+stagnation-regime, so **holdout scores will look better than the method deserves.**
+
+### Step 4 — Re-derive the mass gate (free)
+
+Only meaningful once selection works. `mass_ratio` is `n_pred/n_gt`; today's 2.418 is
+wrong-pocket volume, so the current gate is measuring the bug, not the model.
+
+---
+
+## 5. Parked — do not run these
+
+| Arm | Why parked |
+|---|---|
+| `WG_prec_pocket` (pocket-contrast) | Mis-wired (§7.4). Its *premise* is now partly vindicated (the model does pick a wrong pocket) but `mat_seed_prec = 1.000` still says the **first** commitment is correct — the wrong pocket appears later. Rewrite before any resurrection. |
+| `WG_prec_physfp` | **Un-parked, now the closest existing arm to the right idea.** Its original parking reason was false (§3). But note the discriminating signal is component-level, not node-level (§2.3) — a per-node speed penalty is still the wrong granularity. Rewrite as a pocket-level gate (§4 Step 2). |
+| `WG_prec_cloop` | Parked *harder*. Closed-loop coupling is directionally inverted (§3, §7.1); deeper exposure to it would train against the physics. |
+| Multi-hop / wider-receptive-field features | **Dead (§3a).** Tested, delta −0.0013; the feature was collinear with an existing channel and the model already reaches the signal via message passing. |
+| More scheduled-sampling / dynamics sweeps | 30 legs run; all 0.06–0.14. |
+| Physics-GAT pivot | Capacity is not the bottleneck (teacher-forced 1-step F1 > 0.90). Backup only. |
+| Beta / readout recalibration | Dead (§3). Do not revisit without new evidence. |
+| Off-wall / lumen specialist work | Out of scope (§0). |
+
+---
+
+## 6. Eval protocol locks
+
+1. **Deploy-faithful, no GT velocity leak.** Quote `deploy_*` only. Never
+   `val_state_f1` / `val_mat_f1` / `val_growth_f1`.
+2. **Primary holdout = `patient020` only.** Do not average with `034`/`027`.
+3. **Never compare in-training `deploy_clot_g` against `eval_mat_growth_simple.py`**
+   unless both went through `canonical_deploy_clot_metrics`.
+4. **Headline `deploy_clot_f1` (strict)**, `mass_ratio` alongside.
+5. **Sealed-set leak:** `WG_clotrich_nplus` trained on `021, 032, 035, 037` — the
+   `family_validation` / `generalization_challenge` vessels. Honest held-outs: `020`,
+   plus `043` / `044`.
+6. **New — `*_mirror_y` vessels are duplicates.** Never let a vessel and its mirror
+   land on opposite sides of a train/test or CV split.
+
+---
+
+## 7. Known bugs
+
+1. **Corrector sign inversion (NEW, blocking any coupling work).** On clot nodes the
+   local corrector *increases* speed +30–215% where GT decreases it −41.7%.
+   Non-monotonic in clot severity. `src/inference/corrector_coupling.py`.
+2. **Corrector clot mask is ~97.6% phantom (NEW).** `mu_eff` is built from GT flow at
+   `t+1` but compared against `mu_bulk` frozen from *kinematics-predicted* flow at
+   `t=0`. The kine model over-predicts speed ~7% (|u| 1.058 vs 0.991); higher shear →
+   lower Carreau viscosity → `mu_bulk` sits low → **4,498 of 19,708 nodes flagged as
+   clot before any clot exists**, near-constant across the whole run. The real 110-node
+   signal is ~2.4% of the mask.
+3. **`SPECIES_CLOSED_LOOP_COUPLING` is read as a raw env var** at
+   `species_pushforward_continuous.py:3718,3736`, not from the typed runtime config that
+   sets `closed_loop_coupling=True`. Nothing populates the env var in the eval path, so
+   **every number in this document was measured with coupling OFF.** Training disables
+   it explicitly too (`train_species_pushforward_continuous.py:673,957`). Given bugs 1–2
+   that is currently a mercy, but the gate should read the typed config.
+4. **`WG_prec_pocket` is mis-wired** — `allowed` ignores `active0` so 82–89% of true clot
+   is penalised on real windows; `soft_mat_commit_prob` returns ≈0.5 everywhere; the loss
+   ignores `pocket_contrast_early_steps` and roughly halves the primary step-loss weight.
+5. **`midside_blind` typed-config bug** — `species_pushforward_continuous.py:3115` sets
+   the off-value to the *string* `"0"`, so the `is not None` test at 3177 always fires
+   and every typed leg trains with `train_mask & (hops != 1)`.
+
+---
+
+## 8. Artifacts
+
+**Diagnostics (new, 2026-08-05)**
+- Commitment-order probe (§4 Step 1b): `scripts/probe_commit_order.py`
+  → `outputs/biochem/eda/commit_order/probe.json`; primitives in
+  `src/evaluation/commit_time.py` (tested by `src/tests/test_commit_time_probe.py`)
+- Stenosis/aneurysm sub-cohort selection-ceiling survey (§9.4): same
+  `scripts/probe_commit_order.py`, run with `--allow-holdout` on `039-043`
+  → `outputs/biochem/eda/commit_order/probe_039_043.json`
+- Pocket ranking, cross-vessel (free): `scripts/probe_pocket_ranking.py`
+  → `outputs/biochem/eda/probe_pocket_ranking.json`
+- Multi-hop LOVO probe (free): `scripts/probe_multihop_flow.py`
+- Sweep + summary: `scripts/go_wall_multihop_sweep.ps1`,
+  `scripts/summarize_multihop_sweep.py` → `outputs/biochem/eda/multihop_sweep/SUMMARY.md`
+- Beta curve + σ saturation: `scripts/diag_gelation_beta_margin.py`
+- FP geography: `scripts/diag_fp_geography.py` → `outputs/biochem/eda/fp_geo/`
+- Node-level dump + pocket profile: `scripts/diag_fp_pocket_profile.py`
+  → `outputs/biochem/eda/fp_geo/p020_nodes.npz` (re-analyse without a rollout)
+- Burden predictability: `scripts/eda_burden_predictability.py`
+- One-shot sweep: `scripts/go_wall_multihop_sweep.ps1`
+
+**Standing**
+- Burden / hop structure: `scripts/eda_clot_burden.py`
+- Geometry families: `scripts/eda_generalization.py`
+- Canonical eval: `scripts/eval_mat_growth_simple.py`
+- Best checkpoint: `outputs/biochem/eda/wall_gen_clotrich_nplus/WG_clotrich_nplus/best.pth`
+- Floor checkpoint: `outputs/biochem/eda/wall_gen_prec_iter/WG_prec_iter/best.pth`
+- Historical record: [`GENERALIZATION_PLAN.md`](GENERALIZATION_PLAN.md)
+
+**§9 (stenosis/aneurysm sub-cohort)**
+- Fine-tune legs, all in `src/biochem_gnn/mat_growth_simple.py`
+  (`mat_growth_leg_spec`, `wall_gen_stenosis_subcohort_train_anchors`): `WG_stenosis_subcohort_ft`
+  (v1, regressed — §9.8, kept as historical record), `WG_stenosis_subcohort_ft_v2`
+  (§9.9, regressed differently — §9.10, kept as historical record), `WG_stenosis_subcohort_ft_v3`
+  (§9.11, current)
+- Launcher: `scripts/go_wg_stenosis_subcohort_ft.ps1` (defaults to v3; `-Leg` to reproduce v1/v2)
+- Growth-arrest probe (§9.10/§9.11, no training): `scripts/probe_growth_arrest.py`
+  → `outputs/biochem/eda/growth_arrest/probe.json`
+- New generalizable primitives (default = unchanged for every other leg):
+  `train_t0_coverage_frac` (`PushforwardConfig`, §9.9.1); `deploy_eval_time_fracs` +
+  `select_f1_min_hard_floor` (`ScoringConfig` / `select_checkpoint_score`, §9.9.1);
+  `select_front_speed_target_lambda` + `select_fp_fn_imbalance_lambda`
+  (`ScoringConfig` / `select_checkpoint_score`, §9.10 — symmetric replacements for two
+  confirmed-dead terms, the originals left untouched for legs that rely on them)
+- Tests: `src/tests/test_mat_growth_simple_scope.py`
+  (`test_wg_stenosis_subcohort_ft_flips_underpred_and_freezes_backbone`,
+  `test_wg_stenosis_subcohort_ft_v2_fixes_every_v1_root_cause`,
+  `test_wg_stenosis_subcohort_ft_v3_uses_prec_config_brakes_not_v3_config`,
+  `test_wall_gen_stenosis_subcohort_anchors_and_helper`),
+  `src/tests/test_sliding_window_deploy_selection.py`,
+  `src/tests/test_checkpoint_selection_gt_free.py` (`select_f1_min_hard_floor` and the two
+  §9.10 symmetric-term cases)
+- Zero-shot floor eval: `outputs/biochem/eda/commit_order/eval_p043_gate25.json`
+  (`deploy_clot_f1=0.6497`, no cohort training)
+- v1 regressed eval: `outputs/biochem/eda/wall_gen_stenosis_subcohort/WG_stenosis_subcohort_ft/eval_holdout_cold.json`
+  (`deploy_clot_f1=0.5220`)
+- v2 rejected-run log (no checkpoint promoted): `outputs/biochem/eda/wall_gen_stenosis_subcohort/WG_stenosis_subcohort_ft_v2/train_log.jsonl`
+  (epoch 5's decomposed sliding-window state is §9.10's headline number, `f1=0.732` at 65% horizon)
+
+**Refactor enabling the above:** `eval_deploy_clot_f1` is now
+`deploy_species_rollout_series` → `deploy_clot_phi_fields` → `grade_deploy_clot_series`,
+so diagnostics re-grade the identical rollout instead of drifting from the scored path.
+
+---
+
+## 9. Stenosis/aneurysm sub-cohort pivot (rev 4, 2026-08-05)
+
+A narrower, parallel question to §1–§4's N+-cohort work: **can we generalize within a
+single small, homogeneous vessel family before tackling the full population?** Wall-only
+model, wall-clot-only metric (§0 unchanged) — same scope, smaller cohort.
+
+### 9.1 Why a sub-cohort, and the mental map for after it
+
+```
+Phase A (this section)        Phase B (next)                  Phase C (deferred, §0)
+stenosis/aneurysm 6-vessel     wall-only, ALL clot-rich         compound wall + off-wall
+cohort (039-044), wall-only    vessels (N+ and beyond),         model. Out of scope until
+─────────────────────────  →   wall-only, wall-clot-only    →   Phase B is solid. Do not
+prove generalization holds     same metric, full population     propose off-wall/lumen
+in a small homogeneous set                                      work before then (§0.1).
+```
+
+Phase A is deliberately small enough to iterate fast and cheap (5 GPU-vessels, no
+architecture change) and homogeneous enough that a positive result is unambiguous. It is
+not a replacement for §1–§4: the N+ cohort (`021/032/035/037` train, `020/043/044`
+sealed holdout) remains the primary track and its ceiling-is-vessel-specific finding
+(§3) is a genuine complication there that §9's cohort does **not** show — see §9.4.
+
+**What "done" looks like for Phase A:** `WG_stenosis_subcohort_ft`'s cold eval on the
+holdout beats the zero-shot floor (§9.3) without the mass guardrail firing (§9.7).
+**What happens after:** whichever of (a) the recall-tilted loss reweighting, or (b) the
+deep-mass / coverage relationship (§9.5) as a per-vessel risk signal, survives on this
+cohort becomes a candidate to test on the N+ cohort in §4 Step 2 — as an A/B, not a
+blind swap, since the N+ cohort's original failure mode (over-seeding) is the opposite
+of what §9 diagnoses, and the loss ratio that fixes one can hurt the other.
+
+### 9.2 This cohort's split is NOT the codebase's sealed split — read before running
+
+`src/biochem_gnn/mat_growth_simple.py` already has a curated, deliberately "sealed"
+split for exactly this vessel batch (documented in
+[`GENERALIZATION_PLAN.md`](GENERALIZATION_PLAN.md) §1b, landed 2026-08-03):
+
+| | Sealed (`WALL_GEN_BATCH_1B_*`) | This section (`WALL_GEN_STENOSIS_SUBCOHORT`) |
+|---|---|---|
+| Train | `012, 040, 041, 042` | `039, 040, 041, 042, 044` |
+| Held out | `043` (aneurysm) **and** `044` (stenosis) — both sealed | `043` only |
+| `039` | **Excluded** — half-finished sim, T=92 | Included |
+
+`039` is excluded from `WALL_GEN_CLOT_RICH_ANCHORS` entirely, not just from the sealed
+batch's train set — the commit-order probe independently found it the thinnest signal
+of any vessel probed (29 GT nodes, 3 TP / 7 FP components). Training on `044` here
+spends one of the two sealed challenge points: after `WG_stenosis_subcohort_ft` trains,
+**`patient043` is the only vessel left sealed for both this sub-study and the original
+wall-gen plan.** This was a deliberate scope choice for this narrower question, not an
+oversight — flagged here so it's a decision on record, not a silent split change. Pass
+`-TrainAnchors "patient012,patient040,patient041,patient042"` to
+`go_wg_stenosis_subcohort_ft.ps1` to run the sealed split instead (holding out `044`
+too means evaluating it with `--anchors patient044` in a separate eval call).
+
+### 9.3 Zero-shot floor — no cohort training at all
+
+`WG_clotrich_nplus` (trained on the original N+ cohort, has never seen any of
+`039`–`044`) plus the flow gate at pct 25 — fit entirely on the *N+* cohort, never
+touched by anything in this sub-cohort — applied once to `patient043`:
+
+| metric | value |
+|---|---|
+| `deploy_clot_f1` | **0.6497** |
+| `deploy_clot_score` | 0.6925 |
+| `deploy_clot_mass_ratio` | 0.653 (**under**-seeding) |
+| precision / recall | 0.822 / 0.537 (TP=51, FP=11, FN=44, n_gt=95) |
+| `mat_front_speed_ratio` | 0.862 |
+| `deploy_clot_offwall_n_gt` | 0 — purely a wall-clot vessel |
+
+**Clears both the 0.50 target and the 0.60 stretch with zero cohort-specific training.**
+The auto-generated diagnostic panel (`src/evaluation/seed_growth_diagnostics.py`)
+independently classified this `mode=underseed` and hinted "do not chase score with hard
+fh/topk" — consistent with everything below. This run also **is** §4 Step 2's
+"apply the gate once to a holdout" application for `patient043` (§6 rule 2) — one
+result now serves both tracks.
+
+### 9.4 Selection-ceiling survey across the cohort (`probe_commit_order.py`)
+
+Oracle selection (keep every GT-touching predicted component — the §2.2 construction)
+on the training-side vessels, at the same gate pct 25:
+
+| vessel | off-gate F1 | gate@25 F1 | oracle F1 | purity | GT coverage | `h2min` AUC | mass |
+|---|---|---|---|---|---|---|---|
+| `039` | 0.477 | 0.519 | 0.627 | 0.553 | 0.724 | 0.714 | 2.03 |
+| `040` | 0.483 | 0.704 | 0.824 | 0.949 | 0.727 | 1.000 | 2.01 |
+| `041` | 0.242 | 0.255 | 0.380 | 0.931 | 0.239 | 0.756 | 0.97 |
+| `042` | 0.397 | 0.513 | 0.620 | 1.000 | 0.450 | 0.871 | 1.27 |
+| `043` | 0.478 | 0.667 | 0.697 | 0.930 | 0.558 | 1.000 | 1.34 |
+
+**5 of 5 improve under the gate, none regress** — unlike the N+ cohort's minimax
+tradeoff (§2.7), no vessel in this family is harmed by pct 25. Purity is 0.93–1.00 on
+four of five: **this cohort's failure mode is not over-seeding.** The binding
+constraint is GT coverage (0.24–0.73, mean 0.54) — perfect selection caps `041` at
+0.380 regardless of gate quality. This is the opposite bottleneck from §2's N+
+diagnosis, which is why §9's fine-tune (§9.7) inverts the N+ loss ratio rather than
+reusing it.
+
+### 9.5 Deep clot mass predicts low coverage (n=5, suggestive not established)
+
+Wall nodes at hop ≥2 (`h2 + h3` in the graded hop histogram) vs. this same-vessel GT
+coverage:
+
+```
+deep mass (h2+h3)   0     8     9    68    74      | 106
+vessel            039   040   043   042   041      | 044 (not yet measured)
+GT coverage      0.724 0.727 0.558 0.450 0.239     |   ?
+```
+
+Spearman(deep mass, GT coverage) = **−0.900** (p=0.037, n=5). Mechanism is plausible —
+the wall model is graded on hop-0 only (§0 rule 2; confirmed the graded target equals
+hop-0 exactly on all 7 vessels probed), so when clot grows genuinely 3-D its hop-0
+predictions degrade too. `patient044`'s deep mass (106) is the largest of any vessel in
+the cohort, larger than `041`'s 74 — if the relationship holds, `044` is the hardest
+vessel in the family, which is a further reason it stays a documented stress case
+rather than folded into training (§9.2). n=5 with one near-tie is not enough to lean on
+this alone; treat it as a candidate deployable (no-GT-needed) risk signal to widen at
+full-cohort scale in Phase B, not a settled result.
+
+### 9.6 Reframing: recall, not selection, is this cohort's bottleneck
+
+Contrast with §2's N+ diagnosis directly:
+
+| | N+ cohort (§2) | Stenosis/aneurysm cohort (§9) |
+|---|---|---|
+| Failure mode | Over-seeding (39 components vs 2 GT) | Under-seeding (`mass_ratio` 0.65–2.0, several <1) |
+| What the gate does | Removes the bulk of the problem | Marginal (already near purity ceiling) |
+| Binding constraint | Pocket selection | Growth coverage |
+| §4 Step 2 mechanisms (nucleation gate, pocket-level FP loss) | Targeted correctly | **Would not move this cohort** — they are precision mechanisms for a recall problem |
+
+### 9.7 Wired (v1, superseded — see §9.9): `WG_stenosis_subcohort_ft` fine-tune leg
+
+Registered in `src/biochem_gnn/mat_growth_simple.py` (`LADDER_LEG_ORDER` +
+`mat_growth_leg_spec`), warm-started from `WG_CLOTRICH_NPLUS_CKPT`:
+
+- **Loss ratio inverted, not just softened.** N+'s warm-start actually trains at
+  `underpred_weight=2.0` / `fp_weight=16.0` (8× precision-favoured — the ratio that
+  fixed §2's over-seeding; corrected here from an earlier "8.0" — `fp_weight` isn't set
+  by the geom/flux feature stack this leg inherits, so it silently takes the recipe's
+  16.0 baseline, not `PushforwardConfig`'s bare 8.0 default; confirmed by binding every
+  leg and reading the resolved config directly, §9.10). This leg sets
+  `underpred_weight=4.0` / `fp_weight=4.0` (1:1) — deliberately not further, to avoid
+  overshooting into the opposite failure on a cohort this small.
+- **Backbone frozen.** 5 train vessels, warm-started from a checkpoint that already
+  clears 0.60 zero-shot — heads/gates only, so Phase B's broader (all-vessel) use of
+  the resulting checkpoint isn't compromised by a small-cohort overfit.
+- **Selection targets the diagnosed gap.** Primary = strict `deploy_clot_f1` (0.70) +
+  soft clout score (0.30) — not `mat_f1` alone, too noisy on 5 vessels. Plus
+  `select_front_speed_lambda=0.20` and `select_fn_fp_lambda=0.20`, rewarding front
+  growth completeness and penalising FN-heavy underseed — directly targeting
+  `mat_front_speed_ratio=0.862` and `FN=44` vs `FP=11` from §9.3.
+- **Guardrail.** `select_mass_hard_min=0.5` — the leg's whole point is raising
+  `mass_ratio` toward 1.0; a checkpoint that shrinks it further than today's 0.653 must
+  never be promoted, however good its score looks (the exact precision-mirage pattern
+  `passes_wall_gen_gate` already guards against elsewhere).
+
+**Kept in the codebase unmodified as the exact historical record of the run in §9.8** —
+do not "fix" this leg in place; §9.9 is where every fix landed.
+
+### 9.8 v1 result: regressed (2026-08-05) — overshot into the opposite failure
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+```
+
+| metric | zero-shot (§9.3, no training) | after v1 | direction |
+|---|---|---|---|
+| `deploy_clot_f1` | **0.6497** | 0.5220 | **−0.128** |
+| `deploy_clot_mass_ratio` | 0.653 (under-seed) | 2.590 (over-seed) | past 1.0 |
+| `mat_front_speed_ratio` | 0.862 | 2.994 | 3.5× too fast |
+| FP / FN | 11 / 44 | **157** / 6 | precision collapsed |
+| `mat_overpaint_frac` | 0.042 | 0.185 | 4.5× |
+| diagnostic mode | `underseed` | `overspray` | flipped regimes |
+
+FN fell 44→6 exactly as the loss-ratio flip targeted — it overshot straight through
+balance into the failure mode the rest of the wall-gen ladder exists to prevent. §9.6's
+diagnosis (recall, not selection, is this cohort's bottleneck) is not in question; the
+*magnitude* of the fix was. Five specific, fixable causes, each addressed in §9.9:
+
+1. **Loss-ratio step too large for a frozen-trunk FT.** 2:8 → 4:4 is a full swing to
+   parity in one move, with only 8 trainable head tensors (`freeze_backbone=True`).
+   `WG_prec_front` — the closest existing precedent — moved its own ratio by a single,
+   smaller notch (underpred 1→3), not to full parity.
+2. **One-sided guardrail.** `select_mass_hard_min=0.5` blocks further under-seeding but
+   nothing blocked *over*-seeding — mass reached 2.59 (peaking higher pre-gate) and
+   nothing could reject it.
+3. **Selection graded without the gate.** `CLOT_POCKET_GATE_PCT` was never set during
+   training (only the standalone post-training `--pocket-gate-pct 25` eval set it), so
+   checkpoint selection picked the best checkpoint under *ungated* conditions —
+   conditions that don't match how the checkpoint is actually graded.
+4. **Training windows never start past ~66% of the timeline.** `train_t0_max_for_n_times`
+   (the per-vessel formula) caps window starts at 132 of a ~200-step vessel — the last
+   third of the horizon is only ever seen as a continuation of an earlier window, never
+   as a fresh rollout start. This cohort's whole diagnosis is late-forming clot (§9.5);
+   this formula structurally under-samples exactly that.
+5. **Selection graded a single point.** Only `t_final` was graded, so a checkpoint that
+   degrades mid-rollout but recovers (or just happens to look fine) by `t_final` would
+   never be caught.
+
+### 9.9 v2: `WG_stenosis_subcohort_ft_v2` — every root cause fixed
+
+Same warm start and feature stack as v1 (this is a hyperparameter/protocol fix, not a
+rebuild). Five changes, one per §9.8 cause:
+
+| # | v1 | v2 | why |
+|---|---|---|---|
+| 1 | `underpred=4.0` `fp=4.0` (parity) | `underpred=3.0` `fp=6.0` (half the move) | matches `WG_prec_front`'s single-notch precedent instead of jumping to 1:1 |
+| 2 | `select_mass_hard_min=0.5` only | + `select_mass_hard_max=1.5` | symmetric guard; 1.5 sits above every off-gate mass seen pre-finetune across the cohort (0.97–2.03) but below v1's 2.59 blow-up |
+| 3 | gate unset during training | `env_overrides={"CLOT_POCKET_GATE_PCT": "25"}` | selection now grades under the exact conditions the final eval uses |
+| 4 | legacy `train_t0_max` formula (cap ≈132/200) | `train_t0_coverage_frac=0.85` (new, §9.9.1) | windows can start almost anywhere in the timeline |
+| 5 | single point (`t_final`) | `deploy_eval_time_fracs="0.65,1.0"` (new, §9.9.1) + `select_f1_min_hard_floor=0.30` | grades two sliding points; hard-rejects if the worse one collapses |
+
+Costs **~2× v1's per-epoch wall-clock** (two full deploy-faithful rollouts graded per
+epoch instead of one) — budget accordingly.
+
+#### 9.9.1 New primitives (generalize past this one leg; default = unchanged for every other)
+
+Both are opt-in overrides — unset reproduces the exact prior behaviour, verified by test
+(`src/tests/test_sliding_window_deploy_selection.py`):
+
+- **`train_t0_coverage_frac`** (`PushforwardConfig`, `SPECIES_PUSHFORWARD_TRAIN_T0_COVERAGE_FRAC`).
+  `0.0` (default) = the legacy `train_t0_max_for_n_times` formula, byte-identical.
+  `>0.0` overrides it with `round(coverage_frac * last_step)`, clamped to leave
+  `TRAIN_T0_COVERAGE_MIN_RUNWAY=20` steps of runway (clears the curriculum's largest
+  unroll tier, 15, with margin) — see `species_pushforward_continuous.py`.
+- **`deploy_eval_time_fracs`** (`ScoringConfig`, `SPECIES_CONTINUOUS_DEPLOY_EVAL_TIME_FRACS`).
+  `""` (default) = legacy single-point / dual (mid+full) behaviour, byte-identical.
+  A comma list of horizon fractions (e.g. `"0.5,0.75,1.0"`) grades the deploy-faithful
+  rollout at each resolved index; the training loop means the primary metrics across all
+  points and tracks `deploy_clot_f1_min` (the worst point) for the new
+  `select_f1_min_hard_floor` hard-reject in `select_checkpoint_score`.
+  **Known cost**: each point is a fresh full closed-loop rollout (`eval_deploy_clot_f1`
+  doesn't cache across `time_index` calls the way `grade_deploy_clot_series` does within
+  a single rollout in `probe_commit_order.py` / `diag_pocket_gate_sweep.py`) — an N-point
+  sliding window costs ~N× the single-point eval. Kept at 2 points here for that reason;
+  reusing the single-rollout-many-grades pattern those diagnostics already use would
+  remove this cost if sliding-window selection becomes a recurring pattern across legs.
+
+Locked in by `src/tests/test_mat_growth_simple_scope.py::test_wg_stenosis_subcohort_ft_v2_fixes_every_v1_root_cause`
+(and the unchanged v1 test, now asserting v1 stays exactly as recorded in §9.8),
+`src/tests/test_sliding_window_deploy_selection.py`, and three new
+`test_checkpoint_selection_gt_free.py` cases for `select_f1_min_hard_floor`
+(78/78 passing across the touched files).
+
+**Command:**
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+```
+
+(now defaults `-Leg` to `WG_stenosis_subcohort_ft_v2`; pass
+`-Leg WG_stenosis_subcohort_ft` to reproduce v1's regression exactly). Trains on
+`039,040,041,042,044`, cold-evaluates on `patient043` with pocket-gate pct 25, writes
+`outputs/biochem/eda/wall_gen_stenosis_subcohort/WG_stenosis_subcohort_ft_v2/`. The
+launcher hard-errors if `-GatePct` is changed without also changing the leg's baked-in
+`CLOT_POCKET_GATE_PCT`, to prevent training-time selection and the final eval silently
+grading at different percentiles again. **Compare against the zero-shot floor
+`deploy_clot_f1=0.650` (§9.3) before claiming a win.**
+
+### 9.10 v2 result (2026-08-05): all guards fired correctly — no checkpoint produced
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+```
+
+`select_mass_hard_max=1.5` rejected all 6 epochs (mass 2.08–4.13 at every epoch, gated).
+`best_score=-1e9`, no `best.pth` produced — only `last.pth` (epoch 6's weights, not the
+best epoch reached). **This is the guard working as designed, not a bug**: v1's own
+promoted checkpoint (mass 2.59) scored 0.522, below both the zero-shot floor and v1
+itself. Nothing valuable was lost by rejecting; the run simply never reached an
+acceptable state.
+
+**But the sliding window found something the single-point history never showed.**
+Decomposing epoch 5 exactly from the logged sliding-window means (`deploy_clot_f1_min`
+made this solvable — two points, two unknowns, monotone-growth self-consistency check
+confirms the solution):
+
+| t | GT clot | model pred | mass | F1 |
+|---|---|---|---|---|
+| 130 (65% of horizon) | 91 | 128 | 1.41 | **0.732** |
+| 200 (t_final) | 95 | 261 | 2.75 | 0.499 |
+
+GT is essentially saturated by t≈100 (89 of its final 95 nodes). Between t=130 and
+t=200 the model adds **133** nodes while GT adds **4**. At t=130 the model is in a
+state that beats every number recorded on this vessel — the 0.650 zero-shot floor, and
+the 0.697 oracle-selection ceiling §9.4 measured for the zero-shot checkpoint's own
+components — then spends the next 70 steps destroying that answer.
+
+**This was invisible in every prior measurement in this document**, all of which grade
+`t_final` only. Reading only the endpoint would have concluded "still too much recall
+pressure, tighten further" — the wrong direction entirely.
+
+**Root cause, confirmed by protocol replication (bit-identical across two independent
+runs — the rollout is deterministic, not chaotic):** v1 and v2 both trained on
+`v3_config`. Auditing its differentiable loss terms against `prec_config`
+(`WG_prec_iter`'s own stack) found **every term that could oppose continued growth was
+at exactly 0.0** in both v1 and v2: `step_mass_penalty=0`, `step_prec_fp_penalty=0`,
+`final_mass_penalty=0`, `final_prec_fp_penalty=0`, plus `mature_fp_exempt=True`, which
+specifically exempts already-painted nodes from the one loss term (`gate_fp_weight`)
+that was nonzero. There was no gradient anywhere telling the model to stop once it had
+found the true clot. Root cause was never the `underpred:fp` ratio — it was the total
+absence of an arrest signal, in an architecture whose growth is otherwise unbounded.
+
+**Also found and fixed in this pass, both real bugs:**
+- **The two selection bonus terms were confirmed dead.** `select_front_speed_lambda`
+  rewards `min(front_speed, 1.5)` — monotonic, so once `front_speed` exceeds 1.5 (it
+  was 2.5–5.06 every epoch) the term is a **constant** `+0.30` with zero discriminating
+  power, and it actively *rewards* overshoot on the way there. `select_fn_fp_lambda`
+  only fires FN-heavy (`max(0, fn-fp)`) — silent (`0.000` every epoch) once the regime
+  turned FP-heavy, which is exactly what happened. New, separately-named,
+  backward-compatible replacements added (`select_front_speed_target_lambda` penalizes
+  `|front_speed-1|` symmetrically; `select_fp_fn_imbalance_lambda` penalizes
+  `|fn-fp|/(fn+fp)` symmetrically) — the *old* terms are untouched (`WG_prec_front` and
+  others already rely on their exact existing formula) and default to `0.0`.
+- **`fp_weight=8.0` in §9.7–9.9 was wrong.** Binding every leg and reading
+  `PushforwardConfig.fp_weight` directly: N+'s warm-start actually trains at
+  `underpred=2.0` / `fp=16.0` (8×, not 4×) — the geom/flux stack never overrides
+  `fp_weight`, so it silently inherits the recipe's 16.0 baseline, not
+  `PushforwardConfig`'s bare 8.0 dataclass default — corrected in §9.7's text.
+  **Corrected again in §9.12: this was NOT "harmless", as first written here.** It was
+  harmless to v1/v2's recorded *numbers* (both override `fp_weight` explicitly and
+  trained at exactly what they set) but it corrupted their *design*: believing the
+  baseline was 8.0 made v1's 4.0 and v2/v3's 6.0 look like mild reductions when they
+  were **2.7–4× cuts**, and §9.12 shows that cut — not any knob v1/v2/v3 deliberately
+  tuned — is what drove the mass blow-up in all three.
+- **The sliding-window mean was itself a blind spot for the hard guards**, symmetric to
+  the single-point blind spot sliding-window grading was built to fix. Mass and FP only
+  grow over this rollout (confirmed above: mass 1.41→2.75 within one epoch), so
+  `t_final` is always at least as bad as any earlier point — averaging
+  `select_mass_hard_max`'s input against the mean let a run's true end-state risk hide
+  behind an earlier, healthier point. Fixed in the training loop:
+  `deploy_clot_f1`/`deploy_clot_score`/`deploy_clot_f1_min` stay sliding-window
+  aggregates (mean / worst-point — what they were built for), but
+  `deploy_clot_mass_ratio` and `deploy_clot_fp` — the fields the hard guards read — are
+  now anchored to `t_final` exactly, matching v1's original single-point semantics. The
+  sliding-window mean is still logged (`deploy_clot_mass_ratio_sliding_mean`,
+  `deploy_clot_fp_sliding_mean`) for visibility, just no longer fed to any guard.
+
+### 9.10a Growth-arrest probe result: the defect is *onset phase*, not arrest
+
+`scripts/probe_growth_arrest.py`, zero-shot warm-start (**no training**), gate pct 25,
+10 points across each vessel's horizon:
+
+| vessel | deep mass (§9.5) | GT onset | model onset | phase error | final prec | final rec | final mass |
+|---|---|---|---|---|---|---|---|
+| `patient039` | 0 | t=55 | t=18 | **−37 EARLY** | 0.404 | 0.724 | 1.793 |
+| `patient040` | 8 | t=60 | t=20 | **−40 EARLY** | 0.683 | 0.727 | 1.065 |
+| `patient043` *(holdout)* | 9 | t=60 | t=20 | **−40 EARLY** | 0.828 | 0.558 | 0.674 |
+| `patient042` | 68 | t=20 | t=80 | **+60 LATE** | 0.598 | 0.450 | 0.752 |
+| `patient041` | 74 | t=20 | t=60 | **+40 LATE** | 0.455 | 0.177 | 0.389 |
+
+**The model's clot onset is anti-correlated with the truth — perfectly monotone in deep
+clot mass, n=5.** The vessels that clot early *and* thick (`041`/`042`) are exactly the
+ones it starts latest on; the thin, late-clotting vessels are the ones it starts
+earliest on. This is a *phase* error, not a magnitude one.
+
+Three consequences that redirect the work:
+
+1. **§9.5's deep-mass ↔ coverage correlation (Spearman −0.90) now has a mechanism, and
+   it was never "coverage".** Deep-mass vessels clot early and aggressively; the model
+   starts 40–60 steps late on them and never catches up (`041` ends at recall 0.177).
+2. **§9.10's "doesn't arrest" framing was too narrow.** 3 of 5 vessels have
+   `arrest_ratio > 2`, but only `patient040` loses F1 to it (0.755 → 0.704). On the
+   holdout the zero-shot F1 does **not** degrade across the horizon at all (flat 0.667
+   through `t_final`) — so **v2's collapse was self-inflicted by the fine-tune**, not a
+   latent property of the warm-start. That is a direct confirmation of §9.10's
+   root-cause diagnosis.
+3. **The holdout does not need braking — it needs more growth.** `patient043`'s location
+   is already right (precision 0.96 at t=80, 0.83 at `t_final`; the 11 nodes it fires
+   early at t=40 are all TP by t=80, FP drops to **1**). Its entire `t_final` deficit is
+   FN=42 / recall 0.558 / mass 0.674.
+
+### 9.11 v3: `WG_stenosis_subcohort_ft_v3` — v2 + the brake, single-mechanism A/B
+
+Same warm start as v1/v2. **Exactly v2's config plus one mechanism**, so the result is
+attributable — verified by diffing the two resolved specs programmatically, not by
+inspection:
+
+| knob | v2 | v3 | mechanism |
+|---|---|---|---|
+| `step_mass_penalty` / `step_prec_fp_penalty` | 0 / 0 | **0.75 / 0.5** | `rolled_final_mass_fp_penalty` at **every unroll step** during TBPTT (code comment: *"binds spray during TBPTT"*) — `softplus(mass_ratio − final_mass_target)` |
+| `final_mass_penalty` / `final_mass_target` / `final_prec_fp_penalty` | 0 / 1.2 / 0 | **1.5 / 1.2 / 1.0** | the same signal once more on the rolled-out final state |
+| `mature_fp_exempt` | `True` | **`False`** | matured (already-painted) nodes stay liable for FP loss |
+| `underpred_weight` / `fp_weight` | 3.0 / 6.0 | **3.0 / 6.0** (unchanged) | — |
+| `freeze_backbone` | `True` | **`True`** (unchanged) | — |
+
+Values are `WG_prec_iter`'s own — borrowed, validated machinery, not new code.
+
+**Why the brake is the right single change, and why it is *not* an "arrest" mechanism as
+§9.10 first called it:** `rolled_final_mass_fp_penalty` is **GT-relative at every step**
+— while GT is still empty `n_gt` clamps to 1, so a premature commit of *N* nodes yields
+`mass_ratio = N` and `softplus(N − 1.2)` fires hard. It is a **premature-firing
+suppressor** (what `039`/`040`/`043` need), and because it is GT-relative it stays
+**silent on `041`/`042`**, where the model is *behind* GT. Correct behaviour on both
+halves of a cohort that splits early/late.
+
+That also explains v1/v2 mechanically: raising `underpred_weight` increases growth
+**uniformly**, including where GT is still zero, and 200 autoregressive steps compound
+it into mass 4.0. **The brake is what makes recall pressure safe by making it
+time-aware** — so v3 *keeps* v2's recall pressure rather than lowering it.
+
+**Two corrections to this section's own first draft**, both caught by §9.10a before any
+GPU was spent:
+- An earlier v3 lowered `underpred_weight` to 1.5 on the theory that the brake would
+  otherwise fight it. Wrong: 4 of 5 vessels including the holdout are *under*-grown, and
+  the brake is silent below target, so there was nothing to protect them from — it would
+  have removed the exact pressure the holdout needs.
+- An earlier v3 also unfroze the backbone, justified as "the trunk governs dynamics."
+  The holdout's location is already correct (precision 0.83–0.97), so its defect is
+  rate/onset, which the **readout heads** govern; unfreezing would have added a second
+  uncontrolled variable with no diagnosed need. **If v3 under-grows on the LATE vessels
+  (`041`/`042`), that is the arm where unfreezing (v3b) earns its place** — their
+  precision genuinely is poor (0.46/0.60), so location *is* wrong there.
+
+Keeps every v2 fix unchanged: gated selection (`CLOT_POCKET_GATE_PCT`),
+`train_t0_coverage_frac=0.85`, sliding-window eval (`deploy_eval_time_fracs="0.65,1.0"`)
+with `select_f1_min_hard_floor=0.30`, and `select_mass_hard_min/max=0.5/1.5` — anchored
+to `t_final` (§9.10's fix). The two new symmetric selection terms
+(`select_front_speed_target_lambda=0.15`, `select_fp_fn_imbalance_lambda=0.15`) replace
+the confirmed-dead ones; **selection does not enter the training gradient**, so this
+cannot confound the brake A/B.
+
+Locked in by
+`src/tests/test_mat_growth_simple_scope.py::test_wg_stenosis_subcohort_ft_v3_is_v2_plus_the_brake_and_nothing_else`
+— which asserts the config diff against v2 is a **subset of the brake keys**, so any
+future edit that quietly changes something else fails the test — plus four
+`select_checkpoint_score` cases for the symmetric terms and
+`test_sliding_window_deploy_selection.py`. 83/83 passing across every file touched by
+§9.9–9.11.
+
+**Command:**
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+```
+
+(defaults `-Leg` to `WG_stenosis_subcohort_ft_v3`; `-Leg WG_stenosis_subcohort_ft_v2` or
+`-Leg WG_stenosis_subcohort_ft` reproduce either earlier run exactly — all three are
+frozen-backbone head FTs at `lr=5e-5`.) **Judge it against the right target, which is
+*not* simply "beat 0.650":**
+- The holdout needs **recall up** (0.558) at **mass toward 1.0** (0.674) while holding
+  precision (0.828). Watch `deploy_clot_fn`, not just F1.
+- v2's collapse was self-inflicted, so **"v3 does not collapse" is table stakes, not a
+  win.** The win condition is `t_final` F1 above the 0.650 zero-shot floor with the mass
+  guard un-fired.
+- If v3 lands flat (no better, no worse), that is evidence the brake was necessary but
+  not sufficient, and the phase error in §9.10a — which no loss weight addresses — is
+  the real Phase-B target.
+
+### 9.12 v3 result + the real driver: `fp_weight` was cut in v1 and never restored
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh   # -Leg ..._v3
+```
+
+**v3 is a clean negative.** All 6 epochs mass-rejected again, no checkpoint. The brake is
+wired and does produce gradient (v2 and v3 weights differ — `mat_f1` and
+`mat_front_speed_ratio` differ at every epoch, so this is not a zero-gradient artifact),
+but its effect is negligible:
+
+| ep | v2 f1 | v3 f1 | v2 front | v3 front | v2 mass(mean) | v3 mass(mean) |
+|---|---|---|---|---|---|---|
+| 1 | 0.3681 | 0.3677 | 4.545 | 4.605 | 4.082 | 4.087 |
+| 2 | 0.3726 | 0.3726 | 5.060 | 5.078 | 4.109 | 4.109 |
+| 3 | 0.3708 | 0.3708 | 4.395 | 4.437 | 4.104 | 4.104 |
+| 5 | 0.6155 | 0.6125 | 2.497 | 2.473 | 2.077 | 2.071 |
+
+**`front_speed` moved +1.3% on a model 400% off target.** Two side-benefits: the new
+`*_sliding_mean` fields reproduce v2's logged numbers to 3 decimals (confirming the
+§9.10 t_final-anchoring change did what it claimed and nothing more), and v3's
+directly-logged `t_final` ep5 values (mass 2.768, FP 173) match §9.10's *algebraically
+reconstructed* v2 values (2.75, 172) — independently validating that decomposition.
+
+**Then the actual driver, found by comparing all four legs against observed mass rather
+than against each other's intent:**
+
+| leg | `underpred` | `fp_weight` | ratio | observed `t_final` mass on `patient043` |
+|---|---|---|---|---|
+| `WG_clotrich_nplus` (warm start, no FT) | 2.0 | **16.0** | 0.125 | **0.674** ✅ |
+| `WG_prec_iter` | 1.0 | **16.0** | 0.062 | **1.109** ✅ (on `p020`) |
+| v1 | 4.0 | 4.0 | 1.000 | 4.200 ❌ |
+| v2 | 3.0 | 6.0 | 0.500 | ~4.02 ❌ |
+| v3 (+brake) | 3.0 | 6.0 | 0.500 | 4.032 ❌ |
+
+- **`underpred` — the knob v1, v2 and v3 all tuned — is nearly inert.** 4.0 → 3.0 is a
+  33% cut and moves mass 4% (4.200 → 4.02).
+- **`fp_weight` splits the table perfectly.** Every leg at 16.0 controls mass; every leg
+  that blew up had it cut to 4–6. **v1 cut it, and v2/v3 inherited the cut.**
+
+Cause of the cut is the §9.10 documentation error, which was **not** harmless as first
+recorded: `fp_weight` is not set by the geom/flux stack these legs inherit (so it takes
+`MAT_GROWTH_SIMPLE_RECIPE`'s **16.0**), but it was documented as `PushforwardConfig`'s
+bare **8.0** dataclass default. Every version was therefore designed as a mild reduction
+from 8.0 while actually being a 2.7–4× cut from 16.0. Three iterations of tuning
+`underpred` were spent chasing a symptom of that.
+
+This also re-reads `WG_prec_iter` correctly: its brake "works" (mass 1.109) because it
+keeps `fp_weight=16.0` — the brake was never carrying that result alone.
+
+### 9.13 v4: `WG_stenosis_subcohort_ft_v4` — restore `fp_weight`, change nothing else
+
+v3 with **one value changed: `fp_weight` 6.0 → 16.0.** Verified by programmatic diff:
+config differs from v3 by `{fp_weight}` alone, `runtime_kwargs` and `env_overrides`
+byte-identical. The brake stays (unchanged from v3) so its ~1% effect remains readable.
+**v3-vs-v4 is therefore a clean single-variable test of `fp_weight` itself**, and
+v2-vs-v3 remains the clean test of the brake.
+
+`fp_weight` is now set **explicitly** on this leg rather than inherited, so it cannot
+drift again; the test asserts it equals the recipe baseline and that neither
+`WG_clotrich_nplus` nor `WG_prec_iter` overrides that baseline.
+
+Locked in by `test_wg_stenosis_subcohort_ft_v4_restores_fp_weight_only`.
+
+**Command:**
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+```
+
+(now defaults `-Leg` to `WG_stenosis_subcohort_ft_v4`; `-Leg ..._v3` / `..._v2` /
+`WG_stenosis_subcohort_ft` reproduce the earlier runs exactly.)
+
+**Read the first epoch and stop early if it is wrong.** Epoch 1 alone is decisive and
+costs ~7 min: v1/v2/v3 all reached mass ≈ 4.0 by epoch 1 from a warm start at 0.674. If
+v4's epoch-1 mass lands near 1 (not 4), `fp_weight` is confirmed as the driver and the
+run is worth completing. If it still lands near 4, `fp_weight` is *not* the driver
+either, and the next step is a true null control — fine-tune at the warm-start's exact
+loss weights (`underpred=2.0`, `fp=16.0`) to establish whether *any* fine-tune in this
+configuration preserves the warm-start's behaviour, before tuning anything further.
+
+### 9.14 v4 result: bit-identical to v3 — `fp_weight` retracted as the driver
+
+```
+.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh   # -Leg ..._v4
+```
+
+**Epoch 1 of v4 (`fp_weight=16.0`) is bit-identical to v3's epoch 1 (`fp_weight=6.0`) to
+full float precision** — `loss=61.40549033352689` in both, `mass=4.032`, `f1=0.3677`,
+`front=4.605`, `fp=292`, `fn=4`, all exact. Over an entire epoch (756 windows) that is
+not "a weak effect" — it is zero effect. **§9.12's "`fp_weight` is the driver" claim is
+retracted.**
+
+Ruled out as a wiring bug: `mature_fp_exempt` (read by the same `_growth_huber()`
+factory, via `resolve_config()`) correctly changed behaviour between v2 and v3 (loss
+74.6 → 61.4), so the config-resolution path works. A synthetic unit check on
+`ActiveGrowthHuberLoss` directly (`src/training/biochem_loss_policy.py:230`) confirms
+the FP term does scale with `fp_weight` when its condition fires (loss 30.9 → 33.2 →
+44.7 for `fp_weight` 4/6/16 on the same synthetic batch).
+
+**What actually happened: the FP condition structurally cannot fire in this regime.**
+The term only contributes when `~active & (p_raw > fp_thr)` — a predicted delta above
+`fp_threshold=2e-5` **in raw units** at a node GT says is inactive. Epoch 1 trains with
+`cur_unroll=5` (`curriculum_unroll_for_epoch`: 5 steps through epoch 10, 10 through
+epoch 20) and a **frozen backbone** only 8 epochs' worth of head-tensor movement away
+from a warm start that was itself well-calibrated. A short single-step-supervised
+window essentially never produces a large enough spurious raw delta to cross that
+threshold — so `fp_weight` has been irrelevant to the actual gradient in v1 through v4
+alike, and the mass differences observed between them (v1 4.200 → v2 ~4.02) must trace
+to something other than the loss-weight ratio.
+
+**This reframes the mechanism entirely.** `mass_ratio` is measured on the **200-step
+closed-loop deploy rollout**; the per-step training loss supervises **5–10-step TBPTT
+windows**. Errors invisible within a 5-step window — never crossing the FP threshold,
+never triggering `underpred_weight`'s branch either unless GT itself is locally active
+— can still compound catastrophically over 200 autoregressive steps at deploy time. No
+per-step loss-weight ratio can fix a failure mode the training window is too short to
+observe. The **only** loss term that evaluates a full rolled-out state is the brake
+(`step_mass_penalty` / `final_mass_penalty`, via `rolled_final_mass_fp_penalty`) — and
+§9.12 already found its effect at these weights is ~1% (`front_speed` 4.545 → 4.605).
+Read together: **the brake is the only mechanism structurally capable of seeing this
+failure, and it is currently far too weak relative to the per-step channel losses
+(loss ≈ 61, brake contribution ≈ 0.1–2) to counteract it.**
+
+**Do not run v4 to completion — kill it if still running.** Every remaining epoch will
+reproduce v3's trajectory; nothing downstream of a bit-identical epoch 1 can differ in
+a way attributable to `fp_weight`.
+
+### 9.15 Phase A status: the target is already met, and why every fine-tune failed
+
+**Banked result — `patient043`, sealed holdout, ZERO cohort-specific training:**
+
+| metric | value |
+|---|---|
+| `deploy_clot_f1` | **0.6497** |
+| `deploy_clot_score` | **0.6925** |
+| mass / prec / rec | 0.653 / 0.822 / 0.537 |
+
+`WG_clotrich_nplus` (never saw `039`–`044`) + the flow-percentile pocket gate at pct 25
+(fit on the *N+* cohort, not this one). **Both metrics clear the >0.6 stretch target.**
+Cohort-wide zero-shot with the same gate: `039` 0.52, `040` 0.70, `041` 0.25, `042` 0.51,
+`043` 0.67 — mean 0.53, and the spread is the result, not noise (see below).
+
+**Every fine-tune since has been worse:** v1 0.522; v2/v3/v4 produced no checkpoint at
+all. Four rounds of GPU, zero improvement over doing nothing.
+
+**Root cause of all four failures — a train/test regime mismatch we created:**
+
+| vessel | role | GT wall nodes | deep (h2+h3) | regime |
+|---|---|---|---|---|
+| `039` | train | 29 | 0 | thin / late-GT |
+| `040` | train | 77 | 8 | thin / late-GT |
+| `041` | train | 113 | 74 | **THICK / early-GT** |
+| `042` | train | 109 | 68 | **THICK / early-GT** |
+| `044` | train | 163 | 106 | **THICK / early-GT** |
+| `043` | **HOLDOUT** | 95 | 9 | thin / late-GT |
+
+**78% of training GT nodes (97% of deep mass) come from the THICK regime; the holdout is
+THIN.** Per §9.10a the two regimes have *opposite* errors — thick vessels start 40–60
+steps late and under-grow 4–5×; thin vessels start 37–40 steps early. So the gradient is
+overwhelmingly "grow more, sooner", the frozen head can only apply that globally, and
+`patient043`'s mass goes 0.674 → 4.0 in one epoch. It did so identically at `underpred`
+3.0 vs 4.0, `fp_weight` 6 vs 16, with and without the brake — because **none of those
+knobs was ever the variable that mattered.** All four versions tuned the loss while the
+training set pointed at the wrong regime.
+
+**Consequences for the plan:**
+1. Phase A's numeric goal is met. Further loss-weight tuning is retired as a direction —
+   four controlled data points say it does not reach the failure.
+2. The open questions are now *data-shaped*, not optimization-shaped: (a) is regime
+   predictable from deployable t=0 features (if not, a single deployed model cannot route
+   itself); (b) does regime-matched training beat 0.6497 at all.
+3. §4 Step 3's long-deferred choice — scoped stagnation-regime model vs regime-conditioned
+   model — is now the *central* question rather than a footnote.
+
+### 9.16 Pathology cross-tab: aneurysm vs stenosis, and a visual confirmation of §9.10a
+
+Splitting the zero-shot gate@25 survey (§9.4/§9.9's cohort, `WG_clotrich_nplus` +
+pct-25 gate, no training) by pathology (roles per `GENERALIZATION_PLAN.md` §1b):
+
+| vessel | pathology | `deploy_clot_f1` | prec | rec | deep mass (h2+h3) |
+|---|---|---|---|---|---|
+| `039` | aneurysm | 0.519 | 0.404 | 0.724 | 0 |
+| `040` | aneurysm | 0.704 | 0.683 | 0.727 | 8 |
+| `043` (holdout) | aneurysm | 0.667 | 0.828 | 0.558 | 9 |
+| `041` | stenosis | 0.255 | 0.455 | 0.177 | 74 |
+| `042` | stenosis | **0.513** | 0.598 | 0.450 | 68 |
+| `044` | stenosis | *not yet run against the model* | — | — | 106 |
+
+**Mean F1: aneurysm 0.630 (n=3), stenosis 0.384 (n=2 scored).** We do well on aneurysms
+and poorly on stenoses, on the vessels measured so far.
+
+**Important caveat, stated plainly: pathology and deep clot mass are perfectly
+confounded in this 6-vessel cohort — every aneurysm has deep mass ≤9, every stenosis has
+deep mass ≥68, zero overlap.** This table cannot separate "fails because it's a
+stenosis" from "fails because it's thick/early-clotting" (§9.10a's actual mechanism) —
+they are the same three data points either direction. `patient042` is consistent with
+the mechanistic reading, not just the categorical one: it is the *lowest-deep-mass*
+stenosis (68, vs `041`'s 74 and `044`'s 106) and also the best-scoring one. Read this as
+"deep mass predicts F1, and in this particular batch deep mass happens to track
+pathology" rather than "stenosis is intrinsically harder" — the latter isn't something a
+model can act on; the former is measurable at `t=0` without a rollout.
+
+**Visual confirmation** (`scripts/viz_mat_growth_clot_ladder.py`, now with `--gate-pct`
+support added this session): ladder plots for `040` (aneurysm, good), `041` (stenosis,
+poor), `042` (stenosis, the good one) —
+`outputs/biochem/viz/mat_growth/clot_ladder_{best_patient040,worst_patient041,stenosis_good_patient042}.png`.
+The onset-phase error from §9.10a is directly visible, not just measured: on `040` the
+prediction paints red *before* GT does (`t=22`: GT flat, pred `FP=16, FN=0`); on `041`
+the prediction stays blank while GT has already committed (`t=22`: GT painted, pred
+`FP=0, FN=9`) and never recovers. Caveat: this script's own printed per-frame
+`F1`/`FP`/`FN` come from `clot_trigger_viz_f1`/`scatter_clot_error_panel`, a different
+implementation than `grade_deploy_clot_series` (the path behind every number in this
+table) — they broadly agree on `040` (0.69 vs 0.704) but diverge sharply on `041` (0.08
+vs 0.255, and printed `FN=188` exceeds the vessel's actual GT count of 113). Trust the
+spatial picture; do not quote this script's own printed numbers as canonical.
+
+---
+
+## 10. Physical EDA of the COMSOL data (2026-08-05)
+
+`scripts/eda_clot_physics.py` → `outputs/biochem/eda/clot_physics/eda.json`. **No model, no
+rollout** — GT + geometry + t=0 flow only, across all **43 non-mirror anchors** (32
+clot-rich, ≥20 wall-clot nodes). Grounded in the validated law
+([`COMSOL_PHYSICS_VALIDATION.md`](COMSOL_PHYSICS_VALIDATION.md)), not generic feature search.
+
+### 10.1 What COMSOL actually computes
+
+```
+J0_Mat = Da·( [d(sr,x) < sgt]·(L/γ)·|d(sr,x)|·common     ← separation gate,  21% of growing nodes
+            + [sr < lss]                     ·common )   ← LOW-SHEAR gate, 79.7%  DOMINANT
+common = Sat(M)·k_rs·rp + Sat(M)·k_as·ap + (Mas/Minf)·k_aa·ap
+J0_th  = β·φ_at·Mat·PT                                   ← thrombin ∝ Mat ⇒ AUTOCATALYTIC
+mu1(Mat): hard step 1→80 at Mat = 2e7 plt/cm²            ← the clot label IS this step
+```
+
+~90% of Mat growth is the autocatalytic `(Mas/Minf)·k_aa·AP` term; ~7% fresh deposition.
+Fibrin is provably inert (`mu2(fi) ≡ 0`). **So this is a gated autocatalytic ignition
+problem with a hard threshold readout — not a steady-state deposition problem.**
+Confirmed in our own data: Mat late/early growth ratio median **1.41** (accelerating), and
+within-vessel onset spread (p90−p10) averages **0.346 of the horizon** — clot ignites
+**progressively**, not as a switch.
+
+### 10.2 Feature inventory — what is actually usable
+
+**6 of 18 `x` channels carry zero spatial information on every anchor:** `node_type_0..3`,
+`rheology_flag`, and — most consequentially — **`wss_prior_nd` (wall shear stress) is
+identically 0**. The single quantity the dominant gate depends on is present as a channel
+and empty.
+
+**At wall nodes, 6 more candidate fields are degenerate** (AUC exactly 0.500 on every
+vessel): `speed`, `sdf`, `shear_potential`, `recirc`, `vmag_frac` — because `u=v=0` by
+no-slip and `sdf=0` at the wall. This is §3a's finding, now confirmed cohort-wide.
+
+**What remains informative at the wall:** `mu_eff(t=0)`, `pressure`, `width` / `width_d1` /
+`width_d2`, and neighbourhood aggregates (`speed_h1..h3`, `mu0_h2`).
+
+**Note on `mu_eff(t=0)`:** since `mu_eff = Carreau(sr)·mu1(Mat)` and `mu1 ≡ 1` at t=0, it is
+a monotone-decreasing function of shear rate — i.e. the dominant gate `sr < lss` is exactly
+a threshold on t=0 viscosity, and unlike `speed` it is **non-degenerate at the wall**
+(shear is maximal there). Empirically it performs on par with, not better than, the hop-2
+speed proxy (mean AUC 0.608 vs 0.628 over 32 vessels — indistinguishable at sd ≈ 0.27), and
+the two produce **identical regime labels** (agreement 1.00). It is a viable *local*
+alternative that needs no neighbourhood aggregation, not an upgrade.
+
+### 10.3 Q1/Q2/Q3 — mostly negative, and worth knowing
+
+| question | answer |
+|---|---|
+| **WHERE** does clot form | Best t=0 predictors reach only **mean AUC ≈ 0.63** (`speed_h3` 0.637, `speed_h2` 0.628, `mu0_h2` 0.623) with **sd ≈ 0.22–0.27**, and are correctly-signed on only **62%** of vessels. |
+| **WHEN** does a node ignite | **No t=0 feature predicts per-node onset.** Best mean Spearman is `pressure` at 0.194 with inconsistent sign (38% negative); everything else <0.12. Consistent with autocatalytic ignition: onset depends on integrated history and neighbour coupling, not local instantaneous state. |
+| **HOW THICK** (deep mass, the §9.15 regime var) | **Not predictable.** Best t=0 aggregate is `stag_frac_band` at ρ = −0.338, below the n=32 significance line (≈0.35), out of ~30 features tested. |
+
+The huge sd on Q1 is the real story, and §10.4 explains it.
+
+### 10.4 Q4 — the inverted regime IS routable from t=0 (the headline)
+
+**34% of vessels (11–12 of 32) have the flow→clot relationship *inverted*** — low flow
+predicts *less* clot. This independently reproduces §2.5's list: `024`, `036`, `001`, `011`
+all appear, and so does **`037`**, which finally explains §2.7/§2.9's "no gate threshold
+works on `patient037`" without needing a (checkpoint, vessel) story.
+
+**A single deployable t=0 statistic separates the regimes almost perfectly:**
+
+| | |
+|---|---|
+| feature | `band_speed_q25` — 25th-percentile flow speed in the hop≤3 near-wall band at t=0 |
+| separation AUC | **0.975** |
+| best single threshold | `band_speed_q25 ≥ 0.060` → inverted; **93.8% (30/32)** |
+| **leave-one-vessel-out** | **90.6% (29/32)** — threshold refit each fold |
+| permutation p | **0.000** (max-\|dev\| over all 59 aggregates, 2000 shuffles; null 95th pct 0.325 vs observed 0.475) |
+| robustness | identical result when regime is labelled by `mu0` AUC instead of `speed_h2` AUC (labels agree 1.00) |
+
+**Physical reading, and it follows directly from §10.1:** the dominant gate is
+`sr < lss` — an *absolute* threshold. `band_speed_q25` measures whether the vessel
+possesses a genuine stagnation zone at all. Below ~0.06, a real slow region exists, the
+low-shear gate fires there, and low-flow correctly ranks clot. Above ~0.06 even the slowest
+quartile of the near-wall band is moving, the low-shear gate rarely fires, and deposition
+falls to the **separation gate** (`d(sr,x) < sgt`, the 21% minority mechanism) — which keys
+on the shear *gradient*, not its magnitude, and therefore has a different, often opposite,
+spatial signature. Two mechanisms, one threshold telling you which is in charge.
+
+**Two axes, only one routable.** The inversion axis (§10.4) is predictable at 90.6% LOO.
+The thickness/onset axis (§9.10a, deep mass) is **not** — and they are independent
+(`041`/`042`/`044` are deep-mass vessels but sit on the *normal* side of the inversion
+split). Do not conflate them.
+
+### 10.5 What this changes
+
+1. **The pocket gate can be made self-aware.** §2.7 concluded a global percentile is "the
+   ceiling of what a flow-only post-process can do" because some vessels are harmed and you
+   cannot tell which in advance. You now can, from t=0, before any rollout: apply the gate
+   on stagnation-regime vessels, disable (or invert) it on the ~34% that are inverted.
+   This is a **deploy-time post-process change with no retraining**, and it is the highest
+   expected-value next experiment in this document.
+2. **§2.9's pessimistic corollary is retired** (see §3 corrections table).
+3. **The `wss_prior_nd` channel should be populated or removed.** The physics says wall
+   shear is the driver; the channel meant to carry it is all zeros.
+4. **Feature work should stop adding degenerate channels.** Six candidate fields are
+   provably information-free at wall nodes; `mu_eff(t=0)` is the one physically-principled
+   field that is *not* degenerate there.
+5. **Per-node onset is not learnable from t=0 state** — if timing matters (it does, §9.10a),
+   it has to come from the rollout dynamics, not richer static features.

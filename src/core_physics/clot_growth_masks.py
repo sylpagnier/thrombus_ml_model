@@ -186,7 +186,12 @@ def resolve_growth_support_at_time(
     ceiling = resolve_ceiling_mask(data, device, bio_cfg, ceiling_hops=ceiling_hops)
     ei = data.edge_index.to(device=device)
 
-    dil_hops = int(os.environ.get("SPECIES_GROWTH_DILATION", "1"))
+    try:
+        from src.architecture.pushforward_config import resolve_config
+        _cfg = resolve_config()
+        dil_hops = int(_cfg.growth_dilation) if _cfg is not None else int(os.environ.get("SPECIES_GROWTH_DILATION", "1"))
+    except Exception:
+        dil_hops = int(os.environ.get("SPECIES_GROWTH_DILATION", "1"))
     if t <= 0:
         return t0 & ceiling
 

@@ -16,6 +16,17 @@ Selection metrics for new legs: all-anchor `deploy_clot_f1` and `deploy_clot_rel
 
 New work should **warm-start from locked** (or `species/best.pth`) and apply env via `mat_growth_leg_spec("WC_v7_clot_phi_mse")` unless deliberately ablating.
 
+## Generalization eval (wall-gen / phase1)
+
+Two hard rules (also in `AGENTS.md`):
+
+1. **Deploy-faithful scoring only.** Cold eval uses RGP-DEQ base flow at t=0 and local kinematic tiling/corrector afterward — never COMSOL GT `[u,v]`. New vessels provide geometry only. Prefer `eval_mat_growth_simple.py` / `canonical_deploy_clot_metrics` with `flow_feats_source=auto` and corrector coupling on.
+2. **Primary holdout = `patient020` only** (clot-rich). Do not gate legs on a mean that includes clot-free `patient034`. Optional multi-vessel tables are secondary.
+
+Small cohort defaults: train `005,006,010,023,002`; val/holdout `020`. Flow-source gate: `go_flow_source_ab.ps1` / `run_flow_source_ab.py`. Phase1 tweaks on promoted **`FS_ab_coupled`**: `go_phase1_sweep_v3.ps1` (warm-start `wall_gen_baseline`). Promote: `python scripts/promote_wall_gen_baseline.py`. Plan: [`docs/GENERALIZATION_PLAN.md`](GENERALIZATION_PLAN.md).
+
+**Trunk:** stay on **GraphSAGE**. Stage-A PM-GAT (`WG_physgat_*`, `arch=physics_gat`) is **not** an easy drop-in for wall-gen: cold physgat sprayed (~3.5× mass, cold p020 score stuck ~0.21) even after soft `physics_gat_prior_scale` + identity `edge_proj`. Best wall-gen feature stack remains SAGE **`WG_featfix_03`** (geom+flux, warm-start from `wall_gen_baseline`, cold p020 ~0.33). Do not prioritize further physgat sweeps unless investing in residual/LN trunk + warm-start/distill — default effort goes to SAGE feature / loss / coupling work.
+
 ## How to run
 
 Supported launchers ([`scripts/README.md`](../scripts/README.md)):
@@ -32,6 +43,8 @@ Supported launchers ([`scripts/README.md`](../scripts/README.md)):
 | `go_wc_v7_frontier_ge2_prec_8h.ps1` | ~8h precision Frontier-ge2 compound (orig10, compound val + wall floor) |
 | `go_wc_v7_tile_cc_explore_2h.ps1` | ~2h A/B: union tile vs per-clot-region tiles |
 | `go_wc_v7_open001_1h.ps1` | ~1h open-001 test (001+007+010 train, recall tilt) |
+| `go_wc_v7_wall_only_retrain.ps1` | Step-3: retrain lumen specialist under wall-only vel-decay (warm-start D_Orig10) |
+| `go_wc_v7_wall_lumen_target_9h.ps1` | ~9h autonomous: spray-gated specialist + WALL_ONLY → frontier-route deploy |
 | `go_wc_v7_crack_001_3h.ps1` | ~3h solo-001 ladder (freeze / unfreeze / CC) to crack hop_ge2=0 |
 | `go_wc_v7_frontier_ge2_prec_viz.ps1` | Hop-ladder viz for Frontier-ge2 prec A vs S |
 | `eval_mat_growth_simple.py` | Cohort metrics (`--offwall-ckpt` / `--two-model-route`) |
@@ -255,17 +268,156 @@ Not a missing-GT or orphan-lumen problem. Structure of 001 vs 007 is surprisingl
 | Open001 1h hop_ge2 pred | 27 | **0** |
 | Solo001_CC (train 001 only) hop_ge2 pred | 38 | **0** |
 
-So 001’s thick clot is attached like 007’s; the specialist simply **never turns on** off-wall there — even when 001 is the sole training vessel (crack_001 ladder).
+So 001’s thick clot is attached like 007’s; earlier we read this as “specialist never turns on.” That was wrong for long-horizon deploy.
 
-**Underlying failure mode (best current read):**
+**Root cause (confirmed 2026-07-26):** `ROOT_vel_decay_wipes_001_lumen`
 
-1. **Not competition / freeze / union** — crack_001 rejected H1–H3: solo-001 freeze, unfreeze, and per-component all leave deploy **001 hop_ge2=0**.
-2. **Train↔deploy mismatch on 001** — specialists trained only on 001 still open lumen on **007** (and CC sprays 004/008) while staying silent on 001. Features can drive lumen somewhere; the 001 deploy path does not. Confirmed on correct EVAL static (diagnose_root).
-3. **Compound-val was blind (bug, fixed 2026-07-25)** — used full-graph static → A_floor/compound_f1=0 on 001; `hop_ge2_recall` never rewarded opening 001. Now uses wall-band `band_static`.
-4. **Frozen WC_v7 backbone** was insufficient as a solo explanation (unfreeze failed the same gate).
-5. **Wall-route compound does not rescue 001** — lumen deltas come from the specialist; silence → pure FN on the second-largest teacher.
+- Locked wall ckpt `log_vel_decay_mat` softplus ≈ **0.72** (not init ~3e-4). Per-step Mat *= `(1 - α·speed)` on the band.
+- Wall clot speed ≈ **0** → wall Mat survives (healthy wall F1 ~0.81). Lumen GT speed p90: **001 ≈ 0.60** vs **007 ≈ 0.25** → ~43%/step wipe on 001 vs ~18%/step on 007.
+- Ablation (`scripts/diagnose_001_root_cause.py`, growth `wc_v7_open001_6h/growth_D_Orig10_Band`): baseline **ge2=0/68**; `SPECIES_CONTINUOUS_VEL_DECAY=0` → **ge2=20/68**, offwall=44, F1 0.807→0.835. Report: `.../diagnose_root_cause.json`.
+- Caveat: `load_continuous_bundle(apply_meta_env=True)` force-sets `VEL_DECAY=1` from meta — ablations must re-pin env after load.
 
-**Why this hurts in multiple respects:** cohort hop_ge2 recall is capped while 001’s 68 GT nodes stay FN; spray vessels can dominate FP while the train vessel itself contributes nothing at deploy; short recall/CC knobs worsen spray without unlocking 001.
+**Rejected / secondary (still true, not the smoking gun):**
+
+1. Not competition / freeze / union (crack_001).
+2. Not orphan lumen / out-of-band GT (65/68 in band, orphan=0).
+3. Compound-val blind band_static bug (fixed 2026-07-25) was real but orthogonal.
+4. Solo-001 training fails under default deploy physics because the same wipe still runs at eval.
+
+**Next fix options:** wall-only or speed-capped vel-decay; freeze/clamp α; do **not** ship blanket `VEL_DECAY=0` (see cohort below).
+
+**Orig10 deploy ablation (D_Orig10_Band, wall-route):** `compare_vel_decay_cohort.json`
+
+| | decay ON | decay OFF | Δ |
+|--|--------:|---------:|--:|
+| mean clot F1 | 0.710 | **0.582** | −0.129 |
+| mean clot score | 0.776 | 0.737 | −0.039 |
+| sum hop_ge2 | 99/185 | **539**/185 | +440 |
+| 001 hop_ge2 | 0 | **20** | open |
+| spray (002/006/010 ge2) | 22/14/0 | **100/73/114** | worse |
+
+So decay-off unlocks 001 but **hurts cohort F1** via lumen spray on zero-GT vessels.
+
+**Deploy contract (2026-07-26):** `SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY=1` (default in train/deploy recipes). Vel-decay applies only on wall-band wall nodes; lumen Mat is not washed. Train unrolls + deploy rollouts share this rule; ckpt `meta.vel_decay_wall_only` / `env_overrides` restore it. Legacy full-band washout: `WALL_ONLY=0`.
+
+**Orig10 re-eval under wall-only (same D_Orig10 weights, no retrain):** `compare_vel_decay_wall_only.json`
+
+| | legacy full-band | wall_only | Δ |
+|--|--------:|---------:|--:|
+| mean clot F1 | 0.710 | **0.583** | −0.128 |
+| mean clot score | 0.776 | 0.741 | −0.034 |
+| sum hop_ge2 | 99/185 | **539**/185 | +440 |
+| 001 hop_ge2 | 0 | **20** | open |
+
+Wall-only ≈ decay-off here (wall speed≈0), so spray still dominates mean F1. Contract is correct for new-vessel deploy; **step 3** must retrain the lumen specialist under wall-only so it stops relying on wipe as an implicit FP filter.
+
+### Run log — wall-only retrain step 3→4 (2026-07-26)
+
+Launcher: `go_wc_v7_wall_only_retrain.ps1 -Fresh` (~2.9 h).  
+Out: `outputs/biochem/offwall_model/wc_v7_wall_only_retrain/` (`compare_wall_only_retrain.json`).
+
+Warm-start D_Orig10; freeze-backbone; `hop_ge2_balanced`; val=001; floor Δ=0.12. Best = **ep2** (val ge2 49/68, compound F1 0.790).
+
+| Arm | mean clot F1 | sum hop_ge2 | 001 ge2 | 002 ge2 |
+|-----|-------------:|------------:|--------:|--------:|
+| A canonical (WALL_ONLY=1) | **0.780** | 59/185 | **50**/68 | 0 |
+| legacy D_Orig10 (full-band) | 0.710 | 99/185 | **0**/68 | 22 |
+| unretrain wall_only | 0.583 | 539/185 | 20/68 | 100 |
+| **S retrain** | **0.518** | **764**/185 | **48**/68 | 93 |
+
+**Gates:** `opened_001=True`; `mean_f1_near_A=False`; spray still worse than unretrain. **Verdict: `needs_work`.**
+
+Notes: under WALL_ONLY, **wall-alone A already opens 001** (ge2 50) at mean F1 0.78 — stronger than S. Retrain opened 001 but increased spray (002/006/007/010). **Do not widen (step 5)** until precision/FP on zero-GT lumen is fixed; consider promoting wall-only A as interim deploy or a stronger FP-tilted / spray-aware val.
+
+### Run log — wall+lumen target 9h (2026-07-26/27)
+
+Launcher: `go_wc_v7_wall_lumen_target_9h.ps1` / `run_wall_lumen_target_9h.py`.  
+Out: `outputs/biochem/offwall_model/wc_v7_wall_lumen_target_9h/`.
+
+Contract: `VEL_DECAY=1` + `WALL_ONLY=1`. Goal: wall F1 near A, open 001+007 hop_ge2, zero-GT spray (002/004/008) ≈0.
+
+| Phase | Arm | mean F1 | 001 ge2 | 007 ge2 | 002 ge2 | notes |
+|-------|-----|--------:|--------:|--------:|--------:|-------|
+| A | wall alone | **0.780** | 50/68 | 9/97 | 0 | spray-clean; weak lumen recall |
+| A | Prec8h wall-route | 0.660 | 174/68 | 136/97 | 12 | legacy decay was FP filter |
+| B | spray_max=3 retrain | 0.625 | 30/68 | 151/97 | 52 | all ckpt saves rejected |
+| C | FP=12 soft spray (Prec8h init) | 0.651 | 58/68 | 109/97 | 35 | first valid save (ep6) |
+| D | D_Orig10 + FP=16 | 0.582 | 20/68 | 138/97 | 89 | no valid spray-gated save |
+| E | C + **frontier hops=2** | 0.683 | 60/68 | 83/97 | 13 | spray↓ but F1 < A−0.04 |
+| E | C + **frontier hops=1** | **0.724** | **61**/68 | **32**/97 | **0** | spray-clean; F1 0.016 shy of 0.740 gate |
+| E | C + frontier hops=0 | 0.780 | 50/68 | 9/97 | 0 | ≡ wall alone |
+
+**EDA (`eda_spray_vs_gt_speed.json`):** spray idle band speed overlaps 001 GT (p90≈0.60) — speed washout cannot selectively kill 002 without wiping 001. **Physics pivot that worked:** deploy `two-model-route=frontier` with `frontier_hops=1` so the specialist only acts in the 1-hop neighborhood of committed Mat (not all lumen).
+
+**Best compound so far:** `growth_C/best.pth` + WALL_ONLY + **frontier hops=1**. Gates: open 001/007 + spray-clean **pass**; mean F1 **0.724** vs need ≥0.740 (A−0.04). **Verdict: `near_target`** — do not promote yet; next lever is a short F1-recovery polish (cut 010/006 over-fire) under the same frontier-h1 deploy contract.
+
+**Best growth ckpt:** `outputs/biochem/offwall_model/wc_v7_wall_lumen_target_9h/growth_C/best.pth`  
+**Eval recipe:** `--two-model-route frontier --two-model-frontier-hops 1`
+
+### WC v8 improvement sweeps (8h, 2026-07-27/28)
+
+Launcher: `go_wc_v8_improvement_sweeps.ps1 -DeadlineHours 8`. Out: `outputs/biochem/offwall_model/wc_v8_improvement_sweeps/`.
+
+| Arm | F1 | score | off_rel | 010 ge2 | 007 ge2 | target |
+|-----|---:|------:|--------:|--------:|--------:|:------:|
+| baseline frontier-h1 (locked) | 0.724 | **0.812** | **0.505** | 29/12 | 32/97 | no (wall guardrail) |
+| frontier hops=0 | 0.780 | 0.802 | 0.439 | 0/12 | 9/97 | no (lumen strict) |
+| **frontier hops=0.5** | **0.745** | **0.812** | 0.473 | 32/12 | 34/97 | **yes** |
+| FP polish 010 (last-weights; wall-floor reject) | 0.693 | 0.805 | 0.426 | 41/12 | 45/97 | no |
+| frontier-h1 retrain (fixed floor 0.12) | 0.721 | 0.799 | 0.446 | **15/12** | **51/97** | no |
+
+**Headline:** same locked growth weights + **hops=0.5** (committed + off-wall 1-hop shell) recovers **+0.021 F1** vs h1 and **passes all compound gates** (including wall guardrail). 010 still over-fires; score stays ~0.812.
+
+**Train arms:** short FP polish failed (compound F1 on 001 << A_floor−0.04; no valid ckpt). Retrain under frontier-h1 val cut 010 over-fire (15/12) and lifted 007 recall (51/97) but lost mean score/F1 vs locked. Budget expired before recall_007 / unfreeze.
+
+**Pivot lesson:** eval-time hops=0.5 is the cheapest F1 recovery; retrain needs wall_floor_delta≥0.12 when val=patient001 (A_floor≈0.90). Next: promote/eval hops=0.5 as deploy default, or short polish under hops=0.5 compound-val.
+
+**Target reframed (2026-07-27):** do **not** require zero hop_ge2 preds on idle vessels (002/004/008). Reward **closeness to GT** (clot or no-clot) with emphasis on **precision / clot score**, while still opening true lumen teachers (001/007) and holding mean F1 near wall. Idle vessels fail only if F1/relaxed precision collapse under false lumen paint.
+
+**Compound eval gates:** `src/evaluation/compound_deploy_gates.py` (wired into `eval_mat_growth_simple.py` and `run_wall_lumen_target_9h.py`).
+
+| Tier | Metrics |
+|------|---------|
+| Primary | `deploy_clot_score`, `deploy_clot_offwall_relaxed_f1` |
+| Lumen | `deploy_clot_offwall_strict_f1_hop_ge2`, ge2 recall (sum pred / sum gt) |
+| Spray (reframed) | idle 002/004/008: F1 >= 0.70 and relaxed prec >= 0.85 if hop_ge2 paint |
+| Guardrail | mean `deploy_clot_f1` >= wall_floor - 0.04 |
+
+### Canonical compound deploy (2026-07-27)
+
+**Leg:** `WC_v8_compound_front_h1` — WC v8 compound: WC_v7 wall + frontier-h1 lumen specialist.
+
+| Role | Artifact |
+|------|----------|
+| Wall backbone (unchanged) | `outputs/biochem/biochem_gnn/locked/species_gnn_best.pth` (`WC_v7_clot_phi_mse`) |
+| Lumen growth | `outputs/biochem/biochem_gnn/locked/compound_growth_best.pth` |
+| Manifest | `data/reference/mat_compound_deploy.json` |
+| Env helper | `src/biochem_gnn/compound_deploy.py` |
+
+Promote: `python scripts/promote_compound_deploy.py --growth-src outputs/.../growth_C/best.pth --eval-json ... --wall-floor-json ...`
+
+**Note:** locked WC_v7 remains the strong **wall-only** model; compound stacks the growth specialist with `two-model-route=frontier`, `frontier_hops=1`, `WALL_ONLY=1`.
+
+### WC_v7 vs growth_C + frontier_h1 (same WALL_ONLY eval)
+
+| | Locked **WC_v7** (wall alone) | **growth_C** + frontier hops=1 |
+|--|--|--|
+| Stack | Single locked species GNN | Compound: WC_v7 wall + growth specialist |
+| Routing | n/a | Specialist only in 1-hop of committed Mat |
+| Mean clot F1 | **0.780** | 0.724 |
+| Mean clot score | 0.802 | **0.812** |
+| hop_ge2 strict | 0.097 | **0.181** |
+| mean ge2 pred/gt | 5.9 / 18.5 | **13.1 / 18.5** |
+| 001 ge2 | 50/68 | **61/68** |
+| 007 ge2 | 9/97 | **32/97** |
+| 002 ge2 | 0/0 | 0/0 |
+| 010 ge2 | 0/12 | 29/12 (over-fire) |
+
+**Physics / washout:** both still carry learned `log_vel_decay_mat` softplus **α ≈ 0.72**. Current deploy contract is `VEL_DECAY=1` + **`WALL_ONLY=1`**, so α washes Mat only on **wall** nodes — lumen is **not** speed-washed. Growth_C was trained and meta-tagged under that wall-only contract; locked WC_v7 meta predates the flag but eval/deploy recipes pin WALL_ONLY now.
+
+**Architecture:** same SAGE dual-head wall backbone. Growth_C is a freeze-backbone specialist (Prec8h warm-start) trained with `frontier_ge2` + `loss_lumen_shape` (FP-heavy) under WALL_ONLY; deploy uses frontier route hops=1 (train used hops=2 supervision).
+
+Viz: `scripts/go_wc_v7_growth_c_frontier_h1_compare_viz.ps1` → `outputs/biochem/offwall_model/wc_v7_wall_lumen_target_9h/viz_compare_wc_v7_vs_growth_c_front_h1/`.
 
 ## Run log — tile CC explore 2h (2026-07-23)
 
@@ -403,6 +555,86 @@ Out: `outputs/biochem/offwall_model/wc_v7_crack_001_3h/` (`compare_crack_001.jso
 4. **CC is dangerous without spray gates** — mean hop_ge2 volume jumps via 004/008 paint; clot F1 collapses (−0.14 vs A).
 5. **Revised failure mode:** train↔deploy mismatch on 001 (wall-route compound / IC / teacher-forced tiles vs closed-loop wall state), not short freeze/unfreeze/CC knobs. Next: debug why compound-val clot_f1 is 0 on 001; compare train-tile preds vs deploy wall-route on the same 001 frame; try growth-alone (non-compound) deploy and/or frontier route / teacher-IC deploy ablations.
 
+### Run log — crack_001 layer-2 quick (2026-07-25, band-static val fixed)
+
+Launcher: `go_wc_v7_crack_001_3h.ps1 -Fresh -Epochs 2 -EarlyStop 2 -MaxWindows 12`
+
+**A_floor now healthy** (`≈0.807`) — layer-1 compound-val bug is fixed.  
+**Verdict still `still_closed_architecture_suspect`:** 001 hop_ge2 = **0** on Freeze / Unfreeze / CC.
+
+| Arm | clot_f1 | ge2_n | 001 ge2 | 007 ge2 | 004 | 008 |
+|-----|--------:|------:|--------:|--------:|----:|----:|
+| A | 0.676 | 0.0 | 0 | 0 | 0 | 0 |
+| Prec8hRef | 0.662 | 6.8 | 0 | 17 | 1 | 9 |
+| Solo001_Freeze | 0.566 | 30.2 | **0** | **63** | **47** | 11 |
+| Solo001_Unfreeze | 0.563 | 31.8 | **0** | **63** | **52** | 12 |
+| Solo001_CC | 0.554 | 51.5 | **0** | 34 | **66** | **106** |
+
+Compound-val every ep2: `compound_f1≈0.80` but still `hop_ge2: 0/68` — wall OK, lumen never lights on 001.
+
+**Read:** solo-001 training with global tile feats still sprays 007/004/008 at deploy while 001 stays hard-zero. Matches train/deploy kin feature mismatch (001 lumen cos≈0.16 global vs band).
+
+**Next wiring (done):** `--train-feat-source band` (default) trains tiles on the same wall-band features as eval. Re-run layer-2 quick after this.
+
+### Run log — crack_001 Resume (2026-07-25 evening) — **invalid for band-feat test**
+
+Launcher: `go_wc_v7_crack_001_3h.ps1 -Resume -Epochs 2 ...`
+
+Completed Prec8hRef probe only; **skipped all Solo001 train/probe** because pre-band ckpts/probes already existed (`best.json` has no `train_feat_source`). Numbers match the earlier global-feat layer-2 table exactly → verdict `still_closed_architecture_suspect` is **not** a band-feat result.
+
+Launcher now retrains on Resume when `best.json.train_feat_source != band` (and drops the stale probe).
+
+**True band-feat test:**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_wc_v7_crack_001_3h.ps1 -Resume -Epochs 2 -EarlyStop 2 -MaxWindows 12
+```
+
+(or `-Fresh` to wipe baselines too). Confirm train banner shows `train_feat_source: band`.
+
+### Fast path (preferred for hard-zero bug hunting)
+
+Do **not** re-run the full crack ladder to hunt a stiff 0. Use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\go_wc_v7_001_signs_of_life.ps1
+# or even faster:
+powershell ... -File .\scripts\go_wc_v7_001_signs_of_life.ps1 -SkipDeploy
+```
+
+Mini-trains ~40 steps on one late 001 tile (band vs global), reports lumen Mat delta fire under teacher IC vs resting closed-loop, optional single-anchor deploy. Verdicts: `signs_of_life_band`, `life_on_teacher_dead_on_closed_loop`, `dead_everywhere_*`.
+
+### Run log — 001 narrow ladder (2026-07-25 evening)
+
+Scripts: `diagnose_001_narrow.py`, `diagnose_001_band_long.py`, band Solo001_Freeze retrain.
+
+| Test | Result |
+|------|--------|
+| Band vs global cos(kin, lumen) | 001 **0.145**, 007 **0.198** (both severe; `kin_norm` on band only was the gap) |
+| Signs-of-life band 40/300 steps | fire rises (~28→160+); **deploy hop_ge2 still 0** (compound / growth-alone / frontier) |
+| Global late-tile | fire stays 0; loss flat |
+| Band Solo001_Freeze 2ep/12win (`train_feat_source=band`) | **001 ge2=0**, 007 ge2=**1** (global-feat solo used to spray 007~63) |
+| `out_scale`×50 late-tile | does **not** open hop_ge2 |
+| Bug fixed | launcher FN tilt (`UNDERPRED=12`) was wiped by `apply_mat_growth_leg_env(force=True)` — now restored after leg apply |
+
+**Verdict:** `tile_life_but_deploy_threshold_or_nucleation_gap`. Band feats are necessary (kill spray / unlock tile gradients) but **not sufficient** at 2ep to open 001 deploy lumen. Next: longer band Solo001 budget + instrument full-rollout Mat accumulation (fire ≠ commit).
+
+### Run log — open001 6h autonomous ladder (2026-07-26)
+
+Launcher: `go_wc_v7_open001_6h.ps1 -Fresh` (~6 h) + emergency `go_wc_v7_open001_prec8h_ft.ps1`.  
+Out: `outputs/biochem/offwall_model/wc_v7_open001_6h/`.
+
+| Arm | 001 ge2 | 007 ge2 | cohort ge2 | mean clot_f1 |
+|-----|--------:|--------:|-----------:|-------------:|
+| A/B/C Solo001 band | **0** | — | 0 | 0.80 |
+| C2 Teachers 001+007+010 | **0** | — | 0 | 0.80 |
+| **D_Orig10_Band** | **0** | **44** | **99**/185 | 0.71 |
+| E Prec8h→001+007 FT | **0** | 9 | — | — |
+
+**Verdict: `still_closed_001`.** Band + FN tilt + freeze/unfreeze/CC/teachers/orig10 all fail to light **patient001** hop_ge2, while the same D orig10 compound **does** write lumen elsewhere (007=44, cohort 99). Prec8h warm-start FT also keeps 001 hard-zero.
+
+**Implication:** not a short-budget or freeze/union issue. 001 deploy lumen lock survives correct band features and multi-anchor capacity. Next: instrument full-deploy lumen Mat vs gelation log1p≈3e-4 on 001 (accumulation / vel-decay / state-conditioning), not more Solo001 ep knobs.
+
 ### Run log — crack_001 root diagnose (2026-07-25)
 
 Script: `scripts/diagnose_crack_001_root.py`  
@@ -425,7 +657,7 @@ Same Solo001_Freeze growth on **correct** EVAL static:
 **Root stack (two layers):**
 
 1. **Bug (fixed):** `eval_wall_only_deploy_floor` / `eval_compound_wall_route_deploy` used full-graph `base_feats_global` + all-node `node_idx`. That zeros clot F1 on 001, so `hop_ge2_recall` never saw a usable 001 signal (A_floor=0, compound_f1=0 every epoch). Packs now store `band_static` via `build_band_base_features` (same as eval).
-2. **Remaining 001 lock:** even with correct EVAL static, Solo001_Freeze compound still has **001 hop_ge2=0** while opening 007. So the deploy silence on 001 is real, not only a metric bug. Next: teacher-forced vs closed-loop delta probe on 001 lumen nodes; optionally train tiles on band features (still indexed from full-graph feats today).
+2. **Remaining 001 lock:** even with correct EVAL static, Solo001_Freeze compound still has **001 hop_ge2=0** while opening 007. Layer-2 quick (2 ep) confirmed spray-without-001. **Follow-up fix:** train tiles now default to `--train-feat-source band` (same `band_static` as eval) to kill global↔band kin mismatch.
 
 ## Related
 

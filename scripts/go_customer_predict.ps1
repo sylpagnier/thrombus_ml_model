@@ -19,6 +19,8 @@ if (-not (Test-Path $Inbox)) {
 }
 
 Write-Host "[i] HemoRGP Predict" -ForegroundColor Cyan
+Write-Host "[i] Deploy: WC_v8 compound (WC_v7 wall + frontier-h1 growth)" -ForegroundColor DarkGray
+Write-Host "[i] Wall-only fallback: `$env:CUSTOMER_COMPOUND='0'" -ForegroundColor DarkGray
 Write-Host "[i] Geometries folder: $Inbox" -ForegroundColor DarkGray
 Write-Host "[i] Use Open folder or Browse (starts in that folder)" -ForegroundColor DarkGray
 

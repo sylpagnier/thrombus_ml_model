@@ -244,10 +244,10 @@ def _parse_batch_args(argv: list[str]) -> Optional[argparse.Namespace]:
     p.add_argument(
         "--aneurysm-wall",
         choices=("mirrored", "one"),
-        default="mirrored",
+        default="one",
         help=(
-            "Max-strength aneurysm placement: mirrored/both walls (default) or one wall "
-            "(max wall offset on top or bottom)."
+            "Max-strength aneurysm placement: one wall (default; max wall offset on top "
+            "or bottom) or mirrored/both walls."
         ),
     )
     args = p.parse_args(argv)

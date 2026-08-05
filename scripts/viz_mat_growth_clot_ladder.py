@@ -43,6 +43,7 @@ from src.core_physics.species_pushforward_continuous import (  # noqa: E402
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
 from src.evaluation.clot_relaxed_metrics import compute_clot_relaxed_metrics  # noqa: E402
+from src.evaluation.pocket_gate import apply_pocket_gate  # noqa: E402
 from src.evaluation.viz_clot_phi_simple import _scatter_fullmesh_region  # noqa: E402
 from src.evaluation.clot_timeline_metrics import clot_frame_metrics, summarize_clot_timeline  # noqa: E402
 from src.evaluation.viz_clot_trigger import clot_trigger_viz_f1  # noqa: E402
@@ -117,14 +118,17 @@ def main() -> int:
     ap.add_argument(
         "--two-model-route",
         default="",
-        choices=("", "wall", "frontier", "growth"),
+        choices=("", "wall", "frontier", "frontier_offwall", "frontier_lumen_only", "growth"),
         help="Two-model routing when --offwall-ckpt is set (default: frontier)",
     )
-    ap.add_argument("--two-model-frontier-hops", type=int, default=2)
+    ap.add_argument("--two-model-frontier-hops", type=float, default=2.0)
     ap.add_argument("--arm-label", default="", help="Title tag (e.g. Arm_A_canonical)")
     ap.add_argument("--flow", default="kinematics", choices=("gt", "kinematics"))
     ap.add_argument("--max-frames", type=int, default=10)
     ap.add_argument("--scatter-size", type=float, default=3.0)
+    ap.add_argument("--gate-pct", type=float, default=-1.0,
+                    help="Pocket-gate percentile applied to each frame's prediction before "
+                         "plotting (WALL_MODEL_PLAN.md s4/s9). -1 (default) = off, raw pred.")
     ap.add_argument("--no-error-row", action="store_true")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
@@ -220,6 +224,11 @@ def main() -> int:
     for j, t in enumerate(times):
         phi_gt = gt_clot_phi_at_time(data, int(t), phys, device)
         phi_pred = phi_pred_traj[int(t)]
+        if args.gate_pct >= 0.0:
+            phi_pred, _gate_stats = apply_pocket_gate(
+                phi_pred.reshape(-1), data, device,
+                percentile=float(args.gate_pct), wall_mask=wall_mask_full,
+            )
         tau = float(macro_tau_at_index(data, int(t), bio_cfg=bio))
         fm = clot_frame_metrics(phi_pred, phi_gt, n_band=n_nodes)
         m = clot_trigger_viz_f1(phi_pred, phi_gt, mask)

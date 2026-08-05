@@ -1,0 +1,47 @@
+---
+description: Prefer robust system-wide fixes over brittle temporary patches
+alwaysApply: true
+---
+
+# Robust, concise, system-wide changes
+
+When changing behavior, **prefer the durable control plane** over a one-off workaround.
+
+## Priority order
+
+1. **Typed / shared abstraction** — extend or use existing dataclasses, helpers, and call-site wiring (`PushforwardConfig`, `BiochemRuntimeConfig`, shared eval/deploy builders).
+2. **Focused system-wide fix** — one coherent change that all readers/writers honor (bind once, resolve everywhere).
+3. **Local surgical edit** — only when the concern is truly local and has no shared knob.
+4. **Temporary patch** — last resort; never the default for architecture, features, sweeps, coupling, rollout, or scoring.
+
+## Do
+
+- Keep diffs **concise**: smallest change that fixes the *class* of problem, not just one call site.
+- Add a typed field + helper that checks `get_active_*` / `resolve_*` first; wire legs via `config_kwargs` / `runtime_kwargs`.
+- Prefer `dataclasses.replace` / `with_overrides` and `use_*` context binding over mutating process globals.
+- Update the few hot-path readers that still ignore the typed path when you add a knob.
+- Write or adjust focused tests that assert the active typed config (env cleared).
+
+## Do not
+
+- Toggle features by stamping `os.environ` (except process/IO: paths, tqdm, CUDA).
+- Add one-off scripts, per-leg string dicts, or "just for this run" env bridges as the real fix.
+- Paper over a missing field with another `os.environ.get` at a single site.
+- Expand into unrelated refactors, drive-by cleanups, or mega-files when a typed field + bind would suffice.
+
+## Tension with "small diffs"
+
+Small and local is good **when the design is already right**. If the design is brittle (scattered env strings, duplicated flags, sticky process state), prefer a **short system-wide correction** over another local patch that deepens the debt.
+
+## Concrete anti-patterns
+
+```python
+# BAD: temporary control-plane patch
+os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
+os.environ["SPECIES_DYNAMIC_OCCLUSION"] = "1"
+
+# GOOD: typed override + bind
+cfg = replace(cfg, dual_head=True)
+rt = rt.with_overrides(dynamic_occlusion=True)
+_bind_typed_configs(cfg, rt)  # or use_pushforward_config / use_biochem_runtime
+```

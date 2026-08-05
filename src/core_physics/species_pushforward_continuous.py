@@ -12,9 +12,12 @@ from __future__ import annotations
 import json
 import math
 import os
+from src.core_physics.constants import *
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from src.architecture.pushforward_config import PushforwardConfig, resolve_config
 
 import torch
 import torch.nn as nn
@@ -206,14 +209,45 @@ def legacy_capped_deploy_time_index(n_times: int) -> int:
     return min(LEGACY_CAPPED_DEPLOY_HORIZON, graph_last_time_index(n_times))
 
 
+# Minimum steps left after the latest allowed t0, regardless of coverage_frac -- must clear the
+# curriculum's largest unroll tier (15, at epoch>30; see curriculum_unroll_for_epoch) with margin.
+TRAIN_T0_COVERAGE_MIN_RUNWAY = 20
+
+
+def pushforward_train_t0_coverage_frac(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.train_t0_coverage_frac), 0.0)
+    raw = (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_COVERAGE_FRAC") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
 def train_t0_max_for_n_times(n_times: int) -> int:
-    """Per-vessel window start cap scaled to each graph's full timeline."""
+    """Per-vessel window start cap scaled to each graph's full timeline.
+
+    Legacy formula caps at ~132 of a 200-step timeline (66%) -- the last third of the
+    horizon is never sampled as a window START, only ever reached as a continuation of an
+    earlier window. ``train_t0_coverage_frac`` (0 = this formula, unchanged) overrides that
+    with an explicit fraction of the timeline, clamped to leave ``TRAIN_T0_COVERAGE_MIN_RUNWAY``
+    steps of runway so a window starting near the end still has room for the curriculum's
+    largest unroll.
+    """
     last = graph_last_time_index(n_times)
+    coverage = pushforward_train_t0_coverage_frac()
+    if coverage > 0.0:
+        cap = int(round(coverage * last))
+        return max(0, min(cap, max(0, last - TRAIN_T0_COVERAGE_MIN_RUNWAY)))
     legacy_ref = legacy_capped_deploy_time_index(n_times)
     return max(legacy_ref, int(round(35.0 * last / max(legacy_ref, 1))))
 
 
-def pushforward_train_t0_per_vessel() -> bool:
+def pushforward_train_t0_per_vessel(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.train_t0_per_vessel
     raw = (os.environ.get("SPECIES_PUSHFORWARD_TRAIN_T0_PER_VESSEL") or "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
@@ -233,22 +267,36 @@ def continuous_ckpt_path() -> Path:
     return p
 
 
-def continuous_growth_only_loss() -> bool:
+def continuous_growth_only_loss(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.growth_only_loss
     raw = (os.environ.get("SPECIES_CONTINUOUS_GROWTH_ONLY_LOSS") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_dual_head() -> bool:
+def continuous_dual_head(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.dual_head
     raw = (os.environ.get("SPECIES_CONTINUOUS_DUAL_HEAD") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_saturation_gate() -> bool:
+def continuous_saturation_gate(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.saturation_gate
     raw = (os.environ.get("SPECIES_CONTINUOUS_SATURATION_GATE") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def saturation_headroom_scale() -> float:
+def saturation_headroom_scale(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.saturation_scale
     raw = (os.environ.get("SPECIES_CONTINUOUS_SATURATION_SCALE") or "80").strip()
     try:
         return max(float(raw), 1.0)
@@ -256,7 +304,10 @@ def saturation_headroom_scale() -> float:
         return 80.0
 
 
-def saturation_headroom_scale_offwall() -> float:
+def saturation_headroom_scale_offwall(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.saturation_scale_offwall
     raw = os.environ.get("SPECIES_CONTINUOUS_SATURATION_SCALE_OFFWALL")
     if raw is None:
         return saturation_headroom_scale()
@@ -266,7 +317,10 @@ def saturation_headroom_scale_offwall() -> float:
         return saturation_headroom_scale()
 
 
-def mature_clot_frac() -> float:
+def mature_clot_frac(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.mature_frac
     raw = (os.environ.get("SPECIES_CONTINUOUS_MATURE_FRAC") or "0.95").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -274,7 +328,10 @@ def mature_clot_frac() -> float:
         return 0.95
 
 
-def continuous_mature_fp_exempt() -> bool:
+def continuous_mature_fp_exempt(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.mature_fp_exempt
     raw = (os.environ.get("SPECIES_CONTINUOUS_MATURE_FP_EXEMPT") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -289,12 +346,18 @@ def temporal_lambda_bounds() -> tuple[float, float]:
     return 1.0, 1.0
 
 
-def continuous_delta_residual() -> bool:
+def continuous_delta_residual(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.delta_residual
     raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_RESIDUAL") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_delta_residual_alpha() -> float:
+def continuous_delta_residual_alpha(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.delta_residual_alpha
     raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_RESIDUAL_ALPHA") or "0.35").strip()
     try:
         return max(float(raw), 0.0)
@@ -302,12 +365,18 @@ def continuous_delta_residual_alpha() -> float:
         return 0.35
 
 
-def continuous_temporal_offset() -> bool:
+def continuous_temporal_offset(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.temporal_offset
     raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_OFFSET") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_temporal_offset_scale() -> float:
+def continuous_temporal_offset_scale(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.temporal_offset_scale
     raw = (os.environ.get("SPECIES_CONTINUOUS_TEMPORAL_OFFSET_SCALE") or "0.15").strip()
     try:
         return max(float(raw), 0.0)
@@ -315,12 +384,19 @@ def continuous_temporal_offset_scale() -> float:
         return 0.15
 
 
-def continuous_neighbor_commit_gate() -> bool:
+def continuous_neighbor_commit_gate(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.neighbor_commit_gate
     raw = (os.environ.get("SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE") or "0").strip().lower()
     return raw not in ("0", "false", "off", "no")
 
 
-def continuous_neighbor_commit_alpha() -> float:
+def continuous_neighbor_commit_alpha(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.neighbor_commit_alpha
     raw = (os.environ.get("SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_ALPHA") or "0.8").strip()
     try:
         return max(0.0, min(float(raw), 1.0))
@@ -328,7 +404,10 @@ def continuous_neighbor_commit_alpha() -> float:
         return 0.8
 
 
-def continuous_score_clot_weight() -> float:
+def continuous_score_clot_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.score_clout_w
     raw = (os.environ.get("SPECIES_CONTINUOUS_SCORE_CLOUT_W") or "0").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -353,12 +432,18 @@ def global_species_mass_feature(log_state: torch.Tensor) -> torch.Tensor:
     )
 
 
-def continuous_time_context_enabled() -> bool:
+def continuous_time_context_enabled(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.time_context
     raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_CONTEXT") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_time_ref_seconds() -> float:
+def continuous_time_ref_seconds(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.time_ref_s
     raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_REF_S") or "3000").strip()
     try:
         return max(float(raw), 1.0)
@@ -366,7 +451,10 @@ def continuous_time_ref_seconds() -> float:
         return 3000.0
 
 
-def continuous_time_fourier_freqs() -> int:
+def continuous_time_fourier_freqs(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.time_fourier_freqs
     raw = (os.environ.get("SPECIES_CONTINUOUS_TIME_FOURIER_FREQS") or "8").strip()
     try:
         return max(int(float(raw)), 0)
@@ -401,20 +489,49 @@ def continuous_time_feature_dim() -> int:
     return 1 + 2 * continuous_time_fourier_freqs()
 
 
+def continuous_tail_feature_dim() -> int:
+    """Trailing ``[state_norm, (sat_ratio), (time_context)]`` width after band base feats."""
+    n = _sd()
+    if continuous_saturation_gate():
+        n += _sd()
+    return n + continuous_time_feature_dim()
+
+
 def continuous_feature_dim(latent_dim: int) -> int:
-    """GNN input dim: ``[z_kin, sdf, state_norm, (optional sat_ratio)]``."""
+    """GNN input dim: ``[z_kin, sdf, band_extras..., state_norm, (sat), (time)]``."""
     base = pushforward_feature_dim(int(latent_dim))
     if continuous_saturation_gate():
         base += _sd()
     return base + continuous_time_feature_dim()
 
 
-def continuous_vel_decay_enabled() -> bool:
+def continuous_vel_decay_enabled(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.vel_decay
     raw = (os.environ.get("SPECIES_CONTINUOUS_VEL_DECAY") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
-def continuous_teacher_noise_sigma() -> float:
+def continuous_vel_decay_wall_only(config: PushforwardConfig | None = None) -> bool:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.vel_decay_wall_only
+    """If True, apply vel-decay only on wall nodes (lumen Mat is not washed out).
+
+    Default ON: compound deploy must not let wall-trained alpha wipe lumen growth.
+    Set SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY=0 for legacy full-band washout.
+    """
+    raw = (os.environ.get("SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY") or "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_teacher_noise_sigma(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.teacher_noise
     raw = (os.environ.get("SPECIES_CONTINUOUS_TEACHER_NOISE") or "0.02").strip()
     try:
         return max(float(raw), 0.0)
@@ -422,7 +539,10 @@ def continuous_teacher_noise_sigma() -> float:
         return 0.0
 
 
-def continuous_teacher_fp_frac() -> float:
+def continuous_teacher_fp_frac(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.teacher_fp_frac
     raw = (os.environ.get("SPECIES_CONTINUOUS_TEACHER_FP_FRAC") or "0.08").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -430,7 +550,10 @@ def continuous_teacher_fp_frac() -> float:
         return 0.0
 
 
-def continuous_teacher_blur() -> float:
+def continuous_teacher_blur(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.teacher_blur
     raw = (os.environ.get("SPECIES_CONTINUOUS_TEACHER_BLUR") or "0.25").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -438,7 +561,10 @@ def continuous_teacher_blur() -> float:
         return 0.0
 
 
-def pushforward_max_unroll_steps() -> int:
+def pushforward_max_unroll_steps(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.max_unroll
     raw = (os.environ.get("SPECIES_PUSHFORWARD_MAX_UNROLL") or "200").strip()
     if raw:
         try:
@@ -448,7 +574,10 @@ def pushforward_max_unroll_steps() -> int:
     return max(pushforward_unroll_steps(), 10)
 
 
-def tbptt_tail_steps() -> int:
+def tbptt_tail_steps(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.tbptt_tail
     raw = (os.environ.get("SPECIES_CONTINUOUS_TBPTT_TAIL") or "5").strip()
     try:
         return max(int(float(raw)), 1)
@@ -456,7 +585,10 @@ def tbptt_tail_steps() -> int:
         return 5
 
 
-def closed_loop_init_prob() -> float:
+def closed_loop_init_prob(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.closed_loop_init
     raw = (os.environ.get("SPECIES_CONTINUOUS_CLOSED_LOOP_INIT") or "0.45").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -464,14 +596,107 @@ def closed_loop_init_prob() -> float:
         return 0.0
 
 
-def curriculum_unroll_for_epoch(epoch: int) -> int:
+# ---------------------------------------------------------------------------
+# Scheduled Sampling (noisy-GT anchoring)
+# ---------------------------------------------------------------------------
+
+def scheduled_sampling_enabled(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.scheduled_sampling
+    """Whether to inject intermittent GT anchoring during autoregressive unrolling."""
+    return (os.environ.get("SPECIES_SCHEDULED_SAMPLING") or "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _ss_target_prob(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.ss_target_prob
+    """Max probability of *keeping* the model's own prediction (vs resetting to GT).
+
+    Ramps from 0 (pure GT anchoring) to this value over warmup, then stays.
+    At deploy the model always keeps its own prediction (p=1), so higher target
+    = closer to deploy distribution.
+    """
+    raw = (os.environ.get("SPECIES_SS_TARGET_PROB") or "0.5").strip()
+    try:
+        return min(max(float(raw), 0.0), 1.0)
+    except ValueError:
+        return 0.5
+
+
+def _ss_warmup_epochs(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.ss_warmup_epochs
+    """Epochs of pure GT anchoring (p=0) before the ramp begins."""
+    raw = (os.environ.get("SPECIES_SS_WARMUP_EPOCHS") or "3").strip()
+    try:
+        return max(int(float(raw)), 0)
+    except ValueError:
+        return 3
+
+
+def _ss_anchor_stride(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.ss_anchor_stride
+    """Only consider GT anchoring every *stride* steps (skip in-between).
+
+    Default 10: potential reset points at step 10, 20, 30, ...
+    """
+    raw = (os.environ.get("SPECIES_SS_ANCHOR_STRIDE") or "10").strip()
+    try:
+        return max(int(float(raw)), 1)
+    except ValueError:
+        return 10
+
+
+def _ss_noisy(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return config.ss_noisy
+    """Use noisy GT (via noisy_teacher_log_state0) instead of clean GT.
+
+    Noisy is strongly preferred: teaches error-recovery without oracle dependence.
+    """
+    return (os.environ.get("SPECIES_SS_NOISY") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def scheduled_sampling_keep_prob(epoch: int, max_epochs: int) -> float:
+    """Probability of keeping model prediction (1-p = probability of GT reset).
+
+    * Epochs < warmup: p = 0 (always reset to GT = pure teacher forcing).
+    * Warmup -> max_epochs: linear ramp from 0 to target.
+    * After max_epochs: p = target.
+    """
+    if not scheduled_sampling_enabled():
+        return 1.0  # disabled: always keep own prediction (current behaviour)
+    target = _ss_target_prob()
+    warmup = _ss_warmup_epochs()
+    if epoch < warmup:
+        return 0.0
+    ramp = max(max_epochs - warmup, 1)
+    return min(target * (epoch - warmup) / ramp, target)
+
+
+def curriculum_unroll_for_epoch(epoch: int, config: PushforwardConfig | None = None) -> int:
     """Epoch-based unroll length (Phase 4 curriculum)."""
-    if (os.environ.get("SPECIES_CONTINUOUS_CURRICULUM_UNROLL") or "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
+    config = resolve_config(config)
+    if config is not None:
+        enabled = bool(config.curriculum_unroll)
+    else:
+        enabled = (os.environ.get("SPECIES_CONTINUOUS_CURRICULUM_UNROLL") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    if not enabled:
         return pushforward_unroll_steps()
     max_u = pushforward_max_unroll_steps()
     if epoch <= 10:
@@ -492,7 +717,10 @@ def curriculum_unroll_for_epoch(epoch: int) -> int:
     return min(120, max_u)
 
 
-def continuous_spatial_loss_weight() -> float:
+def continuous_spatial_loss_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.spatial_loss_weight
     raw = (os.environ.get("SPECIES_CONTINUOUS_SPATIAL_LOSS_WEIGHT") or "1.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -500,7 +728,10 @@ def continuous_spatial_loss_weight() -> float:
         return 1.0
 
 
-def continuous_gate_temp() -> float:
+def continuous_gate_temp(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.gate_temp
     """Temperature on the spatial-gate sigmoid: ``gate = sigmoid(logits / T)``.
 
     ``T < 1`` sharpens the gate toward a hard 0/1 decision (sparser support, fewer soft wall
@@ -514,7 +745,10 @@ def continuous_gate_temp() -> float:
         return 1.0
 
 
-def continuous_frontier_hops() -> int:
+def continuous_frontier_hops(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return config.frontier_hops
     """Restrict growth to the ``k``-hop frontier of *predicted* committed Mat (0 = off).
 
     Implements the "nucleate at a few sites, then propagate slowly" architecture: each step a node
@@ -529,7 +763,10 @@ def continuous_frontier_hops() -> int:
         return 0
 
 
-def continuous_nucleation_topk() -> float:
+def continuous_nucleation_topk(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.nucleation_topk
     """Deployable nucleation seed: fraction of band nodes allowed to nucleate by the model's own
     gate confidence (0 = off). When the frontier is empty (no committed mass yet, e.g. t0 where
     phi=0 at deploy), the top ``frac`` highest gate-logit nodes may seed -- the "choose a few areas"
@@ -542,8 +779,11 @@ def continuous_nucleation_topk() -> float:
         return 0.0
 
 
-def continuous_delta_threshold() -> float:
-    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_THRESH") or "5e-6").strip()
+def continuous_delta_threshold(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.delta_thresh
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_THRESH") or str(DEFAULT_DELTA_THRESH)).strip()
     try:
         return max(float(raw), 0.0)
     except ValueError:
@@ -558,15 +798,21 @@ def continuous_delta_threshold_channels() -> tuple[float, float]:
     return fi, mat
 
 
-def continuous_delta_value_scale() -> float:
-    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_VALUE_SCALE") or "150000").strip()
+def continuous_delta_value_scale(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.delta_value_scale
+    raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_VALUE_SCALE") or str(DEFAULT_DELTA_VALUE_SCALE)).strip()
     try:
         return max(float(raw), 1.0)
     except ValueError:
         return 1e5
 
 
-def continuous_underpred_weight() -> float:
+def continuous_underpred_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.underpred_weight
     raw = (os.environ.get("SPECIES_CONTINUOUS_UNDERPRED_WEIGHT") or "2.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -574,7 +820,10 @@ def continuous_underpred_weight() -> float:
         return 2.0
 
 
-def continuous_fp_weight() -> float:
+def continuous_fp_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.fp_weight
     raw = (os.environ.get("SPECIES_CONTINUOUS_FP_WEIGHT") or "8").strip()
     try:
         return max(float(raw), 0.0)
@@ -582,7 +831,10 @@ def continuous_fp_weight() -> float:
         return 0.0
 
 
-def continuous_gate_fp_weight() -> float:
+def continuous_gate_fp_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.gate_fp_weight
     """Extra BCE pressure on spatial gate logits at zero-growth nodes (anti wall-paint)."""
     raw = (os.environ.get("SPECIES_CONTINUOUS_GATE_FP_WEIGHT") or "0").strip()
     try:
@@ -591,7 +843,10 @@ def continuous_gate_fp_weight() -> float:
         return 0.0
 
 
-def continuous_fp_threshold() -> float:
+def continuous_fp_threshold(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.fp_thresh
     raw = (os.environ.get("SPECIES_CONTINUOUS_FP_THRESH") or "2e-5").strip()
     try:
         return max(float(raw), 0.0)
@@ -599,7 +854,10 @@ def continuous_fp_threshold() -> float:
         return 2e-5
 
 
-def continuous_loss_scale() -> float:
+def continuous_loss_scale(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.loss_scale
     default = "1" if continuous_growth_only_loss() else "10000"
     raw = (os.environ.get("SPECIES_CONTINUOUS_LOSS_SCALE") or default).strip()
     try:
@@ -635,7 +893,11 @@ def _growth_huber() -> ActiveGrowthHuberLoss:
     )
 
 
-def continuous_huber_beta() -> float:
+def continuous_huber_beta(config: PushforwardConfig | None = None) -> float:
+
+    config = resolve_config(config)
+    if config is not None:
+        return config.huber_beta
     raw = (os.environ.get("SPECIES_CONTINUOUS_HUBER_BETA") or "1e-4").strip()
     try:
         return max(float(raw), 1e-8)
@@ -655,8 +917,12 @@ def continuous_channel_weights_vec() -> list[float]:
 
 
 def continuous_channel_weights() -> tuple[float, float]:
+    from src.architecture.pushforward_config import get_active_config
     from src.core_physics.species_snapshot_gnn import _env_float_channel
 
+    cfg = get_active_config()
+    if cfg is not None:
+        return float(cfg.channel_weight_fi), float(cfg.channel_weight_mat)
     fi = _env_float_channel("SPECIES_CONTINUOUS_CHANNEL_WEIGHT_FI", 1.0)
     mat = _env_float_channel("SPECIES_CONTINUOUS_CHANNEL_WEIGHT_MAT", 4.0)
     return fi, mat
@@ -664,6 +930,9 @@ def continuous_channel_weights() -> tuple[float, float]:
 
 def continuous_max_sat_log() -> tuple[float, float]:
     """Per-channel log1p saturation after commit (freeze mature clot)."""
+    cfg = resolve_config()
+    if cfg is not None:
+        return float(cfg.max_sat_log_fi), float(cfg.max_sat_log_mat)
     from src.core_physics.species_snapshot_gnn import _env_float_channel
 
     fi = _env_float_channel("SPECIES_CONTINUOUS_MAX_SAT_LOG_FI", 0.002)
@@ -671,8 +940,11 @@ def continuous_max_sat_log() -> tuple[float, float]:
     return fi, mat
 
 
-def continuous_state_scale() -> float:
-    raw = (os.environ.get("SPECIES_CONTINUOUS_STATE_SCALE") or "0.002").strip()
+def continuous_state_scale(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return config.state_scale
+    raw = (os.environ.get("SPECIES_CONTINUOUS_STATE_SCALE") or str(DEFAULT_STATE_SCALE)).strip()
     try:
         return max(float(raw), 1e-8)
     except ValueError:
@@ -681,6 +953,9 @@ def continuous_state_scale() -> float:
 
 def continuous_mat_commit_thresh() -> float:
     """Binary readout threshold on accumulated log Mat (deploy)."""
+    cfg = resolve_config()
+    if cfg is not None and float(cfg.mat_commit_thresh) >= 0.0:
+        return float(cfg.mat_commit_thresh)
     from src.core_physics.species_snapshot_gnn import _env_float_channel
 
     return _env_float_channel("SPECIES_CONTINUOUS_MAT_COMMIT_THRESH", snapshot_active_log_nd())
@@ -782,13 +1057,32 @@ def model_vel_decay_alphas(model: nn.Module) -> tuple[torch.Tensor, torch.Tensor
     return a_fi, a_mat
 
 
+def resolve_vel_decay_speed(
+    wall_speed: torch.Tensor,
+    wall_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-node speed used by vel-decay (optionally zeroed off-wall)."""
+    spd = wall_speed.reshape(-1)
+    if not continuous_vel_decay_wall_only():
+        return spd
+    if wall_mask is None:
+        # Fail closed: never apply full-band washout when wall-only is requested.
+        return torch.zeros_like(spd)
+    m = wall_mask.reshape(-1).to(device=spd.device, dtype=spd.dtype)
+    return spd * m
+
+
 def apply_velocity_decay(
     log_state: torch.Tensor,
     wall_speed: torch.Tensor,
     alphas: tuple[torch.Tensor, torch.Tensor],
+    *,
+    wall_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     st = log_state.reshape(-1, _sd())
-    spd = wall_speed.reshape(-1, 1).to(device=st.device, dtype=st.dtype)
+    spd = resolve_vel_decay_speed(wall_speed, wall_mask).reshape(-1, 1).to(
+        device=st.device, dtype=st.dtype
+    )
     a_fi, a_mat = alphas
     decay = torch.zeros_like(st)
     li_fi = _local_fi_idx()
@@ -828,8 +1122,10 @@ def build_continuous_step_features(
 ) -> torch.Tensor:
     state_norm = normalize_log_state(log_state)
     state_in = maybe_noise_log_state(state_norm, training=training)
-    
-    if os.environ.get("SPECIES_CONVECTION_AGGR") == "1" and velocity is not None and pos_band is not None and edge_index is not None:
+
+    cfg = resolve_config()
+    use_conv = bool(cfg.convection_aggr) if cfg is not None else (os.environ.get("SPECIES_CONVECTION_AGGR") == "1")
+    if use_conv and velocity is not None and pos_band is not None and edge_index is not None:
         mat_idx = _ch_mat()
         if mat_idx is not None and 0 <= mat_idx < state_in.shape[1]:
             row, col = edge_index
@@ -852,7 +1148,10 @@ def build_continuous_step_features(
             upwind_mat = accum / (sum_w + 1e-6)
             
             state_in = state_in.clone()
-            alpha = float(os.environ.get("SPECIES_CONVECTION_ALPHA", "0.5"))
+            if cfg is not None:
+                alpha = float(cfg.convection_alpha)
+            else:
+                alpha = float(os.environ.get("SPECIES_CONVECTION_ALPHA", "0.5"))
             state_in[:, mat_idx] = (1 - alpha) * state_in[:, mat_idx] + alpha * upwind_mat
 
     feats = torch.cat([base_feats, state_in], dim=-1)
@@ -1037,15 +1336,21 @@ def pushforward_log_state_step(
     straight_through: bool = False,
     wall_speed: torch.Tensor | None = None,
     vel_decay_alphas: tuple[torch.Tensor, torch.Tensor] | None = None,
+    wall_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     nxt = log_state.reshape(-1, _sd()) + pred_delta.reshape(-1, _sd())
     if wall_speed is not None and vel_decay_alphas is not None:
-        nxt = apply_velocity_decay(nxt, wall_speed, vel_decay_alphas)
+        nxt = apply_velocity_decay(
+            nxt, wall_speed, vel_decay_alphas, wall_mask=wall_mask
+        )
     nxt = nxt.clamp(min=0.0)
     return soft_commit_log_state(nxt, straight_through=straight_through)
 
 
-def continuous_final_state_weight() -> float:
+def continuous_final_state_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.final_state_weight), 0.0)
     raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_STATE_WEIGHT") or "0.35").strip()
     try:
         return max(float(raw), 0.0)
@@ -1053,12 +1358,331 @@ def continuous_final_state_weight() -> float:
         return 0.25
 
 
-def continuous_final_state_all_band() -> bool:
+def continuous_final_state_all_band(config: PushforwardConfig | None = None) -> bool:
+    config = resolve_config(config)
+    if config is not None:
+        return bool(config.final_state_all_band)
     raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_STATE_ALL_BAND") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
+def continuous_final_mass_penalty(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.final_mass_penalty), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_MASS_PENALTY") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_final_mass_target(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return float(config.final_mass_target)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_MASS_TARGET") or "1.2").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 1.2
+
+
+def continuous_final_prec_fp_penalty(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.final_prec_fp_penalty), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_PREC_FP_PENALTY") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_step_mass_penalty(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.step_mass_penalty), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_STEP_MASS_PENALTY") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_step_prec_fp_penalty(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.step_prec_fp_penalty), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_STEP_PREC_FP_PENALTY") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_seed_aux_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.seed_aux_weight), 0.0)
+    return 0.0
+
+
+def continuous_seed_aux_early_steps(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return max(int(config.seed_aux_early_steps), 1)
+    return 3
+
+
+def continuous_seed_aux_compact_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.seed_aux_compact_weight), 0.0)
+    return 0.0
+
+
+def continuous_seed_aux_pos_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.seed_aux_pos_weight), 1.0)
+    return 4.0
+
+
+def continuous_pocket_contrast_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.pocket_contrast_weight), 0.0)
+    return 0.0
+
+
+def continuous_pocket_contrast_hops(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return max(int(config.pocket_contrast_hops), 0)
+    return 4
+
+
+def continuous_pocket_contrast_early_steps(config: PushforwardConfig | None = None) -> int:
+    config = resolve_config(config)
+    if config is not None:
+        return max(int(config.pocket_contrast_early_steps), 1)
+    return 8
+
+
+def continuous_pocket_contrast_inside_weight(config: PushforwardConfig | None = None) -> float:
+    config = resolve_config(config)
+    if config is not None:
+        return max(float(config.pocket_contrast_inside_weight), 0.0)
+    return 0.0
+
+
+def gt_first_seed_mat_mask(
+    log_series: Sequence[torch.Tensor],
+    *,
+    early_steps: int,
+    band_mask: torch.Tensor,
+) -> torch.Tensor:
+    """First-new GT Mat nodes within ``early_steps`` (multi-pocket seed set).
+
+    Returns only the earliest timestep's newly active Mat -- the seed set for exclusive contrast.
+    """
+    li = _local_mat_idx()
+    m = band_mask.reshape(-1).bool()
+    if li is None or not log_series:
+        return torch.zeros(int(m.numel()), dtype=torch.bool, device=m.device)
+    active0 = log_state_to_active(log_series[0]).reshape(-1, log_series[0].shape[-1])[:, li].bool()
+    k = min(max(int(early_steps), 1), max(len(log_series) - 1, 1))
+    for t in range(1, k + 1):
+        act = log_state_to_active(log_series[t]).reshape(-1, log_series[t].shape[-1])[:, li].bool()
+        first_new = (act & ~active0) & m
+        if bool(first_new.any().item()):
+            return first_new.reshape(-1)
+    return torch.zeros_like(active0)
+
+
+def pocket_allowed_from_gt_seed(
+    gt_seed: torch.Tensor,
+    edge_index: torch.Tensor,
+    hops: int,
+) -> torch.Tensor:
+    """k-hop dilation of GT first-seed (train labels only; never fed as a hard forward mask)."""
+    from src.core_physics.clot_growth_masks import graph_dilate_hops
+
+    return graph_dilate_hops(gt_seed.reshape(-1).bool(), edge_index, int(hops)).reshape(-1)
+
+
+def soft_mat_commit_prob(log_state: torch.Tensor) -> torch.Tensor:
+    """Differentiable soft Mat commit readout for pocket-contrast / seed aux."""
+    li = _local_mat_idx()
+    thr = continuous_mat_commit_thresh()
+    st = log_state.reshape(-1, _sd())
+    mat_col = st[:, li] if li is not None else st[:, 0]
+    return torch.sigmoid((mat_col - thr) * 40.0)
+
+
+def pocket_contrast_aux_loss(
+    pred_soft: torch.Tensor,
+    allowed: torch.Tensor,
+    band_mask: torch.Tensor,
+    *,
+    weight: float = 1.0,
+    inside_weight: float = 0.0,
+) -> torch.Tensor:
+    """Soft-penalize Mat probability outside the allowed GT-seed neighborhood.
+
+    Does not hard-mask the forward. Inside the allowed pocket, growth is free unless
+    ``inside_weight > 0`` (mild under-recall pressure).
+    """
+    w_out = max(float(weight), 0.0)
+    w_in = max(float(inside_weight), 0.0)
+    m = band_mask.reshape(-1).to(device=pred_soft.device).bool()
+    allow = allowed.reshape(-1).to(device=pred_soft.device).bool()
+    p = pred_soft.reshape(-1).clamp(0.0, 1.0)
+    if not bool(m.any().item()) or (w_out <= 0.0 and w_in <= 0.0):
+        return p.sum() * 0.0
+    outside = m & ~allow
+    loss = p.sum() * 0.0
+    if w_out > 0.0 and bool(outside.any().item()):
+        loss = loss + w_out * p[outside].mean()
+    if w_in > 0.0 and bool((m & allow).any().item()):
+        loss = loss + w_in * (1.0 - p[m & allow]).mean()
+    return loss
+
+
+def gt_early_mat_pocket(
+    log_series: Sequence[torch.Tensor],
+    *,
+    early_steps: int,
+    band_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Binary GT early Mat pocket: newly active Mat within the first ``early_steps`` deltas.
+
+    This is a *location* label (where commitment should start), not a mass target.
+    """
+    li = _local_mat_idx()
+    m = band_mask.reshape(-1).bool()
+    if li is None or not log_series:
+        return torch.zeros(int(m.numel()), dtype=torch.bool, device=m.device)
+    active0 = log_state_to_active(log_series[0]).reshape(-1, log_series[0].shape[-1])[:, li].bool()
+    k = min(max(int(early_steps), 1), max(len(log_series) - 1, 1))
+    pocket = torch.zeros_like(active0)
+    for t in range(1, k + 1):
+        act = log_state_to_active(log_series[t]).reshape(-1, log_series[t].shape[-1])[:, li].bool()
+        pocket = pocket | (act & ~active0)
+    return (pocket & m).reshape(-1)
+
+
+def soft_seed_location_aux_loss(
+    pred_soft: torch.Tensor,
+    gt_pocket: torch.Tensor,
+    band_mask: torch.Tensor,
+    *,
+    edge_index: torch.Tensor | None = None,
+    pos_band: torch.Tensor | None = None,
+    weight: float = 1.0,
+    compact_weight: float = 0.0,
+    pos_weight: float = 4.0,
+) -> torch.Tensor:
+    """BCE/focal-style location loss on soft early Mat probs vs GT early pocket.
+
+    Intentionally *not* a mass ratio term: equal-mass wrong location still pays.
+    Optional light compactness: edge smoothness of soft probs (connected pocket prior).
+    """
+    m = band_mask.reshape(-1).to(device=pred_soft.device).bool()
+    w_loc = max(float(weight), 0.0)
+    cw = max(float(compact_weight), 0.0)
+    if not bool(m.any().item()) or (w_loc <= 0.0 and cw <= 0.0):
+        return pred_soft.sum() * 0.0
+    p = pred_soft.reshape(-1).clamp(1e-6, 1.0 - 1e-6)
+    y = gt_pocket.reshape(-1).to(device=p.device, dtype=p.dtype)
+    p_m = p[m]
+    y_m = y[m]
+    # Soft focal-ish: upweight false locations and missed GT pocket nodes.
+    bce = F.binary_cross_entropy(p_m, y_m, reduction="none")
+    pw = max(float(pos_weight), 1.0)
+    w = torch.where(y_m > 0.5, torch.full_like(bce, pw), torch.ones_like(bce))
+    # Extra FP location pressure (wrong place), not total mass.
+    fp = (p_m * (1.0 - y_m)).detach()
+    w = w * (1.0 + 2.0 * fp)
+    loc = (bce * w).sum() / w.sum().clamp(min=1.0) if w_loc > 0.0 else p_m.sum() * 0.0
+
+    compact = p_m.sum() * 0.0
+    if cw > 0.0 and edge_index is not None and int(edge_index.numel()) > 0:
+        row, col = edge_index[0], edge_index[1]
+        # Smooth only where either endpoint is a soft seed candidate.
+        edge_w = (p[row] + p[col]).clamp(min=0.0)
+        if bool(edge_w.any().item()):
+            compact = ((p[row] - p[col]) ** 2 * edge_w).sum() / edge_w.sum().clamp(min=1e-6)
+    elif cw > 0.0 and pos_band is not None and bool((p_m > 0.05).any().item()):
+        pos = pos_band.to(device=p.device, dtype=p.dtype).reshape(-1, pos_band.shape[-1])
+        wpos = p.reshape(-1, 1) * m.reshape(-1, 1).to(dtype=p.dtype)
+        mass = wpos.sum().clamp(min=1e-6)
+        centroid = (pos * wpos).sum(dim=0) / mass
+        compact = (((pos - centroid) ** 2) * wpos).sum() / mass
+
+    return w_loc * loc + cw * compact
+
+
+def rolled_final_mass_fp_penalty(
+    final_pred: torch.Tensor,
+    final_gt: torch.Tensor,
+    band_mask: torch.Tensor,
+    *,
+    mass_weight: float | None = None,
+    mass_target: float | None = None,
+    fp_weight: float | None = None,
+    soft_k: float = 40.0,
+) -> torch.Tensor:
+    """Differentiable soft mass-ratio + soft FP occupancy on rolled final Mat state.
+
+    Cheap train–deploy alignment signal: penalize over-commit (mass_ratio > target) and
+    predicted mass on GT-negative nodes. Uses sigmoid soft occupancy around the Mat commit
+    threshold so gradients flow without a hard threshold.
+    """
+    mw = continuous_final_mass_penalty() if mass_weight is None else max(float(mass_weight), 0.0)
+    fw = continuous_final_prec_fp_penalty() if fp_weight is None else max(float(fp_weight), 0.0)
+    if mw <= 0.0 and fw <= 0.0:
+        return final_pred.sum() * 0.0
+
+    m = band_mask.reshape(-1).to(device=final_pred.device).bool()
+    if not bool(m.any().item()):
+        return final_pred.sum() * 0.0
+
+    from src.training.biochem_species_scope import MAT_CHANNEL, pushforward_state_bulk_indices
+
+    bulk = pushforward_state_bulk_indices()
+    if MAT_CHANNEL not in bulk:
+        return final_pred.sum() * 0.0
+    mat_i = int(bulk.index(MAT_CHANNEL))
+    thr = float(continuous_mat_commit_thresh())
+    pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
+    gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
+    pred_soft = torch.sigmoid(float(soft_k) * (pred - thr))
+    gt_pos = (gt > thr).to(dtype=pred_soft.dtype)
+    n_gt = gt_pos.sum().clamp(min=1.0)
+    mass_ratio = pred_soft.sum() / n_gt
+    target = continuous_final_mass_target() if mass_target is None else float(mass_target)
+    pen = final_pred.sum() * 0.0
+    if mw > 0.0:
+        pen = pen + mw * F.softplus(mass_ratio - target)
+    if fw > 0.0:
+        fp_soft = pred_soft * (1.0 - gt_pos)
+        # Soft FP fraction of predicted occupancy (precision tilt without hard counts).
+        fp_frac = fp_soft.sum() / pred_soft.sum().clamp(min=1e-6)
+        pen = pen + fw * fp_frac
+    return pen * continuous_loss_scale()
+
+
 def continuous_speed_fp_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.scoring.speed_fp_weight), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_SPEED_FP_WEIGHT") or "4.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -1067,6 +1691,14 @@ def continuous_speed_fp_weight() -> float:
 
 
 def deploy_horizon_steps() -> int:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.rollout.deploy_horizon), 0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_HORIZON") or "0").strip()
     try:
         return max(int(float(raw)), 0)
@@ -1075,6 +1707,14 @@ def deploy_horizon_steps() -> int:
 
 
 def deploy_eval_use_full_timeline() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.deploy_eval_full)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_FULL") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on", "full", "last")
 
@@ -1105,19 +1745,46 @@ def default_deploy_metric_times(n_times: int) -> list[int]:
 
 
 def train_deploy_eval_flow_source() -> str:
-    raw = (os.environ.get("SPECIES_TRAIN_DEPLOY_EVAL_FLOW") or "kinematics").strip().lower()
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            raw = str(rt.rollout.train_deploy_eval_flow or "auto").strip().lower()
+        else:
+            raw = (os.environ.get("SPECIES_TRAIN_DEPLOY_EVAL_FLOW") or "auto").strip().lower()
+    except Exception:
+        raw = (os.environ.get("SPECIES_TRAIN_DEPLOY_EVAL_FLOW") or "auto").strip().lower()
     if raw in ("gt", "comsol", "oracle"):
         return "gt"
-    return "kinematics"
+    if raw in ("kine", "kinematics"):
+        return "kinematics"
+    return "auto"
 
 
 def deploy_horizon_aux_all_packs() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.deploy_horizon_all_packs)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_DEPLOY_HORIZON_ALL_PACKS") or "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
 def deploy_horizon_aux_cap_steps() -> int:
     """Cap TBPTT aux unroll length during training (VRAM); 0 = no cap."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.rollout.deploy_horizon_aux_cap), 0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_DEPLOY_HORIZON_AUX_CAP") or "72").strip()
     try:
         return max(int(float(raw)), 0)
@@ -1126,11 +1793,27 @@ def deploy_horizon_aux_cap_steps() -> int:
 
 
 def deploy_eval_dual_times() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.scoring.deploy_eval_dual)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_DUAL") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def deploy_eval_dual_full_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return min(max(float(rt.scoring.deploy_dual_full_w), 0.0), 1.0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_DEPLOY_DUAL_FULL_W") or "0.65").strip()
     try:
         return min(max(float(raw), 0.0), 1.0)
@@ -1138,9 +1821,50 @@ def deploy_eval_dual_full_weight() -> float:
         return 0.65
 
 
+def deploy_eval_time_fracs() -> list[float]:
+    """Sliding-window fractions of the full horizon for deploy clot grading (s9.8).
+
+    Parses ``deploy_eval_time_fracs`` ("0.5,0.75,1.0" style). Empty (default) disables this
+    path entirely -- ``deploy_eval_clot_times`` falls back to the legacy dual/single behaviour,
+    byte-identical to before this function existed.
+    """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        raw = str(rt.scoring.deploy_eval_time_fracs) if rt is not None else ""
+        if rt is None:
+            raw = os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_TIME_FRACS") or ""
+    except Exception:
+        raw = os.environ.get("SPECIES_CONTINUOUS_DEPLOY_EVAL_TIME_FRACS") or ""
+    raw = raw.strip()
+    if not raw:
+        return []
+    out: list[float] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(min(max(float(tok), 0.0), 1.0))
+        except ValueError:
+            continue
+    return out
+
+
 def deploy_eval_clot_times(n_times: int) -> list[int]:
-    """Time indices for deploy clot metric (single full or mid+full dual)."""
+    """Time indices for deploy clot metric.
+
+    Priority: explicit ``deploy_eval_time_fracs`` (sliding-window coverage of the whole
+    horizon, s9.8 -- a checkpoint that only looks good at t_final can hide a rollout that
+    has already gone badly wrong earlier) > legacy dual (mid+full) > single full. Unset
+    ``deploy_eval_time_fracs`` (the default) preserves prior behaviour exactly.
+    """
     last = deploy_eval_time_index(n_times)
+    fracs = deploy_eval_time_fracs()
+    if fracs:
+        idxs = sorted({max(0, min(int(round(f * last)), last)) for f in fracs})
+        return idxs or [last]
     if not deploy_eval_dual_times():
         return [last]
     mid = legacy_capped_deploy_time_index(n_times)
@@ -1150,6 +1874,9 @@ def deploy_eval_clot_times(n_times: int) -> list[int]:
 
 
 def continuous_delta_out_scale() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.delta_out_scale), 1e-9)
     raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_OUT_SCALE") or "1e-5").strip()
     try:
         return max(float(raw), 1e-9)
@@ -1158,6 +1885,9 @@ def continuous_delta_out_scale() -> float:
 
 
 def continuous_delta_softplus_beta() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.delta_softplus_beta), 1.0)
     raw = (os.environ.get("SPECIES_CONTINUOUS_DELTA_SOFTPLUS_BETA") or "20").strip()
     try:
         return max(float(raw), 1.0)
@@ -1185,8 +1915,8 @@ def maybe_noise_log_state(norm_state: torch.Tensor, *, training: bool) -> torch.
 class SpeciesContinuousPushforwardGNN(SpeciesPushforwardGNN):
     """Same GraphSAGE backbone; readout predicts continuous log-delta (FI, Mat)."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
-        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None, arch: str = "sage"):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim, arch=arch)
         self.log_vel_decay_fi = nn.Parameter(torch.tensor(-8.0))
         self.log_vel_decay_mat = nn.Parameter(torch.tensor(-8.0))
 
@@ -1194,8 +1924,8 @@ class SpeciesContinuousPushforwardGNN(SpeciesPushforwardGNN):
 class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
     """Phase 3.5: decoupled spatial gate * magnitude delta (FI, Mat)."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None):
-        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim)
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int | None = None, arch: str = "sage"):
+        super().__init__(in_dim, hidden=hidden, out_dim=_sd() if out_dim is None else out_dim, arch=arch)
         self.log_vel_decay_fi = nn.Parameter(torch.tensor(-8.0))
         self.log_vel_decay_mat = nn.Parameter(torch.tensor(-8.0))
         h = self.hidden
@@ -1219,7 +1949,7 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        self.spatial_gate_heads = os.environ.get("SPECIES_SPATIAL_GATE_HEADS") == "1"
+        self.spatial_gate_heads = spatial_gate_heads_enabled()
         if self.spatial_gate_heads:
             self.spatial_head_wall = nn.Sequential(
                 nn.Linear(gate_in, h),
@@ -1327,7 +2057,7 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
             allowed = allowed | (logit_col >= thr)
 
         # Physics-inspired nucleation prior for Hop >= 2 nodes
-        if os.environ.get("SPECIES_PHYSICS_NUCLEATION") == "1" and getattr(self, "velocity", None) is not None:
+        if physics_nucleation_enabled() and getattr(self, "velocity", None) is not None:
             u = self.velocity[:, 0].to(device=dev, dtype=dt)
             v = self.velocity[:, 1].to(device=dev, dtype=dt)
             speed = torch.sqrt(u * u + v * v)
@@ -1366,8 +2096,13 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                 acc_g.index_add_(0, row, grad)
                 shear_proxy = acc_g / deg.clamp(min=1.0)
 
-                speed_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SPEED_THRESH", "0.15"))
-                shear_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SHEAR_THRESH", "0.20"))
+                cfg_pn = resolve_config()
+                if cfg_pn is not None:
+                    speed_thresh = float(cfg_pn.physics_nuc_speed_thresh)
+                    shear_thresh = float(cfg_pn.physics_nuc_shear_thresh)
+                else:
+                    speed_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SPEED_THRESH", "0.15"))
+                    shear_thresh = float(os.environ.get("SPECIES_PHYSICS_NUC_SHEAR_THRESH", "0.20"))
 
                 stagnant = speed < speed_thresh
                 low_shear = shear_proxy < shear_thresh
@@ -1418,7 +2153,9 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                 spatial_gate_wall = spatial_gate_wall * self._frontier_nucleation_mask(
                     spatial_logits_wall, log_state, edge_index
                 )
-            if os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1" and log_state is not None:
+            cfg_df = resolve_config()
+            use_df = bool(cfg_df.dynamic_frontier_mask) if cfg_df is not None else (os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1")
+            if use_df and log_state is not None:
                 wall_m = getattr(self, "wall_mask_band", None)
                 if wall_m is not None:
                     wall_m = wall_m.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
@@ -1448,8 +2185,13 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
 
             sdf = self._get_sdf_band()
             if sdf is not None:
-                sdf_crit = float(os.environ.get("SPECIES_GATE_SDF_CRIT", "0.012"))
-                sdf_temp = float(os.environ.get("SPECIES_GATE_SDF_TEMP", "0.003"))
+                cfg_gs = resolve_config()
+                if cfg_gs is not None:
+                    sdf_crit = float(cfg_gs.gate_sdf_crit)
+                    sdf_temp = float(cfg_gs.gate_sdf_temp)
+                else:
+                    sdf_crit = float(os.environ.get("SPECIES_GATE_SDF_CRIT", "0.012"))
+                    sdf_temp = float(os.environ.get("SPECIES_GATE_SDF_TEMP", "0.003"))
                 gate = torch.sigmoid((sdf - sdf_crit) / max(sdf_temp, 1e-5)).unsqueeze(-1)
                 pred_delta = gate * pred_delta_offwall + (1.0 - gate) * pred_delta_wall
                 spatial_logits = spatial_logits_offwall
@@ -1466,7 +2208,9 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                 spatial_gate = spatial_gate * self._frontier_nucleation_mask(
                     spatial_logits, log_state, edge_index
                 )
-            if os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1" and log_state is not None:
+            cfg_df = resolve_config()
+            use_df = bool(cfg_df.dynamic_frontier_mask) if cfg_df is not None else (os.environ.get("SPECIES_CONTINUOUS_DYNAMIC_FRONTIER_MASK") == "1")
+            if use_df and log_state is not None:
                 wall_m = getattr(self, "wall_mask_band", None)
                 if wall_m is not None:
                     wall_m = wall_m.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
@@ -1498,11 +2242,13 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
             )
 
         # Apply Skip-Hop GNN odd-hop node reconstruction
-        if os.environ.get("SPECIES_SKIP_HOP_GNN") == "1" and getattr(self, "wall_mask_band", None) is not None:
+        if skip_hop_gnn_enabled() and getattr(self, "wall_mask_band", None) is not None:
             pred_delta = self._reconstruct_odd_nodes(pred_delta, edge_index)
 
         # Apply readout shear gate
-        if os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1":
+        _cfg = resolve_config()
+        use_shear = bool(_cfg.shear_readout_gate) if _cfg is not None else (os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1")
+        if use_shear:
             ld = int(getattr(self, "kin_latent_dim", 0) or 0)
             if x.shape[1] > ld + 6:
                 gamma_si = x[:, ld + 6].reshape(-1, 1)
@@ -1517,7 +2263,8 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                         pred_delta = pred_delta * mask
 
         # Apply frontier kinetics
-        if os.environ.get("SPECIES_FRONTIER_KINETICS") == "1":
+        use_front_kin = bool(_cfg.frontier_kinetics) if _cfg is not None else (os.environ.get("SPECIES_FRONTIER_KINETICS") == "1")
+        if use_front_kin:
             mat_idx = _local_mat_idx()
             pos_band = getattr(self, "pos_band", None)
             velocity = getattr(self, "velocity", None)
@@ -1543,8 +2290,12 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                 flux_ap, flux_t = compute_frontier_fluxes(
                     pos_band, u_vel, v_vel, edge_index, committed, frontier, ap, t_sp
                 )
-                k_ap = float(os.environ.get("SPECIES_FRONTIER_K_AP", "0.5"))
-                k_t = float(os.environ.get("SPECIES_FRONTIER_K_T", "0.5"))
+                if _cfg is not None:
+                    k_ap = float(_cfg.frontier_k_ap)
+                    k_t = float(_cfg.frontier_k_t)
+                else:
+                    k_ap = float(os.environ.get("SPECIES_FRONTIER_K_AP", "0.5"))
+                    k_t = float(os.environ.get("SPECIES_FRONTIER_K_T", "0.5"))
                 K_kinetics = k_ap * flux_ap + k_t * flux_t
                 mask = torch.zeros_like(pred_delta)
                 mask[:, mat_idx] = K_kinetics
@@ -1562,7 +2313,7 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
         return pred_delta
 
 
-def build_continuous_gnn(in_dim: int, *, hidden: int | None = None, arch: str | None = None) -> nn.Module:
+def build_continuous_gnn(in_dim: int, *, hidden: int | None = None, arch: str | None = None, config=None) -> nn.Module:
     from src.core_physics.species_gnode_pushforward import (
         SpeciesGnodeDualHeadContinuousGNN,
         species_pushforward_arch,
@@ -1574,8 +2325,8 @@ def build_continuous_gnn(in_dim: int, *, hidden: int | None = None, arch: str | 
             raise ValueError("gnode pushforward arch requires SPECIES_CONTINUOUS_DUAL_HEAD=1")
         return SpeciesGnodeDualHeadContinuousGNN(in_dim, hidden=hidden)
     if continuous_dual_head():
-        return SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden)
-    return SpeciesContinuousPushforwardGNN(in_dim, hidden=hidden)
+        return SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden, arch=use_arch)
+    return SpeciesContinuousPushforwardGNN(in_dim, hidden=hidden, arch=use_arch)
 
 
 def bind_band_geometry(model: nn.Module, static: dict) -> None:
@@ -1583,7 +2334,10 @@ def bind_band_geometry(model: nn.Module, static: dict) -> None:
         model.set_band_geometry(
             static.get("pos_band"),
             static.get("edge_index"),
-            static.get("wall_mask_band")
+            static.get("wall_mask_band"),
+            wall_normals=static.get("wall_normals_band"),
+            sdf=static.get("sdf_band"),
+            edge_attr=static.get("edge_attr_band"),
         )
 
 
@@ -1595,6 +2349,14 @@ def species_latent_dropout_p() -> float:
     gt-flow ceiling). Forcing z_kin to vanish a fraction of the time makes the model learn backup
     weights on the flow channels. Training-only; 0 disables.
     """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return min(max(float(rt.rollout.latent_dropout), 0.0), 0.95)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_LATENT_DROPOUT") or "0").strip()
     try:
         return min(max(float(raw), 0.0), 0.95)
@@ -1674,24 +2436,149 @@ def clear_offwall_model_cache() -> None:
 
 
 def two_model_route() -> str:
-    """``wall`` = legacy wall vs ~wall; ``frontier`` = growth specialist on clot neighborhood."""
-    raw = (os.environ.get("SPECIES_TWO_MODEL_ROUTE") or "wall").strip().lower()
+    """Route for two-model ownership blending.
+
+    ``wall`` keeps the canonical model on wall nodes and hands ``~wall`` to the
+    growth specialist. ``frontier`` preserves the legacy behavior where the
+    specialist owns the committed clot neighborhood, including committed wall
+    nodes. ``frontier_offwall`` keeps wall ownership with the canonical model
+    and only hands off-wall frontier nodes to the specialist.
+    """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.offwall.two_model_route:
+            raw = str(rt.offwall.two_model_route).strip().lower()
+        else:
+            raw = (os.environ.get("SPECIES_TWO_MODEL_ROUTE") or "wall").strip().lower()
+    except Exception:
+        raw = (os.environ.get("SPECIES_TWO_MODEL_ROUTE") or "wall").strip().lower()
+    if raw in ("frontier_offwall", "frontier-offwall", "frontier_lumen_only", "frontier-lumen-only"):
+        return "frontier_offwall"
     if raw in ("frontier", "growth", "committed", "existing"):
         return "frontier"
     return "wall"
 
 
-def two_model_frontier_hops() -> int:
-    """BFS hops around committed Mat where the growth specialist owns the delta."""
+def two_model_frontier_hops() -> float:
+    """BFS hops around committed Mat where the growth specialist owns the delta.
+
+    Supports fractional hops in (0, 1): 0.5 = committed + off-wall 1-hop shell only
+    (tighter than hops=1). Per-anchor overrides via SPECIES_TWO_MODEL_FRONTIER_HOPS_MAP
+    (e.g. ``patient010:0.5,default:1``).
+    """
+    anchor = ""
+    hop_map_raw = ""
     try:
-        return max(int(float(os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS", "2") or "2")), 0)
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            anchor = str(rt.offwall.frontier_hops_anchor or "").strip()
+            hop_map_raw = str(rt.offwall.frontier_hops_map or "")
+    except Exception:
+        pass
+    if not anchor:
+        anchor = (os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS_ANCHOR") or "").strip()
+    if not hop_map_raw:
+        hop_map_raw = os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS_MAP", "")
+    if anchor:
+        hop_map = parse_two_model_frontier_hops_map(hop_map_raw)
+        if anchor in hop_map:
+            return float(hop_map[anchor])
+        if "default" in hop_map:
+            return float(hop_map["default"])
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.offwall.two_model_frontier_hops), 0.0)
+    except Exception:
+        pass
+    raw = (os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS", "2") or "2").strip()
+    try:
+        return max(float(raw), 0.0)
     except ValueError:
-        return 2
+        return 2.0
+
+
+def parse_two_model_frontier_hops_map(raw: str) -> dict[str, float]:
+    """Parse ``anchor:hops`` comma map (``default`` key optional)."""
+    out: dict[str, float] = {}
+    for part in (raw or "").split(","):
+        piece = part.strip()
+        if not piece or ":" not in piece:
+            continue
+        name, val = piece.split(":", 1)
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            out[name] = max(float(val.strip()), 0.0)
+        except ValueError:
+            continue
+    return out
+
+
+def _frontier_growth_zone(
+    *,
+    committed: torch.Tensor,
+    edge_index: torch.Tensor,
+    wall_mask: torch.Tensor,
+    hops: float,
+) -> torch.Tensor:
+    """Nodes where the growth specialist owns the delta under frontier routing."""
+    from src.core_physics.clot_growth_masks import graph_dilate_hops
+
+    hops_f = max(float(hops), 0.0)
+    if hops_f <= 0.0:
+        return committed.reshape(-1).bool()
+    if hops_f < 1.0:
+        # Tighter than hops=1: committed + off-wall 1-hop shell (hops=0.5 equivalent).
+        shell = graph_dilate_hops(committed, edge_index, 1).reshape(-1).bool()
+        shell = shell & ~committed.reshape(-1).bool() & ~wall_mask.reshape(-1).bool()
+        return (committed.reshape(-1).bool() | shell)
+    hop_int = max(int(hops_f), 1)
+    return graph_dilate_hops(committed, edge_index, hop_int).reshape(-1).bool()
+
+
+def _frontier_offwall_growth_zone(
+    *,
+    committed: torch.Tensor,
+    edge_index: torch.Tensor,
+    wall_mask: torch.Tensor,
+    hops: float,
+) -> torch.Tensor:
+    """Off-wall-only frontier for the growth specialist.
+
+    Unlike legacy ``frontier``, this route never hands committed wall nodes to
+    the growth specialist. Fractional hops keep the 1-hop shell semantics but
+    remain off-wall only.
+    """
+    zone = _frontier_growth_zone(
+        committed=committed,
+        edge_index=edge_index,
+        wall_mask=wall_mask,
+        hops=hops,
+    )
+    return zone & ~wall_mask.reshape(-1).bool()
 
 
 def get_cached_offwall_model(device, in_dim, hidden, out_dim):
     global _OFFWALL_MODEL_CACHE, _OFFWALL_MODEL_CACHE_PATH
-    ckpt_path = os.environ.get("SPECIES_OFFWALL_MODEL_CKPT")
+    ckpt_path = ""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.offwall.offwall_model_ckpt:
+            ckpt_path = str(rt.offwall.offwall_model_ckpt).strip()
+    except Exception:
+        pass
+    if not ckpt_path:
+        ckpt_path = (os.environ.get("SPECIES_OFFWALL_MODEL_CKPT") or "").strip()
     if not ckpt_path:
         raise ValueError("SPECIES_OFFWALL_MODEL_CKPT environment variable must be set when SPECIES_TWO_MODEL_MODE=1")
     if _OFFWALL_MODEL_CACHE is not None and _OFFWALL_MODEL_CACHE_PATH == ckpt_path:
@@ -1719,6 +2606,90 @@ def get_cached_offwall_model(device, in_dim, hidden, out_dim):
     return _OFFWALL_MODEL_CACHE
 
 
+def two_model_mode_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.offwall.two_model_mode)
+    except Exception:
+        pass
+    return os.environ.get("SPECIES_TWO_MODEL_MODE") == "1"
+
+
+def isolate_offwall_loss_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.offwall.isolate_offwall_loss)
+    except Exception:
+        pass
+    return os.environ.get("SPECIES_ISOLATE_OFFWALL_LOSS") == "1"
+
+
+def offwall_loss_scale() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return float(rt.offwall.offwall_loss_scale)
+    except Exception:
+        pass
+    return float(os.environ.get("SPECIES_OFFWALL_LOSS_SCALE", "2.0"))
+
+
+def spatial_gate_heads_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.offwall.spatial_gate_heads)
+    except Exception:
+        pass
+    return os.environ.get("SPECIES_SPATIAL_GATE_HEADS") == "1"
+
+
+def physics_nucleation_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.offwall.physics_nucleation)
+    except Exception:
+        pass
+    return os.environ.get("SPECIES_PHYSICS_NUCLEATION") == "1"
+
+
+def skip_hop_gnn_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.offwall.skip_hop_gnn)
+    except Exception:
+        pass
+    return os.environ.get("SPECIES_SKIP_HOP_GNN") == "1"
+
+
+def wall_mat_only_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.wall_mat_only)
+    except Exception:
+        pass
+    return os.environ.get("CLOT_PHI_PHYSICS_WALL_MAT_ONLY") == "1"
+
+
 def _two_model_blend_mask(
     *,
     route: str,
@@ -1729,14 +2700,15 @@ def _two_model_blend_mask(
     """True where the *wall/canonical* model keeps ownership; False -> growth specialist.
 
     - ``wall``: canonical on wall nodes (nucleation + wall paint); growth on ~wall.
-    - ``frontier``: growth on k-hop neighborhood of committed Mat (wall or lumen);
-      canonical elsewhere (bare-wall nucleation before any clot exists).
+    - ``frontier``: legacy growth ownership on the committed clot neighborhood
+      (wall or lumen); canonical elsewhere.
+    - ``frontier_offwall``: growth only on the off-wall frontier neighborhood;
+      canonical always keeps wall ownership.
     """
     w_m = wall_mask.reshape(-1).bool()
-    if route != "frontier":
+    if route == "wall":
         return w_m
 
-    from src.core_physics.clot_growth_masks import graph_dilate_hops
     from src.training.biochem_species_scope import pushforward_local_index
 
     st = log_state.reshape(-1, log_state.shape[-1])
@@ -1747,7 +2719,21 @@ def _two_model_blend_mask(
     committed = (st[:, midx] > continuous_mat_commit_thresh()).reshape(-1).bool()
     if not bool(committed.any().item()):
         return torch.ones_like(w_m)
-    growth_zone = graph_dilate_hops(committed, edge_index, two_model_frontier_hops())
+    hops = two_model_frontier_hops()
+    if route == "frontier_offwall":
+        growth_zone = _frontier_offwall_growth_zone(
+            committed=committed,
+            edge_index=edge_index,
+            wall_mask=w_m,
+            hops=hops,
+        )
+    else:
+        growth_zone = _frontier_growth_zone(
+            committed=committed,
+            edge_index=edge_index,
+            wall_mask=w_m,
+            hops=hops,
+        )
     # Canonical owns nodes outside the committed neighborhood (nucleation / idle lumen).
     return ~growth_zone.to(device=w_m.device)
 
@@ -1798,7 +2784,9 @@ def predict_continuous_step_delta(
     )
     feats = align_continuous_feature_dim(feats, model)
     use_edge_index = getattr(model, "augmented_edge_index", None)
-    if use_edge_index is None or os.environ.get("SPECIES_LONGRANGE_EDGES") != "1":
+    cfg_lr = resolve_config()
+    use_lr = bool(cfg_lr.longrange_edges) if cfg_lr is not None else (os.environ.get("SPECIES_LONGRANGE_EDGES") == "1")
+    if use_edge_index is None or not use_lr:
         use_edge_index = edge_index
 
     # Helper function to forward model
@@ -1811,7 +2799,7 @@ def predict_continuous_step_delta(
     pred_delta = _run_forward(model, feats, use_edge_index, log_state)
 
     w_mask = wall_mask_band if wall_mask_band is not None else getattr(model, "wall_mask_band", None)
-    if os.environ.get("SPECIES_TWO_MODEL_MODE") == "1" and w_mask is not None and log_state is not None:
+    if two_model_mode_enabled() and w_mask is not None and log_state is not None:
         try:
             offwall_model = get_cached_offwall_model(
                 feats.device, model.in_dim, model.hidden, model.out_dim
@@ -1869,7 +2857,7 @@ def dual_head_step_loss(
     gate_temp = continuous_gate_temp()
     gfw = continuous_gate_fp_weight()
 
-    isolate_offwall = os.environ.get("SPECIES_ISOLATE_OFFWALL_LOSS") == "1"
+    isolate_offwall = isolate_offwall_loss_enabled()
     if isolate_offwall and hops is not None:
         m_wall = m & (hops.to(device=m.device) <= 1)
         m_offwall = m & (hops.to(device=m.device) >= 2)
@@ -1904,12 +2892,12 @@ def dual_head_step_loss(
         loss_offwall = _sub_loss(m_offwall)
 
         if loss_wall is not None and loss_offwall is not None:
-            offwall_scale = float(os.environ.get("SPECIES_OFFWALL_LOSS_SCALE", "2.0"))
+            offwall_scale = offwall_loss_scale()
             return 0.5 * loss_wall + 0.5 * offwall_scale * loss_offwall
         elif loss_wall is not None:
             return loss_wall
         elif loss_offwall is not None:
-            offwall_scale = float(os.environ.get("SPECIES_OFFWALL_LOSS_SCALE", "2.0"))
+            offwall_scale = offwall_loss_scale()
             return offwall_scale * loss_offwall
         else:
             return None
@@ -2073,7 +3061,8 @@ def smooth_hop1_log_targets(log_series: list[torch.Tensor], edge_index: torch.Te
     mat_idx = _ch_mat()
     if mat_idx is None or mat_idx < 0:
         return log_series
-    alpha = float(os.environ.get("SPECIES_HOP1_SMOOTH_ALPHA", "0.4"))
+    cfg_h1 = resolve_config()
+    alpha = float(cfg_h1.hop1_smooth_alpha) if cfg_h1 is not None else float(os.environ.get("SPECIES_HOP1_SMOOTH_ALPHA", "0.4"))
     smoothed_series = []
     for step_tensor in log_series:
         st = step_tensor.clone()
@@ -2118,6 +3107,7 @@ def compute_hop_distances(
 def unroll_continuous_loss(
     model: nn.Module,
     *,
+    config=None,
     base_feats: torch.Tensor,
     edge_index: torch.Tensor,
     log_series: list[torch.Tensor],
@@ -2134,10 +3124,17 @@ def unroll_continuous_loss(
     flow_series: torch.Tensor | None = None,
     flow_cols: tuple[int, int] | None = None,
     wall_mask_band: torch.Tensor | None = None,
+    wall_normals_band: torch.Tensor | None = None,
+    sdf_band: torch.Tensor | None = None,
+    edge_attr_band: torch.Tensor | None = None,
     species_block: torch.Tensor | None = None,
     velocity: torch.Tensor | None = None,
+    epoch: int = 0,
+    max_epochs: int = 100,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-    if os.environ.get("SPECIES_HOP1_SMOOTH") == "1" and wall_mask_band is not None and edge_index is not None:
+    cfg_h1b = resolve_config()
+    use_h1 = bool(cfg_h1b.hop1_smooth) if cfg_h1b is not None else (os.environ.get("SPECIES_HOP1_SMOOTH") == "1")
+    if use_h1 and wall_mask_band is not None and edge_index is not None:
         log_series = smooth_hop1_log_targets(log_series, edge_index, wall_mask_band)
     n_steps = len(log_series) - 1
     if n_steps <= 0:
@@ -2148,7 +3145,13 @@ def unroll_continuous_loss(
         "pos_band": pos_band,
         "edge_index": edge_index,
         "wall_mask_band": wall_mask_band,
+        "wall_normals_band": wall_normals_band,
+        "sdf_band": sdf_band,
+        "edge_attr_band": edge_attr_band,
     })
+
+    if wall_mat_only_enabled() and wall_mask_band is not None:
+        train_mask = train_mask & wall_mask_band.bool()
 
     if log_state0 is None:
         log_state = torch.zeros(base_feats.shape[0], _sd(), device=base_feats.device, dtype=base_feats.dtype)
@@ -2157,25 +3160,48 @@ def unroll_continuous_loss(
     vel_alphas = model_vel_decay_alphas(model)
     tail = tbptt_tail if tbptt_tail is not None else tbptt_tail_steps()
     loss_start = max(0, n_steps - int(tail))
+    seed_aux_w = continuous_seed_aux_weight()
+    seed_aux_k = min(continuous_seed_aux_early_steps(), n_steps) if seed_aux_w > 0.0 else 0
+    pc_w = continuous_pocket_contrast_weight()
+    pc_k = min(continuous_pocket_contrast_early_steps(), n_steps) if pc_w > 0.0 else 0
+    pc_allowed: torch.Tensor | None = None
+    if pc_w > 0.0 and edge_index is not None and log_series:
+        gt_seed = gt_first_seed_mat_mask(
+            log_series, early_steps=max(pc_k, 1), band_mask=train_mask
+        )
+        pc_allowed = pocket_allowed_from_gt_seed(
+            gt_seed, edge_index, continuous_pocket_contrast_hops()
+        )
     step_w = step_loss_weights(n_steps)
     losses: list[torch.Tensor] = []
     loss_ws: list[float] = []
     pred_deltas: list[torch.Tensor] = []
     states: list[torch.Tensor] = [log_state.clone()]
+    early_gate_probs: list[torch.Tensor] = []
 
-    midside_blind = os.environ.get("SPECIES_MIDSIDE_BLIND_LOSS")
-    phys_fp_gating = os.environ.get("SPECIES_PHYSICAL_FP_GATING") == "1"
-    sdf_fp_gating = os.environ.get("SPECIES_SDF_FP_GATING") == "1"
-    isolate_offwall = os.environ.get("SPECIES_ISOLATE_OFFWALL_LOSS") == "1"
+    cfg_loss = resolve_config()
+    if cfg_loss is not None:
+        midside_blind = "1" if cfg_loss.midside_blind_loss else "0"
+        phys_fp_gating = bool(cfg_loss.physical_fp_gating)
+        sdf_fp_gating = bool(cfg_loss.sdf_fp_gating)
+    else:
+        midside_blind = os.environ.get("SPECIES_MIDSIDE_BLIND_LOSS")
+        phys_fp_gating = os.environ.get("SPECIES_PHYSICAL_FP_GATING") == "1"
+        sdf_fp_gating = os.environ.get("SPECIES_SDF_FP_GATING") == "1"
+    isolate_offwall = isolate_offwall_loss_enabled()
     hops = None
     if (midside_blind is not None or phys_fp_gating or sdf_fp_gating or isolate_offwall) and wall_mask_band is not None and edge_index is not None:
         hops = compute_hop_distances(edge_index, wall_mask_band, base_feats.shape[0])
 
     for step in range(n_steps):
-        grad_step = (not training) or step >= loss_start
+        seed_early = seed_aux_w > 0.0 and step < seed_aux_k
+        pocket_live = pc_w > 0.0 and pc_allowed is not None and step < max(pc_k, 1)
+        # TBPTT: keep grads on the tail; also keep early steps live for seed/pocket aux.
+        grad_step = (not training) or step >= loss_start or seed_early or pocket_live
         ctx = torch.enable_grad() if grad_step else torch.no_grad()
         with ctx:
-            if step < loss_start and training:
+            # Detach only after early aux windows so pocket/seed retain a grad path.
+            if step < loss_start and training and step >= seed_aux_k and not pocket_live:
                 log_state = log_state.detach()
             # Trap C: splice the time-varying flow block for the CURRENT state's time, then leash.
             flow_ti = int(time_window[step]) if time_window is not None and step < len(time_window) else step
@@ -2210,7 +3236,9 @@ def unroll_continuous_loss(
             tgt_delta = log_delta_targets(log_series[step], log_series[step + 1])
             gt_log = log_series[step]
             use_edge_index = getattr(model, "augmented_edge_index", None)
-            if use_edge_index is None or os.environ.get("SPECIES_LONGRANGE_EDGES") != "1":
+            cfg_lr = resolve_config()
+            use_lr = bool(cfg_lr.longrange_edges) if cfg_lr is not None else (os.environ.get("SPECIES_LONGRANGE_EDGES") == "1")
+            if use_edge_index is None or not use_lr:
                 use_edge_index = edge_index
 
             # Midside-blind loss masking
@@ -2240,25 +3268,40 @@ def unroll_continuous_loss(
                         acc_g.index_add_(0, row, grad)
                         shear = acc_g / deg.clamp(min=1.0)
 
-                        s_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_CRIT", "0.05"))
-                        s_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_WIDTH", "0.01"))
-                        g_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_CRIT", "10.0"))
-                        g_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_WIDTH", "2.0"))
-                        w_min = float(os.environ.get("SPECIES_PHYSICAL_FP_MIN_WEIGHT", "0.1"))
+                        cfg_pf = resolve_config()
+                        if cfg_pf is not None:
+                            s_crit = float(cfg_pf.physical_fp_speed_crit)
+                            s_width = float(cfg_pf.physical_fp_speed_width)
+                            g_crit = float(cfg_pf.physical_fp_shear_crit)
+                            g_width = float(cfg_pf.physical_fp_shear_width)
+                            w_min = float(cfg_pf.physical_fp_min_weight)
+                        else:
+                            s_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_CRIT", "0.05"))
+                            s_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SPEED_WIDTH", "0.01"))
+                            g_crit = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_CRIT", "10.0"))
+                            g_width = float(os.environ.get("SPECIES_PHYSICAL_FP_SHEAR_WIDTH", "2.0"))
+                            w_min = float(os.environ.get("SPECIES_PHYSICAL_FP_MIN_WEIGHT", "0.1"))
 
                         s_val = torch.sigmoid((speed - s_crit) / max(s_width, 1e-4))
                         g_val = torch.sigmoid((shear - g_crit) / max(g_width, 1e-4))
                         fp_weight_scale = w_min + (1.0 - w_min) * torch.max(s_val, g_val)
 
             # SDF-Weighted FP Gating (Direction 4)
-            if os.environ.get("SPECIES_SDF_FP_GATING") == "1" and pos_band is not None and wall_mask_band is not None:
+            cfg_sdf = resolve_config()
+            use_sdf_fp = bool(cfg_sdf.sdf_fp_gating) if cfg_sdf is not None else (os.environ.get("SPECIES_SDF_FP_GATING") == "1")
+            if use_sdf_fp and pos_band is not None and wall_mask_band is not None:
                 try:
                     wall_pos = pos_band[wall_mask_band.bool()]
                     if wall_pos.numel() > 0:
                         dists = torch.cdist(pos_band.unsqueeze(0), wall_pos.unsqueeze(0)).squeeze(0)
                         sdf_val, _ = dists.min(dim=1)
-                        decay_scale = float(os.environ.get("SPECIES_SDF_FP_DECAY_SCALE", "0.015"))
-                        min_weight = float(os.environ.get("SPECIES_SDF_FP_MIN", "0.1"))
+                        cfg_sdf2 = resolve_config()
+                        if cfg_sdf2 is not None:
+                            decay_scale = float(cfg_sdf2.sdf_fp_decay_scale)
+                            min_weight = float(cfg_sdf2.sdf_fp_min)
+                        else:
+                            decay_scale = float(os.environ.get("SPECIES_SDF_FP_DECAY_SCALE", "0.015"))
+                            min_weight = float(os.environ.get("SPECIES_SDF_FP_MIN", "0.1"))
                         sdf_weight = torch.exp(-sdf_val / max(decay_scale, 1e-4))
                         sdf_weight = torch.clamp(sdf_weight, min=min_weight, max=1.0)
                         if fp_weight_scale is not None:
@@ -2268,6 +3311,7 @@ def unroll_continuous_loss(
                 except Exception as e:
                     print(f"[WARN] Failed to compute SDF-weighted FP gating: {e}")
 
+            spatial_logits = None
             if continuous_dual_head() and hasattr(model, "forward_decoupled"):
                 pred_delta, spatial_logits, magnitude = model.forward_decoupled(
                     feats, use_edge_index, log_state=log_state
@@ -2291,9 +3335,18 @@ def unroll_continuous_loss(
                     fp_weight_scale=fp_weight_scale,
                 )
             pred_deltas.append(pred_delta)
-            if step_loss is not None and grad_step:
+            # Primary step losses only on the TBPTT tail (seed aux is separate).
+            if step_loss is not None and grad_step and step >= loss_start:
                 losses.append(step_loss)
                 loss_ws.append(float(step_w[step]))
+            if seed_early and spatial_logits is not None:
+                li = _local_mat_idx()
+                gate_temp = continuous_gate_temp()
+                logits = spatial_logits.reshape(-1, spatial_logits.shape[-1])
+                col = logits[:, li] if li is not None and li < int(logits.shape[1]) else logits[:, 0]
+                early_gate_probs.append(
+                    torch.sigmoid(col / gate_temp if gate_temp != 1.0 else col)
+                )
             spd = None
             if speed_series is not None and step + 1 < len(speed_series):
                 spd = speed_series[step + 1]
@@ -2303,8 +3356,85 @@ def unroll_continuous_loss(
                 straight_through=training and grad_step,
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
+                wall_mask=wall_mask_band,
             )
             states.append(log_state.clone())
+
+            # After the early seed horizon: location aux vs GT early pocket (not mass).
+            if seed_early and training and (step + 1) == seed_aux_k:
+                if early_gate_probs:
+                    stacked = torch.stack(early_gate_probs, dim=0)
+                    pred_soft = stacked.max(dim=0).values
+                else:
+                    # Soft commit fallback when dual-head logits are unavailable.
+                    li = _local_mat_idx()
+                    thr = continuous_mat_commit_thresh()
+                    st = log_state.reshape(-1, _sd())
+                    mat_col = st[:, li] if li is not None else st[:, 0]
+                    pred_soft = torch.sigmoid((mat_col - thr) * 40.0)
+                gt_pocket = gt_early_mat_pocket(
+                    log_series, early_steps=seed_aux_k, band_mask=train_mask
+                )
+                seed_l = soft_seed_location_aux_loss(
+                    pred_soft,
+                    gt_pocket,
+                    train_mask,
+                    edge_index=use_edge_index,
+                    pos_band=pos_band,
+                    weight=seed_aux_w,
+                    compact_weight=continuous_seed_aux_compact_weight(),
+                    pos_weight=continuous_seed_aux_pos_weight(),
+                )
+                losses.append(seed_l)
+                loss_ws.append(1.0)
+
+            # Exclusive wrong-pocket contrast: soft Mat outside k-hop of GT first-seed.
+            # Train-only label; never hard-masks the forward (true pocket stays free to grow).
+            if training and grad_step and pc_w > 0.0 and pc_allowed is not None:
+                pred_soft_pc = soft_mat_commit_prob(log_state)
+                pc_l = pocket_contrast_aux_loss(
+                    pred_soft_pc,
+                    pc_allowed,
+                    step_train_mask,
+                    weight=pc_w,
+                    inside_weight=continuous_pocket_contrast_inside_weight(),
+                )
+                losses.append(pc_l)
+                loss_ws.append(float(step_w[step]))
+
+            # Per-step soft mass / FP vs GT occupancy (binds spray during TBPTT).
+            if training and grad_step and step >= loss_start and step + 1 < len(log_series):
+                smw = continuous_step_mass_penalty()
+                spw = continuous_step_prec_fp_penalty()
+                if smw > 0.0 or spw > 0.0:
+                    mass_fp_step = rolled_final_mass_fp_penalty(
+                        log_state,
+                        log_series[step + 1],
+                        step_train_mask,
+                        mass_weight=smw,
+                        fp_weight=spw,
+                    )
+                    losses.append(mass_fp_step)
+                    loss_ws.append(float(step_w[step]))
+
+            # --- Scheduled sampling: intermittent noisy-GT anchoring ---
+            # With probability (1 - keep_prob), reset log_state to (noisy) GT
+            # at anchor-stride boundaries. Stabilises long-window training
+            # while converging to fully autoregressive by late epochs.
+            if (
+                training
+                and scheduled_sampling_enabled()
+                and step + 1 < n_steps
+                and (step + 1) % _ss_anchor_stride() == 0
+            ):
+                keep_p = scheduled_sampling_keep_prob(epoch, max_epochs)
+                if keep_p < 1.0 and random.random() > keep_p:
+                    gt_anchor = log_series[step + 1].detach()
+                    if _ss_noisy():
+                        gt_anchor = noisy_teacher_log_state0(
+                            gt_anchor, edge_index, training=True,
+                        )
+                    log_state = gt_anchor
 
         if physics_ctx is not None:
             from src.core_physics.species_gelation_readout import (
@@ -2338,18 +3468,22 @@ def unroll_continuous_loss(
     wsum = max(sum(loss_ws), 1e-6)
     step_loss = sum(loss * w for loss, w in zip(losses, loss_ws)) / wsum
     fw = continuous_final_state_weight()
-    if fw > 0.0 and states:
+    if states:
         m = train_mask.reshape(-1).bool()
         if bool(m.any().item()):
-            if continuous_growth_only_loss() and not continuous_final_state_all_band():
-                final_loss = growth_only_final_state_loss(states[-1], log_series, m)
-            else:
-                beta = continuous_huber_beta()
-                final_tgt = log_series[-1][m]
-                final_pred = states[-1][m]
-                final_loss = F.huber_loss(final_pred, final_tgt, delta=beta, reduction="mean")
-                final_loss = final_loss * continuous_loss_scale()
-            step_loss = step_loss + fw * final_loss
+            if fw > 0.0:
+                if continuous_growth_only_loss() and not continuous_final_state_all_band():
+                    final_loss = growth_only_final_state_loss(states[-1], log_series, m)
+                else:
+                    beta = continuous_huber_beta()
+                    final_tgt = log_series[-1][m]
+                    final_pred = states[-1][m]
+                    final_loss = F.huber_loss(final_pred, final_tgt, delta=beta, reduction="mean")
+                    final_loss = final_loss * continuous_loss_scale()
+                step_loss = step_loss + fw * final_loss
+            # Soft mass / FP on the rolled final state (train–deploy alignment).
+            mass_fp = rolled_final_mass_fp_penalty(states[-1], log_series[-1], m)
+            step_loss = step_loss + mass_fp
 
     if physics_ctx is not None and states:
         from src.core_physics.species_gelation_readout import (
@@ -2445,6 +3579,7 @@ def rollout_continuous_states(
             straight_through=False,
             wall_speed=spd,
             vel_decay_alphas=vel_alphas,
+            wall_mask=wall_mask_band,
         )
         log_states.append(log_state.clone())
         actives.append(log_state_to_active(log_state))
@@ -2469,6 +3604,7 @@ def rollout_prefix_log_state(
     log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
     pos_band = static.get("pos_band")
+    wall_m = static.get("wall_mask_band")
     from src.core_physics.species_deploy_rollout import resolve_species_rollout_uv
     with torch.no_grad():
         for t in range(t_end):
@@ -2491,6 +3627,7 @@ def rollout_prefix_log_state(
                 straight_through=False,
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
+                wall_mask=wall_m,
             )
     if was_training:
         model.train()
@@ -2579,6 +3716,7 @@ def eval_full_rollout_fimat_f1(
     log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
     pos_band = static.get("pos_band")
+    wall_m = static.get("wall_mask_band")
     pred_actives = [log_state_to_active(log_state)]
     gt_actives = [log_state_to_active(species_log_targets(data, 0, device)[node_idx])]
     from src.core_physics.species_deploy_rollout import resolve_species_rollout_uv
@@ -2602,6 +3740,7 @@ def eval_full_rollout_fimat_f1(
             straight_through=False,
             wall_speed=spd,
             vel_decay_alphas=vel_alphas,
+            wall_mask=wall_m,
         )
         pred_actives.append(log_state_to_active(log_state))
         gt_actives.append(log_state_to_active(species_log_targets(data, min(t + 1, n_times - 1), device)[node_idx]))
@@ -2621,7 +3760,8 @@ def eval_full_rollout_fimat_f1(
 
 
 @torch.no_grad()
-def eval_deploy_clot_f1(
+@torch.no_grad()
+def deploy_species_rollout_series(
     model: nn.Module,
     data,
     static: dict,
@@ -2629,28 +3769,25 @@ def eval_deploy_clot_f1(
     bio_cfg,
     device: torch.device,
     *,
-    time_index: int | None = None,
     flow_source: str = "gt",
-) -> dict[str, float]:
-    """Closed-loop species rollout -> nucleation clot F1 at ``time_index`` (deploy physics)."""
-    from src.core_physics.t0_mu_physics import gt_clot_phi_at_time, rollout_t0_clot_phi
-    from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
-    from src.evaluation.clot_relaxed_metrics import (
-        clot_score_from_deploy_dict,
-        compute_clot_relaxed_metrics,
-        metrics_to_deploy_prefix,
-    )
-    from src.training.biochem_species_scope import FI_CHANNEL, MAT_CHANNEL
+    gelation_beta: float | None = None,
+) -> tuple[torch.Tensor, Any]:
+    """Closed-loop deploy species rollout -> ``(species_series, data)``.
+
+    Extracted from :func:`eval_deploy_clot_f1` so offline diagnostics can re-grade the
+    *same* rollout at several readout gains without re-running the GNN. ``data`` comes
+    back because closed-loop coupling clones it and writes diverted UV into ``data.y``.
+    """
     import os
 
+    gel_beta = gelation_beta
     model.eval()
     bind_band_geometry(model, static)
     # Isolate training packs: closed-loop coupling writes diverted UV into data.y in-place.
-    if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1" and hasattr(data, "clone"):
+    if (os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1" or flow_source == "auto") and hasattr(data, "clone"):
         data = data.clone()
     node_idx = static["node_idx"]
     n_times = int(data.y.shape[0])
-    t_eval = resolve_deploy_eval_time_index(n_times, time_index=time_index)
     from src.core_physics.species_deploy_rollout import (
         alloc_species_y_series,
         deploy_fimat_log_init,
@@ -2661,10 +3798,11 @@ def eval_deploy_clot_f1(
     log_state = deploy_fimat_log_init(data, device, node_idx)
     vel_alphas = model_vel_decay_alphas(model)
     pos_band = static.get("pos_band")
+    wall_m = static.get("wall_mask_band")
 
     coupler = None
     mu_bulk_si = None
-    if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
+    if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1" or flow_source == "auto":
         try:
             flow_device = device
             from src.inference.corrector_coupling import ClotAwareFlow, resolve_kinematics_checkpoint, resolve_corrector_checkpoint, reset_coupled_flow_registry
@@ -2714,7 +3852,7 @@ def eval_deploy_clot_f1(
             u0, v0 = coupler.base_flow(data)
             mu_bulk_si = resolve_bulk_carreau_mu_si(data, 0, phys_cfg, flow_device, u_nd=u0, v_nd=v0).reshape(-1)
         except Exception as e:
-            print(f"[WARN] Failed to initialize closed-loop flow coupler in eval_deploy_clot_f1: {e}")
+            print(f"[WARN] Failed to initialize closed-loop flow coupler in deploy rollout: {e}")
 
     for t in range(n_times):
         sp = pin_species_block(data, t, device)
@@ -2752,6 +3890,7 @@ def eval_deploy_clot_f1(
             straight_through=False,
             wall_speed=spd,
             vel_decay_alphas=vel_alphas,
+            wall_mask=wall_m,
         )
 
         if coupler is not None and t + 1 < n_times:
@@ -2776,8 +3915,10 @@ def eval_deploy_clot_f1(
                     phys_cfg,
                     device=device,
                 )
-                mu_eff_si = differentiable_mu_eff_from_species12(species_log12, mu_carreau_si, phi_clot, bio_cfg).reshape(-1)
-                
+                mu_eff_si = differentiable_mu_eff_from_species12(
+                    species_log12, mu_carreau_si, phi_clot, bio_cfg, gelation_beta=gel_beta
+                ).reshape(-1)
+
                 state = coupler.update(data, mu_eff_si, mu_bulk_si=mu_bulk_si, publish=False)
                 set_coupled_flow(data, state.u, state.v)
                 write_coupled_flow_into_y(data, state.u, state.v, time_index=t + 1)
@@ -2785,6 +3926,36 @@ def eval_deploy_clot_f1(
                 import traceback
                 print(f"[WARN] Failed to apply closed-loop flow coupling at eval step {t+1}: {e}")
                 traceback.print_exc()
+    return out, data
+
+
+@torch.no_grad()
+def deploy_clot_phi_trajectory(
+    data,
+    species_series: torch.Tensor,
+    static: dict,
+    phys_cfg,
+    bio_cfg,
+    device: torch.device,
+    *,
+    time_index: int | None = None,
+    flow_source: str = "gt",
+    gelation_beta: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+    """``(phi_series[T, N], phi_gt, wall_mask, t_eval)`` -- the full graded clot timeline.
+
+    :func:`deploy_clot_phi_fields` is the ``t_eval`` slice of this. Kept as one function so
+    a commit-time diagnostic (docs/WALL_MODEL_PLAN.md s4 Step 1b) reads *when* each node
+    crossed the same threshold the score is computed from, instead of re-rolling the
+    physics readout with its own masking and drifting from the scored path.
+    """
+    from src.core_physics.t0_mu_physics import gt_clot_phi_at_time, rollout_t0_clot_phi
+    from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
+    import os
+
+    n_times = int(data.y.shape[0])
+    t_eval = resolve_deploy_eval_time_index(n_times, time_index=time_index)
+    gel_beta = gelation_beta
     with t0_rung2_env():
         nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
         traj = rollout_t0_clot_phi(
@@ -2794,30 +3965,169 @@ def eval_deploy_clot_f1(
             device,
             gamma_mode=RUNG2_GAMMA_MODE,
             flow_source=flow_source,
-            pred_species_series=out,
+            pred_species_series=species_series,
             nucleation=True,
             nucleation_hops=nuc_hops,
+            gelation_beta=gel_beta,
         )
     phi_gt = gt_clot_phi_at_time(data, t_eval, phys_cfg, device)
-    phi_pred = traj[t_eval]["phi"]
-    edge_index = data.edge_index.to(device=device)
+    phi_series = torch.stack([traj[t]["phi"].reshape(-1) for t in range(n_times)], dim=0)
 
     wall_mask = None
     if hasattr(data, "mask_wall") and data.mask_wall is not None:
-        wall_mask = data.mask_wall.bool().to(device=phi_pred.device)
+        wall_mask = data.mask_wall.bool().to(device=phi_series.device)
     elif hasattr(data, "wall_mask") and data.wall_mask is not None:
-        wall_mask = data.wall_mask.bool().to(device=phi_pred.device)
+        wall_mask = data.wall_mask.bool().to(device=phi_series.device)
+    elif wall_mat_only_enabled():
+        wm = static.get("wall_mask_band")
+        if wm is not None:
+            wall_mask = wm.bool().to(device=phi_series.device)
 
+    # Enforce wall-only evaluation for the wall model
+    if wall_mask is not None:
+        wm_row = wall_mask.reshape(1, -1).to(dtype=phi_series.dtype)
+        phi_series = phi_series * wm_row
+        phi_gt = phi_gt * wall_mask
+    return phi_series, phi_gt.reshape(-1), wall_mask, int(t_eval)
+
+
+@torch.no_grad()
+def deploy_clot_phi_fields(
+    data,
+    species_series: torch.Tensor,
+    static: dict,
+    phys_cfg,
+    bio_cfg,
+    device: torch.device,
+    *,
+    time_index: int | None = None,
+    flow_source: str = "gt",
+    gelation_beta: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+    """``(phi_pred, phi_gt, wall_mask, t_eval)`` for the graded clot label.
+
+    Split out of :func:`grade_deploy_clot_series` so diagnostics can inspect the very
+    fields the metric is computed from -- which nodes are TP/FP/FN -- without
+    re-deriving the masking and risking a protocol that drifts from the scored one.
+    """
+    phi_series, phi_gt, wall_mask, t_eval = deploy_clot_phi_trajectory(
+        data,
+        species_series,
+        static,
+        phys_cfg,
+        bio_cfg,
+        device,
+        time_index=time_index,
+        flow_source=flow_source,
+        gelation_beta=gelation_beta,
+    )
+    return phi_series[t_eval].reshape(-1), phi_gt, wall_mask, t_eval
+
+
+@torch.no_grad()
+def grade_deploy_clot_series(
+    data,
+    species_series: torch.Tensor,
+    static: dict,
+    phys_cfg,
+    bio_cfg,
+    device: torch.device,
+    *,
+    time_index: int | None = None,
+    flow_source: str = "gt",
+    gelation_beta: float | None = None,
+) -> dict[str, float]:
+    """Graded clot metrics from an already-computed species rollout.
+
+    The readout is cheap relative to the rollout, so a diagnostic can call this repeatedly
+    at different ``gelation_beta`` against one cached series to trace the beta curve with
+    the closed loop held fixed.
+    """
+    from src.evaluation.clot_relaxed_metrics import (
+        clot_score_from_deploy_dict,
+        compute_clot_relaxed_metrics,
+        metrics_to_deploy_prefix,
+    )
+
+    gel_beta = gelation_beta
+    phi_pred, phi_gt, wall_mask, t_eval = deploy_clot_phi_fields(
+        data,
+        species_series,
+        static,
+        phys_cfg,
+        bio_cfg,
+        device,
+        time_index=time_index,
+        flow_source=flow_source,
+        gelation_beta=gel_beta,
+    )
+
+    from src.evaluation.pocket_gate import apply_pocket_gate, resolve_pocket_gate_percentile
+
+    gate_pct = resolve_pocket_gate_percentile()
+    gate_stats: dict[str, float] = {}
+    if gate_pct is not None:
+        phi_pred, gate_stats = apply_pocket_gate(
+            phi_pred, data, device, percentile=gate_pct, wall_mask=wall_mask
+        )
+
+    edge_index = data.edge_index.to(device=device)
     m = compute_clot_relaxed_metrics(
-        phi_pred.reshape(-1),
-        phi_gt.reshape(-1),
+        phi_pred,
+        phi_gt,
         edge_index,
         wall_mask=wall_mask,
     )
     out = metrics_to_deploy_prefix(m)
     out["deploy_clot_score"] = clot_score_from_deploy_dict(out)
     out["time_index"] = int(t_eval)
+    out["deploy_gelation_beta"] = float(gel_beta) if gel_beta is not None else 1.0
+    out.update(gate_stats)
     return out
+
+
+@torch.no_grad()
+def eval_deploy_clot_f1(
+    model: nn.Module,
+    data,
+    static: dict,
+    phys_cfg,
+    bio_cfg,
+    device: torch.device,
+    *,
+    time_index: int | None = None,
+    flow_source: str = "gt",
+) -> dict[str, float]:
+    """Closed-loop species rollout -> nucleation clot F1 at ``time_index`` (deploy physics)."""
+    from src.core_physics.species_viscosity_calibration import resolve_clot_readout_beta
+
+    # Readout gain on the gelation leg. None => beta 1 (historical grading). Resolved once
+    # per anchor so the same value drives the closed loop and the final graded readout.
+    gel_beta = resolve_clot_readout_beta()
+    if gel_beta is not None:
+        print(f"[i] deploy clot readout gelation_beta={gel_beta:.4f}", flush=True)
+
+    species_series, data = deploy_species_rollout_series(
+        model,
+        data,
+        static,
+        phys_cfg,
+        bio_cfg,
+        device,
+        flow_source=flow_source,
+        gelation_beta=gel_beta,
+    )
+    return grade_deploy_clot_series(
+        data,
+        species_series,
+        static,
+        phys_cfg,
+        bio_cfg,
+        device,
+        time_index=time_index,
+        flow_source=flow_source,
+        gelation_beta=gel_beta,
+    )
 
 
 @torch.no_grad()
@@ -2999,13 +4309,57 @@ class SpeciesContinuousBundle:
     device: torch.device
 
 
+def _widen_input_rows(
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    *,
+    old_in: int,
+    new_in: int,
+    insert_at: int,
+) -> torch.Tensor:
+    """Copy ``src`` into ``tgt`` inserting zero columns for new band extras before the tail.
+
+    Layout: ``[shared_prefix | NEW_EXTRAS | state/sat/time_tail]``.
+    """
+    out = tgt.clone()
+    insert_w = int(new_in) - int(old_in)
+    if insert_w <= 0 or src.shape[-1] < old_in or out.shape[-1] < new_in:
+        n = min(int(src.shape[-1]), int(out.shape[-1]))
+        out[..., :n] = src[..., :n].to(device=out.device, dtype=out.dtype)
+        return out
+    pre = int(insert_at)
+    # Direct input weights: [*, in_dim]
+    if src.shape[-1] == old_in and out.shape[-1] == new_in:
+        out[..., :pre] = src[..., :pre].to(device=out.device, dtype=out.dtype)
+        out[..., pre : pre + insert_w] = 0
+        out[..., pre + insert_w :] = src[..., pre:].to(device=out.device, dtype=out.dtype)
+        return out
+    # Fused heads: [*, hidden + in_dim] — widen only the trailing in_dim block.
+    if src.shape[-1] > old_in and out.shape[-1] == src.shape[-1] + insert_w:
+        h = int(src.shape[-1] - old_in)
+        out[..., :h] = src[..., :h].to(device=out.device, dtype=out.dtype)
+        out[..., h : h + pre] = src[..., h : h + pre].to(device=out.device, dtype=out.dtype)
+        out[..., h + pre : h + pre + insert_w] = 0
+        out[..., h + pre + insert_w :] = src[..., h + pre :].to(device=out.device, dtype=out.dtype)
+        return out
+    n = min(int(src.shape[-1]), int(out.shape[-1]))
+    out[..., :n] = src[..., :n].to(device=out.device, dtype=out.dtype)
+    return out
+
+
 def load_pushforward_state_dict_partial(
     model: nn.Module,
     state_dict: dict[str, torch.Tensor],
     *,
     quiet: bool = False,
+    src_in_dim: int | None = None,
 ) -> int:
-    """Load compatible tensors; copy overlapping output rows when scope/out_dim widens."""
+    """Load compatible tensors; copy overlapping output rows when scope/out_dim widens.
+
+    When ``src_in_dim`` is set and the model input is wider (new geom/flux band channels
+    inserted before the state/sat/time tail), input weights are widened with zero-filled
+    insert columns instead of truncating extras or randomly reiniting the first layer.
+    """
     # Warm-start Spatially-Gated Readout Heads (Direction 6.1)
     if getattr(model, "spatial_gate_heads", False):
         new_state_dict = {}
@@ -3021,8 +4375,16 @@ def load_pushforward_state_dict_partial(
         state_dict = {**state_dict, **new_state_dict}
 
     dst = dict(model.state_dict())
+    new_in = int(getattr(model, "in_dim", 0) or 0)
+    old_in = int(src_in_dim) if src_in_dim is not None else 0
+    widen = bool(old_in > 0 and new_in > old_in)
+    insert_at = 0
+    if widen:
+        tail = continuous_tail_feature_dim()
+        insert_at = max(int(old_in) - int(tail), 0)
     copied = 0
     skipped: list[str] = []
+    widened = 0
     for key, src in state_dict.items():
         if key not in dst:
             skipped.append(key)
@@ -3031,6 +4393,19 @@ def load_pushforward_state_dict_partial(
         if src.shape == tgt.shape:
             dst[key] = src.to(device=tgt.device, dtype=tgt.dtype)
             copied += 1
+            continue
+        if (
+            widen
+            and src.ndim == 2
+            and tgt.ndim == 2
+            and src.shape[0] == tgt.shape[0]
+            and int(tgt.shape[1]) > int(src.shape[1])
+        ):
+            dst[key] = _widen_input_rows(
+                src, tgt, old_in=old_in, new_in=new_in, insert_at=insert_at
+            )
+            copied += 1
+            widened += 1
             continue
         if (
             key.endswith(".weight")
@@ -3062,6 +4437,8 @@ def load_pushforward_state_dict_partial(
     if not quiet:
         ckpt_out = int(state_dict.get("readout.2.weight", torch.empty(0)).shape[0]) if state_dict else 0
         msg = f"[OK] partial ckpt load ({copied} tensors"
+        if widened:
+            msg += f", widened_in {old_in}->{new_in} insert@{insert_at}"
         if skipped:
             msg += f", skipped {len(skipped)}"
         if hasattr(model, "out_dim"):
@@ -3078,6 +4455,13 @@ def load_continuous_bundle(
     architecture: str | None = None,
     apply_meta_env: bool = True,
 ) -> SpeciesContinuousBundle | None:
+    """Load a continuous pushforward checkpoint.
+
+    Architecture is reconstructed from typed ``PushforwardConfig.from_meta(meta)``.
+    ``apply_meta_env`` is retained for API compatibility but no longer mutates
+    ``os.environ`` for architecture knobs.
+    """
+    del apply_meta_env  # architecture comes from typed meta, not os.environ
     path = Path(ckpt_path) if ckpt_path is not None else continuous_ckpt_path()
     if not path.is_file():
         if not quiet:
@@ -3088,82 +4472,49 @@ def load_continuous_bundle(
     in_dim = int(payload.get("in_dim", 0))
     hidden = int(payload.get("hidden", snapshot_hidden_dim()))
     meta = dict(payload.get("meta") or {})
-    if apply_meta_env:
-        scope = meta.get("pushforward_species_scope") or meta.get("species_scope")
-        if scope:
-            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
-        ckpt_dual = bool(meta.get("dual_head") or payload.get("dual_head"))
-        if ckpt_dual:
-            os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
-        if bool(meta.get("saturation_gate")):
-            os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
-        if bool(meta.get("vel_decay")):
-            os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
-        # Retired: never re-enable temporal lambda gate from checkpoint metadata.
-        os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "0"
-        if bool(meta.get("delta_residual")):
-            os.environ["SPECIES_CONTINUOUS_DELTA_RESIDUAL"] = "1"
-        if bool(meta.get("temporal_offset")):
-            os.environ["SPECIES_CONTINUOUS_TEMPORAL_OFFSET"] = "1"
-        if bool(meta.get("kin_per_vessel_norm")):
-            os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
-        if meta.get("mature_fp_exempt") is not None:
-            os.environ["SPECIES_CONTINUOUS_MATURE_FP_EXEMPT"] = "1" if bool(meta.get("mature_fp_exempt")) else "0"
-        if meta.get("geom_feats") is not None:
-            os.environ["SPECIES_GEOM_FEATS"] = "1" if bool(meta.get("geom_feats")) else "0"
-        if meta.get("geom_feats_rich") is not None:
-            os.environ["SPECIES_GEOM_FEATS_RICH"] = "1" if bool(meta.get("geom_feats_rich")) else "0"
-        if meta.get("flow_feats") is not None:
-            os.environ["SPECIES_FLOW_FEATS"] = "1" if bool(meta.get("flow_feats")) else "0"
-        if meta.get("flow_dynamic") is not None:
-            os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] = "1" if bool(meta.get("flow_dynamic")) else "0"
-        if meta.get("flow_drop_xy") is not None:
-            os.environ["SPECIES_FLOW_FEATS_DROP_XY"] = "1" if bool(meta.get("flow_drop_xy")) else "0"
-        channels = meta.get("pushforward_species_channels") or meta.get("species_channels")
-        if channels:
-            if isinstance(channels, (list, tuple)):
-                os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(c)) for c in channels)
-            else:
-                os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
-        if meta.get("neighbor_commit_gate") is not None:
-            os.environ["SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE"] = (
-                "1" if bool(meta.get("neighbor_commit_gate")) else "0"
-            )
-        if meta.get("neighbor_commit_alpha") is not None:
-            os.environ["SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_ALPHA"] = str(meta.get("neighbor_commit_alpha"))
-        if meta.get("gate_temp") is not None:
-            os.environ["SPECIES_CONTINUOUS_GATE_TEMP"] = str(meta.get("gate_temp"))
-        if meta.get("frontier_hops") is not None:
-            os.environ["SPECIES_CONTINUOUS_FRONTIER_HOPS"] = str(meta.get("frontier_hops"))
-        if meta.get("nucleation_topk") is not None:
-            os.environ["SPECIES_CONTINUOUS_NUCLEATION_TOPK"] = str(meta.get("nucleation_topk"))
-    ckpt_dual = bool(meta.get("dual_head") or payload.get("dual_head"))
+    config = PushforwardConfig.from_meta(meta)
+    if payload.get("dual_head") is not None and meta.get("dual_head") is None:
+        from dataclasses import replace as _replace
+
+        config = _replace(config, dual_head=bool(payload.get("dual_head")))
+
+    ckpt_dual = bool(config.dual_head)
     if architecture == "single":
         use_dual = False
     elif architecture == "dual":
         use_dual = True
     else:
-        use_dual = ckpt_dual or continuous_dual_head()
-    if use_dual:
-        ckpt_arch = str(meta.get("arch") or meta.get("pushforward_arch") or "").strip().lower()
-        if ckpt_arch == "gnode":
-            from src.core_physics.species_gnode_pushforward import SpeciesGnodeDualHeadContinuousGNN
+        use_dual = ckpt_dual
 
-            model = SpeciesGnodeDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
+    out_dim = len(config.channels) if config.channels else None
+    ckpt_arch = str(config.arch or meta.get("pushforward_arch") or "").strip().lower()
+
+    from src.architecture.pushforward_config import use_pushforward_config
+
+    with use_pushforward_config(config):
+        if use_dual:
+            if ckpt_arch == "gnode":
+                from src.core_physics.species_gnode_pushforward import SpeciesGnodeDualHeadContinuousGNN
+
+                model = SpeciesGnodeDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
+            else:
+                model = SpeciesDualHeadContinuousGNN(
+                    in_dim, hidden=hidden, out_dim=out_dim, arch=ckpt_arch or "sage"
+                ).to(dev)
         else:
-            model = SpeciesDualHeadContinuousGNN(in_dim, hidden=hidden).to(dev)
-    else:
-        model = SpeciesContinuousPushforwardGNN(in_dim, hidden=hidden).to(dev)
-    load_pushforward_state_dict_partial(model, payload["model_state"], quiet=quiet)
-    model.eval()
-    return SpeciesContinuousBundle(
-        model=model,
-        latent_dim=int(meta.get("latent_dim", in_dim - 1 - _sd())),
-        hidden=hidden,
-        unroll=int(meta.get("unroll", pushforward_unroll_steps())),
-        stride=int(meta.get("stride", pushforward_step_stride())),
-        device=dev,
-    )
+            model = SpeciesContinuousPushforwardGNN(
+                in_dim, hidden=hidden, out_dim=out_dim, arch=ckpt_arch or "sage"
+            ).to(dev)
+        load_pushforward_state_dict_partial(model, payload["model_state"], quiet=quiet)
+        model.eval()
+        return SpeciesContinuousBundle(
+            model=model,
+            latent_dim=int(meta.get("latent_dim", in_dim - 1 - _sd())),
+            hidden=hidden,
+            unroll=int(meta.get("unroll", pushforward_unroll_steps(config))),
+            stride=int(meta.get("stride", pushforward_step_stride(config))),
+            device=dev,
+        )
 
 
 def init_continuous_from_snapshot(

@@ -128,12 +128,36 @@ def data_bio_species_scope() -> str:
 
 def pushforward_species_scope() -> str:
     """Active species channels for GraphSAGE pushforward (default FI+Mat)."""
+    try:
+        from src.architecture.pushforward_config import get_active_config
+
+        cfg = get_active_config()
+        if cfg is not None and cfg.species_scope:
+            return _normalize_scope(str(cfg.species_scope).strip().lower())
+    except Exception:
+        pass
     raw = (
         os.environ.get("BIOCHEM_PUSHFORWARD_SPECIES_SCOPE")
         or os.environ.get("BIOCHEM_DATA_BIO_SPECIES_SCOPE")
         or "fi_mat"
     ).strip().lower()
     return _normalize_scope(raw)
+
+
+def pushforward_state_bulk_indices(*, n_channels: int = 12) -> list[int]:
+    """Bulk channel indices modeled by GraphSAGE pushforward state."""
+    try:
+        from src.architecture.pushforward_config import get_active_config
+
+        cfg = get_active_config()
+        if cfg is not None and cfg.channels:
+            return [int(c) for c in cfg.channels]
+    except Exception:
+        pass
+    explicit = pushforward_channels_from_env()
+    if explicit is not None:
+        return explicit
+    return _scope_channel_indices(pushforward_species_scope(), n_channels=n_channels)
 
 
 def _scope_channel_indices(scope: str, *, n_channels: int = 12) -> list[int]:
@@ -160,14 +184,6 @@ def _scope_channel_indices(scope: str, *, n_channels: int = 12) -> list[int]:
 def data_bio_species_channel_indices(*, n_channels: int = 12) -> list[int]:
     """Active bulk species channels for ``L_Data_Bio`` (subset of ``4:16`` slice)."""
     return _scope_channel_indices(data_bio_species_scope(), n_channels=n_channels)
-
-
-def pushforward_state_bulk_indices(*, n_channels: int = 12) -> list[int]:
-    """Bulk channel indices modeled by GraphSAGE pushforward state."""
-    explicit = pushforward_channels_from_env()
-    if explicit is not None:
-        return explicit
-    return _scope_channel_indices(pushforward_species_scope(), n_channels=n_channels)
 
 
 def pushforward_state_dim(*, n_channels: int = 12) -> int:

@@ -17,6 +17,11 @@ Everything stays in the GINO-DEQ non-dimensional convention: positions by the ge
 length scale (``data.x[:, 0:2]`` are already ND on patient graphs), velocity by ``u_ref``,
 viscosity by ``PhysicsConfig.mu_viscosity_nd_scale``.
 
+**Solver Orchestration Constraint**: The heavy global RGP-DEQ solver should **never**
+be used for flow re-solves during a deployment/rollout sequence. It must only ever be
+executed exactly once at t=0. All subsequent dynamic flow patching and coupling as the
+clot grows must be handled exclusively by the Local Kinematic Corrector.
+
 Enable with ``BIOCHEM_CORRECTOR_COUPLING=1``. The coupled velocity is published to a small
 per-graph registry that the species rollout flow helpers consult, and can also be written
 straight into ``data.y[:, :, 0:2]`` for physics consumers that read the velocity channels.
@@ -58,12 +63,33 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def corrector_coupling_enabled() -> bool:
     """Master switch for routing rollout flow through the local kinematic corrector."""
-    return _env_bool("BIOCHEM_CORRECTOR_COUPLING", False)
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.coupling.corrector_coupling)
+    except Exception:
+        pass
+    return _env_bool("BIOCHEM_CORRECTOR_COUPLING", True)
 
 
 def resolve_corrector_checkpoint(explicit: Path | str | None = None) -> Path:
     """Locate the trained corrector checkpoint (explicit arg > env > default path)."""
-    raw = str(explicit or os.environ.get("BIOCHEM_CORRECTOR_CKPT") or "").strip()
+    raw = ""
+    if explicit is not None:
+        raw = str(explicit).strip()
+    if not raw:
+        try:
+            from src.architecture.runtime_config import get_active_runtime
+
+            rt = get_active_runtime()
+            if rt is not None and rt.coupling.corrector_ckpt:
+                raw = str(rt.coupling.corrector_ckpt).strip()
+        except Exception:
+            pass
+    if not raw:
+        raw = str(os.environ.get("BIOCHEM_CORRECTOR_CKPT") or "").strip()
     if not raw:
         raw = DEFAULT_CORRECTOR_REL
     p = Path(raw)
@@ -74,6 +100,14 @@ def resolve_corrector_checkpoint(explicit: Path | str | None = None) -> Path:
 
 def corrector_num_hops() -> int:
     """k for the k-hop subgraph extracted around clot nodes (Step C)."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.coupling.corrector_num_hops), 1)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_CORRECTOR_NUM_HOPS") or "4").strip()
     try:
         return max(int(float(raw)), 1)
@@ -87,6 +121,14 @@ def corrector_min_delta_mu_si() -> float:
     A small positive floor keeps numerical noise in the predicted ``mu_eff`` from spuriously
     triggering the corrector on the whole mesh.
     """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.corrector_mu_thresh), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_CORRECTOR_MU_THRESH") or "1e-3").strip()
     try:
         return max(float(raw), 0.0)
@@ -95,12 +137,20 @@ def corrector_min_delta_mu_si() -> float:
 
 
 def corrector_max_delta_mu_si() -> float:
-    """Clamp the Δμ feature to the corrector's training range (clot μ ~1.5-3 Pa.s).
+    """Clamp the Delta-mu feature to the corrector's training range (clot mu ~1.5-3 Pa.s).
 
-    Patient gelation caps μ_eff near ~4 Pa.s -- beyond the patches the corrector saw -- so an
-    unclamped Δμ drives it far out of distribution and it extrapolates unphysically large
+    Patient gelation caps mu_eff near ~4 Pa.s -- beyond the patches the corrector saw -- so an
+    unclamped Delta-mu drives it far out of distribution and it extrapolates unphysically large
     diversions (|dUV| ~ the full freestream). 0 disables the clamp.
     """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.corrector_max_delta_mu), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_CORRECTOR_MAX_DELTA_MU") or "3.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -118,11 +168,27 @@ def corrector_local_clusters_enabled() -> bool:
     restores the training scale: each local cluster gets its own COM + small subgraph, and the
     per-node diversions are averaged where patches overlap.
     """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.coupling.local_clusters)
+    except Exception:
+        pass
     return _env_bool("BIOCHEM_CORRECTOR_LOCAL_CLUSTERS", True)
 
 
 def corrector_cluster_radius_nd() -> float:
     """Spatial radius (GINO-DEQ ND frame) of each local clot patch handed to the corrector."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.cluster_radius_nd), 1e-4)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_CORRECTOR_CLUSTER_RADIUS_ND") or "0.12").strip()
     try:
         return max(float(raw), 1e-4)
@@ -132,6 +198,14 @@ def corrector_cluster_radius_nd() -> float:
 
 def corrector_cluster_max_nodes() -> int:
     """Cap on clot nodes per local patch (keeps each call near the trained patch size)."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.coupling.cluster_max_nodes), 1)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_CORRECTOR_CLUSTER_MAX_NODES") or "64").strip()
     try:
         return max(int(float(raw)), 1)
@@ -139,22 +213,55 @@ def corrector_cluster_max_nodes() -> int:
         return 64
 
 
+def corrector_growth_factor() -> float:
+    """Hysteresis: re-run the corrector only once the clot has grown by this factor since the last run."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.growth_factor), 1.0)
+    except Exception:
+        pass
+    raw = (os.environ.get("BIOCHEM_CORRECTOR_GROWTH_FACTOR") or "1.05").strip()
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return 1.05
+
+
 def kine_resolve_enabled() -> bool:
-    """Whether a clot burden may trigger a full GINO-DEQ re-solve (defaults to coupling state).
+    """Whether a clot burden may trigger a full GINO-DEQ re-solve (defaults to False).
 
     The local corrector handles small clots cheaply, but it only patches ``u, v`` -- it never
     regenerates the DEQ latent ``z_kin`` that is the GraphSAGE teacher's *primary* flow input.
     Once enough clot has formed to genuinely reroute the global flow, the kine model must update
     itself (re-solve with the clot ``mu`` in ``MU_PRIOR``) so the latent reflects the new field.
     """
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.coupling.kine_resolve_on_clot)
+    except Exception:
+        pass
     raw = os.environ.get("BIOCHEM_KINE_RESOLVE_ON_CLOT")
     if raw is None:
-        return corrector_coupling_enabled()
+        return False
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def kine_resolve_min_clot_nodes() -> int:
     """Clot node count above which a full DEQ re-solve is warranted (global flow change)."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.coupling.kine_resolve_min_clot_nodes), 1)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_KINE_RESOLVE_MIN_CLOT_NODES") or "40").strip()
     try:
         return max(int(float(raw)), 1)
@@ -163,7 +270,15 @@ def kine_resolve_min_clot_nodes() -> int:
 
 
 def kine_resolve_min_band_frac() -> float:
-    """Alternative trigger: clot fraction of the mesh above which to re-solve (0 disables)."""
+    """Optional: require clot to cover this fraction of the wall band before re-solving."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.kine_resolve_min_band_frac), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_KINE_RESOLVE_MIN_BAND_FRAC") or "0.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -172,10 +287,15 @@ def kine_resolve_min_band_frac() -> float:
 
 
 def kine_resolve_growth_factor() -> float:
-    """Hysteresis: re-solve only once the clot has grown by this factor since the last solve.
+    """Hysteresis for kine re-solve: only re-run after clot grew by this factor."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
 
-    Avoids paying for a global DEQ solve every macro step when the clot is barely changing.
-    """
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.coupling.kine_resolve_growth_factor), 1.0)
+    except Exception:
+        pass
     raw = (os.environ.get("BIOCHEM_KINE_RESOLVE_GROWTH_FACTOR") or "1.5").strip()
     try:
         return max(float(raw), 1.0)
@@ -307,6 +427,11 @@ def couple_flow_with_corrector(
     du_sum = torch.zeros(n, device=device)
     dv_sum = torch.zeros(n, device=device)
     hits = torch.zeros(n, device=device)
+    
+    from torch_geometric.data import Data, Batch
+    data_list = []
+    subset_list = []
+
     for cluster in clusters:
         if cluster.numel() == 0:
             continue
@@ -324,11 +449,22 @@ def couple_flow_with_corrector(
         x_sub = assemble_local_corrector_features(
             pos_nd, sdf_nd, u_coupled, v_coupled, delta_mu_nd, cluster, subset
         )
-        # Step E: predict the diversion and accumulate it for this patch.
-        delta_uv = corrector(x_sub, sub_edge_index.to(device))
-        du_sum[subset] += delta_uv[:, 0]
-        dv_sum[subset] += delta_uv[:, 1]
-        hits[subset] += 1.0
+        data_list.append(Data(x=x_sub, edge_index=sub_edge_index))
+        subset_list.append(subset)
+
+    if data_list:
+        # Step E: predict the diversion in a single batched forward pass and accumulate.
+        batch = Batch.from_data_list(data_list).to(device)
+        delta_uv_batch = corrector(batch.x, batch.edge_index)
+        
+        ptr = 0
+        for subset in subset_list:
+            num_nodes = subset.numel()
+            delta_uv = delta_uv_batch[ptr:ptr + num_nodes]
+            du_sum[subset] += delta_uv[:, 0]
+            dv_sum[subset] += delta_uv[:, 1]
+            hits[subset] += 1.0
+            ptr += num_nodes
 
     touched = hits > 0
     if bool(touched.any()):
@@ -390,11 +526,17 @@ class CorrectorCoupledFlow:
         self._kine = None
         self._base_flow: tuple[torch.Tensor, torch.Tensor] | None = None
         self._base_key: tuple[int, int, int] | None = None
+        self._last_corrector_n = 0
+        self._cached_u: torch.Tensor | None = None
+        self._cached_v: torch.Tensor | None = None
 
     def invalidate_base_cache(self) -> None:
         """Drop cached base flow (call after remesh / geometry change)."""
         self._base_flow = None
         self._base_key = None
+        self._last_corrector_n = 0
+        self._cached_u = None
+        self._cached_v = None
 
     def _ensure_corrector(self) -> LocalKinematicCorrector:
         if self._corrector is None:
@@ -444,6 +586,16 @@ class CorrectorCoupledFlow:
         self, data, delta_mu_si: torch.Tensor, *, publish: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         u0, v0 = self.base_flow(data)
+        
+        nodes = clot_nodes_from_delta_mu(delta_mu_si, min_delta_mu_si=self.min_delta_mu_si)
+        n_clot = int(nodes.numel())
+        
+        if n_clot > 0 and self._cached_u is not None:
+            if n_clot <= self._last_corrector_n * corrector_growth_factor():
+                if publish:
+                    set_coupled_flow(data, self._cached_u, self._cached_v)
+                return self._cached_u, self._cached_v
+        
         u, v = couple_flow_with_corrector(
             data,
             u0,
@@ -454,7 +606,14 @@ class CorrectorCoupledFlow:
             device=self.device,
             num_hops=self.num_hops,
             min_delta_mu_si=self.min_delta_mu_si,
+            clot_nodes=nodes,
         )
+        
+        self._last_corrector_n = n_clot
+        if n_clot > 0:
+            self._cached_u = u.clone()
+            self._cached_v = v.clone()
+        
         if publish:
             set_coupled_flow(data, u, v)
         return u, v
@@ -490,18 +649,45 @@ class CorrectorCoupledFlow:
         return self.couple_from_delta_mu(data, delta_mu_si, publish=publish)
 
 
-def inject_mu_prior(data, mu_eff_si: torch.Tensor, phys_cfg: PhysicsConfig):
-    """Return a shallow graph clone with the predicted clot ``mu`` written into ``MU_PRIOR``.
-
-    The GINO-DEQ reads the viscosity prior from ``data.x[:, NodeFeat.MU_PRIOR]``; injecting the
-    clot ``mu_eff`` there makes a fresh solve (velocity *and* latent) clot-aware.
+def inject_sdf_wall(data, clot_idx: torch.Tensor):
+    """Return a shallow graph clone treating clot nodes as rigid walls (SDF=0).
+    
+    The RGP-DEQ solver enforces no-slip via the hard BC envelope (1 - exp(-lambda * SDF)).
+    By setting SDF=0 and UV_PRIOR=0 at clot nodes, we create a rigid vessel wall, allowing
+    the solver to remain in-distribution (healthy fluid, narrower pipe) instead of OOD.
     """
-    mu_nd = phys_cfg.viscosity_si_to_nd(mu_eff_si.reshape(-1, 1))
-    x_new = data.x.clone()
-    x_new[:, NodeFeat.MU_PRIOR] = mu_nd.to(device=x_new.device, dtype=x_new.dtype)
-    data_k = data.clone()
-    data_k.x = x_new
-    return data_k
+    device = data.x.device
+    data_mod = data.clone()
+    x_new = data_mod.x.clone()
+    
+    # 1. Set SDF = 0 at clot nodes
+    x_new[clot_idx, NodeFeat.SDF.start] = 0.0
+    
+    # 2. Set UV_PRIOR = 0 at clot nodes (no-slip)
+    x_new[clot_idx, NodeFeat.UV_PRIOR] = 0.0
+    if x_new.shape[1] > NodeFeat.WSS_PRIOR.start:
+        x_new[clot_idx, NodeFeat.WSS_PRIOR] = 0.0
+        
+    # 3. Expand wall mask
+    mask_wall_new = data_mod.mask_wall.clone()
+    mask_wall_new[clot_idx] = True
+    
+    # 4. Recompute SDF for ALL nodes from expanded boundary
+    import numpy as np
+    from scipy.spatial import cKDTree
+    pos_np = x_new[:, 0:2].cpu().numpy()
+    wall_np = pos_np[mask_wall_new.cpu().numpy()]
+    if wall_np.shape[0] > 0:
+        tree = cKDTree(wall_np)
+        dists, _ = tree.query(pos_np)
+        sdf_recomputed = torch.tensor(np.clip(dists, 1e-6, None), dtype=torch.float32, device=device)
+        x_new[:, NodeFeat.SDF.start] = sdf_recomputed
+        if x_new.shape[1] > NodeFeat.SHEAR_POT.start:
+            x_new[:, NodeFeat.SHEAR_POT.start] = torch.abs(1.0 - 2.0 * sdf_recomputed)
+            
+    data_mod.x = x_new
+    data_mod.mask_wall = mask_wall_new
+    return data_mod
 
 
 @dataclass
@@ -545,37 +731,51 @@ class ClotAwareFlow(CorrectorCoupledFlow):
             and int(self._frozen_latent.shape[0]) == n
         ):
             return self._frozen_latent
+            
         self._frozen_latent = None
         self._frozen_latent_key = None
+        
+        # Fast path: use cached latent if present on the Data object
+        if hasattr(data, "z_kin_pred") and data.z_kin_pred is not None:
+            z_kin = data.z_kin_pred.to(device=self.device, dtype=torch.float32)
+            if int(z_kin.shape[0]) == n:
+                self._frozen_latent = z_kin
+                self._frozen_latent_key = key
+                return self._frozen_latent
+
         self.base_flow(data)  # ensures the kine model is loaded
-        assert self._kine is not None
+        assert self._kine is not None, "kine model must be loaded if z_kin_pred is missing"
         self._frozen_latent = predict_kinematics_latent(self._kine, data.to(self.device))
         self._frozen_latent_key = key
         return self._frozen_latent
 
     @torch.no_grad()
     def resolve_full(
-        self, data, mu_eff_si: torch.Tensor
+        self, data, clot_nodes: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full clot-aware DEQ re-solve -> ``(z_kin, u, v)`` (the kine model updating itself).
 
         Falls back to a CPU solve on CUDA OOM (a full DEQ solve on a large mesh + the live
         species rollout can exceed a small GPU); results are returned on ``self.device``.
         """
-        self.base_flow(data)  # ensures the kine model is loaded
+        self.base_flow(data)  # ensures the kine model is loaded if not cached from u0_pred
+        if self._kine is None:
+            from src.utils.kinematics_inference import load_kinematics_predictor
+            ckpt = resolve_kinematics_checkpoint(self._kine_ckpt)
+            self._kine = load_kinematics_predictor(ckpt, self.device, phys_cfg=self.phys_cfg)
         assert self._kine is not None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         from src.utils.kinematics_inference import predict_kinematics_and_latent
 
         try:
-            data_k = inject_mu_prior(data.to(self.device), mu_eff_si.to(self.device), self.phys_cfg)
+            data_k = inject_sdf_wall(data.to(self.device), clot_nodes.to(self.device))
             pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
         except torch.cuda.OutOfMemoryError as e:
             # Fragmentation is the usual cause -- defrag and RETRY ON GPU (full speed) before CPU.
             torch.cuda.empty_cache()
             try:
-                data_k = inject_mu_prior(data.to(self.device), mu_eff_si.to(self.device), self.phys_cfg)
+                data_k = inject_sdf_wall(data.to(self.device), clot_nodes.to(self.device))
                 pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
                 print("[i] DEQ re-solve recovered on GPU after empty_cache.")
             except torch.cuda.OutOfMemoryError:
@@ -612,7 +812,7 @@ class ClotAwareFlow(CorrectorCoupledFlow):
         n_total = int(data.num_nodes)
 
         if clot_burden_significant(n_clot, n_total) and self._grown_enough(n_clot):
-            z_kin, u, v = self.resolve_full(data, mu_eff_si)
+            z_kin, u, v = self.resolve_full(data, nodes)
             self._last_resolve_n = n_clot
             state = ClotFlowState(u=u, v=v, z_kin=z_kin, mode="resolved", n_clot=n_clot)
         elif n_clot > 0:

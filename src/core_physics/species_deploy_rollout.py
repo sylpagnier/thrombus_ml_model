@@ -31,6 +31,14 @@ _kine_model = None
 
 
 def species_rollout_deploy_faithful() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.deploy_faithful)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_ROLLOUT_DEPLOY_FAITHFUL") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -45,6 +53,14 @@ def _normalize_vel_source(raw: str) -> str:
 
 
 def species_rollout_vel_source() -> str:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.rollout.rollout_vel_source:
+            return _normalize_vel_source(rt.rollout.rollout_vel_source)
+    except Exception:
+        pass
     default = "kinematics" if species_rollout_deploy_faithful() else "gt"
     raw = (os.environ.get("SPECIES_ROLLOUT_VEL_SOURCE") or default).strip().lower()
     return _normalize_vel_source(raw)
@@ -52,6 +68,14 @@ def species_rollout_vel_source() -> str:
 
 def species_train_vel_source() -> str:
     """Velocity for species unroll loss (may use GT to save VRAM during train)."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.rollout.train_vel_source:
+            return _normalize_vel_source(rt.rollout.train_vel_source)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_TRAIN_VEL_SOURCE") or "gt").strip()
     if raw:
         return _normalize_vel_source(raw)
@@ -59,6 +83,15 @@ def species_train_vel_source() -> str:
 
 
 def species_rollout_pin_other() -> PinOtherSpecies:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.rollout.rollout_pin_other:
+            raw = str(rt.rollout.rollout_pin_other).strip().lower()
+            return "gt" if raw == "gt" else "rest"
+    except Exception:
+        pass
     if not species_rollout_deploy_faithful():
         raw = (os.environ.get("SPECIES_ROLLOUT_PIN_OTHER") or "gt").strip().lower()
     else:
@@ -67,6 +100,14 @@ def species_rollout_pin_other() -> PinOtherSpecies:
 
 
 def species_rollout_ic_source() -> str:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and rt.rollout.rollout_ic_source:
+            return str(rt.rollout.rollout_ic_source).strip().lower()
+    except Exception:
+        pass
     default = "resting" if species_rollout_deploy_faithful() else "gt"
     return (os.environ.get("SPECIES_ROLLOUT_IC_SOURCE") or default).strip().lower()
 
@@ -176,6 +217,29 @@ def resolve_species_rollout_uv(
         _pred_uv_cache = (pred[:, 0], pred[:, 1])
         _pred_uv_key = key
     return _pred_uv_cache
+
+
+def band_uv_for_model(
+    data,
+    time_index: int,
+    device: torch.device,
+    node_idx: torch.Tensor,
+    *,
+    for_training: bool = False,
+) -> torch.Tensor:
+    """Deploy-faithful band UV ``(N_band, 2)`` for model inputs (never steal COMSOL GT).
+
+    Agents: do **not** pass ``data.y[..., 0:2]`` into ``model.velocity`` / physics
+    priors / convective upwind. New vessels have no GT flow; use this helper
+    (``resolve_species_rollout_uv`` -> coupled / ``u0_pred`` / RGP-DEQ) instead.
+    GT UV is allowed only when the leg explicitly sets ``train_vel_source=gt``
+    (crutch A/B), which this helper still honors via the typed runtime source.
+    """
+    u, v = resolve_species_rollout_uv(
+        data, time_index, device, for_training=for_training
+    )
+    idx = node_idx.reshape(-1).to(device=device)
+    return torch.stack([u.reshape(-1)[idx], v.reshape(-1)[idx]], dim=-1)
 
 
 def band_speed_for_rollout(

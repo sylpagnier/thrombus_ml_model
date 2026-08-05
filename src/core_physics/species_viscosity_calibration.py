@@ -52,6 +52,14 @@ def viscosity_calibration_dir() -> Path:
 
 
 def viscosity_calibration_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.gelation.viscosity_calib)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_VISCOSITY_CALIB") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -62,6 +70,18 @@ def mat_log1p_from_si(mat_si: torch.Tensor, bio_cfg: BiochemConfig) -> torch.Ten
 
 
 def viscosity_beta_bounds() -> tuple[float, float]:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            lo = float(rt.gelation.beta_min)
+            hi = float(rt.gelation.beta_max)
+            if hi <= lo:
+                hi = lo + 1.0
+            return lo, hi
+    except Exception:
+        pass
     lo_raw = (os.environ.get("SPECIES_VISCOSITY_BETA_MIN") or "0.1").strip()
     hi_raw = (os.environ.get("SPECIES_VISCOSITY_BETA_MAX") or "2.0").strip()
     try:
@@ -370,10 +390,20 @@ def resolve_deploy_gelation_beta(
     *,
     cal_path: Path | str | None = None,
 ) -> torch.Tensor | None:
-    """Global s35 beta, or per-anchor ``SPECIES_GELATION_BETA_OVERRIDE`` env."""
+    """Global s35 beta, or per-anchor ``SPECIES_GELATION_BETA_OVERRIDE`` / runtime override."""
     if not viscosity_calibration_enabled():
         return None
-    override = (os.environ.get("SPECIES_GELATION_BETA_OVERRIDE") or "").strip()
+    override = ""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and str(rt.gelation.beta_override or "").strip():
+            override = str(rt.gelation.beta_override).strip()
+    except Exception:
+        pass
+    if not override:
+        override = (os.environ.get("SPECIES_GELATION_BETA_OVERRIDE") or "").strip()
     if override:
         return torch.tensor(float(override), device=device, dtype=torch.float32)
     raw = cal_path or os.environ.get("SPECIES_VISCOSITY_CALIB_PATH") or str(
@@ -386,6 +416,41 @@ def resolve_deploy_gelation_beta(
         return None
     cal, _ = load_viscosity_calibration(p, device=device)
     return cal.beta
+
+
+def resolve_clot_readout_beta() -> float | None:
+    """Explicit gelation gain for the *graded* clot readout, or ``None`` to leave it alone.
+
+    Deliberately narrower than :func:`resolve_deploy_gelation_beta`: it honours only an
+    explicit override (typed ``gelation.beta_override`` or ``SPECIES_GELATION_BETA_OVERRIDE``)
+    and never falls back to the on-disk ``beta.pth``. That file was fitted at ``t=53``
+    against a different checkpoint (docs/WALL_MODEL_PLAN.md s2), so picking it up here would
+    silently re-grade every historical ``deploy_clot_f1``. No override => identical numbers
+    to the pre-wiring behaviour (effective beta 1.0).
+    """
+    override = ""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None and str(rt.gelation.beta_override or "").strip():
+            override = str(rt.gelation.beta_override).strip()
+    except Exception:
+        pass
+    if not override:
+        override = (os.environ.get("SPECIES_GELATION_BETA_OVERRIDE") or "").strip()
+    if not override:
+        return None
+    try:
+        beta = float(override)
+    except ValueError:
+        return None
+    lo, hi = viscosity_beta_bounds()
+    if not (lo <= beta <= hi):
+        raise ValueError(
+            f"SPECIES_GELATION_BETA_OVERRIDE={beta} outside allowed range [{lo}, {hi}]"
+        )
+    return beta
 
 
 def load_viscosity_calibration(

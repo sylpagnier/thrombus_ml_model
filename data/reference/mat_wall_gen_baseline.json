@@ -1,0 +1,78 @@
+{
+  "stack": "wall_gen_baseline",
+  "leg": "FS_ab_coupled",
+  "label": "Wall-gen baseline: deploy-faithful train (RGP-DEQ @ t=0 + local tiling), drop-xy, WC_v7 dynamics",
+  "promoted_at": "2026-08-02T20:57:35Z",
+  "source_ckpt": "outputs/biochem/eda/flow_source_ab/FS_ab_coupled/best.pth",
+  "baseline_ckpt": "outputs/biochem/biochem_gnn/wall_gen_baseline/species/best.pth",
+  "note": "Phase1 / wall-gen generalization baseline from flow-source A/B. Train+deploy use RGP-DEQ base flow and local tiling (no GT velocity). Does not replace locked WC_v7 for compound/in-family warm-starts.",
+  "cohort": {
+    "train": "patient005,patient006,patient010,patient023,patient002",
+    "val": "patient020",
+    "holdout": "patient020"
+  },
+  "config_kwargs": {
+    "dual_head": true,
+    "species_scope": "mat",
+    "saturation_gate": true,
+    "flow_feats": true,
+    "flow_feats_dynamic": true,
+    "mature_fp_exempt": true,
+    "teacher_noise": 0.02,
+    "teacher_fp_frac": 0.08,
+    "teacher_blur": 0.25,
+    "tbptt_tail": 5,
+    "closed_loop_init": 0.45,
+    "physics_readout": true,
+    "loss_scale": 0.1,
+    "score_clout_w": 0.75,
+    "flow_feats_drop_xy": true,
+    "flow_feats_source": "auto",
+    "scheduled_sampling": false
+  },
+  "runtime_kwargs": {
+    "viscosity_calib": true,
+    "wall_hops": 3,
+    "dynamic_occlusion": true,
+    "wall_mat_only": false,
+    "nucleation_hops": 4,
+    "ceiling_hops": 4,
+    "closed_loop_coupling": true,
+    "corrector_coupling": true,
+    "rollout_vel_source": "coupled",
+    "clout_score_mode": "guiding",
+    "guide_relax_hops": 3,
+    "clout_prec_rec_floor": 0.3,
+    "deploy_faithful": true,
+    "rollout_ic_source": "resting",
+    "phi_loss_weight": 20.0,
+    "phi_loss_type": "mse",
+    "mu_loss_weight": 0.0,
+    "kine_resolve_on_clot": false,
+    "train_vel_source": "coupled",
+    "train_deploy_eval_flow": "auto"
+  },
+  "scores": {
+    "eval_json": "outputs/biochem/eda/flow_source_ab/flow_source_ab_summary.csv",
+    "note": "Recorded from completed flow-source A/B cold deploy (anchors were 020+034 mean at promote time; primary gate is patient020 going forward).",
+    "mean": {
+      "deploy_clot_score": 0.2765,
+      "deploy_clot_f1": 0.265,
+      "deploy_mat_f1": 0.098
+    },
+    "train_select_best_score": 0.278,
+    "protocol": {
+      "deploy_faithful": true,
+      "flow": "RGP-DEQ @ t=0 + local tiling (corrector coupling)",
+      "no_gt_velocity": true,
+      "holdout_at_ab_run": "patient020,patient034",
+      "holdout_policy_going_forward": "patient020"
+    }
+  },
+  "flow_source_ab": {
+    "gt_mean_score_020_034": 0.268,
+    "kine_mean_score_020_034": 0.2534,
+    "coupled_mean_score_020_034": 0.2765,
+    "winner": "FS_ab_coupled"
+  }
+}

@@ -1,0 +1,28 @@
+---
+description: Deploy-faithful generalization eval + patient020 holdout for wall-gen legs
+alwaysApply: true
+---
+
+# Generalization eval (wall-gen / mat-growth)
+
+## Deploy-faithful only
+
+When scoring generalization or comparing wall-gen / phase1 / flow-source / physgat legs:
+
+- Use cold deploy (`eval_mat_growth_simple.py` / `canonical_deploy_clot_metrics`).
+- **t=0:** RGP-DEQ once (cached `u0_pred` / kinematics ckpt). Never re-solve the global DEQ during rollout.
+- **t>0:** local kinematic corrector + tiling only for flow updates.
+- Eval forces `flow_feats_source=auto` + corrector coupling on. Never claim generalization from GT velocity / GT-teacher-forced `val_*`.
+- **Never feed COMSOL `data.y[..., 0:2]` into the model** (`model.velocity`, physics-GAT attention, convective upwind). Use `band_uv_for_model` / `resolve_species_rollout_uv` (coupled / `u0_pred` / RGP-DEQ). GT UV is labels / timeline / explicit `train_vel_source=gt` crutch legs only.
+
+New vessels provide **geometry only** — no COMSOL `[u,v]`.
+
+## Holdout gate
+
+Primary holdout for these legs: **`patient020` only** (clot-rich).
+
+Do not gate decisions on means that include clot-free `patient034`. Optional multi-vessel tables are secondary diagnostics.
+
+Canonical cohort: train `005,006,010,023,002`; val = holdout = `020`.
+
+Full policy: [AGENTS.md](../../AGENTS.md), [docs/GENERALIZATION_PLAN.md](../../docs/GENERALIZATION_PLAN.md).

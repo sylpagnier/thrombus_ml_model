@@ -81,7 +81,7 @@ def test_normalize_pathology_mode_aliases():
 
 
 def test_normalize_aneurysm_wall_mode_aliases():
-    assert normalize_aneurysm_wall_mode(None) == "mirrored"
+    assert normalize_aneurysm_wall_mode(None) == "one"
     assert normalize_aneurysm_wall_mode("both") == "mirrored"
     assert normalize_aneurysm_wall_mode("one-wall") == "one"
     assert normalize_aneurysm_wall_mode("single") == "one"
@@ -110,10 +110,12 @@ def test_sample_params_max_stenosis_targets_occlusion():
     assert occlusion == pytest.approx(cfg.max_stenosis_diameter_occlusion, abs=0.03)
 
 
-def test_sample_params_max_aneurysm_uses_config_cap():
+def test_sample_params_max_aneurysm_mirrored_uses_config_cap():
     cfg = VesselConfig(phase="biochem")
     rng = np.random.default_rng(1)
-    p = _sample_params(0, 2, cfg, rng, pathology_mode="max_aneurysm")
+    p = _sample_params(
+        0, 2, cfg, rng, pathology_mode="max_aneurysm", aneurysm_wall_mode="mirrored"
+    )
     assert p["v_type"] == "aneurysm"
     assert p["path_loc"] == 2
     assert p["aneurysm_wall_mode"] == "mirrored"
@@ -127,19 +129,12 @@ def test_sample_params_max_aneurysm_uses_config_cap():
     assert peak_lumen / width == pytest.approx(cfg.max_aneurysm_width_scale, rel=0.02)
 
 
-def test_sample_params_max_aneurysm_one_wall():
+def test_sample_params_max_aneurysm_one_wall_is_default():
     cfg = VesselConfig(phase="biochem")
     rng = np.random.default_rng(5)
     seen_walls = set()
     for i in range(30):
-        p = _sample_params(
-            i,
-            1,
-            cfg,
-            rng,
-            pathology_mode="max_aneurysm",
-            aneurysm_wall_mode="one",
-        )
+        p = _sample_params(i, 1, cfg, rng, pathology_mode="max_aneurysm")
         assert p["v_type"] == "aneurysm"
         assert p["aneurysm_wall_mode"] == "one"
         assert p["path_loc"] in (0, 1)
@@ -161,18 +156,12 @@ def test_sample_params_straight_max_one_wall_aneurysm():
     rng = np.random.default_rng(9)
     aneur_count = 0
     for i in range(60):
-        p = _sample_params(
-            i,
-            1,
-            cfg,
-            rng,
-            pathology_mode="straight_max",
-            aneurysm_wall_mode="one",
-        )
+        p = _sample_params(i, 1, cfg, rng, pathology_mode="straight_max")
         assert p["curve_type"] == "straight"
         if p["v_type"] == "aneurysm":
             aneur_count += 1
             assert p["path_loc"] in (0, 1)
+            assert p["aneurysm_wall_mode"] == "one"
         else:
             assert p["path_loc"] == 2  # max stenosis stays both-wall
     assert aneur_count >= 1
@@ -204,21 +193,27 @@ def test_sample_params_straight_max_is_straight_extreme():
         assert p["curve_type"] == "straight"
         assert p["angle_span"] == 0.0
         assert p["amplitude"] == 0.0
-        assert p["path_loc"] == 2
         assert p["v_type"] in ("stenosis", "aneurysm")
         assert all(abs(x) < 1e-15 for x in p["tortuosity"])
         assert all(abs(x) < 1e-15 for x in p["noise_top"])
         assert all(abs(x) < 1e-15 for x in p["noise_bot"])
         seen.add(p["v_type"])
-        geom = compute_geometry_from_params(p, _gen_cfg(cfg))
-        widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
         nominal = float(p["width"])
+        offsets = np.asarray(p["offsets"], dtype=float)
         if p["v_type"] == "stenosis":
+            assert p["path_loc"] == 2
+            geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+            widths = np.linalg.norm(geom.top_coords - geom.bot_coords, axis=1)
             occlusion = 1.0 - (float(np.min(widths)) / nominal)
             assert occlusion == pytest.approx(cfg.max_stenosis_diameter_occlusion, abs=0.03)
         else:
-            assert float(np.max(widths)) / nominal == pytest.approx(
-                cfg.max_aneurysm_width_scale, rel=0.02
+            assert p["path_loc"] in (0, 1)
+            assert p["aneurysm_wall_mode"] == "one"
+            top = offsets if p["path_loc"] in (0, 2) else np.zeros_like(offsets)
+            bot = offsets if p["path_loc"] in (1, 2) else np.zeros_like(offsets)
+            peak_lumen = float(np.max(nominal + top + bot))
+            assert peak_lumen / nominal == pytest.approx(
+                1.0 + float(cfg.max_aneurysm_factor), rel=0.02
             )
     assert seen == {"stenosis", "aneurysm"}
 

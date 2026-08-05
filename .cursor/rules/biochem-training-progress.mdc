@@ -11,8 +11,9 @@ Legacy GNODE / corrector chronicles: **[docs/archive/BIOCHEM_TRAINING_PROGRESS.m
 
 ## Metrics to prefer
 
-- **Use**: deploy clot F1 / clot score / relaxed precision, wall / off-wall hop metrics, `mu_log_mae` when applicable.
-- **Do not** treat collapsing aux losses alone as deploy success.
+- **Use**: cold **deploy-faithful** clot F1 / clot score / relaxed precision (RGP-DEQ @ t=0 + local tiling; no GT velocity), wall / off-wall hop metrics, `mu_log_mae` when applicable.
+- Wall-gen / phase1 / flow-source **primary holdout = `patient020` only** (clot-rich). Do not gate on means that include clot-free `patient034`.
+- **Do not** treat collapsing aux losses alone as deploy success; do not quote GT-teacher-forced `val_*` as generalization.
 
 ## Edit style
 

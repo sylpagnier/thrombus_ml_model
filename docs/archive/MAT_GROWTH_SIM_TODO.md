@@ -175,3 +175,32 @@ Run `-Promote` to copy alias -> `mat_canonical_deploy/species/best.pth`.
 4. ~~Does precision-first selection change the P vs G ranking?~~ **W matches P=0.762 at triage tier.**
 5. ~~Does W hold at 40 ep / all windows? Does **WC** beat W at full budget?~~ **WC wins** on FP-aware deploy pick (§191); W +0.006 F1 but 2-3x worse medFP/p90FP.
 6. ~~Does flow+frontier without top-k (WD) help topology?~~ **No -- WD dead at deploy.**
+
+---
+
+## Wall-gen sparse seed ledger (2026-08-04) — patient020 gate
+
+Goal: raise deploy-faithful `patient020` clot score from `WG_prec_iter` floor (~0.35 score / ~0.37 F1) toward **>0.4** (stretch **>0.5**).
+
+### What we tried
+
+| Experiment | Result | Lesson |
+|------------|--------|--------|
+| **Eval wiring fix** (`canonical_deploy_clot_metrics` preserve active `PushforwardConfig`) | Mat F1 had been moving while `deploy_clot_*` stayed flat across fh/tk; after fix, clot path sees overrides | Required before trusting any sparse-commit sweep |
+| **Post-hoc** `frontier_hops=2` + `nucleation_topk=0.05` on `WG_prec_iter` | clot_f1 ~0.31, score ~0.53, mass ~0.18, FP=0, FN=90 — **underseed** | Hard mask kills spray but stalls the front; not a free lunch |
+| **Train hard mask** `WG_prec_seed*` (fh+topk ON, warm then cold) | Warm: deploy died by ep4–5; cold: clot_f1=0 from ep1 | Do **not** train with hard frontier/topk from scratch or as primary FT |
+| **Seed-location aux** `WG_prec_seed_aux` (warm `WG_prec_iter`, fh=0, early BCE on gate vs GT early pocket) | Alive but **no lift**: best ep2 clot_f1 **0.311** / score **0.327** (below floor); by ep6 seed_p **1→0**, FN↑, score **0.293** — **killed after ep6** | Early seed_p was already 1.0; failure is **front/recall**, not pocket location. Aux drifted into underseed |
+| **Front/recall FT** `WG_prec_front` (underpred=3, gate_fp=3, step_fp↓; select front+FN; seed_aux off) | Same underseed drift: best ep1 f1 **0.316** / score **0.329** (below floor ~0.37); by ep5 mass **0.90→0.71**, front **0.44→0.34**, FN **77→85** — **killed after ep5** | Loss reweight alone does not grow the front; still needs an explicit **front-new** signal (or different commit mechanism), not just underpred/FP easing |
+
+Artifacts: `…/wall_gen_prec_seed_aux/…/train_log_stopped_ep6.jsonl`, `…/wall_gen_prec_front/WG_prec_front/train_log_stopped_ep5.jsonl`; floor remains `WG_prec_iter/best.pth`.
+
+### Ranked next (toward >0.4 / ideally >0.5)
+
+1. **Locked gate (2026-08-04):** primary = `deploy_clot_f1` on `patient020`; mass in `[0.8,1.3]` (starve reject `<0.5`); FN must not rise vs floor ~67; **never** promote on score alone when mass starved (fh=2 score 0.53 was a mirage).
+2. **Primary FT — `WG_prec_physfp` or `WG_prec_cloop`** from `WG_prec_iter` (not seed/front). Choose via `scripts/viz_fp_geography.py`: distant FPs -> physfp (`physical_fp_gating`); adjacent overpaint -> cloop (`closed_loop_init=0.85`, `tbptt_tail=12`). Launcher: `go_wg_prec_physfp.ps1`.
+3. Only if that stalls: mid-cohort with winning recipe — not more underpred/FP / seed_aux knob tweaks.
+4. Compound off-wall later — wall precision on 020 is still the gate.
+
+**Avoid:** more hard-mask trains; stronger seed_aux; more underpred-only FT; gating with clot-free `patient034`; chasing score via FP=0 / mass<<1.
+
+**Status:** seed/front line abandoned (see table above). Floor remains `WG_prec_iter/best.pth`.

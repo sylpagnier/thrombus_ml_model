@@ -74,7 +74,7 @@ def mu_eff_carreau_blend_from_phi(
     project_support: bool = True,
 ) -> torch.Tensor:
     """Log-blend Carreau bulk toward clot mu cap along phi (deploy coupled feedback)."""
-    u, v = _resolve_uv_for_temporal_risk(data, 0, device)
+    u, v = _resolve_uv_for_temporal_risk(data, 0, device, vel_source="kinematics")
     mu_c = resolve_bulk_carreau_mu_si(data, t_out, phys_cfg, device, u_nd=u, v_nd=v)
     mu = log_blend_mu_eff_si(mu_c, phi.reshape(-1))
     if not project_support:
@@ -97,17 +97,12 @@ def mu_eff_carreau_blend_from_phi(
 
 @torch.no_grad()
 def _init_coupled_uv_from_frozen_kine(data, device: torch.device) -> None:
-    prev = os.environ.get("CLOT_TEMPORAL_VEL_SOURCE")
-    os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "kinematics"
     reset_temporal_kinematics_cache()
     from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
 
-    u, v = _resolve_uv_for_temporal_risk(data, 0, device)
+    u, v = _resolve_uv_for_temporal_risk(data, 0, device, vel_source="kinematics")
     set_coupled_uv_cache(data, u, v)
-    if prev is not None:
-        os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = prev
-    else:
-        os.environ.pop("CLOT_TEMPORAL_VEL_SOURCE", None)
+    
 
 
 @torch.no_grad()
@@ -126,7 +121,6 @@ def rollout_temporal_phi_coupled(
     if cfg.kind == "threshold_accum":
         raise NotImplementedError("coupled rollout supports progressive shell kinds only")
 
-    os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "coupled"
     reset_coupled_uv_cache()
     reset_temporal_kinematics_cache()
     _init_coupled_uv_from_frozen_kine(data, device)

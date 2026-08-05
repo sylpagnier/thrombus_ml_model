@@ -31,11 +31,27 @@ from src.utils.rheology import multiplicative_clot_mu_eff_nd, phi_clot_from_mat_
 
 
 def continuous_physics_readout() -> bool:
+    try:
+        from src.architecture.pushforward_config import get_active_config
+
+        cfg = get_active_config()
+        if cfg is not None:
+            return bool(cfg.physics_readout)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_PHYSICS_READOUT") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def continuous_phi_loss_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.gelation.phi_loss_weight), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_PHI_LOSS_WEIGHT") or "1.0").strip()
     try:
         return max(float(raw), 0.0)
@@ -44,6 +60,14 @@ def continuous_phi_loss_weight() -> float:
 
 
 def continuous_mu_loss_weight() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.gelation.mu_loss_weight), 0.0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_CONTINUOUS_MU_LOSS_WEIGHT") or "0.25").strip()
     try:
         return max(float(raw), 0.0)
@@ -53,6 +77,14 @@ def continuous_mu_loss_weight() -> float:
 
 def gelation_temperature_scale() -> float:
     """Override sigmoid sharpness (1.0 = use biochem gnode temps)."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.gelation.gelation_temp_scale), 0.1)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_GELATION_TEMP_SCALE") or "1.0").strip()
     try:
         return max(float(raw), 0.1)
@@ -100,14 +132,32 @@ def differentiable_mu_eff_from_species12(
     mu_carreau_si: torch.Tensor,
     phi_clot: torch.Tensor,
     bio_cfg: BiochemConfig,
+    *,
+    gelation_beta: float | None = None,
 ) -> torch.Tensor:
-    """mu_eff = mu_carreau * (1 + (ratio_max - 1) * phi_clot)."""
+    """mu_eff = mu_carreau * (1 + beta * (ratio_max - 1) * phi_clot).
+
+    ``gelation_beta=None`` means beta 1, i.e. the historical readout. Passing beta here
+    (not only at the graded readout) is what puts the gain *inside* the closed loop:
+    viscosity -> occlusion -> stagnation -> more clot.
+    """
     ratio = max(float(clot_phi_physics_mu_ratio_max(bio_cfg)), 1.0)
+    if gelation_beta is not None:
+        # Fold beta into the excess-over-baseline so beta=1 is exactly a no-op.
+        ratio = 1.0 + max(float(gelation_beta), 0.0) * (ratio - 1.0)
     mu_c = mu_carreau_si.reshape(-1).to(device=species_log12.device, dtype=species_log12.dtype)
     return multiplicative_clot_mu_eff_nd(mu_c, phi_clot, ratio).reshape(-1).clamp(min=1e-8)
 
 
 def gelation_frontier_boost() -> float:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(float(rt.gelation.frontier_boost), 1.0)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_GELATION_FRONTIER_BOOST") or "2.0").strip()
     try:
         return max(float(raw), 1.0)
@@ -125,11 +175,34 @@ def _env_f(name: str, default: float, lo: float = 0.0) -> float:
 
 def footprint_tversky_enabled() -> bool:
     """Moves 2+3: shape the clot footprint with a precision/recall-weighted Tversky loss."""
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.gelation.footprint_tversky)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_FOOTPRINT_TVERSKY") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def footprint_tversky_params() -> dict[str, float]:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            g = rt.gelation
+            return {
+                "alpha": max(float(g.footprint_tversky_alpha), 0.0),
+                "beta": max(float(g.footprint_tversky_beta), 0.0),
+                "wall_fp_w": max(float(g.footprint_wall_fp_w), 1.0),
+                "lumen_fn_w": max(float(g.footprint_lumen_fn_w), 1.0),
+                "bce_blend": max(float(g.footprint_bce_blend), 0.0),
+            }
+    except Exception:
+        pass
     return {
         "alpha": _env_f("SPECIES_FOOTPRINT_TVERSKY_ALPHA", 0.7),   # FP weight (precision, move 2)
         "beta": _env_f("SPECIES_FOOTPRINT_TVERSKY_BETA", 0.3),     # FN weight (recall, move 3)

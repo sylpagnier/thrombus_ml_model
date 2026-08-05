@@ -44,6 +44,11 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     rollout_species_gnn_phi_trajectory,
     species_gnn_static_from_band_dict,
 )
+from src.evaluation.canonical_clot_eval import canonical_deploy_clot_metrics  # noqa: E402
+from src.evaluation.seed_growth_diagnostics import (  # noqa: E402
+    format_seed_growth_panel,
+    seed_growth_diagnostic_panel,
+)
 from src.evaluation.clot_timeline_metrics import eval_clot_timeline_on_grid  # noqa: E402
 from src.core_physics.species_pushforward_gnn import build_band_base_features  # noqa: E402
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
@@ -86,10 +91,22 @@ def _resolve_baseline_ckpt(explicit: str) -> Path:
     return global_ckpt_path()
 
 
-def _load_static(data, device, kine_model, wall_hops: int) -> dict:
+def _load_static(data, device, kine_model, wall_hops: int, anchor: str) -> dict:
     """One joint GINO-DEQ solve per vessel; bake u0_pred + z_kin into pack features."""
+    from src.utils.kinematics_inference import predict_kinematics_and_latent
+    from src.utils.paths import get_project_root
+    from pathlib import Path
+    
+    kine_stem = Path(kine_model.config.ckpt_path).stem if getattr(kine_model, "config", None) and hasattr(kine_model.config, "ckpt_path") else "deploy"
+    cache_dir = get_project_root() / ".cache" / "kinematics_t0" / kine_stem
+
     with torch.no_grad():
-        pred_uv, z_kin = predict_kinematics_and_latent(kine_model, data)
+        pred_uv, z_kin = predict_kinematics_and_latent(
+            kine_model, 
+            data,
+            disk_cache_dir=cache_dir,
+            disk_cache_key=anchor.strip()
+        )
     data.u0_pred = pred_uv[:, 0].detach().to(device="cpu").clone()
     data.v0_pred = pred_uv[:, 1].detach().to(device="cpu").clone()
     return build_band_base_features(
@@ -97,28 +114,75 @@ def _load_static(data, device, kine_model, wall_hops: int) -> dict:
     )
 
 
-def _apply_ckpt_recipe(meta: dict, *, label: str, ckpt_path: Path | str | None = None) -> None:
-    """Match eval env to how the checkpoint was trained (do not force mat on fi_mat ckpts)."""
+# Script-lifetime typed config contexts (entered by _apply_ckpt_recipe / two-model bind).
+_EVAL_PF_CM = None
+_EVAL_RT_CM = None
+# Explicit --gelation-beta, re-applied after every recipe rebind (see _apply_ckpt_recipe).
+_EVAL_GELATION_BETA = ""
+
+
+def _bind_eval_typed_configs(pf, rt) -> None:
+    """Keep PushforwardConfig / BiochemRuntimeConfig active for the eval process."""
+    global _EVAL_PF_CM, _EVAL_RT_CM
+    from src.architecture.pushforward_config import use_pushforward_config
+    from src.architecture.runtime_config import use_biochem_runtime
+
+    if _EVAL_PF_CM is not None:
+        try:
+            _EVAL_PF_CM.__exit__(None, None, None)
+        except Exception:
+            pass
+        _EVAL_PF_CM = None
+    if _EVAL_RT_CM is not None:
+        try:
+            _EVAL_RT_CM.__exit__(None, None, None)
+        except Exception:
+            pass
+        _EVAL_RT_CM = None
+    _EVAL_PF_CM = use_pushforward_config(pf)
+    _EVAL_PF_CM.__enter__()
+    _EVAL_RT_CM = use_biochem_runtime(rt)
+    _EVAL_RT_CM.__enter__()
+
+
+def _apply_ckpt_recipe(
+    meta: dict,
+    *,
+    label: str,
+    ckpt_path: Path | str | None = None,
+    pf_overrides: dict[str, object] | None = None,
+) -> None:
+    """Bind typed train/deploy configs from checkpoint meta (architecture + runtime).
+
+    Architecture / rollout policy go through PushforwardConfig and BiochemRuntimeConfig.
+    Only residual unknown / IO env keys are written to os.environ.
+    """
+    from dataclasses import replace
+
+    from src.architecture.pushforward_config import (
+        PushforwardConfig,
+        split_legacy_env_overrides,
+    )
+    from src.architecture.runtime_config import (
+        BiochemRuntimeConfig,
+        split_legacy_runtime_env,
+    )
+    from src.biochem_gnn.config import GLOBAL_TRAIN_RECIPE
+
     scope = meta.get("pushforward_species_scope") or meta.get("species_scope")
-    if scope:
-        os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
-    dual = meta.get("dual_head")
-    if dual is not None:
-        os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1" if bool(dual) else "0"
+    recipe_env: dict[str, str] = dict(GLOBAL_TRAIN_RECIPE)
     if label == "mat_growth_simple" or scope == "mat":
-        from src.biochem_gnn.mat_growth_simple import apply_mat_growth_simple_recipe_env
+        from src.biochem_gnn.mat_growth_simple import MAT_GROWTH_SIMPLE_RECIPE
 
-        apply_mat_growth_simple_recipe_env(force=True)
-    else:
-        from src.biochem_gnn.config import apply_train_recipe_env
+        recipe_env.update({k: str(v) for k, v in MAT_GROWTH_SIMPLE_RECIPE.items()})
+    # Deploy eval must not inherit training GT flow-feat source.
+    recipe_env.pop("SPECIES_FLOW_FEATS_SOURCE", None)
 
-        apply_train_recipe_env(force=True)
-
-    # Restore leg spec env overrides if present in metadata or path
+    residual_env: dict[str, str] = {}
     overrides = meta.get("env_overrides")
-    if overrides:
-        for k, v in overrides.items():
-            os.environ[k] = str(v)
+    if isinstance(overrides, dict) and overrides:
+        recipe_env = {**recipe_env, **{k: str(v) for k, v in overrides.items()}}
+        recipe_env.pop("SPECIES_FLOW_FEATS_SOURCE", None)
     elif ckpt_path is not None:
         path_s = str(ckpt_path).replace("\\", "/")
         if "mat_growth_ladder/" in path_s:
@@ -127,48 +191,73 @@ def _apply_ckpt_recipe(meta: dict, *, label: str, ckpt_path: Path | str | None =
                 leg = parts[1].split("/")[0]
                 if leg:
                     try:
-                        from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env
-                        apply_mat_growth_leg_env(leg, force=True)
+                        from src.biochem_gnn.mat_growth_simple import mat_growth_leg_spec
+
+                        spec = mat_growth_leg_spec(leg)
+                        recipe_env.update({k: str(v) for k, v in spec.env_overrides.items()})
+                        # Typed leg knobs applied via merged meta below.
+                        meta = {
+                            **meta,
+                            "config_kwargs": {
+                                **dict(spec.config_kwargs),
+                                **dict(meta.get("config_kwargs") or {}),
+                            },
+                            "runtime_kwargs": {
+                                **dict(spec.runtime_kwargs),
+                                **dict(meta.get("runtime_kwargs") or {}),
+                            },
+                        }
                     except Exception as e:
-                        print(f"[WARN] Failed to apply leg env for {leg} from path: {e}")
+                        print(f"[WARN] Failed to apply leg typed config for {leg} from path: {e}")
 
+    merged_meta = {**meta, "env_overrides": recipe_env if recipe_env else meta.get("env_overrides")}
+    pf = PushforwardConfig.from_meta(merged_meta)
+    # Deploy-faithful: auto flow-feat source (kine + optional coupling).
+    pf = replace(pf, flow_feats_source="auto")
+    # Deploy-only sparse commitment overrides.
+    if pf_overrides:
+        pf = replace(pf, **pf_overrides)
 
-    # Restore input/architecture-shaping flags LAST (after the recipe env, which would otherwise
-    # clobber them). These change base_feats width (geom) or the spatial-gate input dim (neighbor
-    # gate); a mismatch silently drops the trained heads in the partial loader.
-    if meta.get("geom_feats") is not None:
-        os.environ["SPECIES_GEOM_FEATS"] = "1" if bool(meta.get("geom_feats")) else "0"
-    if meta.get("geom_feats_rich") is not None:
-        os.environ["SPECIES_GEOM_FEATS_RICH"] = "1" if bool(meta.get("geom_feats_rich")) else "0"
-    if meta.get("flow_feats") is not None:
-        os.environ["SPECIES_FLOW_FEATS"] = "1" if bool(meta.get("flow_feats")) else "0"
-    if meta.get("flow_dynamic") is not None:
-        os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] = "1" if bool(meta.get("flow_dynamic")) else "0"
-    channels = meta.get("pushforward_species_channels") or meta.get("species_channels")
-    if channels:
-        if isinstance(channels, (list, tuple)):
-            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(c)) for c in channels)
-        else:
-            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
-    if meta.get("neighbor_commit_gate") is not None:
-        os.environ["SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_GATE"] = (
-            "1" if bool(meta.get("neighbor_commit_gate")) else "0"
+    rt = BiochemRuntimeConfig.from_meta(merged_meta).with_overrides(
+        deploy_faithful=True,
+        rollout_vel_source="kinematics",
+        rollout_pin_other="rest",
+        rollout_ic_source="resting",
+        # Fair cold-deploy A/B: never inherit a train-time GT/coupling-off crutch.
+        corrector_coupling=True,
+        closed_loop_coupling=True,
+        train_deploy_eval_flow="auto",
+    )
+    # Preserve CLI --gelation-beta across recipe rebind (ckpt meta must not override it).
+    if _EVAL_GELATION_BETA:
+        rt = rt.with_overrides(beta_override=_EVAL_GELATION_BETA)
+    # Preserve CLI two-model / off-wall bind across recipe rebind.
+    prev_rt = None
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        prev_rt = get_active_runtime()
+    except Exception:
+        pass
+    if prev_rt is not None and prev_rt.offwall.two_model_mode:
+        rt = rt.with_overrides(
+            two_model_mode=True,
+            offwall_model_ckpt=prev_rt.offwall.offwall_model_ckpt,
+            two_model_route=prev_rt.offwall.two_model_route,
+            two_model_frontier_hops=prev_rt.offwall.two_model_frontier_hops,
+            frontier_hops_map=prev_rt.offwall.frontier_hops_map,
+            frontier_hops_anchor=prev_rt.offwall.frontier_hops_anchor,
         )
-    if meta.get("neighbor_commit_alpha") is not None:
-        os.environ["SPECIES_CONTINUOUS_NEIGHBOR_COMMIT_ALPHA"] = str(meta.get("neighbor_commit_alpha"))
-    if meta.get("gate_temp") is not None:
-        os.environ["SPECIES_CONTINUOUS_GATE_TEMP"] = str(meta.get("gate_temp"))
-    if meta.get("frontier_hops") is not None:
-        os.environ["SPECIES_CONTINUOUS_FRONTIER_HOPS"] = str(meta.get("frontier_hops"))
-    if meta.get("nucleation_topk") is not None:
-        os.environ["SPECIES_CONTINUOUS_NUCLEATION_TOPK"] = str(meta.get("nucleation_topk"))
+    _bind_eval_typed_configs(pf, rt)
 
-    # Deploy-faithful eval: never inherit training-only GT velocity / species pins.
-    os.environ["SPECIES_ROLLOUT_DEPLOY_FAITHFUL"] = "1"
-    os.environ["SPECIES_ROLLOUT_VEL_SOURCE"] = "kinematics"
-    os.environ["SPECIES_ROLLOUT_PIN_OTHER"] = "rest"
-    os.environ["SPECIES_ROLLOUT_IC_SOURCE"] = "resting"
-    os.environ.pop("SPECIES_FLOW_FEATS_SOURCE", None)  # default auto (kine + optional coupling)
+    # Residual unknown env only (not architecture / OffwallConfig / RolloutDeployConfig keys).
+    if recipe_env:
+        _cfg, rem1 = split_legacy_env_overrides(recipe_env)
+        _rt, rem2 = split_legacy_runtime_env(rem1)
+        residual_env.update(rem2)
+    for k, v in residual_env.items():
+        os.environ[k] = str(v)
+    os.environ.pop("SPECIES_FLOW_FEATS_SOURCE", None)
 
 
 def _eval_ckpt(
@@ -177,11 +266,13 @@ def _eval_ckpt(
     device: torch.device,
     *,
     label: str,
+    cheap_val: bool = False,
+    pf_overrides: dict[str, object] | None = None,
 ) -> dict:
     clear_offwall_model_cache()
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     meta = dict(payload.get("meta") or {})
-    _apply_ckpt_recipe(meta, label=label, ckpt_path=ckpt_path)
+    _apply_ckpt_recipe(meta, label=label, ckpt_path=ckpt_path, pf_overrides=pf_overrides)
     bundle = load_continuous_bundle(ckpt_path, device=device, quiet=True)
     if bundle is None:
         raise FileNotFoundError(f"could not load continuous bundle: {ckpt_path}")
@@ -194,23 +285,44 @@ def _eval_ckpt(
     )
     phys = PhysicsConfig(phase="biochem")
     bio = BiochemConfig(phase="biochem")
-    flow_eval = train_deploy_eval_flow_source()
+    flow_eval = "kinematics"
     # Load timeline bundle once per ckpt (not once per vessel).
     gnn_bundle = load_species_gnn_rollout_bundle(ckpt_path, device=device, quiet=True)
     per: dict[str, dict] = {}
+    from src.architecture.pushforward_config import get_active_config
+    from src.architecture.runtime_config import get_active_runtime
+
+    hops_map_raw = ""
+    rt_active = get_active_runtime()
+    if rt_active is not None:
+        hops_map_raw = str(rt_active.offwall.frontier_hops_map or "")
+    if not hops_map_raw:
+        hops_map_raw = os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS_MAP", "")
     for anc in anchors:
         print(f"    - {anc}...", flush=True)
+        if hops_map_raw:
+            rt0 = get_active_runtime()
+            pf0 = get_active_config()
+            if rt0 is not None and pf0 is not None:
+                _bind_eval_typed_configs(
+                    pf0,
+                    rt0.with_overrides(
+                        frontier_hops_anchor=anc,
+                        frontier_hops_map=hops_map_raw,
+                    ),
+                )
+            else:
+                os.environ["SPECIES_TWO_MODEL_FRONTIER_HOPS_ANCHOR"] = anc
         reset_species_rollout_flow_cache()
         data = torch.load(ANCHOR_DIR / f"{anc}.pt", map_location=device, weights_only=False)
-        static = _load_static(data, device, kine, wall_hops)
+        static = _load_static(data, device, kine, wall_hops, anc)
         static["n_times"] = int(data.y.shape[0])
         t_eval = deploy_eval_time_index(int(data.y.shape[0]))
         mat_m = eval_full_rollout_fimat_f1(
             model, data, static, device, time_index=t_eval
         )
-        env_snap = {k: os.environ.get(k) for k in ("T0_R4_FLOW_SOURCE", "SPECIES_ROLLOUT_VEL_SOURCE")}
-        apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": flow_eval})
-        clot_m = eval_deploy_clot_f1(
+        # Shared protocol with training (see src/evaluation/canonical_clot_eval.py).
+        clot_m = canonical_deploy_clot_metrics(
             model,
             data,
             static,
@@ -220,32 +332,28 @@ def _eval_ckpt(
             time_index=t_eval,
             flow_source=flow_eval,
         )
-        for k, v in env_snap.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
         timeline_summary: dict[str, float] = {}
-        try:
-            if gnn_bundle is not None:
-                # Reuse the same band static / u0_pred (no second DEQ + ckpt reload).
-                gnn_static = species_gnn_static_from_band_dict(
-                    static, data, device=device, wall_hops=wall_hops
-                )
-                phi_traj = rollout_species_gnn_phi_trajectory(
-                    data,
-                    gnn_bundle,
-                    gnn_static,
-                    phys_cfg=phys,
-                    bio_cfg=bio,
-                    device=device,
-                    flow_source=flow_eval,
-                )
-                tl = eval_clot_timeline_on_grid(phi_traj, data, phys, device, max_frames=10)
-                timeline_summary = dict(tl.get("summary") or {})
-        except Exception as exc:
-            print(f"[WARN] clot timeline metrics skipped for {anc}: {exc}", flush=True)
+        if not cheap_val:
+            try:
+                if gnn_bundle is not None:
+                    # Reuse the same band static / u0_pred (no second DEQ + ckpt reload).
+                    gnn_static = species_gnn_static_from_band_dict(
+                        static, data, device=device, wall_hops=wall_hops
+                    )
+                    phi_traj = rollout_species_gnn_phi_trajectory(
+                        data,
+                        gnn_bundle,
+                        gnn_static,
+                        phys_cfg=phys,
+                        bio_cfg=bio,
+                        device=device,
+                        flow_source=flow_eval,
+                    )
+                    tl = eval_clot_timeline_on_grid(phi_traj, data, phys, device, max_frames=10)
+                    timeline_summary = dict(tl.get("summary") or {})
+            except Exception as exc:
+                print(f"[WARN] clot timeline metrics skipped for {anc}: {exc}", flush=True)
 
         per[anc] = {
             "t_eval": int(t_eval),
@@ -271,8 +379,23 @@ def _eval_ckpt(
             "deploy_clot_offwall_n_gt_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0)),
             "deploy_clot_offwall_strict_f1_hop2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop2", 0.0)),
             "deploy_clot_offwall_strict_f1_hop_ge2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0)),
+            "deploy_wall_score": float(clot_m.get("deploy_wall_score", 0.0)),
+            "deploy_wall_strict_f1": float(clot_m.get("deploy_wall_strict_f1", 0.0)),
+            "deploy_clot_mass_ratio": float(clot_m.get("deploy_clot_mass_ratio", 0.0)),
+            "deploy_clot_empty_gt_score": float(clot_m.get("deploy_clot_empty_gt_score", 0.0)),
+            "deploy_clot_fp": float(clot_m.get("deploy_clot_fp", 0.0)),
+            "deploy_clot_fn": float(clot_m.get("deploy_clot_fn", 0.0)),
+            "deploy_gelation_beta": float(clot_m.get("deploy_gelation_beta", 1.0)),
+            "deploy_pocket_gate_pct": float(clot_m.get("deploy_pocket_gate_pct", 0.0)),
+            "deploy_pocket_gate_thresh": float(clot_m.get("deploy_pocket_gate_thresh", 0.0)),
+            "deploy_pocket_gate_ncomp_total": float(clot_m.get("deploy_pocket_gate_ncomp_total", 0.0)),
+            "deploy_pocket_gate_ncomp_kept": float(clot_m.get("deploy_pocket_gate_ncomp_kept", 0.0)),
+            "deploy_pocket_gate_dropped_nodes": float(clot_m.get("deploy_pocket_gate_dropped_nodes", 0.0)),
             **{k: float(v) for k, v in timeline_summary.items()},
         }
+        panel = seed_growth_diagnostic_panel(per[anc])
+        per[anc]["diagnostic"] = panel
+        print(format_seed_growth_panel(panel, label=anc), flush=True)
     keys = (
         "deploy_mat_f1",
         "deploy_clot_f1",
@@ -287,6 +410,18 @@ def _eval_ckpt(
         "deploy_clot_offwall_n_gt_hop_ge2",
         "deploy_clot_offwall_strict_f1_hop2",
         "deploy_clot_offwall_strict_f1_hop_ge2",
+        "deploy_wall_score",
+        "deploy_wall_strict_f1",
+        "deploy_clot_mass_ratio",
+        "deploy_clot_empty_gt_score",
+        "deploy_clot_fp",
+        "deploy_clot_fn",
+        "deploy_gelation_beta",
+        "deploy_pocket_gate_pct",
+        "deploy_pocket_gate_thresh",
+        "deploy_pocket_gate_ncomp_total",
+        "deploy_pocket_gate_ncomp_kept",
+        "deploy_pocket_gate_dropped_nodes",
         "mat_seed_prec",
         "mat_seed_count",
         "mat_front_prec",
@@ -302,7 +437,16 @@ def _eval_ckpt(
         "clot_fp_early_mean",
     )
     mean = {k: sum(per[a].get(k, 0.0) for a in anchors) / max(len(anchors), 1) for k in keys}
-    return {"label": label, "ckpt": str(ckpt_path), "per_anchor": per, "mean": mean, "meta": meta}
+    mean_panel = seed_growth_diagnostic_panel(mean)
+    print(format_seed_growth_panel(mean_panel, label="mean"), flush=True)
+    return {
+        "label": label,
+        "ckpt": str(ckpt_path),
+        "per_anchor": per,
+        "mean": mean,
+        "diagnostic": mean_panel,
+        "meta": meta,
+    }
 
 
 def main() -> int:
@@ -322,14 +466,66 @@ def main() -> int:
     ap.add_argument(
         "--two-model-route",
         default="",
-        choices=("", "wall", "frontier"),
+        choices=("", "wall", "frontier", "frontier_offwall", "frontier_lumen_only"),
         help="Routing for two-model blend (default: frontier when --offwall-ckpt is set)",
     )
     ap.add_argument(
         "--two-model-frontier-hops",
+        type=float,
+        default=2.0,
+        help="Hops around committed Mat for frontier routing (0.5=tight off-wall shell)",
+    )
+    ap.add_argument(
+        "--two-model-frontier-hops-map",
+        default="",
+        help="Per-anchor hops map, e.g. patient010:0.5,patient007:1,default:1",
+    )
+    ap.add_argument(
+        "--deploy-frontier-hops",
         type=int,
-        default=2,
-        help="Hops around committed Mat for frontier routing",
+        default=None,
+        help="Deploy-time sparse commitment: restrict growth to k-hop predicted frontier (PushforwardConfig.frontier_hops).",
+    )
+    ap.add_argument(
+        "--deploy-nucleation-topk",
+        type=float,
+        default=None,
+        help="Deploy-time sparse commitment: top-k gate-logit fraction allowed to nucleate at t0 (PushforwardConfig.nucleation_topk).",
+    )
+    ap.add_argument(
+        "--deploy-gate-temp",
+        type=float,
+        default=None,
+        help="Deploy-time sparse commitment: sigmoid temperature for spatial gate sharpness (PushforwardConfig.gate_temp).",
+    )
+    ap.add_argument(
+        "--deploy-mat-commit-thresh",
+        type=float,
+        default=None,
+        help="Deploy-time sparse commitment: accumulated log-Mat threshold for committed support (PushforwardConfig.mat_commit_thresh).",
+    )
+    ap.add_argument(
+        "--deploy-clot-trigger-commit-thresh",
+        type=float,
+        default=None,
+        help="Deploy-time clot-trigger projection threshold (CLOT_TRIGGER_COMMIT_THRESH).",
+    )
+    ap.add_argument(
+        "--pocket-gate-pct",
+        type=float,
+        default=None,
+        help="Deploy post-process (docs/WALL_MODEL_PLAN.md s4 Step 1): drop predicted clot "
+             "components whose min hop-2 speed is at/above this percentile of the vessel's "
+             "own wall-node hop-2 speed distribution. Unset = gate off (unchanged behaviour). "
+             "No retraining -- re-grades the same rollout (CLOT_POCKET_GATE_PCT).",
+    )
+    ap.add_argument(
+        "--gelation-beta",
+        type=float,
+        default=None,
+        help="Gelation readout gain applied to the graded clot label (valid [0.1, 2.0]). "
+             "Unset = 1.0 = historical grading. Drives both the closed-loop mu_eff and the "
+             "final readout, so each value needs its own rollout.",
     )
     ap.add_argument(
         "--no-baseline",
@@ -341,7 +537,45 @@ def main() -> int:
         default="",
         help="Force mat-growth leg env before eval (e.g. WC_v7_clot_phi_mse)",
     )
+    ap.add_argument(
+        "--wall-floor-json",
+        default="",
+        help="Wall-alone eval JSON for compound gate guardrail (mean deploy_clot_f1)",
+    )
+    ap.add_argument(
+        "--cheap-val",
+        action="store_true",
+        help="Skip heavy timeline grid interpolation (fast evaluation)",
+    )
+    ap.add_argument(
+        "--list-legs",
+        default="",
+        help="Print matching ladder leg codes and exit",
+    )
     args = ap.parse_args()
+
+    if args.list_legs.strip():
+        try:
+            from src.biochem_gnn.mat_growth_simple import LADDER_LEG_ORDER
+            filter_str = args.list_legs.strip().lower()
+            for leg in LADDER_LEG_ORDER:
+                if filter_str in leg.lower():
+                    print(leg)
+            return 0
+        except Exception as e:
+            print(f"[ERROR] Failed to list legs: {e}")
+            return 1
+
+    global _EVAL_GELATION_BETA
+    if args.gelation_beta is not None:
+        beta = float(args.gelation_beta)
+        if not (0.1 <= beta <= 2.0):
+            print(f"[ERROR] --gelation-beta {beta} outside valid range [0.1, 2.0]")
+            return 1
+        _EVAL_GELATION_BETA = f"{beta:.6g}"
+        # Env is the fallback path for any rebind that drops the typed field.
+        os.environ["SPECIES_GELATION_BETA_OVERRIDE"] = _EVAL_GELATION_BETA
+        print(f"[i] gelation readout beta = {_EVAL_GELATION_BETA} (default grading is 1.0)", flush=True)
 
     root = get_project_root()
     device = require_cuda_device()
@@ -373,6 +607,39 @@ def main() -> int:
         apply_mat_growth_leg_env(args.mat_leg.strip(), force=True)
         print(f"[i] Forced mat-leg env: {args.mat_leg.strip()}", flush=True)
 
+    pf_overrides: dict[str, object] = {}
+    if args.deploy_frontier_hops is not None:
+        pf_overrides["frontier_hops"] = int(args.deploy_frontier_hops)
+    if args.deploy_nucleation_topk is not None:
+        pf_overrides["nucleation_topk"] = float(args.deploy_nucleation_topk)
+    if args.deploy_gate_temp is not None:
+        pf_overrides["gate_temp"] = float(args.deploy_gate_temp)
+    if args.deploy_mat_commit_thresh is not None:
+        pf_overrides["mat_commit_thresh"] = float(args.deploy_mat_commit_thresh)
+    if args.deploy_clot_trigger_commit_thresh is not None:
+        os.environ["CLOT_TRIGGER_COMMIT_THRESH"] = str(float(args.deploy_clot_trigger_commit_thresh))
+    if args.pocket_gate_pct is not None:
+        pct = float(args.pocket_gate_pct)
+        if not (0.0 <= pct <= 100.0):
+            print(f"[ERROR] --pocket-gate-pct {pct} outside [0, 100]")
+            return 1
+        os.environ["CLOT_POCKET_GATE_PCT"] = str(pct)
+        print(f"[i] pocket gate percentile = {pct} (unset = gate off)", flush=True)
+
+    report["deploy_overrides"] = {
+        "frontier_hops": pf_overrides.get("frontier_hops"),
+        "nucleation_topk": pf_overrides.get("nucleation_topk"),
+        "gate_temp": pf_overrides.get("gate_temp"),
+        "mat_commit_thresh": pf_overrides.get("mat_commit_thresh"),
+        "clot_trigger_commit_thresh": (
+            float(args.deploy_clot_trigger_commit_thresh)
+            if args.deploy_clot_trigger_commit_thresh is not None
+            else None
+        ),
+        "gelation_beta": float(args.gelation_beta) if args.gelation_beta is not None else None,
+        "pocket_gate_pct": float(args.pocket_gate_pct) if args.pocket_gate_pct is not None else None,
+    }
+
     offwall_raw = args.offwall_ckpt.strip()
     if offwall_raw:
         offwall_path = Path(offwall_raw)
@@ -381,15 +648,28 @@ def main() -> int:
         if not offwall_path.is_file():
             raise FileNotFoundError(f"--offwall-ckpt not found: {offwall_path}")
         route = args.two_model_route.strip() or "frontier"
-        os.environ["SPECIES_TWO_MODEL_MODE"] = "1"
-        os.environ["SPECIES_OFFWALL_MODEL_CKPT"] = str(offwall_path).replace("\\", "/")
-        os.environ["SPECIES_TWO_MODEL_ROUTE"] = route
-        os.environ["SPECIES_TWO_MODEL_FRONTIER_HOPS"] = str(int(args.two_model_frontier_hops))
+        hops_map = args.two_model_frontier_hops_map.strip()
+        from src.architecture.pushforward_config import PushforwardConfig, get_active_config
+        from src.architecture.runtime_config import BiochemRuntimeConfig, get_active_runtime
+
+        pf0 = get_active_config() or PushforwardConfig()
+        rt0 = get_active_runtime() or BiochemRuntimeConfig()
+        _bind_eval_typed_configs(
+            pf0,
+            rt0.with_overrides(
+                two_model_mode=True,
+                offwall_model_ckpt=str(offwall_path).replace("\\", "/"),
+                two_model_route=route,
+                two_model_frontier_hops=float(args.two_model_frontier_hops),
+                frontier_hops_map=hops_map,
+            ),
+        )
         report["two_model"] = {
             "enabled": True,
             "offwall_ckpt": str(offwall_path),
             "route": route,
-            "frontier_hops": int(args.two_model_frontier_hops),
+            "frontier_hops": float(args.two_model_frontier_hops),
+            "frontier_hops_map": hops_map or None,
         }
         print(
             f"[i] two-model ON route={route} frontier_hops={args.two_model_frontier_hops} "
@@ -397,16 +677,22 @@ def main() -> int:
             flush=True,
         )
     else:
-        os.environ["SPECIES_TWO_MODEL_MODE"] = "0"
-        os.environ.pop("SPECIES_OFFWALL_MODEL_CKPT", None)
+        from src.architecture.pushforward_config import PushforwardConfig, get_active_config
+        from src.architecture.runtime_config import BiochemRuntimeConfig, get_active_runtime
+
+        pf0 = get_active_config() or PushforwardConfig()
+        rt0 = get_active_runtime() or BiochemRuntimeConfig()
+        _bind_eval_typed_configs(pf0, rt0.with_overrides(two_model_mode=False, offwall_model_ckpt=""))
         report["two_model"] = {"enabled": False}
 
     print(f"[i] eval leg: {simple_ckpt}", flush=True)
     report["simple"] = _eval_ckpt(
         simple_ckpt,
-        anchors,
+        [anc.strip() for anc in args.anchors.split(",") if anc.strip()],
         device,
         label="mat_growth_simple",
+        cheap_val=getattr(args, "cheap_val", False),
+        pf_overrides=pf_overrides or None,
     )
 
     # Clean up environment overrides and empty CUDA cache to prevent memory accumulation and paging hangs
@@ -432,6 +718,12 @@ def main() -> int:
             "deploy_mat_f1",
             "deploy_clot_f1",
             "deploy_clot_score",
+            "deploy_wall_score",
+            "deploy_wall_strict_f1",
+            "deploy_clot_mass_ratio",
+            "deploy_clot_empty_gt_score",
+            "deploy_clot_fp",
+            "deploy_clot_fn",
             "deploy_clot_offwall_relaxed_f1",
             "deploy_clot_offwall_strict_f1",
             "deploy_clot_offwall_n_pred",
@@ -439,8 +731,33 @@ def main() -> int:
             "deploy_clot_offwall_n_pred_hop_ge2",
             "deploy_clot_offwall_n_gt_hop_ge2",
             "deploy_clot_offwall_strict_f1_hop_ge2",
+            "mat_seed_prec",
+            "mat_seed_count",
+            "mat_front_speed_ratio",
+            "mat_overpaint_frac",
         ):
             print(f"  {k}: {mean.get(k, 0.0):.4f}", flush=True)
+        diag = report["simple"].get("diagnostic") or seed_growth_diagnostic_panel(mean)
+        print(format_seed_growth_panel(diag, label="summary"), flush=True)
+        if report.get("two_model", {}).get("enabled"):
+            from src.evaluation.compound_deploy_gates import (  # noqa: E402
+                format_gate_summary,
+                gate_compound_eval_report,
+            )
+
+            wall_floor_f1 = None
+            if args.wall_floor_json.strip():
+                wf = Path(args.wall_floor_json)
+                if not wf.is_absolute():
+                    wf = root / wf
+                if wf.is_file():
+                    wrep = json.loads(wf.read_text(encoding="utf-8"))
+                    ws = wrep.get("simple") or wrep
+                    wall_floor_f1 = float((ws.get("mean") or {}).get("deploy_clot_f1", 0) or 0)
+            gates = gate_compound_eval_report(report, wall_floor_f1=wall_floor_f1)
+            report["compound_gates"] = gates
+            out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            print(f"[i] compound gates: {format_gate_summary(gates)}", flush=True)
         return 0
 
     print(f"[i] eval canonical baseline: {baseline_ckpt}", flush=True)
@@ -472,6 +789,10 @@ def main() -> int:
         "deploy_mat_f1",
         "deploy_clot_f1",
         "deploy_clot_score",
+        "deploy_wall_score",
+        "deploy_wall_strict_f1",
+        "deploy_clot_mass_ratio",
+        "deploy_clot_empty_gt_score",
         "deploy_clot_offwall_relaxed_f1",
         "deploy_clot_offwall_strict_f1",
         "deploy_clot_offwall_n_pred",

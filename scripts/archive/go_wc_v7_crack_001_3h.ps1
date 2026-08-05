@@ -1,8 +1,10 @@
 # ~3h hypothesis ladder: crack patient001 lumen lock (hop_ge2 stays 0).
 #
 # Evidence so far:
-#   Open001 (001+007+010, freeze, cheap-val) raised 007 volume + spray but 001 stayed 0.
-#   Train never saw real hop_ge2 metrics (cheap-val zeros them; ckpt = -loss).
+#   Layer-1: compound-val full-graph static -> A_floor=0 (fixed: band_static val).
+#   Layer-2: A_floor healthy but 001 still 0; solo-001 sprays 007/004/008.
+#   Root: train tiles used global feats vs deploy wall-band (kin cos~0.16 on 001).
+#   Fix: --train-feat-source band (default) matches eval features.
 #
 # Ladder (each arm trains ONLY patient001; stop early if 001 opens unless -FullLadder):
 #   H1 Solo001_Freeze   - eliminate 007 gradient competition; freeze heads-only
@@ -139,6 +141,18 @@ function Invoke-CompoundProbe {
     $null = Invoke-PythonRcCheck -Label "probe $ArmId" -PyArgs $evalArgs
 }
 
+function Test-GrowthCkptUsesBandFeats {
+    param([string] $GrowthDir)
+    $meta = Join-Path $GrowthDir "best.json"
+    if (-not (Test-Path $meta)) { return $false }
+    try {
+        $j = Get-Content -Raw -Path $meta | ConvertFrom-Json
+        return ([string]$j.train_feat_source).Trim().ToLower() -eq "band"
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-CrackTrain {
     param(
         [string] $ArmId,
@@ -148,16 +162,21 @@ function Invoke-CrackTrain {
     if (-not (Test-BudgetOk)) { return $false }
     $growthDir = Join-Path $OutDir "growth_$ArmId"
     $growthCkpt = Join-Path $growthDir "best.pth"
+    $probeOut = Join-Path $OutDir "probe_$ArmId.json"
     New-Item -ItemType Directory -Force -Path $growthDir | Out-Null
     if ($Fresh) {
-        Remove-Item -Force $growthCkpt, (Join-Path $growthDir "train_log.jsonl"), (Join-Path $growthDir "best.json") -ErrorAction SilentlyContinue
+        Remove-Item -Force $growthCkpt, (Join-Path $growthDir "train_log.jsonl"), (Join-Path $growthDir "best.json"), $probeOut -ErrorAction SilentlyContinue
     }
     if ($EvalOnly) {
         return (Test-Path $growthCkpt)
     }
     if ($Resume -and (Test-Path $growthCkpt)) {
-        Write-Host "[skip] train $ArmId; ckpt exists -> $growthCkpt" -ForegroundColor DarkGray
-        return $true
+        if (Test-GrowthCkptUsesBandFeats -GrowthDir $growthDir) {
+            Write-Host "[skip] train $ArmId; band-feat ckpt exists -> $growthCkpt" -ForegroundColor DarkGray
+            return $true
+        }
+        Write-Host "[i] stale ckpt $ArmId missing train_feat_source=band; retraining" -ForegroundColor Yellow
+        Remove-Item -Force $growthCkpt, (Join-Path $growthDir "train_log.jsonl"), (Join-Path $growthDir "best.json"), $probeOut -ErrorAction SilentlyContinue
     }
 
     # Extreme FN tilt: force lumen positives; FP light so 001 can light before spray worry.
@@ -180,6 +199,7 @@ function Invoke-CrackTrain {
         "--loss-mode", "loss_lumen_shape",
         "--lumen-shape-weight", "$LumenShapeWeight",
         "--ckpt-metric", "hop_ge2_recall",
+        "--train-feat-source", "band",
         "--mat-leg", "WC_v7_clot_phi_mse",
         "--init", $WallCkpt,
         "--out", $growthCkpt

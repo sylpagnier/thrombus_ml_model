@@ -13,13 +13,23 @@ Training entry points (authoritative)
 Code Priorities
 - Preserve mesh-agnostic behavior: never assume fixed node counts, edge counts, or regular grids.
 - Keep boundaries clear: shared physics lives in `core_physics`; RGP-DEQ in `architecture`; graphs/meshes/datagen in `data_gen`; deploy stack in `biochem_gnn`.
-- Prefer small, local changes over broad refactors unless explicitly requested.
+- Prefer concise diffs that fix the class of problem: robust typed / system-wide wiring over brittle temporary patches; avoid unrelated mega-refactors.
 - Keep variable names physically meaningful (`u`, `v`, `p`, `phi`, `mu`, `gamma_dot`) and avoid cryptic abbreviations.
+- Prefer robust typed configs (`PushforwardConfig`, `BiochemRuntimeConfig`) and system-wide wiring over temporary `os.environ` toggles or one-off string dicts. New features/sweeps must add typed fields, not env keys.
+- See `.cursor/rules/robust-system-wide-changes.mdc` (always apply).
+
+Configuration Architecture Guardrail
+- Never mutate `os.environ` to alter architectures, features, sweeps, coupling, rollout, or scoring.
+- Architecture: `PushforwardConfig` / `MatGrowthLegSpec.config_kwargs`.
+- Runtime/deploy: `BiochemRuntimeConfig` / `MatGrowthLegSpec.runtime_kwargs`.
+- Use `dataclasses.replace` / `with_overrides` + `use_pushforward_config` / `use_biochem_runtime`.
+- `env_overrides` is deprecated residual only; process/IO (paths, tqdm, CUDA) may remain CLI/env.
 
 Physics and Modeling Guardrails
 - Carreau-Yasuda rheology and Navier-Stokes consistency are central; avoid edits that weaken these constraints without justification.
 - For DEQ-related changes, preserve solver stability and convergence behavior.
 - Prefer geometry occlusion + optional `local_kinematic_corrector` over viscosity injection into frozen RGP-DEQ.
+- **Generalization eval (mandatory):** cold deploy only — RGP-DEQ once at t=0, then local tiling/corrector for flow updates; never GT velocity. Wall-gen / phase1 / flow-source holdout gate = clot-rich **`patient020` only** (see `AGENTS.md`).
 
 Data and File Hygiene
 - Ignore and avoid editing cache/derived files (`__pycache__`, `.pytest_cache`, `.pyc`, generated plots/logs/checkpoints under `outputs/`).

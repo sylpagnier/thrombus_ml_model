@@ -82,6 +82,9 @@ def _rollout_phi(
     flow: str,
     label: str,
 ):
+    # Bind this ckpt's typed recipe before pack/features (geom/flux change in_dim).
+    payload = torch.load(wall_ckpt, map_location="cpu", weights_only=False)
+    _apply_ckpt_recipe(dict(payload.get("meta") or {}), label="mat_growth_compare", ckpt_path=wall_ckpt)
     note = _configure_two_model(offwall=offwall, route=route, frontier_hops=frontier_hops)
     print(f"[i] rollout {label} ({note})...", flush=True)
     t0 = time.perf_counter()

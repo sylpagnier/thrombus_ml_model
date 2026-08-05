@@ -388,16 +388,12 @@ def recompute_sdf_euclidean(pos: torch.Tensor, new_wall_mask: torch.Tensor) -> t
         if orig_mask_wall is not None:
             data.mask_wall = orig_mask_wall.clone()
 
-        prev_vel = os.environ.get("CLOT_TEMPORAL_VEL_SOURCE")
-        os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "coupled"
         reset_coupled_uv_cache()
 
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
 
-        os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "kinematics"
-        u0, v0 = _resolve_uv_for_temporal_risk(data, 0, self.device)
+        u0, v0 = _resolve_uv_for_temporal_risk(data, 0, self.device, vel_source="kinematics")
         set_coupled_uv_cache(data, u0, v0)
-        os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = "coupled"
 
         species_out = alloc_species_y_series(data, self.device)
         log_state = deploy_fimat_log_init(data, self.device, stat.node_idx)
@@ -448,7 +444,18 @@ def recompute_sdf_euclidean(pos: torch.Tensor, new_wall_mask: torch.Tensor) -> t
                     mu_by_t[t] = step.mu_pred_si
 
                     clotted = (phi.reshape(-1) >= 0.5)
-                    if os.environ.get("SPECIES_DYNAMIC_OCCLUSION") == "1":
+                    dyn_occ = False
+                    try:
+                        from src.architecture.runtime_config import get_active_runtime
+
+                        rt = get_active_runtime()
+                        if rt is not None:
+                            dyn_occ = bool(rt.rollout.dynamic_occlusion)
+                        else:
+                            dyn_occ = os.environ.get("SPECIES_DYNAMIC_OCCLUSION") == "1"
+                    except Exception:
+                        dyn_occ = os.environ.get("SPECIES_DYNAMIC_OCCLUSION") == "1"
+                    if dyn_occ:
                         # 2. Append clotted nodes to wall mask
                         if hasattr(data, "mask_wall") and data.mask_wall is not None:
                             data.mask_wall = data.mask_wall.bool() | clotted
@@ -505,18 +512,21 @@ def recompute_sdf_euclidean(pos: torch.Tensor, new_wall_mask: torch.Tensor) -> t
                         if vel_alphas is not None
                         else None
                     )
+                    wall_m = (
+                        data.mask_wall[stat.node_idx]
+                        if hasattr(data, "mask_wall") and data.mask_wall is not None
+                        else None
+                    )
                     log_state = pushforward_log_state_step(
                         log_state,
                         pred_delta,
                         straight_through=False,
                         wall_speed=spd,
                         vel_decay_alphas=vel_alphas,
+                        wall_mask=wall_m,
                     )
         finally:
-            if prev_vel is None:
-                os.environ.pop("CLOT_TEMPORAL_VEL_SOURCE", None)
-            else:
-                os.environ["CLOT_TEMPORAL_VEL_SOURCE"] = prev_vel
+            pass
             reset_coupled_uv_cache()
 
         if gel_beta is not None:

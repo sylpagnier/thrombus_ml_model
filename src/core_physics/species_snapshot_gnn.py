@@ -35,6 +35,8 @@ from src.utils.paths import get_project_root
 
 DEFAULT_SNAPSHOT_CKPT = "outputs/biochem/species_snapshot_s1/best.pth"
 DEFAULT_SPECIES_GNN_VIZ_DIR = "outputs/biochem/viz/species_gnn"
+# Sentinel so set_band_geometry can omit mesh priors without wiping a prior bind.
+_MESH_UNSET = object()
 
 
 def species_gnn_viz_dir() -> Path:
@@ -59,6 +61,14 @@ def snapshot_ckpt_path() -> Path:
 
 
 def snapshot_wall_hops() -> int:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return max(int(rt.rollout.wall_hops), 0)
+    except Exception:
+        pass
     return max(int(float(os.environ.get("SPECIES_SNAPSHOT_WALL_HOPS", "3") or "3")), 0)
 
 
@@ -240,6 +250,14 @@ def fi_mat_active_labels(
 
 
 def kin_per_vessel_norm_enabled() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.kin_per_vessel_norm)
+    except Exception:
+        pass
     raw = (os.environ.get("SPECIES_KIN_PER_VESSEL_NORM") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -391,26 +409,53 @@ def compute_frontier_fluxes(
 
 
 class SpeciesSnapshotGNN(nn.Module):
-    """3-layer GraphSAGE + skip readout (``z_kin`` + SDF -> FI/Mat). Not a generic GNN/GNO."""
+    """3-layer GraphSAGE/GAT/physics-GAT + skip readout (``z_kin`` + SDF -> FI/Mat)."""
 
-    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = 2):
+    def __init__(self, in_dim: int, *, hidden: int | None = None, out_dim: int = 2, arch: str = "sage"):
         super().__init__()
         h = snapshot_hidden_dim() if hidden is None else max(int(hidden), 16)
         self.in_dim = int(in_dim)
         self.hidden = h
         self.out_dim = int(out_dim)
-        self.conv1 = SAGEConv(self.in_dim, h)
-        self.conv2 = SAGEConv(h, h)
-        self.conv3 = SAGEConv(h, h)
+        self.arch = arch.strip().lower()
+        if self.arch == "gat":
+            from torch_geometric.nn import GATv2Conv
+            self.conv1 = GATv2Conv(self.in_dim, h, add_self_loops=False, edge_dim=None)
+            self.conv2 = GATv2Conv(h, h, add_self_loops=False, edge_dim=None)
+            self.conv3 = GATv2Conv(h, h, add_self_loops=False, edge_dim=None)
+            # Multiscale skip-hop convolution layers
+            self.skip_conv1 = GATv2Conv(self.in_dim, h, add_self_loops=False, edge_dim=None)
+            self.skip_conv2 = GATv2Conv(h, h, add_self_loops=False, edge_dim=None)
+            self.skip_conv3 = GATv2Conv(h, h, add_self_loops=False, edge_dim=None)
+        elif self.arch == "physics_gat":
+            from src.core_physics.species_physics_gat import SpeciesPhysicsGATConv
+            from src.architecture.pushforward_config import resolve_config as _resolve_pf
+
+            _cfg_pg = _resolve_pf()
+            prior_scale = (
+                float(_cfg_pg.physics_gat_prior_scale) if _cfg_pg is not None else 0.05
+            )
+            _pg = dict(prior_scale=prior_scale, priors_multiply_before_add=True)
+            self.conv1 = SpeciesPhysicsGATConv(self.in_dim, h, **_pg)
+            self.conv2 = SpeciesPhysicsGATConv(h, h, **_pg)
+            self.conv3 = SpeciesPhysicsGATConv(h, h, **_pg)
+            self.skip_conv1 = SpeciesPhysicsGATConv(self.in_dim, h, **_pg)
+            self.skip_conv2 = SpeciesPhysicsGATConv(h, h, **_pg)
+            self.skip_conv3 = SpeciesPhysicsGATConv(h, h, **_pg)
+        else:
+            self.conv1 = SAGEConv(self.in_dim, h)
+            self.conv2 = SAGEConv(h, h)
+            self.conv3 = SAGEConv(h, h)
+            # Multiscale skip-hop convolution layers
+            self.skip_conv1 = SAGEConv(self.in_dim, h)
+            self.skip_conv2 = SAGEConv(h, h)
+            self.skip_conv3 = SAGEConv(h, h)
+
         self.readout = nn.Sequential(
             nn.Linear(h + self.in_dim, h),
             nn.ReLU(),
             nn.Linear(h, self.out_dim),
         )
-        # Multiscale skip-hop convolution layers
-        self.skip_conv1 = SAGEConv(self.in_dim, h)
-        self.skip_conv2 = SAGEConv(h, h)
-        self.skip_conv3 = SAGEConv(h, h)
         
         # Convective upwind projection layers
         self.conv_proj1 = nn.Linear(h, h)
@@ -422,9 +467,18 @@ class SpeciesSnapshotGNN(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Blanket Xavier zeros edge_proj bias; restore identity gate for PM-GAT.
+        if self.arch == "physics_gat":
+            for _name in ("conv1", "conv2", "conv3", "skip_conv1", "skip_conv2", "skip_conv3"):
+                _c = getattr(self, _name, None)
+                if _c is not None and hasattr(_c, "init_edge_proj_identity"):
+                    _c.init_edge_proj_identity()
         self.pos_band = None
         self.edge_index = None
         self.wall_mask_band = None
+        self.wall_normals_band = None
+        self.sdf_band = None
+        self.edge_attr_band = None
         self._cached_hops = None
         self._cached_even_edges = None
         self._cached_even_mask = None
@@ -435,9 +489,57 @@ class SpeciesSnapshotGNN(nn.Module):
         self.augmented_edge_index = None
         self.skip_edge_index = None
 
-    def set_band_geometry(self, pos_band, edge_index, wall_mask_band=None):
+    def _physics_edge_bundle(self, edge_index: torch.Tensor, edge_attr_geom=None):
+        from src.core_physics.species_physics_gat import build_physics_edge_bundle
+
+        # Prefer mesh edge_attr when the caller uses the bound band edges.
+        geom = edge_attr_geom
+        if geom is None:
+            bound_ei = getattr(self, "edge_index", None)
+            bound_ea = getattr(self, "edge_attr_band", None)
+            if (
+                bound_ea is not None
+                and bound_ei is not None
+                and bound_ei.shape == edge_index.shape
+                and torch.equal(bound_ei, edge_index)
+            ):
+                geom = bound_ea
+        return build_physics_edge_bundle(
+            edge_index,
+            pos=getattr(self, "pos_band", None),
+            wall_normals=getattr(self, "wall_normals_band", None),
+            sdf=getattr(self, "sdf_band", None),
+            wall_mask=getattr(self, "wall_mask_band", None),
+            edge_attr_geom=geom,
+        )
+
+    def _conv(self, conv: nn.Module, x: torch.Tensor, edge_index: torch.Tensor, edge_bundle=None):
+        if self.arch == "physics_gat":
+            if edge_bundle is None:
+                edge_bundle = self._physics_edge_bundle(edge_index)
+            return conv(x, edge_index, bundle=edge_bundle)
+        return conv(x, edge_index)
+
+    def set_band_geometry(
+        self,
+        pos_band,
+        edge_index,
+        wall_mask_band=None,
+        *,
+        wall_normals=_MESH_UNSET,
+        sdf=_MESH_UNSET,
+        edge_attr=_MESH_UNSET,
+    ):
         self.pos_band = pos_band
         self.edge_index = edge_index
+        # Mesh priors: bind always passes values (may be None to clear). Step helpers
+        # that only refresh pos/edges omit these kwargs so priors stay put.
+        if wall_normals is not _MESH_UNSET:
+            self.wall_normals_band = wall_normals
+        if sdf is not _MESH_UNSET:
+            self.sdf_band = sdf
+        if edge_attr is not _MESH_UNSET:
+            self.edge_attr_band = edge_attr
         if wall_mask_band is not None:
             self.wall_mask_band = wall_mask_band
             self._cached_hops = None
@@ -445,14 +547,19 @@ class SpeciesSnapshotGNN(nn.Module):
             self._cached_even_mask = None
             self._cached_odd_mask = None
             self._cached_odd_to_even_neighbors = None
-        if os.environ.get("SPECIES_LONGRANGE_EDGES") == "1" and pos_band is not None and edge_index is not None and wall_mask_band is not None:
-            mult = float(os.environ.get("SPECIES_LONGRANGE_DIST_MULT", "2.5"))
+        from src.architecture.pushforward_config import resolve_config as _resolve_pf
+        _cfg = _resolve_pf()
+        use_lr = bool(_cfg.longrange_edges) if _cfg is not None else (os.environ.get("SPECIES_LONGRANGE_EDGES") == "1")
+        if use_lr and pos_band is not None and edge_index is not None and wall_mask_band is not None:
+            mult = float(_cfg.longrange_dist_mult) if _cfg is not None else float(os.environ.get("SPECIES_LONGRANGE_DIST_MULT", "2.5"))
             self.augmented_edge_index = build_longrange_edges(pos_band, edge_index, wall_mask_band, max_mult=mult)
         else:
             self.augmented_edge_index = None
 
-        if os.environ.get("SPECIES_MULTISCALE_SKIP_HOP") == "1" and pos_band is not None and edge_index is not None and wall_mask_band is not None:
-            mult = float(os.environ.get("SPECIES_MULTISCALE_SKIP_HOP_MULT", "3.0"))
+        _cfg2 = _resolve_pf()
+        use_ms = bool(_cfg2.multiscale_skip_hop) if _cfg2 is not None else (os.environ.get("SPECIES_MULTISCALE_SKIP_HOP") == "1")
+        if use_ms and pos_band is not None and edge_index is not None and wall_mask_band is not None:
+            mult = float(_cfg2.multiscale_skip_hop_mult) if _cfg2 is not None else float(os.environ.get("SPECIES_MULTISCALE_SKIP_HOP_MULT", "3.0"))
             self.skip_edge_index = build_skip_only_edges(pos_band, edge_index, wall_mask_band, max_mult=mult)
         else:
             self.skip_edge_index = None
@@ -516,6 +623,7 @@ class SpeciesSnapshotGNN(nn.Module):
         return out
 
     def forward_hidden(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        edge_bundle = self._physics_edge_bundle(edge_index) if self.arch == "physics_gat" else None
         if os.environ.get("SPECIES_SKIP_HOP_GNN") == "1" and getattr(self, "wall_mask_band", None) is not None:
             num_nodes = x.size(0)
             res = self._get_hops_and_subgraphs(edge_index, num_nodes)
@@ -532,38 +640,64 @@ class SpeciesSnapshotGNN(nn.Module):
                     keep = (remap_row != -1) & (remap_col != -1)
                     sub_edge_index_even = torch.stack([remap_row[keep], remap_col[keep]], dim=0)
                     x_even = x[even_idx]
-                    h_even = F.relu(self.conv1(x_even, sub_edge_index_even))
-                    h_even = F.relu(self.conv2(h_even, sub_edge_index_even))
-                    h_even = F.relu(self.conv3(h_even, sub_edge_index_even))
+                    sub_bundle = None
+                    if edge_bundle is not None and keep.any():
+                        from src.core_physics.species_physics_gat import build_physics_edge_bundle
+
+                        pos_b = getattr(self, "pos_band", None)
+                        nrm_b = getattr(self, "wall_normals_band", None)
+                        sdf_b = getattr(self, "sdf_band", None)
+                        wall_b = getattr(self, "wall_mask_band", None)
+                        sub_bundle = build_physics_edge_bundle(
+                            sub_edge_index_even,
+                            pos=pos_b[even_idx] if pos_b is not None else None,
+                            wall_normals=nrm_b[even_idx] if nrm_b is not None else None,
+                            sdf=sdf_b[even_idx] if sdf_b is not None else None,
+                            wall_mask=wall_b[even_idx] if wall_b is not None else None,
+                        )
+                    h_even = F.relu(self._conv(self.conv1, x_even, sub_edge_index_even, sub_bundle))
+                    h_even = F.relu(self._conv(self.conv2, h_even, sub_edge_index_even, sub_bundle))
+                    h_even = F.relu(self._conv(self.conv3, h_even, sub_edge_index_even, sub_bundle))
                     h = torch.zeros((num_nodes, self.hidden), device=x.device, dtype=x.dtype)
                     h[even_idx] = h_even
                     return h
         # Layer 1
-        h1 = F.relu(self.conv1(x, edge_index))
-        if os.environ.get("SPECIES_CONVECTIVE_UPWIND") == "1" and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
+        h1 = F.relu(self._conv(self.conv1, x, edge_index, edge_bundle))
+        from src.architecture.pushforward_config import resolve_config as _resolve_pf
+        _cfg_cu = _resolve_pf()
+        use_cu = bool(_cfg_cu.convective_upwind) if _cfg_cu is not None else (os.environ.get("SPECIES_CONVECTIVE_UPWIND") == "1")
+        if use_cu and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
             h1_up = convective_upwind_message_passing(h1, edge_index, self.velocity, self.pos_band)
             h1 = h1 + F.relu(self.conv_proj1(h1_up))
             
         # Layer 2
-        h2 = F.relu(self.conv2(h1, edge_index))
-        if os.environ.get("SPECIES_CONVECTIVE_UPWIND") == "1" and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
+        h2 = F.relu(self._conv(self.conv2, h1, edge_index, edge_bundle))
+        if use_cu and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
             h2_up = convective_upwind_message_passing(h2, edge_index, self.velocity, self.pos_band)
             h2 = h2 + F.relu(self.conv_proj2(h2_up))
             
         # Layer 3
-        h3 = F.relu(self.conv3(h2, edge_index))
-        if os.environ.get("SPECIES_CONVECTIVE_UPWIND") == "1" and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
+        h3 = F.relu(self._conv(self.conv3, h2, edge_index, edge_bundle))
+        if use_cu and getattr(self, "velocity", None) is not None and getattr(self, "pos_band", None) is not None:
             h3_up = convective_upwind_message_passing(h3, edge_index, self.velocity, self.pos_band)
             h3 = h3 + F.relu(self.conv_proj3(h3_up))
             
         # Multiscale Skip-Hop path
-        if os.environ.get("SPECIES_MULTISCALE_SKIP_HOP") == "1" and getattr(self, "skip_edge_index", None) is not None:
+        use_ms_fwd = bool(_cfg_cu.multiscale_skip_hop) if _cfg_cu is not None else (os.environ.get("SPECIES_MULTISCALE_SKIP_HOP") == "1")
+        if use_ms_fwd and getattr(self, "skip_edge_index", None) is not None:
             skip_edge_index = self.skip_edge_index.to(device=x.device)
             if skip_edge_index.numel() > 0:
-                h_skip1 = F.relu(self.skip_conv1(x, skip_edge_index))
-                h_skip2 = F.relu(self.skip_conv2(h_skip1, skip_edge_index))
-                h_skip3 = F.relu(self.skip_conv3(h_skip2, skip_edge_index))
-                blend_scale = float(os.environ.get("SPECIES_MULTISCALE_SKIP_HOP_SCALE", "0.5"))
+                skip_bundle = (
+                    self._physics_edge_bundle(skip_edge_index) if self.arch == "physics_gat" else None
+                )
+                h_skip1 = F.relu(self._conv(self.skip_conv1, x, skip_edge_index, skip_bundle))
+                h_skip2 = F.relu(self._conv(self.skip_conv2, h_skip1, skip_edge_index, skip_bundle))
+                h_skip3 = F.relu(self._conv(self.skip_conv3, h_skip2, skip_edge_index, skip_bundle))
+                blend_scale = (
+                    float(_cfg_cu.multiscale_skip_hop_scale)
+                    if _cfg_cu is not None
+                    else float(os.environ.get("SPECIES_MULTISCALE_SKIP_HOP_SCALE", "0.5"))
+                )
                 h3 = h3 + blend_scale * h_skip3
                 
         return h3
@@ -577,7 +711,10 @@ class SpeciesSnapshotGNN(nn.Module):
             out = self._reconstruct_odd_nodes(out, edge_index)
 
         # Apply readout shear gate
-        if os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1":
+        from src.architecture.pushforward_config import resolve_config as _resolve_pf
+        _cfg_sg = _resolve_pf()
+        use_shear = bool(_cfg_sg.shear_readout_gate) if _cfg_sg is not None else (os.environ.get("SPECIES_SHEAR_READOUT_GATE") == "1")
+        if use_shear:
             ld = int(getattr(self, "kin_latent_dim", 0) or 0)
             if x.shape[1] > ld + 6:
                 gamma_si = x[:, ld + 6].reshape(-1, 1)
@@ -593,7 +730,8 @@ class SpeciesSnapshotGNN(nn.Module):
                         out = out * mask
 
         # Apply frontier kinetics
-        if os.environ.get("SPECIES_FRONTIER_KINETICS") == "1":
+        use_fk = bool(_cfg_sg.frontier_kinetics) if _cfg_sg is not None else (os.environ.get("SPECIES_FRONTIER_KINETICS") == "1")
+        if use_fk:
             from src.training.biochem_species_scope import _local_mat_idx
             mat_idx = _local_mat_idx()
             pos_band = getattr(self, "pos_band", None)
@@ -613,8 +751,12 @@ class SpeciesSnapshotGNN(nn.Module):
                 flux_ap, flux_t = compute_frontier_fluxes(
                     pos_band, u_vel, v_vel, edge_index, committed, frontier, ap, t_sp
                 )
-                k_ap = float(os.environ.get("SPECIES_FRONTIER_K_AP", "0.5"))
-                k_t = float(os.environ.get("SPECIES_FRONTIER_K_T", "0.5"))
+                if _cfg_sg is not None:
+                    k_ap = float(_cfg_sg.frontier_k_ap)
+                    k_t = float(_cfg_sg.frontier_k_t)
+                else:
+                    k_ap = float(os.environ.get("SPECIES_FRONTIER_K_AP", "0.5"))
+                    k_t = float(os.environ.get("SPECIES_FRONTIER_K_T", "0.5"))
                 K_kinetics = k_ap * flux_ap + k_t * flux_t
                 mask = torch.zeros_like(out)
                 mask[:, mat_idx] = K_kinetics

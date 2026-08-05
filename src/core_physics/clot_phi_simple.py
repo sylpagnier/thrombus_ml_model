@@ -113,7 +113,7 @@ def gt_gamma_dot_nd(data, time_index: int, device: torch.device) -> torch.Tensor
     if (
         os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
         or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
-        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+        or vel_source == "kinematics" or (vel_source is None and os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics")
     ):
         use_kine = True
     elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
@@ -121,7 +121,7 @@ def gt_gamma_dot_nd(data, time_index: int, device: torch.device) -> torch.Tensor
 
     if use_kine:
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
-        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device, vel_source=vel_source)
     else:
         y = data.y[time_index].to(device=device, dtype=torch.float32)
         u = y[:, 0]
@@ -183,7 +183,7 @@ def gt_neg_dgamma_dx_phys(
     if (
         os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
         or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
-        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+        or vel_source == "kinematics" or (vel_source is None and os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics")
     ):
         use_kine = True
     elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
@@ -191,7 +191,7 @@ def gt_neg_dgamma_dx_phys(
 
     if use_kine:
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
-        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device, vel_source=vel_source)
         return pred_neg_dgamma_dx_phys(data, u, v, bio_cfg, device)
     else:
         y = data.y[time_index].to(device=device, dtype=torch.float32)
@@ -726,6 +726,29 @@ def comsol_carreau_mu_si_from_uv(
     )
 
 
+def apply_gelation_beta_to_gel(
+    gel: torch.Tensor,
+    beta: torch.Tensor | float,
+    *,
+    base_mode: str,
+) -> torch.Tensor:
+    """Scale the gelation leg by a single scalar gain, preserving the no-clot identity.
+
+    ``comsol`` / ``comsol_carreau`` carry ``gel`` multiplicatively (identity ``1``), the
+    ``carreau`` / ``blood`` legs carry it additively (identity ``0``), so beta has to act
+    on the *excess over identity* in the first case and on the raw leg in the second.
+    Both reduce to a no-op at ``beta = 1``.
+    """
+    g = gel.reshape(-1)
+    if isinstance(beta, torch.Tensor):
+        b = beta.reshape(()).to(device=g.device, dtype=g.dtype)
+    else:
+        b = torch.tensor(float(beta), device=g.device, dtype=g.dtype)
+    if base_mode in ("comsol", "comsol_carreau"):
+        return (1.0 + b * (g - 1.0)).clamp(min=1e-8)
+    return (b * g).clamp(min=0.0)
+
+
 def _resolve_gelation_legs(
     species_log1p: torch.Tensor,
     bio_cfg: BiochemConfig,
@@ -736,6 +759,7 @@ def _resolve_gelation_legs(
     v_nd: torch.Tensor | None = None,
     time_index: int | None = None,
     base_mode: str,
+    gelation_beta: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(mu1, mu2, gel)`` with COMSOL or soft gelation legs."""
     mu_ratio_max = clot_phi_physics_mu_ratio_max(bio_cfg)
@@ -799,6 +823,8 @@ def _resolve_gelation_legs(
             props,
         ).clamp(0.0, 1.0)
         gel = gel * gate
+    if gelation_beta is not None:
+        gel = apply_gelation_beta_to_gel(gel, gelation_beta, base_mode=base_mode)
     return mu1, mu2, gel
 
 
@@ -873,6 +899,14 @@ def clot_phi_physics_hard_step() -> bool:
 
 
 def clot_phi_physics_wall_mat_only() -> bool:
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            return bool(rt.rollout.wall_mat_only)
+    except Exception:
+        pass
     return _env_bool("CLOT_PHI_PHYSICS_WALL_MAT_ONLY", False)
 
 
@@ -1043,6 +1077,7 @@ def physics_mu_eff_si(
     v_nd: torch.Tensor | None = None,
     phys_cfg: PhysicsConfig | None = None,
     time_index: int | None = None,
+    gelation_beta: torch.Tensor | float | None = None,
 ) -> torch.Tensor:
     """Gelation trigger: legacy Carreau*gel, COMSOL export, or COMSOL Carreau (spf.mu)."""
     from src.config import PhysicsConfig as _PhysicsConfig
@@ -1058,6 +1093,7 @@ def physics_mu_eff_si(
         v_nd=v_nd,
         time_index=time_index,
         base_mode=base_mode,
+        gelation_beta=gelation_beta,
     )
     if base_mode == "comsol_carreau":
         if data is None or u_nd is None or v_nd is None:
@@ -1394,7 +1430,7 @@ def predict_phi_prior_rule(
     if (
         os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
         or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
-        or os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics"
+        or vel_source == "kinematics" or (vel_source is None and os.environ.get("CLOT_TEMPORAL_VEL_SOURCE") == "kinematics")
     ):
         use_kine = True
     elif not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item()):
@@ -1402,7 +1438,7 @@ def predict_phi_prior_rule(
 
     if use_kine:
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
-        u, v = _resolve_uv_for_temporal_risk(data, int(t_in), device)
+        u, v = _resolve_uv_for_temporal_risk(data, int(t_in), device, vel_source=vel_source)
     else:
         y_in = data.y[int(t_in)].to(device=device, dtype=torch.float32)
         u = y_in[:, 0]
@@ -2233,6 +2269,7 @@ def build_clot_phi_step(
     species_log_override: torch.Tensor | None = None,
     rollout_state: "ClotPhiRolloutState | None" = None,
     train_epoch: int | None = None,
+    vel_source: str | None = None,
 ) -> ClotPhiStepBatch:
     """One time slice: labels and features on wall-adjacent nodes."""
     from src.core_physics.clot_phi_rollout import (
@@ -2276,7 +2313,7 @@ def build_clot_phi_step(
     elif clot_phi_vel_source(data) == "kinematics":
         from src.core_physics.clot_temporal_growth_rules import _resolve_uv_for_temporal_risk
 
-        u, v = _resolve_uv_for_temporal_risk(data, time_index, device)
+        u, v = _resolve_uv_for_temporal_risk(data, time_index, device, vel_source=vel_source)
     else:
         u, v = u_gt, v_gt
     mu_gt = phys_cfg.viscosity_nd_to_si(y_gt[:, STATE_CHANNEL_MU_EFF_ND])

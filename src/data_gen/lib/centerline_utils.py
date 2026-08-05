@@ -257,7 +257,7 @@ def enrich_anchor_sidecar_json(
     nodes_si = mesh.points[:, :2] * scale
     tags = dict(VesselConfig(phase="kinematics").TAGS)
     try:
-        mask_inlet, mask_outlet, mask_wall = gmsh_line_boundary_masks(mesh, len(nodes_si), tags)
+        mask_inlet, mask_outlet, mask_wall, _ = gmsh_line_boundary_masks(mesh, len(nodes_si), tags)
     except ValueError as exc:
         raise ValueError(
             f"{stem}: Gmsh boundary tags missing on {mesh_path.name} ({exc}). "

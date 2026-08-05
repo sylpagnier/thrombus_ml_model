@@ -10,6 +10,17 @@ from src.training.train_offwall_growth import (
 )
 
 
+def test_ckpt_score_compound_primary_blend():
+    s = growth_specialist_ckpt_score(
+        ckpt_metric="compound_primary",
+        clot_score=0.80,
+        offwall_relaxed_f1=0.50,
+        offwall_n_pred=10.0,
+        offwall_n_gt=20.0,
+    )
+    assert abs(s - (0.6 * 0.80 + 0.4 * 0.50)) < 1e-6
+
+
 def test_ckpt_score_offwall_balanced_prefers_volume_match():
     low_vol = growth_specialist_ckpt_score(
         ckpt_metric="offwall_balanced",

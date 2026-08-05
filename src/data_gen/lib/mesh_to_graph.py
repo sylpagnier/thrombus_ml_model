@@ -258,7 +258,7 @@ class MeshToGraph(MeshToGraphComplete):
         spine_pts = spine_pts_nd * float(d_bar)
         spine_tree_wall = cKDTree(spine_pts)
 
-        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
+        mask_inlet, mask_outlet, mask_wall, mask_wound = self._get_boundary_masks(mesh, len(nodes))
 
         # Scaling Factors
         ref_mu = self.phys_cfg.mu_ref
@@ -538,6 +538,7 @@ class MeshToGraph(MeshToGraphComplete):
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            mask_wound=mask_wound,
             is_anchor=is_anchor,
             d_bar=d_bar,
             u_ref=u_ref,

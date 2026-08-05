@@ -112,6 +112,8 @@ GLOBAL_TRAIN_RECIPE: dict[str, str] = {
     "SPECIES_CONTINUOUS_SATURATION_SCALE": "80",
     # Baseline temporal handling is explicit tau + Fourier context only.
     "SPECIES_CONTINUOUS_VEL_DECAY": "1",
+    # Wall-only washout: lumen Mat is not decayed (compound deploy / new vessels).
+    "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": "1",
     "SPECIES_CONTINUOUS_TEACHER_NOISE": "0.02",
     "SPECIES_CONTINUOUS_TEACHER_FP_FRAC": "0.08",
     "SPECIES_CONTINUOUS_TEACHER_BLUR": "0.25",
@@ -146,15 +148,14 @@ GLOBAL_TRAIN_RECIPE: dict[str, str] = {
 }
 
 DEPLOY_INFERENCE_ENV: dict[str, str] = {
-    "SPECIES_CONTINUOUS_DUAL_HEAD": "1",
     "SPECIES_KIN_PER_VESSEL_NORM": "1",
     "SPECIES_CONTINUOUS_SATURATION_GATE": "1",
     "SPECIES_CONTINUOUS_TIME_CONTEXT": "1",
     "SPECIES_CONTINUOUS_TIME_REF_S": "3000",
     "SPECIES_CONTINUOUS_TIME_FOURIER_FREQS": "8",
     "SPECIES_CONTINUOUS_VEL_DECAY": "1",
+    "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": "1",
     "SPECIES_CONTINUOUS_MATURE_FP_EXEMPT": "1",
-    "SPECIES_VISCOSITY_CALIB": "1",
     "SPECIES_VISCOSITY_BETA_MIN": "0.1",
     "SPECIES_VISCOSITY_BETA_MAX": "2.0",
     "T0_RUNG4_STEP": "species_gnn",
@@ -164,6 +165,10 @@ DEPLOY_INFERENCE_ENV: dict[str, str] = {
     "SPECIES_ROLLOUT_IC_SOURCE": "resting",
     "SPECIES_SNAPSHOT_WALL_HOPS": "3",
     "CLOT_PHI_CEILING_HOPS": "3",
+    "SPECIES_CLOSED_LOOP_COUPLING": "1",
+    "BIOCHEM_CORRECTOR_COUPLING": "1",
+    "T0_R4_FLOW_SOURCE": "auto",
+    "SPECIES_FLOW_FEATS_SOURCE": "auto",
 }
 
 CKPT_PHASE_ALIASES = frozenset({PHASE_CKPT, "clot_deploy_gnn", "species_gnn_deploy_baseline"})
@@ -245,14 +250,244 @@ def is_biochem_gnn_checkpoint_phase(phase: str) -> bool:
 is_deploy_gnn_checkpoint_phase = is_biochem_gnn_checkpoint_phase
 
 
-def apply_train_recipe_env(*, overrides: dict[str, str] | None = None, force: bool = False) -> dict[str, str]:
+# Process/IO env keys that may still be written by recipe/deploy apply helpers.
+_IO_ENV_KEYS = frozenset({
+    "SPECIES_GNN_CLOUT_CKPT",
+    "SPECIES_CONTINUOUS_CKPT",
+    "T0_R4_SPECIES_GNN_CKPT",
+    "SPECIES_VISCOSITY_CALIB_PATH",
+    "KINEMATICS_CHECKPOINT",
+    "BIOCHEM_GNN_LOAO_AUTO",
+    "T0_RUNG4_STEP",
+    "SPECIES_PUSHFORWARD_CKPT",
+})
+
+# IO / path keys that deploy must always refresh (never inherit stale process env).
+DEPLOY_MUST_OVERWRITE = frozenset({
+    "SPECIES_GNN_CLOUT_CKPT",
+    "SPECIES_CONTINUOUS_CKPT",
+    "T0_R4_SPECIES_GNN_CKPT",
+    "SPECIES_VISCOSITY_CALIB_PATH",
+    "KINEMATICS_CHECKPOINT",
+})
+
+_ACTIVE_PF_TOKEN = None
+_ACTIVE_RT_TOKEN = None
+
+
+def _bind_typed_configs(pf, rt) -> None:
+    """Replace process-wide active typed configs (deploy/eval scripts)."""
+    global _ACTIVE_PF_TOKEN, _ACTIVE_RT_TOKEN
+    from src.architecture.pushforward_config import _ACTIVE_CONFIG
+    from src.architecture.runtime_config import _ACTIVE_RUNTIME
+
+    if _ACTIVE_PF_TOKEN is not None:
+        try:
+            _ACTIVE_CONFIG.reset(_ACTIVE_PF_TOKEN)
+        except Exception:
+            pass
+    if _ACTIVE_RT_TOKEN is not None:
+        try:
+            _ACTIVE_RUNTIME.reset(_ACTIVE_RT_TOKEN)
+        except Exception:
+            pass
+    _ACTIVE_PF_TOKEN = _ACTIVE_CONFIG.set(pf)
+    _ACTIVE_RT_TOKEN = _ACTIVE_RUNTIME.set(rt)
+
+
+def build_train_recipe_configs(
+    *,
+    overrides: dict[str, str] | None = None,
+) -> tuple[Any, Any]:
+    """Typed PushforwardConfig + BiochemRuntimeConfig from GLOBAL_TRAIN_RECIPE."""
+    from dataclasses import replace as _replace
+
+    from src.architecture.pushforward_config import (
+        PushforwardConfig,
+        split_legacy_env_overrides,
+    )
+    from src.architecture.runtime_config import (
+        BiochemRuntimeConfig,
+        split_legacy_runtime_env,
+    )
+
     merged = dict(GLOBAL_TRAIN_RECIPE)
     if overrides:
         merged.update({k: str(v) for k, v in overrides.items()})
-    for key, val in merged.items():
-        if force or not str(os.environ.get(key, "")).strip():
-            os.environ[key] = str(val)
+    pf_kw, rem = split_legacy_env_overrides(merged)
+    rt_kw, _io = split_legacy_runtime_env(rem)
+    pf = _replace(PushforwardConfig(), **pf_kw) if pf_kw else PushforwardConfig()
+    rt = BiochemRuntimeConfig.from_kwargs(rt_kw) if rt_kw else BiochemRuntimeConfig()
+    return pf, rt
+
+
+def build_deploy_configs(
+    manifest: dict[str, Any] | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+    anchor: str | None = None,
+    prefer_loao: bool = True,
+) -> tuple[Any, Any, dict[str, str]]:
+    """Typed deploy configs + IO-only env dict (ckpt paths, etc.)."""
+    from dataclasses import replace as _replace
+
+    from src.architecture.pushforward_config import (
+        PushforwardConfig,
+        split_legacy_env_overrides,
+    )
+    from src.architecture.runtime_config import (
+        BiochemRuntimeConfig,
+        split_legacy_runtime_env,
+    )
+
+    m = manifest or load_manifest()
+    merged = dict(DEPLOY_INFERENCE_ENV)
+    pre = {k: str(v) for k, v in (overrides or {}).items()}
+    if "SPECIES_GNN_CLOUT_CKPT" in pre:
+        merged["SPECIES_GNN_CLOUT_CKPT"] = pre["SPECIES_GNN_CLOUT_CKPT"]
+    elif anchor:
+        merged["SPECIES_GNN_CLOUT_CKPT"] = str(species_ckpt_for_anchor(anchor, m, prefer_loao=prefer_loao))
+    else:
+        merged["SPECIES_GNN_CLOUT_CKPT"] = str(m.get("species_gnn_ckpt", rel_path(LOCKED_GNN_CKPT)))
+    merged["SPECIES_CONTINUOUS_CKPT"] = merged["SPECIES_GNN_CLOUT_CKPT"]
+    merged["T0_R4_SPECIES_GNN_CKPT"] = merged["SPECIES_GNN_CLOUT_CKPT"]
+    merged["SPECIES_VISCOSITY_CALIB_PATH"] = str(m.get("viscosity_beta", rel_path(LOCKED_BETA_CKPT)))
+    merged["KINEMATICS_CHECKPOINT"] = str(m.get("kinematics_ckpt", rel_path(DEFAULT_KINE_CKPT)))
+
+    ckpt_path = _abs(merged["SPECIES_GNN_CLOUT_CKPT"])
+    dual_head = True
+    viscosity_calib = True
+    meta: dict[str, Any] = {}
+    if ckpt_path.is_file():
+        import torch
+
+        try:
+            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            meta = dict(payload.get("meta") or {})
+            dual_head = bool(meta.get("dual_head", True))
+            viscosity_calib = bool(dual_head)
+            merged["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1" if dual_head else "0"
+            merged["SPECIES_VISCOSITY_CALIB"] = "1" if viscosity_calib else "0"
+        except Exception:
+            pass
+
+    beta_ov = m.get("beta_overrides") or {}
+    if anchor and isinstance(beta_ov, dict):
+        stem = anchor.strip().replace(".pt", "")
+        if stem in beta_ov:
+            merged["SPECIES_GELATION_BETA_OVERRIDE"] = str(beta_ov[stem])
+    scope = m.get("species_scope") or m.get("pushforward_species_scope") or meta.get("pushforward_species_scope")
+    channels = m.get("species_channels") or m.get("pushforward_species_channels") or meta.get("pushforward_species_channels")
+    if channels:
+        if isinstance(channels, (list, tuple)):
+            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(x)) for x in channels)
+        else:
+            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
+    elif scope:
+        merged["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
+    if m.get("loao_auto") is not None:
+        merged["BIOCHEM_GNN_LOAO_AUTO"] = str(m.get("loao_auto"))
+    merged.update(pre)
+
+    # Deploy: zero training noise in typed config.
+    pf_kw, rem = split_legacy_env_overrides(merged)
+    rt_kw, io_rem = split_legacy_runtime_env(rem)
+    pf_kw.update(
+        {
+            "teacher_noise": 0.0,
+            "teacher_fp_frac": 0.0,
+            "teacher_blur": 0.0,
+            "input_noise": 0.0,
+            "scheduled_sampling": False,
+            "dual_head": dual_head,
+        }
+    )
+    if channels:
+        if isinstance(channels, (list, tuple)):
+            pf_kw["channels"] = tuple(int(c) for c in channels)
+        else:
+            pf_kw["channels"] = tuple(int(c) for c in str(channels).split(",") if str(c).strip())
+    if scope:
+        pf_kw["species_scope"] = str(scope)
+    # Prefer checkpoint meta architecture when present.
+    if meta:
+        pf_from_meta = PushforwardConfig.from_meta(meta)
+        base = pf_from_meta
+    else:
+        base = PushforwardConfig()
+    pf = _replace(base, **{k: v for k, v in pf_kw.items() if hasattr(base, k)})
+    rt_kw["viscosity_calib"] = viscosity_calib
+    rt_kw.setdefault("closed_loop_coupling", True)
+    rt_kw.setdefault("corrector_coupling", True)
+    rt_kw.setdefault("deploy_faithful", True)
+    rt_kw.setdefault("rollout_vel_source", "kinematics")
+    rt = BiochemRuntimeConfig.from_kwargs(rt_kw)
+
+    io_env = {k: str(v) for k, v in merged.items() if k in _IO_ENV_KEYS or k in io_rem}
+    io_env.update({k: str(v) for k, v in io_rem.items()})
+    for k in _IO_ENV_KEYS:
+        if k in merged:
+            io_env[k] = str(merged[k])
+    return pf, rt, io_env
+
+
+def apply_train_recipe_env(*, overrides: dict[str, str] | None = None, force: bool = False) -> dict[str, str]:
+    """Apply train recipe as typed configs (primary). Env bridge is IO/unknown only."""
+    from src.architecture.pushforward_config import split_legacy_env_overrides
+    from src.architecture.runtime_config import split_legacy_runtime_env
+
+    pf, rt = build_train_recipe_configs(overrides=overrides)
+    _bind_typed_configs(pf, rt)
+
+    merged = dict(GLOBAL_TRAIN_RECIPE)
+    if overrides:
+        merged.update({k: str(v) for k, v in overrides.items()})
+    _pf_kw, rem = split_legacy_env_overrides(merged)
+    _rt_kw, rem2 = split_legacy_runtime_env(rem)
+    for key, val in rem2.items():
+        if key in _IO_ENV_KEYS:
+            if force or not str(os.environ.get(key, "")).strip():
+                os.environ[key] = str(val)
+    for key in _IO_ENV_KEYS:
+        if key in merged and (force or not str(os.environ.get(key, "")).strip()):
+            os.environ[key] = str(merged[key])
     return merged
+
+
+def apply_deploy_env(
+    manifest: dict[str, Any] | None = None,
+    *,
+    overrides: dict[str, str] | None = None,
+    anchor: str | None = None,
+    prefer_loao: bool = True,
+) -> dict[str, str]:
+    """Apply deploy policy as typed configs (primary) + IO path env writes."""
+    pf, rt, io_env = build_deploy_configs(
+        manifest, overrides=overrides, anchor=anchor, prefer_loao=prefer_loao
+    )
+    _bind_typed_configs(pf, rt)
+
+    # Zero train-noise for any remaining legacy readers.
+    for noise_var in (
+        "SPECIES_CONTINUOUS_TEACHER_NOISE",
+        "SPECIES_CONTINUOUS_TEACHER_FP_FRAC",
+        "SPECIES_CONTINUOUS_TEACHER_BLUR",
+        "SPECIES_PUSHFORWARD_INPUT_NOISE",
+        "SPECIES_SCHEDULED_SAMPLING",
+    ):
+        os.environ[noise_var] = "0"
+
+    # Write IO paths always; do not stamp architecture/runtime control-plane keys.
+    for k, v in io_env.items():
+        if k in _IO_ENV_KEYS or k in DEPLOY_MUST_OVERWRITE:
+            if k in _IO_ENV_KEYS or k.endswith("_CKPT") or "PATH" in k or k == "KINEMATICS_CHECKPOINT":
+                os.environ[k] = str(v)
+    for k in _IO_ENV_KEYS:
+        if k in io_env:
+            os.environ[k] = str(io_env[k])
+        elif overrides and k in overrides:
+            os.environ[k] = str(overrides[k])
+    return {**{k: str(v) for k, v in io_env.items()}, **(overrides or {})}
 
 
 def rel_path(path: Path | str) -> str:
@@ -341,52 +576,11 @@ def species_ckpt_for_anchor(
     return global_ckpt
 
 
-def apply_deploy_env(
-    manifest: dict[str, Any] | None = None,
-    *,
-    overrides: dict[str, str] | None = None,
-    anchor: str | None = None,
-    prefer_loao: bool = True,
-) -> dict[str, str]:
-    m = manifest or load_manifest()
-    merged = dict(DEPLOY_INFERENCE_ENV)
-    pre = {k: str(v) for k, v in (overrides or {}).items()}
-    if "SPECIES_GNN_CLOUT_CKPT" in pre:
-        merged["SPECIES_GNN_CLOUT_CKPT"] = pre["SPECIES_GNN_CLOUT_CKPT"]
-    elif anchor:
-        merged["SPECIES_GNN_CLOUT_CKPT"] = str(species_ckpt_for_anchor(anchor, m, prefer_loao=prefer_loao))
-    else:
-        merged["SPECIES_GNN_CLOUT_CKPT"] = str(m.get("species_gnn_ckpt", rel_path(LOCKED_GNN_CKPT)))
-    merged["SPECIES_CONTINUOUS_CKPT"] = merged["SPECIES_GNN_CLOUT_CKPT"]
-    merged["T0_R4_SPECIES_GNN_CKPT"] = merged["SPECIES_GNN_CLOUT_CKPT"]
-    merged["SPECIES_VISCOSITY_CALIB_PATH"] = str(m.get("viscosity_beta", rel_path(LOCKED_BETA_CKPT)))
-    beta_ov = m.get("beta_overrides") or {}
-    if anchor and isinstance(beta_ov, dict):
-        stem = anchor.strip().replace(".pt", "")
-        if stem in beta_ov:
-            merged["SPECIES_GELATION_BETA_OVERRIDE"] = str(beta_ov[stem])
-    merged["KINEMATICS_CHECKPOINT"] = str(m.get("kinematics_ckpt", rel_path(DEFAULT_KINE_CKPT)))
-    scope = m.get("species_scope") or m.get("pushforward_species_scope")
-    channels = m.get("species_channels") or m.get("pushforward_species_channels")
-    if channels:
-        if isinstance(channels, (list, tuple)):
-            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(x)) for x in channels)
-        else:
-            merged["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
-    elif scope:
-        merged["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
-    if m.get("loao_auto") is not None:
-        merged["BIOCHEM_GNN_LOAO_AUTO"] = str(m.get("loao_auto"))
-    merged.update(pre)
-    for k, v in merged.items():
-        if k in os.environ and k not in (overrides or {}) and k not in (
-            "SPECIES_GNN_CLOUT_CKPT",
-            "SPECIES_CONTINUOUS_CKPT",
-            "T0_R4_SPECIES_GNN_CKPT",
-            "SPECIES_VISCOSITY_CALIB_PATH",
-            "KINEMATICS_CHECKPOINT",
-        ):
-            continue
-        os.environ[k] = str(v)
-    return merged
+DEPLOY_MUST_OVERWRITE = frozenset({
+    "SPECIES_GNN_CLOUT_CKPT",
+    "SPECIES_CONTINUOUS_CKPT",
+    "T0_R4_SPECIES_GNN_CKPT",
+    "SPECIES_VISCOSITY_CALIB_PATH",
+    "KINEMATICS_CHECKPOINT",
+})
 

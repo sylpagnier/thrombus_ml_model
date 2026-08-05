@@ -98,11 +98,11 @@ def train_species(
     if lr is not None:
         cmd.extend(["--lr", str(lr)])
     if all_anchors:
-        cmd.append("--all-anchors")
+        cmd.extend(["--all-anchors", "--exclude-val-from-train"])
     elif anchors.strip():
         cmd.extend(["--anchors", anchors])
     else:
-        cmd.append("--all-anchors")
+        cmd.extend(["--all-anchors", "--exclude-val-from-train"])
     _run(cmd, label="biochem_gnn species_gnn")
 
 
@@ -196,9 +196,9 @@ def main() -> int:
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument(
         "--arch",
-        choices=("sage", "gnode"),
+        choices=("sage",),
         default="sage",
-        help="Pushforward trunk for species GNN (sage=GraphSAGE, gnode=GINO derivative)",
+        help="Pushforward trunk for species GNN (sage=GraphSAGE)",
     )
     args = ap.parse_args()
 

@@ -135,6 +135,11 @@ def predict_clot_phi_at_time(
         _ROLLOUT_CACHE.pop(cache_key, None)
     traj = _ROLLOUT_CACHE.get(cache_key)
     if traj is None:
+        from src.core_physics.species_viscosity_calibration import resolve_clot_readout_beta
+
+        # phi responds to an *explicit* beta override only; the on-disk s35 beta keeps its
+        # historical role (Mat boost + reported mu) and must not re-grade phi. See
+        # resolve_clot_readout_beta and docs/WALL_MODEL_PLAN.md s1.
         traj = rollout_t0_clot_phi(
             data,
             phys_cfg,
@@ -144,7 +149,7 @@ def predict_clot_phi_at_time(
             flow_source=flow_source,
             pred_species_series=pred_species_series,
             nucleation=nucleation,
-            gelation_beta=gelation_beta,
+            gelation_beta=resolve_clot_readout_beta(),
         )
         _ROLLOUT_CACHE[cache_key] = traj
     entry = traj[t]
@@ -181,10 +186,15 @@ def rollout_t0_clot_phi(
     pred_species_series: torch.Tensor | None = None,
     nucleation: bool = True,
     nucleation_hops: int = 1,
-    gelation_beta: torch.Tensor | None = None,
+    gelation_beta: torch.Tensor | float | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
-    """Physics clot trigger rollout from a predicted species timeline."""
-    del gamma_mode, flow_source, gelation_beta
+    """Physics clot trigger rollout from a predicted species timeline.
+
+    ``gelation_beta`` is the single scalar readout gain on the gelation leg (see
+    ``apply_gelation_beta_to_gel``). ``None`` leaves the leg untouched, which is the
+    historical behaviour every recorded ``deploy_clot_*`` number was graded under.
+    """
+    del gamma_mode
     from src.core_physics.clot_phi_simple import build_clot_phi_step
     from src.core_physics.clot_trigger_rollout import _project_step_phi
     from src.core_physics.clot_trigger_rollout import clot_trigger_forward_seed_mode
@@ -207,6 +217,7 @@ def rollout_t0_clot_phi(
             phys_cfg,
             bio_cfg,
             device,
+            vel_source=flow_source,
             species_log_override=species_log1p,
         )
         phi_raw, mu_raw = forward_physics_trigger_phi(
@@ -220,6 +231,7 @@ def rollout_t0_clot_phi(
             apply_region=False,
             time_index=int(t),
             mu_anchor_si=mu_anchor_si,
+            gelation_beta=gelation_beta,
         )
         if mu_anchor_si is None:
             mu_anchor_si = mu_raw.reshape(-1).clone()

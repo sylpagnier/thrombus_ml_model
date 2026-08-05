@@ -7,6 +7,7 @@ import torch
 from src.evaluation.clot_relaxed_metrics import (
     clot_guiding_score,
     compute_clot_relaxed_metrics,
+    empty_gt_match_score,
     f_beta_score,
 )
 
@@ -94,3 +95,61 @@ def test_vacuous_empty_match_scores_one():
     assert m["clot_relaxed_f05"] == 1.0
     assert m["clot_f1"] == 1.0
     assert m["clot_vacuous_match"] == 1.0
+    assert m["clot_empty_gt"] == 1.0
+
+
+def test_empty_gt_grades_by_false_positive_count():
+    """Clot-free GT: a small blip must outrank a spray instead of both scoring 0."""
+    n = 40
+    ei = _chain_graph(n)
+    gt = torch.zeros(n)
+
+    blip = torch.zeros(n)
+    blip[5] = 1.0
+    spray = torch.zeros(n)
+    spray[::2] = 1.0  # 20 nodes
+
+    m_blip = compute_clot_relaxed_metrics(blip, gt, ei, relax_hops=2)
+    m_spray = compute_clot_relaxed_metrics(spray, gt, ei, relax_hops=2)
+
+    # Ordering is what matters: nothing > blip > spray, and none of them collapse to 0.
+    assert m_blip["clot_guiding"] > m_spray["clot_guiding"]
+    assert 0.0 < m_spray["clot_guiding"] < m_blip["clot_guiding"] < 1.0
+    assert m_blip["clot_empty_gt"] == 1.0
+    # Raw counts stay truthful for diagnostics.
+    assert m_blip["clot_fp"] == 1.0
+    assert m_blip["clot_gt_pos"] == 0.0
+    assert m_spray["clot_fp"] == 20.0
+
+
+def test_empty_gt_match_score_monotonic():
+    assert empty_gt_match_score(0) == 1.0
+    scores = [empty_gt_match_score(k) for k in (0, 1, 5, 20, 200)]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[-1] < 0.1
+    # tol is the half-way point by construction
+    assert abs(empty_gt_match_score(8, tol=8.0) - 0.5) < 1e-9
+
+
+def test_offwall_empty_gt_graded_penalizes_spray():
+    """Wall-only GT clot: off-wall spray must score below a clean off-wall prediction."""
+    n = 30
+    ei = _chain_graph(n)
+    wall = torch.zeros(n, dtype=torch.bool)
+    wall[:10] = True
+
+    gt = torch.zeros(n)
+    gt[2] = 1.0  # GT clot on the wall only -> no off-wall GT
+
+    clean = gt.clone()  # matches GT, predicts nothing off-wall
+    sprayer = gt.clone()
+    sprayer[15:25] = 1.0  # 10 off-wall false positives
+
+    m_clean = compute_clot_relaxed_metrics(clean, gt, ei, relax_hops=2, wall_mask=wall)
+    m_spray = compute_clot_relaxed_metrics(sprayer, gt, ei, relax_hops=2, wall_mask=wall)
+
+    assert m_clean["offwall_empty_gt"] == 1.0
+    assert m_clean["offwall_n_gt"] == 0.0
+    assert m_clean["offwall_relaxed_f1"] == 1.0
+    assert m_spray["offwall_relaxed_f1"] < m_clean["offwall_relaxed_f1"]
+    assert m_spray["offwall_n_pred"] == 10.0

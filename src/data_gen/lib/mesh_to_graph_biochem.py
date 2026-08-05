@@ -302,7 +302,7 @@ class MeshToGraphPhase3:
         spine_pts = spine_pts_nd * float(d_bar)
         spine_tree_wall = cKDTree(spine_pts)
 
-        mask_inlet, mask_outlet, mask_wall = self._get_boundary_masks(mesh, len(nodes))
+        mask_inlet, mask_outlet, mask_wall, mask_wound = self._get_boundary_masks(mesh, len(nodes))
         outlet_normal = self._compute_outlet_normals(mesh, nodes, mask_outlet)
 
         # Scaling: u_ref uses mu_ref (Re); label mu_nd uses mu_viscosity_nd_scale (channel STATE_CHANNEL_MU_EFF_ND).
@@ -570,6 +570,7 @@ class MeshToGraphPhase3:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            mask_wound=mask_wound,
             d_bar_si=float(d_bar),
             u_ref=float(u_ref),
             phys_cfg=phys_kine,
@@ -589,6 +590,7 @@ class MeshToGraphPhase3:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            mask_wound=mask_wound,
             u_bc=u_bc,
             v_bc=v_bc,
             p_bc=p_bc,

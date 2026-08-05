@@ -37,7 +37,6 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     load_species_gnn_rollout_bundle,
     prepare_species_gnn_rollout_static,
     rollout_species_gnn_phi_trajectory,
-    species_gnn_rollout_ckpt,
 )
 from src.core_physics.species_gnn_ladder_viz import ladder_viz_times, scatter_clot_error_panel  # noqa: E402
 from src.core_physics.species_pushforward_continuous import (  # noqa: E402
@@ -54,7 +53,6 @@ from src.inference.species_gnn_deploy_env import (  # noqa: E402
     DEFAULT_MANIFEST,
     load_deploy_manifest,
     species_ckpt_for_anchor,
-    species_gnn_deploy_env,
 )
 from src.utils.paths import get_project_root  # noqa: E402
 
@@ -227,34 +225,38 @@ def viz_anchor_deploy(
     ckpt_pick = species_ckpt_for_anchor(anchor, manifest, prefer_loao=True)
     beta_ov = (manifest.get("beta_overrides") or {}).get(anchor, "")
 
-    print(f"[i] anchor={anchor} flow={flow_source} ckpt={ckpt_pick.name}", flush=True)
+    print(f"[i] anchor={anchor} flow={flow_source} ckpt={ckpt_pick}", flush=True)
     if beta_ov:
         print(f"[i] beta_override={beta_ov}", flush=True)
 
     t0 = time.perf_counter()
-    with species_gnn_deploy_env(
-        manifest,
-        overrides={"T0_R4_FLOW_SOURCE": flow_source},
-        anchor=anchor,
-        prefer_loao=True,
-    ):
-        ckpt = Path(species_gnn_rollout_ckpt())
-        ckpt_key = str(ckpt.resolve())
-        bundle = None
-        if bundle_cache is not None and ckpt_key in bundle_cache:
-            bundle = bundle_cache[ckpt_key]
-        else:
-            bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
-            if bundle is not None and bundle_cache is not None:
-                bundle_cache[ckpt_key] = bundle
-        if bundle is None:
-            raise FileNotFoundError(f"missing ckpt: {ckpt}")
-        static = prepare_species_gnn_rollout_static(data, device=device)
-        phi_gnn = rollout_species_gnn_phi_trajectory(
-            data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=device,
-            flow_source=flow_source,
-        )
-        beta_used = os.environ.get("SPECIES_GELATION_BETA_OVERRIDE", "")
+    # Set specific overrides explicitly rather than silently injecting DEPLOY_INFERENCE_ENV
+    if beta_ov:
+        os.environ["SPECIES_GELATION_BETA_OVERRIDE"] = str(beta_ov)
+    
+    ckpt = ckpt_pick
+    ckpt_key = str(ckpt.resolve())
+    bundle = None
+    if bundle_cache is not None and ckpt_key in bundle_cache:
+        bundle = bundle_cache[ckpt_key]
+    else:
+        print("[i] loading bundle...", flush=True)
+        bundle = load_species_gnn_rollout_bundle(ckpt, device=device)
+        print("[i] loaded bundle", flush=True)
+        if bundle is not None and bundle_cache is not None:
+            bundle_cache[ckpt_key] = bundle
+    if bundle is None:
+        raise FileNotFoundError(f"missing ckpt: {ckpt}")
+    print("[i] static...", flush=True)
+    static = prepare_species_gnn_rollout_static(data, device=device)
+    print("[i] rollout...", flush=True)
+    phi_gnn = rollout_species_gnn_phi_trajectory(
+        data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=device,
+        flow_source=flow_source,
+    )
+    beta_used = os.environ.get("SPECIES_GELATION_BETA_OVERRIDE", "")
+    if beta_ov:
+        os.environ.pop("SPECIES_GELATION_BETA_OVERRIDE", None)
     nuc_masks = _nucleation_masks_for_phi_trajectory(
         data, phi_gnn, phys=phys, bio=bio, device=device,
     )

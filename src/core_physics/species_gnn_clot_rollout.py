@@ -22,11 +22,13 @@ from src.core_physics.clot_phi_simple import sdf_nd_from_data
 from src.core_physics.species_deploy_rollout import (
     alloc_species_y_series,
     band_speed_for_rollout,
+    band_uv_for_model,
     deploy_fimat_log_init,
     pin_species_block,
     reset_species_rollout_flow_cache,
     species_rollout_pin_other,
 )
+from src.architecture.pushforward_config import PushforwardConfig
 from src.core_physics.species_pushforward_continuous import (
     SpeciesContinuousBundle,
     SpeciesDualHeadContinuousGNN,
@@ -100,6 +102,9 @@ class SpeciesGnnRolloutStatic:
     pos_band: torch.Tensor | None = None
     flow_series: torch.Tensor | None = None  # [n_t, n_band, flow_dim] for dynamic flow (Trap C)
     flow_cols: tuple[int, int] | None = None  # (start, width) of the flow block in base_feats
+    wall_normals_band: torch.Tensor | None = None
+    sdf_band: torch.Tensor | None = None
+    edge_attr_band: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,7 @@ class SpeciesGnnRolloutBundle:
     label: str
     continuous: SpeciesContinuousBundle | None = None
     binary: SpeciesPushforwardBundle | None = None
+    config: PushforwardConfig | None = None
 
     @property
     def device(self) -> torch.device:
@@ -153,57 +159,11 @@ def load_species_gnn_rollout_bundle(
     payload = torch.load(path, map_location=dev, weights_only=False)
     meta = dict(payload.get("meta") or {})
     phase = str(meta.get("phase") or payload.get("phase") or "").lower()
-    if bool(meta.get("kin_per_vessel_norm")):
-        os.environ["SPECIES_KIN_PER_VESSEL_NORM"] = "1"
-    scope = meta.get("pushforward_species_scope") or meta.get("species_scope")
-    channels = meta.get("pushforward_species_channels") or meta.get("species_channels")
-    if channels:
-        if isinstance(channels, (list, tuple)):
-            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = ",".join(str(int(c)) for c in channels)
-        else:
-            os.environ["BIOCHEM_PUSHFORWARD_SPECIES_CHANNELS"] = str(channels)
-    elif scope:
-        os.environ["BIOCHEM_PUSHFORWARD_SPECIES_SCOPE"] = str(scope)
-    if bool(meta.get("dual_head")):
-        os.environ["SPECIES_CONTINUOUS_DUAL_HEAD"] = "1"
-    if bool(meta.get("vel_decay")):
-        os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = "1"
-    if bool(meta.get("flow_feats")):
-        # Reproduce the trained clot-aware flow feature set; deploy source stays 'auto'
-        # (kine base + corrector-coupled override) -- do NOT inherit the training 'gt' source.
-        os.environ["SPECIES_FLOW_FEATS"] = "1"
-        os.environ.pop("SPECIES_FLOW_FEATS_SOURCE", None)
-        # Time-varying flow (Trap C): if the teacher trained on per-step flow, reproduce it at deploy
-        # (the per-step coupled velocity in data.y supplies the dynamic series).
-        if bool(meta.get("flow_dynamic")):
-            os.environ["SPECIES_FLOW_FEATS_DYNAMIC"] = "1"
-    if bool(meta.get("geom_feats")):
-        # Leg C/D: reproduce the static non-flow geometry discriminator block at deploy.
-        os.environ["SPECIES_GEOM_FEATS"] = "1"
-    if bool(meta.get("saturation_gate")):
-        os.environ["SPECIES_CONTINUOUS_SATURATION_GATE"] = "1"
-    # Retired: do not re-enable temporal lambda gate from legacy checkpoint metadata.
-    os.environ["SPECIES_CONTINUOUS_TEMPORAL_GATE"] = "0"
+    config = PushforwardConfig.from_meta(meta)
 
-    # Restore leg spec overrides if present in metadata or inferred from path
-    overrides = meta.get("env_overrides")
-    if overrides:
-        for k, v in overrides.items():
-            os.environ[k] = str(v)
-    else:
-        path_s = str(path).replace("\\", "/")
-        if "mat_growth_ladder/" in path_s:
-            parts = path_s.split("mat_growth_ladder/")
-            if len(parts) > 1:
-                leg = parts[1].split("/")[0]
-                if leg:
-                    try:
-                        from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env
-                        apply_mat_growth_leg_env(leg, force=True)
-                    except Exception as e:
-                        if not quiet:
-                            print(f"[WARN] Failed to apply leg env for {leg} from path: {e}")
-
+    # Note: Closed-loop models and flow features are resolved based on the new config rather than global env variables,
+    # though some environment overrides might be required during transition.
+    
     label = _bundle_label_from_path(path, phase)
     if (
         "continuous" in phase
@@ -216,11 +176,11 @@ def load_species_gnn_rollout_bundle(
         cont = load_continuous_bundle(path, device=dev, quiet=True)
         if cont is None:
             return None
-        return SpeciesGnnRolloutBundle(kind="continuous", label=label, continuous=cont)
+        return SpeciesGnnRolloutBundle(kind="continuous", label=label, continuous=cont, config=config)
     binary = load_pushforward_bundle(path, device=dev, quiet=True)
     if binary is None:
         return None
-    return SpeciesGnnRolloutBundle(kind="binary", label=label, binary=binary)
+    return SpeciesGnnRolloutBundle(kind="binary", label=label, binary=binary, config=config)
 
 
 @torch.no_grad()
@@ -280,6 +240,9 @@ def species_gnn_static_from_band_dict(
         pos_band=stat.get("pos_band"),
         flow_series=stat.get("flow_series"),
         flow_cols=stat.get("flow_cols"),
+        wall_normals_band=stat.get("wall_normals_band"),
+        sdf_band=stat.get("sdf_band"),
+        edge_attr_band=stat.get("edge_attr_band"),
     )
 
 
@@ -331,25 +294,47 @@ def rollout_species_gnn_species_series(
         assert bundle.continuous is not None
         model = bundle.continuous.model
         wmask = data.mask_wall[stat.node_idx] if hasattr(data, "mask_wall") and data.mask_wall is not None else None
-        bind_band_geometry(model, {"pos_band": stat.pos_band, "edge_index": stat.edge_index, "wall_mask_band": wmask})
+        bind_band_geometry(
+            model,
+            {
+                "pos_band": stat.pos_band,
+                "edge_index": stat.edge_index,
+                "wall_mask_band": wmask,
+                "wall_normals_band": stat.wall_normals_band,
+                "sdf_band": stat.sdf_band,
+                "edge_attr_band": stat.edge_attr_band,
+            },
+        )
         log_state = deploy_fimat_log_init(data, dev, stat.node_idx)
-        vel_alphas = model_vel_decay_alphas(model) if continuous_vel_decay_enabled() else None
+        vel_alphas = model_vel_decay_alphas(model) if continuous_vel_decay_enabled(config=bundle.config) else None
 
         coupler = None
         mu_bulk_si = None
-        if os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1":
+        closed_loop = False
+        try:
+            from src.architecture.runtime_config import get_active_runtime
+
+            rt = get_active_runtime()
+            if rt is not None:
+                closed_loop = bool(rt.coupling.closed_loop_coupling)
+        except Exception:
+            pass
+        if not closed_loop:
+            closed_loop = os.environ.get("SPECIES_CLOSED_LOOP_COUPLING") == "1"
+        if closed_loop:
             try:
                 from src.inference.corrector_coupling import (
                     ClotAwareFlow,
                     resolve_kinematics_checkpoint,
                     resolve_corrector_checkpoint,
+                    kine_resolve_enabled,
                 )
                 from src.core_physics.clot_growth_masks import resolve_bulk_carreau_mu_si
                 from src.core_physics.coupled_shear_gnn import load_local_corrector
 
                 kine_ckpt = resolve_kinematics_checkpoint()
                 corr_ckpt = resolve_corrector_checkpoint()
-                resolve_on = os.environ.get("BIOCHEM_KINE_RESOLVE_ON_CLOT") == "1"
+                resolve_on = kine_resolve_enabled()
                 if resolve_on:
                     cache_key = ("resolve", str(kine_ckpt), str(corr_ckpt), str(dev))
                     if cache_key in _CLOSED_LOOP_MODELS_CACHE:
@@ -380,7 +365,10 @@ def rollout_species_gnn_species_series(
             out[t, :, sc.SPECIES_BLOCK] = sp
             if t >= n_steps - 1:
                 break
-            vel_val = data.y[t, stat.node_idx, 0:2] if hasattr(data, "y") and data.y is not None and t < data.y.shape[0] else None
+            # Deploy-faithful UV only (coupled / u0_pred / RGP-DEQ). Never COMSOL data.y.
+            vel_val = band_uv_for_model(
+                data, t, dev, stat.node_idx, for_training=False
+            )
             pred_delta = predict_continuous_step_delta(
                 model,
                 stat.base_feats,
@@ -407,6 +395,7 @@ def rollout_species_gnn_species_series(
                 straight_through=False,
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
+                wall_mask=wmask,
             )
 
             # If closed loop coupling is enabled, update velocity for t+1
@@ -421,9 +410,20 @@ def rollout_species_gnn_species_series(
                     species_log12 = sp_next
                     
                     phi_clot = differentiable_clot_phi_from_species12(species_log12, bio)
+                    use_kine_flow = False
+                    try:
+                        from src.core_physics.species_deploy_rollout import species_rollout_vel_source
+
+                        use_kine_flow = species_rollout_vel_source() == "kinematics"
+                    except Exception:
+                        pass
+                    if not use_kine_flow:
+                        use_kine_flow = (
+                            os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
+                            or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+                        )
                     if (
-                        os.environ.get("T0_R4_FLOW_SOURCE") == "kinematics"
-                        or os.environ.get("CLOT_PHI_VEL_SOURCE") == "kinematics"
+                        use_kine_flow
                         or not hasattr(data, "y") or data.y is None or data.y.numel() == 0 or bool((data.y == 0).all().item())
                     ):
                         u_t1, v_t1 = u0, v0
@@ -488,8 +488,19 @@ def rollout_species_gnn_species_series(
 
 
 def _resolve_flow_source(flow_source: str | None) -> str:
+    if flow_source is None:
+        try:
+            from src.core_physics.species_deploy_rollout import species_rollout_vel_source
+
+            src = species_rollout_vel_source()
+            if src in ("kinematics", "coupled"):
+                return "kinematics"
+            if src == "gt":
+                return "gt"
+        except Exception:
+            pass
     raw = (flow_source or os.environ.get("T0_R4_FLOW_SOURCE") or "gt").strip().lower()
-    if raw in ("pred", "kine", "kinematics", "deq", "gino"):
+    if raw in ("pred", "kine", "kinematics", "deq", "gino", "auto"):
         return "kinematics"
     return "gt"
 
@@ -513,12 +524,23 @@ def rollout_species_gnn_phi_trajectory(
     pred = rollout_species_gnn_species_series(
         data, bundle, static, phys_cfg=phys, bio_cfg=bio, device=dev,
     )
-    from src.core_physics.species_viscosity_calibration import resolve_deploy_gelation_beta
+    from src.core_physics.species_viscosity_calibration import resolve_clot_readout_beta
 
-    gel_beta = resolve_deploy_gelation_beta(dev)
+    # Explicit override only -- keeps timeline metrics on the same grading as deploy_clot_f1
+    # and stops the stale on-disk t=53 beta from silently re-grading phi.
+    gel_beta = resolve_clot_readout_beta()
     flow = _resolve_flow_source(flow_source)
-    import os
-    nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
+    nuc_hops = 1
+    try:
+        from src.architecture.runtime_config import get_active_runtime
+
+        rt = get_active_runtime()
+        if rt is not None:
+            nuc_hops = int(rt.rollout.nucleation_hops)
+        else:
+            nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
+    except Exception:
+        nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "1"))
     with t0_rung2_env():
         traj = rollout_t0_clot_phi(
             data, phys, bio, dev,

@@ -38,6 +38,11 @@ from src.core_physics.clot_growth_masks import (
 )
 from src.biochem_gnn.config import PHASE_CKPT, apply_deploy_env, apply_train_recipe_env
 from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env
+from src.architecture.runtime_config import (
+    BiochemRuntimeConfig,
+    get_active_runtime,
+    use_biochem_runtime,
+)
 from src.training.biochem_species_scope import (
     pushforward_species_scope,
     pushforward_state_bulk_indices,
@@ -78,6 +83,7 @@ from src.core_physics.species_pushforward_continuous import (
     continuous_teacher_fp_frac,
     continuous_teacher_noise_sigma,
     continuous_vel_decay_enabled,
+    continuous_vel_decay_wall_only,
     curriculum_unroll_for_epoch,
     eval_deploy_clot_f1,
     eval_full_rollout_fimat_f1,
@@ -108,6 +114,7 @@ from src.core_physics.species_pushforward_continuous import (
     continuous_delta_threshold,
     continuous_delta_value_scale,
     continuous_huber_beta_growth,
+    continuous_underpred_weight,
 )
 from src.core_physics.species_pushforward_gnn import (
     build_band_base_features,
@@ -137,25 +144,39 @@ from src.utils import species_channels as sc
 
 @torch.no_grad()
 def build_global_base_features(data, kine_model, device) -> torch.Tensor:
-    """Build kinematic, SDF, and flow features globally on the full graph."""
+    """Build kinematic, SDF, and flow features globally on the full graph.
+
+    When ``SPECIES_KIN_PER_VESSEL_NORM`` is on, apply the same per-vessel z_kin
+    standardization as ``build_band_base_features`` (stats over all nodes). Without
+    this, global tiles disagree with deploy band feats (cos~0.15 on lumen).
+    """
     n = int(data.num_nodes)
     z_kin = predict_kinematics_latent(kine_model, data)
     sdf = sdf_nd_from_data(data, device, n)
-    
-    from src.core_physics.species_snapshot_gnn import build_snapshot_features
-    base_feats = build_snapshot_features(z_kin, sdf)
-    
+
+    from src.core_physics.species_snapshot_gnn import (
+        build_snapshot_features,
+        kin_per_vessel_norm_enabled,
+        kinematic_latent_band_stats,
+    )
+
+    kin_mean = kin_std = None
+    if kin_per_vessel_norm_enabled():
+        all_nodes = torch.arange(n, device=device)
+        kin_mean, kin_std = kinematic_latent_band_stats(z_kin, all_nodes)
+    base_feats = build_snapshot_features(z_kin, sdf, kin_mean=kin_mean, kin_std=kin_std)
+
     from src.core_physics.species_pushforward_gnn import _resolve_flow_uv, _flow_feats_from_uv
     if flow_feats_enabled():
         u, v = _resolve_flow_uv(data, kine_model, device)
         flow = _flow_feats_from_uv(data, u, v, device, torch.arange(n, device=device))
         base_feats = torch.cat([base_feats, flow], dim=1)
-    
+
     if geom_feats_enabled():
         from src.core_physics.species_pushforward_gnn import _geometry_band_features
         geom = _geometry_band_features(data, device, torch.arange(n, device=device)).to(dtype=base_feats.dtype)
         base_feats = torch.cat([base_feats, geom], dim=1)
-        
+
     return base_feats
 
 
@@ -197,13 +218,13 @@ def _build_anchor_pack_offwall(
     from src.core_physics.clot_phi_simple import _wall_mask_from_data
     wall_mask_full = _wall_mask_from_data(data, device, data.num_nodes).to("cpu")
 
-    # Pre-build dynamic flow series if enabled
+    # Pre-build dynamic flow series if enabled (source-gated: gt vs kine/auto).
     flow_series_global = None
     flow_cols = None
     if flow_feats_enabled() and flow_feats_dynamic() and getattr(data, "y", None) is not None and data.y.dim() == 3:
-        from src.core_physics.species_pushforward_gnn import _flow_feats_series_from_y
-        flow_series_global = _flow_feats_series_from_y(
-            data, device, torch.arange(data.num_nodes, device=device)
+        from src.core_physics.species_pushforward_gnn import build_flow_feats_series
+        flow_series_global = build_flow_feats_series(
+            data, kine_model, device, torch.arange(data.num_nodes, device=device)
         ).to("cpu")
         # Identify starting column of flow features: base snapshot features are z_kin + sdf
         z_kin = predict_kinematics_latent(kine_model, data)
@@ -322,9 +343,11 @@ def compute_shape_loss(
         if t.dim() == 1:
             active = t > active_thresh
             pred_ch = p
+            tgt_ch = t
         else:
             active = t[:, 0] > active_thresh
             pred_ch = p[:, 0]
+            tgt_ch = t[:, 0]
         gt_dilated = graph_dilate_hops(active, edge_index, hops=2)
         pred_active = pred_ch > active_thresh
         fp_mask = pred_active & (~gt_dilated) & mask.reshape(-1)
@@ -338,6 +361,23 @@ def compute_shape_loss(
             )
             loss = loss + 0.5 * fp_loss
 
+        # Missed-mass / under-prediction tilt on active GT nodes (wires SPECIES_CONTINUOUS_UNDERPRED_WEIGHT).
+        under_w = float(continuous_underpred_weight())
+        fn_mask = active & mask.reshape(-1)
+        if under_w > 1.0 and bool(fn_mask.any().item()):
+            pred_fn = pred_ch[fn_mask] * val_scale
+            tgt_fn = tgt_ch[fn_mask] * val_scale
+            # Only penalize when pred lags GT (clamp under-shoot).
+            under = torch.relu(tgt_fn - pred_fn)
+            if bool((under > 0).any().item()):
+                fn_loss = F.huber_loss(
+                    under,
+                    torch.zeros_like(under),
+                    delta=huber_beta,
+                    reduction="mean",
+                )
+                loss = loss + (under_w - 1.0) * fn_loss
+
         if loss_mode == "loss_lumen_shape" and hop_dist is not None:
             lumen = (hop_dist.reshape(-1) >= 2) & mask.reshape(-1)
             if bool(lumen.any().item()) and bool((active & lumen).any().item()):
@@ -346,8 +386,7 @@ def compute_shape_loss(
                 inter = (pred_s * gt_s).sum()
                 pred_sum = pred_s.sum()
                 gt_sum = gt_s.sum()
-                fn_w = float(os.environ.get("SPECIES_LUMEN_SHAPE_FN_W", "2.5"))
-                fp_w = float(os.environ.get("SPECIES_LUMEN_SHAPE_FP_W", "1.0"))
+                fn_w, fp_w = _lumen_shape_dice_weights()
                 dice = (2.0 * inter) / (fp_w * pred_sum + fn_w * gt_sum + 1e-6)
                 loss = loss + float(lumen_shape_weight) * (1.0 - dice)
         return loss
@@ -410,8 +449,12 @@ def growth_specialist_ckpt_score(
     - ``offwall_balanced``: blend relaxed F1 with volume match vs GT (best-practice Arm C).
     - ``hop_ge2_balanced``: prioritize hop>=2 strict F1 + lumen volume match.
     - ``hop_ge2_recall``: limit-analysis score — reward lumen recall (TP/GT), light FP penalty.
+    - ``hop_ge2_target``: hop_ge2_balanced minus spray penalty (zero-GT hop_ge2 preds).
     """
     mode = (ckpt_metric or "clot_score").strip().lower()
+    if mode in ("compound_primary", "deploy_primary", "primary"):
+        # Align with compound_deploy_gates primary tier (score + offwall relaxed).
+        return 0.6 * float(clot_score) + 0.4 * float(offwall_relaxed_f1)
     if mode in ("offwall_relaxed", "offwall_relaxed_f1", "relaxed"):
         return float(offwall_relaxed_f1)
     if mode in ("hop_ge2_recall", "lumen_recall", "recall_push"):
@@ -428,7 +471,7 @@ def growth_specialist_ckpt_score(
             + 0.35 * float(hop_ge2_strict_f1)
             - 0.10 * min(overshoot, 2.0)
         )
-    if mode in ("hop_ge2_balanced", "lumen_balanced", "hop2"):
+    if mode in ("hop_ge2_balanced", "lumen_balanced", "hop2", "hop_ge2_target", "target"):
         n_gt = max(float(hop_ge2_n_gt), 0.0)
         n_pred = max(float(hop_ge2_n_pred), 0.0)
         if n_gt <= 0.0:
@@ -446,6 +489,40 @@ def growth_specialist_ckpt_score(
         vol_match = min(n_pred / n_gt, 1.0)
         return 0.7 * float(offwall_relaxed_f1) + 0.3 * vol_match
     return float(clot_score)
+
+
+def growth_specialist_ckpt_score_with_spray(
+    *,
+    ckpt_metric: str,
+    clot_score: float,
+    offwall_relaxed_f1: float,
+    offwall_n_pred: float,
+    offwall_n_gt: float,
+    hop_ge2_strict_f1: float = 0.0,
+    hop_ge2_n_pred: float = 0.0,
+    hop_ge2_n_gt: float = 0.0,
+    spray_ge2_pred: float = 0.0,
+    spray_penalty: float = 0.02,
+) -> float:
+    """Like ``growth_specialist_ckpt_score`` with explicit zero-GT hop_ge2 spray penalty."""
+    metric_l = (ckpt_metric or "").strip().lower()
+    if metric_l in ("hop_ge2_target", "target"):
+        base_metric = "hop_ge2_balanced"
+    elif metric_l in ("compound_primary_spray", "primary_spray"):
+        base_metric = "compound_primary"
+    else:
+        base_metric = ckpt_metric
+    base = growth_specialist_ckpt_score(
+        ckpt_metric=base_metric,
+        clot_score=clot_score,
+        offwall_relaxed_f1=offwall_relaxed_f1,
+        offwall_n_pred=offwall_n_pred,
+        offwall_n_gt=offwall_n_gt,
+        hop_ge2_strict_f1=hop_ge2_strict_f1,
+        hop_ge2_n_pred=hop_ge2_n_pred,
+        hop_ge2_n_gt=hop_ge2_n_gt,
+    )
+    return float(base) - float(spray_penalty) * min(max(float(spray_ge2_pred), 0.0), 80.0)
 
 def unroll_offwall_loss_custom(
     model: nn.Module,
@@ -552,18 +629,25 @@ def unroll_offwall_loss_custom(
                 lumen_shape_weight=lumen_shape_weight,
             )
             
-            # Decay state for next step
+            # Decay state for next step (deploy-faithful: per-vessel-norm speed + wall-only)
             spd = None
             if continuous_vel_decay_enabled():
-                vel = velocity[step + 1] if velocity is not None and step + 1 < len(velocity) else (velocity[step] if velocity is not None else None)
-                spd = vel.norm(dim=1) if vel is not None else None
-                
+                vel = (
+                    velocity[step + 1]
+                    if velocity is not None and step + 1 < len(velocity)
+                    else (velocity[step] if velocity is not None else None)
+                )
+                if vel is not None:
+                    raw = torch.linalg.vector_norm(vel, dim=-1)
+                    spd = (raw / raw.max().clamp(min=1e-6)).clamp(0.0, 1.0)
+
             log_state = pushforward_log_state_step(
                 log_state,
                 pred_delta,
                 straight_through=model.training and grad_step,
                 wall_speed=spd,
                 vel_decay_alphas=vel_alphas,
+                wall_mask=wall_mask_band,
             )
             
             if step_loss is not None and grad_step:
@@ -611,8 +695,50 @@ def freeze_growth_backbone(model: torch.nn.Module) -> tuple[int, int]:
     return n_frozen, n_train
 
 
+def unfreeze_growth_backbone(model: torch.nn.Module) -> int:
+    """Unfreeze all parameters (inverse of freeze_growth_backbone). Returns trainable count."""
+    n_train = 0
+    for param in model.parameters():
+        param.requires_grad = True
+        n_train += 1
+    return n_train
+
+
+def _lumen_shape_dice_weights() -> tuple[float, float]:
+    """FN/FP soft-Dice weights: prefer active OffwallConfig, else env defaults."""
+    rt = get_active_runtime()
+    if rt is not None:
+        fn_w = float(rt.offwall.lumen_shape_fn_w)
+        fp_w = float(rt.offwall.lumen_shape_fp_w)
+        # Typed defaults are 0; treat unset (both 0) as "use historical defaults".
+        if fn_w > 0.0 or fp_w > 0.0:
+            return (
+                fn_w if fn_w > 0.0 else float(os.environ.get("SPECIES_LUMEN_SHAPE_FN_W", "2.5")),
+                fp_w if fp_w > 0.0 else float(os.environ.get("SPECIES_LUMEN_SHAPE_FP_W", "1.0")),
+            )
+    return (
+        float(os.environ.get("SPECIES_LUMEN_SHAPE_FN_W", "2.5")),
+        float(os.environ.get("SPECIES_LUMEN_SHAPE_FP_W", "1.0")),
+    )
+
+
+def _normalize_two_model_route(route: str) -> str:
+    route_norm = (route or "wall").strip().lower()
+    if route_norm in ("frontier_offwall", "frontier_lumen_only", "frontier-lumen-only"):
+        return "frontier_offwall"
+    if route_norm in ("frontier", "growth", "committed"):
+        return "frontier"
+    return "wall"
+
+
+def _two_model_runtime(**overrides):
+    """Context manager: bind OffwallConfig overrides without relying on env alone."""
+    base = get_active_runtime() or BiochemRuntimeConfig()
+    return use_biochem_runtime(base.with_overrides(**overrides))
+
+
 def _restore_two_model_env(prev: dict[str, str | None]) -> None:
-    """Restore SPECIES_TWO_MODEL_* env keys after compound val."""
+    """Restore SPECIES_TWO_MODEL_* env keys after compound val (legacy bridge)."""
     clear_offwall_model_cache()
     for key, val in prev.items():
         if val is None:
@@ -622,7 +748,7 @@ def _restore_two_model_env(prev: dict[str, str | None]) -> None:
 
 
 @torch.no_grad()
-def eval_compound_wall_route_deploy(
+def eval_compound_route_deploy(
     *,
     growth_model: torch.nn.Module,
     wall_ckpt: Path,
@@ -633,16 +759,19 @@ def eval_compound_wall_route_deploy(
     device: torch.device,
     hidden: int,
     meta_env: dict[str, str] | None = None,
+    route: str = "wall",
+    frontier_hops: float = 1.0,
 ) -> dict:
-    """Wall-route compound deploy: frozen wall ckpt + current growth weights on disk.
+    """Compound deploy eval: frozen wall ckpt + current growth weights on disk.
 
     Saves ``growth_model`` to ``growth_tmp_ckpt`` so the two-model cache can load it,
-    then evaluates with ``eval_deploy_clot_f1`` on the val pack.
+    then evaluates with ``eval_deploy_clot_f1`` on the val pack under the given route.
     """
     prev = {
         "SPECIES_TWO_MODEL_MODE": os.environ.get("SPECIES_TWO_MODEL_MODE"),
         "SPECIES_OFFWALL_MODEL_CKPT": os.environ.get("SPECIES_OFFWALL_MODEL_CKPT"),
         "SPECIES_TWO_MODEL_ROUTE": os.environ.get("SPECIES_TWO_MODEL_ROUTE"),
+        "SPECIES_TWO_MODEL_FRONTIER_HOPS": os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS"),
     }
     save_continuous_checkpoint(
         growth_tmp_ckpt,
@@ -658,10 +787,16 @@ def eval_compound_wall_route_deploy(
         device=device,
         quiet=True,
         architecture="dual",
-        apply_meta_env=False,
+        apply_meta_env=True,
     )
     if wall_bundle is None:
         raise RuntimeError(f"failed to load wall ckpt for compound val: {wall_ckpt}")
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+    )
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+    )
     wall_model = wall_bundle.model
     wall_model.eval()
 
@@ -673,32 +808,76 @@ def eval_compound_wall_route_deploy(
         )
     dummy_static = _band_static_to_device(val_static_pack, device)
     val_data = val_pack["data"].to(device)
+    route_n = _normalize_two_model_route(route)
     try:
         n_val = int(val_data.y.shape[0])
         t_deploy = deploy_eval_time_index(n_val)
         flow_eval = train_deploy_eval_flow_source()
-        apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": flow_eval})
-
-        os.environ["SPECIES_TWO_MODEL_MODE"] = "1"
-        os.environ["SPECIES_OFFWALL_MODEL_CKPT"] = str(growth_tmp_ckpt)
-        os.environ["SPECIES_TWO_MODEL_ROUTE"] = "wall"
-
-        clf = eval_deploy_clot_f1(
-            wall_model,
-            val_data,
-            dummy_static,
-            phys,
-            bio,
-            device,
-            time_index=t_deploy,
-            flow_source=flow_eval,
+        # Keep washout contract aligned with training (train==deploy).
+        apply_deploy_env(
+            overrides={
+                "T0_R4_FLOW_SOURCE": flow_eval,
+                "SPECIES_CONTINUOUS_VEL_DECAY": os.environ.get(
+                    "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+                ),
+                "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": os.environ.get(
+                    "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+                ),
+            }
         )
-        return dict(clf)
+
+        with _two_model_runtime(
+            two_model_mode=True,
+            offwall_model_ckpt=str(growth_tmp_ckpt),
+            two_model_route=route_n,
+            two_model_frontier_hops=float(frontier_hops),
+        ):
+            clf = eval_deploy_clot_f1(
+                wall_model,
+                val_data,
+                dummy_static,
+                phys,
+                bio,
+                device,
+                time_index=t_deploy,
+                flow_source=flow_eval,
+            )
+            return dict(clf)
     finally:
         _restore_two_model_env(prev)
         del wall_bundle, wall_model, val_data
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+
+def eval_compound_wall_route_deploy(
+    *,
+    growth_model: torch.nn.Module,
+    wall_ckpt: Path,
+    growth_tmp_ckpt: Path,
+    val_pack: dict,
+    phys: PhysicsConfig,
+    bio: BiochemConfig,
+    device: torch.device,
+    hidden: int,
+    meta_env: dict[str, str] | None = None,
+    route: str = "wall",
+    frontier_hops: float = 1.0,
+) -> dict:
+    """Backward-compatible alias for wall-route compound val."""
+    return eval_compound_route_deploy(
+        growth_model=growth_model,
+        wall_ckpt=wall_ckpt,
+        growth_tmp_ckpt=growth_tmp_ckpt,
+        val_pack=val_pack,
+        phys=phys,
+        bio=bio,
+        device=device,
+        hidden=hidden,
+        meta_env=meta_env,
+        route=route,
+        frontier_hops=frontier_hops,
+    )
 
 
 @torch.no_grad()
@@ -723,19 +902,23 @@ def eval_wall_only_deploy_floor(
         "SPECIES_TWO_MODEL_ROUTE": os.environ.get("SPECIES_TWO_MODEL_ROUTE"),
     }
     clear_offwall_model_cache()
-    os.environ["SPECIES_TWO_MODEL_MODE"] = "0"
-    os.environ.pop("SPECIES_OFFWALL_MODEL_CKPT", None)
-    os.environ.pop("SPECIES_TWO_MODEL_ROUTE", None)
 
     wall_bundle = load_continuous_bundle(
         str(wall_ckpt),
         device=device,
         quiet=True,
         architecture="dual",
-        apply_meta_env=False,
+        apply_meta_env=True,
     )
     if wall_bundle is None:
         raise RuntimeError(f"failed to load wall ckpt for A floor: {wall_ckpt}")
+    # Re-pin washout contract after wall meta restore (train==deploy).
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+    )
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+    )
     wall_model = wall_bundle.model
     wall_model.eval()
 
@@ -745,18 +928,29 @@ def eval_wall_only_deploy_floor(
         n_val = int(val_data.y.shape[0])
         t_deploy = deploy_eval_time_index(n_val)
         flow_eval = train_deploy_eval_flow_source()
-        apply_deploy_env(overrides={"T0_R4_FLOW_SOURCE": flow_eval})
-        clf = eval_deploy_clot_f1(
-            wall_model,
-            val_data,
-            dummy_static,
-            phys,
-            bio,
-            device,
-            time_index=t_deploy,
-            flow_source=flow_eval,
+        apply_deploy_env(
+            overrides={
+                "T0_R4_FLOW_SOURCE": flow_eval,
+                "SPECIES_CONTINUOUS_VEL_DECAY": os.environ.get(
+                    "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+                ),
+                "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": os.environ.get(
+                    "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+                ),
+            }
         )
-        return float(clf.get("deploy_clot_f1", 0.0))
+        with _two_model_runtime(two_model_mode=False, offwall_model_ckpt="", two_model_route="wall"):
+            clf = eval_deploy_clot_f1(
+                wall_model,
+                val_data,
+                dummy_static,
+                phys,
+                bio,
+                device,
+                time_index=t_deploy,
+                flow_source=flow_eval,
+            )
+            return float(clf.get("deploy_clot_f1", 0.0))
     finally:
         _restore_two_model_env(prev)
         del wall_bundle, wall_model, val_data
@@ -764,12 +958,282 @@ def eval_wall_only_deploy_floor(
             torch.cuda.empty_cache()
 
 
+def _mean_metric(dicts: list[dict], key: str) -> float:
+    if not dicts:
+        return 0.0
+    return float(sum(float(d.get(key, 0.0) or 0.0) for d in dicts) / len(dicts))
+
+
+def eval_compound_route_deploy_mean(
+    *,
+    growth_model: torch.nn.Module,
+    wall_ckpt: Path,
+    growth_tmp_ckpt: Path,
+    val_packs: list[dict],
+    phys: PhysicsConfig,
+    bio: BiochemConfig,
+    device: torch.device,
+    hidden: int,
+    meta_env: dict[str, str] | None = None,
+    route: str = "wall",
+    frontier_hops: float = 1.0,
+    spray_packs: list[dict] | None = None,
+    spray_val_max_ge2: float = 8.0,
+) -> dict:
+    """Mean compound-deploy metrics over a full validation pack set.
+
+    Loads the wall model once and saves the growth tmp ckpt once, then reuses
+    both across all val (+ optional spray) anchors (avoids N disk reloads).
+    """
+    if not val_packs:
+        raise RuntimeError("eval_compound_route_deploy_mean requires at least one val pack")
+
+    prev = {
+        "SPECIES_TWO_MODEL_MODE": os.environ.get("SPECIES_TWO_MODEL_MODE"),
+        "SPECIES_OFFWALL_MODEL_CKPT": os.environ.get("SPECIES_OFFWALL_MODEL_CKPT"),
+        "SPECIES_TWO_MODEL_ROUTE": os.environ.get("SPECIES_TWO_MODEL_ROUTE"),
+        "SPECIES_TWO_MODEL_FRONTIER_HOPS": os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS"),
+    }
+    save_continuous_checkpoint(
+        growth_tmp_ckpt,
+        growth_model,
+        {
+            "tmp_compound_val": True,
+            "env_overrides": meta_env or collect_active_env_overrides(),
+        },
+    )
+    clear_offwall_model_cache()
+    wall_bundle = load_continuous_bundle(
+        str(wall_ckpt),
+        device=device,
+        quiet=True,
+        architecture="dual",
+        apply_meta_env=True,
+    )
+    if wall_bundle is None:
+        raise RuntimeError(f"failed to load wall ckpt for compound val: {wall_ckpt}")
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+    )
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+    )
+    wall_model = wall_bundle.model
+    wall_model.eval()
+
+    route_n = _normalize_two_model_route(route)
+    flow_eval = train_deploy_eval_flow_source()
+    apply_deploy_env(
+        overrides={
+            "T0_R4_FLOW_SOURCE": flow_eval,
+            "SPECIES_CONTINUOUS_VEL_DECAY": os.environ.get(
+                "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+            ),
+            "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": os.environ.get(
+                "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+            ),
+        }
+    )
+
+    def _eval_one(vp: dict) -> dict:
+        val_static_pack = vp.get("band_static")
+        if not isinstance(val_static_pack, dict) or "base_feats" not in val_static_pack:
+            raise RuntimeError(
+                "compound-val requires val_pack['band_static'] from "
+                "_build_anchor_pack_offwall"
+            )
+        dummy_static = _band_static_to_device(val_static_pack, device)
+        val_data = vp["data"].to(device)
+        try:
+            n_val = int(val_data.y.shape[0])
+            t_deploy = deploy_eval_time_index(n_val)
+            clf = eval_deploy_clot_f1(
+                wall_model,
+                val_data,
+                dummy_static,
+                phys,
+                bio,
+                device,
+                time_index=t_deploy,
+                flow_source=flow_eval,
+            )
+        finally:
+            del val_data
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        row = dict(clf)
+        row["anchor"] = vp.get("anchor")
+        return row
+
+    per: list[dict] = []
+    spray_ge2_pred = 0.0
+    spray_reject = False
+    try:
+        with _two_model_runtime(
+            two_model_mode=True,
+            offwall_model_ckpt=str(growth_tmp_ckpt),
+            two_model_route=route_n,
+            two_model_frontier_hops=float(frontier_hops),
+        ):
+            for vp in val_packs:
+                row = _eval_one(vp)
+                per.append(row)
+                print(
+                    f"[i] compound-val {vp.get('anchor')}: "
+                    f"f1={float(row.get('deploy_clot_f1', 0.0)):.3f} "
+                    f"score={float(row.get('deploy_clot_score', 0.0)):.3f} "
+                    f"offwall={float(row.get('deploy_clot_offwall_n_pred', 0.0)):.0f}/"
+                    f"{float(row.get('deploy_clot_offwall_n_gt', 0.0)):.0f}",
+                    flush=True,
+                )
+            for sp in spray_packs or []:
+                row = _eval_one(sp)
+                s_pred = float(row.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0) or 0.0)
+                s_gt = float(row.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0) or 0.0)
+                print(
+                    f"[i] spray-val {sp.get('anchor')}: ge2={s_pred:.0f}/{s_gt:.0f} "
+                    f"f1={float(row.get('deploy_clot_f1', 0.0)):.3f}",
+                    flush=True,
+                )
+                if s_gt <= 0.5:
+                    spray_ge2_pred += s_pred
+                    if s_pred > float(spray_val_max_ge2):
+                        spray_reject = True
+                else:
+                    overshoot = max(0.0, s_pred - s_gt)
+                    spray_ge2_pred += overshoot
+                    if s_pred > max(float(spray_val_max_ge2), s_gt * 1.5):
+                        spray_reject = True
+    finally:
+        _restore_two_model_env(prev)
+        del wall_bundle, wall_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    return {
+        "deploy_clot_score": _mean_metric(per, "deploy_clot_score"),
+        "deploy_clot_f1": _mean_metric(per, "deploy_clot_f1"),
+        "deploy_clot_offwall_relaxed_f1": _mean_metric(per, "deploy_clot_offwall_relaxed_f1"),
+        "deploy_clot_offwall_strict_f1": _mean_metric(per, "deploy_clot_offwall_strict_f1"),
+        "deploy_clot_offwall_n_pred": _mean_metric(per, "deploy_clot_offwall_n_pred"),
+        "deploy_clot_offwall_n_gt": _mean_metric(per, "deploy_clot_offwall_n_gt"),
+        "deploy_clot_offwall_strict_f1_hop_ge2": _mean_metric(
+            per, "deploy_clot_offwall_strict_f1_hop_ge2"
+        ),
+        "deploy_clot_offwall_n_pred_hop_ge2": _mean_metric(
+            per, "deploy_clot_offwall_n_pred_hop_ge2"
+        ),
+        "deploy_clot_offwall_n_gt_hop_ge2": _mean_metric(
+            per, "deploy_clot_offwall_n_gt_hop_ge2"
+        ),
+        "n_val_anchors": float(len(per)),
+        "per_anchor": per,
+        "spray_ge2_pred": float(spray_ge2_pred),
+        "spray_reject": bool(spray_reject),
+    }
+
+
+def eval_wall_only_deploy_floor_mean(
+    *,
+    wall_ckpt: Path,
+    val_packs: list[dict],
+    phys: PhysicsConfig,
+    bio: BiochemConfig,
+    device: torch.device,
+) -> float:
+    """Mean Arm-A clot F1 over the full validation pack set (wall loaded once)."""
+    if not val_packs:
+        raise RuntimeError("eval_wall_only_deploy_floor_mean requires at least one val pack")
+
+    prev = {
+        "SPECIES_TWO_MODEL_MODE": os.environ.get("SPECIES_TWO_MODEL_MODE"),
+        "SPECIES_OFFWALL_MODEL_CKPT": os.environ.get("SPECIES_OFFWALL_MODEL_CKPT"),
+        "SPECIES_TWO_MODEL_ROUTE": os.environ.get("SPECIES_TWO_MODEL_ROUTE"),
+    }
+    clear_offwall_model_cache()
+
+    wall_bundle = load_continuous_bundle(
+        str(wall_ckpt),
+        device=device,
+        quiet=True,
+        architecture="dual",
+        apply_meta_env=True,
+    )
+    if wall_bundle is None:
+        raise RuntimeError(f"failed to load wall ckpt for A floor: {wall_ckpt}")
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+    )
+    os.environ["SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY"] = os.environ.get(
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+    )
+    wall_model = wall_bundle.model
+    wall_model.eval()
+    flow_eval = train_deploy_eval_flow_source()
+    apply_deploy_env(
+        overrides={
+            "T0_R4_FLOW_SOURCE": flow_eval,
+            "SPECIES_CONTINUOUS_VEL_DECAY": os.environ.get(
+                "SPECIES_CONTINUOUS_VEL_DECAY", "1"
+            ),
+            "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY": os.environ.get(
+                "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY", "1"
+            ),
+        }
+    )
+
+    floors: list[float] = []
+    try:
+        with _two_model_runtime(two_model_mode=False, offwall_model_ckpt="", two_model_route="wall"):
+            for vp in val_packs:
+                val_static_pack = vp.get("band_static")
+                if not isinstance(val_static_pack, dict) or "base_feats" not in val_static_pack:
+                    raise RuntimeError(
+                        "A-floor requires val_pack['band_static'] from _build_anchor_pack_offwall"
+                    )
+                dummy_static = _band_static_to_device(val_static_pack, device)
+                val_data = vp["data"].to(device)
+                try:
+                    n_val = int(val_data.y.shape[0])
+                    t_deploy = deploy_eval_time_index(n_val)
+                    clf = eval_deploy_clot_f1(
+                        wall_model,
+                        val_data,
+                        dummy_static,
+                        phys,
+                        bio,
+                        device,
+                        time_index=t_deploy,
+                        flow_source=flow_eval,
+                    )
+                    floors.append(float(clf.get("deploy_clot_f1", 0.0)))
+                finally:
+                    del val_data
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+    finally:
+        _restore_two_model_env(prev)
+        del wall_bundle, wall_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return float(sum(floors) / max(len(floors), 1))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Train decoupled off-wall species continuous GNN with shape losses")
     ap.add_argument("--anchor", default="patient007")
     ap.add_argument("--anchors", default="", help="Comma-separated anchors for multi-vessel train")
     ap.add_argument("--all-anchors", action="store_true", help="Train on all biochem anchor graphs on disk")
-    ap.add_argument("--val-anchor", default="patient007", help="Holdout anchor for val logging")
+    ap.add_argument(
+        "--val-anchor",
+        default="patient007",
+        help="Primary holdout anchor for val (used if --val-anchors empty)",
+    )
+    ap.add_argument(
+        "--val-anchors",
+        default="",
+        help="Comma-separated validation anchors; compound-val / A-floor mean over all",
+    )
     ap.add_argument("--init", default="", help="Optional checkpoint to warm-start")
     ap.add_argument("--no-init", action="store_true", help="Random init")
     ap.add_argument("--epochs", type=int, default=50)
@@ -793,7 +1257,17 @@ def main() -> int:
         "--max-tiles-per-window",
         type=int,
         default=8,
-        help="Cap connected-component tiles per window (largest first); ignored for union",
+        help="Cap per-component tiles per window (ignored for union mode)",
+    )
+    ap.add_argument(
+        "--train-feat-source",
+        choices=("band", "global"),
+        default="band",
+        help=(
+            "band=wall-band features matching eval_mat_growth_simple (default; fixes "
+            "train/deploy kin mismatch that hard-zeros patient001 hop_ge2); "
+            "global=legacy full-graph features (ablate only)"
+        ),
     )
     ap.add_argument(
         "--frontier-hops",
@@ -818,9 +1292,22 @@ def main() -> int:
     )
     ap.add_argument(
         "--ckpt-metric",
-        choices=("clot_score", "offwall_relaxed", "offwall_balanced", "hop_ge2_balanced", "hop_ge2_recall"),
+        choices=(
+            "clot_score",
+            "offwall_relaxed",
+            "offwall_balanced",
+            "hop_ge2_balanced",
+            "hop_ge2_recall",
+            "hop_ge2_target",
+            "compound_primary",
+            "compound_primary_spray",
+        ),
         default="clot_score",
-        help="hop_ge2_balanced=prec+vol; hop_ge2_recall=limit-analysis recall push",
+        help=(
+            "compound_primary=0.6*deploy_clot_score+0.4*offwall_relaxed; "
+            "compound_primary_spray=primary minus spray penalty; "
+            "hop_ge2_target=balanced minus zero-GT spray penalty"
+        ),
     )
     ap.add_argument(
         "--lumen-shape-weight",
@@ -836,7 +1323,19 @@ def main() -> int:
     ap.add_argument(
         "--compound-val",
         action="store_true",
-        help="Val = wall-route compound deploy (wall ckpt + this growth model) on --val-anchor",
+        help="Val = compound deploy (wall ckpt + this growth model) on --val-anchor",
+    )
+    ap.add_argument(
+        "--compound-val-route",
+        choices=("wall", "frontier", "frontier_offwall", "frontier_lumen_only"),
+        default="wall",
+        help="Two-model route during --compound-val (frontier/frontier_offwall match deploy)",
+    )
+    ap.add_argument(
+        "--compound-val-frontier-hops",
+        type=float,
+        default=1.0,
+        help="Frontier hops during --compound-val when route=frontier (0.5=tight off-wall shell)",
     )
     ap.add_argument(
         "--wall-ckpt",
@@ -856,9 +1355,44 @@ def main() -> int:
         help="Run compound deploy val every N epochs (1=every epoch)",
     )
     ap.add_argument(
+        "--spray-val-anchors",
+        default="",
+        help="Comma anchors used as spray probes (must be in --anchors). Reject if hop_ge2 pred exceeds max while GT=0.",
+    )
+    ap.add_argument(
+        "--spray-val-max-ge2",
+        type=float,
+        default=2.0,
+        help="Max allowed hop_ge2 pred on a zero-GT spray val anchor before reject",
+    )
+    ap.add_argument(
+        "--spray-score-penalty",
+        type=float,
+        default=0.025,
+        help="Per predicted hop_ge2 node penalty on spray anchors (hop_ge2_target)",
+    )
+    ap.add_argument(
         "--freeze-backbone",
         action="store_true",
         help="Freeze SAGE/conv; train spatial/magnitude heads only (wall-protect)",
+    )
+    ap.add_argument(
+        "--backbone-unfreeze-after",
+        type=int,
+        default=0,
+        help="After this epoch (1-based), unfreeze backbone for --backbone-unfreeze-epochs",
+    )
+    ap.add_argument(
+        "--backbone-unfreeze-epochs",
+        type=int,
+        default=0,
+        help="Partial-unfreeze window length (0=stay frozen/unfrozen per --freeze-backbone)",
+    )
+    ap.add_argument(
+        "--backbone-unfreeze-lr",
+        type=float,
+        default=None,
+        help="LR during partial-unfreeze window (default: 0.25 * base lr)",
     )
     ap.add_argument(
         "--mat-leg",
@@ -875,13 +1409,52 @@ def main() -> int:
         load_continuous_bundle(init_ckpt, quiet=True, apply_meta_env=True)
         print(f"[i] Applied meta environment overrides from {init_ckpt} early", flush=True)
 
+    # Snapshot specialist loss knobs + washout contract set by launchers before leg force-apply.
+    # apply_mat_growth_leg_env(force=True) would otherwise reset UNDERPRED to the
+    # WC_v7 default (2.0) and erase crack/recall FN tilt (e.g. 12.0).
+    _launcher_loss_keys = (
+        "SPECIES_CONTINUOUS_UNDERPRED_WEIGHT",
+        "SPECIES_LUMEN_SHAPE_FN_W",
+        "SPECIES_LUMEN_SHAPE_FP_W",
+        "SPECIES_CONTINUOUS_VEL_DECAY",
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY",
+    )
+    _launcher_loss_env = {
+        k: str(os.environ.get(k, "")).strip()
+        for k in _launcher_loss_keys
+        if str(os.environ.get(k, "")).strip()
+    }
+
     # Mat-leg last (force) so WC_v7 feature/physics knobs win over stale init meta.
     if args.mat_leg.strip():
         apply_mat_growth_leg_env(args.mat_leg.strip(), force=True)
         print(f"[i] Applied mat-growth leg env: {args.mat_leg.strip()}", flush=True)
 
-    # Never wall-only gelation for a growth specialist
-    os.environ["CLOT_PHI_PHYSICS_WALL_MAT_ONLY"] = "0"
+    for k, v in _launcher_loss_env.items():
+        os.environ[k] = v
+    if _launcher_loss_env:
+        print(
+            "[i] Restored launcher loss overrides: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(_launcher_loss_env.items())),
+            flush=True,
+        )
+
+    # Never wall-only gelation for a growth specialist — typed rollout + residual env.
+    from src.architecture.pushforward_config import get_active_config
+    from src.biochem_gnn.config import _bind_typed_configs
+
+    rt_ov: dict = {"wall_mat_only": False}
+    if "SPECIES_LUMEN_SHAPE_FN_W" in _launcher_loss_env:
+        rt_ov["lumen_shape_fn_w"] = float(_launcher_loss_env["SPECIES_LUMEN_SHAPE_FN_W"])
+    if "SPECIES_LUMEN_SHAPE_FP_W" in _launcher_loss_env:
+        rt_ov["lumen_shape_fp_w"] = float(_launcher_loss_env["SPECIES_LUMEN_SHAPE_FP_W"])
+    pf_active = get_active_config()
+    rt_active = (get_active_runtime() or BiochemRuntimeConfig()).with_overrides(**rt_ov)
+    if pf_active is not None:
+        _bind_typed_configs(pf_active, rt_active)
+    else:
+        use_biochem_runtime(rt_active).__enter__()
+    os.environ.pop("CLOT_PHI_PHYSICS_WALL_MAT_ONLY", None)
     
     unroll = pushforward_unroll_steps() if args.unroll is None else int(args.unroll)
     stride = pushforward_step_stride() if args.stride is None else int(args.stride)
@@ -902,47 +1475,89 @@ def main() -> int:
     bio = BiochemConfig(phase="biochem")
 
     train_anchors = parse_biochem_train_anchors(args.anchors or args.anchor, all_anchors=bool(args.all_anchors), root=root)
-    val_anchor = args.val_anchor.strip() or train_anchors[0]
+    val_anchor_names = [a.strip() for a in str(args.val_anchors).split(",") if a.strip()]
+    if not val_anchor_names:
+        primary = args.val_anchor.strip() or train_anchors[0]
+        val_anchor_names = [primary]
+    # Keep train/val disjoint for packing/logging; train loop only uses `packs`.
+    train_set = set(train_anchors)
+    val_anchor_names = [a for a in val_anchor_names if a]
+    overlap = sorted(train_set & set(val_anchor_names))
+    if overlap:
+        print(
+            f"[WARN] dropping train/val overlap from train packs: {overlap}",
+            flush=True,
+        )
+        train_anchors = [a for a in train_anchors if a not in set(val_anchor_names)]
+        if not train_anchors:
+            raise RuntimeError("no train anchors left after removing val overlap")
+    val_anchor = val_anchor_names[0]
 
     kine_ckpt = str(resolve_kinematics_checkpoint())
     kine_model = load_kinematics_predictor(kine_ckpt, device, phys_cfg=PhysicsConfig(phase="kinematics"))
 
+    def _pack_one(anc: str) -> dict:
+        return _build_anchor_pack_offwall(
+            anc,
+            root=root,
+            device=device,
+            kine_model=kine_model,
+            unroll=unroll,
+            stride=stride,
+            max_windows=int(args.max_windows),
+            phys=phys,
+            bio=bio,
+        )
+
     print(f"[i] Pre-processing graph datasets...", flush=True)
     packs: list[dict] = []
     for anc in train_anchors:
-        packs.append(
-            _build_anchor_pack_offwall(
-                anc,
-                root=root,
-                device=device,
-                kine_model=kine_model,
-                unroll=unroll,
-                stride=stride,
-                max_windows=int(args.max_windows),
-                phys=phys,
-                bio=bio,
-            )
-        )
+        packs.append(_pack_one(anc))
         # Pack tensors stay on CPU; free transient GPU from kinematics / flow series.
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    val_pack = next((p for p in packs if p["anchor"] == val_anchor), packs[0])
+
+    pack_by_name = {p["anchor"]: p for p in packs}
+    val_packs: list[dict] = []
+    for anc in val_anchor_names:
+        if anc in pack_by_name:
+            # Val anchor also present in train list: reuse pack, still val-only for scoring.
+            val_packs.append(pack_by_name[anc])
+            continue
+        val_packs.append(_pack_one(anc))
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    if not val_packs:
+        raise RuntimeError(f"no validation packs resolved from {val_anchor_names}")
+    val_pack = val_packs[0]
 
     # Kinematics predictor is only needed for feature packing; free VRAM for the GNN.
     del kine_model
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(
-        f"[i] Packed {len(packs)} anchors on CPU "
+        f"[i] Packed {len(packs)} train + {len(val_packs)} val anchors on CPU "
         f"(peak GPU after pack free: "
         f"{(torch.cuda.memory_allocated() / (1024 ** 2)):.0f} MiB)"
         if device.type == "cuda"
-        else f"[i] Packed {len(packs)} anchors",
+        else f"[i] Packed {len(packs)} train + {len(val_packs)} val anchors",
         flush=True,
     )
+    print(f"[i] val anchors: {','.join(p['anchor'] for p in val_packs)}", flush=True)
 
-    # Resolve dims using first pack
-    ref_static = packs[0]["base_feats_global"]
+    # Resolve dims using first pack (prefer band feats — same path as deploy).
+    train_feat_source = str(args.train_feat_source).strip().lower()
+    if train_feat_source == "band" and isinstance(packs[0].get("band_static"), dict):
+        ref_static = packs[0]["band_static"]["base_feats"]
+    else:
+        ref_static = packs[0]["base_feats_global"]
+        if train_feat_source == "band":
+            print(
+                "[WARN] --train-feat-source=band but pack missing band_static; "
+                "falling back to global",
+                flush=True,
+            )
+            train_feat_source = "global"
     latent_dim = int(ref_static.shape[1] - 1)
     in_dim = continuous_feature_dim(latent_dim)
 
@@ -967,6 +1582,15 @@ def main() -> int:
     if bool(args.freeze_backbone):
         n_fr, n_tr = freeze_growth_backbone(model)
         print(f"[i] freeze-backbone: frozen={n_fr} trainable_heads={n_tr}", flush=True)
+
+    backbone_unfreeze_after = max(int(args.backbone_unfreeze_after), 0)
+    backbone_unfreeze_epochs = max(int(args.backbone_unfreeze_epochs), 0)
+    backbone_unfreeze_lr = (
+        float(args.backbone_unfreeze_lr)
+        if args.backbone_unfreeze_lr is not None
+        else max(lr * 0.25, 1e-5)
+    )
+    backbone_refrozen = False
 
     # Setup optimizer (trainable params only when backbone frozen)
     opt = optim.Adam(
@@ -1015,6 +1639,8 @@ def main() -> int:
         wall_ckpt_path = root / wall_ckpt_path
     compound_val_every = max(int(args.compound_val_every), 1)
     wall_floor_delta = float(args.wall_clot_floor_delta)
+    compound_val_route = str(args.compound_val_route).strip().lower()
+    compound_val_frontier_hops = float(args.compound_val_frontier_hops)
     a_floor_clot_f1: float | None = None
     growth_tmp_ckpt = out_path.parent / "_compound_val_growth_tmp.pth"
     print(
@@ -1027,8 +1653,12 @@ def main() -> int:
         f"  ckpt metric: {ckpt_metric}\n"
         f"  lumen_shape_weight: {lumen_shape_weight}\n"
         f"  freeze_backbone: {int(bool(args.freeze_backbone))}\n"
+        f"  train_feat_source: {train_feat_source}\n"
         f"  compound_val: {int(use_compound_val)} every={compound_val_every} "
-        f"floor_delta={wall_floor_delta}\n"
+        f"route={compound_val_route} frontier_hops={compound_val_frontier_hops} "
+        f"n_val={len(val_packs)} floor_delta={wall_floor_delta}\n"
+        f"  backbone_unfreeze: after={backbone_unfreeze_after} "
+        f"epochs={backbone_unfreeze_epochs} lr={backbone_unfreeze_lr:.1e}\n"
         f"  mat-leg: {args.mat_leg.strip() or '(none)'}\n"
         f"  output: {out_path}",
         flush=True,
@@ -1037,21 +1667,61 @@ def main() -> int:
     if use_compound_val:
         if not wall_ckpt_path.is_file():
             raise FileNotFoundError(f"--compound-val needs wall ckpt: {wall_ckpt_path}")
-        print(f"[i] Measuring Arm-A clot F1 floor on {val_anchor}...", flush=True)
-        a_floor_clot_f1 = eval_wall_only_deploy_floor(
+        val_names = ",".join(p["anchor"] for p in val_packs)
+        print(f"[i] Measuring Arm-A clot F1 floor on val set ({val_names})...", flush=True)
+        a_floor_clot_f1 = eval_wall_only_deploy_floor_mean(
             wall_ckpt=wall_ckpt_path,
-            val_pack=val_pack,
+            val_packs=val_packs,
             phys=phys,
             bio=bio,
             device=device,
         )
         print(
-            f"[i] A_floor deploy_clot_f1={a_floor_clot_f1:.4f} "
-            f"(reject if compound < {a_floor_clot_f1 - wall_floor_delta:.4f})",
+            f"[i] A_floor mean deploy_clot_f1={a_floor_clot_f1:.4f} "
+            f"(reject if compound mean < {a_floor_clot_f1 - wall_floor_delta:.4f})",
             flush=True,
         )
 
     for ep in range(1, int(args.epochs) + 1):
+        # Scheduled partial backbone unfreeze (1-2 epoch window typical).
+        if (
+            bool(args.freeze_backbone)
+            and backbone_unfreeze_after > 0
+            and backbone_unfreeze_epochs > 0
+            and ep == backbone_unfreeze_after
+        ):
+            n_tr = unfreeze_growth_backbone(model)
+            opt = optim.Adam(
+                (p for p in model.parameters() if p.requires_grad),
+                lr=backbone_unfreeze_lr,
+                weight_decay=1e-5,
+            )
+            backbone_refrozen = False
+            print(
+                f"[i] epoch {ep}: partial backbone unfreeze for "
+                f"{backbone_unfreeze_epochs} ep (lr={backbone_unfreeze_lr:.1e}, "
+                f"trainable={n_tr})",
+                flush=True,
+            )
+        elif (
+            bool(args.freeze_backbone)
+            and backbone_unfreeze_after > 0
+            and backbone_unfreeze_epochs > 0
+            and ep == backbone_unfreeze_after + backbone_unfreeze_epochs
+            and not backbone_refrozen
+        ):
+            n_fr, n_tr = freeze_growth_backbone(model)
+            opt = optim.Adam(
+                (p for p in model.parameters() if p.requires_grad),
+                lr=lr,
+                weight_decay=1e-5,
+            )
+            backbone_refrozen = True
+            print(
+                f"[i] epoch {ep}: refreeze backbone (frozen={n_fr} trainable_heads={n_tr})",
+                flush=True,
+            )
+
         model.train()
         ep_losses: list[float] = []
         ep_tiles = 0
@@ -1065,48 +1735,72 @@ def main() -> int:
             # Keep full timeline graph on CPU (4GB GPUs OOM on data.to(cuda)).
             data_cpu = pack["data"]
             n_nodes = int(data_cpu.num_nodes)
-            edge_index = data_cpu.edge_index.to(device=device)
-            base_feats_global = pack["base_feats_global"].to(device=device)
+            edge_full = data_cpu.edge_index.to(device=device)
             wall_mask_full = pack["wall_mask_full"].to(device=device)
-            pos_cpu = data_cpu.x[:, :2]
-            hop_full = compute_hop_distances(edge_index, wall_mask_full, n_nodes)
+            hop_full = compute_hop_distances(edge_full, wall_mask_full, n_nodes)
+
+            use_band = train_feat_source == "band" and isinstance(pack.get("band_static"), dict)
+            if use_band:
+                band = _band_static_to_device(pack["band_static"], device)
+                band_nodes = band["node_idx"].long()  # full-graph ids
+                edge_train = band["edge_index"]
+                base_feats_train = band["base_feats"]
+                wall_mask_train = band["wall_mask_band"].bool()
+                pos_train = band["pos_band"]
+                hop_train = hop_full[band_nodes]
+                flow_train = band.get("flow_series")
+                flow_cols_train = band.get("flow_cols") or pack.get("flow_cols")
+            else:
+                band_nodes = None
+                edge_train = edge_full
+                base_feats_train = pack["base_feats_global"].to(device=device)
+                wall_mask_train = wall_mask_full
+                pos_train = data_cpu.x[:, :2].to(device=device)
+                hop_train = hop_full
+                flow_train = (
+                    pack["flow_series_global"].to(device)
+                    if pack.get("flow_series_global") is not None
+                    else None
+                )
+                flow_cols_train = pack.get("flow_cols")
 
             for win in wins:
                 win_use = win[: cur_unroll + 1]
 
-                # 1. Active clot union (GT helper streams y[t] only onto device).
-                clot_union = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+                # 1. Clot union on full graph; restrict to band when training on band feats.
+                clot_union_full = torch.zeros(n_nodes, dtype=torch.bool, device=device)
                 for ti in win_use:
                     clot_t = gt_growth_commit_mask_at_time(data_cpu, ti, phys, device)
-                    clot_union |= clot_t
+                    clot_union_full |= clot_t
 
+                clot_union = clot_union_full[band_nodes] if use_band else clot_union_full
                 if not clot_union.any():
                     continue
 
                 if tile_mode == "per_component":
-                    tile_seeds = bool_mask_connected_components(clot_union, edge_index)
+                    tile_seeds = bool_mask_connected_components(clot_union, edge_train)
                     if max_tiles_per_window > 0:
                         tile_seeds = tile_seeds[:max_tiles_per_window]
                 else:
                     tile_seeds = [clot_union]
 
                 for clot_seed in tile_seeds:
-                    # 2-3. Local subgraph around this clot seed (union or one CC)
-                    subgraph_mask = graph_dilate_hops(clot_seed, edge_index, args.hops_k)
-                    node_idx, edge_sub, remap = induced_subgraph(subgraph_mask, edge_index)
+                    # 2-3. Local subgraph in train-graph coords (band-local or full)
+                    subgraph_mask = graph_dilate_hops(clot_seed, edge_train, args.hops_k)
+                    local_idx, edge_sub, _remap = induced_subgraph(subgraph_mask, edge_train)
 
-                    # 4. Supervision mask (relative to this tile's clot seed)
-                    wall_mask_sub = wall_mask_full[node_idx]
-                    hop_sub = hop_full[node_idx]
+                    # 4. Supervision mask
+                    wall_mask_sub = wall_mask_train[local_idx]
+                    hop_sub = hop_train[local_idx]
                     if supervise_mode == "frontier":
-                        growth_zone_full = graph_dilate_hops(clot_seed, edge_index, frontier_hops)
-                        train_mask = growth_zone_full[node_idx]
+                        growth_zone = graph_dilate_hops(clot_seed, edge_train, frontier_hops)
+                        train_mask = growth_zone[local_idx]
                     elif supervise_mode == "frontier_lumen":
-                        growth_zone_full = graph_dilate_hops(clot_seed, edge_index, frontier_hops)
-                        train_mask = growth_zone_full[node_idx] & (~wall_mask_sub)
+                        growth_zone = graph_dilate_hops(clot_seed, edge_train, frontier_hops)
+                        train_mask = growth_zone[local_idx] & (~wall_mask_sub)
                     elif supervise_mode == "frontier_ge2":
-                        growth_zone_full = graph_dilate_hops(clot_seed, edge_index, frontier_hops)
-                        train_mask = growth_zone_full[node_idx] & (hop_sub >= 2)
+                        growth_zone = graph_dilate_hops(clot_seed, edge_train, frontier_hops)
+                        train_mask = growth_zone[local_idx] & (hop_sub >= 2)
                     elif supervise_mode == "hop_ge2":
                         train_mask = hop_sub >= 2
                     else:
@@ -1114,32 +1808,37 @@ def main() -> int:
                     if not train_mask.any():
                         continue
 
-                    # 5. Slice inputs (CPU y -> device only for subgraph nodes / times)
-                    node_idx_cpu = node_idx.detach().cpu()
-                    base_feats_sub = base_feats_global[node_idx]
-                    pos_sub = pos_cpu[node_idx_cpu].to(device=device, dtype=base_feats_sub.dtype)
+                    # 5. Features from train graph; species/vel from full-graph ids
+                    full_idx = band_nodes[local_idx] if use_band else local_idx
+                    full_idx_cpu = full_idx.detach().cpu()
+                    base_feats_sub = base_feats_train[local_idx]
+                    pos_sub = pos_train[local_idx].to(dtype=base_feats_sub.dtype)
 
                     series = []
                     for ti in win_use:
                         y = data_cpu.y[int(ti)].to(device=device, dtype=torch.float32)
                         sp = y[:, sc.SPECIES_BLOCK]
-                        sp_sub = torch.stack([sp[:, int(ch)] for ch in bulk_channels], dim=-1)[node_idx]
+                        sp_sub = torch.stack(
+                            [sp[:, int(ch)] for ch in bulk_channels], dim=-1
+                        )[full_idx]
                         series.append(sp_sub)
 
                     velocity_series = [
-                        data_cpu.y[int(ti), node_idx_cpu, 0:2].to(device=device, dtype=torch.float32)
+                        data_cpu.y[int(ti), full_idx_cpu, 0:2].to(
+                            device=device, dtype=torch.float32
+                        )
                         for ti in win_use
                     ]
                     species_block_full = [
-                        data_cpu.y[int(ti), node_idx_cpu, sc.SPECIES_BLOCK].to(
+                        data_cpu.y[int(ti), full_idx_cpu, sc.SPECIES_BLOCK].to(
                             device=device, dtype=torch.float32
                         )
                         for ti in win_use
                     ]
 
                     flow_series_sub = None
-                    if pack["flow_series_global"] is not None:
-                        flow_series_sub = pack["flow_series_global"][:, node_idx_cpu].to(device)
+                    if flow_train is not None:
+                        flow_series_sub = flow_train[:, local_idx].to(device)
 
                     loss = unroll_offwall_loss_custom(
                         model,
@@ -1150,7 +1849,7 @@ def main() -> int:
                         pos_band=pos_sub,
                         time_window=win_use,
                         flow_series=flow_series_sub,
-                        flow_cols=pack["flow_cols"],
+                        flow_cols=flow_cols_train,
                         wall_mask_band=wall_mask_sub,
                         species_block=species_block_full,
                         velocity=velocity_series,
@@ -1170,7 +1869,7 @@ def main() -> int:
                     ep_losses.append(float(loss.item()))
                     ep_tiles += 1
 
-            del base_feats_global, wall_mask_full, edge_index, hop_full
+            del wall_mask_full, edge_full, hop_full, base_feats_train
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -1195,6 +1894,7 @@ def main() -> int:
         wall_reject = False
         compound_clot_f1 = 0.0
         skipped_compound = False
+        spray_ge2_pred = 0.0
         if bool(args.cheap_val):
             # Smoke path: avoid parking ~200MB y timelines on a 4GB GPU for deploy eval.
             val_clot_score = 0.0
@@ -1223,16 +1923,32 @@ def main() -> int:
                 flush=True,
             )
         elif use_compound_val:
-            clf = eval_compound_wall_route_deploy(
+            spray_names = [a.strip() for a in str(args.spray_val_anchors).split(",") if a.strip()]
+            all_lookup = {p["anchor"]: p for p in packs}
+            for vp in val_packs:
+                all_lookup[vp["anchor"]] = vp
+            spray_packs = []
+            for sname in spray_names:
+                spack = all_lookup.get(sname)
+                if spack is None:
+                    print(f"[WARN] spray-val anchor missing from packs: {sname}", flush=True)
+                    continue
+                spray_packs.append(spack)
+
+            clf = eval_compound_route_deploy_mean(
                 growth_model=model,
                 wall_ckpt=wall_ckpt_path,
                 growth_tmp_ckpt=growth_tmp_ckpt,
-                val_pack=val_pack,
+                val_packs=val_packs,
                 phys=phys,
                 bio=bio,
                 device=device,
                 hidden=hidden,
                 meta_env=collect_active_env_overrides(),
+                route=compound_val_route,
+                frontier_hops=compound_val_frontier_hops,
+                spray_packs=spray_packs,
+                spray_val_max_ge2=float(args.spray_val_max_ge2),
             )
             val_clot_score = float(clf.get("deploy_clot_score", 0.0))
             compound_clot_f1 = float(clf.get("deploy_clot_f1", 0.0))
@@ -1243,7 +1959,10 @@ def main() -> int:
             hop_ge2_strict_f1 = float(clf.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0))
             hop_ge2_n_pred = float(clf.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0))
             hop_ge2_n_gt = float(clf.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0))
-            val_score = growth_specialist_ckpt_score(
+            spray_ge2_pred = float(clf.get("spray_ge2_pred", 0.0) or 0.0)
+            spray_reject = bool(clf.get("spray_reject", False))
+
+            val_score = growth_specialist_ckpt_score_with_spray(
                 ckpt_metric=ckpt_metric,
                 clot_score=val_clot_score,
                 offwall_relaxed_f1=offwall_relaxed_f1,
@@ -1252,30 +1971,35 @@ def main() -> int:
                 hop_ge2_strict_f1=hop_ge2_strict_f1,
                 hop_ge2_n_pred=hop_ge2_n_pred,
                 hop_ge2_n_gt=hop_ge2_n_gt,
+                spray_ge2_pred=spray_ge2_pred,
+                spray_penalty=float(args.spray_score_penalty),
             )
             floor = float(a_floor_clot_f1 if a_floor_clot_f1 is not None else 0.0)
             if compound_clot_f1 < (floor - wall_floor_delta):
                 wall_reject = True
                 print(
-                    f"[WARN] wall-floor reject: compound clot_f1={compound_clot_f1:.4f} "
+                    f"[WARN] wall-floor reject: compound mean clot_f1={compound_clot_f1:.4f} "
                     f"< A_floor={floor:.4f} - {wall_floor_delta:.3f}",
                     flush=True,
                 )
+            if spray_reject:
+                wall_reject = True
+                print(
+                    f"[WARN] spray reject: zero-GT hop_ge2_pred={spray_ge2_pred:.0f} "
+                    f"(max_per_anchor={float(args.spray_val_max_ge2):.0f})",
+                    flush=True,
+                )
         else:
-            val_static = val_pack["base_feats_global"].to(device)
+            # Growth-alone val must also use wall-band static (same as deploy / compound-val).
+            val_static_pack = val_pack.get("band_static")
+            if not isinstance(val_static_pack, dict) or "base_feats" not in val_static_pack:
+                raise RuntimeError(
+                    "growth-alone val requires val_pack['band_static'] "
+                    "(wall-band static matching eval_mat_growth_simple)"
+                )
+            dummy_static = _band_static_to_device(val_static_pack, device)
             val_data = val_pack["data"].to(device)
             try:
-                # Must bind wall_mask_band: dual-head sat / magnitude paths and hop
-                # geometry depend on it. Omitting it made train-val offwall counts
-                # non-reproducible vs eval_mat_growth_simple (firewall seq collapse).
-                wall_band = val_pack["wall_mask_full"].to(device=device)
-                dummy_static = {
-                    "node_idx": torch.arange(int(val_data.num_nodes), device=device),
-                    "base_feats": val_static,
-                    "edge_index": val_data.edge_index,
-                    "pos_band": val_data.x[:, :2].to(dtype=val_static.dtype),
-                    "wall_mask_band": wall_band,
-                }
                 n_val = int(val_data.y.shape[0])
                 t_deploy = deploy_eval_time_index(n_val)
                 _ = eval_full_rollout_fimat_f1(
@@ -1299,7 +2023,7 @@ def main() -> int:
                     flow_source=flow_eval,
                 )
             finally:
-                del val_data, val_static
+                del val_data
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
@@ -1357,7 +2081,11 @@ def main() -> int:
                 "loss_mode": args.loss_mode,
                 "mat_leg": args.mat_leg.strip() or None,
                 "compound_val": use_compound_val,
+                "val_anchors": [p["anchor"] for p in val_packs],
                 "freeze_backbone": bool(args.freeze_backbone),
+                "train_feat_source": train_feat_source,
+                "vel_decay": continuous_vel_decay_enabled(),
+                "vel_decay_wall_only": continuous_vel_decay_wall_only(),
                 "env_overrides": collect_active_env_overrides(),
             }
             save_continuous_checkpoint(out_path, model, meta)
@@ -1429,6 +2157,7 @@ def main() -> int:
                 "supervise_mode": supervise_mode,
                 "loss_mode": args.loss_mode,
                 "freeze_backbone": bool(args.freeze_backbone),
+                "train_feat_source": train_feat_source,
                 "compound_val": use_compound_val,
                 "a_floor_clot_f1": a_floor_clot_f1,
                 "env_overrides": collect_active_env_overrides(),

@@ -15,6 +15,14 @@ from typing import Any, Callable, Iterator
 import numpy as np
 import torch
 
+from src.biochem_gnn.compound_deploy import (
+    COMPOUND_LEG,
+    DEFAULT_COMPOUND_DEPLOY_ENV,
+    WALL_LEG,
+    load_compound_manifest,
+    resolve_growth_ckpt,
+    resolve_wall_ckpt as resolve_compound_wall_ckpt,
+)
 from src.biochem_gnn.mat_growth_simple import apply_mat_growth_leg_env, mat_growth_leg_spec
 from src.config import BiochemConfig, PhysicsConfig
 from src.core_physics.species_gnn_clot_rollout import (
@@ -22,7 +30,7 @@ from src.core_physics.species_gnn_clot_rollout import (
     prepare_species_gnn_rollout_static,
     rollout_species_gnn_species_series,
 )
-from src.core_physics.species_viscosity_calibration import resolve_deploy_gelation_beta
+from src.core_physics.species_viscosity_calibration import resolve_clot_readout_beta
 from src.core_physics.t0_device import require_cuda_device
 from src.core_physics.t0_mu_physics import rollout_t0_clot_phi
 from src.core_physics.t0_rung_config import RUNG2_GAMMA_MODE, t0_rung2_env
@@ -30,12 +38,12 @@ from src.inference.corrector_coupling import CorrectorCoupledFlow
 from src.inference.species_gnn_deploy_env import load_deploy_manifest, species_gnn_deploy_env
 from src.utils.paths import get_project_root
 
-# Canonical = WC_v7_clot_phi_mse (promoted 2026-07-19). locked/ is the source of truth;
-# mat_canonical_deploy/ and species/best.pth are synced aliases.
+# Wall backbone = WC_v7_clot_phi_mse; customer default stacks compound growth specialist
+# (WC_v8_compound_front_h1) via data/reference/mat_compound_deploy.json.
 DEFAULT_WALL_CKPT = Path("outputs/biochem/biochem_gnn/locked/species_gnn_best.pth")
-# Unified WC_v7 already covers off-wall; two-model offwall is opt-in via CUSTOMER_OFFWALL_CKPT.
-DEFAULT_OFFWALL_CKPT: Path | None = None
-DEFAULT_MAT_LEG = "WC_v7_clot_phi_mse"
+DEFAULT_GROWTH_CKPT = Path("outputs/biochem/biochem_gnn/locked/compound_growth_best.pth")
+DEFAULT_MAT_LEG = WALL_LEG
+DEFAULT_COMPOUND_LEG = COMPOUND_LEG
 
 
 @dataclass
@@ -89,12 +97,33 @@ def _abs(path: Path | str) -> Path:
     return p
 
 
+def _compound_mode_requested() -> bool:
+    """Customer default uses compound deploy unless CUSTOMER_COMPOUND=0."""
+    flag = os.environ.get("CUSTOMER_COMPOUND", "1").strip().lower()
+    return flag not in ("0", "false", "no", "off", "wall_only", "wall-only")
+
+
+def _compound_deploy_overrides() -> dict[str, str]:
+    man = load_compound_manifest()
+    deploy = dict(DEFAULT_COMPOUND_DEPLOY_ENV)
+    deploy.update(man.get("deploy") or {})
+    return {
+        str(k): str(v)
+        for k, v in deploy.items()
+        if k != "mat_leg" and (str(k).startswith("SPECIES_") or str(k).startswith("BIOCHEM_"))
+    }
+
+
 def _resolve_wall_ckpt(explicit: Path | str | None = None) -> Path:
     raw = str(explicit or os.environ.get("CUSTOMER_WALL_CKPT") or "").strip()
-    p = _abs(raw) if raw else _abs(DEFAULT_WALL_CKPT)
+    if raw:
+        p = _abs(raw)
+    elif _compound_mode_requested():
+        p = resolve_compound_wall_ckpt()
+    else:
+        p = _abs(DEFAULT_WALL_CKPT)
     if not p.is_file():
-        # Fall back to locked species GNN
-        alt = _abs("outputs/biochem/biochem_gnn/locked/species_gnn_best.pth")
+        alt = _abs(DEFAULT_WALL_CKPT)
         if alt.is_file():
             return alt
     return p
@@ -102,12 +131,18 @@ def _resolve_wall_ckpt(explicit: Path | str | None = None) -> Path:
 
 def _resolve_offwall_ckpt(explicit: Path | str | None = None) -> Path | None:
     raw = str(explicit or os.environ.get("CUSTOMER_OFFWALL_CKPT") or "").strip()
-    if not raw:
-        if DEFAULT_OFFWALL_CKPT is None:
-            return None
-        raw = str(DEFAULT_OFFWALL_CKPT)
-    p = _abs(raw)
-    return p if p.is_file() else None
+    if raw.lower() in ("none", "0", "off", "false", "wall_only", "wall-only"):
+        return None
+    if raw:
+        p = _abs(raw)
+        return p if p.is_file() else None
+    if not _compound_mode_requested():
+        return None
+    growth = resolve_growth_ckpt()
+    if growth.is_file():
+        return growth
+    fallback = _abs(DEFAULT_GROWTH_CKPT)
+    return fallback if fallback.is_file() else None
 
 
 @contextmanager
@@ -131,21 +166,38 @@ def _customer_deploy_env(
         "T0_R4_SPECIES_GNN_CKPT": str(wall_ckpt).replace("\\", "/"),
         "BIOCHEM_CORRECTOR_COUPLING": "1",
     }
-    # Mat-growth recipe (wall + off-wall clot physics)
+    # Mat-growth recipe (wall + off-wall clot physics) -- typed first, residual env last.
     try:
+        from dataclasses import replace as _replace
+
+        from src.architecture.pushforward_config import PushforwardConfig
+        from src.architecture.runtime_config import BiochemRuntimeConfig
+        from src.biochem_gnn.config import _bind_typed_configs
+
         spec = mat_growth_leg_spec(mat_leg)
         overrides.update({k: str(v) for k, v in spec.env_overrides.items()})
+        pf = _replace(PushforwardConfig(), **dict(spec.config_kwargs)) if spec.config_kwargs else PushforwardConfig()
+        rt = BiochemRuntimeConfig.from_kwargs(spec.runtime_kwargs or {})
+        if offwall_ckpt is not None:
+            rt = rt.with_overrides(
+                two_model_mode=True,
+                offwall_model_ckpt=str(offwall_ckpt).replace("\\", "/"),
+            )
+        else:
+            rt = rt.with_overrides(two_model_mode=False)
+        rt = rt.with_overrides(corrector_coupling=True, t0_flow_source="kinematics")
+        _bind_typed_configs(pf, rt)
     except Exception:
-        pass
+        try:
+            spec = mat_growth_leg_spec(mat_leg)
+            overrides.update({k: str(v) for k, v in spec.env_overrides.items()})
+        except Exception:
+            pass
 
     if offwall_ckpt is not None:
         overrides["SPECIES_TWO_MODEL_MODE"] = "1"
         overrides["SPECIES_OFFWALL_MODEL_CKPT"] = str(offwall_ckpt).replace("\\", "/")
-        overrides.setdefault("SPECIES_TWO_MODEL_ROUTE", os.environ.get("SPECIES_TWO_MODEL_ROUTE", "frontier"))
-        overrides.setdefault(
-            "SPECIES_TWO_MODEL_FRONTIER_HOPS",
-            os.environ.get("SPECIES_TWO_MODEL_FRONTIER_HOPS", "2"),
-        )
+        overrides.update(_compound_deploy_overrides())
     else:
         overrides.setdefault("SPECIES_TWO_MODEL_MODE", "0")
 
@@ -160,6 +212,8 @@ def _customer_deploy_env(
         "SPECIES_TWO_MODEL_MODE",
         "SPECIES_TWO_MODEL_ROUTE",
         "SPECIES_TWO_MODEL_FRONTIER_HOPS",
+        "SPECIES_CONTINUOUS_VEL_DECAY",
+        "SPECIES_CONTINUOUS_VEL_DECAY_WALL_ONLY",
         "BIOCHEM_CORRECTOR_COUPLING",
         "SPECIES_DYNAMIC_OCCLUSION",
         "BIOCHEM_ROLLOUT_DYNAMIC_OCCLUSION",
@@ -205,7 +259,13 @@ class CustomerDeployPipeline:
         if not self.wall_ckpt.is_file():
             raise FileNotFoundError(
                 f"Wall/species checkpoint missing: {self.wall_ckpt}. "
-                "Promote WC_v7_clot_phi_mse to locked/species_gnn_best.pth first."
+                "Promote WC_v7 wall or compound deploy first "
+                "(scripts/promote_compound_deploy.py)."
+            )
+        if self.offwall_ckpt is not None and not self.offwall_ckpt.is_file():
+            raise FileNotFoundError(
+                f"Compound growth checkpoint missing: {self.offwall_ckpt}. "
+                "Run scripts/promote_compound_deploy.py or set CUSTOMER_COMPOUND=0."
             )
         with _customer_deploy_env(
             wall_ckpt=self.wall_ckpt,
@@ -268,8 +328,21 @@ class CustomerDeployPipeline:
                 bio_cfg=bio,
                 device=self.device,
             )
-            gel_beta = resolve_deploy_gelation_beta(self.device)
-            nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "2"))
+            # Explicit override only: the promoted on-disk beta keeps its historical role
+            # (Mat boost inside the species rollout) and must not additionally re-grade the
+            # clot phi readout. See resolve_clot_readout_beta.
+            gel_beta = resolve_clot_readout_beta()
+            nuc_hops = 2
+            try:
+                from src.architecture.runtime_config import get_active_runtime
+
+                rt = get_active_runtime()
+                if rt is not None:
+                    nuc_hops = int(rt.rollout.nucleation_hops)
+                else:
+                    nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "2"))
+            except Exception:
+                nuc_hops = int(os.environ.get("CLOT_V2_NUCLEATION_HOPS", "2"))
             log("[i] Rolling out clot-phi / gelation...")
             with t0_rung2_env():
                 traj = rollout_t0_clot_phi(
@@ -365,6 +438,7 @@ class CustomerDeployPipeline:
                 "wall_ckpt": str(self.wall_ckpt),
                 "offwall_ckpt": str(self.offwall_ckpt) if self.offwall_ckpt else None,
                 "mat_leg": self.mat_leg,
+                "compound_leg": DEFAULT_COMPOUND_LEG if self.offwall_ckpt is not None else None,
                 "t_final_s": t_end,
                 "two_model": self.offwall_ckpt is not None,
                 "include_velocity": bool(include_velocity),

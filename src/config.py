@@ -234,10 +234,16 @@ class VesselConfig:
     # fraction vs nominal (e.g. severe stenosis). Used to set a physical floor on inferred R_nd.
     nominal_radius: float = 0.5
     min_radius_factor: float = 0.2
+    
+    # Wound Site Configuration
+    wound_probability: float = 0.0  # Probability a vessel gets wound(s) (overridden by --wound flag)
+    wound_count_range: tuple[int, int] = (1, 2)  # (min, max) wound sites per vessel
+    wound_center_frac_range: tuple[float, float] = (0.3, 0.7)  # Allowed location range along vessel
+    wound_half_width_frac_range: tuple[float, float] = (0.02, 0.08)  # Half-width as fraction of length
 
     # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {
-        "Inlet": 101, "Outlet_1": 102, "Walls": 103, "Fluid_Domain": 201
+        "Inlet": 101, "Outlet_1": 102, "Walls": 103, "Wound": 104, "Fluid_Domain": 201
     })
 
 

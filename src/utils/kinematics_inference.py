@@ -155,7 +155,13 @@ def _run_joint_solve(model: RGP_DEQ, data: Data) -> tuple[torch.Tensor, torch.Te
 
 
 @torch.no_grad()
-def predict_kinematics_and_latent(model: RGP_DEQ, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
+def predict_kinematics_and_latent(
+    model: RGP_DEQ,
+    data: Data,
+    *,
+    disk_cache_dir: Path | None = None,
+    disk_cache_key: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """One GINO-DEQ solve; returns ``(pred [N, C], z_kin [N, latent_dim])`` and fills both caches."""
     key = _graph_key(data)
     if (
@@ -165,8 +171,28 @@ def predict_kinematics_and_latent(model: RGP_DEQ, data: Data) -> tuple[torch.Ten
     ):
         return model._cache_pred, model._cache_latent
 
+    cache_path = None
+    if disk_cache_dir is not None and disk_cache_key is not None:
+        cache_path = disk_cache_dir / f"{disk_cache_key}.pt"
+        if cache_path.exists():
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            pred = payload["pred_uv"]
+            z = payload["z_kin"]
+            device = next(model.parameters()).device
+            pred, z = pred.to(device), z.to(device)
+            _store_joint_cache(model, key, pred, z)
+            return pred, z
+
     pred, z = _run_joint_solve(model, data)
     _store_joint_cache(model, key, pred, z)
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "pred_uv": pred.detach().cpu(),
+            "z_kin": z.detach().cpu(),
+        }, cache_path)
+
     return pred, z
 
 
