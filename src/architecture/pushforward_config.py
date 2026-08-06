@@ -102,6 +102,14 @@ ENV_KEY_TO_FIELD: dict[str, str] = {
     "SPECIES_CONTINUOUS_FINAL_PREC_FP_PENALTY": "final_prec_fp_penalty",
     "SPECIES_CONTINUOUS_STEP_MASS_PENALTY": "step_mass_penalty",
     "SPECIES_CONTINUOUS_STEP_PREC_FP_PENALTY": "step_prec_fp_penalty",
+    "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_WEIGHT": "rolled_soft_f1_weight",
+    "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_BETA": "rolled_soft_f1_beta",
+    "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_K": "rolled_soft_f1_k",
+    "SPECIES_CONTINUOUS_STEP_SOFT_F1_WEIGHT": "step_soft_f1_weight",
+    "SPECIES_CONTINUOUS_AUTOCAT_GROWTH": "autocatalytic_growth",
+    "SPECIES_CONTINUOUS_AUTOCAT_K_DEP_INIT": "autocat_k_dep_init",
+    "SPECIES_CONTINUOUS_AUTOCAT_K_AUTO_INIT": "autocat_k_auto_init",
+    "SPECIES_CONTINUOUS_AUTOCAT_ALPHA": "autocat_alpha",
     "SPECIES_CONTINUOUS_FREEZE_BACKBONE": "freeze_backbone",
     "SPECIES_CONTINUOUS_SCORE_CLOUT_W": "score_clout_w",
     "SPECIES_PUSHFORWARD_SCORE_GROWTH_W": "score_growth_w",
@@ -310,6 +318,32 @@ class PushforwardConfig:
     # Per-step soft mass / FP on rolled state vs GT at that time (binds TBPTT, not just final).
     step_mass_penalty: float = 0.0
     step_prec_fp_penalty: float = 0.0
+    # --- Rolled-state soft-F_beta surrogate (WALL_MODEL_PLAN.md s12.3/s12.5, change E) ---
+    # v6 established that deepening the per-step delta REGRESSION does not make loss track the
+    # thresholded rollout metric (|z| < 0.5 on a near-doubling of deploy score, and 5x deeper
+    # rollout moved it the wrong way). The existing rolled-state terms cannot fix that either:
+    # `final_mass_penalty` is softplus(mass_ratio - target), i.e. ONE-SIDED (identically zero
+    # below target, so no gradient toward growing), and `final_prec_fp_penalty` is an FP
+    # *fraction* that saturates near 1.0 exactly in the fp=292 regime the model is stuck in.
+    # Neither has a TP term, so nothing in the objective is monotone in F1.
+    # This term is the metric itself, softened: 1 - soft_F_beta over the rolled committed set.
+    # beta > 1 tilts toward recall, beta < 1 toward precision. 0 disables.
+    rolled_soft_f1_weight: float = 0.0
+    rolled_soft_f1_beta: float = 1.0
+    rolled_soft_f1_k: float = 40.0
+    # Same surrogate applied per-unroll-step against that step's GT (not just the final state).
+    step_soft_f1_weight: float = 0.0
+    # --- Gated-autocatalytic growth law (s11.3 change D) ---
+    # COMSOL's actual Mat law is ~(Mas/Minf)*k_aa*AP: growth rate is proportional to material
+    # ALREADY COMMITTED locally. The generic delta head has no such term, so it models
+    # propagation without ignition -- which is what s12.4's two-basin attractor looks like.
+    # When on, magnitude is multiplied by (k_dep + k_auto * local_committed_frac), with
+    # local_committed_frac the graph-blurred committed-Mat indicator already computed for
+    # `neighbor_commit_gate`. k_dep/k_auto are learnable (log-parameterised, positive).
+    autocatalytic_growth: bool = False
+    autocat_k_dep_init: float = 1.0
+    autocat_k_auto_init: float = 1.0
+    autocat_alpha: float = 0.8  # graph-blur alpha for the local-committed feature
     # Early seed-location aux (not a mass term): soft first-new / early Mat vs GT early pocket.
     # Keep weight small so prec mass/FP stays primary; 0 disables.
     seed_aux_weight: float = 0.0

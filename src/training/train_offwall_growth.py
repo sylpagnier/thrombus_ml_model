@@ -681,6 +681,11 @@ def freeze_growth_backbone(model: torch.nn.Module) -> tuple[int, int]:
         "magnitude_head_wall",
         "spatial_head_offwall",
         "magnitude_head_offwall",
+        # s11.3 change D growth-law rate constants. These ARE the growth law, not backbone --
+        # freezing them would silently disable the mechanism under freeze_backbone=True, which
+        # every stenosis sub-cohort leg uses.
+        "log_k_dep",
+        "log_k_auto",
     )
     n_frozen = 0
     n_train = 0

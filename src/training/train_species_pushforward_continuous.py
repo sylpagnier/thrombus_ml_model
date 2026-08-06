@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import time
 from pathlib import Path
 
@@ -1166,6 +1167,18 @@ def main() -> int:
     best_score = -1e9
     stale = 0
     dead_phi_epochs = 0
+    # Salvage retention (WALL_MODEL_PLAN.md s12.4/s12.5 item 1). The selection gates
+    # (mass/FN hard reject) are correct as *selection* policy but they were also, silently,
+    # the *retention* policy: a rejected epoch hits `continue` below and no weights are ever
+    # written. Five consecutive stenosis sub-cohort legs (v2..v6) rejected every epoch and
+    # left zero best.pth between them -- including v2 ep5 and v3 ep5 at deploy F1 0.6155 /
+    # 0.6125, the two best states the cohort has ever reached, now unrecoverable.
+    # This tracks the best raw deploy_clot_score across ALL epochs, gate or no gate, and
+    # writes best_salvage.pth. It does NOT touch best_score, early stop, or which epoch the
+    # gate calls best -- selection semantics are unchanged.
+    salvage_score = -1e9
+    salvage_epoch = -1
+    salvage_path = out_path.parent / "best_salvage.pth"
     if bool(args.exclude_val_from_train):
         print(
             f"[i] select=deploy_only (val {args.val_anchor} held out); "
@@ -1730,6 +1743,24 @@ def main() -> int:
         )
         row["select_mode"] = select_mode
         row["select_score"] = score
+        # Gate-independent retention: keep the highest raw deploy score we ever saw.
+        if float(deploy_clot_score) > salvage_score:
+            salvage_score = float(deploy_clot_score)
+            salvage_epoch = ep
+            save_continuous_checkpoint(
+                salvage_path,
+                model,
+                {
+                    **meta_base,
+                    "salvage_score": salvage_score,
+                    "salvage_epoch": ep,
+                    "salvage_select_mode": select_mode,
+                    "salvage_gate_rejected": select_mode.endswith("_reject"),
+                    **row,
+                },
+            )
+        row["salvage_best_score"] = salvage_score
+        row["salvage_best_epoch"] = salvage_epoch
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
         if select_mode == "deploy_only_mass_reject":
@@ -1774,6 +1805,26 @@ def main() -> int:
 
     last_path = out_path.parent / "last.pth"
     save_continuous_checkpoint(last_path, model, {**meta_base, "epoch": ep, "last_score": score})
+    if salvage_epoch > 0:
+        print(
+            f"[i] salvage ckpt: ep {salvage_epoch} deploy_clot_score={salvage_score:.4f} -> {salvage_path.name}",
+            flush=True,
+        )
+    if not out_path.exists() and salvage_path.exists():
+        # Every epoch was gate-rejected. Promote the salvage so the leg is analysable at all
+        # instead of leaving nothing behind (s12.4: this voided v2..v6). Meta records that the
+        # gate rejected it, so nothing downstream can mistake it for a gate-passing selection.
+        shutil.copyfile(salvage_path, out_path)
+        print(
+            f"[WARN] no epoch passed the selection gate; promoted salvage ep {salvage_epoch} "
+            f"(deploy_clot_score={salvage_score:.4f}) to {out_path.name}",
+            flush=True,
+        )
+        print(
+            "[WARN]   this checkpoint is GATE-REJECTED -- meta.salvage_gate_rejected=True. "
+            "Grade it, do not ship it.",
+            flush=True,
+        )
     print(f"[OK] best_score={best_score:.3f} elapsed={time.perf_counter() - t0:.1f}s ckpt={out_path}", flush=True)
     return 0
 

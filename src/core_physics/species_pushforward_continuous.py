@@ -1674,6 +1674,106 @@ def rolled_final_mass_fp_penalty(
     return pen * continuous_loss_scale()
 
 
+def continuous_rolled_soft_f1_weight() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.rolled_soft_f1_weight), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_ROLLED_SOFT_F1_WEIGHT") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_step_soft_f1_weight() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.step_soft_f1_weight), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_STEP_SOFT_F1_WEIGHT") or "0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def continuous_rolled_soft_f1_beta() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.rolled_soft_f1_beta), 1e-3)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_ROLLED_SOFT_F1_BETA") or "1.0").strip()
+    try:
+        return max(float(raw), 1e-3)
+    except ValueError:
+        return 1.0
+
+
+def continuous_rolled_soft_f1_k() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.rolled_soft_f1_k), 1.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_ROLLED_SOFT_F1_K") or "40.0").strip()
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return 40.0
+
+
+def rolled_soft_f1_loss(
+    final_pred: torch.Tensor,
+    final_gt: torch.Tensor,
+    band_mask: torch.Tensor,
+    *,
+    weight: float | None = None,
+    beta: float | None = None,
+    soft_k: float | None = None,
+) -> torch.Tensor:
+    """``weight * (1 - soft_F_beta)`` on the rolled Mat committed set (s12.5 change E).
+
+    This is the deploy metric itself, softened -- the only term in the objective with a TP
+    numerator, hence the only one that is monotone in F1 by construction.
+
+    Why the existing rolled-state terms are not enough (s12.3):
+      * ``final_mass_penalty`` = softplus(mass_ratio - target) is one-sided: identically 0
+        below target, so it never pushes growth up, only down.
+      * ``final_prec_fp_penalty`` = fp/(tp+fp) saturates toward 1.0 precisely in the
+        fp=292 / mass=4.0 basin the model actually occupies, so its gradient vanishes where
+        it is most needed.
+    Soft occupancy is a sigmoid around the Mat commit threshold, matching
+    ``rolled_final_mass_fp_penalty`` so the two terms see the same soft set.
+    """
+    w = continuous_rolled_soft_f1_weight() if weight is None else max(float(weight), 0.0)
+    if w <= 0.0:
+        return final_pred.sum() * 0.0
+
+    m = band_mask.reshape(-1).to(device=final_pred.device).bool()
+    if not bool(m.any().item()):
+        return final_pred.sum() * 0.0
+
+    from src.training.biochem_species_scope import MAT_CHANNEL, pushforward_state_bulk_indices
+
+    bulk = pushforward_state_bulk_indices()
+    if MAT_CHANNEL not in bulk:
+        return final_pred.sum() * 0.0
+    mat_i = int(bulk.index(MAT_CHANNEL))
+
+    thr = float(continuous_mat_commit_thresh())
+    k = continuous_rolled_soft_f1_k() if soft_k is None else max(float(soft_k), 1.0)
+    b = continuous_rolled_soft_f1_beta() if beta is None else max(float(beta), 1e-3)
+
+    pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
+    gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
+    p_soft = torch.sigmoid(k * (pred - thr))
+    gt_pos = (gt > thr).to(dtype=p_soft.dtype)
+
+    tp = (p_soft * gt_pos).sum()
+    fp = (p_soft * (1.0 - gt_pos)).sum()
+    fn = ((1.0 - p_soft) * gt_pos).sum()
+    b2 = b * b
+    denom = ((1.0 + b2) * tp + b2 * fn + fp).clamp(min=1e-6)
+    soft_f = (1.0 + b2) * tp / denom
+    return w * (1.0 - soft_f) * continuous_loss_scale()
+
+
 def continuous_speed_fp_weight() -> float:
     try:
         from src.architecture.runtime_config import get_active_runtime
@@ -1895,6 +1995,40 @@ def continuous_delta_softplus_beta() -> float:
         return 20.0
 
 
+def continuous_autocatalytic_growth() -> bool:
+    cfg = resolve_config()
+    if cfg is not None:
+        return bool(cfg.autocatalytic_growth)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_AUTOCAT_GROWTH") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_autocat_alpha() -> float:
+    cfg = resolve_config()
+    if cfg is not None:
+        return min(max(float(cfg.autocat_alpha), 0.0), 1.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_AUTOCAT_ALPHA") or "0.8").strip()
+    try:
+        return min(max(float(raw), 0.0), 1.0)
+    except ValueError:
+        return 0.8
+
+
+def continuous_autocat_inits() -> tuple[float, float]:
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.autocat_k_dep_init), 1e-6), max(float(cfg.autocat_k_auto_init), 1e-6)
+    try:
+        kd = max(float((os.environ.get("SPECIES_CONTINUOUS_AUTOCAT_K_DEP_INIT") or "1.0").strip()), 1e-6)
+    except ValueError:
+        kd = 1.0
+    try:
+        ka = max(float((os.environ.get("SPECIES_CONTINUOUS_AUTOCAT_K_AUTO_INIT") or "1.0").strip()), 1e-6)
+    except ValueError:
+        ka = 1.0
+    return kd, ka
+
+
 def delta_readout(raw_delta: torch.Tensor) -> torch.Tensor:
     """Non-negative log increment (species do not decrease on clot front)."""
     st = raw_delta.reshape(-1, _sd())
@@ -1989,6 +2123,20 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                     nn.init.xavier_uniform_(m.weight, gain=0.3)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+        # --- s11.3 change D: explicit gated-autocatalytic growth ---
+        # COMSOL grows Mat as ~(Mas/Minf)*k_aa*AP -- rate proportional to material already
+        # committed locally (~90% of real Mat growth, s11.3). The generic delta head has no
+        # such term, so it can propagate but cannot ignite, which is what the two-basin
+        # attractor in s12.4 looks like. Learnable, log-parameterised so both stay positive;
+        # at k_dep=k_auto=1 an isolated node keeps its current rate and a fully-committed
+        # neighbourhood doubles it, so the warm start is not disturbed at t=0.
+        self.autocat_growth = continuous_autocatalytic_growth()
+        self.log_k_dep: nn.Parameter | None = None
+        self.log_k_auto: nn.Parameter | None = None
+        if self.autocat_growth:
+            kd, ka = continuous_autocat_inits()
+            self.log_k_dep = nn.Parameter(torch.tensor(math.log(kd)))
+            self.log_k_auto = nn.Parameter(torch.tensor(math.log(ka)))
         self.delta_residual: nn.Linear | None = None
         if continuous_delta_residual():
             self.delta_residual = nn.Linear(fused, out_dim)
@@ -2113,6 +2261,47 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
 
         return allowed.to(dtype=dt).unsqueeze(-1).detach()
 
+    def _autocatalytic_factor(
+        self, log_state: torch.Tensor, edge_index: torch.Tensor
+    ) -> torch.Tensor | None:
+        """``k_dep + k_auto * local_committed_frac``, Mat column only (s11.3 change D).
+
+        ``local_committed_frac`` is the graph-blurred committed-Mat indicator -- the same
+        quantity ``_neighbor_commit_feature`` builds, but consumed here as a *multiplicative
+        rate term* rather than as a gate input feature, which is what makes the law
+        autocatalytic rather than merely commit-aware. Returns ``None`` when disabled.
+        """
+        if not self.autocat_growth or self.log_k_dep is None or self.log_k_auto is None:
+            return None
+        st = log_state.reshape(-1, _sd())
+        midx = _local_bulk_index(MAT_CHANNEL)
+        if midx is None or midx < 0 or midx >= int(st.shape[1]):
+            return None
+        committed = (st[:, midx] > continuous_mat_commit_thresh()).to(dtype=st.dtype).unsqueeze(-1)
+        local = _graph_blur_band_state(committed, edge_index, continuous_autocat_alpha())
+        local = local.clamp(min=0.0, max=1.0)
+        k_dep = torch.exp(self.log_k_dep)
+        k_auto = torch.exp(self.log_k_auto)
+        return k_dep + k_auto * local
+
+    def _apply_autocatalytic(
+        self,
+        pred_delta: torch.Tensor,
+        log_state: torch.Tensor | None,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        if log_state is None:
+            return pred_delta
+        fac = self._autocatalytic_factor(log_state, edge_index)
+        if fac is None:
+            return pred_delta
+        mat_idx = _local_mat_idx()
+        if mat_idx is None or mat_idx >= int(pred_delta.shape[1]):
+            return pred_delta
+        scale = torch.ones_like(pred_delta)
+        scale[:, mat_idx] = fac.reshape(-1)
+        return pred_delta * scale
+
     def temporal_lambda_from_state(self, log_state: torch.Tensor) -> torch.Tensor:
         """Scalar integration pace ``lambda in [lo, hi]`` from global band mass."""
         if self.temporal_gate is None:
@@ -2231,6 +2420,10 @@ class SpeciesDualHeadContinuousGNN(SpeciesSnapshotGNN):
                 lam = self.temporal_lambda_from_state(log_state)
                 magnitude = magnitude * lam
             pred_delta = spatial_gate * magnitude
+
+        # s11.3 change D: scale the Mat rate by locally-committed material before any
+        # additive corrections, so the term is a true rate multiplier on the growth law.
+        pred_delta = self._apply_autocatalytic(pred_delta, log_state, edge_index)
 
         if self.delta_residual is not None:
             alpha = continuous_delta_residual_alpha()
@@ -3416,6 +3609,18 @@ def unroll_continuous_loss(
                     )
                     losses.append(mass_fp_step)
                     loss_ws.append(float(step_w[step]))
+                # Soft-F_beta on the rolled state at this step vs that step's GT (change E).
+                ssf = continuous_step_soft_f1_weight()
+                if ssf > 0.0:
+                    losses.append(
+                        rolled_soft_f1_loss(
+                            log_state,
+                            log_series[step + 1],
+                            step_train_mask,
+                            weight=ssf,
+                        )
+                    )
+                    loss_ws.append(float(step_w[step]))
 
             # --- Scheduled sampling: intermittent noisy-GT anchoring ---
             # With probability (1 - keep_prob), reset log_state to (noisy) GT
@@ -3484,6 +3689,9 @@ def unroll_continuous_loss(
             # Soft mass / FP on the rolled final state (train–deploy alignment).
             mass_fp = rolled_final_mass_fp_penalty(states[-1], log_series[-1], m)
             step_loss = step_loss + mass_fp
+            # Soft-F_beta on the rolled final state: the deploy metric itself, softened.
+            # This is the term v6 proved the objective was missing (s12.3 change E).
+            step_loss = step_loss + rolled_soft_f1_loss(states[-1], log_series[-1], m)
 
     if physics_ctx is not None and states:
         from src.core_physics.species_gelation_readout import (
