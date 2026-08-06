@@ -277,7 +277,7 @@ class PatchFactoryConfig:
     # via the Laminar Flow built-in ``spf.mu`` (the template defines only ``Clot_Mask`` and
     # applies it inside Fluid Properties -- there is no ``mu_final`` variable). mu is the
     # optional last expr; if it fails, u/v/p are still saved.
-    eval_exprs: Sequence[str] = ("u", "v", "p", "spf.mu")
+    eval_exprs: Sequence[str] = ("u", "v", "p", "spf.mu", "spf.sr")
     dataset_tag: str = "dset1"
     # channel_h drives the rectangle height, so the geometry + mapped mesh must be rebuilt
     # before each solve. Mapped meshing on a rectangle is cheap.
@@ -372,7 +372,7 @@ class PatchFactoryComsolGenerator:
 
     def _evaluate_grid(
         self, x: np.ndarray, y: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """Evaluate fields at (x, y) via the COMSOL Java ``Interp`` numerical feature."""
         coords_T = np.vstack([x, y])  # (2, N)
         model_j = self.model.java
@@ -407,7 +407,8 @@ class PatchFactoryComsolGenerator:
 
         u, v, p = data[0], data[1], data[2]
         mu = data[3] if len(data) > 3 else None
-        return u, v, p, mu
+        sr = data[4] if len(data) > 4 else None
+        return u, v, p, mu, sr
 
     # -- Mesh convergence --------------------------------------------------------
     def _capture_mesh_distributions(self) -> None:
@@ -542,6 +543,7 @@ class PatchFactoryComsolGenerator:
         v: np.ndarray,
         p: np.ndarray,
         mu: Optional[np.ndarray],
+        sr: Optional[np.ndarray],
     ) -> None:
         u_base, v_base = baseline_shear_field(x, y, s.shear_rate)
         du = u - u_base

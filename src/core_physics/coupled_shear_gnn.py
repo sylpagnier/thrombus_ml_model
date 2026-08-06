@@ -67,7 +67,7 @@ class CoupledShearGNN(nn.Module):
 class LocalKinematicCorrector(nn.Module):
     """Local k-hop kinematic corrector for velocity diversion around micro-clots.
 
-    Predicts a per-node residual ``[dU, dV]`` added to the frozen RGP-DEQ base
+    Predicts a per-node residual ``[dU, dV, dShear]`` added to the frozen RGP-DEQ base
     flow on the subgraph extracted around nucleating clot nodes. A GATv2 stack is
     used so attention can learn the anisotropic diversion (flow reroutes over and
     around a clot far more than it reverses behind it).
@@ -88,7 +88,7 @@ class LocalKinematicCorrector(nn.Module):
         self.readout = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Linear(self.hidden_dim, 2),
+            nn.Linear(self.hidden_dim, 3), # [dU, dV, dShear]
         )
         # Start as a near-identity correction so an untrained model leaves the
         # frozen base flow essentially unchanged.
@@ -96,7 +96,7 @@ class LocalKinematicCorrector(nn.Module):
         nn.init.zeros_(self.readout[-1].bias)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """Return kinematic correction ``[N_sub, 2]`` for the subgraph."""
+        """Return kinematic correction ``[N_sub, 3]`` for the subgraph."""
         h = F.gelu(self.conv1(x, edge_index))
         h = F.gelu(self.conv2(h, edge_index))
         h = F.gelu(self.conv3(h, edge_index))

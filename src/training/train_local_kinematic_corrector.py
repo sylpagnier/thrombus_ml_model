@@ -169,6 +169,8 @@ def patch_to_data(
 
     x_c = crop(x); y_c = crop(y)
     du_c = crop(du); dv_c = crop(dv); ub_c = crop(u_base); mu_c = crop(mu)
+    d_shear = np.asarray(z["d_shear"], dtype=np.float64) if "d_shear" in z.files else np.zeros_like(x)
+    dshear_c = crop(d_shear)
     ny_c, nx_c = x_c.shape
     if ny_c < 2 or nx_c < 2:
         return None
@@ -180,7 +182,8 @@ def patch_to_data(
     v0_nd = torch.zeros_like(u0_nd)              # baseline v = 0
     delta_mu_si = flat(mu_c) - mu_inf
     delta_mu_nd = delta_mu_si / float(phys.mu_viscosity_nd_scale)
-    target = torch.stack([flat(du_c) / u_ref, flat(dv_c) / u_ref], dim=-1)
+    dshear_nd = flat(dshear_c) / (u_ref / length_scale)
+    target = torch.stack([flat(du_c) / u_ref, flat(dv_c) / u_ref, dshear_nd], dim=-1)
 
     clot_nodes = torch.where(delta_mu_si > float(cfg.mu_thresh_si))[0]
     if clot_nodes.numel() == 0:
@@ -330,14 +333,14 @@ def train_corrector(
     best_val_rel = float("nan")
 
     def _meta(
-        epoch: int, train_mse: float, val_mse: float | None, val_rel: float | None = None
+        epoch: int, train_mse: float, val_mse: float | None, val_rel: float | None = None, val_rel_shear: float | None = None
     ) -> dict[str, Any]:
         return {
             "model": "LocalKinematicCorrector",
             "in_channels": LOCAL_CORRECTOR_IN_CHANNELS,
             "hidden_dim": hidden_dim,
             "feature_names": ["dx", "dy", "dist_to_wall", "u0", "v0", "delta_mu"],
-            "target": "delta_uv_nd",
+            "target": "delta_uv_shear_nd",
             "normalization": {
                 "length_scale": "channel_height_H",
                 "velocity_scale": "PhysicsConfig.get_u_ref(H)",
@@ -349,6 +352,7 @@ def train_corrector(
             "train_mse_nd": train_mse,
             "val_mse_nd": val_mse,
             "val_rel_l2": val_rel,
+            "val_rel_shear": val_rel_shear,
             "nd_cfg": vars(cfg),
             "sampling": {
                 "hard_boost": hard_boost,
@@ -385,24 +389,31 @@ def train_corrector(
 
         val_mse: float | None = None
         val_rel: float | None = None
+        val_rel_shear: float | None = None
         if val_loader is not None:
             model.eval()
             vt = 0.0
             vb = 0
             sq_err = 0.0   # sum ||pred - target||^2 over all nodes/components
             sq_tgt = 0.0   # sum ||target||^2 (global L2 norm of the diversion field)
+            sq_err_shear = 0.0
+            sq_tgt_shear = 0.0
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(dev)
                     pred = model(batch.x, batch.edge_index)
                     vt += float(F.mse_loss(pred, batch.y).item())
                     vb += 1
-                    sq_err += float(((pred - batch.y) ** 2).sum().item())
-                    sq_tgt += float((batch.y ** 2).sum().item())
+                    sq_err += float(((pred[:, :2] - batch.y[:, :2]) ** 2).sum().item())
+                    sq_tgt += float((batch.y[:, :2] ** 2).sum().item())
+                    if batch.y.shape[-1] >= 3:
+                        sq_err_shear += float(((pred[:, 2] - batch.y[:, 2]) ** 2).sum().item())
+                        sq_tgt_shear += float((batch.y[:, 2] ** 2).sum().item())
             val_mse = vt / max(vb, 1)
             # Global relative L2 error: robust to the ~0 far-field targets (a per-sample
             # mean would divide by tiny norms). Reported as a percentage of the true dU field.
             val_rel = float((sq_err / sq_tgt) ** 0.5) if sq_tgt > 0 else float("nan")
+            val_rel_shear = float((sq_err_shear / sq_tgt_shear) ** 0.5) if sq_tgt_shear > 0 else float("nan")
 
         # Selecting by MSE or relL2 picks the same epoch (val ||target|| is fixed), but we
         # surface relL2 because it is the tangible "how far off is the diversion" number.
@@ -410,7 +421,7 @@ def train_corrector(
         if score < best_val:
             best_val = score
             best_val_rel = val_rel if val_rel is not None else float("nan")
-            save_local_corrector(best_path, model, _meta(epoch, train_mse, val_mse, val_rel))
+            save_local_corrector(best_path, model, _meta(epoch, train_mse, val_mse, val_rel, val_rel_shear))
 
         if scheduler is not None:
             scheduler.step()
@@ -418,14 +429,15 @@ def train_corrector(
         if epoch % 10 == 0 or epoch == epochs - 1:
             if val_mse is not None:
                 rtxt = f" | val relL2 {val_rel * 100:.2f}%" if math.isfinite(val_rel) else ""
-                vtxt = f" | val MSE {val_mse:.6e}{rtxt}"
+                stxt = f" | shear {val_rel_shear * 100:.2f}%" if val_rel_shear is not None and math.isfinite(val_rel_shear) else ""
+                vtxt = f" | val MSE {val_mse:.6e}{rtxt}{stxt}"
             else:
                 vtxt = ""
             lrtxt = f" | lr {optimizer.param_groups[0]['lr']:.2e}" if scheduler is not None else ""
             ltag = "relL2^2" if loss_mode == "relative" else "MSE"
             print(f"[i] epoch {epoch:3d} | train {ltag} {train_mse:.6e}{vtxt}{lrtxt}")
 
-    save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse, val_rel))
+    save_local_corrector(last_path, model, _meta(epochs - 1, train_mse, val_mse, val_rel, val_rel_shear))
     rel_txt = f" (relL2 {best_val_rel * 100:.2f}%)" if math.isfinite(best_val_rel) else ""
     print(f"[OK] best val MSE_nd {best_val:.6e}{rel_txt} -> {best_path}")
     return model

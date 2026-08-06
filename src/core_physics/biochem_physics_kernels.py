@@ -748,6 +748,9 @@ class BiochemPhysicsKernels:
 
         # This is non-dimensional.
         gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
+        
+        if hasattr(data, "dshear_pred") and data.dshear_pred is not None:
+            gamma_dot_nd = gamma_dot_nd + data.dshear_pred.to(device=gamma_dot_nd.device)
 
         # Redimensionalize to physical 1/s
         u_ref = spatial_props['u_ref'].to(u.device)

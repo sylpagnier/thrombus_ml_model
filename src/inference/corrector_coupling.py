@@ -381,7 +381,7 @@ def couple_flow_with_corrector(
     num_hops: int | None = None,
     min_delta_mu_si: float | None = None,
     clot_nodes: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Apply the trained corrector's velocity diversion around the active clot (Steps B-E).
 
     ``u0_nd, v0_nd`` are the frozen GINO-DEQ base flow (ND); ``delta_mu_si`` is the per-node
@@ -403,7 +403,7 @@ def couple_flow_with_corrector(
     )
     nodes = nodes.reshape(-1).to(device=device)
     if nodes.numel() == 0:
-        return u_coupled, v_coupled
+        return u_coupled, v_coupled, None
 
     hops = corrector_num_hops() if num_hops is None else int(num_hops)
     pos_nd = data.x[:, 0:2].to(device=device, dtype=torch.float32)
@@ -426,6 +426,7 @@ def couple_flow_with_corrector(
     )
     du_sum = torch.zeros(n, device=device)
     dv_sum = torch.zeros(n, device=device)
+    dshear_sum = torch.zeros(n, device=device)
     hits = torch.zeros(n, device=device)
     
     from torch_geometric.data import Data, Batch
@@ -463,36 +464,43 @@ def couple_flow_with_corrector(
             delta_uv = delta_uv_batch[ptr:ptr + num_nodes]
             du_sum[subset] += delta_uv[:, 0]
             dv_sum[subset] += delta_uv[:, 1]
+            if delta_uv.shape[-1] >= 3:
+                dshear_sum[subset] += delta_uv[:, 2]
             hits[subset] += 1.0
             ptr += num_nodes
 
     touched = hits > 0
+    dshear_coupled = None
     if bool(touched.any()):
         u_coupled[touched] = u_coupled[touched] + du_sum[touched] / hits[touched]
         v_coupled[touched] = v_coupled[touched] + dv_sum[touched] / hits[touched]
-    return u_coupled, v_coupled
+        dshear_coupled = torch.zeros(n, device=device)
+        dshear_coupled[touched] = dshear_sum[touched] / hits[touched]
+    return u_coupled, v_coupled, dshear_coupled
 
 
 # --- per-graph coupled-flow registry (consumed by the species rollout flow helpers) ---
-_COUPLED_FLOW: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_COUPLED_FLOW: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
 
 
 def reset_coupled_flow_registry() -> None:
     _COUPLED_FLOW.clear()
 
 
-def set_coupled_flow(data, u_nd: torch.Tensor, v_nd: torch.Tensor) -> None:
-    _COUPLED_FLOW[_graph_key(data)] = (u_nd.detach().reshape(-1), v_nd.detach().reshape(-1))
+def set_coupled_flow(data, u_nd: torch.Tensor, v_nd: torch.Tensor, dshear_nd: torch.Tensor | None = None) -> None:
+    dshear_flat = dshear_nd.detach().reshape(-1) if dshear_nd is not None else None
+    _COUPLED_FLOW[_graph_key(data)] = (u_nd.detach().reshape(-1), v_nd.detach().reshape(-1), dshear_flat)
 
 
 def get_coupled_flow(
     data, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
     entry = _COUPLED_FLOW.get(_graph_key(data))
     if entry is None:
         return None
-    u, v = entry
-    return u.to(device=device), v.to(device=device)
+    u, v, dshear = entry
+    ds = dshear.to(device=device) if dshear is not None else None
+    return u.to(device=device), v.to(device=device), ds
 
 
 class CorrectorCoupledFlow:
@@ -584,7 +592,7 @@ class CorrectorCoupledFlow:
     @torch.no_grad()
     def couple_from_delta_mu(
         self, data, delta_mu_si: torch.Tensor, *, publish: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         u0, v0 = self.base_flow(data)
         
         nodes = clot_nodes_from_delta_mu(delta_mu_si, min_delta_mu_si=self.min_delta_mu_si)
@@ -593,10 +601,10 @@ class CorrectorCoupledFlow:
         if n_clot > 0 and self._cached_u is not None:
             if n_clot <= self._last_corrector_n * corrector_growth_factor():
                 if publish:
-                    set_coupled_flow(data, self._cached_u, self._cached_v)
-                return self._cached_u, self._cached_v
+                    set_coupled_flow(data, self._cached_u, self._cached_v, self._cached_dshear)
+                return self._cached_u, self._cached_v, self._cached_dshear
         
-        u, v = couple_flow_with_corrector(
+        u, v, dshear = couple_flow_with_corrector(
             data,
             u0,
             v0,
@@ -613,10 +621,11 @@ class CorrectorCoupledFlow:
         if n_clot > 0:
             self._cached_u = u.clone()
             self._cached_v = v.clone()
+            self._cached_dshear = dshear.clone() if dshear is not None else None
         
         if publish:
-            set_coupled_flow(data, u, v)
-        return u, v
+            set_coupled_flow(data, u, v, dshear)
+        return u, v, dshear
 
     def _delta_mu_si(
         self, mu_eff_si: torch.Tensor, mu_bulk_si: torch.Tensor | None
@@ -643,7 +652,7 @@ class CorrectorCoupledFlow:
         *,
         mu_bulk_si: torch.Tensor | None = None,
         publish: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Step F input: predicted ``mu_eff_si`` -> coupled ``(u, v)`` (delta over the bulk ref)."""
         delta_mu_si = self._delta_mu_si(mu_eff_si, mu_bulk_si)
         return self.couple_from_delta_mu(data, delta_mu_si, publish=publish)
@@ -657,6 +666,7 @@ class ClotFlowState:
 
     u: torch.Tensor
     v: torch.Tensor
+    dshear: torch.Tensor | None
     z_kin: torch.Tensor | None  # clot-aware DEQ latent if a full re-solve ran, else None
     mode: str                   # "frozen" | "corrector" | "resolved"
     n_clot: int
@@ -810,16 +820,16 @@ class ClotAwareFlow(CorrectorCoupledFlow):
         if clot_burden_significant(n_clot, n_total) and self._grown_enough(n_clot):
             z_kin, u, v = self.resolve_full(data, nodes)
             self._last_resolve_n = n_clot
-            state = ClotFlowState(u=u, v=v, z_kin=z_kin, mode="resolved", n_clot=n_clot)
+            state = ClotFlowState(u=u, v=v, dshear=None, z_kin=z_kin, mode="resolved", n_clot=n_clot)
         elif n_clot > 0:
-            u, v = self.couple_from_delta_mu(data, delta_mu_si, publish=False)
-            state = ClotFlowState(u=u, v=v, z_kin=None, mode="corrector", n_clot=n_clot)
+            u, v, dshear = self.couple_from_delta_mu(data, delta_mu_si, publish=False)
+            state = ClotFlowState(u=u, v=v, dshear=dshear, z_kin=None, mode="corrector", n_clot=n_clot)
         else:
             u0, v0 = self.base_flow(data)
-            state = ClotFlowState(u=u0.clone(), v=v0.clone(), z_kin=None, mode="frozen", n_clot=0)
+            state = ClotFlowState(u=u0.clone(), v=v0.clone(), dshear=None, z_kin=None, mode="frozen", n_clot=0)
 
         if publish:
-            set_coupled_flow(data, state.u, state.v)
+            set_coupled_flow(data, state.u, state.v, state.dshear)
         return state
 
 
@@ -829,6 +839,7 @@ def write_coupled_flow_into_y(
     u_nd: torch.Tensor,
     v_nd: torch.Tensor,
     *,
+    dshear_nd: torch.Tensor | None = None,
     time_index: int | None = None,
 ) -> None:
     """Step F: overwrite the velocity channels in ``data.y`` so physics consumers see the diversion.
@@ -846,3 +857,8 @@ def write_coupled_flow_into_y(
         ti = max(0, min(int(time_index), int(data.y.shape[0]) - 1))
         data.y[ti, :, 0] = u
         data.y[ti, :, 1] = v
+
+    if dshear_nd is not None:
+        data.dshear_pred = dshear_nd.reshape(-1).to(device=data.y.device, dtype=data.y.dtype)
+    elif hasattr(data, "dshear_pred"):
+        del data.dshear_pred
