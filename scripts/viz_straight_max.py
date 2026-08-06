@@ -24,34 +24,35 @@ def plot_vessels():
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
     for i in range(3):
-        json_path = out_dir / f"patient{i:03d}.json"
+        json_path = out_dir / f"vessel_{i}.json"
         if not json_path.exists():
             continue
             
         with open(json_path, 'r') as f:
             data = json.load(f)
             
-        # The JSON has boundaries which we can plot
         ax = axes[i]
         
-        walls = data.get("wall_segments", [])
-        for seg in walls:
-            pts = seg.get("points", [])
-            if pts:
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                ax.plot(xs, ys, 'b-', linewidth=2)
-                
-        inlet = data.get("inlet_segment", {}).get("points", [])
-        if inlet:
-            ax.plot([p[0] for p in inlet], [p[1] for p in inlet], 'g-', linewidth=2)
+        top_pts = data.get("top_wall_pts", [])
+        if top_pts:
+            xs = [p[0] for p in top_pts]
+            ys = [p[1] for p in top_pts]
+            ax.plot(xs, ys, 'b-', linewidth=2)
             
-        outlet = data.get("outlet_segment", {}).get("points", [])
-        if outlet:
-            ax.plot([p[0] for p in outlet], [p[1] for p in outlet], 'r-', linewidth=2)
+        bot_pts = data.get("bot_wall_pts", [])
+        if bot_pts:
+            xs = [p[0] for p in bot_pts]
+            ys = [p[1] for p in bot_pts]
+            ax.plot(xs, ys, 'b-', linewidth=2)
+            
+        # Draw inlet (first points of top and bot)
+        if top_pts and bot_pts:
+            ax.plot([top_pts[0][0], bot_pts[0][0]], [top_pts[0][1], bot_pts[0][1]], 'g-', linewidth=2)
+            # Draw outlet (last points)
+            ax.plot([top_pts[-1][0], bot_pts[-1][0]], [top_pts[-1][1], bot_pts[-1][1]], 'r-', linewidth=2)
             
         # Also plot the pathology descriptor if present
-        v_type = data.get("v_type", "")
+        v_type = data.get("type", "")
         max_sten = data.get("max_stenosis", "")
         max_aneu = data.get("max_aneurysm", "")
         

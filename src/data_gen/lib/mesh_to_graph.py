@@ -538,7 +538,6 @@ class MeshToGraph(MeshToGraphComplete):
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
-            mask_wound=mask_wound,
             is_anchor=is_anchor,
             d_bar=d_bar,
             u_ref=u_ref,

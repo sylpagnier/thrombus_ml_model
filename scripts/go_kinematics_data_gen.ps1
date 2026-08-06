@@ -16,17 +16,22 @@ $vesselArgs = @("--phase", "1", "--level", "0", "-n", "$NumVessels", "--patholog
 if ($Overwrite) {
     $vesselArgs += "--overwrite"
 }
-& python -m src.data_gen.lib.vessel_generator @vesselArgs
+& python src/data_gen/lib/vessel_generator.py @vesselArgs
 
 # 2. Anchors (COMSOL)
 Write-Host "Generating COMSOL anchors..." -ForegroundColor Cyan
-$anchorArgs = @("--phase", "1", "--rheology", "newtonian")
-# anchor_generator automatically processes new meshes
-& python -m src.data_gen.lib.anchor_generator @anchorArgs
+$ow_str = if ($Overwrite) { "True" } else { "False" }
+$pyScript = @"
+from src.data_gen.lib.anchor_generator import AnchorGenerator
+gen = AnchorGenerator(phase='phase1')
+allow_overwrite = $ow_str
+gen.run_batch(max_new=$NumVessels, allow_overwrite=allow_overwrite)
+"@
+& python -c $pyScript
 
 # 3. Mesh to Graph (PyG)
 Write-Host "Converting meshes to PyG graphs..." -ForegroundColor Cyan
 $meshArgs = @("--phase", "1", "--rheology", "newtonian")
-& python -m src.data_gen.lib.mesh_to_graph @meshArgs
+& python src/data_gen/lib/mesh_to_graph.py @meshArgs
 
 Write-Host "Done!" -ForegroundColor Green

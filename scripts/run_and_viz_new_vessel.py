@@ -24,7 +24,7 @@ def main():
     print(f"[i] Using species GNN checkpoint: {wall_ckpt}")
     
     # Input geometry
-    geom_path = REPO / "customer_geometries/vessel_0_demo.pt"
+    geom_path = REPO / "outputs/temp_vessels/vessel_0.msh"
     if not geom_path.exists():
         print(f"[ERR] Demo vessel not found: {geom_path}")
         return 1
