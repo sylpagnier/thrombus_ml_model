@@ -1557,3 +1557,160 @@ not a noisy proxy for the metric; it is close to unrelated to it.
 
 **Retained for the record:** every epoch was still mass-rejected (mass 2.77–4.06), and
 epoch 5 reproduced its anomalous 0.6125 in both arms, confirming determinism again.
+
+**Artifact location note:** v5's run lives under `outputs/biochem/eda/autonomous_6h/`, not
+under the sub-cohort `RunRoot` where v1–v4/v6 live. It is not missing; it is elsewhere.
+
+### 12.3 v6 result (2026-08-06) — change B FAILS a third time, and this one is decisive
+
+`.\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft_v6 -Epochs 6
+-EarlyStop 6 -Fresh`, 5100s wall-clock (850s/epoch, ~5× v3 as predicted).
+
+**Launcher bug found and fixed first:** `go_wg_stenosis_subcohort_ft.ps1`'s `$KnownLegs`
+allowlist stopped at v4, so it rejected `-Leg WG_stenosis_subcohort_ft_v6` outright. v5 and
+v6 are now in both `$KnownLegs` and `$GatedLegs` (both bake `CLOT_POCKET_GATE_PCT=25`).
+This is why v5 had to be run out of the autonomous block's own `RunRoot`.
+
+**The mechanism verified as engaged** (from `last.json` + per-epoch `cur_unroll`), so this is
+a real negative, not a plumbing failure:
+```
+unroll = 25          curriculum_unroll = False     cur_unroll = 25 in ALL 6 epochs
+deploy_horizon = 150 deploy_horizon_aux_cap = 150  deploy_horizon_all_packs = True
+n_windows = 751      tbptt_tail = 5                freeze_backbone = True
+```
+(Ignore the env block in the printed "Resolved Configuration Fingerprint" — it shows
+`SPECIES_PUSHFORWARD_UNROLL=10`, `CURRICULUM_UNROLL=1`, `AUX_CAP=72`. Those are the *base
+defaults* from `src/biochem_gnn/config.py`, not the resolved values; `get_active_runtime()`
+takes precedence over env at every read site. The `config_kwargs`/`runtime_kwargs` blocks
+and the `[i] phase=…` header line carry the values that actually ran.)
+
+**Result — the objective moved, the model did not:**
+
+| | unroll | loss range | spread | best-ep score | saturated epochs | ckpt |
+|---|---|---|---|---|---|---|
+| v3 | 5 | 61.359–61.471 | 0.18% | 0.4998 (ep5) | 5/6 at fp=292 | none |
+| v5 | 5 | 61.358–61.470 | 0.18% | 0.4998 (ep5) | 5/6 at fp=292 | none |
+| **v6** | **25** | **74.435–74.929** | **0.66%** | **0.4414 (ep3)** | **5/6 at fp=292** | **none** |
+
+Unlike v4 (bit-identical to v3 — the FP term never fired), **v6 genuinely changed the
+objective**: different loss magnitude, and 3.7× v3's epoch-to-epoch spread. It changed
+nothing downstream. Same fp=292 attractor, same mass ≈4.03, same universal mass-reject,
+same single stochastic excursion, no checkpoint.
+
+**The pre-registered criterion does not resolve.** `Spearman(loss, deploy_clot_score)` went
+`+0.4286` (v3/v5) → **`−0.4058`** (v6) — nominally the hoped-for sign flip. It is not
+evidence:
+```
+exact permutation test (n=6, 720 perms):  P(rho <= -0.4058 | H0) = 0.217
+leave-one-out:  drop ep1 -> +0.0513   drop ep3 -> -0.9747   (one point flips the sign)
+5 of 6 score values lie within 0.002 of each other (0.26102-0.26303, 0.8% spread)
+ep2 and ep4 are IDENTICAL to 9 d.p. on all 6 deploy metrics -- the same thresholded state
+```
+The rank statistic had no dynamic range to measure: the ranks among five numerically tied
+points are noise at the 1e-3 level. **Do not quote −0.4058 as a win.**
+
+**The statistic that does resolve it.** Deploy score is *bimodal*, not continuous: one "good"
+epoch at 0.44–0.50 and the rest at ≈0.26 — a ~90% relative jump. Ask directly whether the
+loss can tell them apart (z of the good epoch's loss against the bad epochs' mean±sd):
+
+| leg | unroll | good ep | good score | bad score | **z of good-epoch loss** |
+|---|---|---|---|---|---|
+| v2 | 5 | 5 | 0.5011 | 0.2686 | **−0.47** |
+| v3 | 5 | 5 | 0.4998 | 0.2611 | **−0.30** |
+| v5 | 5 | 5 | 0.4998 | 0.2611 | **−0.30** |
+| **v6** | **25** | **3** | **0.4414** | **0.2618** | **+0.22** |
+
+In every leg `|z| < 0.5`: **the loss cannot see a near-doubling of deploy score.** Making
+every one of 751 windows a 25-step rollout moved the separation from −0.30 to **+0.22** —
+away from informative, not toward it.
+
+**Verdict — §11.3 change B is closed as a clean negative, third specification:**
+- v4 (weight): FP term never fired, loss bit-identical → no-op.
+- v5 (length): aux is 1 optimizer step of 757 → no-op, exactly as the §12.2 census predicted.
+- v6 (coverage + depth, 5× compute): objective demonstrably changed, alignment did not.
+
+The §12.2 decision rule fires. **Do not respecify change B a fourth time.** The per-step
+delta loss is not a mis-weighted proxy for the thresholded-rollout metric; it is decoupled
+from it. Go to §11.3 change D.
+
+### 12.4 What v6 exposes that is bigger than change B: a two-state attractor
+
+Pooling every epoch of every sub-cohort leg (n=41) makes the real structure visible. The
+model is not continuously mis-tuned — it occupies one of **two** states:
+
+```
+SATURATED   fp >= 292, mass ~4.0, score ~0.26, relaxed recall = 1.000   35/41 epochs
+EXCURSION   fp 110-260, mass 2.08-3.67, score 0.28-0.50                  6/41 epochs
+```
+
+All six excursions, ranked — and score is **strictly monotone in fp across all six**
+(Spearman = −1.000), independent of which leg produced them:
+
+| leg | ep | fp | mass | score | deploy F1 | front |
+|---|---|---|---|---|---|---|
+| **v2** | 5 | **110** | 2.077 | **0.5011** | **0.6155** | 2.497 |
+| v3 | 5 | 173 | 2.768 | 0.4998 | 0.6125 | 2.473 |
+| v5 | 5 | 173 | 2.768 | 0.4998 | 0.6125 | 2.473 |
+| v6 | 3 | 218 | 3.200 | 0.4414 | 0.5335 | 2.629 |
+| v2 | 6 | 243 | 3.516 | 0.2978 | 0.4047 | 4.246 |
+| v1 | 14 | 260 | 3.674 | 0.2796 | 0.4009 | 2.994 |
+
+**Three consequences.**
+
+1. **This is bistability, not mis-tuning** — which is the signature of a gated, thresholded,
+   autocatalytic system, and independent support for change D. Nothing in the objective
+   steers toward the good basin; the model falls into it about once per six epochs by
+   chance, then falls back out.
+
+2. **The brake makes excursions shallower, not deeper.** v2 (no brake) reaches fp=110;
+   v3/v5 (v2 + brake, otherwise a clean single-mechanism A/B per §9.11) reach fp=173; v6
+   (brake + 25-step unroll) reaches only fp=218. The §9.11 brake was added to suppress
+   over-painting and the deepest anti-over-paint state on record came from the leg
+   *without* it. Suggestive (one excursion per leg), not established — but it inverts the
+   sign §9.11 assumed, and §9.12's "the brake moves the rollout ~1%" understated it by
+   measuring the mean rather than the excursion.
+
+3. **`select_mass_hard_max = 1.5` has silently voided five consecutive legs.** The best
+   states the model has ever reached are mass 2.077 / 2.768 / 3.200 — all rejected. v2, v3,
+   v4, v5 and v6 each wrote **zero** `best.pth`; only `last.pth` survives, so **v2 ep5 and
+   v3 ep5, at in-training deploy F1 0.6155 and 0.6125, are unrecoverable.** Every
+   "the fine-tune failed" conclusion from §9.10 onward is partly a statement about this
+   guard, not only about the training.
+
+**Caveat before treating 0.6155 as near-parity with the 0.6497 zero-shot floor:** they are
+not the same measurement. Training-time deploy eval runs `train_deploy_eval_flow="auto"`
+(kine + optional coupling); `scripts/eval_mat_growth_simple.py:288` pins
+`flow_eval="kinematics"`. One confirmation run is needed before the comparison is quotable.
+
+**Closed, not a gap:** `deploy_clot_score` *is* logged per epoch
+(`train_species_pushforward_continuous.py:1682`, written unconditionally at :1733, including
+for rejected epochs). The suspected wiring gap does not exist.
+
+**For scale, on the freeze:** `freeze_growth_backbone` leaves 8 of 40 tensors trainable —
+`spatial_head` + `magnitude_head`, 45,186 of 186,887 params (24%). The entire GraphSAGE
+trunk *and* the `readout` head are frozen. Every sub-cohort leg to date has run this way.
+
+### 12.5 Revised plan after v6
+
+Ordered by value per GPU-minute. Items 1–3 need no training at all.
+
+1. **Fix checkpoint retention before running anything else.** Keep top-k by
+   `deploy_clot_score` regardless of the mass gate, or raise `select_mass_hard_max` above
+   the observed excursion floor (~2.0). Without this, change D produces no checkpoint and is
+   exactly as uninterpretable as v2–v6. Highest value on the board and nearly free.
+2. **Re-grade legs by excursion depth, not by end-of-training loss.** §12.3 shows loss cannot
+   rank epochs. Min `deploy_clot_fp` / min mass / count of sub-gate epochs are already
+   logged, discriminate cleanly at n=6, and give change D an interpretable readout without
+   requiring the loss–metric alignment that change B failed to deliver.
+3. **Re-state the §12.1 routing payoff in `deploy_clot_score`** (still free, unchanged), and
+   **run the `patient044` probe** (§9.16, still a free unspent confirmatory point).
+4. **§11.3 change D — explicit gated-autocatalytic growth term.** The decision rule fires and
+   §12.4's bistability is independent evidence for it: an ignition mechanism is exactly what
+   a two-basin system lacks.
+5. **Cheap A/Bs that §12.4 newly justifies, if change D needs company:** drop the §9.11 brake
+   (per §12.4 item 2 it may be stabilizing the bad basin), and unfreeze the backbone — no
+   sub-cohort leg has ever trained anything but the two final readout MLPs.
+
+**Unblocked by fiat:** §11.3's architecture items (`wss_prior_nd`, the analytical Poiseuille
+prior block, shrinking `z_kin`) were gated on change B succeeding. That gate can never open
+now, so it is dropped. Item 2 above replaces it as the interpretability precondition.

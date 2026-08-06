@@ -1067,6 +1067,22 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
         # deeper rollout signal on every update still does not, then the per-step delta loss is
         # structurally misaligned with the thresholded-rollout metric, and s11 should move to
         # change D (explicit autocatalysis) rather than reweighting this objective further.
+        #
+        # V6 RAN (2026-08-06, 5100s) AND IS A CLEAN NEGATIVE -- s11.3 change B is CLOSED (s12.3).
+        # Mechanism verified engaged (cur_unroll=25 all 6 epochs, 751 windows, all_packs=True) and
+        # the objective really did change: loss 74.44-74.93 vs v3's 61.36-61.47, spread 0.66% vs
+        # 0.18%. NOTHING downstream moved -- same fp=292 attractor 5/6 epochs, same mass ~4.03,
+        # every epoch mass-rejected, no checkpoint. Spearman(loss, deploy_clot_score) did read
+        # -0.406, but that is NOISE, not a win: exact permutation p=0.217, dropping one epoch
+        # flips it to +0.05, and 5 of 6 score values lie within 0.002 of each other (ep2 and ep4
+        # are identical to 9 d.p. on all six deploy metrics). The statistic that DOES resolve it:
+        # deploy score is bimodal (one epoch at 0.44-0.50, the rest at ~0.26) and the loss of the
+        # good epoch sits at z = +0.22 against the bad ones -- v3/v5 at unroll 5 were z = -0.30,
+        # so 5x the rollout depth moved alignment the WRONG way. |z| < 0.5 in every leg: the loss
+        # cannot see a near-doubling of deploy score. DO NOT re-specify change B a fourth time.
+        # The bigger finding is in s12.4: a two-state attractor (35/41 epochs saturated at
+        # fp>=292, 6/41 excursions, score strictly monotone in fp), and select_mass_hard_max=1.5
+        # discarding every excursion -- v2..v6 wrote ZERO best.pth between them.
         "WG_stenosis_subcohort_ft_v6": MatGrowthLegSpec(
             code="WG_stenosis_subcohort_ft_v6",
             label="Stenosis/aneurysm sub-cohort v6: unroll 5->25 on EVERY window + aux on all "

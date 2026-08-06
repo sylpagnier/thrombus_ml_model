@@ -197,8 +197,12 @@ if ($Leg -eq "WG_stenosis_subcohort_ft_v6") {
     Write-Host "[i]   why: v5 lengthened the aux 40->150 and was BIT-IDENTICAL to v3 -- the aux is 1 opt step of 757," -ForegroundColor DarkGray
     Write-Host "[i]   so its length/weight cannot matter. Coverage/depth is the only remaining lever." -ForegroundColor DarkGray
     Write-Host "[i] cost: ~18.9k evals/epoch vs v3's 3.8k (~5x, ~35 min/epoch); tbptt_tail=5 keeps it forward-only" -ForegroundColor DarkGray
-    Write-Host "[i] SUCCESS CRITERION IS NOT F1: does Spearman(loss, deploy_clot_score) across epochs go NEGATIVE?" -ForegroundColor Yellow
-    Write-Host "[i]   v3 and v5 both sat at +0.314 (lower loss -> WORSE deploy). If v6 stays positive, go to s11.3 change D." -ForegroundColor Yellow
+    Write-Host "[i] WARNING: v6 RAN 2026-08-06 and is a CLEAN NEGATIVE (s12.3) -- change B is CLOSED, do not re-specify it." -ForegroundColor Yellow
+    Write-Host "[i]   the objective DID change (loss 74.4-74.9 vs v3's 61.4) and nothing downstream moved:" -ForegroundColor Yellow
+    Write-Host "[i]   same fp=292 attractor 5/6 epochs, mass ~4.03, every epoch mass-rejected, no checkpoint." -ForegroundColor Yellow
+    Write-Host "[i]   Spearman read -0.406 but that is noise (perm p=0.217; one epoch flips the sign). Real test:" -ForegroundColor Yellow
+    Write-Host "[i]   good-epoch loss z = +0.22 vs v3's -0.30 -- 5x rollout depth moved alignment the WRONG way." -ForegroundColor Yellow
+    Write-Host "[i]   Next work is s11.3 change D + the s12.5 checkpoint-retention fix, NOT another change-B leg." -ForegroundColor Yellow
 } elseif ($Leg -eq "WG_stenosis_subcohort_ft_v5") {
     Write-Host "[i] v5 = v3 + ONE change: deploy_horizon/aux_cap 40 -> 150" -ForegroundColor DarkGray
     Write-Host "[i] WARNING: v5 RAN and was BIT-IDENTICAL to v3 (s12.2) -- the aux is 1 optimizer step of 757," -ForegroundColor Yellow
