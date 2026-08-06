@@ -699,7 +699,7 @@ def train_kinematics(
             if finetune_lr is None and "scheduler_state_dict" in ckpt:
                 try:
                     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                except (ValueError, RuntimeError):
+                except (ValueError, RuntimeError, KeyError):
                     print("[kin] WARN could not restore scheduler state; fresh scheduler.")
             start_epoch = int(ckpt.get("epoch", ckpt.get("best_epoch", -1))) + 1
             best_val_composite_loss = float(ckpt.get("best_val_composite_loss", best_val_composite_loss))
