@@ -1,0 +1,3 @@
+{
+  "default_ckpt": "outputs/biochem/eda/wall_gen_sweep_v3/WC_v3_baseline/best.pth"
+}

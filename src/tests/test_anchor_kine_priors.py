@@ -6,7 +6,7 @@ import torch
 
 from src.config import NodeFeat, PhysicsConfig
 from src.data_gen.lib.node_feature_assembly import (
-    apply_gt_flow_priors_to_kine_x,
+
     build_kinematics_node_x_tensor,
     resolve_anchor_kine_phys_cfg,
 )
@@ -51,34 +51,7 @@ def test_build_kinematics_node_x_carreau_rheo_flag():
     assert float(mu.mean()) > 1.0
 
 
-def test_apply_gt_flow_priors_overwrites_uv_mu():
-    n = 6
-    x = torch.zeros(n, NodeFeat.WIDTH_D2.stop)
-    u = torch.linspace(0.1, 1.0, n)
-    v = torch.linspace(0.0, 0.2, n)
-    mu = torch.ones(n) * 2.5
-    mask_wall = torch.zeros(n, dtype=torch.bool)
-    mask_wall[-1] = True
-    edge = torch.tensor([[0, 1, 2, 3, 4], [1, 2, 3, 4, 0]], dtype=torch.long)
-    wn = torch.zeros(n, 2)
-    wn[:, 0] = 1.0
-    V = torch.zeros(edge.shape[1], 5)
-    W = torch.ones(edge.shape[1])
-    M = torch.eye(5).unsqueeze(0).expand(n, 5, 5).clone()
-    out = apply_gt_flow_priors_to_kine_x(
-        x,
-        u_nd=u,
-        v_nd=v,
-        mu_nd=mu,
-        mask_wall=mask_wall,
-        wall_normal=wn,
-        edge_index=edge,
-        M_inv=M,
-        V=V,
-        W=W,
-    )
-    assert torch.allclose(out[:, NodeFeat.UV_PRIOR][:-1, 0], u[:-1])
-    assert torch.allclose(out[:, NodeFeat.MU_PRIOR].reshape(-1), mu)
+
 
 
 def test_kinematics_anchor_dir_uses_carreau():

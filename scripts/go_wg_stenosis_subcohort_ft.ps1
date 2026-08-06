@@ -88,6 +88,23 @@ param(
 # v4 is v3 with that ONE value restored: fp_weight 6.0 -> 16.0. Brake kept so its effect stays
 # readable against v2. v3-vs-v4 is therefore a clean single-variable test of fp_weight.
 #
+# v5 (WG_stenosis_subcohort_ft_v5) = v3 + ONE change: deploy_horizon/aux_cap 40 -> 150, testing
+# whether making the objective SEE the deploy horizon makes decreasing loss track deploy score.
+# IT RAN AND CHANGED NOTHING -- bit-identical to v3 (s12.2). Census found why: the deploy_horizon
+# aux gets its OWN opt.zero_grad/backward/step, so it is 1 optimizer step out of 757, and
+# grad_clip=1.0 neuters its magnitude too. Its length and weight are both irrelevant by
+# construction.
+#
+# v6 (WG_stenosis_subcohort_ft_v6) attacks the same problem from the other side (s12.3): instead
+# of making ONE term horizon-aware, make EVERY term horizon-aware -- curriculum_unroll
+# True -> False (the curriculum was pinning unroll to 5 through epoch 10 regardless of config),
+# unroll 5 -> 25 on all ~756 main windows, deploy_horizon_all_packs -> True. ~5x v3's compute
+# (~35 min/epoch, ~3.5h for 6 epochs); tbptt_tail=5 keeps the extra cost forward-only.
+# ITS SUCCESS CRITERION IS NOT F1: read train_log.jsonl and ask whether
+# Spearman(loss, deploy_clot_score) across epochs went NEGATIVE. v3 and v5 both sat at +0.314
+# -- weakly POSITIVE, i.e. lower loss trended toward WORSE deploy score. If v6 also fails to
+# flip it, stop reweighting this objective and go to s11.3 change D (explicit autocatalysis).
+#
 # WARNING -- default train set deliberately departs from the codebase's sealed
 # WALL_GEN_BATCH_1B_* split (train=012/040/041/042, challenge=043+044, exclude=039):
 #   - includes patient039 (excluded there: half-finished sim, T=92, thinnest signal probed)
@@ -96,7 +113,9 @@ param(
 # both this sub-study and the original wall-gen plan once this leg trains. See s9 for the
 # tradeoff. Pass -TrainAnchors to override (e.g. the sealed WALL_GEN_BATCH_1B_TRAIN list).
 #
+#   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft_v6 -Epochs 6 -EarlyStop 6 -Fresh   # live leg
 #   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Epochs 15 -EarlyStop 6 -Fresh
+#   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft_v5 -Fresh   # reproduce v5 (== v3)
 #   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft_v3 -Fresh   # reproduce v3
 #   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft_v2 -Fresh   # reproduce v2
 #   .\scripts\go_wg_stenosis_subcohort_ft.ps1 -Leg WG_stenosis_subcohort_ft -Fresh      # reproduce v1
@@ -107,8 +126,9 @@ Set-Location $RepoRoot
 . (Join-Path $PSScriptRoot "_python_rc.ps1")
 $env:PYTHONUNBUFFERED = "1"
 
-$KnownLegs = @("WG_stenosis_subcohort_ft", "WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4")
-$GatedLegs = @("WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4")
+$KnownLegs = @("WG_stenosis_subcohort_ft", "WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4", "WG_stenosis_subcohort_ft_v5", "WG_stenosis_subcohort_ft_v6")
+# Every leg from v2 on bakes CLOT_POCKET_GATE_PCT=25 into its env_overrides.
+$GatedLegs = @("WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4", "WG_stenosis_subcohort_ft_v5", "WG_stenosis_subcohort_ft_v6")
 if ($KnownLegs -notcontains $Leg) {
     Write-Host "[ERR] This launcher is for $($KnownLegs -join ' / ') only (got $Leg)" -ForegroundColor Red
     exit 1
@@ -171,7 +191,19 @@ if (-not $NoInit -and -not (Test-Path $InitPath)) {
 
 Write-Host "[NEW] wg_stenosis_subcohort_ft ($Leg): $Epochs ep / ES $EarlyStop / lr=$Lr" -ForegroundColor Cyan
 Write-Host "[i] goal=recall FT (FN down, front_speed up) on the stenosis/aneurysm sub-cohort" -ForegroundColor DarkGray
-if ($Leg -eq "WG_stenosis_subcohort_ft_v4") {
+if ($Leg -eq "WG_stenosis_subcohort_ft_v6") {
+    Write-Host "[i] v6 = s11.3 change B, retry 2: make EVERY loss term horizon-aware, not just the aux" -ForegroundColor DarkGray
+    Write-Host "[i]   curriculum_unroll True->False, unroll 5->25 on all ~756 windows; deploy_horizon_all_packs->True" -ForegroundColor DarkGray
+    Write-Host "[i]   why: v5 lengthened the aux 40->150 and was BIT-IDENTICAL to v3 -- the aux is 1 opt step of 757," -ForegroundColor DarkGray
+    Write-Host "[i]   so its length/weight cannot matter. Coverage/depth is the only remaining lever." -ForegroundColor DarkGray
+    Write-Host "[i] cost: ~18.9k evals/epoch vs v3's 3.8k (~5x, ~35 min/epoch); tbptt_tail=5 keeps it forward-only" -ForegroundColor DarkGray
+    Write-Host "[i] SUCCESS CRITERION IS NOT F1: does Spearman(loss, deploy_clot_score) across epochs go NEGATIVE?" -ForegroundColor Yellow
+    Write-Host "[i]   v3 and v5 both sat at +0.314 (lower loss -> WORSE deploy). If v6 stays positive, go to s11.3 change D." -ForegroundColor Yellow
+} elseif ($Leg -eq "WG_stenosis_subcohort_ft_v5") {
+    Write-Host "[i] v5 = v3 + ONE change: deploy_horizon/aux_cap 40 -> 150" -ForegroundColor DarkGray
+    Write-Host "[i] WARNING: v5 RAN and was BIT-IDENTICAL to v3 (s12.2) -- the aux is 1 optimizer step of 757," -ForegroundColor Yellow
+    Write-Host "[i]   so lengthening it changes nothing. Use -Leg WG_stenosis_subcohort_ft_v6." -ForegroundColor Yellow
+} elseif ($Leg -eq "WG_stenosis_subcohort_ft_v4") {
     Write-Host "[i] v4 = EXACTLY v3 + ONE value: fp_weight 6.0 -> 16.0 (the warm-start/prec_iter baseline v1 silently cut)" -ForegroundColor DarkGray
     Write-Host "[i] why: fp_weight splits every leg by observed t_final mass on p043 --" -ForegroundColor DarkGray
     Write-Host "[i]   fp=16 -> mass 0.674 (warm-start) / 1.109 (prec_iter)   |   fp=4-6 -> mass 4.200 (v1) / ~4.02 (v2) / 4.032 (v3)" -ForegroundColor DarkGray

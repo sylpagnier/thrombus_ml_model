@@ -1239,12 +1239,26 @@ poor), `042` (stenosis, the good one) —
 The onset-phase error from §9.10a is directly visible, not just measured: on `040` the
 prediction paints red *before* GT does (`t=22`: GT flat, pred `FP=16, FN=0`); on `041`
 the prediction stays blank while GT has already committed (`t=22`: GT painted, pred
-`FP=0, FN=9`) and never recovers. Caveat: this script's own printed per-frame
-`F1`/`FP`/`FN` come from `clot_trigger_viz_f1`/`scatter_clot_error_panel`, a different
-implementation than `grade_deploy_clot_series` (the path behind every number in this
-table) — they broadly agree on `040` (0.69 vs 0.704) but diverge sharply on `041` (0.08
-vs 0.255, and printed `FN=188` exceeds the vessel's actual GT count of 113). Trust the
-spatial picture; do not quote this script's own printed numbers as canonical.
+`FP=0, FN=9`) and never recovers. `042` shows the *same* failure shape as `041`, smaller:
+`F1` also stays at `0.00` through `t=88`, but it reaches a real peak (`F1=0.25` at
+`t=133`) before decaying to `0.15` by `t_final` as GT outruns it (`FN` → 171) — a shorter
+delay, not a different mechanism, consistent with its lower deep mass (68 vs `041`'s 74).
+Caveat: this script's own printed per-frame `F1`/`FP`/`FN` come from
+`clot_trigger_viz_f1`/`scatter_clot_error_panel`, a different implementation than
+`grade_deploy_clot_series` (the path behind every number in this table) — they broadly
+agree on `040` (0.69 vs 0.704) but diverge sharply on `041` (0.08 vs 0.255, and printed
+`FN=188` exceeds the vessel's actual GT count of 113). Trust the spatial picture; do not
+quote this script's own printed numbers as canonical.
+
+**Practical takeaway, logged as asked: as currently measured, stenoses are the harder
+pathology for this model.** Mean F1 0.384 vs 0.630, and the one stenosis that scores
+respectably (`042`) still shows the *same* late-onset failure as the worst one (`041`),
+just less far along it — not a case that was actually solved. Treat "stenosis" as a
+practical warning label for this cohort's current model, and §9.10a's deep-mass/onset
+mechanism as the reason why, not a competing explanation. `044` (the third stenosis,
+deep mass 106 — higher than either `041` or `042`) is the natural next check: if the
+gradient holds it should be the worst vessel in the cohort, and it is a free, read-only
+probe away from confirming that.
 
 ---
 
@@ -1352,3 +1366,194 @@ split). Do not conflate them.
    field that is *not* degenerate there.
 5. **Per-node onset is not learnable from t=0 state** — if timing matters (it does, §9.10a),
    it has to come from the rollout dynamics, not richer static features.
+
+---
+
+## 11. Rethinking the biochem model (2026-08-05)
+
+Synthesis of §10's physics, §3's corrections, and §9.12/§9.14's training-loop findings.
+Everything here is grounded in a measurement in this document, not in intuition.
+
+### 11.1 What the model actually is today
+
+```
+in_dim = 287  =  z_kin(256) + sdf(1) + band_extras(11) + state(1) + sat(1) + time(17)
+band_extras(11) = flow(5) + geom_rich(5) + flux_stag(1)
+flow(5) = [log1p(speed), log1p(shear), tanh(div), x_n, y_n]   x_n/y_n ZEROED by drop_xy
+trunk   = 3-layer GraphSAGE (+ parallel skip-hop convs)  -> receptive field 3 hops
+heads   = spatial gate x magnitude (dual head), Mat channel only
+rollout = 200 autoregressive steps; TRAINING = 5-10 step TBPTT windows
+readout = Carreau x mu1(Mat) -> hard threshold -> clot
+```
+
+### 11.2 Six structural problems, each with its evidence
+
+1. **`z_kin` is 256 of 287 input dims — 89% of the input is a frozen latent trained for a
+   *different task* (flow prediction).** §10.2 found the causally-relevant physics is ~6–10
+   numbers. The `latent_dropout` "latent leash" exists for exactly this concern and is
+   currently **0.0**. This is the single largest representational imbalance in the stack.
+2. **The exact gate quantity is absent, and cannot be recovered from the graph.**
+   The dominant gate is `spf.sr < lss`; `mu_eff(t=0) = Carreau(sr)` is a monotone readout of
+   it (§10.2). Measured here: `mu0` is **not** collinear with what the model already has
+   (|r| = 0.69 vs hop-2 speed — §3a killed multihop at 0.9936), and `r(mu0, raw speed)` is
+   **undefined** because speed ≡ 0 at wall nodes. So it is genuinely new information.
+   **But** neither graph shear estimator recovers it: `G_x/G_y` sparse-gradient shear
+   |r| = 0.04–0.30, neighbour-gradient fallback |r| = 0.13–0.40 — and the "proper" operator
+   is *worse*. This extends §2.5 from "under-resolves the gradient" to **"graph operators
+   cannot reconstruct the shear field."**
+   *Open flag:* `mu_prior_nd` (x-channel 13) equals GT t=0 `mu_eff` exactly, as do
+   `u_prior`/`v_prior` vs GT t=0 `u`/`v`. Feeding them is therefore a **GT t=0 flow leak**
+   under the current deploy protocol — but whether Stage-A "prior" channels are considered
+   deploy-legal inputs is an unresolved protocol question that should be settled explicitly
+   before anyone uses them.
+3. **`wss_prior_nd` is identically zero on every anchor** — the channel that should carry
+   wall shear, the driver of the dominant gate, is empty (§10.2).
+4. **Decreasing loss does not track deploy score.** Loss moves 0.2% across epochs while
+   deploy F1 swings 0.37→0.61 (§9.12). The FP loss term provably never fires (v3 vs v4
+   bit-identical, §9.14). The rolled-state brake moves the rollout ~1% (§9.12). Root cause:
+   training supervises **5–10-step GT-anchored windows**; deploy is a **200-step free
+   rollout**. Errors that only compound over 200 steps are invisible to the objective.
+5. **No autocatalysis structure.** COMSOL's Mat growth is ~90% `(Mas/Minf)·k_aa·AP` —
+   positive feedback on already-deposited material (§10.1). Our model predicts Mat deltas
+   with a generic GNN. §9.10a's onset anti-correlation is precisely the failure mode of a
+   system modelling an ignition process without an ignition term.
+6. **Two regimes, one model.** 34% of vessels invert (§10.4) — now routable at deploy.
+
+### 11.3 What to change, ranked by expected value
+
+| # | change | why | cost |
+|---|---|---|---|
+| A | **Regime-route the gate** | §10.4; deploy-time only, no retraining | done — §10.5 |
+| B | **Make the objective see the deploy horizon** — raise the `deploy_horizon` aux toward full length (`tbptt_tail` bounds gradient memory, so the forward is the only cost) | the *only* loss term evaluating a rolled-out state; without it no loss change reliably improves deploy score (§9.12/§9.14) | medium |
+| C | **Shrink `z_kin` (256 → 32/64) or raise `latent_dropout`** | 89% of input is off-task latent; §11.2.1 | medium |
+| D | **Add an explicit autocatalytic term** — growth ∝ (local committed Mat) × availability, mirroring `(Mas/Minf)·k_aa·AP` | gray-box: the physics doc states the deposition law needs *no* learned parameters; what needs learning is the closure from predicted flow | high |
+| E | **Populate `wss_prior_nd` or delete it** | §11.2.3 | low |
+| F | Add `mu0`-derived gate features | informative (§11.2.2) **but blocked** — not deploy-computable, and the `_prior` channels are a possible leak | blocked pending protocol decision |
+
+### 11.4 The honest strategic read
+
+The last four training rounds (v1–v4) failed for reasons that had nothing to do with the
+knobs being tuned — first a train/test regime mismatch (§9.15), then loss terms that
+structurally cannot fire (§9.14). **B is the prerequisite for any further training work:**
+until decreasing loss tracks deploy score, every training experiment is uninterpretable,
+which is exactly what v1–v4 demonstrated four times. A and E are cheap and independent.
+D is the physically-correct long-term direction but should not be attempted before B.
+
+### 10.6 Regime-routed gate: measured payoff is ZERO — and it misroutes `patient037`
+
+`scripts/diag_regime_gate_sweep.py`, one rollout per anchor re-graded three ways
+(gate OFF / global pct 25 / regime-routed at the predicted-flow threshold 0.0822):
+
+| anchor | router says | off | global | routed | routed − global |
+|---|---|---|---|---|---|
+| `patient021` | normal | 0.3448 | 0.4082 | 0.4082 | +0.0000 |
+| `patient037` | **normal** | 0.2849 | **0.1716** | **0.1716** | +0.0000 |
+| `patient035` | normal | 0.4800 | 0.6042 | 0.6042 | +0.0000 |
+| `patient032` | INVERTED | 0.6128 | 0.6208 | **0.6128** | **−0.0081** |
+| `patient020` | normal | 0.5000 | 0.7373 | 0.7373 | +0.0000 |
+| `patient043` | normal | 0.4775 | 0.6667 | 0.6667 | +0.0000 |
+
+```
+mean F1:  off=0.4500   global=0.5348   routed=0.5335   <- routing is slightly WORSE
+worst-vessel delta vs off:  global=-0.1133   routed=-0.1133   <- s2.7's minimax concern UNCHANGED
+vessels where routing beat the global gate: 0/6
+```
+
+**`patient037` — the vessel the router exists to protect — is misclassified as normal.**
+Under GT flow its `band_speed_q25` is 0.0849 (above the GT threshold 0.060 → correctly
+inverted). Under predicted flow it is 0.0756, *below* the recalibrated 0.0822 → routed as
+normal, gate applied, F1 0.285 → 0.172 exactly as before. It is one of the ~16% LOO errors
+(§10.4/probe_regime_route), and it happens to be the highest-stakes vessel in the set.
+
+Note the predictor's error is **not a uniform rescale**: it inflates slow vessels hugely
+(`043` 9.2×) while *deflating* `037` (0.89×). So it compresses the dynamic range and
+shuffles vessels across the boundary — which is precisely where routing decisions live.
+Rank correlation of +0.967 (§10.4) was necessary but not sufficient.
+
+**Caveat on statistical power, and why §11 keeps the router alive for now:** this set
+contained only **one** genuinely inverted vessel (`032`), and there the global gate was
+mildly *helping* (+0.0081), so skipping it could only lose. The hypothesis — "routing helps
+because the gate is harmful on inverted vessels" — was therefore barely tested. The properly
+powered test needs the inverted cohort (`019`, `025`, `029`, `011`, `024`, `001`), which is
+what the autonomous block's phase 1 runs. **If routing does not win there, the router is
+dead** and §10.5's claim ("the pocket gate can be made self-aware") must be retracted.
+
+---
+
+## 12. Autonomous block results (2026-08-06)
+
+`scripts/go_autonomous_6h.ps1`, 1h33m wall-clock (both phases finished well under the 6h
+budget; the 10 min/vessel throughput estimate was inflated by concurrent GPU load).
+
+### 12.1 PHASE 1 — the regime router WORKS. §10.6's negative was underpowered.
+
+Powered test, 6 inverted + 6 normal vessels, gate OFF vs global pct 25 vs regime-routed:
+
+| anchor | regime | off | global | routed | routed − global |
+|---|---|---|---|---|---|
+| `patient019` | INVERTED | 0.0511 | **0.0000** | 0.0511 | **+0.0511** |
+| `patient025` | INVERTED | 0.1986 | 0.1452 | 0.1986 | +0.0535 |
+| `patient029` | INVERTED | 0.2308 | **0.0000** | 0.2308 | **+0.2308** |
+| `patient011` | INVERTED | 0.8392 | 0.8492 | 0.8392 | −0.0100 |
+| `patient024` | INVERTED | 0.4581 | 0.1618 | 0.4581 | **+0.2964** |
+| `patient001` | INVERTED | 0.8852 | 0.8530 | 0.8852 | +0.0322 |
+| `patient002` | normal | 0.7671 | 0.7724 | 0.7724 | +0.0000 |
+| `patient006` | normal | 0.8140 | 0.8140 | 0.8140 | +0.0000 |
+| `patient010` | normal | 0.9273 | 0.9273 | 0.9273 | +0.0000 |
+| `patient013` | normal | 0.6058 | 0.6150 | 0.6150 | +0.0000 |
+| `patient040` | normal | 0.4828 | 0.7044 | 0.7044 | +0.0000 |
+| `patient041` | normal | 0.2422 | 0.2548 | 0.2548 | +0.0000 |
+
+```
+mean F1:  off=0.5418   global=0.5081   routed=0.5626
+worst-vessel delta vs off:  global=-0.2964   routed=+0.0000
+routing beat global on 5/12, lost on 1/12 (patient011, -0.0100)
+router flagged 6/12 inverted -- all 6 match the s10.4 EDA labels
+```
+
+**Three things this establishes:**
+1. **The global gate is NET HARMFUL at cohort scale** — 0.5081 vs 0.5418 with the gate
+   OFF. Every prior gate result was measured on stagnation-regime vessels, which is why
+   this was never visible. §2.7's "+0.451 / +0.314" gains were real but unrepresentative.
+2. **On inverted vessels the gate is catastrophic, not merely unhelpful** — it drives
+   `patient019` and `patient029` to **F1 exactly 0.0000** (it deletes every predicted
+   component) and `patient024` from 0.458 → 0.162.
+3. **Routing solves §2.7's minimax problem outright.** Worst-vessel delta goes
+   −0.2964 → **+0.0000**: routing never does worse than not gating. Mean beats both
+   alternatives. The gate's benefit on normal vessels (+0.0415 mean) is fully preserved
+   while its harm on inverted ones (−0.1090 mean) is fully removed.
+
+**Caveat that stands:** the router is ~84% LOO on predicted flow, and `patient037` remains
+one of its errors (§10.6) — misrouted as normal, so the gate still costs it −0.113. The
+router is a large net win, not a complete solution. §10.5's claim survives; §10.6's
+"if routing does not win there, the router is dead" falsification test **passed**.
+
+### 12.2 PHASE 2 — v5 (aux 40 → 150) changes NOTHING, and the census says why
+
+| | loss range | spread | deploy F1 | Spearman(loss, F1) |
+|---|---|---|---|---|
+| v3 (aux 40) | 61.359–61.471 | 0.18% | 0.3655–0.6125 | **+0.314** |
+| v5 (aux 150) | 61.358–61.470 | 0.18% | 0.3655–0.6125 | **+0.314** |
+
+Identical to three decimals on every column. Config verified to have taken effect
+(`deploy_horizon_steps` 40 → 150, aux rollout length 40 → 150 steps), so this is a real
+negative, not a plumbing failure.
+
+**Why — a loss-term census settles it:**
+```
+main per-step TBPTT windows : 756   (5-step unroll x 5 train vessels)
+deploy_horizon aux rollouts :   1   (deploy_horizon_all_packs=False)
+-> the aux is ~1/757 of the averaged loss terms, at ANY horizon length
+```
+Lengthening a single term that carries ~0.13% of the loss average cannot move the
+objective. **§11.3 change B was necessary but wrongly specified:** the horizon was the
+wrong dial. What matters is the aux's *weight and coverage*, not its length —
+`deploy_horizon_all_packs=True` plus a large explicit weight, or a fundamentally different
+objective that grades the rolled-out state directly.
+
+Note also `Spearman(loss, F1) = +0.314` — not merely uncorrelated but **weakly positively**
+correlated, i.e. lower loss trended toward *worse* deploy F1 in both arms. The objective is
+not a noisy proxy for the metric; it is close to unrelated to it.
+
+**Retained for the record:** every epoch was still mass-rejected (mass 2.77–4.06), and
+epoch 5 reproduced its anomalous 0.6125 in both arms, confirming determinism again.

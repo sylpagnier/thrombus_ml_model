@@ -25,10 +25,13 @@ Short cheat sheet for agents and contributors. Full orientation: [docs/PROJECT_C
 - Production allfix: `go_kinematics_production_allfix.ps1` — Rel L2 **~0.087** after continuity finetune
 - Manifest: [data/reference/kinematics_best_20260426T184600Z.json](data/reference/kinematics_best_20260426T184600Z.json)
 - Config helpers: `snapshot_rgp_deq_model_config` / `resolve_rgp_deq_ctor_kwargs` in `src/architecture/kinematics_model_config.py` (gino/pmgp aliases retained)
-- **Solver Orchestration**: Dynamic flow patching is handled via a hybrid macro/micro architecture. See [docs/KINE_ADJUSTMENTS.md](docs/KINE_ADJUSTMENTS.md) for the policy on using dynamic SDF updates with the global RGP-DEQ solver for macro-resolves, and the Local Kinematic Corrector for micro-gaps.
+- **Solver Orchestration**: Dynamic flow patching is handled via a hybrid macro/micro architecture. See [docs/KINE_ADJUSTMENTS.md](docs/KINE_ADJUSTMENTS.md) for macro-resolves, micro-resolves, and smooth SDF fast-marching.
+- **GT Leakage Policy**: `prior_mode="analytic"` MUST be used for priors. See [docs/KINE_ADJUSTMENTS.md](docs/KINE_ADJUSTMENTS.md).
 
 
 ## Configuration Architecture Guardrail
+
+**GT Input Leakage Policy**: Never feed COMSOL ground-truth velocity, viscosity, or WSS into model INPUT features (data.x channels 11-14). Prior channels must always use analytical Poiseuille/Carreau formulas computed from mesh geometry. GT data may only appear in LABELS (data.y) and loss targets.
 
 **Strict Policy**: Never mutate `os.environ` to alter model architectures, toggle features,
 deploy/rollout policy, scoring, coupling, or sweeps.

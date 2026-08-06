@@ -18,9 +18,10 @@ class PredChannels:
     P = 2
     MU_EFF_ND = STATE_CHANNEL_MU_EFF_ND
     WSS = 4
+    SHEAR_RATE = 5
     UV = slice(U, V + 1)
     KINEMATICS = slice(U, P + 1)
-    ALL_PHYSICS = slice(U, WSS + 1)
+    ALL_PHYSICS = slice(U, SHEAR_RATE + 1)
 
 
 class NodeFeat:

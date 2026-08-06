@@ -649,45 +649,6 @@ class CorrectorCoupledFlow:
         return self.couple_from_delta_mu(data, delta_mu_si, publish=publish)
 
 
-def inject_sdf_wall(data, clot_idx: torch.Tensor):
-    """Return a shallow graph clone treating clot nodes as rigid walls (SDF=0).
-    
-    The RGP-DEQ solver enforces no-slip via the hard BC envelope (1 - exp(-lambda * SDF)).
-    By setting SDF=0 and UV_PRIOR=0 at clot nodes, we create a rigid vessel wall, allowing
-    the solver to remain in-distribution (healthy fluid, narrower pipe) instead of OOD.
-    """
-    device = data.x.device
-    data_mod = data.clone()
-    x_new = data_mod.x.clone()
-    
-    # 1. Set SDF = 0 at clot nodes
-    x_new[clot_idx, NodeFeat.SDF.start] = 0.0
-    
-    # 2. Set UV_PRIOR = 0 at clot nodes (no-slip)
-    x_new[clot_idx, NodeFeat.UV_PRIOR] = 0.0
-    if x_new.shape[1] > NodeFeat.WSS_PRIOR.start:
-        x_new[clot_idx, NodeFeat.WSS_PRIOR] = 0.0
-        
-    # 3. Expand wall mask
-    mask_wall_new = data_mod.mask_wall.clone()
-    mask_wall_new[clot_idx] = True
-    
-    # 4. Recompute SDF for ALL nodes from expanded boundary
-    import numpy as np
-    from scipy.spatial import cKDTree
-    pos_np = x_new[:, 0:2].cpu().numpy()
-    wall_np = pos_np[mask_wall_new.cpu().numpy()]
-    if wall_np.shape[0] > 0:
-        tree = cKDTree(wall_np)
-        dists, _ = tree.query(pos_np)
-        sdf_recomputed = torch.tensor(np.clip(dists, 1e-6, None), dtype=torch.float32, device=device)
-        x_new[:, NodeFeat.SDF.start] = sdf_recomputed
-        if x_new.shape[1] > NodeFeat.SHEAR_POT.start:
-            x_new[:, NodeFeat.SHEAR_POT.start] = torch.abs(1.0 - 2.0 * sdf_recomputed)
-            
-    data_mod.x = x_new
-    data_mod.mask_wall = mask_wall_new
-    return data_mod
 
 
 @dataclass
@@ -767,23 +728,58 @@ class ClotAwareFlow(CorrectorCoupledFlow):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         from src.utils.kinematics_inference import predict_kinematics_and_latent
+        from src.utils.fast_march_sdf import fast_march_sdf
+
+        device = self.device
+        data = data.to(device)
+        clot_nodes = clot_nodes.to(device)
+
+        # Prepare for SDF update
+        original_sdf = data.x[:, NodeFeat.SDF.start].clone()
+
+        clot_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
+        clot_mask[clot_nodes] = True
+        wall_mask = data.mask_wall.clone()
+
+        # 1. Compute smoothed SDF
+        sdf_updated = fast_march_sdf(
+            pos_nd=data.x[:, 0:2],
+            edge_index=data.edge_index,
+            wall_mask=wall_mask,
+            clot_mask=clot_mask,
+            original_sdf_nd=original_sdf,
+            max_hops=10
+        )
+
+        # 2. Temporarily update SDF
+        data.x[:, NodeFeat.SDF.start] = sdf_updated
 
         try:
-            data_k = inject_sdf_wall(data.to(self.device), clot_nodes.to(self.device))
-            pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
+            pred, z_kin = predict_kinematics_and_latent(self._kine, data)
         except torch.cuda.OutOfMemoryError as e:
             # Fragmentation is the usual cause -- defrag and RETRY ON GPU (full speed) before CPU.
             torch.cuda.empty_cache()
             try:
-                data_k = inject_sdf_wall(data.to(self.device), clot_nodes.to(self.device))
-                pred, z_kin = predict_kinematics_and_latent(self._kine, data_k)
+                pred, z_kin = predict_kinematics_and_latent(self._kine, data)
                 print("[i] DEQ re-solve recovered on GPU after empty_cache.")
             except torch.cuda.OutOfMemoryError:
+                data.x[:, NodeFeat.SDF.start] = original_sdf  # Restore before throwing
                 raise RuntimeError("DEQ re-solve OOM on CUDA. Silent fallbacks to CPU are disabled by Hardware Execution Policy to prevent hangs.") from e
+
+        # 3. Restore original SDF
+        data.x[:, NodeFeat.SDF.start] = original_sdf
+
+        u = pred[:, 0].contiguous().to(device)
+        v = pred[:, 1].contiguous().to(device)
+
+        # 4. Enforce zero velocity on clot nodes
+        u[clot_nodes] = 0.0
+        v[clot_nodes] = 0.0
+
         return (
-            z_kin.to(self.device),
-            pred[:, 0].contiguous().to(self.device),
-            pred[:, 1].contiguous().to(self.device),
+            z_kin.to(device),
+            u,
+            v,
         )
 
     def _grown_enough(self, n_clot: int) -> bool:

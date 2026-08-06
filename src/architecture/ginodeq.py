@@ -233,8 +233,10 @@ class RGP_DEQ(nn.Module):
         wss_fuse: Optional[bool] = None,
         bc_envelope: Optional[bool] = None,
         fourier_learnable: Optional[bool] = None,
+        shear_head: bool = True,
     ):
         super().__init__()
+        self.shear_head = shear_head
         self.max_iters = max_iters
         self.outer_iters = outer_iters
         self.num_fourier_freqs = num_fourier_freqs
@@ -286,12 +288,24 @@ class RGP_DEQ(nn.Module):
                 _make_activation(self.activation_fn),
                 nn.Linear(latent_dim, 1),
             )
+            if self.shear_head:
+                self.shear_decoder = nn.Sequential(
+                    SpectralLinear(latent_dim + 4, latent_dim),
+                    _make_activation(self.activation_fn),
+                    nn.Linear(latent_dim, 1),
+                )
         else:
             self.wss_decoder = nn.Sequential(
                 SpectralLinear(latent_dim, latent_dim),
                 _make_activation(self.activation_fn),
                 nn.Linear(latent_dim, 1),  # Non-recurrent output projection
             )
+            if self.shear_head:
+                self.shear_decoder = nn.Sequential(
+                    SpectralLinear(latent_dim, latent_dim),
+                    _make_activation(self.activation_fn),
+                    nn.Linear(latent_dim, 1),
+                )
         self.use_siren_decoder = bool(use_siren_decoder)
         self.use_width_priors = bool(use_width_priors)
         self.decouple_rheology = False
@@ -486,9 +500,18 @@ class RGP_DEQ(nn.Module):
 
         if self.wss_fuse:
             wss_pred = self.wss_decoder(torch.cat([z, u_v_p, mu], dim=1))
+            if getattr(self, "shear_head", True):
+                shear_pred = self.shear_decoder(torch.cat([z, u_v_p, mu], dim=1))
         else:
             wss_pred = self.wss_decoder(z)
-        return torch.cat([u_v_p, mu, wss_pred], dim=1)
+            if getattr(self, "shear_head", True):
+                shear_pred = self.shear_decoder(z)
+        
+        out_list = [u_v_p, mu, wss_pred]
+        if getattr(self, "shear_head", True):
+            out_list.append(shear_pred)
+            
+        return torch.cat(out_list, dim=1)
 
     @torch.no_grad()
     def solve_latent(

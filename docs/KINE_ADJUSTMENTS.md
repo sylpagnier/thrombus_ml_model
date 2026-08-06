@@ -3,28 +3,39 @@
 This document outlines the hybrid architecture for capturing accurate hemodynamics as a vessel transitions from an empty state to near occlusion.
 
 ## Overview
-Historically, kinematic coupling relied entirely on the **Local Kinematic Corrector**, which proved insufficient and out-of-distribution (OOD) for massive, late-stage clots. Concurrently, attempting to force the global **RGP-DEQ** solver to handle these large clots by injecting extreme viscosity spikes into `MU_PRIOR` caused the latent space (`z_kin`) to collapse or the GPU to run out of memory.
+The architecture relies on a hybrid macro/micro approach for dynamic flow coupling. The global RGP-DEQ solver handles large-scale macro-resolves by updating the Signed Distance Field (SDF), while the Local Kinematic Corrector fills in micro-scale perturbations between these resolves.
 
-To resolve this, we adopt a **Geometry-Based Hybrid Architecture**:
-1. **Macro Adjustments**: The RGP-DEQ solver handles large-scale flow rerouting by treating the clot as a solid wall (SDF update) rather than a viscosity anomaly.
-2. **Micro Adjustments**: The Local Kinematic Corrector fills in the gaps between macro resolves.
+## GT Input Leakage Policy
+- Phase 3 clinical anchor fine-tuning MUST use `prior_mode="analytic"` (never `"gt_flow"`).
+- The old `apply_gt_flow_priors_to_kine_x()` function is DEPRECATED.
+- **Why**: The residual hard-BC formulation `u_pred = u_prior + (1-exp(-λ·SDF))·Δu` makes GT priors trivially learnable (Δu ≈ 0), destroying generalization.
+- Prior channels (11-14) must always contain analytical Poiseuille/Carreau formulas from geometry.
 
-## 1. Macro-Resolves (RGP-DEQ via SDF)
-When a clot grows enough to significantly alter the global flow field (e.g., occluding a new threshold percentage of the lumen or hopping deeper into the channel), we trigger a macro-resolve.
+## Direct Shear Rate Prediction
+- The GINODEQ model now has a `shear_decoder` head (channel 5) predicting per-node `log1p(shear_rate)`.
+- This replaces the noisy WLS finite-difference approach for downstream consumers.
+- Supervised by deriving GT shear rate from GT velocity via WLS operators during training.
+- Downstream consumers (`clot_kinematics_fields`, `species_pushforward_gnn`) should prefer the direct prediction.
 
-Instead of changing the viscosity parameter `MU_PRIOR`, we recalculate the **Signed Distance Field (SDF)** of the vessel, effectively treating the gelled clot boundary as the new rigid vessel wall (`SDF = 0`). 
+## Smooth SDF Fast-Marching
+- When macro-resolves are triggered, SDF is smoothly recomputed via graph-based fast-marching.
+- This replaces binary `SDF=0` masking, giving the solver the smooth gradients it expects.
+- The fast-march computes Euclidean shortest paths from the combined wall+clot boundary.
 
-**Why this works**: The RGP-DEQ model was trained on healthy fluid across variously shaped vessels. By feeding it a narrower vessel via the updated SDF, the solver remains perfectly in-distribution. It outputs an accurate, updated base flow (`u0, v0`) and a clean updated latent (`z_kin`) reflecting the stenosed geometry.
+## Macro-Resolves
+- **Trigger policy**: When clot nodes exceed threshold or hop count changes.
+- **Process**: fast-march SDF → RGP-DEQ solve → zero-velocity enforcement on clot nodes.
 
-## 2. Micro-Resolves (Local Kinematic Corrector)
-Because a full RGP-DEQ solve is computationally heavy, we do not run it at every timestep. In the intervening rollout steps between macro-resolves, the **Local Kinematic Corrector** applies localized, micro-scale flow diversions (`u, v`) around the newly nucleating clot nodes.
+## Micro-Resolves
+- Local Kinematic Corrector for small perturbations between macro-resolves.
 
-## 3. Species Model Consumption
-The species GraphSAGE teacher model must dynamically consume the updated `z_kin` from the macro-resolves. As the vessel narrows, the updated `z_kin` informs the species model of the shifting geometric boundaries, allowing it to accurately localize the next phase of clot growth based on the constricted flow.
+## Training
+- RGP-DEQ trains on analytical priors only (no GT leak).
+- L2 stenosed synthetics (up to 80% occlusion) are already in the training curriculum.
+- Shear decoder supervised by WLS-derived GT shear rate.
+- Local corrector may need retraining on post-adjustment flow.
 
-## Training Implications
-Because this architecture dynamically adjusts the SDF to keep the solver in-distribution, **no retraining of the RGP-DEQ kinematics model is required**. The solver naturally handles the updated `SDF = 0` geometries because it was already trained on a diverse set of vessel shapes, including stenoses.
-
-Similarly, the **Local Kinematic Corrector** does not need retraining, as it continues to see its standard local graph patches and small delta-velocities.
-
-If the species model (GraphSAGE teacher) requires fine-tuning on the new $z_{kin}$ dynamics, you can promote this pipeline using the standard deploy tools. However, current probes indicate the $z_{kin}$ magnitude ratio remains near 1.0 (no distribution shift), suggesting the species model will seamlessly consume the updated latent without structural retraining.
+## Metrics
+- Local 3-hop Rel L2 error around clots (target <15%).
+- Shear rate Rel L2 (target <20%).
+- Shear correlation, wall-specific and lumen-specific shear metrics.

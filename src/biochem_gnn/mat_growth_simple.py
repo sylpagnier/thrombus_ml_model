@@ -214,6 +214,8 @@ LADDER_LEG_ORDER: tuple[str, ...] = (
     "WG_stenosis_subcohort_ft_v2",
     "WG_stenosis_subcohort_ft_v3",
     "WG_stenosis_subcohort_ft_v4",
+    "WG_stenosis_subcohort_ft_v5",
+    "WG_stenosis_subcohort_ft_v6",
 )
 
 # Full-length clot-rich anchors (T=201, off-wall >=30%) from docs/GENERALIZATION_PLAN.md EDA.
@@ -978,6 +980,134 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "deploy_eval_full": True,
                 "deploy_horizon_all_packs": False,
                 "deploy_horizon_aux_cap": 40,
+            },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # v5 -- THE PREREQUISITE EXPERIMENT (WALL_MODEL_PLAN.md s11.3 change B).
+        # v1-v4 all failed for reasons unrelated to the knob being tuned, and s9.12/s9.14
+        # found why: the training objective supervises 5-10 step TBPTT windows while deploy
+        # is a 200-step free rollout, so loss moves 0.2% while deploy F1 swings 0.37->0.61.
+        # The FP term provably never fires (v3 vs v4 bit-identical) and the rolled-state
+        # brake moves the rollout ~1%. The ONLY loss term that evaluates a rolled-out state
+        # is the deploy_horizon aux -- and it is capped at 40 of ~200 steps, i.e. it never
+        # sees the regime where over-painting actually accumulates (GT saturates by t~100,
+        # the model keeps depositing to t=200).
+        #
+        # v5 = v3 with ONE change: deploy_horizon/aux_cap 40 -> 150. tbptt_tail=5 still
+        # bounds gradient memory (activations beyond the tail are detached), so the extra
+        # cost is forward-only. This tests the claim that gates all further training work:
+        # does making the objective SEE the deploy horizon make decreasing loss actually
+        # track deploy score? v3-vs-v5 is a clean single-variable test of exactly that.
+        "WG_stenosis_subcohort_ft_v5": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v5",
+            label="Stenosis/aneurysm sub-cohort v5: v3 + full-horizon deploy aux (40 -> 150) "
+                  "-- tests whether loss can be made to track deploy score",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+            },
+            runtime_kwargs={
+                **v3_runtime,
+                "select_clot_f1_weight": 0.70,
+                "select_clot_score_weight": 0.30,
+                "select_mat_f1_weight": 0.0,
+                "select_front_speed_target_lambda": 0.15,
+                "select_fp_fn_imbalance_lambda": 0.15,
+                "select_mass_hard_min": 0.5,
+                "select_mass_hard_max": 1.5,
+                "select_f1_min_hard_floor": 0.30,
+                "deploy_eval_time_fracs": "0.65,1.0",
+                # THE single change from v3 (40 -> 150 on both).
+                "deploy_horizon": 150,
+                "deploy_eval_full": True,
+                "deploy_horizon_all_packs": False,
+                "deploy_horizon_aux_cap": 150,
+            },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # v6 -- s11.3 change B, RE-SPECIFIED TWICE (see s12.2, s12.3).
+        # v5 lengthened the deploy_horizon aux 40 -> 150 and changed NOTHING (bit-identical to
+        # v3). Census: the aux gets its OWN opt.zero_grad/backward/step, so it is 1 optimizer
+        # step out of 757; and grad_clip=1.0 clips the update, so scaling its loss magnitude is
+        # neutered too. COUNT is the only lever -- but making the aux 20% of steps needs ~190
+        # rollouts of 150 steps per epoch (~28k model evals vs the main loop's 3.8k), which is
+        # computationally infeasible. And --max-windows cannot rebalance it either: it
+        # truncates to `windows[:N]`, i.e. the EARLIEST t0 only, which would bias training to
+        # early times and defeat train_t0_coverage_frac (s9.9 change 4).
+        #
+        # So v6 attacks the same problem from the other side: instead of making ONE term
+        # horizon-aware, make EVERY term horizon-aware.
+        #   curriculum_unroll: True -> False   (curriculum pins unroll to 5 through epoch 10,
+        #                                       overriding the configured value)
+        #   unroll:              10 -> 25      (every one of the ~756 main windows now carries
+        #                                       a 25-step rollout signal, not 5)
+        #   deploy_horizon_all_packs: -> True  (aux on all train packs; val pack still excluded)
+        # tbptt_tail=5 still bounds gradient memory, so the extra cost is forward-only:
+        # ~756 x 25 = 18.9k evals/epoch vs v3's 3.8k, i.e. ~5x (~35 min/epoch). No t0 bias.
+        #
+        # The question is unchanged and is NOT "does v6 score higher": does decreasing loss now
+        # TRACK deploy F1? v3 and v5 both sat at Spearman(loss, F1) = +0.314 -- weakly POSITIVE,
+        # i.e. lower loss trended toward WORSE deploy score. If v6 turns that negative the
+        # objective is finally aligned and further training work becomes interpretable. If a 5x
+        # deeper rollout signal on every update still does not, then the per-step delta loss is
+        # structurally misaligned with the thresholded-rollout metric, and s11 should move to
+        # change D (explicit autocatalysis) rather than reweighting this objective further.
+        "WG_stenosis_subcohort_ft_v6": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v6",
+            label="Stenosis/aneurysm sub-cohort v6: unroll 5->25 on EVERY window + aux on all "
+                  "packs -- makes the whole objective horizon-aware (s11.3 change B, retry 2)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                # THE change: every main window becomes a 25-step rollout.
+                "curriculum_unroll": False,
+                "unroll": 25,
+            },
+            runtime_kwargs={
+                **v3_runtime,
+                "select_clot_f1_weight": 0.70,
+                "select_clot_score_weight": 0.30,
+                "select_mat_f1_weight": 0.0,
+                "select_front_speed_target_lambda": 0.15,
+                "select_fp_fn_imbalance_lambda": 0.15,
+                "select_mass_hard_min": 0.5,
+                "select_mass_hard_max": 1.5,
+                "select_f1_min_hard_floor": 0.30,
+                "deploy_eval_time_fracs": "0.65,1.0",
+                "deploy_horizon": 150,
+                "deploy_eval_full": True,
+                "deploy_horizon_all_packs": True,
+                "deploy_horizon_aux_cap": 150,
             },
             env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
         ),

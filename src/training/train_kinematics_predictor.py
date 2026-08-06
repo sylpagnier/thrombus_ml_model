@@ -59,8 +59,18 @@ from src.utils.kinematics_geometry import (
     split_anchor_physics_stratified,
     split_clinical_anchor_train_val,
     train_pool_for_epoch,
-    warn_if_single_level_cohort,
 )
+
+
+def compute_gt_shear_rate(data):
+    from src.utils.rheology import compute_shear_rate
+    u_gt = data.y[:, 0]  # u_nd
+    v_gt = data.y[:, 1]  # v_nd
+    u_x = data.G_x @ u_gt
+    u_y = data.G_y @ u_gt  
+    v_x = data.G_x @ v_gt
+    v_y = data.G_y @ v_gt
+    return compute_shear_rate(u_x, u_y, v_x, v_y)
 
 
 def resolve_kinematics_train_val_split(
@@ -502,6 +512,18 @@ def compute_step_loss(
     bc_weight = 50.0 if stage == 2 else 5.0
 
     # 6. Final Composite Loss
+    l_shear = torch.tensor(0.0, device=device)
+    w_shear = 0.1
+    if pred.shape[1] > PredChannels.SHEAR_RATE and stage in (1, 3):
+        node_is_anchor = anchor_node_mask(data)
+        if node_is_anchor is not None and node_is_anchor.any() and hasattr(data, 'G_x'):
+            gt_shear = compute_gt_shear_rate(data)
+            pred_shear = pred[:, PredChannels.SHEAR_RATE]
+            l_shear = torch.nn.functional.smooth_l1_loss(
+                torch.log1p(pred_shear[node_is_anchor]),
+                torch.log1p(gt_shear[node_is_anchor])
+            )
+            
     loss = (
         weighted_pdes
         + (weight_data * l_data_kine)
@@ -510,6 +532,7 @@ def compute_step_loss(
         + (io_weight * l_io)
         + (1.0 * p_grad_loss)
         + (weight_wss * l_wss)
+        + (w_shear * l_shear)
         + (0.1 * jac_loss)
     )
 
@@ -519,6 +542,7 @@ def compute_step_loss(
     weighted_io = io_weight * l_io
     weighted_pgrad = 1.0 * p_grad_loss
     weighted_wss = weight_wss * l_wss
+    weighted_shear = w_shear * l_shear
     weighted_jac = 0.1 * jac_loss
     metrics = {
         "L_mom": l_mom.item(),
@@ -528,6 +552,7 @@ def compute_step_loss(
         "L_bc": l_bc.item(),
         "L_io": l_io.item(),
         "L_wss": l_wss.item(),
+        "L_shear": l_shear.item(),
         "L_jac": jac_loss.item(),
         "L_pgrad": p_grad_loss.item(),
         "L_total": loss.item(),
@@ -538,6 +563,7 @@ def compute_step_loss(
         "C_io": weighted_io.item(),
         "C_pgrad": weighted_pgrad.item(),
         "C_wss": weighted_wss.item(),
+        "C_shear": weighted_shear.item(),
         "C_jac": weighted_jac.item(),
     }
     return loss, metrics
@@ -660,7 +686,7 @@ def train_kinematics(
                 schedulers=[warmup_scheduler, cosine_scheduler],
                 milestones=[warm_up_epochs],
             )
-            model.load_state_dict(resume_state)
+            model.load_state_dict(resume_state, strict=False)
             if isinstance(ckpt.get("training_manifest"), dict):
                 training_manifest.update(ckpt["training_manifest"])
             if "loss_weighter_state_dict" in ckpt:
@@ -684,7 +710,7 @@ def train_kinematics(
             lbfgs_initialized = False
             print(f"[kin] Loaded full training state (next epoch: {start_epoch})")
         else:
-            model.load_state_dict(ckpt)
+            model.load_state_dict(ckpt, strict=False)
             m = re.search(r"kinematics_ckpt_(\d+)\.pth$", str(resume_from))
             if m:
                 start_epoch = int(m.group(1))
@@ -1107,9 +1133,12 @@ def train_kinematics(
                             f" | synthetic_L2_val_rel_L2={s_l2_rel:.3f} (n={s_l2_n})"
                         )
             if math.isfinite(rel_l2) and math.isfinite(continuity):
+                shear_msg = ""
+                if "shear_rel_l2" in scores:
+                    shear_msg = f" | [i] shear_rel_l2: {scores['shear_rel_l2']:.4f}"
                 print(
                     f"[kin] [Validation] Rel L2: {rel_l2:.4f} | "
-                    f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}{patient_msg}"
+                    f"div_u mean: {continuity:.3e} | composite: {val_comp:.4f}{level_msg}{patient_msg}{shear_msg}"
                 )
             else:
                 print(

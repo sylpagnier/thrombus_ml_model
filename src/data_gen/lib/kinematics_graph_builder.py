@@ -181,7 +181,7 @@ def build_kinematics_graph_from_comsol_steady(
     phys_cfg: Optional[PhysicsConfig] = None,
     raw_sidecar_dir: Optional[Any] = None,
     geometry_level: Optional[int] = None,
-    prior_mode: str = "gt_flow",
+    prior_mode: str = "analytic",
 ) -> Data:
     """Assemble a single steady-state kinematics ``Data`` object (trainer schema).
 
@@ -248,18 +248,7 @@ def build_kinematics_graph_from_comsol_steady(
 
     mode = str(prior_mode or "analytic").strip().lower()
     if mode in ("gt", "gt_flow", "gt_t0"):
-        x_tensor = apply_gt_flow_priors_to_kine_x(
-            x_tensor,
-            u_nd=u_nd,
-            v_nd=v_nd,
-            mu_nd=mu_nd,
-            mask_wall=mask_wall,
-            wall_normal=wall_normal_vec,
-            edge_index=edge_index,
-            M_inv=M_inv,
-            V=V,
-            W=W,
-        )
+        print("WARNING: 'gt_flow' prior mode is deprecated. GT input leakage is forbidden. Using analytic priors instead.")
 
     u_nd = u_nd.clone()
     v_nd = v_nd.clone()

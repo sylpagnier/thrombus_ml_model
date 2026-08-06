@@ -188,6 +188,34 @@ class DynamicLossWeighter(nn.Module):
             total_loss += scales[i] * task_loss
         return total_loss
 
+
+def shear_rate_metrics(pred_shear: torch.Tensor, gt_shear: torch.Tensor, mask_wall: torch.Tensor) -> dict:
+    metrics = {}
+    diff = pred_shear - gt_shear
+    gt_norm = torch.norm(gt_shear, p=2) + 1e-8
+    metrics["shear_rel_l2"] = float((torch.norm(diff, p=2) / gt_norm).item())
+    metrics["shear_mse"] = float(F.mse_loss(pred_shear, gt_shear).item())
+    
+    pred_mean = pred_shear.mean()
+    gt_mean = gt_shear.mean()
+    cov = torch.mean((pred_shear - pred_mean) * (gt_shear - gt_mean))
+    pred_std = torch.std(pred_shear) + 1e-8
+    gt_std = torch.std(gt_shear) + 1e-8
+    metrics["shear_corr"] = float((cov / (pred_std * gt_std)).item())
+    
+    if mask_wall is not None and mask_wall.any():
+        diff_wall = pred_shear[mask_wall] - gt_shear[mask_wall]
+        gt_wall_norm = torch.norm(gt_shear[mask_wall], p=2) + 1e-8
+        metrics["shear_wall_rel_l2"] = float((torch.norm(diff_wall, p=2) / gt_wall_norm).item())
+        
+        mask_lumen = ~mask_wall
+        if mask_lumen.any():
+            diff_lumen = pred_shear[mask_lumen] - gt_shear[mask_lumen]
+            gt_lumen_norm = torch.norm(gt_shear[mask_lumen], p=2) + 1e-8
+            metrics["shear_lumen_rel_l2"] = float((torch.norm(diff_lumen, p=2) / gt_lumen_norm).item())
+    return metrics
+
+
 def validate_and_plot(model, val_data, epoch, device, phase="kinematics"):
     model.eval()
     with torch.no_grad():
@@ -335,14 +363,21 @@ def quantify_performance(
                     c_u_t[:, 0, 0], c_u_t[:, 1, 0], c_v_t[:, 0, 0], c_v_t[:, 1, 0], eps=1e-6
                 )
 
-                u_p = pred[:, PredChannels.U:PredChannels.U + 1]
-                v_p = pred[:, PredChannels.V:PredChannels.V + 1]
-                c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
-                g_dot_p = compute_shear_rate(
-                    c_u_p[:, 0, 0], c_u_p[:, 1, 0], c_v_p[:, 0, 0], c_v_p[:, 1, 0], eps=1e-6
-                )
-
-                metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
+                if pred.shape[1] > PredChannels.SHEAR_RATE:
+                    pred_shear = pred[:, PredChannels.SHEAR_RATE]
+                    shear_mets = shear_rate_metrics(pred_shear[node_mask], g_dot_t[node_mask], data.mask_wall[node_mask] if hasattr(data, "mask_wall") else None)
+                    for k, v in shear_mets.items():
+                        if k not in metrics:
+                            metrics[k] = []
+                        metrics[k].append(v)
+                else:
+                    u_p = pred[:, PredChannels.U:PredChannels.U + 1]
+                    v_p = pred[:, PredChannels.V:PredChannels.V + 1]
+                    c_u_p, c_v_p = kernels._compute_derivatives(u_p, props), kernels._compute_derivatives(v_p, props)
+                    g_dot_p = compute_shear_rate(
+                        c_u_p[:, 0, 0], c_u_p[:, 1, 0], c_v_p[:, 0, 0], c_v_p[:, 1, 0], eps=1e-6
+                    )
+                    metrics["shear_mse"].append(F.mse_loss(g_dot_p[node_mask], g_dot_t[node_mask]).item())
 
                 if phase == "kinematics" and data.y.shape[1] >= 4:
                     mu_p = pred[node_mask, PredChannels.MU_EFF_ND]
@@ -393,9 +428,16 @@ def quantify_performance(
     out["wall_slip_std"] = ws_std
     out["wall_slip_p90"] = ws_p90
 
-    sh_std, sh_p90 = _list_dispersion(metrics["shear_mse"])
+    sh_std, sh_p90 = _list_dispersion(metrics.get("shear_mse", []))
     out["shear_mse_std"] = sh_std
     out["shear_mse_p90"] = sh_p90
+    
+    # Add newly dynamically added shear metrics explicitly to out
+    for k in ["shear_rel_l2", "shear_corr", "shear_wall_rel_l2", "shear_lumen_rel_l2"]:
+        if k in metrics:
+            k_std, k_p90 = _list_dispersion(metrics[k])
+            out[f"{k}_std"] = k_std
+            out[f"{k}_p90"] = k_p90
 
     out["val_total_batches"] = float(val_total_batches)
     out["val_anchor_batches"] = float(val_anchor_batches)

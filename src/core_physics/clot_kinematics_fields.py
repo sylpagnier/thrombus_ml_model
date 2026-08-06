@@ -97,6 +97,7 @@ def compute_clot_kinematics_fields(
     v_nd: torch.Tensor,
     bio_cfg: "BiochemConfig",
     props: dict,
+    pred_shear_nd: torch.Tensor | None = None,
 ) -> ClotKinematicsFields:
     """Build SI shear-rate and adhesion-proxy fields from graph kinematics."""
     u = u_nd.reshape(-1).to(dtype=torch.float32)
@@ -108,7 +109,11 @@ def compute_clot_kinematics_fields(
     du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
     dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
     dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
-    gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
+    
+    if pred_shear_nd is not None:
+        gamma_dot_nd = pred_shear_nd.reshape(-1).to(dtype=torch.float32).clamp(min=1e-6)
+    else:
+        gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
 
     u_ref = props["u_ref"].to(device=device, dtype=torch.float32).reshape(-1)
     d_bar = props["d_bar"].to(device=device, dtype=torch.float32).reshape(-1)
