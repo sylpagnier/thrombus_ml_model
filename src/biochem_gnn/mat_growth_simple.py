@@ -216,6 +216,10 @@ LADDER_LEG_ORDER: tuple[str, ...] = (
     "WG_stenosis_subcohort_ft_v4",
     "WG_stenosis_subcohort_ft_v5",
     "WG_stenosis_subcohort_ft_v6",
+    "WG_stenosis_subcohort_ft_v7",
+    "WG_stenosis_subcohort_ft_v8",
+    "WG_stenosis_subcohort_ft_v9",
+    "WG_stenosis_subcohort_ft_v10",
 )
 
 # Full-length clot-rich anchors (T=201, off-wall >=30%) from docs/GENERALIZATION_PLAN.md EDA.
@@ -509,6 +513,29 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
         "select_mass_hard_max": 3.0,
         "select_overpaint_lambda": 0.30,
         "select_overpaint_frac_target": 0.08,
+    }
+
+    # Shared selection/rollout runtime for the stenosis sub-cohort legs from v3 on. v3..v6 each
+    # spell this out verbatim (kept that way as historical record); v7+ share it so the ladder
+    # differs ONLY in config_kwargs and each step stays a clean single-variable test.
+    # select_mass_hard_max stays at 1.5: it is correct as *selection* policy. It was never
+    # correct as *retention* policy, and that is fixed in the trainer (best_salvage.pth,
+    # WALL_MODEL_PLAN.md s12.5 item 1), not by loosening the gate here.
+    _SUBCOHORT_RUNTIME_V3PLUS: dict[str, Any] = {
+        **v3_runtime,
+        "select_clot_f1_weight": 0.70,
+        "select_clot_score_weight": 0.30,
+        "select_mat_f1_weight": 0.0,
+        "select_front_speed_target_lambda": 0.15,
+        "select_fp_fn_imbalance_lambda": 0.15,
+        "select_mass_hard_min": 0.5,
+        "select_mass_hard_max": 1.5,
+        "select_f1_min_hard_floor": 0.30,
+        "deploy_eval_time_fracs": "0.65,1.0",
+        "deploy_horizon": 40,
+        "deploy_eval_full": True,
+        "deploy_horizon_all_packs": False,
+        "deploy_horizon_aux_cap": 40,
     }
 
     specs: dict[str, MatGrowthLegSpec] = {
@@ -1125,6 +1152,193 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "deploy_horizon_all_packs": True,
                 "deploy_horizon_aux_cap": 150,
             },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # =====================================================================================
+        # v7/v8/v9 -- the post-change-B ladder (s12.6). Built on a NEW root cause that v6's
+        # post-mortem turned up and that invalidates the premise of v3/v4/v5/v6 alike:
+        #
+        #   THE ROLLED-STATE LOSS TERMS WERE NUMERICALLY DEAD, NOT WEAK.
+        #   soft occupancy is sigmoid(soft_k * (pred - thr)) with soft_k=40 and the actual Mat
+        #   commit threshold thr=1e-4. That returns 0.4990 for an EMPTY node and 0.5000 at
+        #   threshold -- the "soft committed set" is a constant 0.5 everywhere. Measured:
+        #     rolled_final_mass_fp_penalty  29.11500 -> 29.15093  (0.12%)
+        #     as the rollout goes from EMPTY to 12x OVER-PAINTED,
+        #   and its soft mass_ratio reads 19.96 in every case instead of 0.00 -> 12.00.
+        #   This is the mechanical cause of s9.12's "the brake moved the rollout ~1%".
+        #   Fix: rolled_soft_k_relative=True makes the argument k*(pred-thr)/thr, i.e. a
+        #   scale-free RELATIVE deviation. Dynamic range 0.12% -> 97.7%.
+        #   The flag defaults False, so v1..v6 stay bit-reproducible.
+        #
+        # Second finding, same family: fp_weight compares per-step pred_delta against
+        # fp_thresh=2e-5 while predicted deltas run ~1e-7, so the FP branch never selects any
+        # node. That is the mechanical cause of s9.14's v3-vs-v4 bit-identity. NOT changed in
+        # this ladder (one variable at a time); the soft-F_beta term below applies FP pressure
+        # on the rolled state, which is the better place for it anyway.
+        #
+        # v7 = v3 with ONE change: rolled_soft_k_relative=True. This does not add a term; it
+        # brings v3's OWN brake to life for the first time. v3-vs-v7 therefore finally tests
+        # what s9.11 believed it was testing.
+        "WG_stenosis_subcohort_ft_v7": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v7",
+            label="Stenosis/aneurysm sub-cohort v7: v3 with the soft-occupancy scale fixed "
+                  "(rolled_soft_k_relative) -- the first run in which the brake is not dead",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                # THE single change from v3.
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V3PLUS},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # v10 -- s13.6, step 4a of the architecture ladder. ONE variable off v7:
+        # latent_dropout 0.0 -> 0.30. s11.2.1's largest structural imbalance is that z_kin is
+        # 256 of a 287-dim input (89%) and is a FROZEN, off-task kinematics latent. Dropout on
+        # it is the cheapest possible probe of "is the readout leaning on the off-task latent
+        # instead of the geometry/flow channels" -- config-only, no new code.
+        # Base is v7 (= v3 + the s12.6.1 occupancy fix), NOT v9: v9 bundles three changes and
+        # would make this unattributable, which is the exact mistake that cost v1-v6.
+        # 14 epochs, per s12.8.2's floor -- 6 would be unreadable.
+        "WG_stenosis_subcohort_ft_v10": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v10",
+            label="Stenosis/aneurysm sub-cohort v10: v7 + latent_dropout 0.30 "
+                  "(s13 step 4a -- cheapest architecture probe, single variable)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                # inherited from v7 (already tested in isolation, s12.6.6)
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+            },
+            runtime_kwargs={
+                **_SUBCOHORT_RUNTIME_V3PLUS,
+                # THE single change from v7.
+                "latent_dropout": 0.30,
+            },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # v8 = v7 + the soft-F_beta rolled-state surrogate (s12.5 change E). The brake, even
+        # alive, is still only a SUPPRESSOR: final_mass_penalty is softplus(mass_ratio-target),
+        # identically zero below target, and final_prec_fp_penalty is an FP fraction. Neither
+        # has a TP numerator, so neither is monotone in F1. This term is the deploy metric
+        # itself, softened -- 1 - soft_F_beta over the rolled committed set -- and is the direct
+        # answer to "make training loss track deploy score", which is what change B failed to
+        # achieve by reweighting a per-step regression (s12.3).
+        # beta=1.0: the cohort over-paints 4x during training (fp=292), so this is not the place
+        # for a recall tilt; the deploy-time under-seeding is a separate, gate-side problem.
+        "WG_stenosis_subcohort_ft_v8": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v8",
+            label="Stenosis/aneurysm sub-cohort v8: v7 + soft-F_beta rolled-state surrogate "
+                  "(s12.5 change E -- the metric itself, softened)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                # THE single change from v7. Weights are sized against the OBSERVED loss scale,
+                # not picked by feel -- this is the exact trap v5 fell into. loss_scale=0.1
+                # multiplies both rolled-state terms and the total loss runs ~61, so the shipped
+                # -looking weight of 4.0 would cap the term at 0.4, i.e. 0.65% of the objective:
+                # unable to steer anything, for the same reason the deploy_horizon aux could not
+                # (s12.2). 120.0 caps it at 12.0, ~20% of the objective, which can.
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 1.0,
+                "step_soft_f1_weight": 40.0,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V3PLUS},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # v9 = v8 + s11.3 change D, the explicit gated-autocatalytic growth law. COMSOL grows
+        # Mat as ~(Mas/Minf)*k_aa*AP -- rate proportional to material already committed locally,
+        # ~90% of real Mat growth. The generic delta head has no such term, so it can propagate
+        # but cannot ignite, which is exactly what s12.4's two-basin attractor looks like (35/41
+        # epochs pinned at fp>=292, 6/41 excursions, nothing steering between them).
+        # magnitude is multiplied by (k_dep + k_auto * local_committed_frac); both learnable and
+        # log-parameterised. At the k=1 init an isolated node keeps its current rate, so the
+        # warm start is undisturbed at t=0 and only committed neighbourhoods accelerate.
+        # NOTE: log_k_dep/log_k_auto are added to freeze_growth_backbone's head allowlist --
+        # they ARE the growth law, and freezing them would silently disable the mechanism.
+        "WG_stenosis_subcohort_ft_v9": MatGrowthLegSpec(
+            code="WG_stenosis_subcohort_ft_v9",
+            label="Stenosis/aneurysm sub-cohort v9: v8 + explicit gated-autocatalytic growth "
+                  "(s11.3 change D) -- adds the ignition term the two-basin attractor lacks",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 1.2,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 1.0,
+                "step_soft_f1_weight": 40.0,
+                # THE single change from v8.
+                "autocatalytic_growth": True,
+                "autocat_k_dep_init": 1.0,
+                "autocat_k_auto_init": 1.0,
+                "autocat_alpha": 0.8,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V3PLUS},
             env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
         ),
         # v4 -- v3's brake moved the rollout ~1% on a model 400% off target (front_speed

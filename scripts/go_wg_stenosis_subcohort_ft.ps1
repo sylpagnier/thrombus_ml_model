@@ -126,9 +126,9 @@ Set-Location $RepoRoot
 . (Join-Path $PSScriptRoot "_python_rc.ps1")
 $env:PYTHONUNBUFFERED = "1"
 
-$KnownLegs = @("WG_stenosis_subcohort_ft", "WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4", "WG_stenosis_subcohort_ft_v5", "WG_stenosis_subcohort_ft_v6")
+$KnownLegs = @("WG_stenosis_subcohort_ft", "WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4", "WG_stenosis_subcohort_ft_v5", "WG_stenosis_subcohort_ft_v6", "WG_stenosis_subcohort_ft_v7", "WG_stenosis_subcohort_ft_v8", "WG_stenosis_subcohort_ft_v9", "WG_stenosis_subcohort_ft_v10")
 # Every leg from v2 on bakes CLOT_POCKET_GATE_PCT=25 into its env_overrides.
-$GatedLegs = @("WG_stenosis_subcohort_ft_v2", "WG_stenosis_subcohort_ft_v3", "WG_stenosis_subcohort_ft_v4", "WG_stenosis_subcohort_ft_v5", "WG_stenosis_subcohort_ft_v6")
+$GatedLegs = $KnownLegs | Where-Object { $_ -ne "WG_stenosis_subcohort_ft" }
 if ($KnownLegs -notcontains $Leg) {
     Write-Host "[ERR] This launcher is for $($KnownLegs -join ' / ') only (got $Leg)" -ForegroundColor Red
     exit 1
@@ -191,7 +191,23 @@ if (-not $NoInit -and -not (Test-Path $InitPath)) {
 
 Write-Host "[NEW] wg_stenosis_subcohort_ft ($Leg): $Epochs ep / ES $EarlyStop / lr=$Lr" -ForegroundColor Cyan
 Write-Host "[i] goal=recall FT (FN down, front_speed up) on the stenosis/aneurysm sub-cohort" -ForegroundColor DarkGray
-if ($Leg -eq "WG_stenosis_subcohort_ft_v6") {
+if ($Leg -like "WG_stenosis_subcohort_ft_v1[0-9]" -or $Leg -like "WG_stenosis_subcohort_ft_v[789]") {
+    Write-Host "[i] POST-CHANGE-B LADDER (s12.6). New root cause: the rolled-state loss terms were" -ForegroundColor DarkGray
+    Write-Host "[i]   NUMERICALLY DEAD, not weak. soft occupancy = sigmoid(40*(pred-1e-4)) returns 0.4990 for an" -ForegroundColor DarkGray
+    Write-Host "[i]   EMPTY node and 0.5000 at threshold, so the brake moves 29.11500 -> 29.15093 (0.12%) across" -ForegroundColor DarkGray
+    Write-Host "[i]   the whole range from empty to 12x over-painted. rolled_soft_k_relative fixes it: range 97.7%." -ForegroundColor DarkGray
+    if ($Leg -eq "WG_stenosis_subcohort_ft_v7") {
+        Write-Host "[i] v7 = v3 + ONE change: rolled_soft_k_relative=True. Adds no term -- brings v3's OWN brake to life." -ForegroundColor DarkGray
+    } elseif ($Leg -eq "WG_stenosis_subcohort_ft_v8") {
+        Write-Host "[i] v8 = v7 + soft-F_beta rolled-state surrogate (change E): the deploy metric itself, softened." -ForegroundColor DarkGray
+        Write-Host "[i]   It is the only term with a TP numerator, hence the only one monotone in F1 by construction." -ForegroundColor DarkGray
+    } else {
+        Write-Host "[i] v9 = v8 + gated-autocatalytic growth (change D): magnitude *= (k_dep + k_auto*local_committed)." -ForegroundColor DarkGray
+        Write-Host "[i]   Mirrors COMSOL's (Mas/Minf)*k_aa*AP. Adds the ignition term the s12.4 two-basin attractor lacks." -ForegroundColor DarkGray
+    }
+    Write-Host "[i] READ: Spearman(loss, deploy_clot_score) AND min deploy_clot_fp (excursion depth, s12.5 item 2)." -ForegroundColor DarkGray
+    Write-Host "[i] Retention is now safe: best_salvage.pth keeps the top-scoring epoch even if the gate rejects all." -ForegroundColor DarkGray
+} elseif ($Leg -eq "WG_stenosis_subcohort_ft_v6") {
     Write-Host "[i] v6 = s11.3 change B, retry 2: make EVERY loss term horizon-aware, not just the aux" -ForegroundColor DarkGray
     Write-Host "[i]   curriculum_unroll True->False, unroll 5->25 on all ~756 windows; deploy_horizon_all_packs->True" -ForegroundColor DarkGray
     Write-Host "[i]   why: v5 lengthened the aux 40->150 and was BIT-IDENTICAL to v3 -- the aux is 1 opt step of 757," -ForegroundColor DarkGray

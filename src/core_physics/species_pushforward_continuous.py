@@ -1658,7 +1658,7 @@ def rolled_final_mass_fp_penalty(
     thr = float(continuous_mat_commit_thresh())
     pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
     gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
-    pred_soft = torch.sigmoid(float(soft_k) * (pred - thr))
+    pred_soft = soft_commit_prob(pred, thr, float(soft_k))
     gt_pos = (gt > thr).to(dtype=pred_soft.dtype)
     n_gt = gt_pos.sum().clamp(min=1.0)
     mass_ratio = pred_soft.sum() / n_gt
@@ -1672,6 +1672,27 @@ def rolled_final_mass_fp_penalty(
         fp_frac = fp_soft.sum() / pred_soft.sum().clamp(min=1e-6)
         pen = pen + fw * fp_frac
     return pen * continuous_loss_scale()
+
+
+def continuous_rolled_soft_k_relative() -> bool:
+    cfg = resolve_config()
+    if cfg is not None:
+        return bool(cfg.rolled_soft_k_relative)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_ROLLED_SOFT_K_RELATIVE") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def soft_commit_prob(pred: torch.Tensor, thr: float, soft_k: float) -> torch.Tensor:
+    """Differentiable occupancy around the Mat commit threshold.
+
+    With ``rolled_soft_k_relative`` the argument is scaled by ``thr`` so ``soft_k`` is
+    dimensionless. Without it this is the original absolute form, which at the shipped
+    ``soft_k=40`` and ``thr=1e-4`` returns ~0.5 for every node -- see the config note on
+    ``rolled_soft_k_relative`` for the measurement.
+    """
+    if continuous_rolled_soft_k_relative():
+        return torch.sigmoid(float(soft_k) * (pred - thr) / max(abs(thr), 1e-12))
+    return torch.sigmoid(float(soft_k) * (pred - thr))
 
 
 def continuous_rolled_soft_f1_weight() -> float:
@@ -1762,7 +1783,7 @@ def rolled_soft_f1_loss(
 
     pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
     gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
-    p_soft = torch.sigmoid(k * (pred - thr))
+    p_soft = soft_commit_prob(pred, thr, k)
     gt_pos = (gt > thr).to(dtype=p_soft.dtype)
 
     tp = (p_soft * gt_pos).sum()

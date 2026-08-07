@@ -105,6 +105,7 @@ ENV_KEY_TO_FIELD: dict[str, str] = {
     "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_WEIGHT": "rolled_soft_f1_weight",
     "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_BETA": "rolled_soft_f1_beta",
     "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_K": "rolled_soft_f1_k",
+    "SPECIES_CONTINUOUS_ROLLED_SOFT_K_RELATIVE": "rolled_soft_k_relative",
     "SPECIES_CONTINUOUS_STEP_SOFT_F1_WEIGHT": "step_soft_f1_weight",
     "SPECIES_CONTINUOUS_AUTOCAT_GROWTH": "autocatalytic_growth",
     "SPECIES_CONTINUOUS_AUTOCAT_K_DEP_INIT": "autocat_k_dep_init",
@@ -331,6 +332,17 @@ class PushforwardConfig:
     rolled_soft_f1_weight: float = 0.0
     rolled_soft_f1_beta: float = 1.0
     rolled_soft_f1_k: float = 40.0
+    # Soft occupancy scale fix. sigmoid(k*(pred - thr)) with the shipped k=40 and the actual
+    # Mat commit threshold of 1e-4 returns ~0.4990 for an empty node and 0.5000 at threshold:
+    # the "soft committed set" is a constant 0.5 everywhere and carries almost no signal.
+    # Measured: `rolled_final_mass_fp_penalty` moves 29.11500 -> 29.15093 (**0.12%**) as the
+    # rollout goes from EMPTY to 12x over-painted, and its soft mass_ratio reads 19.96 in every
+    # case instead of 0.00 -> 12.00. That is the mechanical reason s9.12's brake "moved the
+    # rollout ~1%" and s9.14's fp_weight A/B came out bit-identical -- those terms were never
+    # weak, they were numerically dead.
+    # When True the sigmoid argument becomes k*(pred - thr)/thr, i.e. a RELATIVE deviation, so
+    # k is scale-free. Default False keeps v1..v6 bit-reproducible; new legs opt in.
+    rolled_soft_k_relative: bool = False
     # Same surrogate applied per-unroll-step against that step's GT (not just the final state).
     step_soft_f1_weight: float = 0.0
     # --- Gated-autocatalytic growth law (s11.3 change D) ---

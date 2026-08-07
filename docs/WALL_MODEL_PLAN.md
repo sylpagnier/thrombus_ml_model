@@ -1216,7 +1216,7 @@ pct-25 gate, no training) by pathology (roles per `GENERALIZATION_PLAN.md` §1b)
 | `043` (holdout) | aneurysm | 0.667 | 0.828 | 0.558 | 9 |
 | `041` | stenosis | 0.255 | 0.455 | 0.177 | 74 |
 | `042` | stenosis | **0.513** | 0.598 | 0.450 | 68 |
-| `044` | stenosis | *not yet run against the model* | — | — | 106 |
+| `044` | stenosis | **0.602** (run 2026-08-06 — see §12.7) | — | — | 106 |
 
 **Mean F1: aneurysm 0.630 (n=3), stenosis 0.384 (n=2 scored).** We do well on aneurysms
 and poorly on stenoses, on the vessels measured so far.
@@ -1714,3 +1714,727 @@ Ordered by value per GPU-minute. Items 1–3 need no training at all.
 **Unblocked by fiat:** §11.3's architecture items (`wss_prior_nd`, the analytical Poiseuille
 prior block, shrinking `z_kin`) were gated on change B succeeding. That gate can never open
 now, so it is dropped. Item 2 above replaces it as the interpretability precondition.
+
+## 12.6 The real root cause: two loss terms were numerically dead (2026-08-06)
+
+Implementing §12.5 turned up something that reframes §9.11 through §12.3. **Three legs of
+"the brake barely moves the rollout" were not measuring a weak brake. They were measuring a
+term that cannot respond to the model at all.**
+
+### 12.6.1 Dead term 1 — soft occupancy is a constant 0.5
+
+Every rolled-state term (`step_mass_penalty`, `step_prec_fp_penalty`, `final_mass_penalty`,
+`final_prec_fp_penalty`) turns predictions into a differentiable committed set with
+`sigmoid(soft_k * (pred - thr))`. Shipped `soft_k = 40`. Actual Mat commit threshold:
+**`thr = 1e-4`**. So:
+
+```
+pred = 0      (empty node)      -> sigma = 0.4990
+pred = thr    (at threshold)    -> sigma = 0.5000
+pred = 10*thr (well committed)  -> sigma = 0.5090
+```
+
+The "soft committed set" is 0.5 everywhere. Sweeping a synthetic rollout from empty to 12×
+over-painted, holding everything else fixed:
+
+| hard fp | hard mass | soft mass_ratio it computes | soft fp_frac | brake penalty |
+|---|---|---|---|---|
+| 0 | 0.00 | 19.9600 | 0.97500 | 29.11500 |
+| 60 | 2.20 | 19.9644 | 0.97491 | 29.12151 |
+| 292 | 6.84 | 19.9737 | 0.97492 | 29.13544 |
+| 550 | 12.00 | 19.9840 | 0.97493 | 29.15093 |
+
+**The penalty moves 0.12% across the entire range from nothing to 12× over-target**, and the
+mass ratio it reports is 19.96 in every row instead of 0.00 → 12.00. This is the mechanical
+cause of §9.12's "the brake moved the rollout ~1% (front_speed 4.545 → 4.605)". The brake was
+never weak; it was inert.
+
+**Fix:** `rolled_soft_k_relative=True` makes the argument `k*(pred - thr)/thr` — a scale-free
+relative deviation. Dynamic range **0.12% → 97.7%**, and the soft-F1 surrogate below goes from
+a flat 0.952 to a proper 0.0009 (perfect) … 0.9999 (empty) with a minimum at the right mass.
+The flag defaults to `False`, so v1–v6 stay bit-reproducible.
+
+### 12.6.2 Dead term 2 — `fp_weight` compares against a threshold 200× too high
+
+`ActiveGrowthHuberLoss` selects false positives as `(~gt_active) & (pred_delta > fp_thr)`,
+with `fp_thr = max(fp_threshold=2e-5, delta_thresh=5e-6) = 2e-5`. Measured predicted deltas
+run **~1e-7** (`delta_out_scale=1e-5` × a softplus of order 1e-2). The FP branch therefore
+selects no nodes and `fp_weight` multiplies an empty set. That is precisely the signature
+§9.14 recorded — v3 vs v4 bit-identical under `fp_weight` 6.0 → 16.0 — and it means **§9.12's
+whole "fp_weight is the driver" table was reading a variable that never entered the loss**,
+which §9.14 already retracted empirically without knowing why.
+
+Not changed in the v7–v9 ladder (one variable at a time). The soft-F_β term applies FP
+pressure on the rolled state instead, which is the better place for it.
+
+### 12.6.3 What this means for the change-B verdict
+
+§12.3's verdict stands and gets *stronger*, not weaker: v6 changed the per-step regression
+depth while the three terms that grade the rolled state were dead, so "make the objective
+horizon-aware" was never actually on trial. But it also means the objective has never been
+tested in a working state — **v3, v4, v5 and v6 were all A/B tests against a dead control.**
+
+### 12.6.4 What was built
+
+1. **Retention (§12.5 item 1) — done.** `best_salvage.pth` tracks the best raw
+   `deploy_clot_score` across all epochs regardless of the gate, and is promoted to
+   `best.pth` with a loud warning if no epoch passes. Selection semantics, `best_score` and
+   early stop are untouched. No leg can silently produce nothing again.
+2. **Change E — the rolled-state soft-F_β surrogate.** `1 - soft_F_beta` over the rolled
+   committed set: the deploy metric itself, softened. It is the only term in the objective
+   with a TP numerator, hence the only one monotone in F1 by construction. The existing
+   rolled terms cannot substitute — `final_mass_penalty` is `softplus(mass_ratio - target)`,
+   identically zero below target so it never pushes growth *up*, and `final_prec_fp_penalty`
+   is an FP fraction that saturates toward 1.0 exactly in the fp=292 basin.
+3. **Change D — gated-autocatalytic growth.** `magnitude *= (k_dep + k_auto *
+   local_committed_frac)`, mirroring COMSOL's `(Mas/Minf)·k_aa·AP`. Learnable and
+   log-parameterised; at the `k=1` init an isolated node keeps its rate, so the warm start is
+   undisturbed at `t=0` and only committed neighbourhoods accelerate. Verified 1.40×
+   amplification adjacent to committed material with live gradients. `log_k_dep`/`log_k_auto`
+   were added to `freeze_growth_backbone`'s allowlist — they *are* the growth law, and
+   freezing them would have silently disabled the mechanism under `freeze_backbone=True`,
+   which every sub-cohort leg uses.
+4. **`scripts/diag_leg_alignment.py`** — grades a leg on both §12.5 criteria: alignment
+   (Spearman + exact permutation p + jackknife + z-separation + how many distinct deploy
+   states were actually visited) and excursion depth. Reproduces §12.3's numbers exactly and
+   flags v6's sign as unstable automatically.
+
+### 12.6.5 The v7–v9 ladder
+
+Each step is one variable, on the v3 base, warm-started from `WG_clotrich_nplus`:
+
+| leg | change from previous | question |
+|---|---|---|
+| v7 | `rolled_soft_k_relative=True` | with the brake *alive* for the first time, does v3's own mechanism work? |
+| v8 | + soft-F_β surrogate (change E) | does grading the rolled state with the metric align loss and deploy score? |
+| v9 | + autocatalytic growth (change D) | does an explicit ignition term break the two-basin attractor? |
+
+### 12.6.6 v7 result (n=1 epoch): the brake is alive but *under-weighted*
+
+Epoch 1, against v3's epoch 1 (same seed, same data, single-variable):
+
+```
+        loss       mass    fp   fn   f1      score    front
+v3 ep1  61.4055    4.032   292   4   0.3677  0.2591   4.605
+v7 ep1  61.6514    4.032   292   4   0.3680  0.2590   4.575
+```
+
+The loss moved **+0.246 (+0.40%)** — proof the revived term now enters the objective, since
+v3-vs-v4 under a *dead* term was identical to four decimals. The rollout moved **nothing**:
+identical mass, identical fp, identical fn.
+
+**Why, quantitatively:** the brake's full range is ~17.1 raw × `loss_scale = 0.1` = **1.71
+loss-units**, against a total loss of 61.65. Even at maximum it is 2.8% of the objective, and
+at the observed mass 4.03 it contributes ~0.25. Fixing the occupancy was necessary but not
+sufficient: **the term is now real and still too small to steer.**
+
+This is the same failure mode as v5's aux (§12.2) — a term that cannot matter because of its
+share of the objective, not because of its form. It is why v8/v9 size the soft-F_β weight
+against the *measured* loss scale rather than by feel:
+
+```
+observed epoch-to-epoch loss spread (the noise floor the term must beat):  v3 0.112, v6 0.495
+soft-F1 term variation across the two observed basins (fp=292 vs fp=110):
+    weight   4  ->  0.14 loss-units  =  0.3x the noise floor   (would be another v5)
+    weight 120  ->  4.08 loss-units  =  8.2x the noise floor   <- chosen
+    weight 300  -> 10.20 loss-units  = 20.6x the noise floor
+```
+
+**Retired by this measurement:** any remaining reading of §9.11/§9.12 in which the brake is a
+mechanism that "works but weakly". It is a mechanism that was dead, and is now alive at 2.8%
+authority. Its configured weights were never calibrated against the objective's actual scale.
+
+### 12.6.7 Change E's premise, verified with zero GPU
+
+If the surrogate is to be a faithful proxy, `deploy_clot_f1` (what soft-F_β targets) must rank
+epochs the same way `deploy_clot_score` (the guiding metric) does. Across all 41 recorded
+epochs of v1–v6:
+
+| leg | n | ρ(deploy_clot_f1, deploy_clot_score) | ρ(training loss, deploy_clot_score) |
+|---|---|---|---|
+| v1 | 15 | +0.929 | +0.206 |
+| v2 | 6 | **+1.000** | +0.371 |
+| v3 | 6 | +0.943 | +0.429 |
+| v5 | 6 | +0.943 | +0.429 |
+| v6 | 6 | **+1.000** | −0.406 |
+
+F1 and score are rank-identical within every leg. **A loss term monotone in soft-F1 is
+therefore monotone in the guiding metric by construction** — which is exactly what no term in
+the current objective is. This does not prove the surrogate will train well; it proves the
+premise is sound before spending GPU on it.
+
+### 12.6.8 Budget reality — what actually ran
+
+Measured throughput on this machine was **1186 s/epoch** for the sub-cohort legs (v6's 850 s
+was under lighter load), and a standalone 1-vessel `eval_mat_growth_simple.py` took ~18 min.
+The 2.5 h budget therefore bought roughly **one leg**, not three. Choices made, explicitly:
+
+* v7 stopped after 1 epoch — its epoch-1 result (above) already answered its question, and it
+  was the least promising leg once the 2.8%-authority calculation was in hand.
+* **v8 was skipped** and the budget put on **v9** (the full stack: occupancy fix + soft-F_β at
+  8.2× the noise floor + autocatalysis). This costs the E-vs-D attribution, which must be
+  recovered later by running v8. Stated plainly so nobody reads a v9 result as evidence for
+  change D specifically.
+* The `patient044` probe (§9.16) was started and killed mid-rollout to free the GPU for
+  training; it remains unspent. The `patient043` control it completed first returned
+  **`clot_f1 = 0.650`, mass 0.653, front 0.862, mode=underseed** — an exact reproduction of
+  the §9.15 headline, which confirms the measurement path used for everything above.
+* Re-stating §12.1's routing payoff in score terms was **not** done: the cached
+  `phase1_regime_gate_cohort.json` carries F1 only, and a 12-vessel re-sweep does not fit.
+
+### 12.6.9 A term-placement trap to fix in v10 — the per-step surrogate is *diluted*, not added
+
+v9 epoch 1 came in at `loss = 59.412` against v3's `61.406` — the total went **down** after
+adding two positive terms. The reason is structural and worth pinning:
+
+```
+per-step terms:  step_loss = sum(loss_i * w_i) / sum(w_i)     <- a weighted MEAN
+final term:      step_loss = step_loss + rolled_soft_f1_loss(...)  <- ADDED
+```
+
+A per-step term is averaged *in*, so a term whose value (2.80) is far below the Huber terms
+(~61) pulls the mean down and receives only `1/(n_terms+1)` of the gradient share. Only the
+final-state term carries its full nominal weight (+8.40 here). So `step_soft_f1_weight` does
+not mean what `rolled_soft_f1_weight` means, and the two are not comparable numbers.
+
+**Consequence for reading v9:** its surrogate authority is essentially the final-state term
+alone. **Fix for v10:** either add the per-step surrogate to the sum rather than the mean, or
+raise `step_soft_f1_weight` by roughly the term count. Do not simply scale both together.
+
+**What epoch 1 does establish:** the objective moved by 1.994 loss-units in one step — **4.0×
+v6's entire six-epoch spread** — so unlike v4 and v5 this is a real intervention on the loss.
+The rollout did not move with it (`fp=293`, `mass=4.042`, still the saturated basin), which is
+the expected starting point: one epoch of head-only training at `lr=5e-5` from a warm start
+already sitting in that basin.
+
+### 12.6.10 How to read v9 — pre-registered before epochs 2–4 were seen
+
+Written while epoch 1 was the only result, so the conclusion cannot be fitted after the fact.
+
+* **Success:** any epoch leaves the saturated basin (`fp < 292`) *and* the loss ranks it below
+  the saturated epochs. That would be the first time in seven legs that the objective both
+  moved and carried the rollout with it.
+* **Partial:** excursions get deeper than v6's `fp=218` but the loss still cannot rank them
+  (`|z| < 0.5`). Reads as "the growth law changed, the objective still cannot see it" — go to
+  §12.6.9's placement fix, not to another mechanism.
+* **Null:** all epochs stay at `fp ≈ 292`. Then the full stack — occupancy fix, a surrogate at
+  8.2× the loss noise floor, and an explicit ignition term — failed to move a model whose only
+  trainable parts are the two readout MLPs. **In that case the next variable is
+  `freeze_backbone`, not the objective.** Every sub-cohort leg from v1 to v9 has trained 8–10
+  tensors out of 40 (45k of 187k params), and §12.4's attractor may simply be out of reach of
+  the readout heads. That would be a genuinely new arm, not a seventh reweighting.
+
+Note the asymmetry deliberately: two of the three outcomes point *away* from further objective
+work. After change B's three failures, the prior that "the loss is the problem" has to be
+allowed to lose.
+
+## 12.7 `patient044` spent (2026-08-06) — the deep-mass → failure gradient is FALSIFIED
+
+§9.16's last unscored vessel, run zero-shot against `WG_clotrich_nplus` + pct-25 gate, no
+training. `patient043` was measured on the same command in the same session as a scale control
+and returned **`clot_f1 = 0.650`**, reproducing the §9.15 headline exactly.
+
+```
+patient043   deep mass   9   ->  clot_f1 0.650   mass 0.653   front_spd 0.862   mode=underseed
+patient044   deep mass 106   ->  clot_f1 0.602   mass 0.571   front_spd 0.634   mode=underseed
+```
+
+**The prediction was that `044` would be the worst vessel in the cohort.** §9.16 ranked the
+five scored vessels and deep mass tracked F1 monotonically (`040` deep 8 → 0.704, `043` deep 9
+→ 0.667, `042` deep 68 → 0.513, `041` deep 74 → 0.255). Extrapolating that gradient, `044` at
+deep mass 106 — 43% above `041` — should have come in at **≤ 0.255**.
+
+It came in at **0.602**: 2.4× the prediction, and the third-best vessel in the cohort. Allowing
+the ~0.017 offset between the two measurement paths (§9.16's table reads `043` as 0.667, this
+run reads 0.650) changes nothing about that conclusion.
+
+**What this retires.** "Deep clot mass predicts deploy failure" was §9.5's suggestive finding,
+§9.10a's mechanism, and §9.16's organising story for the whole cohort. It does not survive its
+own pre-registered confirmatory test. The n=5 monotonicity that looked so clean was, with the
+sixth point in hand, **not a gradient at all** — `041` is simply an outlier, and the aneurysm/
+stenosis split §9.16 flagged as "perfectly confounded" now separates: `044` is a *stenosis*
+with the *highest* deep mass and it scores like an aneurysm.
+
+**What this costs.** §11.3 change D was motivated partly as targeting "§9.10a/§9.16's measured
+failure — the model paints early on thin vessels and late on thick ones". That specific
+motivation is now unsupported. Change D may still be right on COMSOL-mechanism grounds
+(`(Mas/Minf)·k_aa·AP` is the real growth law regardless), but it should no longer be sold as
+addressing a measured deep-mass gradient. **This is a second pre-registered prediction
+overturned by its own probe in two sessions** — §2.9 went the same way in §10.4/§12.1.
+
+**What this gains, and it is the most useful number of the session.** Zero-shot, with no
+cohort training at all, the warm start scores **0.650 on `043` and 0.602 on `044`** — both
+sealed, both `mode=underseed`, both essentially at the 0.6 target. The two vessels that were
+supposed to be hardest are the two closest to shipping. The gap to the goal is not "the model
+cannot do stenoses"; it is `041` (0.255) and `039` (0.519), and `041`'s failure now needs its
+own explanation rather than a cohort-wide one.
+
+## 12.8 v9 result — INCONCLUSIVE, and the reason indicts every leg in this study
+
+v9 = occupancy fix + soft-F_β surrogate at 8.2× the loss noise floor + gated-autocatalytic
+growth. All three mechanisms verified engaged before reading anything (the v6 discipline):
+
+```
+freeze_backbone: frozen=32 trainable_heads=10     <- 10, not 8: log_k_dep/log_k_auto ARE training
+autocatalytic_growth=True  autocat_k_dep_init=1.0  autocat_k_auto_init=1.0  autocat_alpha=0.8
+rolled_soft_k_relative=True  rolled_soft_f1_k=10.0  rolled_soft_f1_weight=120.0
+```
+
+| | loss | mass | fp | fn | f1 | score |
+|---|---|---|---|---|---|---|
+| v3 ep1 (reference) | 61.4055 | 4.032 | 292 | 4 | 0.3677 | 0.2591 |
+| v9 ep1 | 59.4122 | 4.042 | 293 | 4 | 0.3691 | 0.2601 |
+| v9 ep2 | 59.4616 | 4.032 | 292 | 4 | 0.3743 | 0.2620 |
+| v9 ep3 | 59.3688 | 4.042 | 292 | 3 | 0.3725 | 0.2608 |
+| v9 ep4 | 59.4645 | 4.074 | 292 | **0** | 0.3827 | 0.2657 |
+
+**The objective moved.** 61.41 → 59.41 is 1.994 loss-units — **4.0× v6's entire six-epoch
+spread**. Unlike v4 (dead term, bit-identical) and v5 (1-of-757 steps), this is unambiguously
+a real intervention on the loss.
+
+**The rollout did not.** `fp` ∈ {292, 293}, mass 4.032–4.074, score range **0.0056**. Four
+epochs, **zero excursions**.
+
+**One suggestive-but-not-separable signal.** FN fell monotonically 4 → 4 → 3 → **0** while FP
+stayed pinned at 292 — the surrogate did push recall to completion, which is what a term with
+a TP numerator should do. But v9's F1 range (0.3691–0.3827) sits *inside* v3's own
+non-excursion range (0.3655–0.3811), so at n=4 this is **not separable from ordinary
+epoch-to-epoch wander**. Recorded as a lead, not a result.
+
+**The retention fix earned itself on this run.** Every epoch was gate-rejected, exactly as in
+v2–v6 — and unlike v2–v6, the leg left a recoverable checkpoint:
+```
+[i] salvage ckpt: ep 4 deploy_clot_score=0.2657 -> best_salvage.pth
+[WARN] no epoch passed the selection gate; promoted salvage ep 4 to best.pth
+[WARN]   this checkpoint is GATE-REJECTED -- meta.salvage_gate_rejected=True. Grade it, do not ship it.
+```
+
+### 12.8.1 Why this is not a verdict — the power calculation nobody ran
+
+The tempting read is "the full stack failed too". That read is not supported:
+
+```
+base excursion rate across v1-v6:  6 excursions / 41 epochs = 0.146 per epoch
+P(0 excursions in 3 epochs | v9 behaves EXACTLY like v1-v6) = 0.622
+P(0 excursions in 4 epochs | ditto)                        = 0.531
+P(0 excursions in 6 epochs | ditto)                        = 0.387
+```
+
+**At n=4 there is a ~53% chance of observing zero excursions even if v9 changed nothing at
+all.** Zero excursions is the single most likely outcome under the null. It carries no
+information.
+
+Worse, and this is the part that generalises: **the alignment criterion is unmeasurable
+without an excursion.** "Does the loss rank the good epoch below the bad ones" requires a good
+epoch to exist. With 0 excursions there is nothing to rank, so v9 cannot answer either of its
+two questions — not because the mechanisms failed, but because the experiment was too short to
+observe the phenomenon it was designed to measure.
+
+### 12.8.2 The design flaw this exposes, retroactively, in v1–v9
+
+Every leg in §9 and §12 ran 6 epochs or fewer. At a 0.146/epoch excursion rate:
+
+* 6 epochs → **0.9 expected excursions.** v3 got 1, v5 got 1, v6 got 1, v2 got 2, v4 got 0.
+* A correlation between loss and deploy score needs **at least 2** excursions to be estimable
+  at all, and realistically 4–5 to be distinguishable from noise.
+* Reaching 2 expected excursions needs **~14 epochs**; 4 expected needs **~27**.
+
+So §12.3's headline — "Spearman flipped sign but p=0.217 and one epoch flips it" — was never a
+finding about v6's mechanism. **It was a finding about running a 6-epoch experiment on a
+process with a 15%-per-epoch event rate.** v3's +0.43 and v6's −0.41 differ only in where each
+leg's single excursion happened to land. Both were always going to be noise.
+
+**This is the binding constraint on the whole study, and it is not an objective problem, an
+architecture problem, or a data problem.** At the measured 650–1200 s/epoch, an interpretable
+leg costs **2.5–4.5 GPU-hours**, not the ~1 hour every leg since v1 has been given. Six legs
+× 6 epochs bought six ambiguous results for the price of roughly two decisive ones.
+
+### 12.8.3 Revised plan
+
+1. **Stop running 6-epoch legs.** Minimum viable leg is ~14 epochs. Better: change the
+   readout so the phenomenon is observable per-*window* rather than per-*epoch* — the
+   excursion is a property of the rolled state, and grading many t0 windows per epoch would
+   raise the event count by orders of magnitude without more GPU. This is the highest-value
+   methodological fix available and it is cheap.
+2. **Then `freeze_backbone=False`** — the pre-registered §12.6.10 next variable, untouched by
+   the power problem. Every leg v1–v9 trained 8–10 tensors of 40 (45k of 187k params, both
+   readout MLPs only). §12.4's attractor may simply be out of reach of the readout heads.
+3. **Then v8**, to recover the change-D vs change-E attribution v9 conflates (§12.6.8).
+4. **Fix the per-step surrogate dilution** first, since it is nearly free (§12.6.9).
+5. **Re-read §12.6.7 before any of it:** the surrogate's premise (F1 and score rank
+   identically) is verified and independent of all of the above. Change E is still the best
+   available answer to "make the loss track deploy score"; it has simply not yet been given an
+   experiment capable of showing it.
+
+### 12.8.4 Where the goal actually stands
+
+The session's most useful number is not from training at all (§12.7): zero-shot, no cohort
+training, `WG_clotrich_nplus` + pct-25 gate scores **0.650 on `patient043`** and **0.602 on
+`patient044`** — the two sealed vessels, both `mode=underseed`. Against the target of >0.6 on
+unseen vessels, **the untrained warm start already clears it on both sealed holdouts.**
+
+Nine fine-tune legs have not beaten it, and §12.8.2 now explains why none of them could have
+been read either way. The gap to "all vessels" is `patient041` (0.255) and `patient039`
+(0.519) — and with §12.7 falsifying the deep-mass gradient, `041` needs its own diagnosis
+rather than a cohort-wide story.
+
+## 13. Cohort close-out attempt (2026-08-06, session 3)
+
+**Budget:** 7 GPU-hours of a 9 h allowance, 2 h headroom. Spend tracked per step below.
+
+**Goal:** `deploy_clot_score > 0.60` on all six of `039`–`044`, generalizing to unseen vessels.
+
+**Standing constraints for this session** (each derived from a logged failure, not taste):
+one variable per leg (§9.12/§9.14 cost six legs to this); ≥14 epochs per leg (§12.8.2 —
+excursion base rate 0.146/epoch makes anything shorter unreadable); no concurrent GPU jobs
+(this session measured epoch time going 650 s → 1900 s under contention); verify every
+mechanism engaged before trusting a result (§12.3 — v4 and v5 both looked like real tests and
+were silently no-ops).
+
+### 13.1 Step 1 — cohort-wide zero-shot baseline, in score terms — PRE-REGISTERED
+
+Written before the eval returned.
+
+Everything in §9/§12 that shaped this plan was measured in `deploy_clot_f1`. The guiding
+metric was changed to `deploy_clot_score` two sessions ago and **the cohort has never been
+scored on it**. §9.15's single datapoint (`patient043`: F1 0.6497, score 0.6925) says score
+reads *higher* than F1 on the one vessel where both are known, so the existing F1 tables are
+probably pessimistic. That is a hypothesis about one vessel, not a correction factor.
+
+`eval_mat_growth_simple.py --anchors patient039..044 --pocket-gate-pct 25`, warm start
+`WG_clotrich_nplus`, no training of any kind.
+
+**Decision rule, fixed in advance:**
+* **All 6 ≥ 0.60 → STOP.** The goal is met zero-shot and every fine-tune leg v1–v9 was
+  chasing a target that was already cleared. Write it up and end the session.
+* **Otherwise** → the vessels below 0.60 are the gap, and step 2 (regime routing in score
+  terms) is attempted only if it could plausibly move those specific vessels.
+
+**Prior, recorded so it can be scored:** F1 is known for five of six (§9.16 + §12.7):
+`039` 0.519, `040` 0.704, `041` 0.255, `042` 0.513, `043` 0.650, `044` 0.602. If the
+F1→score offset seen on `043` (+0.043) were uniform, four vessels would clear 0.60 and
+`041` and `042` would not. **Expected outcome: the gap is `041`, probably `042`, possibly
+`039`.** If instead all six clear, the offset is far larger than one vessel suggested and
+that itself is the finding.
+
+### 13.2 Step 1 RESULT — the gap is `039`, `041`, `042`. Prediction confirmed.
+
+`eval_mat_growth_simple.py`, `WG_clotrich_nplus` + pct-25 gate, no training, 6 vessels, ~35 min.
+
+| vessel | **`deploy_clot_score`** | `deploy_clot_f1` | mass | fp | fn | ≥0.60 |
+|---|---|---|---|---|---|---|
+| `039` | **0.4660** | 0.5185 | 1.793 | 31 | 8 | NO |
+| `040` | **0.6218** | 0.7044 | 1.065 | 26 | 21 | yes |
+| `041` | **0.3319** | 0.2548 | 0.389 | 24 | 93 | NO |
+| `042` | **0.5030** | 0.5131 | 0.752 | 33 | 60 | NO |
+| `043` | **0.6925** | 0.6497 | 0.653 | 11 | 44 | yes |
+| `044` | **0.6400** | 0.6016 | 0.571 | 16 | 86 | yes |
+| mean | 0.5425 | 0.5403 | | | | 3/6 |
+
+**§13.1's pre-registered prediction — "the gap is `041`, probably `042`, possibly `039`" —
+is exactly right**, including `040` clearing. Step 1's stop condition does **not** fire;
+proceed to step 2.
+
+**The uniform-offset assumption was wrong, as flagged.** The F1→score offset is not a
+constant, it is not even a constant sign:
+
+```
+039 -0.0525    040 -0.0826    041 +0.0771
+042 -0.0101    043 +0.0428    044 +0.0384
+```
+
+Score reads *lower* than F1 on `039`/`040`/`042` and *higher* on `041`/`043`/`044`. So the
+§12.3 note that "existing F1 tables are likely pessimistic" (extrapolated from `043` alone)
+is **retracted** — the two metrics reorder vessels, they do not offset them. Concretely,
+`041` is the worst vessel on both metrics but by very different margins (F1 0.255 vs score
+0.332), and `040` drops from a comfortable 0.704 to a marginal 0.622.
+
+**Structure of the gap — it is not one failure mode, it is two:**
+* `039` over-paints (mass **1.793**, fp 31, fn 8) — `mode=overspray`.
+* `041` and `042` under-paint (mass **0.389** / **0.752**, fn **93** / **60**) —
+  `mode=underseed`.
+
+Any single fix that moves all three has to be non-monotone in mass. **A global gate change
+cannot do it** — loosening the gate helps `041`/`042` and hurts `039`, tightening does the
+reverse. That is precisely the case regime *routing* exists to handle, which is what makes
+step 2 worth its GPU rather than a formality.
+
+### 13.3 Step 2 — regime routing in score terms — PRE-REGISTERED
+
+Written before the sweep returned. `diag_regime_gate_sweep.py --anchors patient039..044
+--pct 25`, three conditions per vessel (gate OFF / global / regime-routed), no training.
+18 rollouts, ~1.5–1.8 h at step 1's measured ~6 min/rollout.
+
+**Built-in consistency check:** routing is identical to the global gate on non-inverted
+vessels, so the sweep's `global` column must reproduce §13.2's numbers. If it does not, one
+of the two measurement paths is wrong and neither result is usable.
+
+**Decision rule, fixed in advance:**
+* **All 6 routed scores ≥ 0.60 → STOP.** Log the routed config as the answer; no training.
+* **Otherwise** → continue to the architecture ladder (step 4). Step 3's per-window
+  observability design gets ≤30 min of investigation and is dropped if nothing clean falls
+  out (per instruction).
+
+**Prediction, recorded so it can be scored:** routing will **not** close the gap.
+§12.1 labelled `041` *normal*-regime, and routing by construction does nothing on normal
+vessels — routed ≡ global there. `041` is both the worst vessel (0.3319) and the one whose
+failure the gate cannot explain: it is at mass **0.389** *with* the gate on, i.e. it is
+under-painting by 2.6× before the gate removes anything. `039` is the mirror case (mass
+1.793, over-spray) where gate-off should make it *worse*. Expected: routing helps `042` a
+little at most, moves `041` not at all, and the gap survives.
+
+**The one way this prediction is interesting if wrong:** the `off` column is measured for
+every vessel regardless of regime. If gate-OFF lifts `041`/`042` over 0.60 while the
+*flow-regime* router leaves them alone, that says the router is keyed on the wrong variable —
+routing on **mass/underseed** rather than on flow regime would then be a cheap, no-training
+win, and §12.1's router would need re-specifying rather than re-confirming.
+
+### 13.4 Step 2 RESULT — routing is structurally irrelevant to this cohort. Prediction confirmed.
+
+`diag_regime_gate_sweep.py`, 6 vessels × 3 conditions, 31 min.
+
+| vessel | regime | gate OFF | global | **routed** | routed−global |
+|---|---|---|---|---|---|
+| `039` | normal | 0.4251 | 0.4865 | 0.4865 | +0.0000 |
+| `040` | normal | 0.3564 | 0.6100 | 0.6100 | +0.0000 |
+| `041` | normal | 0.2475 | 0.3483 | 0.3483 | +0.0000 |
+| `042` | normal | 0.3452 | 0.5182 | 0.5182 | +0.0000 |
+| `043` | normal | 0.4112 | 0.7270 | 0.7270 | +0.0000 |
+| `044` | normal | 0.4741 | 0.6465 | 0.6465 | +0.0000 |
+| mean | | 0.3766 | 0.5561 | 0.5561 | +0.0000 |
+
+**All six cohort vessels are normal-regime, so routing ≡ global on every one — it beat the
+global gate on 0/6.** §12.1's large routing win came from a 12-vessel set containing six
+*inverted* vessels, **none of which are in this cohort**. Routing is not a weak intervention
+here; it is a no-op by construction. §12.1's finding stands on its own cohort and is simply
+not transferable to `039`–`044`. **This closes the routing thread for this goal.**
+
+The "interesting if wrong" branch of §13.3 also closed: gate-OFF is *worse* on all six
+(mean 0.3766 vs 0.5561), and drops `041` to 0.2475 and `042` to 0.3452. So routing on
+mass/underseed instead of flow regime would not help either — the gate is doing real work on
+every vessel in this cohort. Step 2's stop condition does not fire; the gap is unchanged at
+`039`, `041`, `042`.
+
+### 13.4a The consistency check FIRED — two tools disagree on `deploy_clot_score`
+
+§13.3 pre-registered: the sweep's `global` column must reproduce §13.2. It does not.
+
+```
+vessel   eval_mat_growth_simple   diag_regime_gate_sweep    diff     F1 (both tools)
+039              0.4660                   0.4865          +0.0204   0.5185 / 0.5185
+040              0.6218                   0.6100          -0.0118   0.7044 / 0.7044
+041              0.3319                   0.3483          +0.0165   0.2548 / 0.2548
+042              0.5030                   0.5182          +0.0152   0.5131 / 0.5131
+043              0.6925                   0.7270          +0.0345   0.6497 / 0.6667
+044              0.6400                   0.6465          +0.0065   0.6016 / 0.5992
+```
+
+**`deploy_clot_f1` is bit-identical on four of six vessels while `deploy_clot_score` differs
+on all six.** Identical F1 means the predicted sets are identical, so this is not a rollout
+difference — **the two tools score the same predictions differently.**
+
+Cause: `deploy_clot_score` is `relaxed_prec_floor` mode, which is gated on
+`clout_prec_rec_floor`, and that constant is **not consistent across the codebase**:
+```
+src/architecture/runtime_config.py:74      clout_prec_rec_floor: float = 0.30   (dataclass default)
+src/biochem_gnn/mat_growth_simple.py:50    SPECIES_CLOUT_PREC_REC_FLOOR = "0.35" (recipe env)
+src/biochem_gnn/mat_growth_simple.py:412   clout_prec_rec_floor: 0.30           (runtime kwarg)
+```
+The guiding metric of this whole study is **not uniquely defined**. This is the same class of
+bug as §12.6's dead constants: a threshold that differs by provenance rather than by intent.
+
+**Handling, stated rather than buried.** §13.3's rule said "neither result is usable" if this
+fired. That rule was too strong and I am relaxing it deliberately, with the reason: the
+disagreement is ≤0.0345 while the gap margins are 0.08–0.27, and **both paths select exactly
+the same three vessels as the gap**. The decision is robust to the discrepancy even though the
+numbers are not.
+
+**Canonical path for the rest of this session: `eval_mat_growth_simple.py`** — it is the
+launcher's own eval and the source of §9.15's headline 0.6497/0.6925. Every §13 number
+compared against another §13 number will come from it. Reconciling the floor constant is
+logged as work, not done here.
+
+### 13.5 Step 3 — per-window observability: DEPRIORITIZED after investigation (~20 min)
+
+The obvious candidate was `deploy_eval_time_fracs`, which already grades a leg at multiple
+times per epoch (currently `"0.65,1.0"`). Raising it to 6 points would 3× the observation
+count — if it were cheap. **It is not.** `train_species_pushforward_continuous.py:1552`
+runs a *separate* `canonical_deploy_clot_metrics` call per time point, each performing its own
+rollout:
+
+```python
+for t_clot in clot_times:
+    clf_by_t[int(t_clot)] = canonical_deploy_clot_metrics(model, ...)   # one rollout each
+```
+
+So observation count is exactly linear in GPU cost — it buys nothing over just running more
+epochs.
+
+The correct design is roll-once-grade-many: one rollout, snapshot the committed set at every
+requested time, score each snapshot. That is genuinely cheap (rolling is the expensive part;
+scoring a snapshot is not). But it requires editing `canonical_deploy_clot_metrics`, which is
+the **shared** path behind `eval_mat_growth_simple.py`, `diag_regime_gate_sweep.py` and the
+in-training eval — i.e. the path §13.4a has just shown is *already* inconsistent between
+callers. Changing it mid-session would make §13.2's baseline non-comparable with everything
+measured after it.
+
+**Per the session's own instruction, deprioritized rather than attempted.** Falling back to
+§12.8.2's 14-epoch floor. Logged as the highest-value cheap fix for a session that starts with
+a clean measurement path — do it *before* establishing a baseline, not after.
+
+### 13.6 Step 4a — `latent_dropout` 0.0 → 0.30 (v10) — PRE-REGISTERED
+
+Written before launch. `WG_stenosis_subcohort_ft_v10` = **v7 + exactly one change**:
+`latent_dropout 0.0 → 0.30`. Base is v7 (v3 + §12.6.1's occupancy fix), **not** v9 — v9
+bundles three changes and would make this unattributable, which is the mistake that cost
+v1–v6. **14 epochs** per §12.8.2's floor; 6 would be unreadable. ~2.6 h at v9's uncontended
+~680 s/epoch.
+
+**Rationale:** §11.2.1's largest structural imbalance is that `z_kin` is 256 of a 287-dim
+input (89%) and is a *frozen, off-task* kinematics latent. Dropout on that slice is the
+cheapest possible probe of "is the readout leaning on the off-task latent instead of the
+geometry/flow channels". Config-only, no new code.
+
+**Mechanism-engaged check (constraint 5, the v4/v5 lesson):** the trainer prints
+`[i] latent leash: dropout p=0.30 on z_kin[:N]` at line 921 only when `p > 0`, and
+`maybe_drop_latent` zeroes `base_feats[:, :kin_latent_dim]` per unrolled step. **If that line
+is absent from the log, the run is void and will not be reported as a result.**
+
+**Decision rule, fixed in advance:**
+* **All 6 cohort vessels ≥ 0.60 on the canonical `eval_mat_growth_simple.py` path → STOP.**
+* Otherwise → step 4b (`z_kin` shrink) if budget remains, else stop and log.
+
+**Stated limitation, not discovered afterwards:** the default split trains on
+`039,040,041,042,044` and seals only `043`. **Two of the three gap vessels (`041`, `042`) are
+in the training set**, so any improvement on them is *in-sample* and is weak evidence for the
+stated goal of generalizing to unseen vessels. `043` remains the only honest generalization
+probe here, and it already clears the bar zero-shot (0.6925). A proper leave-one-out over the
+gap vessels is 3× this cost and does not fit the remaining budget. Read `041`/`042` gains, if
+any, as an upper bound.
+
+**Prediction, recorded so it can be scored:** this will **not** close the gap. `041` needs
++0.27. Across v1–v9, no head-only fine-tune has moved the deploy state off the `fp ≈ 292`
+attractor at all, and `latent_dropout` is a regulariser, not a mechanism that adds growth.
+The genuinely valuable outcome is the *first properly-powered* measurement (14 epochs,
+~2.0 expected excursions vs the 0.9 every prior leg had) of whether head-only training moves
+the attractor **at all** — which is the question §12.8.2 showed no previous leg could answer.
+
+### 13.7 Step 4a/5 RESULT — v10 REGRESSES the held-out vessel. Prediction confirmed.
+
+Cohort eval of v10's promoted salvage (ep 12), canonical `eval_mat_growth_simple.py`, pct-25
+gate, vs §13.2's zero-shot baseline. Mechanism was verified engaged
+(`[i] latent leash: dropout p=0.30 on z_kin[:256]`), so this is a real test.
+
+| vessel | zero-shot | v10 | Δ | v10 mass | split | ≥0.60 |
+|---|---|---|---|---|---|---|
+| `039` | 0.4660 | 0.3921 | **−0.0739** | 2.483 | in-sample | no |
+| `040` | 0.6218 | **0.7072** | +0.0854 | 1.312 | in-sample | YES |
+| `041` | 0.3319 | 0.4600 | **+0.1282** | 2.186 | in-sample | no |
+| `042` | 0.5030 | 0.4399 | −0.0631 | 2.339 | in-sample | no |
+| `043` | 0.6925 | 0.5555 | **−0.1370** | 1.674 | **HELD OUT** | no |
+| `044` | 0.6400 | 0.5632 | −0.0767 | 1.497 | in-sample | no |
+| mean | 0.5425 | 0.5197 | −0.0228 | | | |
+
+**The gap went from 3 vessels to 5.** The only honest generalization probe, `043`, dropped
+**−0.1370**. §13.6's prediction ("this will not close the gap") is confirmed, and by a wider
+margin than expected — the leg is not neutral, it is harmful.
+
+**A third measurement path, and the in-training number was optimistic.** v10 ep12 reported
+`deploy_clot_score = 0.6221` on `043` *during training*; the canonical eval scores the same
+checkpoint at **0.5555** on the same vessel — a **+0.0666 overstatement**. In-training eval
+uses `train_deploy_eval_flow="auto"`; §13.4a already found `eval_mat_growth_simple.py` and
+`diag_regime_gate_sweep.py` disagree by up to 0.0345. **There are now three mutually
+inconsistent implementations of the guiding metric**, and the in-training one — the one every
+leg's selection and every §9/§12 conclusion is based on — is the most optimistic of them.
+
+### 13.7.1 The actual mechanism: one global knob, a cohort with opposite needs
+
+Every vessel's mass went **up** under v10, without exception:
+
+```
+039 1.793 -> 2.483    040 1.065 -> 1.312    041 0.389 -> 2.186
+042 0.752 -> 2.339    043 0.653 -> 1.674    044 0.571 -> 1.497
+```
+
+`latent_dropout` did not change *where* the model paints, it changed *how much*, uniformly.
+That helps exactly the vessels that were starved — `041` (mass 0.389, the most under-massed,
+gains **+0.128**) and `040` (gains +0.085) — and hurts every vessel that was already near
+target by pushing it into overshoot, `043` worst of all (0.653 → 1.674, −0.137).
+
+**This is the same structural finding as §13.2/§13.4, now demonstrated on the training side
+as well as the gate side: the cohort needs *per-vessel* growth magnitude, and every knob
+available — gate percentile, loss weights, latent dropout — is *global*.** `041` needs 5.6×
+more mass; `043` needs 1.0×. No single scalar satisfies both, which is why ten legs have
+failed and why the mean barely moves while individual vessels swing ±0.14.
+
+**The zero-shot warm start remains the best configuration in the study.** Ten fine-tune legs
+(v1–v10), none has beaten it on a held-out vessel.
+
+### 13.8 Step 4b BLOCKED by constraint 2 — session stopped here, with budget remaining
+
+`z_kin` 256 → 64 changes the model input width from 287 to **95**. The warm start's first-layer
+weights are fixed at that width:
+
+```
+WG_clotrich_nplus  in_dim = 287
+  conv1.lin_l.weight       (64, 287)
+  skip_conv1.lin_l.weight  (64, 287)
+=> cannot load into (64, 95)
+```
+
+Every leg v1–v10 is warm-started from `WG_clotrich_nplus`, and §13.2's baseline *is* that warm
+start. So step 4b as specified cannot be run as a single-variable test: it necessarily bundles
+**"shrink `z_kin`"** with **"lose the warm start"**, and the second is the larger effect by far
+(a cold start would not remotely reach 0.55 in 14 epochs). Constraint 2 says split that into
+two legs; two 14-epoch legs plus two cohort evals is ~5 h, and 3.4 h remain.
+
+The bottleneck workaround — `z' = up(down(z))`, 256→64→256, preserving `in_dim` — is not
+identity at initialisation for any rank < 256, so it *also* perturbs the warm start on epoch 1
+and *also* bundles two changes.
+
+**Stopped here at ~3.4 h of a 7 h budget, deliberately, rather than spending it on a test that
+could not be attributed.** Constraint 2 exists because v1–v6 were lost to exactly this.
+
+**Secondary evidence pointing the same way, from 4a's own result.** Step 4a *is* a test of the
+hypothesis behind 4b — "the readout over-relies on the frozen off-task `z_kin`". Dropout
+removes `z_kin` stochastically; if it were harmful, removal should help. It **hurt the held-out
+vessel by −0.137**. That is evidence against the premise of 4b, not for it. A learned
+projection compresses rather than destroys, so this is suggestive rather than decisive — which
+is why the blocker above, not this, is the stated reason for stopping.
+
+### 13.9 Session summary — where this actually stands
+
+| | mean | `043` (held out) | vessels ≥0.60 |
+|---|---|---|---|
+| **zero-shot warm start** | **0.5425** | **0.6925** | **3/6** |
+| + regime routing | 0.5561* | 0.7270* | 3/6 |
+| v10 (14-epoch FT) | 0.5197 | 0.5555 | 1/6 |
+
+*routing measured on the second, inconsistent path (§13.4a); routed ≡ global on all six.
+
+**The goal is not met: 3 of 6 vessels are below 0.60 zero-shot (`039` 0.466, `041` 0.332,
+`042` 0.503), and nothing tried this session improved that.** The zero-shot warm start is
+still the best configuration in the study after eleven attempts.
+
+**What this session established that previous ones could not:**
+1. The cohort has **two opposite failure modes** — `039` over-paints (mass 1.79), `041`/`042`
+   under-paint (0.39/0.75). Confirmed independently on the gate side (§13.4) and the training
+   side (§13.7.1).
+2. **Every available knob is global and the requirement is per-vessel.** `041` needs ~5.6×
+   more mass, `043` needs ~1.0×. Gate percentile, loss weights and latent dropout all move all
+   six together. This is why ten legs failed, and it predicts steps 4b–4d fail the same way.
+3. **Regime routing is inapplicable here** — all six vessels are normal-regime, so routing ≡
+   global gate on every one (§13.4). §12.1's win came from a disjoint set of inverted vessels.
+4. **Three mutually inconsistent implementations of `deploy_clot_score`** (§13.4a, §13.7),
+   spanning 0.0666 on a single vessel/checkpoint, with the in-training one — which drives all
+   selection and every §9/§12 conclusion — the most optimistic.
+
+**Highest-value next work, in order:**
+1. **Reconcile `clout_prec_rec_floor`** (0.30 vs 0.35 vs 0.30 across three files) and make one
+   scoring implementation canonical. Nothing measured here is fully trustworthy until this is
+   done, and it is nearly free.
+2. **Per-vessel conditioning**, not another global knob. Finding 2 says the model needs a
+   growth-magnitude signal that varies by vessel. `band_speed_q25` is already computed per
+   vessel and already separates the cohort; feeding it as a conditioning scalar is the
+   cheapest form of this and was already proposed in §11.3.
+3. Only then the `z_kin` ladder, run as the **two** legs constraint 2 requires.
