@@ -582,3 +582,28 @@ def metrics_to_deploy_prefix(m: dict[str, float], *, prefix: str = "deploy_") ->
     if "time_index" in m:
         out["time_index"] = float(m["time_index"])
     return out
+
+def scoring_fingerprint() -> dict[str, object]:
+    """Resolved values of every constant that feeds ``clot_score_from_deploy_dict``.
+
+    These constants resolve from the *ambient* typed runtime when one is bound and from
+    ``os.environ`` otherwise, so two tools scoring the SAME predictions can disagree purely
+    because one of them bound a runtime and the other did not. That is not hypothetical:
+    ``eval_mat_growth_simple.py`` binds a runtime (``guide_relax_hops=3``) while
+    ``diag_regime_gate_sweep.py`` originally bound none (default 2), which changed the
+    dilation radius and therefore ``deploy_clot_score`` on all six cohort vessels while
+    leaving the strict ``deploy_clot_f1`` bit-identical (WALL_MODEL_PLAN.md 13.4a / 20.1).
+
+    Print this from any tool that reports a score, and compare across tools before comparing
+    the scores themselves.
+    """
+    from src.architecture.runtime_config import get_active_runtime
+
+    return {
+        "clout_score_mode": species_continuous_clout_score_mode(),
+        "clout_prec_rec_floor": clot_prec_recall_floor(),
+        "guide_relax_hops": clot_guide_relax_hops(),
+        "guide_f_beta": clot_guide_f_beta(),
+        "empty_gt_fp_tol": clot_empty_gt_fp_tol(),
+        "runtime_bound": get_active_runtime() is not None,
+    }

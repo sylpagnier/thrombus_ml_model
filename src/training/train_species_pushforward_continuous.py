@@ -80,6 +80,7 @@ from src.core_physics.species_pushforward_continuous import (
     deploy_horizon_aux_all_packs,
     deploy_horizon_aux_cap_steps,
     train_deploy_eval_flow_source,
+    use_vessel_mat_max,
     continuous_teacher_fp_frac,
     continuous_teacher_noise_sigma,
     continuous_vel_decay_enabled,
@@ -223,7 +224,15 @@ def _build_anchor_pack(
     from src.core_physics.species_pushforward_gnn import band_extra_feature_dim, band_feats_cache_tag
 
     feat_tag = band_feats_cache_tag()
-    pack_cache_dir = root / ".cache" / "packs" / f"{kine_stem}_hops{wall_hops}_{feat_tag}{suffix}"
+    # Prior source is part of the pack identity: the DEQ latent baked into the cache is
+    # conditioned on the prior columns, so reusing a `stored` pack under `analytic` would
+    # silently preserve the leak (vessel_scope.prior_source_cache_tag).
+    from src.core_physics.vessel_scope import prior_source_cache_tag
+
+    pack_cache_dir = (
+        root / ".cache" / "packs"
+        / f"{kine_stem}_hops{wall_hops}_{feat_tag}{suffix}{prior_source_cache_tag()}"
+    )
     pack_cache_path = pack_cache_dir / f"{anchor.strip()}{suffix}.pt"
 
     data = None
@@ -251,6 +260,12 @@ def _build_anchor_pack(
     if static is None:
         graph_path = root / VesselConfig(phase="biochem_anchors").graph_output_dir / f"{anchor.strip()}{suffix}.pt"
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
+
+        # Legal priors BEFORE the solve: the DEQ consumes UV_PRIOR / MU_PRIOR, so rewriting
+        # them afterwards would leave z_kin conditioned on the leaked CFD field (16.1c).
+        from src.core_physics.vessel_scope import prepare_vessel_data
+
+        data, _ = prepare_vessel_data(data)
 
         # One GINO-DEQ solve per vessel: UV baseline + z_kin (joint cache). Local corrector uses UV later.
         from src.utils.kinematics_inference import predict_kinematics_and_latent
@@ -301,9 +316,14 @@ def _build_anchor_pack(
     val_m = val_m.to("cpu")
     data = data.to("cpu")
 
+    from src.core_physics.vessel_scope import resolve_vessel_mat_max
+
     return {
         "anchor": anchor.strip(),
         "data": data,
+        # Per-vessel label scale travels WITH the pack, so no loop can forget to bind it.
+        # None on a clot-free pack -> mat_label_thresh() falls back to the absolute threshold.
+        "mat_max": resolve_vessel_mat_max(data),
         "static": static_cpu,
         "train_m": train_m,
         "val_m": val_m,
@@ -1232,6 +1252,25 @@ def main() -> int:
         continuous_underpred_weight,
     )
 
+    # Mechanism-engaged line for the per-vessel label scale (22.2). Without this, a rel_max
+    # run that failed to bind mat_max would look identical to an absolute run in the log.
+    try:
+        from src.core_physics.species_pushforward_continuous import mat_label_thresh
+        _lab_mode = getattr(pushforward_config, "mat_label_thresh_mode", "absolute")
+        _samples = [(p["anchor"], p.get("mat_max")) for p in packs[:3]]
+        with use_vessel_mat_max(_samples[0][1] if _samples else None):
+            _thr = mat_label_thresh()
+        print(
+            f"[i] label threshold: mode={_lab_mode} frac="
+            f"{getattr(pushforward_config, 'mat_label_rel_frac', 0.0):.3g} "
+            f"-> {_samples[0][0] if _samples else 'n/a'} thr={_thr:.3e} "
+            f"(mat_max per pack: "
+            + ", ".join(f"{a}={('%.2e' % m) if m else 'None'}" for a, m in _samples) + ")",
+            flush=True,
+        )
+    except Exception as _e:
+        print(f"[WARN] could not report label threshold: {_e}", flush=True)
+
     print(
         f"[i] underpred_weight={float(continuous_underpred_weight()):.4g} "
         f"gate_fp_weight={float(continuous_gate_fp_weight()):.4g}",
@@ -1248,102 +1287,106 @@ def main() -> int:
         random.shuffle(pack_order)
 
         for pack in pack_order:
-            wins = pack["windows"][:]
-            random.shuffle(wins)
-            static = pack["static"]
-            # Move static and data to GPU for training
-            static_gpu = {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in static.items()
-            }
-            pack_data_gpu = pack["data"].to(device)
-            train_m_gpu = pack["train_m"].to(device)
+          # Bind this vessel's label scale for every loss computed on its windows. Without
+          # this, mat_label_thresh() silently falls back to the absolute threshold and
+          # `rel_max` becomes a no-op -- the exact failure mode of v4/v5 (12.3).
+          with use_vessel_mat_max(pack.get("mat_max")):
+              wins = pack["windows"][:]
+              random.shuffle(wins)
+              static = pack["static"]
+              # Move static and data to GPU for training
+              static_gpu = {
+                  k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                  for k, v in static.items()
+              }
+              pack_data_gpu = pack["data"].to(device)
+              train_m_gpu = pack["train_m"].to(device)
 
-            for win in wins:
-                win_use = win[: cur_unroll + 1]
-                series = log_series_on_band(pack_data_gpu, win_use, device, static_gpu["node_idx"])
-                speed_series = (
-                    band_speed_series(
-                        pack_data_gpu, win_use, device, static_gpu["node_idx"], for_training=True
-                    )
-                    if continuous_vel_decay_enabled()
-                    else None
-                )
-                physics_ctx = None
-                if physics_on:
-                    physics_ctx = build_species_physics_ctx(
-                        pack_data_gpu,
-                        time_window=win_use,
-                        node_idx=static_gpu["node_idx"],
-                        phys_cfg=pack["phys"],
-                        bio_cfg=pack["bio"],
-                        device=device,
-                    )
-                w_t0 = pushforward_window_t0_weight(int(win_use[0]))
-                if w_t0 <= 0.0:
-                    continue
-                log_state0 = series[0]
-                if (
-                    int(win_use[0]) > 0
-                    and closed_loop_init_prob() > 0.0
-                    and random.random() < closed_loop_init_prob()
-                ):
-                    log_state0 = rollout_prefix_log_state(
-                        model,
-                        pack_data_gpu,
-                        static_gpu,
-                        int(win_use[0]),
-                        device,
-                    )
-                # Deploy-faithful UV for model.velocity (resolve via train_vel_source).
-                # Never feed raw COMSOL data.y UV into architecture paths.
-                velocity_series = [
-                    band_uv_for_model(
-                        pack_data_gpu, ti, device, static_gpu["node_idx"], for_training=True
-                    )
-                    for ti in win_use
-                ]
-                species_block_full = [pack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_use]
-                flow_series_win = _flow_series_for_unroll(
-                    pack_data_gpu, static_gpu, device, win_use, velocity_series
-                )
-                loss, _, _ = unroll_continuous_loss(
-                    model,
-                    base_feats=static_gpu["base_feats"],
-                    edge_index=static_gpu["edge_index"],
-                    log_series=series,
-                    train_mask=train_m_gpu,
-                    log_state0=log_state0,
-                    speed_series=speed_series,
-                    training=True,
-                    physics_ctx=physics_ctx,
-                    window_weight=w_t0,
-                    tbptt_tail=tbptt_tail_steps(),
-                    pos_band=static_gpu.get("pos_band"),
-                    time_window=win_use,
-                    flow_series=flow_series_win,
-                    flow_cols=static_gpu.get("flow_cols"),
-                    wall_mask_band=pack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(pack_data_gpu, "mask_wall") and pack_data_gpu.mask_wall is not None else None,
-                    wall_normals_band=static_gpu.get("wall_normals_band"),
-                    sdf_band=static_gpu.get("sdf_band"),
-                    edge_attr_band=static_gpu.get("edge_attr_band"),
-                    species_block=species_block_full,
-                    velocity=velocity_series,
-                    epoch=ep,
-                    max_epochs=int(args.epochs),
-                )
-                if not loss.requires_grad:
-                    continue
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                if grad_clip > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                opt.step()
-                ep_losses.append(float(loss.item()))
+              for win in wins:
+                  win_use = win[: cur_unroll + 1]
+                  series = log_series_on_band(pack_data_gpu, win_use, device, static_gpu["node_idx"])
+                  speed_series = (
+                      band_speed_series(
+                          pack_data_gpu, win_use, device, static_gpu["node_idx"], for_training=True
+                      )
+                      if continuous_vel_decay_enabled()
+                      else None
+                  )
+                  physics_ctx = None
+                  if physics_on:
+                      physics_ctx = build_species_physics_ctx(
+                          pack_data_gpu,
+                          time_window=win_use,
+                          node_idx=static_gpu["node_idx"],
+                          phys_cfg=pack["phys"],
+                          bio_cfg=pack["bio"],
+                          device=device,
+                      )
+                  w_t0 = pushforward_window_t0_weight(int(win_use[0]))
+                  if w_t0 <= 0.0:
+                      continue
+                  log_state0 = series[0]
+                  if (
+                      int(win_use[0]) > 0
+                      and closed_loop_init_prob() > 0.0
+                      and random.random() < closed_loop_init_prob()
+                  ):
+                      log_state0 = rollout_prefix_log_state(
+                          model,
+                          pack_data_gpu,
+                          static_gpu,
+                          int(win_use[0]),
+                          device,
+                      )
+                  # Deploy-faithful UV for model.velocity (resolve via train_vel_source).
+                  # Never feed raw COMSOL data.y UV into architecture paths.
+                  velocity_series = [
+                      band_uv_for_model(
+                          pack_data_gpu, ti, device, static_gpu["node_idx"], for_training=True
+                      )
+                      for ti in win_use
+                  ]
+                  species_block_full = [pack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_use]
+                  flow_series_win = _flow_series_for_unroll(
+                      pack_data_gpu, static_gpu, device, win_use, velocity_series
+                  )
+                  loss, _, _ = unroll_continuous_loss(
+                      model,
+                      base_feats=static_gpu["base_feats"],
+                      edge_index=static_gpu["edge_index"],
+                      log_series=series,
+                      train_mask=train_m_gpu,
+                      log_state0=log_state0,
+                      speed_series=speed_series,
+                      training=True,
+                      physics_ctx=physics_ctx,
+                      window_weight=w_t0,
+                      tbptt_tail=tbptt_tail_steps(),
+                      pos_band=static_gpu.get("pos_band"),
+                      time_window=win_use,
+                      flow_series=flow_series_win,
+                      flow_cols=static_gpu.get("flow_cols"),
+                      wall_mask_band=pack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(pack_data_gpu, "mask_wall") and pack_data_gpu.mask_wall is not None else None,
+                      wall_normals_band=static_gpu.get("wall_normals_band"),
+                      sdf_band=static_gpu.get("sdf_band"),
+                      edge_attr_band=static_gpu.get("edge_attr_band"),
+                      species_block=species_block_full,
+                      velocity=velocity_series,
+                      epoch=ep,
+                      max_epochs=int(args.epochs),
+                  )
+                  if not loss.requires_grad:
+                      continue
+                  opt.zero_grad(set_to_none=True)
+                  loss.backward()
+                  if grad_clip > 0.0:
+                      torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                  opt.step()
+                  ep_losses.append(float(loss.item()))
 
-            # Cleanup GPU pack memory (Data.to is in-place; restore CPU residency)
-            del static_gpu, pack_data_gpu, train_m_gpu
-            _release_pack_to_cpu(pack)
+              # Cleanup GPU pack memory (Data.to is in-place; restore CPU residency)
+              del static_gpu, pack_data_gpu, train_m_gpu
+              _release_pack_to_cpu(pack)
 
         if True:
             h = deploy_horizon_steps()
@@ -1359,75 +1402,78 @@ def main() -> int:
                 dep_packs = [p for p in dep_packs if p["anchor"] != val_anchor]
             aux_cap = deploy_horizon_aux_cap_steps()
             for vpack in dep_packs:
-                n_times = int(vpack["static"]["n_times"])
-                if h > 0:
-                    t_end = min(int(h), n_times - 1)
-                else:
-                    t_end = graph_last_time_index(n_times)
-                if aux_cap > 0:
-                    t_end = min(t_end, aux_cap - 1)
-                if t_end < 3:
-                    continue
-                win_dep = list(range(0, t_end + 1))
-                static = vpack["static"]
-                # Move to GPU for deploy horizon loss
-                static_gpu = {
-                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                    for k, v in static.items()
-                }
-                vpack_data_gpu = vpack["data"].to(device)
-                train_m_gpu = vpack["train_m"].to(device)
+                # Bind this vessel's label scale for the deploy-horizon aux loss too, so the
+                # aux and the main loop grade against the same label definition.
+                with use_vessel_mat_max(vpack.get("mat_max")):
+                    n_times = int(vpack["static"]["n_times"])
+                    if h > 0:
+                        t_end = min(int(h), n_times - 1)
+                    else:
+                        t_end = graph_last_time_index(n_times)
+                    if aux_cap > 0:
+                        t_end = min(t_end, aux_cap - 1)
+                    if t_end < 3:
+                        continue
+                    win_dep = list(range(0, t_end + 1))
+                    static = vpack["static"]
+                    # Move to GPU for deploy horizon loss
+                    static_gpu = {
+                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in static.items()
+                    }
+                    vpack_data_gpu = vpack["data"].to(device)
+                    train_m_gpu = vpack["train_m"].to(device)
 
-                series = log_series_on_band(vpack_data_gpu, win_dep, device, static_gpu["node_idx"])
-                speed_series = band_speed_series(
-                    vpack_data_gpu, win_dep, device, static_gpu["node_idx"], for_training=True
-                )
-                w_dep = 2.5 if vpack["anchor"] == val_anchor else 1.25
-                velocity_series = [
-                    band_uv_for_model(
-                        vpack_data_gpu, ti, device, static_gpu["node_idx"], for_training=True
+                    series = log_series_on_band(vpack_data_gpu, win_dep, device, static_gpu["node_idx"])
+                    speed_series = band_speed_series(
+                        vpack_data_gpu, win_dep, device, static_gpu["node_idx"], for_training=True
                     )
-                    for ti in win_dep
-                ]
-                species_block_full = [vpack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_dep]
-                flow_series_win = _flow_series_for_unroll(
-                    vpack_data_gpu, static_gpu, device, win_dep, velocity_series
-                )
-                loss_dep, _, _ = unroll_continuous_loss(
-                    model,
-                    base_feats=static_gpu["base_feats"],
-                    edge_index=static_gpu["edge_index"],
-                    log_series=series,
-                    train_mask=train_m_gpu,
-                    log_state0=series[0],
-                    speed_series=speed_series,
-                    training=True,
-                    window_weight=w_dep,
-                    tbptt_tail=min(tbptt_tail_steps(), max(5, len(win_dep) // 5)),
-                    speed_fp_weight=continuous_speed_fp_weight(),
-                    pos_band=static_gpu.get("pos_band"),
-                    time_window=win_dep,
-                    flow_series=flow_series_win,
-                    flow_cols=static_gpu.get("flow_cols"),
-                    wall_mask_band=vpack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(vpack_data_gpu, "mask_wall") and vpack_data_gpu.mask_wall is not None else None,
-                    wall_normals_band=static_gpu.get("wall_normals_band"),
-                    sdf_band=static_gpu.get("sdf_band"),
-                    edge_attr_band=static_gpu.get("edge_attr_band"),
-                    species_block=species_block_full,
-                    velocity=velocity_series,
-                    epoch=ep,
-                    max_epochs=int(args.epochs),
-                )
-                if loss_dep.requires_grad:
-                    opt.zero_grad(set_to_none=True)
-                    loss_dep.backward()
-                    if grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    opt.step()
-                    ep_losses.append(float(loss_dep.item()))
+                    w_dep = 2.5 if vpack["anchor"] == val_anchor else 1.25
+                    velocity_series = [
+                        band_uv_for_model(
+                            vpack_data_gpu, ti, device, static_gpu["node_idx"], for_training=True
+                        )
+                        for ti in win_dep
+                    ]
+                    species_block_full = [vpack_data_gpu.y[ti, static_gpu["node_idx"], sc.SPECIES_BLOCK] for ti in win_dep]
+                    flow_series_win = _flow_series_for_unroll(
+                        vpack_data_gpu, static_gpu, device, win_dep, velocity_series
+                    )
+                    loss_dep, _, _ = unroll_continuous_loss(
+                        model,
+                        base_feats=static_gpu["base_feats"],
+                        edge_index=static_gpu["edge_index"],
+                        log_series=series,
+                        train_mask=train_m_gpu,
+                        log_state0=series[0],
+                        speed_series=speed_series,
+                        training=True,
+                        window_weight=w_dep,
+                        tbptt_tail=min(tbptt_tail_steps(), max(5, len(win_dep) // 5)),
+                        speed_fp_weight=continuous_speed_fp_weight(),
+                        pos_band=static_gpu.get("pos_band"),
+                        time_window=win_dep,
+                        flow_series=flow_series_win,
+                        flow_cols=static_gpu.get("flow_cols"),
+                        wall_mask_band=vpack_data_gpu.mask_wall[static_gpu["node_idx"]] if hasattr(vpack_data_gpu, "mask_wall") and vpack_data_gpu.mask_wall is not None else None,
+                        wall_normals_band=static_gpu.get("wall_normals_band"),
+                        sdf_band=static_gpu.get("sdf_band"),
+                        edge_attr_band=static_gpu.get("edge_attr_band"),
+                        species_block=species_block_full,
+                        velocity=velocity_series,
+                        epoch=ep,
+                        max_epochs=int(args.epochs),
+                    )
+                    if loss_dep.requires_grad:
+                        opt.zero_grad(set_to_none=True)
+                        loss_dep.backward()
+                        if grad_clip > 0.0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        opt.step()
+                        ep_losses.append(float(loss_dep.item()))
 
-                del static_gpu, vpack_data_gpu, train_m_gpu
-                _release_pack_to_cpu(vpack)
+                    del static_gpu, vpack_data_gpu, train_m_gpu
+                    _release_pack_to_cpu(vpack)
 
         model.eval()
         val_state_f1: list[float] = []
@@ -1456,7 +1502,9 @@ def main() -> int:
         mat_front_speed_ratio = 0.0
         deploy_clot_fp = 0.0
         deploy_clot_fn = 0.0
-        with torch.no_grad():
+        # The reported deploy metrics must use the SAME label definition the loss trained
+        # against, or selection grades against a different notion of 'committed'.
+        with torch.no_grad(), use_vessel_mat_max(val_pack.get("mat_max")):
             # Move val pack to GPU
             val_static_gpu = {
                 k: (v.to(device) if isinstance(v, torch.Tensor) else v)

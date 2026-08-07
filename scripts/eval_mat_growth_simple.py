@@ -44,6 +44,8 @@ from src.core_physics.species_gnn_clot_rollout import (  # noqa: E402
     rollout_species_gnn_phi_trajectory,
     species_gnn_static_from_band_dict,
 )
+from src.core_physics.vessel_scope import prepare_vessel_data  # noqa: E402
+from src.core_physics.species_pushforward_continuous import use_vessel_mat_max  # noqa: E402
 from src.evaluation.canonical_clot_eval import canonical_deploy_clot_metrics  # noqa: E402
 from src.evaluation.seed_growth_diagnostics import (  # noqa: E402
     format_seed_growth_panel,
@@ -119,6 +121,7 @@ _EVAL_PF_CM = None
 _EVAL_RT_CM = None
 # Explicit --gelation-beta, re-applied after every recipe rebind (see _apply_ckpt_recipe).
 _EVAL_GELATION_BETA = ""
+_FP_REPORTED = False
 
 
 def _bind_eval_typed_configs(pf, rt) -> None:
@@ -314,88 +317,107 @@ def _eval_ckpt(
             else:
                 os.environ["SPECIES_TWO_MODEL_FRONTIER_HOPS_ANCHOR"] = anc
         reset_species_rollout_flow_cache()
-        data = torch.load(ANCHOR_DIR / f"{anc}.pt", map_location=device, weights_only=False)
-        static = _load_static(data, device, kine, wall_hops, anc)
-        static["n_times"] = int(data.y.shape[0])
-        t_eval = deploy_eval_time_index(int(data.y.shape[0]))
-        mat_m = eval_full_rollout_fimat_f1(
-            model, data, static, device, time_index=t_eval
+        # Same vessel scope as training: legal priors applied BEFORE the kinematics solve
+        # inside _load_static, and this vessel's label scale bound for every metric.
+        data, _vmax = prepare_vessel_data(
+            torch.load(ANCHOR_DIR / f"{anc}.pt", map_location=device, weights_only=False)
         )
-        # Shared protocol with training (see src/evaluation/canonical_clot_eval.py).
-        clot_m = canonical_deploy_clot_metrics(
-            model,
-            data,
-            static,
-            phys,
-            bio,
-            device,
-            time_index=t_eval,
-            flow_source=flow_eval,
-        )
+        with use_vessel_mat_max(_vmax):
+            static = _load_static(data, device, kine, wall_hops, anc)
+            static["n_times"] = int(data.y.shape[0])
+            t_eval = deploy_eval_time_index(int(data.y.shape[0]))
+            mat_m = eval_full_rollout_fimat_f1(
+                model, data, static, device, time_index=t_eval
+            )
+            # Report the fingerprint from INSIDE the scoring scope, once. Printed at startup
+            # it showed the UNBOUND defaults (runtime_bound=False, hops=2), which is precisely
+            # not what scoring uses -- an instrument that lies is worse than none (20.1).
+            global _FP_REPORTED
+            if not _FP_REPORTED:
+                from src.evaluation.clot_relaxed_metrics import scoring_fingerprint
+                from src.evaluation.canonical_clot_eval import bind_canonical_deploy_protocol
+                _prev_env = dict(os.environ)
+                try:
+                    bind_canonical_deploy_protocol(flow="kinematics")
+                    print(f"[i] SCORING FINGERPRINT (scoring scope) {scoring_fingerprint()}", flush=True)
+                finally:
+                    os.environ.clear(); os.environ.update(_prev_env)
+                _FP_REPORTED = True
+            # Shared protocol with training (see src/evaluation/canonical_clot_eval.py).
+            clot_m = canonical_deploy_clot_metrics(
+                model,
+                data,
+                static,
+                phys,
+                bio,
+                device,
+                time_index=t_eval,
+                flow_source=flow_eval,
+            )
 
-        timeline_summary: dict[str, float] = {}
-        if not cheap_val:
-            try:
-                if gnn_bundle is not None:
-                    # Reuse the same band static / u0_pred (no second DEQ + ckpt reload).
-                    gnn_static = species_gnn_static_from_band_dict(
-                        static, data, device=device, wall_hops=wall_hops
-                    )
-                    phi_traj = rollout_species_gnn_phi_trajectory(
-                        data,
-                        gnn_bundle,
-                        gnn_static,
-                        phys_cfg=phys,
-                        bio_cfg=bio,
-                        device=device,
-                        flow_source=flow_eval,
-                    )
-                    tl = eval_clot_timeline_on_grid(phi_traj, data, phys, device, max_frames=10)
-                    timeline_summary = dict(tl.get("summary") or {})
-            except Exception as exc:
-                print(f"[WARN] clot timeline metrics skipped for {anc}: {exc}", flush=True)
+            timeline_summary: dict[str, float] = {}
+            if not cheap_val:
+                try:
+                    if gnn_bundle is not None:
+                        # Reuse the same band static / u0_pred (no second DEQ + ckpt reload).
+                        gnn_static = species_gnn_static_from_band_dict(
+                            static, data, device=device, wall_hops=wall_hops
+                        )
+                        phi_traj = rollout_species_gnn_phi_trajectory(
+                            data,
+                            gnn_bundle,
+                            gnn_static,
+                            phys_cfg=phys,
+                            bio_cfg=bio,
+                            device=device,
+                            flow_source=flow_eval,
+                        )
+                        tl = eval_clot_timeline_on_grid(phi_traj, data, phys, device, max_frames=10)
+                        timeline_summary = dict(tl.get("summary") or {})
+                except Exception as exc:
+                    print(f"[WARN] clot timeline metrics skipped for {anc}: {exc}", flush=True)
 
-        per[anc] = {
-            "t_eval": int(t_eval),
-            "deploy_mat_f1": float(mat_m["deploy_mat_f1"]),
-            "deploy_fi_f1": float(mat_m.get("deploy_fi_f1", 0.0)),
-            "mat_seed_prec": float(mat_m.get("mat_seed_prec", 0.0)),
-            "mat_seed_count": float(mat_m.get("mat_seed_count", 0.0)),
-            "mat_front_prec": float(mat_m.get("mat_front_prec", 0.0)),
-            "mat_front_speed_ratio": float(mat_m.get("mat_front_speed_ratio", 0.0)),
-            "mat_overpaint_frac": float(mat_m.get("mat_overpaint_frac", 0.0)),
-            "mat_overpaint_per_gt": float(mat_m.get("mat_overpaint_per_gt", 0.0)),
-            "deploy_clot_f1": float(clot_m["deploy_clot_f1"]),
-            "deploy_clot_score": float(clot_m.get("deploy_clot_score", 0.0)),
-            "deploy_clot_relaxed_prec": float(clot_m.get("deploy_clot_relaxed_prec", 0.0)),
-            "deploy_clot_relaxed_rec": float(clot_m.get("deploy_clot_relaxed_rec", 0.0)),
-            "deploy_clot_offwall_relaxed_f1": float(clot_m.get("deploy_clot_offwall_relaxed_f1", 0.0)),
-            "deploy_clot_offwall_strict_f1": float(clot_m.get("deploy_clot_offwall_strict_f1", 0.0)),
-            "deploy_clot_offwall_n_pred": float(clot_m.get("deploy_clot_offwall_n_pred", 0.0)),
-            "deploy_clot_offwall_n_gt": float(clot_m.get("deploy_clot_offwall_n_gt", 0.0)),
-            "deploy_clot_offwall_n_pred_hop2": float(clot_m.get("deploy_clot_offwall_n_pred_hop2", 0.0)),
-            "deploy_clot_offwall_n_pred_hop3": float(clot_m.get("deploy_clot_offwall_n_pred_hop3", 0.0)),
-            "deploy_clot_offwall_n_pred_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0)),
-            "deploy_clot_offwall_n_gt_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0)),
-            "deploy_clot_offwall_strict_f1_hop2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop2", 0.0)),
-            "deploy_clot_offwall_strict_f1_hop_ge2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0)),
-            "deploy_wall_score": float(clot_m.get("deploy_wall_score", 0.0)),
-            "deploy_wall_strict_f1": float(clot_m.get("deploy_wall_strict_f1", 0.0)),
-            "deploy_clot_mass_ratio": float(clot_m.get("deploy_clot_mass_ratio", 0.0)),
-            "deploy_clot_empty_gt_score": float(clot_m.get("deploy_clot_empty_gt_score", 0.0)),
-            "deploy_clot_fp": float(clot_m.get("deploy_clot_fp", 0.0)),
-            "deploy_clot_fn": float(clot_m.get("deploy_clot_fn", 0.0)),
-            "deploy_gelation_beta": float(clot_m.get("deploy_gelation_beta", 1.0)),
-            "deploy_pocket_gate_pct": float(clot_m.get("deploy_pocket_gate_pct", 0.0)),
-            "deploy_pocket_gate_thresh": float(clot_m.get("deploy_pocket_gate_thresh", 0.0)),
-            "deploy_pocket_gate_ncomp_total": float(clot_m.get("deploy_pocket_gate_ncomp_total", 0.0)),
-            "deploy_pocket_gate_ncomp_kept": float(clot_m.get("deploy_pocket_gate_ncomp_kept", 0.0)),
-            "deploy_pocket_gate_dropped_nodes": float(clot_m.get("deploy_pocket_gate_dropped_nodes", 0.0)),
-            **{k: float(v) for k, v in timeline_summary.items()},
-        }
-        panel = seed_growth_diagnostic_panel(per[anc])
-        per[anc]["diagnostic"] = panel
-        print(format_seed_growth_panel(panel, label=anc), flush=True)
+            per[anc] = {
+                "t_eval": int(t_eval),
+                "deploy_mat_f1": float(mat_m["deploy_mat_f1"]),
+                "deploy_fi_f1": float(mat_m.get("deploy_fi_f1", 0.0)),
+                "mat_seed_prec": float(mat_m.get("mat_seed_prec", 0.0)),
+                "mat_seed_count": float(mat_m.get("mat_seed_count", 0.0)),
+                "mat_front_prec": float(mat_m.get("mat_front_prec", 0.0)),
+                "mat_front_speed_ratio": float(mat_m.get("mat_front_speed_ratio", 0.0)),
+                "mat_overpaint_frac": float(mat_m.get("mat_overpaint_frac", 0.0)),
+                "mat_overpaint_per_gt": float(mat_m.get("mat_overpaint_per_gt", 0.0)),
+                "deploy_clot_f1": float(clot_m["deploy_clot_f1"]),
+                "deploy_clot_score": float(clot_m.get("deploy_clot_score", 0.0)),
+                "deploy_clot_relaxed_prec": float(clot_m.get("deploy_clot_relaxed_prec", 0.0)),
+                "deploy_clot_relaxed_rec": float(clot_m.get("deploy_clot_relaxed_rec", 0.0)),
+                "deploy_clot_offwall_relaxed_f1": float(clot_m.get("deploy_clot_offwall_relaxed_f1", 0.0)),
+                "deploy_clot_offwall_strict_f1": float(clot_m.get("deploy_clot_offwall_strict_f1", 0.0)),
+                "deploy_clot_offwall_n_pred": float(clot_m.get("deploy_clot_offwall_n_pred", 0.0)),
+                "deploy_clot_offwall_n_gt": float(clot_m.get("deploy_clot_offwall_n_gt", 0.0)),
+                "deploy_clot_offwall_n_pred_hop2": float(clot_m.get("deploy_clot_offwall_n_pred_hop2", 0.0)),
+                "deploy_clot_offwall_n_pred_hop3": float(clot_m.get("deploy_clot_offwall_n_pred_hop3", 0.0)),
+                "deploy_clot_offwall_n_pred_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_pred_hop_ge2", 0.0)),
+                "deploy_clot_offwall_n_gt_hop_ge2": float(clot_m.get("deploy_clot_offwall_n_gt_hop_ge2", 0.0)),
+                "deploy_clot_offwall_strict_f1_hop2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop2", 0.0)),
+                "deploy_clot_offwall_strict_f1_hop_ge2": float(clot_m.get("deploy_clot_offwall_strict_f1_hop_ge2", 0.0)),
+                "deploy_wall_score": float(clot_m.get("deploy_wall_score", 0.0)),
+                "deploy_wall_strict_f1": float(clot_m.get("deploy_wall_strict_f1", 0.0)),
+                "deploy_clot_mass_ratio": float(clot_m.get("deploy_clot_mass_ratio", 0.0)),
+                "deploy_clot_empty_gt_score": float(clot_m.get("deploy_clot_empty_gt_score", 0.0)),
+                "deploy_clot_fp": float(clot_m.get("deploy_clot_fp", 0.0)),
+                "deploy_clot_fn": float(clot_m.get("deploy_clot_fn", 0.0)),
+                "deploy_gelation_beta": float(clot_m.get("deploy_gelation_beta", 1.0)),
+                "deploy_pocket_gate_pct": float(clot_m.get("deploy_pocket_gate_pct", 0.0)),
+                "deploy_pocket_gate_thresh": float(clot_m.get("deploy_pocket_gate_thresh", 0.0)),
+                "deploy_pocket_gate_ncomp_total": float(clot_m.get("deploy_pocket_gate_ncomp_total", 0.0)),
+                "deploy_pocket_gate_ncomp_kept": float(clot_m.get("deploy_pocket_gate_ncomp_kept", 0.0)),
+                "deploy_pocket_gate_dropped_nodes": float(clot_m.get("deploy_pocket_gate_dropped_nodes", 0.0)),
+                **{k: float(v) for k, v in timeline_summary.items()},
+            }
+            panel = seed_growth_diagnostic_panel(per[anc])
+            per[anc]["diagnostic"] = panel
+            print(format_seed_growth_panel(panel, label=anc), flush=True)
     keys = (
         "deploy_mat_f1",
         "deploy_clot_f1",
@@ -624,7 +646,9 @@ def main() -> int:
             print(f"[ERROR] --pocket-gate-pct {pct} outside [0, 100]")
             return 1
         os.environ["CLOT_POCKET_GATE_PCT"] = str(pct)
-        print(f"[i] pocket gate percentile = {pct} (unset = gate off)", flush=True)
+        from src.evaluation.clot_relaxed_metrics import scoring_fingerprint
+    print(f"[i] SCORING FINGERPRINT {scoring_fingerprint()}", flush=True)
+    print(f"[i] pocket gate percentile = {pct} (unset = gate off)", flush=True)
 
     report["deploy_overrides"] = {
         "frontier_hops": pf_overrides.get("frontier_hops"),

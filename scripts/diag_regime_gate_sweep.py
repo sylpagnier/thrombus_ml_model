@@ -41,6 +41,8 @@ from src.core_physics.species_pushforward_continuous import (  # noqa: E402
     load_continuous_bundle,
 )
 from src.core_physics.t0_device import require_cuda_device  # noqa: E402
+from src.evaluation.canonical_clot_eval import canonical_grade_series  # noqa: E402
+from src.evaluation.clot_relaxed_metrics import scoring_fingerprint  # noqa: E402
 from src.evaluation.pocket_gate import DEFAULT_REGIME_BAND_SPEED_THRESH  # noqa: E402
 from src.utils.kinematics_inference import (  # noqa: E402
     load_kinematics_predictor,
@@ -59,7 +61,10 @@ def _grade(data, series, static, phys, bio, device, pct, route) -> dict:
         else:
             os.environ[k] = str(v)
     try:
-        return grade_deploy_clot_series(
+        # Canonical protocol, same as eval_mat_growth_simple.py. Calling
+        # grade_deploy_clot_series directly here silently used a DIFFERENT protocol and made
+        # deploy_clot_score incomparable across tools (WALL_MODEL_PLAN.md 20.1).
+        return canonical_grade_series(
             data, series, static, phys, bio, device,
             time_index=None, flow_source="kinematics", gelation_beta=None,
         )
@@ -88,6 +93,7 @@ def main() -> int:
     payload = torch.load(ckpt, map_location="cpu", weights_only=False)
     meta = dict(payload.get("meta") or {})
     _apply_ckpt_recipe(meta, label="regime_gate_sweep", ckpt_path=ckpt)
+    print(f"[i] SCORING FINGERPRINT {scoring_fingerprint()}", flush=True)
     bundle = load_continuous_bundle(ckpt, device=device, quiet=True)
     model = bundle.model
     wall_hops = int(meta.get("wall_hops", 3))

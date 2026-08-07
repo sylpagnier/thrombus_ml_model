@@ -140,6 +140,21 @@ if ($GatedLegs -contains $Leg -and $GatePct -ne 25) {
     exit 1
 }
 
+# Seal guard: the cohort-v2 generalization set is spent ONCE (WALL_MODEL_PLAN.md 21.1).
+# Using one as the val anchor would tune selection against it every epoch.
+$SealedCsv = (python -c @"
+from src.biochem_gnn.mat_growth_simple import WALL_COHORT_V2_GENERALIZATION
+print(','.join(WALL_COHORT_V2_GENERALIZATION))
+"@).Trim()
+$Sealed = @($SealedCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($Sealed -contains $HoldoutAnchor) {
+    Write-Host "[ERR] $HoldoutAnchor is in the SEALED generalization set:" -ForegroundColor Red
+    Write-Host "[ERR]   $SealedCsv" -ForegroundColor Red
+    Write-Host "[ERR] Using it as -HoldoutAnchor tunes selection against it every epoch and spends the seal." -ForegroundColor Red
+    Write-Host "[i] Pick a dev-cohort vessel instead, e.g. -HoldoutAnchor patient041" -ForegroundColor DarkGray
+    exit 1
+}
+
 $OutDir = Join-Path $RepoRoot $RunRoot
 $ArmDir = Join-Path $OutDir $Leg
 $ArmCkpt = Join-Path $ArmDir "best.pth"

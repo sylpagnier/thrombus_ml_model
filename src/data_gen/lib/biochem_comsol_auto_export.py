@@ -280,12 +280,14 @@ def write_boundary_txt_from_mesh(
 
     inlet_tag = vessel_cfg.TAGS["Inlet"]
     wall_tag = vessel_cfg.TAGS["Walls"]
+    wound_tag = vessel_cfg.TAGS.get("Wound", 104)
     outlet_tags = {tag_id for name, tag_id in vessel_cfg.TAGS.items() if "Outlet" in name}
 
     masks = {
         "inlet": np.zeros(n_nodes, dtype=bool),
         "outlet": np.zeros(n_nodes, dtype=bool),
         "wall": np.zeros(n_nodes, dtype=bool),
+        "wound": np.zeros(n_nodes, dtype=bool),
     }
     try:
         line_cells = mesh.get_cells_type("line")
@@ -310,6 +312,8 @@ def write_boundary_txt_from_mesh(
             masks["outlet"][nodes] = True
         elif tag == wall_tag:
             masks["wall"][nodes] = True
+        elif tag == wound_tag:
+            masks["wound"][nodes] = True
 
     def _write_one(path: Path, node_mask: np.ndarray) -> None:
         coords = np.unique(pts[node_mask, :2], axis=0)
@@ -321,12 +325,17 @@ def write_boundary_txt_from_mesh(
     _write_one(inlet_p, masks["inlet"])
     _write_one(outlet_p, masks["outlet"])
     _write_one(wall_p, masks["wall"])
+    
+    wound_p = label_dir / f"{stem}_wound.txt"
+    if masks["wound"].any():
+        _write_one(wound_p, masks["wound"])
     logger.info(
-        "[OK] %s: boundary txt from mesh (inlet=%d outlet=%d wall=%d unique coords)",
+        "[OK] %s: boundary txt from mesh (inlet=%d outlet=%d wall=%d wound=%d unique coords)",
         stem,
         int(masks["inlet"].sum()),
         int(masks["outlet"].sum()),
         int(masks["wall"].sum()),
+        int(masks["wound"].sum()),
     )
     return inlet_p, outlet_p, wall_p
 

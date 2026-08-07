@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import math
+import contextlib
+import contextvars
 import os
 from src.core_physics.constants import *
 import random
@@ -961,6 +963,52 @@ def continuous_mat_commit_thresh() -> float:
     return _env_float_channel("SPECIES_CONTINUOUS_MAT_COMMIT_THRESH", snapshot_active_log_nd())
 
 
+# Per-vessel GT Mat maximum, set by whoever knows which vessel is active (loss/eval loops).
+# Only consulted when mat_label_thresh_mode == "rel_max".
+_VESSEL_MAT_MAX: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "vessel_mat_max", default=None
+)
+
+
+@contextlib.contextmanager
+def use_vessel_mat_max(value: float | None):
+    """Bind the active vessel's max GT Mat for relative label thresholding."""
+    token = _VESSEL_MAT_MAX.set(None if value is None else float(value))
+    try:
+        yield value
+    finally:
+        _VESSEL_MAT_MAX.reset(token)
+
+
+def mat_label_thresh() -> float:
+    """Threshold defining what counts as TRULY committed (labels / metrics / GT side of losses).
+
+    Distinct from :func:`continuous_mat_commit_thresh`, which thresholds the model's own
+    prediction. They are allowed to differ: the label threshold may be vessel-relative (it is
+    computed from GT, which is available wherever labels are), whereas the prediction threshold
+    must not be -- using max(GT Mat) to decide what the model predicts would be a deploy leak.
+
+    Rationale for rel_max (WALL_MODEL_PLAN.md 20.3): max Mat spans 45x across the 35 usable
+    packs against a fixed 1e-4, so "committed" is a much stricter state on some vessels than
+    others. Relative-10% raises mean best-feature AUC 0.768 -> 0.800 and cuts cross-vessel
+    variance 0.102 -> 0.058.
+
+    Falls back to the absolute threshold when no vessel max is bound, so callers that have not
+    been taught about vessels keep working unchanged.
+    """
+    cfg = resolve_config()
+    mode = (getattr(cfg, "mat_label_thresh_mode", "absolute") if cfg is not None
+            else (os.environ.get("SPECIES_CONTINUOUS_MAT_LABEL_THRESH_MODE") or "absolute"))
+    if str(mode).strip().lower() != "rel_max":
+        return continuous_mat_commit_thresh()
+    vmax = _VESSEL_MAT_MAX.get()
+    if vmax is None or not (vmax > 0.0):
+        return continuous_mat_commit_thresh()
+    frac = (float(getattr(cfg, "mat_label_rel_frac", 0.10)) if cfg is not None
+            else float(os.environ.get("SPECIES_CONTINUOUS_MAT_LABEL_REL_FRAC") or 0.10))
+    return max(float(vmax) * max(frac, 0.0), 0.0)
+
+
 def log_series_on_band(
     data,
     time_indices: Sequence[int],
@@ -1659,7 +1707,8 @@ def rolled_final_mass_fp_penalty(
     pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
     gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
     pred_soft = soft_commit_prob(pred, thr, float(soft_k))
-    gt_pos = (gt > thr).to(dtype=pred_soft.dtype)
+    # GT side may use a per-vessel label threshold; prediction side must not (deploy leak).
+    gt_pos = (gt > mat_label_thresh()).to(dtype=pred_soft.dtype)
     n_gt = gt_pos.sum().clamp(min=1.0)
     mass_ratio = pred_soft.sum() / n_gt
     target = continuous_final_mass_target() if mass_target is None else float(mass_target)
@@ -1784,7 +1833,8 @@ def rolled_soft_f1_loss(
     pred = final_pred.reshape(-1, final_pred.shape[-1])[m, mat_i]
     gt = final_gt.reshape(-1, final_gt.shape[-1])[m, mat_i]
     p_soft = soft_commit_prob(pred, thr, k)
-    gt_pos = (gt > thr).to(dtype=p_soft.dtype)
+    # GT side may use a per-vessel label threshold; prediction side must not (deploy leak).
+    gt_pos = (gt > mat_label_thresh()).to(dtype=p_soft.dtype)
 
     tp = (p_soft * gt_pos).sum()
     fp = (p_soft * (1.0 - gt_pos)).sum()

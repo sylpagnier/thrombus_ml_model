@@ -553,6 +553,7 @@ class PatientDataExtractor:
         inlet_path = self.label_dir / f"{stem}_inlet.txt"
         outlet_path = self.label_dir / f"{stem}_outlet.txt"
         wall_path = self.label_dir / f"{stem}_wall.txt"
+        wound_path = self.label_dir / f"{stem}_wound.txt"
 
         if not txt_path.exists():
             print(f"[ERR] Skipping {stem}: COMSOL domain data (.txt) missing.", flush=True)
@@ -582,6 +583,12 @@ class PatientDataExtractor:
         mask_wall, diag_wall = self._load_spatial_mask(
             wall_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
         )
+        
+        mask_wound = torch.zeros(num_nodes, dtype=torch.bool)
+        if wound_path.exists():
+            mask_wound, _ = self._load_spatial_mask(
+                wound_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
+            )
 
         d_bar = resolve_d_bar_si_from_sidecar_or_inlet(
             sidecar_meta,
@@ -800,6 +807,7 @@ class PatientDataExtractor:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            mask_wound=mask_wound,
             u_nd=u_nd_0,
             v_nd=v_nd_0,
             p_nd=p_nd_0,

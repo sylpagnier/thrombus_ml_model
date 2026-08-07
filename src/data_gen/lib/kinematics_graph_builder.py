@@ -29,6 +29,7 @@ def wall_normals_and_sdf_mesh_to_graph_style(
     mask_wall: torch.Tensor,
     mask_inlet: torch.Tensor,
     mask_outlet: torch.Tensor,
+    mask_wound: Optional[torch.Tensor] = None,
     d_bar_si: float,
     centerline_pts_si: Optional[np.ndarray] = None,
     wall_tag: Optional[int] = None,
@@ -71,7 +72,10 @@ def wall_normals_and_sdf_mesh_to_graph_style(
             spine_tree = cKDTree(np.asarray(centerline_pts_si, dtype=np.float64))
         else:
             spine_tree = None
-        interior = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
+        if mask_wound is not None:
+            interior = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy() | mask_wound.numpy())
+        else:
+            interior = ~(mask_wall.numpy() | mask_inlet.numpy() | mask_outlet.numpy())
         center_pt = np.mean(nodes[interior], axis=0) if interior.any() else np.mean(nodes, axis=0)
 
         for line in wall_lines:
@@ -165,6 +169,7 @@ def build_kinematics_graph_from_comsol_steady(
     mask_inlet: torch.Tensor,
     mask_outlet: torch.Tensor,
     mask_wall: torch.Tensor,
+    mask_wound: Optional[torch.Tensor] = None,
     u_nd: torch.Tensor,
     v_nd: torch.Tensor,
     p_nd: torch.Tensor,
@@ -214,6 +219,7 @@ def build_kinematics_graph_from_comsol_steady(
         mask_wall=mask_wall,
         mask_inlet=mask_inlet,
         mask_outlet=mask_outlet,
+        mask_wound=mask_wound,
         d_bar_si=float(d_bar_si),
         centerline_pts_si=centerline_pts_si,
     )
@@ -232,7 +238,7 @@ def build_kinematics_graph_from_comsol_steady(
         wall_normal=wall_normal_vec,
         mask_inlet=mask_inlet,
         mask_outlet=mask_outlet,
-        mask_wall=mask_wall,
+        mask_wall=mask_wall if mask_wound is None else (mask_wall | mask_wound),
         d_bar_si=float(d_bar_si),
         u_ref=float(u_ref),
         phys_cfg=phys_cfg,
@@ -254,6 +260,9 @@ def build_kinematics_graph_from_comsol_steady(
     v_nd = v_nd.clone()
     u_nd[mask_wall] = 0.0
     v_nd[mask_wall] = 0.0
+    if mask_wound is not None:
+        u_nd[mask_wound] = 0.0
+        v_nd[mask_wound] = 0.0
 
     y_labels = comsol_fields_to_kinematics_y(
         u_nd=u_nd,
@@ -261,7 +270,7 @@ def build_kinematics_graph_from_comsol_steady(
         p_nd=p_nd,
         mu_nd=mu_nd,
         wall_normal_vec=wall_normal_vec,
-        mask_wall=mask_wall,
+        mask_wall=mask_wall if mask_wound is None else (mask_wall | mask_wound),
         edge_index=edge_index,
         M_inv=M_inv,
         V=V,
@@ -277,6 +286,7 @@ def build_kinematics_graph_from_comsol_steady(
         mask_inlet=mask_inlet,
         mask_outlet=mask_outlet,
         mask_wall=mask_wall,
+        mask_wound=mask_wound,
         is_anchor=True,
         d_bar=float(d_bar_si),
         u_ref=float(u_ref),

@@ -186,3 +186,60 @@ def canonical_deploy_clot_metrics(
     out = {str(k): float(v) for k, v in metrics.items()}
     out["canonical_protocol"] = 1.0
     return out
+
+def canonical_grade_series(
+    data: Any,
+    species_series: "torch.Tensor",
+    static: dict,
+    phys_cfg: Any,
+    bio_cfg: Any,
+    device: "torch.device",
+    *,
+    time_index: int | None = None,
+    flow_source: str | None = None,
+    gelation_beta: float | None = None,
+) -> dict[str, float]:
+    """Canonical grading of an ALREADY-COMPUTED rollout.
+
+    Same protocol as :func:`canonical_deploy_clot_metrics`, but for callers that roll out once
+    and grade several times (e.g. a gate sweep). Rolling once and grading N times is the right
+    design -- the rollout dominates cost -- but the grading must still happen under the
+    canonical protocol or the numbers are not comparable with the eval script's.
+
+    This existed as a gap: ``diag_regime_gate_sweep.py`` called ``grade_deploy_clot_series``
+    directly, i.e. WITHOUT ``bind_canonical_deploy_protocol``, while
+    ``eval_mat_growth_simple.py`` graded through the canonical path. Same predictions, two
+    protocols, so ``deploy_clot_score`` disagreed on all six cohort vessels while the strict
+    ``deploy_clot_f1`` stayed bit-identical (WALL_MODEL_PLAN.md 13.4a, corrected in 20.1).
+    """
+    from src.architecture.runtime_config import get_active_runtime
+    from src.biochem_gnn.config import _bind_typed_configs
+    from src.core_physics.species_pushforward_continuous import (
+        grade_deploy_clot_series,
+        train_deploy_eval_flow_source,
+    )
+
+    flow = (flow_source or train_deploy_eval_flow_source()).strip().lower()
+    env_snap = {k: os.environ.get(k) for k in (*_PROTOCOL_ENV_KEYS, *_NOISE_ENV_KEYS)}
+    prev_pf = get_active_config()
+    prev_rt = get_active_runtime()
+    try:
+        bind_canonical_deploy_protocol(flow=flow)
+        metrics = grade_deploy_clot_series(
+            data, species_series, static, phys_cfg, bio_cfg, device,
+            time_index=time_index, flow_source=flow, gelation_beta=gelation_beta,
+        )
+    finally:
+        for key, val in env_snap.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        if prev_pf is not None or prev_rt is not None:
+            _bind_typed_configs(
+                prev_pf if prev_pf is not None else get_active_config(),
+                prev_rt if prev_rt is not None else get_active_runtime(),
+            )
+    out = {str(k): float(v) for k, v in metrics.items()}
+    out["canonical_protocol"] = 1.0
+    return out

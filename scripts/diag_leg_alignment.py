@@ -139,7 +139,9 @@ def main() -> int:
         if not rows:
             print(f"[skip] {nm}: empty log")
             continue
-        results.append(analyse(nm, rows))
+        _r = analyse(nm, rows)
+        _r["_rows"] = rows
+        results.append(_r)
         if args.per_epoch:
             print(f"\n=== {nm} ({p}) ===")
             print(f"{'ep':>3} {'loss':>11} {'unr':>4} {'score':>8} {'f1':>8} {'mass':>7} {'fp':>5} {'select':>26}")
@@ -160,6 +162,35 @@ def main() -> int:
               f"{r.get('perm_p', float('nan')):>7.3f} {jk:>17} {str(r.get('sign_stable', '')):>7} "
               f"{r.get('z', float('nan')):>+7.2f} {r.get('best_score', 0):>8.4f} "
               f"{r.get('bad_score', 0):>7.4f} {r['distinct_fp']:>11} {r['loss_spread_pct']:>8.2f}%")
+    print(chr(10) + "=" * 118)
+    print("3. LEARNING CURVE  (is it still improving? -- the stop/extend decision)")
+    print("=" * 118)
+    print(f"{'leg':<10} {'n':>3} {'best ep':>8} {'best/n':>7} {'first':>8} {'last':>8} "
+          f"{'slope/ep':>10} {'tail slope':>11} {'verdict':>12}")
+    for r in results:
+        rows = r.get("_rows") or []
+        if len(rows) < 3:
+            continue
+        sc = [float(x.get("deploy_clot_score", 0.0)) for x in rows]
+        n = len(sc)
+        bi = max(range(n), key=lambda i: sc[i])
+        xs = list(range(n))
+        mx, my = sum(xs) / n, sum(sc) / n
+        den = sum((x - mx) ** 2 for x in xs) or 1e-9
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, sc)) / den
+        k = max(3, n // 3)
+        ts = sc[-k:]
+        txs = list(range(len(ts)))
+        tmx, tmy = sum(txs) / len(ts), sum(ts) / len(ts)
+        tden = sum((x - tmx) ** 2 for x in txs) or 1e-9
+        tslope = sum((x - tmx) * (y - tmy) for x, y in zip(txs, ts)) / tden
+        late = bi >= n - max(2, n // 3)
+        verdict = "EXTEND" if (late and tslope > 0) else ("plateau" if abs(tslope) < 0.002 else "declining")
+        print(f"{r['leg']:<10} {n:>3} {bi + 1:>8} {(bi + 1) / n:>7.2f} {sc[0]:>8.4f} {sc[-1]:>8.4f} "
+              f"{slope:>+10.4f} {tslope:>+11.4f} {verdict:>12}")
+    print("  EXTEND  = best epoch is late AND tail still rising -> more epochs have upside")
+    print("  plateau = tail flat -> stop; spend the budget on the next variable instead")
+
 
     print("\n" + "=" * 118)
     print("2. EXCURSION DEPTH  (s12.5 item 2 -- the gate-independent way to rank legs)")

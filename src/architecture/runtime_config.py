@@ -64,6 +64,14 @@ class RolloutDeployConfig:
     deploy_horizon_aux_cap: int = 72
     train_deploy_eval_flow: str = "auto"  # auto | gt | kinematics | coupled
     t0_flow_source: str = "auto"
+    # --- s17 Z2/Z3: what goes into data.x[UV_PRIOR|MU_PRIOR|WSS_PRIOR] ---
+    # The packs ship these bit-identical to the converged clot-free CFD field y[0] (s16.1), and
+    # the RGP-DEQ consumes them as inputs. The deployment contract is geometry + IC/BC ONLY, so
+    # "stored" trains on information that will not exist at deploy.
+    #   stored   -- as shipped. LEAKED. Kept only to reproduce legs v1-v10.
+    #   analytic -- Poiseuille magnitude + potential-flow direction from geometry+BC. LEGAL.
+    #   zero     -- prior block zeroed; the Z1 ablation floor.
+    prior_source: str = "stored"
 
 
 @dataclass(frozen=True)
@@ -222,6 +230,7 @@ RUNTIME_ENV_TO_FIELD: dict[str, str] = {
     "SPECIES_DEPLOY_HORIZON_AUX_CAP": "deploy_horizon_aux_cap",
     "SPECIES_TRAIN_DEPLOY_EVAL_FLOW": "train_deploy_eval_flow",
     "T0_R4_FLOW_SOURCE": "t0_flow_source",
+    "SPECIES_PRIOR_SOURCE": "prior_source",
     "SPECIES_CONTINUOUS_CLOUT_SCORE": "clout_score_mode",
     "SPECIES_CLOUT_PREC_REC_FLOOR": "clout_prec_rec_floor",
     "CLOT_GUIDE_RELAX_HOPS": "guide_relax_hops",

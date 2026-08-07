@@ -2217,6 +2217,12 @@ every vessel in this cohort. Step 2's stop condition does not fire; the gap is u
 
 ### 13.4a The consistency check FIRED — two tools disagree on `deploy_clot_score`
 
+> **DIAGNOSIS CORRECTED IN 20.1.** The cause is NOT `clout_prec_rec_floor` (it is inert at the
+> ~1.000 relaxed recall every run had, and the typed values agree at 0.30). It is that the two
+> tools used different scoring ENTRY POINTS, only one of which bound the canonical deploy
+> protocol. The discrepancy itself is real; the attribution below is not.
+
+
 §13.3 pre-registered: the sweep's `global` column must reproduce §13.2. It does not.
 
 ```
@@ -2438,3 +2444,1175 @@ still the best configuration in the study after eleven attempts.
    vessel and already separates the cohort; feeding it as a conditioning scalar is the
    cheapest form of this and was already proposed in §11.3.
 3. Only then the `z_kin` ladder, run as the **two** legs constraint 2 requires.
+
+# 14. Ground-up review: data, physics, and a new architecture direction (2026-08-07)
+
+Written after stepping away from fine-tuning. Every number below is measured this session on
+the raw anchor packs, not carried over. **Several long-standing assumptions in this document
+do not survive contact with the data.**
+
+## 14.1 Data inventory — we have been training on 14% of the available data
+
+```
+data/processed/graphs_biochem_anchors/   43 patient packs (+ mirror augmentations)
+  with >= 20 clotted nodes at t_final:   35
+  actually used by every leg v1-v10:      5   (039,040,041,042,044)
+```
+Eight packs (`017,022,023,026,027,030,033,034`) have **zero** clot and are unusable as
+positives, but the other **35 are usable and 30 have never been trained on.** Every
+generalization claim in sections 9-13 rests on a 5-vessel training set and a 1-vessel holdout.
+
+## 14.2 Feature audit — 6 of 18 input channels are dead, 2 are unnormalised
+
+`data.x` is `kine_x_v1_18ch`. Measured on `039/041/043` (identical on all three):
+
+| ch | name | status |
+|---|---|---|
+| 0-2 | `x_nd, y_nd, sdf_nd` | OK |
+| 3 | `shear_potential` | OK — and one of the better predictors (14.4) |
+| 4-5 | `wall_normal_x/y` | OK |
+| 6-9 | `node_type_0..3` | **IDENTICALLY ZERO on every node of every vessel** |
+| 10 | `rheology_flag` | **CONSTANT 1.0** — zero variance |
+| 11-13 | `u_prior, v_prior, mu_prior_nd` | = clot-free CFD initial condition (see 14.3) |
+| 14 | `wss_prior_nd` | **IDENTICALLY ZERO** — confirms 11.2.3 |
+| 15 | `width_nd` | OK |
+| 16 | `width_d1` | range +/-272, unnormalised |
+| 17 | `width_d2` | range **-307566 ... +1968**, unnormalised |
+
+**Six of eighteen channels carry no information at all**, and `width_d2` spans five orders of
+magnitude unnormalised. The model does not consume `data.x` directly — it consumes
+`[z_kin(256), sdf, flow_feats, geom_feats, flux_stag, state, sat, time]` — but `z_kin` is
+produced by the kinematics DEQ *from* `data.x`, so the dead channels sit upstream of everything.
+
+## 14.3 RETRACTED — the `u_prior`/`mu_prior` "GT leak" is not a leak
+
+> **THIS SECTION IS ITSELF RETRACTED — see 16.1.** `u_prior` is a converged Navier-Stokes
+> field (it contains backflow, which a clamped parabolic magnitude cannot produce), and the
+> RGP-DEQ consumes it as an input. It IS initial-condition leakage relative to the
+> geometry-to-surrogate deployment contract. The reasoning below is kept as the record of a
+> wrong turn; do not act on it.
+
+
+The handoff and section 11 state these channels are "bit-identical to GT `y[0]`... as stored,
+they are a leak", and blocked the analytical-prior work on that basis. The bit-identity is real
+and reproduced here. **The inference drawn from it is wrong:**
+
+```
+patient041  Mat at t=0: max = 0.0, nonzero nodes = 0      FI at t=0: max = 0.0
+patient043  Mat at t=0: max = 0.0, nonzero nodes = 0      FI at t=0: max = 0.0
+```
+
+`y[0]` is the **clot-free initial state**. `u_prior = u_nd(t=0)` is therefore the CFD solution
+on the clean geometry — exactly what a deployment pipeline computes before any clot exists. It
+is a legitimate, causally-available input, not future information. Leakage would require
+`y[t>0]`.
+
+**Consequence:** the entire "recompute an analytical Poiseuille prior to avoid the leak"
+workstream is unnecessary. The real flow field is already in the pack, is far better than a
+Poiseuille approximation, and is legal. This unblocks the strongest physics features available.
+
+## 14.4 What actually predicts clot — measured, clot-free-legal features only
+
+AUC for "node is committed at `t_final`", within the 3-hop wall band, using only features
+computable at `t=0` without knowing the clot:
+
+| feature | 039 | 040 | 041 | 042 | 043 | 044 | **mean** |
+|---|---|---|---|---|---|---|---|
+| **residence time (1/speed)** | 0.881 | 0.806 | 0.670 | 0.691 | 0.823 | 0.679 | **0.758** |
+| **-WSS (= -mu * shear rate)** | 0.814 | 0.782 | 0.645 | 0.643 | 0.818 | 0.674 | **0.729** |
+| `shear_potential` | 0.857 | 0.656 | 0.646 | 0.691 | 0.681 | 0.663 | 0.699 |
+| `mu_eff(t=0)` | **0.928** | **0.847** | 0.484 | 0.473 | **0.907** | 0.516 | 0.693 |
+| `width_grad` | 0.797 | 0.689 | 0.623 | 0.618 | 0.656 | 0.587 | 0.662 |
+| `width_nd` | 0.581 | 0.611 | 0.357 | 0.355 | 0.630 | 0.340 | 0.479 |
+| `sdf_nd` | 0.146 | 0.332 | 0.331 | 0.308 | 0.320 | 0.345 | 0.297 |
+
+Two things stand out.
+
+1. **Low speed / long residence time is the single most consistent predictor** (0.758), with
+   low wall shear stress right behind (0.729). This matches the COMSOL mechanism directly.
+2. **`mu_eff(t=0)` is bimodal and splits the cohort exactly**: AUC 0.93/0.85/0.91 on
+   `039/040/043` versus 0.48/0.47/0.52 — *chance* — on `041/042/044`. The cohort contains
+   **two physically distinct clot mechanisms**, and this is the mechanistic version of the
+   "global knob, per-vessel need" problem 13.7.1 found empirically.
+
+## 14.5 The finding that reframes the architecture: a linear model matches the GNN
+
+> **RETRACTED — see 19.2.** This used LEAKED features (16.1) on the favourable 039-044 cohort
+> with an oracle threshold. Redone properly (deploy-legal features, trained on the 29
+> non-cohort vessels, same 6 test vessels) the GNN wins 0.540 vs 0.516 while handicapped.
+> The rollout does earn its place. Do not cite this section's conclusion.
+
+
+Leave-one-vessel-out logistic regression, 8 physics features, no `z_kin`, no GNN, no rollout:
+
+```
+LOO AUC:  039 0.941   040 0.928   041 0.749   042 0.755   043 0.891   044 0.749   mean 0.836
+```
+
+Converted to best-threshold F1 and set against the current model's actual `deploy_clot_f1`:
+
+| vessel | logreg F1 | GNN `deploy_clot_f1` | delta |
+|---|---|---|---|
+| `039` | 0.6667 | 0.5185 | +0.1482 |
+| `040` | 0.6953 | 0.7044 | -0.0091 |
+| `041` | 0.4674 | 0.2548 | +0.2126 |
+| `042` | 0.4585 | 0.5131 | -0.0546 |
+| `043` | 0.6627 | 0.6497 | +0.0130 |
+| `044` | 0.4032 | 0.6016 | -0.1984 |
+| **mean** | **0.5590** | **0.5403** | **+0.0186** |
+
+The logreg is oracle-thresholded per vessel, so it is an upper bound and not apples-to-apples
+with a full gated rollout. **But 187k parameters, a 256-dim frozen latent and a 200-step
+autoregressive rollout are not beating eight hand-computed physics numbers and a dot product.**
+
+Note also **AUC 0.836 -> F1 0.559 even at the oracle threshold.** The ranking is respectable;
+the score is destroyed by sparsity (4-15% positives in-band). Better *ranking* is the lever,
+not better thresholding.
+
+## 14.6 The mechanism the architecture is missing: nucleation
+
+Every commit event decomposed into **growth** (node had a committed neighbour when it turned
+on) vs **nucleation** (it did not):
+
+| vessel | commits | growth | nucleation | **nucleation %** | nucleation by time quartile |
+|---|---|---|---|---|---|
+| `039` | 92 | 45 | 47 | **51.1%** | [41, 5, 0, 1] |
+| `040` | 144 | 76 | 68 | **47.2%** | [41, 0, 25, 2] |
+| `041` | 266 | 186 | 80 | 30.1% | [29, 34, 3, 14] |
+| `042` | 251 | 184 | 67 | 26.7% | [28, 23, 12, 4] |
+| `043` | 167 | 70 | 97 | **58.1%** | [56, 5, 27, 9] |
+| `044` | 379 | 260 | 119 | 31.4% | [41, 40, 17, 21] |
+
+**27-58% of all commits are nucleation, and it continues into the last quartile** — not just an
+initial seeding transient. Corroborating: only 43-81% of the final clot lies within 3 hops of
+the `t=20` clot, and dilating *oracle* `t=20` seeds by the best k caps at **F1 0.52-0.64** —
+roughly where the real model already is.
+
+**The current architecture is a growth/propagation model.** The autoregressive rollout, the
+neighbour-commit gate, and section 11.3's proposed autocatalytic term all strengthen
+*growth-from-existing-clot* — the half of the problem that already works. A third to a half of
+the clot appears where nothing was, driven by the local *field* (low WSS, long residence),
+which is exactly why the field-only logistic regression in 14.5 is competitive.
+
+**A seed-and-grow model has a ceiling near F1 0.58 on this cohort. That ceiling is where ten
+fine-tuning legs have been stuck.**
+
+## 14.7 Label inconsistency — the commit threshold means different things per vessel
+
+`max Mat` across the 35 usable packs spans **3.3e-4 to 1.5e-2, a 45x range**, while the commit
+threshold is a fixed `1e-4`. On `patient003` that threshold is ~25% of the vessel's peak Mat;
+on `patient012` it is ~0.7%. "Committed" is therefore not a consistent physical state across
+vessels. This is a *label* problem sitting underneath every metric in this document, and it is
+a third instance of the same pathology as 12.6 (dead constants) and 13.4a (three different
+`clout_prec_rec_floor` values): **a global constant standing in for a per-vessel quantity.**
+
+# 15. Ranked experiment list — systematic path forward (2026-08-07)
+
+Ordered by **information gained per GPU-hour**, not by expected score. Tiers A-B are cheap and
+several are near-certain to change how everything downstream is read; do them first. Each entry
+states what it tests, what it costs, and **what result would kill it** — so a negative is as
+useful as a positive.
+
+Standing rules carried from 12.8.2 / 13: one variable per leg, >= 14 epochs for any leg whose
+readout is the excursion rate, no concurrent GPU jobs, verify the mechanism engaged before
+trusting any result.
+
+## Tier A — free or near-free, and they change the meaning of every later number
+
+**A1. Unify `deploy_clot_score`.** Three implementations disagree by up to 0.14 on one
+checkpoint (13.4a, 13.7): `clout_prec_rec_floor` is 0.30 / 0.35 / 0.30 across three files, and
+the in-training version driving all selection is the most optimistic. Pick one, make the other
+two call it, re-derive the 13.2 baseline.
+*Cost:* ~0 GPU. *Kill:* n/a — this is a precondition, not a hypothesis.
+
+**A2. Per-vessel commit threshold.** 14.7: `max Mat` spans 45x across vessels against a fixed
+`1e-4` threshold, so "committed" is a stricter physical state on some vessels than others.
+Re-derive labels at a per-vessel relative threshold (e.g. `alpha * max Mat` or a fixed
+percentile of the vessel's own final Mat) and re-measure the 14.4 AUCs and the 13.2 baseline.
+*Cost:* ~0 GPU. *Kill:* if AUCs and per-vessel scores barely move, the absolute threshold is
+fine and this is closed — worth knowing either way.
+
+**A3. Delete the six dead channels; normalise `width_d1/d2`.** 14.2: four `node_type` channels
+are identically zero, `rheology_flag` is constant, `wss_prior_nd` is zero, `width_d2` spans
+-307566..1968 unnormalised. These feed the kinematics DEQ that produces `z_kin`.
+*Cost:* ~0 GPU to fix; requires re-running the kinematics encoder to see the effect.
+*Kill:* if `z_kin` is dropped entirely (B2/C1) this matters much less — sequence accordingly.
+
+**A4. Expand the cohort from 5 to ~30 training vessels.** 14.1: 35 usable packs exist, 30 never
+trained on. This is the single largest untapped resource in the project and costs only
+wall-clock. Do it as its own leg (constraint 2) so it is not confounded with an architecture
+change.
+*Cost:* longer epochs, no new code. *Kill:* if held-out score does not improve with 6x the
+data, the bottleneck is definitively architectural, not statistical — a very valuable negative.
+
+## Tier B — cheap model experiments that test the 14.5/14.6 reframing directly
+
+**B1. Ship the logistic-regression baseline as a real deploy arm.** 14.5 shows 8 physics
+features match the GNN. Run it through the actual deploy path (fixed gate, no oracle
+threshold) so the comparison is apples-to-apples.
+*Cost:* ~1 GPU-hour. *Kill:* if it collapses under a fixed gate it was a thresholding artefact
+and the GNN is doing more than it appears — also valuable.
+
+**B2. `z_kin` ablation, done properly.** Never actually tested. 13.8 blocked the *shrink*
+because `in_dim` 287->95 breaks the warm start; the *ablation* has no such problem — zero the
+`z_kin` block at both train and deploy, keeping `in_dim` at 287. If performance is unchanged,
+89% of the input is dead weight and the whole `z_kin` ladder (11.2.1) closes at once.
+*Cost:* ~1 leg. *Kill:* if scores drop materially, `z_kin` is load-bearing and C1 must keep it.
+Note 4a is weak evidence it *is* load-bearing (dropout hurt the holdout by 0.137).
+
+**B3. Longer training windows / autoregressive horizon.** Open question from the brief. Current
+`unroll` is 5 (curriculum) to 25; the deploy rollout is 200 steps. v10's two deep excursions
+both occurred *after* the curriculum stepped to `unroll=10` (13.7) — suggestive that windows
+are too short for autoregressive error to self-correct.
+*Cost:* 1 leg at >= 14 epochs, `unroll` 25-50, `curriculum_unroll=False`. *Kill:* v6 already
+tested `unroll=25` and found nothing — but v6 ran with the dead loss terms of 12.6, so this
+deserves exactly one clean re-test, not more.
+
+## Tier C — the architecture the evidence actually points to
+
+**C1. Two-term model: nucleation field + growth propagation.** The central proposal, straight
+from 14.6. Replace the single generic delta head with an explicit sum:
+
+```
+dMat = NUCLEATION(local physics field)  +  GROWTH(local committed Mat) * gate(shear)
+```
+* `NUCLEATION` — a per-node rate from the 14.4 features (residence time, -WSS,
+  `shear_potential`, `width_grad`, `mu_eff(t=0)`), **independent of neighbouring clot**. This is
+  the 27-58% of commits the current architecture cannot express.
+* `GROWTH` — the autocatalytic term already implemented for v9 (`k_dep + k_auto * local
+  committed`), which is correct for the other half.
+
+*Cost:* real implementation + >= 14-epoch leg. *Kill:* if a nucleation head trained on the
+14.4 features cannot beat the logreg of 14.5, the field model is saturated and the remaining
+error is temporal/calibration, not spatial.
+
+**C2. Per-vessel conditioning.** 13.7.1 and 14.4 independently say the cohort needs per-vessel
+*amount*, and 14.4 gives the mechanism: `mu_eff(t=0)` is diagnostic on `039/040/043` and
+useless on `041/042/044`. Feed a small per-vessel descriptor (`band_speed_q25`, median WSS,
+`mu_eff` AUC-proxy, geometry class) as a global conditioning vector.
+*Cost:* moderate. *Kill:* if conditioning does not separate the two regimes in the learned
+representation, the split is not recoverable from `t=0` data.
+
+**C3. Reframe as ranking, not per-step regression.** 14.5: AUC 0.836 -> F1 0.559 at the oracle
+threshold. Ranking quality is the binding constraint, and the current objective is a per-step
+Huber regression on deltas — the thing change B spent four legs failing to align (12.3). Train
+directly on a ranking/AUC surrogate over the final committed set.
+*Cost:* moderate; the soft-F_beta term from 12.6 is a partial version already built.
+*Kill:* if a ranking objective does not lift LOO AUC above ~0.90, the features are the limit,
+not the loss.
+
+## Tier D — deferred, with reasons
+
+**D1. Analytical Poiseuille prior.** **Now unnecessary** — 14.3 shows the real clot-free CFD
+field is already in the pack and legal. Use `u_prior/v_prior/mu_prior` directly instead.
+
+**D2. Populate `wss_prior_nd`.** Superseded by A3/C1: WSS is trivially computable from
+`u_prior/mu_prior` on the fly (that is exactly the `-WSS` feature at AUC 0.729). Populating the
+stored channel is redundant with computing it.
+
+**D3. `z_kin` shrink 256->64.** Gated behind B2. If the ablation says `z_kin` is dead weight,
+shrink is pointless — delete it. If it says load-bearing, shrink becomes worth the two legs
+constraint 2 requires.
+
+**D4. Regime routing.** Closed for this cohort (13.4): all six vessels are normal-regime, so
+routed == global on every one.
+
+**D5. Further change-B objective reweighting.** Closed (12.3, three failed specifications).
+C3 is the replacement — a different objective *family*, not another weighting of this one.
+
+## Suggested first sequence
+
+`A1 -> A2 -> A4` (all cheap, and A1/A2 change how A4 is read), then `B2` (settles `z_kin` and
+therefore D3), then `C1` as the main architectural bet, with `B3` as a one-shot control on
+window length. `B1` is worth running early purely as an honest floor to measure against.
+
+# 16. Corrections and cohort-wide physics review (2026-08-07, later same day)
+
+Three challenges were put to section 14. **Two of its conclusions do not survive, including one
+of its headline claims.** Everything below is measured on all 35 usable packs, not on 6.
+
+## 16.1 RETRACTION OF 14.3 — `u_prior` IS a leak, and the RGP-DEQ is fed the answer
+
+Section 14.3 argued that because `y[0]` is clot-free, `u_prior = u_nd(t=0)` is a legitimate
+initial condition rather than leakage. **That reasoning was incomplete and the conclusion is
+wrong.** Three measurements settle it.
+
+**(a) `u_prior` is a converged Navier-Stokes field, not an analytical prior.**
+`build_poiseuille_priors` computes `u_prior_mag = u_max * (1 - r_lane^2/r^2)` clamped to
+`min=0` — a non-negative parabolic magnitude. The stored field contains backflow:
+
+```
+patient041   u_prior min = -1.0534    9.0% of nodes have u < 0
+patient043   u_prior min = -0.0591    4.9% of nodes have u < 0
+```
+A clamped parabolic magnitude cannot produce recirculation. This is a CFD solution.
+
+**(b) `build_poiseuille_priors` output was never stored.** That function also returns
+`wss_prior = mu_prior * gamma_dot * mask_wall`, which is non-zero on every wall node. The
+stored `wss_prior_nd` is **identically zero on every vessel** (14.2). The three channels that
+*do* have a `y[0]` counterpart were overwritten with it; the one that does not have a
+counterpart (`wss`) was left empty. That is the signature of GT being written over the priors.
+
+**(c) The RGP-DEQ consumes them as input.** `src/architecture/ginodeq.py:438-440`:
+```python
+uv_prior = data.x[:, NodeFeat.UV_PRIOR]
+p_prior  = data.x[:, NodeFeat.SHEAR_POT]
+mu_prior = data.x[:, NodeFeat.MU_PRIOR]
+```
+**The flow surrogate whose job is to predict the velocity field is being handed the true
+velocity field as an input feature.** `z_kin` is therefore conditioned on the converged CFD
+solution, and its genuine out-of-distribution quality has never been measured.
+
+This is not *temporal* leakage — no clot information is involved, `y[0]` really is clot-free.
+It is **initial-condition leakage relative to the deployment contract**: at deploy on unseen
+geometry you have a mesh, not a converged solve. The correct chain is
+`geometry -> RGP-DEQ -> predicted flow`, and the stored priors short-circuit it.
+
+**How much of section 14.4's feature table was leak** — same feature, computed from the stored
+CFD field versus recomputed analytically from `(sdf_nd, width_nd)` alone:
+
+| feature | source | 039 | 040 | 041 | 042 | 043 | 044 | mean |
+|---|---|---|---|---|---|---|---|---|
+| `-speed` | GT-CFD | 0.881 | 0.806 | 0.670 | 0.691 | 0.823 | 0.679 | 0.758 |
+| `-speed` | **analytic** | 0.901 | 0.869 | 0.668 | 0.668 | 0.874 | 0.666 | **0.774** |
+| `-WSS` | GT-CFD | 0.814 | 0.782 | 0.645 | 0.643 | 0.818 | 0.674 | 0.729 |
+| `-WSS` | **analytic** | 0.563 | 0.578 | 0.347 | 0.347 | 0.606 | 0.331 | **0.462** |
+| `mu_eff` | GT-CFD | 0.928 | 0.847 | 0.484 | 0.473 | 0.907 | 0.516 | 0.693 |
+| `mu_eff` | **analytic** | 0.563 | 0.578 | 0.347 | 0.347 | 0.606 | 0.331 | **0.462** |
+
+**The best feature survives; the strong ones do not.** Analytic `-speed` is *better* than the
+leaked version (0.774 vs 0.758) and costs nothing. But `-WSS` and `mu_eff` collapse to 0.462 —
+their predictive power was entirely the CFD recirculation structure, which a parabolic profile
+cannot reproduce. (Analytic `mu` and analytic `-WSS` are monotone transforms of each other,
+hence identical AUC.)
+
+## 16.2 The aneurysm/stenosis mechanism — and why the framing was wrong anyway
+
+Taking the question at face value first. All biochem intermediates at `t=10`, AUC for final Mat:
+
+| vessel | class | RP | AP | APR | APS | FI | Mas | **mu_eff** |
+|---|---|---|---|---|---|---|---|---|
+| `039` | ANEUR | 0.036 | 0.030 | 0.965 | 0.961 | 0.941 | 0.971 | **0.928** |
+| `040` | ANEUR | 0.056 | 0.053 | 0.947 | 0.885 | 0.856 | 0.971 | **0.847** |
+| `043` | ANEUR | 0.067 | 0.059 | 0.936 | 0.911 | 0.892 | 0.973 | **0.907** |
+| `041` | STEN | 0.201 | 0.172 | 0.817 | 0.766 | 0.712 | 0.839 | **0.488** |
+| `042` | STEN | 0.226 | 0.192 | 0.792 | 0.762 | 0.704 | 0.680 | **0.474** |
+| `044` | STEN | 0.205 | 0.192 | 0.804 | 0.798 | 0.770 | 0.830 | **0.522** |
+
+`RP`/`AP` are inverted (they are *consumed* where clot forms) — that is the reaction working as
+written. Every transported species (`APR`, `APS`, `FI`, `Mas`) predicts well in **both** classes.
+**Only `mu_eff` collapses on the stenoses.** So the chemistry is not different — the *coupling
+between local hemodynamics and deposition site* is.
+
+**Transport test.** If stenosis clot is seeded by shear-activation at the throat and then
+deposits downstream, an advected shear-sourced scalar should beat local shear there and not in
+aneurysms. Upwind-advecting a shear source along the `t=0` field:
+
+| vessel | class | local shear | advected | gain | recirc (`-u`) |
+|---|---|---|---|---|---|
+| `039` | ANEUR | 0.174 | 0.126 | −0.048 | 0.799 |
+| `040` | ANEUR | 0.193 | 0.179 | −0.014 | 0.832 |
+| `043` | ANEUR | 0.189 | 0.156 | −0.033 | 0.855 |
+| `041` | STEN | 0.363 | 0.422 | **+0.059** | 0.622 |
+| `042` | STEN | 0.366 | 0.429 | **+0.063** | 0.612 |
+| `044` | STEN | 0.337 | 0.392 | **+0.055** | 0.625 |
+
+The sign is exactly as predicted — advection helps stenoses, hurts aneurysms — but the effect
+is small (~0.06). The larger difference is **recirculation strength**: `-u` scores 0.80-0.86 on
+aneurysms versus 0.61-0.63 on stenoses. An aneurysm has one clean enclosed stagnation pocket
+that localises the clot; a stenosis does not, so its clot is spatially diffuse (and its
+positive rate is ~2x higher: 10.6-15.1% vs 4.1-7.5%).
+
+**But see 16.3 — this whole framing is a six-vessel artifact.**
+
+## 16.3 Cohort-wide: the feature rules do NOT generalize, and `mu_eff` is not bimodal — it is unreliable
+
+All 35 usable vessels, AUC for final Mat within the 3-hop wall band:
+
+```
+feature      mean   median   >0.65      <0.50
+-anaSpd     0.768   0.746    32/35       0/35     <- deploy-legal, geometry only
+-sdf        0.768   0.749    31/35       0/35     <- deploy-legal, geometry only
+-u (CFD)    0.760   0.773    28/35       0/35     <- needs the flow field
+wgrad       0.717   0.676    22/35       0/35     <- deploy-legal, geometry only
+shear (CFD) 0.343   0.337     2/35      30/35     <- consistently inverted; as -shear ~0.657
+mu_eff (CFD) 0.482  0.473    12/35      19/35     <- NOT USABLE
+```
+
+**`mu_eff` averages 0.482 — worse than chance — and is *anti*-predictive on 19 of 35 vessels,
+as low as 0.050 (`p011`), 0.056 (`p018`), 0.058 (`p025`).** It is not a feature that works on
+aneurysms and fails on stenoses. It is a feature that points in an arbitrary direction
+depending on the vessel. Section 14.4's 0.93/0.85/0.91-versus-0.48/0.47/0.52 split was a
+coincidence of which six vessels were in the cohort.
+
+**This retires the "two clot mechanisms" reading of 14.4.** There is one mechanism; there is a
+weak, robust geometric signal; and there is a strong flow-structure signal whose *sign* varies
+by vessel because it depends on recirculation topology that neither geometry nor a parabolic
+prior encodes.
+
+## 16.4 The honest deploy-legal ceiling — and why the flow surrogate is the real bottleneck
+
+> **PARTLY SUPERSEDED — see 18.2.** Z1 has now measured the surrogate directly: on the legal
+> prior path it retains 97% of the GT field's clot AUC (0.763 vs 0.789). The flow surrogate is
+> NOT the binding constraint. The F1 0.322 ceiling below still stands; the gap is nucleation,
+> temporal dynamics and calibration, not flow prediction.
+
+
+Logistic regression, **deploy-legal features only** (geometry + analytic Poiseuille: `-anaSpd`,
+`-sdf`, `wgrad`, `wgrad_2hop`, `curv`, `width`, `-anaGamma`, `shear_potential`, and two hop
+means). 26 training vessels, 9 held out:
+
+| held-out vessel | AUC | best F1 | pos% |
+|---|---|---|---|
+| `patient001` | 0.789 | 0.427 | 13.3% |
+| `patient005` | 0.663 | 0.191 | 6.5% |
+| `patient009` | 0.901 | 0.427 | 6.4% |
+| `patient013` | 0.848 | 0.610 | 17.6% |
+| `patient018` | 0.664 | 0.084 | 1.9% |
+| `patient024` | 0.856 | 0.423 | 7.2% |
+| `patient031` | 0.617 | 0.092 | 2.0% |
+| `patient037` | 0.798 | 0.296 | 7.1% |
+| `patient042` | 0.767 | 0.352 | 10.6% |
+| **mean** | **0.767** | **0.322** | |
+
+Set against section 14.5's leaked-feature run (AUC 0.836, F1 0.559 on 6 vessels):
+
+**Geometry alone cannot reach the goal.** Mean best-threshold F1 of **0.322** against a target
+of 0.60, and that is with an oracle per-vessel threshold. The signal that closes the gap —
+recirculation topology, `-u` at AUC 0.760 and `mu_eff` where it works — requires a *real
+velocity field*.
+
+**Therefore the RGP-DEQ flow surrogate is the binding constraint of this entire project, and
+its true accuracy has never been measured**, because it is handed `u_prior`/`mu_prior` as
+inputs (16.1c). Section 10.6's "predicted-flow inflation up to 9x on slow vessels" is the only
+hint of its unassisted quality, and it is not encouraging.
+
+Everything downstream — nucleation heads, autocatalytic growth, per-vessel conditioning, loss
+surrogates — is being tuned on top of a flow field that is either leaked (in training) or of
+unknown quality (at deploy). **That is the most probable single explanation for why eleven legs
+have failed to beat a zero-shot warm start.**
+
+# 17. Revised experiment list (supersedes section 15)
+
+Section 15 was written before the 16.1 retraction and the 35-vessel survey. Those two results
+reorder it substantially: **the flow surrogate moves to the top, and three section-15 entries
+are now known to be built on leaked inputs.**
+
+## Tier 0 — must happen before any other result is interpretable
+
+**Z1. Measure the RGP-DEQ's unassisted flow accuracy.** *The single most important open
+question in the project.* It currently receives `u_prior`/`v_prior`/`mu_prior` — the converged
+CFD answer — as input features (16.1c). Zero or shuffle those three channels and measure
+predicted-vs-true `u,v` error, per vessel, across all 35. Report as relative L2 and as the AUC
+of `-|u_pred|` for clot (i.e. does the *predicted* field retain the discriminative structure).
+*Why first:* 16.4 shows geometry alone caps at F1 0.322 versus a 0.60 goal, so the flow field
+is required; and every feature, `z_kin` value and training result to date is conditioned on a
+field that is either leaked or unmeasured.
+*Kill:* if unassisted RGP-DEQ error is small and `-|u_pred|` retains AUC ~0.75, the leak is
+cosmetic and the pipeline is sound — enormously reassuring and cheap to establish.
+*If it fails:* fixing the flow surrogate becomes the project, and the biochem model is
+downstream of it.
+
+**Z2. Decide and document the deployment contract.** Is a clot-free steady CFD solve available
+at deploy time, or is it geometry-only? These give different legal feature sets and different
+ceilings (0.836 vs 0.767 AUC by 14.5/16.4). Every "leak" argument in this document has been
+ambiguous because this was never written down.
+*Cost:* zero GPU. *Kill:* n/a — it is a decision, not a hypothesis.
+
+**Z3. Stop training with `flow_feats_source='gt'` while deploying with `auto`/`kinematics`.**
+The recipe trains on the true field and deploys on the predicted one. Whatever Z1 finds, this
+mismatch is a train/deploy distribution shift sitting under every leg v1-v10.
+
+## Tier A — free, and they change how every number is read (carried from section 15)
+
+**A1. Unify `deploy_clot_score`** — three implementations, disagreeing by up to 0.14 (13.4a,
+13.7); the in-training one drives all selection and is the most optimistic. *~0 GPU.*
+
+**A2. Per-vessel commit threshold** — `max Mat` spans 45x against a fixed `1e-4` (14.7).
+*~0 GPU.* Re-derive the 14.4/16.3 AUCs and the 13.2 baseline afterwards.
+
+**A3. Delete the six dead channels; normalise `width_d1/d2`** (14.2). Note these feed the
+RGP-DEQ, so this interacts with Z1 — do Z1 first, then A3, then re-run Z1.
+
+**A4. Expand 5 -> ~30 training vessels** (14.1). Now better motivated than in section 15:
+16.3 shows the 6-vessel cohort produced at least one confidently wrong conclusion (`mu_eff`
+bimodality), so small-cohort inference is demonstrably unsafe here.
+
+## Tier B — cheap model experiments
+
+**B1. Ship the deploy-legal logistic regression as a real deploy arm.** Now a *geometry-only*
+baseline at AUC 0.767 / F1 0.322 (16.4) rather than section 14.5's leaked 0.836/0.559. This is
+the honest floor any new architecture must beat.
+
+**B2. `z_kin` ablation.** Unchanged in method (zero the block, keep `in_dim=287`, sidestepping
+the 13.8 warm-start blocker) but **reinterpreted**: since `z_kin` is conditioned on the leaked
+CFD field (16.1c), a large drop when ablating would show the model is leaning on leaked flow,
+not that the latent is intrinsically valuable. Run it *after* Z1 so the result is readable.
+
+**B3. Longer autoregressive windows.** Unchanged. One clean re-test at `unroll` 25-50 with the
+12.6 loss fixes in place, >= 14 epochs.
+
+## Tier C — architecture
+
+**C1. Two-term model: nucleation field + growth propagation.** Still the central proposal and
+strengthened by 16.3: 27-58% of commits are nucleation (14.6), and the robust deploy-legal
+signal is a smooth geometric field, which is exactly what a nucleation head consumes.
+```
+dMat = NUCLEATION(field) + GROWTH(local committed Mat) * gate(shear)
+```
+**Revision from section 15:** drop `mu_eff(t=0)` from the proposed nucleation feature list —
+16.3 shows it is anti-predictive on 19/35 vessels. Use `-anaSpd`, `-sdf`, `wgrad`,
+`shear_potential`, `curv`, plus whatever flow feature survives Z1.
+
+**C2. Per-vessel conditioning.** Motivation *changes*. Section 15 justified it by the
+aneurysm/stenosis split, which 16.3 retires. The surviving justification is 13.7.1's measured
+one: vessels need opposite growth *magnitudes* (`041` ~5.6x more mass, `043` ~1.0x) and every
+knob is global. Condition on something that predicts required magnitude — positive rate
+correlates with `pos%` 1.9-17.6%, which is itself partly predictable from geometry.
+
+**C3. Reframe as ranking.** Unchanged, and now better supported: 16.4 shows AUC 0.767 -> F1
+0.322, so the loss between "good ranking" and "good score" is enormous and is where the target
+is being lost.
+
+**C4. NEW — recirculation-topology features.** 16.2/16.3 identify recirculation structure as
+the strong signal that geometry cannot express (`-u` AUC 0.760 mean, 28/35 above 0.65) and
+16.4 shows geometry alone is insufficient without it. If Z1 shows the RGP-DEQ predicts `u`
+adequately, derive explicit topological features from the *predicted* field: backflow fraction,
+recirculation-zone membership, vortex-core distance, streamline residence time. These are the
+physically correct nucleation predictors and none is currently computed.
+
+## Tier D — closed or superseded
+
+* **D1. Analytical Poiseuille prior — REOPENED and partly done.** 16.1 shows the stored priors
+  are CFD, not analytic, so a real analytic recompute *is* meaningful. Already measured:
+  analytic `-speed` (0.774) beats the leaked version (0.758); analytic `-WSS`/`mu` collapse to
+  0.462. Use analytic speed; do not expect analytic WSS to substitute for CFD.
+* **D2. `wss_prior_nd`** — still zero, still redundant: computable on the fly. But note the
+  *analytic* WSS is near-useless (0.462), so populating it is low value. Real WSS needs Z1.
+* **D3. `z_kin` shrink** — gated behind B2, which is gated behind Z1.
+* **D4. Regime routing** — closed for this cohort (13.4).
+* **D5. Change-B objective reweighting** — closed (12.3); C3 is the replacement.
+
+## Revised first sequence
+
+`Z2` (decide the contract, free) -> `Z1` (measure the surrogate) -> `A1`, `A2` (free, fix the
+metric and labels) -> `A4` (expand the cohort) -> `B1` (honest floor) -> `B2` (`z_kin`, now
+interpretable) -> `C1` + `C4` as the architectural bet.
+
+**Z1 is the gate.** If the RGP-DEQ cannot supply a usable velocity field on unseen geometry,
+then C1/C4 are being built on sand and the correct project is flow prediction, not biochemistry.
+
+# 18. Z ladder — wired and executed (2026-08-07)
+
+## 18.0 What was built
+
+| file | purpose |
+|---|---|
+| `src/data_gen/lib/legal_priors.py` | prior-source switch (`stored`/`analytic`/`zero`), potential-flow direction solver, train/deploy parity guard |
+| `scripts/diag_rgp_deq_flow_audit.py` | Z1 — RGP-DEQ accuracy with and without the leak |
+| `scripts/diag_shear_decodability.py` | Z4 — is shear useful, and is it decodable |
+| `runtime_config.py: prior_source` | Z3 — `SPECIES_PRIOR_SOURCE`, defaults to `stored` for v1-v10 reproducibility |
+
+**Test status.** `src/tests/` runs 538 passed / 8 failed. All 8 are in
+`test_species_flow_feats.py` and are **pre-existing**: the file passes 22/22 in isolation, and
+the same 8 fail with this session's changes stashed. It is a cross-test state leak in
+full-suite runs (config context bleeding between tests), not a regression from the Z ladder.
+Worth fixing separately — a suite that fails only in aggregate hides real regressions.
+
+**Flow direction.** The analytic prior needs a streamwise direction. `shear_potential` (x[:,3])
+is *not* one — inlet and outlet both average 0.51 and its gradient is uncorrelated with velocity
+(mean cos +0.01). Replaced with a proper potential-flow solve: graph Laplace, `phi=1` inlet /
+`phi=0` outlet, direction `= -grad phi`. **Jacobi is unusable here** — these meshes run ~274 hops
+inlet-to-outlet so Jacobi needs O(diameter^2) ~ 75k sweeps; at 600 sweeps the direction field
+scored cos +0.19. Conjugate gradient on the free block converges in **0.4 s** and scores
+**cos +0.742** across all 43 packs (range 0.721-0.757).
+
+## 18.1 Z2 — deployment contract, DECIDED
+
+**At deploy we receive geometry + initial and boundary conditions only. No clot-free CFD solve.**
+
+This settles every ambiguous leak argument in sections 14 and 16. The stored
+`u_prior`/`v_prior`/`mu_prior` are the converged CFD field (s16.1) and are therefore **not legal
+inputs**. `prior_source='analytic'` is the only deployable setting; `'stored'` is retained purely
+to reproduce legs v1-v10.
+
+## 18.2 Z1 RESULT — the leak costs field accuracy but almost NO discriminative power
+
+All 35 usable vessels, RGP-DEQ re-solved under each prior condition, compared against GT `y[0]`:
+
+| prior source | rel L2 (u) | cos(pred, GT) | **AUC(-\|u_pred\|)** | within 0.05 of GT |
+|---|---|---|---|---|
+| `stored` (leaked) | 0.116 | +0.996 | 0.782 | 34/35 |
+| **`analytic` (legal)** | 0.566 | +0.773 | **0.763** | 28/35 |
+| `zero` (ablation) | 0.984 | +0.236 | 0.748 | 23/35 |
+| — GT field — | — | — | *0.789* | — |
+
+**Removing the leak costs 4.9x the field error (relL2 0.116 -> 0.566) but only 0.019 of clot
+AUC (0.782 -> 0.763), against a GT ceiling of 0.789.** The legal path retains **97%** of the
+ground-truth field's discriminative power.
+
+This is the distinction the audit was built to isolate: *field accuracy* and *usefulness to the
+clot model* are different quantities. The surrogate becomes numerically mediocre without the
+answer, and stays almost exactly as useful.
+
+**Z1 VERDICT: PASS. Flow prediction is not the blocking project.** Section 16.4's conclusion —
+"the RGP-DEQ is the binding constraint, and if it fails the correct project is flow prediction"
+— is **retired**. C1/C4 can be built on the legal path.
+
+**Two caveats worth keeping.**
+1. `zero` still scores 0.748. The gap from `analytic` to `zero` is only 0.015, so the analytic
+   priors add little over nothing — the DEQ recovers clot-relevant structure mostly from
+   geometry either way. Do not over-credit the analytic priors.
+2. AUC 0.763 on the legal path is essentially the same as section 16.4's deploy-legal logistic
+   regression (0.767), which mapped to best-F1 **0.322**. So Z1 passing does *not* mean the
+   0.60 goal is now reachable — it means the remaining gap is **not** in flow prediction. It is
+   in nucleation modelling, temporal dynamics and calibration (s14.6, s16.4).
+
+## 18.3 Z3 — train/deploy parity, wired
+
+`prior_source` is now a first-class runtime field with `assert_train_deploy_prior_parity()`,
+which raises when a leg trains on a prior block it will not have at deploy. v1-v10 all trained
+with `flow_feats_source='gt'` and the leaked prior block, then deployed against a predicted
+field — a distribution shift that sat under every result in sections 9-13 and was never checked.
+
+Default remains `stored` so historical legs stay bit-reproducible; **every new leg must set
+`analytic`**, and re-baseline against section 13.2 rather than comparing across the change.
+
+## 18.4 Z4 RESULT — shear is NOT worth decoding for the clot model
+
+Two questions, and the first gates the second.
+
+**Q1: does the TRUE shear field add anything over deploy-legal geometry?**
+
+| vessel | geometry only | geometry + GT shear | gain | shear alone |
+|---|---|---|---|---|
+| `039` | 0.897 | 0.888 | −0.009 | 0.830 |
+| `040` | 0.890 | 0.889 | −0.001 | 0.787 |
+| `041` | 0.680 | 0.686 | +0.006 | 0.634 |
+| `042` | 0.680 | 0.679 | −0.000 | 0.634 |
+| `043` | 0.877 | 0.884 | +0.007 | 0.815 |
+| `044` | 0.667 | 0.660 | −0.007 | 0.655 |
+| **mean** | **0.782** | **0.781** | **−0.001** | 0.726 |
+
+**Adding the ground-truth shear field to `[-anaSpd, -sdf, wgrad]` changes clot AUC by −0.001.**
+Shear alone is a decent predictor (0.726), but it is *redundant* with geometry — the geometric
+features already encode it. This is consistent with s16.3, where `mu_eff` (a pure function of
+shear) averaged 0.482 and was anti-predictive on 19/35 vessels.
+
+**A shear decoder head cannot improve the clot model, however accurate it becomes.** That is
+not a statement about the decoder's quality; it is a statement about the information already
+present in geometry.
+
+**Q2: decodability, for completeness.** Analytic shear (geometry-only) correlates with GT shear
+at **r = 0.742** mean (0.606-0.865), rel L2 0.34-0.77. Any decoder must beat that baseline —
+`scripts/diag_shear_decodability.py --kine-ckpt <path>` is wired to make that comparison once
+the shear-head model exists.
+
+**Recommendation:** the shear head may still be worth having for flow-model quality or for other
+downstream tasks, but **do not sequence the clot work behind it** — Q1 says the ceiling it
+could buy is zero.
+
+## 18.5 Revised priorities after the Z ladder
+
+The Z ladder was supposed to gate everything else. It has now run, and it *reopens* the
+architecture work rather than blocking it:
+
+1. **~~Z1 fix the flow surrogate~~ — not needed.** Legal path retains 97% of GT discriminative
+   power (18.2).
+2. **~~Z4 shear decoder~~ — will not help the clot model.** (18.4)
+3. **Set `prior_source='analytic'` on all new legs and re-baseline** (18.3). This is now the
+   precondition, and it is cheap.
+4. **A1 unify `deploy_clot_score`; A2 per-vessel commit threshold** — unchanged, still free,
+   still block trustworthy measurement.
+5. **A4 expand 5 -> ~30 vessels** — unchanged.
+6. **C1 nucleation + growth two-term model** — now the clear main bet. 18.2's caveat 2 localises
+   the remaining gap precisely: not flow, not shear, not features. Nucleation (27-58% of commits,
+   s14.6), temporal dynamics, and the AUC 0.77 -> F1 0.32 calibration collapse (s16.4).
+7. **C4 recirculation-topology features** — demoted. 18.2 shows the DEQ already recovers most
+   clot-relevant flow structure, and 18.4 shows shear-derived quantities are redundant with
+   geometry. Only worth revisiting if C1 stalls.
+
+# 19. Post-Z re-plan (2026-08-07)
+
+Z1 and Z4 both **clear** rather than block, so the architecture work is reopened. But the Z1
+table plus three cheap decompositions run afterwards change *where* the remaining gap is, and
+retire another of this document's claims.
+
+## 19.1 The Z1 table's most important row is the one nobody is reading
+
+```
+prior source        rel L2(u)   AUC(-|u_pred|)
+GT field                 —          0.789
+stored (leaked)       0.116         0.782
+analytic (legal)      0.566         0.763
+zero (ablation)       0.984         0.748
+```
+
+Going from the true field to **no flow information at all** costs **0.041 AUC**. Flow
+contributes ~2-5% of discriminative power for clot. Two consequences:
+
+1. **C4 (recirculation topology) is correctly demoted** — agreed.
+2. **B2 (`z_kin` ablation) should be promoted to the front, not left mid-list.** `z_kin` is the
+   DEQ latent — a *flow* representation — and it occupies **256 of 287 input dimensions (89%)**.
+   Z1 says the entire flow channel is worth ~0.04 AUC. Either `z_kin` is carrying something
+   other than flow, or 89% of the input is near-dead weight. That is now a 1-leg question with
+   a large payoff either way, and it makes every later experiment cheaper if it comes back dead.
+
+## 19.2 RETRACTION of 14.5 — the linear model does NOT match the GNN
+
+14.5 claimed "a linear model matches the GNN" from leaked features on the 6-vessel cohort with
+an oracle threshold. Redone properly — deploy-legal features, logreg trained on the 29
+non-cohort vessels, tested on the same 6 vessels the GNN was scored on:
+
+| vessel | logreg F1 | GNN F1 | GNN gain |
+|---|---|---|---|
+| `039` | 0.781 | 0.518 | **−0.263** |
+| `040` | 0.550 | 0.704 | +0.154 |
+| `041` | 0.354 | 0.255 | −0.099 |
+| `042` | 0.344 | 0.513 | +0.169 |
+| `043` | 0.639 | 0.650 | +0.011 |
+| `044` | 0.427 | 0.602 | +0.174 |
+| **mean** | **0.516** | **0.540** | **+0.024** |
+
+The GNN wins by +0.024 on average while being *handicapped* (fixed gate vs the logreg's oracle
+threshold) — and the per-vessel spread is enormous (−0.263 to +0.174). So the GNN does add
+real structure on 4 of 6 vessels; 14.5's dismissal was an artifact of leaked features plus a
+favourable cohort. **The rollout is earning its place; it is the calibration across vessels
+that is not.**
+
+## 19.3 The AUC -> F1 collapse decomposed: it is a RANKING problem, not calibration or coherence
+
+9 held-out vessels, deploy-legal logreg, three interventions:
+
+```
+F1 @ oracle threshold, no smoothing        0.322     <- 16.4's number
+F1 @ oracle COUNT of positives             0.198     <- calibration is NOT the gap
+F1 @ 3x graph smoothing                    0.311     <- spatial coherence is NOT the gap
+F1 @ smoothing + oracle count              0.199
+```
+
+Both "obvious" fixes make it **worse or do nothing**:
+
+* **Oracle count is worse than an oracle threshold (0.198 vs 0.322).** At AUC ~0.78 with 2-18%
+  positives, the F1-optimal operating point commits *more* nodes than truly clot — over-commit
+  buys recall faster than it loses precision. **This partially exonerates the over-painting
+  that §9-§13 spent ten legs fighting: mass ratio > 1 is F1-rational at this ranking quality.**
+  Chasing mass 1.0 was optimising the wrong thing.
+* **Graph smoothing does nothing (0.311 vs 0.322).** Whatever the GNN adds in 19.2, it is not
+  spatial smoothing.
+
+With calibration and coherence both eliminated, **the binding constraint is ranking quality**,
+and every path measured caps at AUC 0.75-0.79: geometry alone 0.748, +analytic 0.763,
++leaked CFD 0.782, GT field 0.789, deploy-legal logreg 0.767.
+
+## 19.4 The goal is stated on an easy subset
+
+Same logreg, same features, different test sets:
+
+```
+tested on 9 random held-out vessels    mean F1 0.322
+tested on the 039-044 cohort           mean F1 0.516
+```
+
+**The stenosis/aneurysm cohort is substantially easier than a random draw from the 35.** A
+result of ">0.6 on 039-044" therefore does not imply ">0.6 generalizing to unseen vessels",
+which is the actual goal. Any target should be re-stated on a random held-out split, or the
+cohort result read as an upper bound.
+
+## 19.5 Revised next steps
+
+Where I agree with the standing plan: set `analytic` on new legs, unify `deploy_clot_score`
+(A1), per-vessel commit threshold (A2), expand to ~30 vessels (A4), demote C4, and make C1 the
+main bet. Four changes:
+
+**(i) Promote B2 (`z_kin` ablation) to run first among the model experiments.** Rationale in
+19.1 — Z1 has made it a high-information, single-leg question, and a dead result shrinks the
+input by 89% and speeds up everything after it.
+
+**(ii) Re-target C1's nucleation head at EARLY commits, not the final map.** 14.6 showed 27-58%
+of commits are nucleation; 12.8/§14 showed oracle `t=20` seeds dilated by k hops already reach
+F1 0.52-0.64 — i.e. *seeds plus growth is most of the answer*. Training the nucleation head on
+the final map dilutes it across 200 steps of consequences. Train it on "does this node commit
+in the first ~20 steps", let the growth term propagate, and grade the composite.
+*First cheap check before building anything:* measure AUC of the deploy-legal features for the
+**t=20 seed set** versus the final map. If seeds are more predictable, C1's design follows
+directly; if not, the nucleation head has no better target than what already exists.
+
+**(iii) Stop optimising mass ratio toward 1.0.** 19.3 shows over-commit is F1-rational at
+achievable ranking quality. `select_mass_hard_max=1.5` and the §9.11 brake were fighting the
+metric, not helping it. Re-derive the mass target *from* the F1-optimal operating point at the
+model's measured AUC rather than from physical mass matching.
+
+**(iv) Re-state the goal on a random held-out split** (19.4), or explicitly accept 039-044 as a
+development set and hold a separate random set for the real generalization claim.
+
+**What I would not do next:** more work on flow (Z1), shear decoding (Z4), recirculation
+topology (C4), routing (13.4), or objective reweighting (12.3). All five are now closed by
+measurement.
+
+# 20. Phase 0 — measurement foundation (2026-08-07)
+
+No GPU. Everything here changes how later numbers are read, so it precedes the Phase 1
+re-baseline. Two of this document's own diagnoses are corrected below.
+
+## 20.0 (0a) Test-suite cross-test state leak — FIXED
+
+8 tests in `test_species_flow_feats.py` failed in aggregate runs and passed in isolation.
+
+**Root cause.** `src/biochem_gnn/config.py::_bind_typed_configs` binds PushforwardConfig /
+BiochemRuntimeConfig **process-wide** via module-global contextvar tokens — deliberate, so
+deploy and eval scripts keep one active config for the process. Under pytest that persists
+across tests. Any test calling `apply_train_recipe_env` / `apply_mat_growth_leg_env`
+(`test_mat_growth_simple_scope`, `test_runtime_config`, `test_seed_aux_loss` — all sorting
+*before* `test_species_flow_feats`) leaves a config bound, and every `*_enabled()` helper checks
+`resolve_config()` **before** falling back to `os.environ`. So later tests that set env vars
+were silently ignored.
+
+**Fix.** Autouse isolation fixture in `src/tests/conftest.py` restoring the binding after each
+test. Production behaviour untouched.
+
+```
+before:  538 passed, 8 failed
+after:   546 passed, 0 failed   (order-independent; file still 22/22 in isolation)
+```
+
+## 20.1 (0b) `deploy_clot_score` unified — and 13.4a's diagnosis was wrong twice
+
+13.4a attributed the cross-tool score discrepancy to `clout_prec_rec_floor` being 0.30 / 0.35 /
+0.30 across three files. **Both parts of that are wrong:**
+
+1. **The floor is inert in every run we have.** `relaxed_prec_floor_score` returns plain
+   precision whenever `recall >= floor`; every logged run had relaxed recall ~1.000, so the
+   floor could not have contributed anything.
+2. **The typed values agree.** `build_train_recipe_configs()` resolves
+   `clout_prec_rec_floor = 0.30`, identical to the default runtime. The literal `"0.35"` at
+   `mat_growth_simple.py:50` never reaches the typed config.
+
+**The actual cause: three different scoring entry points with different protocols.**
+
+| caller | function | protocol |
+|---|---|---|
+| `eval_mat_growth_simple.py` | `canonical_deploy_clot_metrics` | `bind_canonical_deploy_protocol` |
+| `diag_regime_gate_sweep.py` | `grade_deploy_clot_series` (raw) | **none** |
+| in-training | mean over `clf_by_t` sliding fracs | selection signal (9.8) |
+
+The sweep graded the *same predictions* without the canonical deploy protocol. That moves
+`deploy_clot_score` while leaving strict `deploy_clot_f1` bit-identical — exactly the observed
+pattern (F1 identical on 4/6 vessels, score different on all 6).
+
+**Fix.**
+* New `canonical_grade_series()` in `src/evaluation/canonical_clot_eval.py` — same protocol as
+  `canonical_deploy_clot_metrics`, for callers that roll out once and grade many times (which
+  is the right design; the rollout dominates cost).
+* `diag_regime_gate_sweep.py` now calls it instead of the raw grader.
+* New `scoring_fingerprint()` in `clot_relaxed_metrics.py`, printed by both tools, exposing the
+  resolved constants **and whether a runtime is bound** — the actual failure mode.
+* `src/tests/test_canonical_scoring_parity.py` (6 tests) pins: both canonical entry points bind
+  the protocol; the sweep never calls the raw grader; the floor is inert at full recall.
+
+**The in-training sliding-window mean is left alone** — it is a *selection* signal by design
+(9.8), not a reported score. The contract is now: reported scores come from a canonical entry
+point; training-time aggregation is a separate, clearly-labelled quantity.
+
+## 20.2 (0e) The F1-optimal commit ratio is 3.0x, not 1.0x — this reframes sections 9-13
+
+For each held-out vessel, sweeping the number of committed nodes to maximise F1 at achievable
+ranking quality:
+
+| vessel | n_true | optimal commit | ratio | F1@opt | F1@ratio 1.0 |
+|---|---|---|---|---|---|
+| `001` | 290 | 871 | 3.00 | 0.431 | 0.286 |
+| `005` | 144 | 821 | 5.70 | 0.191 | 0.118 |
+| `009` | 141 | 67 | 0.48 | 0.433 | 0.383 |
+| `013` | 383 | 703 | 1.84 | 0.613 | 0.470 |
+| `018` | 41 | 233 | 5.68 | 0.080 | 0.000 |
+| `024` | 156 | 538 | 3.45 | 0.429 | 0.160 |
+| `031` | 45 | 7 | 0.16 | 0.077 | 0.044 |
+| `037` | 153 | 648 | 4.24 | 0.300 | 0.078 |
+| `042` | 243 | 685 | 2.82 | 0.358 | 0.239 |
+| **mean** | | | **3.04** | | |
+
+**Mean 3.04x, median 3.00x.** Committing at the true count instead costs roughly 0.15 F1 on
+average. At AUC ~0.78 with 2-18% positives, over-commit buys recall faster than it loses
+precision.
+
+Now set that against every best epoch this project ever produced, under
+`select_mass_hard_max = 1.5`:
+
+```
+leg/epoch          mass    score    gate     |mass - 3.04|
+v2 ep5            2.077   0.5011  REJECTED       0.96
+v3 ep5            2.768   0.4998  REJECTED       0.27
+v6 ep3            3.200   0.4414  REJECTED       0.16
+v10 ep12          1.674   0.6221  REJECTED       1.37
+v10 ep14          2.021   0.5860  REJECTED       1.02
+saturated basin   4.030   0.2620  REJECTED       0.99
+```
+
+**Every one of them was rejected, and the three best sit within 0.27 of the empirically optimal
+ratio.** The legs were finding the right operating point and the selection gate was discarding
+it. Together with 12.4 (retention discarded them too) this is the mechanical explanation for
+sections 9-13: **the search was working; the acceptance criteria were wrong.** The 9.11 brake,
+`final_mass_target=1.2` and `select_mass_hard_max=1.5` were all pulling toward physical mass
+matching, which is *not* the F1 optimum.
+
+**Wired.** `_SUBCOHORT_RUNTIME_V11PLUS` — `select_mass_hard_min 1.2`, `hard_max 4.5`,
+`soft_target 3.0`, `soft_lambda 0.15`. `_SUBCOHORT_RUNTIME_V3PLUS` is untouched so v3-v10 stay
+reproducible.
+
+## 20.3 (0d) Per-vessel commit threshold — MEASURED, adoption recommended
+
+Label definition swept across all 35 vessels (`-sdf` used as a fixed probe feature):
+
+| threshold | pos% mean | pos% sd | pos% range | AUC mean | **AUC sd** |
+|---|---|---|---|---|---|
+| fixed `1e-4` (current) | 8.12 | 4.15 | 1.9-17.6 | 0.768 | **0.102** |
+| relative 1% of max Mat | 15.38 | 10.35 | 4.1-42.0 | 0.629 | 0.066 |
+| relative 5% of max Mat | 10.92 | 7.06 | 2.7-27.2 | 0.708 | 0.054 |
+| **relative 10% of max Mat** | 7.69 | 5.11 | 2.1-21.0 | **0.800** | **0.058** |
+
+Relative-10% gives both a **higher** mean AUC (0.800 vs 0.768) and **43% lower cross-vessel
+variance** (sd 0.058 vs 0.102). The same features work equally well on every vessel, which is
+precisely the generalization property being chased.
+
+**Recommended but not yet applied**, because adopting it invalidates numeric comparability with
+every result in sections 9-19. It should be switched on exactly once, at the Phase 1
+re-baseline, never mid-ladder.
+
+## 20.4 (0f) Seeds are far more predictable than the final map
+
+Same deploy-legal features, two targets, 35 vessels:
+
+```
+target        n     mean best-feature AUC     sd
+final map    35            0.806             0.085
+t=20 seeds   32            0.903             0.032
+```
+
+**Seeds are both more predictable (+0.097 AUC) and 2.7x more consistent across vessels.** The
+`t=0` physics says where clot *starts* much better than where it *ends up*, which is what a
+nucleation term should model; the final map is that signal plus 200 steps of propagation.
+
+**This settles C1's design (19.5 item ii): train the nucleation head on early commits, and let
+the growth term carry it forward.** Combined with 14.6 (27-58% of commits are nucleation) and
+the oracle-seed dilation ceiling of F1 0.52-0.64, the two-term split now has direct empirical
+support rather than being an argument from mechanism.
+
+## 20.5 (0c) Goal split — decision required
+
+Not a measurement. Recorded for an explicit decision at Phase 1:
+
+```
+same model, same features, different test sets:
+  9 random held-out vessels   mean F1 0.322
+  the 039-044 cohort          mean F1 0.516
+```
+
+`039`-`044` is materially easier than a random draw from the 35. **Recommendation:** treat
+`039`-`044` as a development set and hold a random 8-10 vessel set, untouched, for the
+generalization claim. Otherwise ">0.6 on the cohort" will not mean ">0.6 on unseen vessels".
+
+## 20.6 Phase 0 status
+
+| item | status |
+|---|---|
+| 0a test isolation | **done** — 546 passed, 0 failed, order-independent |
+| 0b unify `deploy_clot_score` | **done** — canonical entry point + fingerprint + 6 tests |
+| 0c goal split | **decision pending** (20.5) |
+| 0d per-vessel threshold | **measured**, adoption recommended at Phase 1 (20.3) |
+| 0e mass target | **done** — 3.04x measured, `_SUBCOHORT_RUNTIME_V11PLUS` wired |
+| 0f seed target | **measured** — settles C1's head target (20.4) |
+
+Suite: **552 passed, 0 failed.**
+
+# 21. Phase 0 decisions wired (2026-08-07)
+
+Both open decisions from 20.5 / 20.3 resolved by the user and implemented.
+
+## 21.1 (0c) Cohort split v2 — DECIDED and sealed
+
+`039`-`044` stays the **dev** cohort, with one stenosis and one aneurysm held back from it,
+plus a broader sealed set chosen to make the generalization claim meaningful.
+
+**Geometry class is now computable.** Width-profile skew recovers the known labels exactly:
+aneurysms `039/040/043` = **+1.05 / +0.69 / +0.65**, stenoses `041/042/044` =
+**-0.58 / -0.57 / -0.51**. Applied to all 35: 7 aneurysm-like, 28 stenosis-like.
+
+**Holdout construction rules, applied programmatically, not by hand:**
+* every holdout vessel is **interior** on all four descriptor axes (pos%, best-feature AUC,
+  nucleation%, skew) — never a global min or max, so the sealed set tests *interpolation*;
+* `T >= 150`, so no severely truncated simulation sits in the holdout;
+* class balance proportional to the pool (2 aneurysm / 6 stenosis vs the pool's 7/28);
+* `042` (median stenosis) and `043` (the long-sealed aneurysm) are the two dev holdouts.
+
+A first, greedy attempt was rejected: it put `patient003` in the holdout, which is the global
+maximum on *both* skew (1.94) and nucleation (82.0) and has `T=29`, and it left only 4
+aneurysms to train on.
+
+```
+SEALED GENERALIZATION (8)   001, 007, 010, 013, 014, 031, 042, 043
+                            2 aneurysm / 6 stenosis, all T>=155
+TRAIN (27)                  002,003,004,005,006,008,009,011,012,015,016,018,019,020,021,
+                            024,025,028,029,032,035,036,037,039,040,041,044
+                            5 aneurysm / 22 stenosis
+DEV                         039-044   (dev-train 039,040,041,044 | dev-holdout 042,043)
+```
+
+**Coverage:** train spans the holdout's range on pos%, nucleation% and skew. The one exception
+is the AUC upper bound — holdout 0.944 (`043`) vs train 0.941 (`040`), a **0.003** tie, which is
+immaterial and is the price of keeping `043` sealed for continuity with sections 9-20.
+
+Wired as `WALL_COHORT_V2_TRAIN` / `WALL_COHORT_V2_GENERALIZATION` / `WALL_COHORT_V2_DEV` /
+`WALL_COHORT_V2_DEV_HOLDOUT` in `mat_growth_simple.py`, with disjointness asserted.
+
+**Standing rule:** the 8 sealed vessels are spent **once**. Do not tune against them, and do not
+report a generalization number that was iterated on.
+
+## 21.2 (0d) Per-vessel commit threshold — ADOPTED
+
+User decision: robustness going forward outweighs backward comparability. Adopted at the
+measured optimum, relative **10% of each vessel's max Mat** (20.3: AUC 0.768 -> 0.800,
+cross-vessel AUC sd 0.102 -> 0.058).
+
+**A leak boundary this exposed, and how it is handled.** A 10%-of-max threshold is computed
+from GT. That is fine for *labels* — wherever labels exist, GT exists — but it would be a
+**deploy leak** if used for the model's own predicted commit readout, which must not consult
+`max(GT Mat)`. The implementation therefore splits the two roles that were previously one
+global scalar:
+
+| role | function | may be vessel-relative? |
+|---|---|---|
+| what counts as TRULY committed (labels, metrics, GT side of losses) | `mat_label_thresh()` | **yes** |
+| what the MODEL predicts as committed | `continuous_mat_commit_thresh()` | **no — leak** |
+
+Deploy-time selection was already percentile-based (`CLOT_POCKET_GATE_PCT`), so the prediction
+side needs nothing vessel-specific.
+
+**Implementation.** `mat_label_thresh_mode` (`"absolute"` | `"rel_max"`) and
+`mat_label_rel_frac` (0.10) on `PushforwardConfig`; a `_VESSEL_MAT_MAX` contextvar with
+`use_vessel_mat_max()`; the GT side of `rolled_final_mass_fp_penalty` and `rolled_soft_f1_loss`
+switched to `mat_label_thresh()`. Defaults to `"absolute"`, and `rel_max` falls back to absolute
+when no vessel is bound, so nothing silently changes for callers that have not been taught about
+vessels.
+
+**Measured effect** (rel_max, 10%):
+```
+vessel      max Mat    abs thr   rel thr   n(abs)  n(rel)
+024        3.40e-04    1.0e-04   3.4e-05     156     305     low-peak  -> MORE positives
+043        2.17e-03    1.0e-04   2.2e-04     167     109
+041        4.31e-03    1.0e-04   4.3e-04     262     138
+012        1.51e-02    1.0e-04   1.5e-03     254      73     high-peak -> FEWER positives
+```
+Exactly the intended equalisation.
+
+**Consequence, stated plainly:** every count, F1 and score in sections 9-20 was computed under
+the absolute threshold and is **not comparable** with anything measured after `rel_max` is
+switched on. The switch happens once, at the Phase 1 re-baseline. Three tests pin the
+behaviour, including that the prediction-side threshold never consults the vessel max.
+
+## 21.3 Phase 0 complete
+
+| item | status |
+|---|---|
+| 0a test isolation | **done** — 546 passed / 0 failed, order-independent |
+| 0b unify `deploy_clot_score` | **done** — `canonical_grade_series` + fingerprint + 6 tests |
+| 0c goal split | **done** — cohort split v2 sealed (21.1) |
+| 0d per-vessel threshold | **done** — `rel_max` @ 10% wired, leak-scoped (21.2) |
+| 0e mass target | **done** — 3.04x measured, `_SUBCOHORT_RUNTIME_V11PLUS` |
+| 0f seed target | **done** — seeds AUC 0.903 vs final 0.806; settles C1 |
+
+**Suite: 555 passed, 0 failed.**
+
+**Phase 1 is now unblocked.** It must switch on, in one re-baseline leg and never mid-ladder:
+cohort v2 train set (27), `prior_source=analytic`, `mat_label_thresh_mode=rel_max`,
+`_SUBCOHORT_RUNTIME_V11PLUS` selection, >= 14 epochs. That leg is a *reference point*, not an
+A/B — nothing is attributable across it, and every later leg is single-variable against it.
+
+# 22. Phase 1 wiring (2026-08-07)
+
+Two per-vessel properties had to be established once at pack entry and honoured everywhere
+downstream. They are bundled into one primitive rather than threaded separately, because
+applying one without the other is a silent correctness bug and this project's dominant failure
+mode is exactly that (12.3 v4/v5, 20.0, 20.1).
+
+## 22.1 `src/core_physics/vessel_scope.py`
+
+```
+prior_source_cache_tag(src)   -> ""  for stored, "_prior-<src>" otherwise
+resolve_vessel_mat_max(data)  -> peak GT Mat, or None when unavailable
+prepare_vessel_data(data)     -> (data with configured priors, mat_max)
+```
+
+Three traps this closes, each of which would have produced a confident no-op:
+
+1. **Priors must be applied BEFORE the kinematics solve.** The RGP-DEQ consumes
+   `UV_PRIOR`/`MU_PRIOR` (16.1c), so rewriting them after the solve leaves `z_kin` conditioned
+   on the leaked CFD field while the config claims `analytic`. Wired at the load site, ahead of
+   `predict_kinematics_and_latent`, and pinned by a source-order test.
+2. **The pack cache key must include the prior source.** `pack_cache_dir` was keyed on the
+   feature stack only, and the DEQ latent is baked into the cached pack — so an `analytic` run
+   would have silently reused `stored` packs and preserved the leak intact. `stored` maps to an
+   empty tag so every pre-existing cache stays valid.
+3. **`mat_max` travels with the pack**, so no loop can forget to bind it. `None` (not `0.0`)
+   on a clot-free pack, so `mat_label_thresh()` falls back to absolute rather than collapsing
+   to zero and labelling every node committed.
+
+## 22.2 Binding sites
+
+`use_vessel_mat_max` is now entered at all three places a label threshold is consumed, each as
+a real `with` block (no manual `__enter__`, which is the leak-prone pattern the trainer already
+uses for typed configs):
+
+| site | scope |
+|---|---|
+| main training loop | `pack["mat_max"]` |
+| deploy-horizon aux loss | `vpack["mat_max"]` |
+| reported deploy metrics / selection | `val_pack["mat_max"]` |
+
+`eval_mat_growth_simple.py` uses the same primitive, so a reported score and the loss that
+produced it grade against the same definition of "committed".
+
+## 22.3 A real bug the wiring surfaced
+
+`resolve_vessel_mat_max` first indexed `y` with `MAT_CHANNEL`. **`MAT_CHANNEL` is 11, an index
+within the species block, not a column of `y`** — `SPECIES_BLOCK = slice(4, 16)`, so the Mat
+column is `4 + 11 = 15`. `y[:, :, 11]` is `FG_log1p_nd`, whose peak is ~0.69 against Mat's
+~4.3e-3, i.e. **~160x too large**. Every relative label threshold would have been inflated by
+that factor and essentially nothing would have been labelled committed.
+
+Caught by checking the resolved value against a directly-measured one (`patient041` returned
+6.94e-01 where 4.31e-3 was expected), not by the test — the original test seeded and read using
+the *same* wrong index, so it passed against a broken function. It now asserts the column
+arithmetic explicitly, plants a decoy in the FG column, and cross-checks a real pack.
+
+## 22.4 `WG_phase1_baseline`
+
+The re-baseline leg. **Not an A/B**: it switches the whole Phase-0 foundation on at once and
+becomes the reference every later single-variable leg is measured against. Nothing is
+attributable across it, and no number before it is comparable with any number after it.
+
+```
+cohort      5 ad-hoc vessels -> WALL_COHORT_V2_TRAIN (27), 8 sealed      (21.1)
+priors      stored (leaked CFD) -> analytic                              (16.1, 17 Z2)
+labels      fixed 1e-4 -> rel_max @ 10% of each vessel's peak Mat        (20.3, 21.2)
+selection   mass window [0.5,1.5] -> [1.2,4.5], target 3.0               (20.2)
+objective   soft-F_beta surrogate live, occupancy scale fixed            (12.6)
+```
+Backbone stays frozen and the growth law stays generic — change D / change E attribution comes
+after this, one variable at a time.
+
+**Validation anchor.** The launcher's historical default is `patient043`, which is now
+**sealed**. Using it for epoch selection would spend the seal on the very first leg. Phase 1
+uses `patient041` instead: dev-cohort, not sealed, and the hardest vessel on record, so
+selection is not flattered. Effective split is 26 train / 1 val / 8 sealed.
+
+## 22.5 Guards
+
+`src/tests/test_vessel_scope_and_phase1.py` (16 tests). Each corresponds to a specific way the
+wiring could become a silent no-op: prior-vs-solve ordering, cache-key separation, the Mat
+column mapping, all three binding sites present, the eval script using the same scope, the leg
+resolving the full foundation, cohort disjointness, historical legs unchanged, and the
+label/prediction threshold separation (the prediction side must never consult the vessel max —
+that would be a deploy leak).
+
+**Suite: 571 passed, 0 failed.**

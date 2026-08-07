@@ -107,6 +107,8 @@ ENV_KEY_TO_FIELD: dict[str, str] = {
     "SPECIES_CONTINUOUS_ROLLED_SOFT_F1_K": "rolled_soft_f1_k",
     "SPECIES_CONTINUOUS_ROLLED_SOFT_K_RELATIVE": "rolled_soft_k_relative",
     "SPECIES_CONTINUOUS_STEP_SOFT_F1_WEIGHT": "step_soft_f1_weight",
+    "SPECIES_CONTINUOUS_MAT_LABEL_THRESH_MODE": "mat_label_thresh_mode",
+    "SPECIES_CONTINUOUS_MAT_LABEL_REL_FRAC": "mat_label_rel_frac",
     "SPECIES_CONTINUOUS_AUTOCAT_GROWTH": "autocatalytic_growth",
     "SPECIES_CONTINUOUS_AUTOCAT_K_DEP_INIT": "autocat_k_dep_init",
     "SPECIES_CONTINUOUS_AUTOCAT_K_AUTO_INIT": "autocat_k_auto_init",
@@ -352,6 +354,20 @@ class PushforwardConfig:
     # When on, magnitude is multiplied by (k_dep + k_auto * local_committed_frac), with
     # local_committed_frac the graph-blurred committed-Mat indicator already computed for
     # `neighbor_commit_gate`. k_dep/k_auto are learnable (log-parameterised, positive).
+    # --- Per-vessel LABEL threshold (WALL_MODEL_PLAN.md 20.3 / 21) ---
+    # `max Mat` spans 45x across the 35 usable packs while the commit threshold is a fixed 1e-4,
+    # so "committed" is a far stricter physical state on some vessels than others. Measured over
+    # all 35: relative-10%-of-max raises mean best-feature AUC 0.768 -> 0.800 AND cuts
+    # cross-vessel AUC variance 0.102 -> 0.058 (43% less), i.e. the same features work equally
+    # well everywhere -- exactly the generalization property being chased.
+    #
+    # SCOPE, deliberately narrow: this sets the threshold used to decide what counts as TRUE
+    # (labels, metrics, the GT side of losses). It must NOT be used for the model's own predicted
+    # commit readout -- that would require max(GT Mat) at deploy, which is a leak. The prediction
+    # side stays on `mat_commit_thresh`; deploy-time selection is already percentile-based
+    # (CLOT_POCKET_GATE_PCT).
+    mat_label_thresh_mode: str = "absolute"   # "absolute" | "rel_max"
+    mat_label_rel_frac: float = 0.10
     autocatalytic_growth: bool = False
     autocat_k_dep_init: float = 1.0
     autocat_k_auto_init: float = 1.0

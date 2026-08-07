@@ -7,6 +7,7 @@ Covers the two things that made v3-v6 uninterpretable, so they cannot regress si
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.architecture.pushforward_config import PushforwardConfig, use_pushforward_config
@@ -165,3 +166,44 @@ def test_autocatalytic_off_by_default():
     with use_pushforward_config(PushforwardConfig(species_scope="mat", dual_head=True)):
         m, x, ei = _tiny_model(False)
         assert m.log_k_dep is None and m.log_k_auto is None
+
+
+# --- Per-vessel label threshold (WALL_MODEL_PLAN.md 20.3 / 21) -------------------------------
+
+def test_label_thresh_defaults_to_absolute_and_is_leak_safe():
+    """Default must be the historical absolute threshold, and rel_max must no-op when unbound."""
+    from src.core_physics.species_pushforward_continuous import (
+        continuous_mat_commit_thresh, mat_label_thresh,
+    )
+    with use_pushforward_config(PushforwardConfig(species_scope="mat")):
+        assert mat_label_thresh() == continuous_mat_commit_thresh()
+    # rel_max with no vessel bound must fall back rather than guess
+    with use_pushforward_config(
+        PushforwardConfig(species_scope="mat", mat_label_thresh_mode="rel_max")
+    ):
+        assert mat_label_thresh() == continuous_mat_commit_thresh()
+
+
+def test_label_thresh_scales_per_vessel():
+    from src.core_physics.species_pushforward_continuous import (
+        mat_label_thresh, use_vessel_mat_max,
+    )
+    cfg = PushforwardConfig(species_scope="mat", mat_label_thresh_mode="rel_max",
+                            mat_label_rel_frac=0.10)
+    with use_pushforward_config(cfg):
+        with use_vessel_mat_max(4.31e-3):          # patient041
+            assert mat_label_thresh() == pytest.approx(4.31e-4)
+        with use_vessel_mat_max(3.40e-4):          # patient024, 12.7x smaller peak
+            assert mat_label_thresh() == pytest.approx(3.40e-5)
+
+
+def test_prediction_side_threshold_never_uses_vessel_max():
+    """The model's own commit threshold must stay absolute -- using GT max would be a leak."""
+    from src.core_physics.species_pushforward_continuous import (
+        continuous_mat_commit_thresh, use_vessel_mat_max,
+    )
+    cfg = PushforwardConfig(species_scope="mat", mat_label_thresh_mode="rel_max")
+    with use_pushforward_config(cfg):
+        before = continuous_mat_commit_thresh()
+        with use_vessel_mat_max(1.5e-2):
+            assert continuous_mat_commit_thresh() == before
