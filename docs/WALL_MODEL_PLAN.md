@@ -4742,3 +4742,128 @@ has already been measured as routable.
 This keeps C1's motivation -- an explicit ignition term the current architecture cannot express
 -- while grounding the form in the PDE rather than in commit-event statistics that turned out to
 be definitionally fragile.
+
+## 26.14 T5 final result — the loss_scale fix is real and does not help
+
+`WG_t5_unified_scale`, 6 epochs, one variable (`loss_scale_unified`) against 3a.
+
+| ep | T5 score | T5 mass | T5 fp | T5 rprec | Phase 1 score | P1 mass | P1 fp |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.4334 | 2.823 | 215 | 0.438 | 0.4104 | 3.062 | 242 |
+| 2 | 0.3706 | 2.708 | 202 | 0.362 | 0.3706 | 2.708 | 202 |
+| 3 | 0.4031 | 2.699 | 201 | 0.397 | 0.3757 | 2.699 | 201 |
+| 4 | 0.4424 | 1.478 | 84 | 0.522 | 0.4593 | 2.363 | 165 |
+| 5 | 0.4065 | 0.619 | 31 | 0.552 | 0.4350 | 0.708 | 31 |
+| 6 | 0.4220 | 1.398 | 85 | 0.467 | **0.4889** | 2.062 | 131 |
+
+**On the IN-TRAINING metric: best T5 0.4424 vs Phase 1's 0.4889** -- better at epochs 1 and 3,
+bit-identical at 2, worse at 4-6.
+
+**On the CANONICAL COLD EVAL the ranking REVERSES.** Both legs select epoch 4; both evaluated on
+`patient041` through `eval_mat_growth_simple.py`:
+
+| leg | sel ep | cold score | mass | fp | rprec |
+|---|---|---|---|---|---|
+| Phase 1 | 4 | 0.4319 | 2.363 | 165 | 0.434 |
+| **T5** | 4 | **0.5103** | 1.478 | 84 | 0.545 |
+
+**T5 wins by +0.078 and clears the 0.50 floor** -- the best cold number of the session. See
+26.14.1: the two metrics disagree in *direction*, which is a live instrument problem, so neither
+"T5 helps" nor "T5 does not help" can be asserted until it is resolved.
+
+Caveat: Phase 1 is *not* T5's control -- 3a is, and 3a stopped at 2 epochs. Phase 1 additionally
+differs in `physics_readout`, the mass terms, `rolled_soft_f1_beta` and `closed_loop_init`, so
+the epoch 4-6 gap is not attributable to the unified scale alone. Extending 3a to 6 epochs would
+make it attributable; that is not worth the GPU given the pivot.
+
+Two incidental findings worth keeping:
+
+* **Epoch 2 joined the plateau exactly** (0.3706237861441937 / 2.7079646017699117 / 202), making
+  it the *fifth* leg to do so. The attractor survives a 10x rescaling of the rolled terms. It
+  yields only to removing the per-step block (leg B) or changing the input (3b).
+* **Epoch 3 matched Phase 1 on `mass`, `fp`, `fn` AND recall, yet scored +0.027 higher**, because
+  its 201 false positives were better *placed* -- relaxed precision dilates by 2 hops. **Counts
+  are not sufficient to characterise a committed set**; any such comparison must include
+  `relaxed_prec`. This weakens the in-training-vs-cold-eval cross-check of 26.10 as originally
+  stated, which used `mass` and `fp` only.
+
+## 26.15 PIVOT — Phase 3 is now a physics-mirroring model, and the law is already in the repo
+
+The finding that reframes the project: **the COMSOL wall deposition law is implemented, and
+validated to machine precision, in this repository.**
+
+* `src/core_physics/comsol_surface_deposition.py` -- canonical `J0_Mat`, single source of truth
+* `src/tests/test_comsol_wall_deposition_calibration.py` -- pins it against COMSOL's own exported
+  `J0_*` columns (`patient007`, 876 wall nodes x 201 timesteps). **5 tests pass.**
+* `src/core_physics/biochem_physics_kernels.py::biochem_wall_residual` -- the law wired
+  end-to-end, both gates and saturation included
+* `docs/COMSOL_PHYSICS_VALIDATION.md` -- *"matches the repo's `BiochemConfig` to machine
+  precision"*
+
+Meanwhile the deployed stack is `frozen flow -> GraphSAGE learns Mat directly -> gelation ->
+clot readout`. **The GraphSAGE replaces the law rather than using it.** Roughly fifteen legs have
+been spent teaching a 187k-parameter network to approximate a function already available exactly,
+which is the most parsimonious explanation on record for why it generalises poorly: the network
+must re-infer `lss = 25 1/s` and `sgt = -7.5e4` from data on every new geometry, while the law
+applies them exactly everywhere.
+
+Tracing what `j0_mat_si` needs:
+
+| input | source | learned? |
+|---|---|---|
+| `sat_m`, `mas` | integrated state | no |
+| `step2t` | activation-phase gate | no |
+| `shear_sr`, `dsrx` | flow field | via the flow surrogate |
+| **`rp`, `ap`** | bulk platelet concentrations at the wall | **yes -- and only this** |
+
+**The learning surface collapses from "predict `dMat` everywhere every step" to "predict platelet
+concentrations at the wall."** Saturation, the correct *local* autocatalysis `(Mas/Minf)·k_aa·ap`,
+both gates and their thresholds all come free and correct. And every species is a GT channel in
+the packs, so the learned part is directly supervisable.
+
+10.4's regime bimodality also stops being a routing problem and becomes a consequence of which
+gate fires -- and it was already measured routable at t=0 by `band_speed_q25` (AUC 0.975, 90.6%
+LOO).
+
+**Step 0 of the new plan, before any model is written:** does `j0_mat_si` fed GT species from the
+packs reproduce GT `dMat`? If yes, everything above follows. If no, the premise is wrong and it
+must be found out then, not after building. The unit plumbing (`log1p_nd` -> SI, the
+`1/(s*cm) -> 1/(s*m)` conversion on `dsrx`, the `x1e4` surface-rate factor) is where this will go
+wrong; a mismatch means the plumbing or the premise is broken, **not** that the constants need
+adjusting -- they are pinned by a passing test.
+
+Full specification, build order, standing constraints and the state of the instrument:
+**`docs/PHASE3_HANDOFF.md`**, rewritten for a new context window. The previous additive-C1 plan is
+retained there as an optional comparison arm (section 3), with its premise corrected to ~21%.
+
+## 26.14.1 THE IN-TRAINING METRIC AND THE CANONICAL EVAL DISAGREE IN DIRECTION
+
+Found while writing up T5. On an **identical committed set** -- same `mass`, same `fp` -- the
+in-training deploy score and the canonical cold eval differ, and the difference is not a constant
+offset:
+
+| leg | sel ep | in-training | cold eval | delta | committed set |
+|---|---|---|---|---|---|
+| Phase 1 | 4 | 0.4593 | 0.4319 | **-0.027** | mass 2.363, fp 165 (both) |
+| T5 | 4 | 0.4424 | **0.5103** | **+0.068** | mass 1.478, fp 84 (both) |
+
+**The two move in opposite directions and reorder the legs.** By the in-training metric Phase 1
+beats T5; by the canonical eval T5 beats Phase 1 by +0.078.
+
+The scoring *parameters* are identical in both fingerprints -- `clout_score_mode=guiding`,
+`clout_prec_rec_floor=0.3`, `guide_relax_hops=2`, `guide_f_beta=0.5`, `empty_gt_fp_tol=8.0`. Only
+`runtime_bound` differs, and that is a diagnostic flag (`get_active_runtime() is not None`), not a
+scoring parameter. So the split is elsewhere in the two paths, and it is **not** the parameter
+drift that 20.1 fixed.
+
+**Why this matters more than T5's result.** In-training selection drives which checkpoint every
+leg keeps. If it disagrees in *direction* with the canonical eval, then epoch selection across
+this entire project may have been keeping the wrong checkpoints -- and every "best epoch" number
+in sections 21-26 inherits that. This is an A1-class problem of the same family 20.1 was written
+to close, and 20.1 evidently did not close all of it.
+
+**Do not read T5's verdict as settled.** It wins on the canonical metric at a matched epoch and
+loses on the in-training one; until the split is explained, neither is the answer. Resolving it is
+cheap relative to its blast radius: instrument both paths on one checkpoint with one committed
+set and diff the intermediate quantities (tp/fp/fn before relaxation, the dilation, the recall
+floor, the guiding blend).
