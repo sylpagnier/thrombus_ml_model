@@ -245,6 +245,7 @@ def build_rgp_deq_from_ctor(phys_cfg: Any, ctor: Mapping[str, Any]) -> RGP_DEQ:
         wss_fuse=bool(ctor["wss_fuse"]) if "wss_fuse" in ctor else None,
         bc_envelope=bool(ctor["bc_envelope"]) if "bc_envelope" in ctor else None,
         fourier_learnable=bool(ctor["fourier_learnable"]) if "fourier_learnable" in ctor else None,
+        shear_head=bool(ctor["shear_head"]) if "shear_head" in ctor else True,
     )
 
 
