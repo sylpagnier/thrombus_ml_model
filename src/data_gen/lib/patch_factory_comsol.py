@@ -672,6 +672,10 @@ class PatchFactoryComsolGenerator:
                 ok = self._solve_one(s)
                 consecutive_fails = 0
             except Exception as exc:
+                with open("error_log.txt", "a") as err_file:
+                    import traceback
+                    err_file.write(f"Error on patch {s.idx}:\n")
+                    traceback.print_exc(file=err_file)
                 consecutive_fails += 1
                 if (
                     reconnects < max_reconnects
