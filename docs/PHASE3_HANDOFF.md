@@ -173,6 +173,8 @@ pinned by a passing test; a mismatch means the plumbing is wrong, or the premise
 
 ## 2. BUILD ORDER
 
+0. **Resolve the metric split** (§6.1a). CPU, and it decides whether any epoch selection to date
+   is trustworthy.
 1. **Step 0** (§1.5). CPU. Everything depends on it.
 2. **Confirm the new corrector loads** (§6.3) — 3-output `[dU, dV, dShear]`, no WARN. It supplies
    `shear_sr`/`dsrx`, so the law is only as good as it is.
@@ -268,6 +270,33 @@ Wired as `loss_scale_unified`, default **off**. **Tested over 6 epochs (§26.11)
 help.** Better at epochs 1 and 3, bit-identical at 2, worse at 4–6; best 0.4424 against Phase 1's
 0.4889. It drives the mass collapse *faster*. A real bug fix that produces a worse model — which
 is itself evidence for the pivot in §1.
+
+### 6.1a THE IN-TRAINING METRIC AND THE CANONICAL EVAL DISAGREE IN DIRECTION — unresolved
+
+**Read this before trusting any "best epoch" in §21–§26.** On an *identical committed set* —
+same `mass`, same `fp` — the in-training deploy score and the canonical cold eval differ, and not
+by a constant:
+
+| leg | sel ep | in-training | cold eval | delta |
+|---|---|---|---|---|
+| Phase 1 | 4 | 0.4593 | 0.4319 | **−0.027** |
+| T5 | 4 | 0.4424 | **0.5103** | **+0.068** |
+
+They move in **opposite directions and reorder the legs**. By the in-training metric Phase 1
+beats T5; by the canonical eval T5 wins by +0.078 and clears the 0.50 floor.
+
+Scoring *parameters* are identical in both fingerprints (`clout_score_mode=guiding`,
+`clout_prec_rec_floor=0.3`, `guide_relax_hops=2`, `guide_f_beta=0.5`, `empty_gt_fp_tol=8.0`);
+only `runtime_bound` differs and that is a diagnostic flag, not a scoring parameter. So this is
+**not** the parameter drift §20.1 fixed.
+
+**Blast radius:** in-training selection decides which checkpoint every leg keeps. If it disagrees
+in direction with the canonical eval, epoch selection across this project may have kept the wrong
+checkpoints, and every "best epoch" number in §21–§26 inherits that.
+
+**Cheap to resolve relative to the damage:** instrument both paths on one checkpoint with one
+committed set and diff the intermediates — tp/fp/fn before relaxation, the dilation, the recall
+floor, the guiding blend. Do this early; it is the difference between measuring and guessing.
 
 ### 6.2 `deploy_clot_score` has a resolution floor; `deploy_mat_f1` does not
 
@@ -372,6 +401,9 @@ you build; that file is why the last session caught four dead mechanisms.
 
 ## 9. OPEN QUESTIONS
 
+0. **Why do the in-training and canonical metrics disagree in direction?** §6.1a. It decides
+   whether any "best epoch" on record is trustworthy, and it is cheap to answer. Do it alongside
+   Step 0.
 1. **Does the law reproduce GT `dMat` on the graph packs?** §1.5. Everything depends on it.
 2. **Is the flow good enough?** The law consumes `shear_sr` and `dsrx` directly. Z1 scored the
    flow channel at 0.041 AUC on clot-ranking. If Step 0 passes and the assembled model still
