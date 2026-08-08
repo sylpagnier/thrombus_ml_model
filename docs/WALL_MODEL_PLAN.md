@@ -4867,3 +4867,88 @@ loses on the in-training one; until the split is explained, neither is the answe
 cheap relative to its blast radius: instrument both paths on one checkpoint with one committed
 set and diff the intermediate quantities (tp/fp/fn before relaxation, the dilation, the recall
 floor, the guiding blend).
+
+## 26.16 The species are near-CONSTANT — 26.15's plan targeted the wrong component
+
+26.15 proposed learning `rp`/`ap` at the wall and letting the validated law do the rest. Measured
+before building it, that is wrong.
+
+**Spatial coefficient of variation across wall-band nodes (std/mean, mid-time):**
+
+```
+RP   0.003        <- flat to 0.3%
+AP   0.095        <- ~10%
+Mas  3.934
+Mat  4.399        <- 440%
+```
+
+**Cross-vessel**, `RP@wall` spans 0.9978e-6 .. 1.0e-6 -- a **0.2% spread over the whole cohort**.
+`AP@wall` spans 4.6e-8 .. 5.0e-8. Both platelet concentrations are essentially their inlet values
+everywhere, at all times sampled.
+
+The species carry **none** of the structure. With `RP0`, `AP0` effectively constant:
+
+```
+J0_Mat ~= Da · gates(flow) · [ Sat·(k_rs·RP0 + k_as·AP0) + (Mas/Minf)·k_aa·AP0 ]
+```
+
+so every spatial and temporal feature of `Mat` enters through **the gates** (flow-derived) and
+**`Mas`/`Sat`** (integrated state). There is essentially no chemistry to learn. A model built to
+predict `rp`/`ap` would be learning constants.
+
+Note also `k_as/k_rs = 12.2x` is offset by `RP` being ~20x larger than `AP`, so the fresh-
+deposition term is 63% RP / 37% AP. But since both are constants, that split does not matter.
+
+## 26.17 The gates DO discriminate -- on GT flow. That is the whole question.
+
+`scripts/diag_physics_gate_support.py`, 35 vessels, wall+3hop band, commit = Mat > 10% of vessel
+peak, gates evaluated at t=0:
+
+```
+                                      mean AUC   mean |AUC-0.5|
+low-shear gate  [sr < lss=25 1/s]       0.510        0.136
+separation gate [d(sr,x) < sgt]         0.659        0.167
+best-of-two per vessel                     --        0.203
+```
+
+**The "dominant" 79.7% mechanism averages to chance -- because it is bimodal, not because it is
+weak.** 14 vessels have low shear predicting MORE clot (mean AUC 0.679); 14 have it predicting
+LESS (mean 0.347); 7 are ambiguous. Averaging cancels them.
+
+**10.4's mechanism is confirmed quantitatively:**
+
+```
+rho(band_speed_q25, AUC low-shear gate)  = -0.413     (10.4 predicts negative)
+rho(band_speed_q25, AUC separation gate) = +0.607     (10.4 predicts positive)
+
+group                    n   band_speed_q25   AUC low-shear   AUC separation
+low shear -> MORE clot  14       0.0428            0.679           0.589
+INVERTED                14       0.0874            0.714 <- separation takes over
+```
+
+The inverted vessels are **2x faster**. Slow vessel -> real stagnation zone -> the low-shear gate
+carries the signal. Fast vessel -> no stagnation -> deposition falls to the shear-*gradient*
+mechanism. This is 10.4's physical reading, now measured on the gates themselves rather than on a
+flow proxy, and it means **the law's two-gate sum may reproduce the cohort's bimodality for free**
+-- the separation term scales with `|dsrx|`, which is larger exactly on the fast vessels.
+
+### The measurement nobody has made, and it decides everything
+
+**Every AUC above was computed from GROUND-TRUTH velocity** -- `gamma_si` derives from
+`y[:,0], y[:,1]`. Z1 measured the *predicted* flow field's marginal contribution to clot ranking
+at **0.041 AUC**.
+
+So: **how much gate discrimination survives when the gates are computed from PREDICTED flow?**
+
+* survives -> the physics plan works, and the learned component is the flow correction;
+* collapses -> the flow surrogate is the entire problem, no chemistry or architecture work helps,
+  and improving flow becomes the project.
+
+This supersedes 26.15's Step 0 (which asked whether the law reproduces GT `dMat` from GT species
+-- a weaker question, since the species turn out to be constants). It is cheap: recompute
+`gamma_si` and `dshear_ds` from the corrector/kinematics flow instead of `y`, rerun
+`diag_physics_gate_support.py`, and compare the two AUC columns.
+
+**It also reframes the whole project.** The GNN has been learning `dMat` from a flow field that Z1
+says is nearly uninformative. If 26.17's check shows gate discrimination collapsing on predicted
+flow, that single fact explains sections 9 through 26.

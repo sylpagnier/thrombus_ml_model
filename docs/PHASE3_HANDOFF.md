@@ -106,66 +106,92 @@ Every input `j0_mat_si` needs, and where it comes from:
 | `sat_m` = 1 − M_tot/Minf | integrated state | no |
 | `mas` | integrated state | no |
 | `step2t` | activation-phase time gate (`surface_time_gate_scalar`) | no |
-| `shear_sr`, `dsrx` | flow field → `_compute_shear_rate(u,v,…)` | via the flow surrogate |
-| **`rp`, `ap`** | **bulk platelet concentrations at the wall** | **YES — this is the model** |
+| `rp`, `ap` | **near-CONSTANT — see below** | **no** |
+| **`shear_sr`, `dsrx`** | **flow field → the gates** | **YES — this is the model** |
 
-**The learning surface collapses from "predict `dMat` at every node every step" to "predict
-platelet concentrations at the wall."** Saturation, the correct local autocatalysis, both gates,
-and their thresholds all come free and exact. §10.4's regime bimodality stops being a routing
-problem to solve and becomes a consequence of which gate fires.
-
-All species are present as GT channels in the packs, so `rp`/`ap` can be supervised directly:
+**An earlier draft of this handoff said the learned part was `rp`/`ap` at the wall. That was
+wrong, and §26.16 measured it before anything was built.** Spatial coefficient of variation
+across wall-band nodes:
 
 ```
-u_nd, v_nd, p_nd, mu_eff_nd, RP, AP, APR, APS, PT, T, AT, FG, FI, M, Mas, Mat   (log1p_nd)
+RP   0.003     <- flat to 0.3%          Mas  3.934
+AP   0.095     <- ~10%                  Mat  4.399   <- 440%
 ```
 
-### 1.4 Why this should generalize where the GNN does not
+Cross-vessel, `RP@wall` spans 0.9978e-6 … 1.0e-6 — a **0.2% spread over the entire cohort**. Both
+platelet concentrations sit at essentially their inlet values everywhere, at every time sampled.
+**There is almost no chemistry to learn.** With `RP0`, `AP0` constant the law collapses to
 
-The GNN must infer the gate thresholds from data on each new geometry. The law applies
-`lss = 25 1/s` and `sgt = −7.5e4` exactly, on any geometry, for free. What varies per vessel is
-*which gate is in charge* — and §10.4 already measured that as routable from t=0:
+```
+J0_Mat ~= Da · gates(flow) · [ Sat·(k_rs·RP0 + k_as·AP0) + (Mas/Minf)·k_aa·AP0 ]
+```
 
-| | |
-|---|---|
-| statistic | `band_speed_q25` — 25th-pct flow speed in the hop≤3 band at t=0 |
-| separation AUC | **0.975** |
-| leave-one-vessel-out | **90.6%** (30/32), threshold refit each fold |
-| permutation p | 0.000 |
+so every spatial and temporal feature of `Mat` enters through **the gates** (flow-derived) and
+**`Mas`/`Sat`** (integrated state). **The learnable content of this problem is the FLOW FIELD.**
+That makes the corrector (§6.3) the central component, not a supporting one.
 
-**"Clots form differently depending on geometry" is `which gate is in charge`, and it is already
-a solved measurement.** A model built on the law inherits that; a model that learns `dMat`
-directly has to re-learn it per vessel, which is exactly the −0.263-to-+0.174 spread of §19.2.
+### 1.4 Do the gates actually discriminate on our data? Measured: yes — on GT flow
 
-### 1.5 STEP 0 — the make-or-break validation. Do this before writing any model.
+`scripts/diag_physics_gate_support.py`, 35 vessels, wall+3hop band, gates at t=0 (§26.17):
 
-**Does `j0_mat_si`, fed GT species from the packs, reproduce GT `dMat`?**
+```
+                                      mean AUC   mean |AUC-0.5|
+low-shear gate  [sr < lss=25 1/s]       0.510        0.136
+separation gate [d(sr,x) < sgt]         0.659        0.167
+best-of-two per vessel                     --        0.203
+```
 
-If yes: the law plus species transport fully explains the target, the only unknown is upstream,
-and everything in §1.3 follows. If no: this plan is wrong and you must find out now, not after
-building it.
+**The "dominant" 79.7% mechanism averages to chance because it is bimodal, not weak.** 14 vessels
+have low shear predicting MORE clot (mean AUC 0.679), 14 predicting LESS (0.347), 7 ambiguous.
 
-Pattern to follow — `src/tests/test_comsol_wall_deposition_calibration.py`, which already does
-this for `patient007` against COMSOL's exported `J0_Mat`. Extending it to the graph packs needs:
+§10.4's mechanism is confirmed quantitatively:
 
-* `shear_sr`, `dsrx` computed on the graph — `_compute_shear_rate(u, v, spatial_props, data)` in
-  `biochem_physics_kernels.py`, and `gt_neg_dgamma_dx_phys` / `pred_neg_dgamma_dx_phys` in
-  `clot_phi_simple.py` for the wall shear gradient;
-* `log1p_nd` species → SI. **This is where it will go wrong.** The calibration test carries an
-  explicit `1/(s·cm) → 1/(s·m)` conversion on `dsrx` and a `×1e4` surface-rate factor; get the
-  unit system wrong and you will get a confident, meaningless answer.
-* `sat_m` from `M + Mas + Mat` against `Minf * surface_scale`.
+```
+rho(band_speed_q25, AUC low-shear gate)  = -0.413      (10.4 predicts negative)
+rho(band_speed_q25, AUC separation gate) = +0.607      (10.4 predicts positive)
 
-Report per-vessel correlation and relative error of predicted vs actual `dMat` on wall-band
-nodes. **Do not proceed past a poor result by adjusting constants** — they are calibrated and
-pinned by a passing test; a mismatch means the plumbing is wrong, or the premise is.
+group                    n   band_speed_q25   AUC low-shear   AUC separation
+low shear -> MORE clot  14       0.0428            0.679           0.589
+INVERTED                14       0.0874            0.347           0.714
+```
+
+Inverted vessels are **2× faster**. Slow → real stagnation zone → low-shear gate carries it.
+Fast → no stagnation → deposition falls to the shear-*gradient* mechanism. So **the law's
+two-gate sum may reproduce the cohort's bimodality for free**, since the separation term scales
+with `|dsrx|`, which is largest exactly on the fast vessels. §10.4 separately measured the regime
+itself routable from `band_speed_q25` at AUC 0.975 / **90.6% LOO**.
+
+### 1.5 STEP 0 — the one measurement that decides the project
+
+**Every AUC in §1.4 was computed from GROUND-TRUTH velocity** (`gamma_si` derives from
+`y[:,0], y[:,1]`). Z1 measured the *predicted* flow field's marginal contribution to clot ranking
+at **0.041 AUC**.
+
+> **How much gate discrimination survives when the gates are computed from PREDICTED flow?**
+
+* **Survives** → the physics plan works, and the learned component is the flow correction.
+* **Collapses** → the flow surrogate is the entire problem. No chemistry work, no architecture
+  work, and no objective work helps, and improving flow becomes the project.
+
+It is cheap: recompute `gamma_si` and `dshear_ds` from the corrector/kinematics flow instead of
+from `y`, rerun `scripts/diag_physics_gate_support.py`, and compare the two AUC columns
+vessel-by-vessel.
+
+**This supersedes the earlier Step 0** ("does the law reproduce GT `dMat` from GT species?"),
+which is a weaker question now that §26.16 shows the species are constants. Note also that the
+unit risk that earlier draft warned about does not exist — `gamma_si` is already SI (range
+~0.006–1264 1/s, so `lss=25` sits well inside it), `dshear_ds` is already in the gate's units,
+and `is_low_shear` is already computed in the t=0 feature table.
+
+**If the gates hold up on predicted flow, then run the law end-to-end** against GT `Mat`
+trajectories as a second check before building anything.
 
 ### 1.6 Kill criteria
 
 * **Step 0 fails** (law + GT species does not reproduce GT `dMat`) → the premise is wrong; stop
   and report rather than tuning around it.
-* **The species head cannot beat a logreg** on `rp`/`ap` at the wall from deploy-legal features →
-  the bottleneck is flow, not chemistry; go to §4's flow item.
+* **Gate discrimination collapses on predicted flow** (§1.5) → the flow surrogate is the whole
+  problem; stop and make flow the project.
 * **Whole model** against §19.2's bar: logreg **0.516**, GNN **0.540**. And against the standing
   0.6925 once §6.3 makes that comparison legitimate.
 
@@ -178,11 +204,12 @@ pinned by a passing test; a mismatch means the plumbing is wrong, or the premise
 1. **Step 0** (§1.5). CPU. Everything depends on it.
 2. **Confirm the new corrector loads** (§6.3) — 3-output `[dU, dV, dShear]`, no WARN. It supplies
    `shear_sr`/`dsrx`, so the law is only as good as it is.
-3. **Species head**: predict `rp`, `ap` at the wall from deploy-legal features, supervised against
-   the GT channels. This is the one learned component — keep it small, and check it against a
-   logreg baseline before adding capacity.
-4. **Assemble**: species head → `j0_mat_si` → integrate `Mat` → `mu1(Mat)` step → clot readout.
-   Compare against GT `Mat` trajectories.
+3. **Flow → gates.** The learned component is the flow correction, not chemistry (§1.3). Feed the
+   corrector's `u,v` (and its shear head) into `gamma_si` / `dshear_ds`, and measure the gate AUCs
+   against the GT-flow numbers in §1.4. Improving that gap IS the model.
+4. **Assemble**: flow → gates → `j0_mat_si` with `rp`/`ap` held at their measured constants →
+   integrate `Mat` → `mu1(Mat)` step → clot readout. Compare against GT `Mat` trajectories.
+   Treat `rp`/`ap` as constants first; only make them learned if the residual demands it.
 5. **Then** single-variable legs from that baseline. The assembly in (4) is a **re-baseline**, not
    an A/B — label it as such in the log, as Phase 1 was.
 
@@ -217,10 +244,9 @@ If §1 stalls, this is the fallback, and the two are directly comparable on the 
 
 ## 4. PHASE 4 — after the physics model lands
 
-* **Flow surrogate quality.** If Step 0 succeeds and the assembled model still underperforms, the
-  error is in `shear_sr`/`dsrx`, i.e. the flow. Z1 measured the RGP-DEQ's unassisted flow at
-  0.041 AUC on the clot-ranking task — near-useless by that probe — while the law depends on
-  shear directly. **This becomes the main line if the chemistry is fine and the flow is not.**
+* **Species as a residual.** §26.16 shows `rp`/`ap` are constants to 0.3%/10%. If the assembled
+  model has structured residuals that the gates cannot explain, revisit whether the ~10% `AP`
+  variation matters. Do not start here — start by assuming they are constants.
 * **D3 — `z_kin` shrink.** Gated on a **shuffle** test, not the zero-ablation already run (§6.4).
 * **C2 — per-vessel conditioning.** §19.2's spread (−0.263 to +0.174) is the strongest argument
   on record. It should largely dissolve if §1.4 is right — check whether it does.
