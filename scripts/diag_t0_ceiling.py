@@ -45,7 +45,10 @@ MAT_REL_FRAC = 0.10
 CEILING_HOPS = 3
 # Leaked CFD channels (16.1c) are not deploy-legal even under the t=0-GT-flow bandaid: they are
 # the CONVERGED clot-affected solution, not the t=0 field.
-ILLEGAL = {"u_prior", "v_prior", "mu_prior", "speed_mismatch_nd", "kine_x_wss_prior_nd"}
+# 16.1c: the converged clot-affected CFD solution. These appear BOTH bare and with a
+# `kine_x_`/`bio_x_` prefix, and an earlier version of this script only excluded the bare names --
+# so the leak won on 3 of 35 vessels and inflated the ceiling. Match on substring instead.
+ILLEGAL_SUBSTR = ("u_prior", "v_prior", "mu_prior", "speed_mismatch", "wss_prior")
 LEGAL_GROUPS = {"geometry", "topology", "kine_x", "bio_x", "flow", "flow_derived", "shear_grad"}
 
 
@@ -93,7 +96,7 @@ def vessel_rows(path: Path, device, phys, bio):
     feats = build_feature_table_at_time(data, 0, device=device, phys_cfg=phys, bio_cfg=bio)
     cols: dict[str, torch.Tensor] = {}
     for k, (v, g, _s) in sorted(feats.items()):
-        if g not in LEGAL_GROUPS or k in ILLEGAL:
+        if g not in LEGAL_GROUPS or any(b in k for b in ILLEGAL_SUBSTR):
             continue
         v = v.reshape(-1)
         if v.numel() != int(data.num_nodes) or not bool(torch.isfinite(v).all()):

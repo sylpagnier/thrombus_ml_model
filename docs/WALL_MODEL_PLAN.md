@@ -5021,3 +5021,84 @@ goal-split question becomes unavoidable.
 
 Handoff rewritten accordingly: `docs/PHASE3_HANDOFF.md`, now Phase 3/4/5 with the bandaid stated
 up front (0a), the feasibility measurement as 1.5a, and Phase 5 as its own section (4a).
+
+## 26.19 WHY generalization fails, measured — ranking transfers, the LEVEL does not
+
+The question "we know the physics, so why can't we generalize?" now has an evidence-based answer,
+and it is not the one the project has been assuming.
+
+### 1. Within a vessel, ranking is fine. Across vessels, the operating point is unknowable.
+
+```
+mean best-single-feature AUC, within vessel : 0.884
+base rate across the 35 vessels             : 2.1% .. 21.2%   (10x)
+```
+
+**Nothing at t=0 predicts how much clot a vessel will develop.** Over 225 vessel-level t=0
+aggregates (mean / q25 / std of every deploy-legal feature over the band):
+
+```
+best |rho| vs base_rate, 225 real aggregates  : 0.513
+best |rho| vs base_rate, 225 RANDOM vectors   : 0.513   <- identical
+```
+
+The best "predictor" is exactly what a random search of the same size finds. And the physics does
+not rescue it -- the fraction of band nodes with a gate open at t=0:
+
+```
+rho(frac low-shear gate open,  base_rate) = -0.054
+rho(frac separation gate open, base_rate) = +0.037
+rho(frac either gate open,     base_rate) = -0.055
+```
+
+**This single fact explains a decade of this project's symptoms**: 2.7/2.9's "no gate threshold
+works on `patient037`", 9.10's mass-rejection of every epoch, Phase 1's mass collapse from 3.06 to
+0.43, T5's faster collapse, and the existence of the mass selection guard at all. You can rank
+nodes within a vessel; you cannot know where to cut. At a ~7% base rate, precision is exquisitely
+sensitive to exactly the thing that does not transfer.
+
+### 2. The gate is open nearly half the time
+
+```
+low-shear gate open on  45.6%  of band nodes (mean)
+separation gate open on  0.9%
+...but only ~7% of band nodes ever commit
+```
+
+The dominant gate is **necessary-ish and wildly insufficient**. Whatever selects ~7% out of the
+45.6% with an open gate is not the gate, and at t=0 we have not found it.
+
+### 3. There is no cohort-wide physics feature
+
+**13 different features win across 35 vessels** (26.18's ceiling run): pressure 5x, a boundary
+condition 5x, `speed_nd` 5x, and a **raw y-coordinate 5x**. A raw coordinate beating every physics
+feature on a vessel means the ranker is finding *where in this vessel*, not *why*. Each vessel has
+its own accidental best correlate; that is the generalization failure made visible.
+
+### 4. t=0 -> final clot is an ignition map, not a regression
+
+10.1: ~90% of Mat growth is the autocatalytic `(Mas/Minf)*k_aa*ap` term. Autocatalysis is a
+bifurcation -- a node marginally above threshold runs away, marginally below never starts -- so
+small t=0 differences become binary outcome differences. 20.4 measured exactly this degradation:
+t=0 features predict the **t=20 seeds at AUC 0.903** but the **final map at 0.806**.
+
+### 5. "Before clot affects flow" holds only for initiation
+
+10.1: clot "ignites progressively, not as a switch", with within-vessel onset spread (p90-p10)
+averaging **0.346 of the horizon**, and `mu1(Mat)` steps viscosity 1 -> 80 at commitment. Over a
+third of the run, already-committed nodes are changing the flow that uncommitted nodes see. The
+t=0 field describes the initial gate state, not the field during growth.
+
+### What this means for Phase 3 -- and it is the strongest argument for the physics model yet
+
+The physics model's value is **not** better ranking. Ranking is already 0.884 and is not the
+bottleneck. Its value is that **the level might emerge instead of being predicted**: a learned
+model must choose an operating point that 26.19.1 shows is unknowable from t=0, whereas the law
+sets the amount dynamically through saturation `Sat = 1 - M_tot/Minf`, the `Da` rate scale, and
+the finite horizon. Mass conservation replaces a threshold nobody can transfer.
+
+**Whether the integrated law actually reproduces the per-vessel level is exactly Step 0, and it is
+unanswered.** That is now the single most valuable measurement in the project: not "does the law
+rank correctly" (we know ranking is adequate) but **"does the law get the AMOUNT right per
+vessel"**. If it does, generalization follows and the >0.6 projection in 26.18 is conservative. If
+it does not, no architecture fixes it and the goal needs restating against 20.5's split.

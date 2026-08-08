@@ -193,8 +193,10 @@ support the gates" moves to **Phase 5** (§4a). Phase 3's Step 0 is the end-to-e
 > **Integrate `j0_mat_si` forward using t=0 gates, `rp`/`ap` held at their measured constants, and
 > the autocatalytic `Mas` feedback. Does the resulting `Mat` trajectory match GT?**
 
-Run it per vessel and report correlation and relative error against GT `Mat`, plus the resulting
-`deploy_clot_score`. This is the whole plan in one measurement, and it is CPU-only.
+Run it per vessel and report **the predicted committed-node count and mass ratio against GT**,
+not merely correlation — §1.5c explains why the level, not the ranking, is the thing being
+tested. Also report the resulting `deploy_clot_score`. This is the whole plan in one measurement,
+and it is CPU-only.
 
 What it distinguishes:
 
@@ -279,10 +281,74 @@ The honest objective for Phase 3 is therefore **not** "add 0.09 to 0.463 and hop
 right mechanism makes the gain consistent, the target is reachable. If the gain stays
 vessel-dependent, it is not, and §20.5's goal-split question becomes unavoidable.
 
+### 1.5b WHY GENERALIZATION FAILS — measured. Ranking transfers; the LEVEL does not.
+
+This is the most important section in the document. "We know the physics, so why can't we
+generalize?" has an answer, and it is not the one the project assumed (§26.19).
+
+**Within a vessel, ranking is fine. Across vessels, the operating point is unknowable.**
+
+```
+mean best-single-feature AUC, within vessel : 0.884
+base rate across the 35 vessels             : 2.1% .. 21.2%   (10x)
+
+best |rho| vs base_rate over 225 real t=0 aggregates : 0.513
+best |rho| vs base_rate over 225 RANDOM vectors      : 0.513   <- identical
+```
+
+**Nothing at t=0 predicts how much clot a vessel develops** — the best "predictor" is exactly what
+a random search of the same size finds. And the physics does not rescue it:
+
+```
+rho(frac low-shear gate open,  base_rate) = -0.054
+rho(frac separation gate open, base_rate) = +0.037
+```
+
+**This one fact explains the project's whole symptom list**: §2.7/§2.9's "no gate threshold works
+on `patient037`", §9.10's mass-rejection of every epoch, Phase 1's mass collapse 3.06 → 0.43, T5's
+faster collapse, and why a mass selection guard exists at all. You can rank nodes within a vessel;
+you cannot know where to cut. At a ~7% base rate, precision is exquisitely sensitive to exactly
+the quantity that does not transfer.
+
+**Three supporting facts:**
+
+* **The gate is open nearly half the time.** Low-shear gate open on **45.6%** of band nodes, and
+  only ~7% ever commit. The dominant gate is necessary-ish and wildly insufficient; whatever
+  selects 7% out of that 45.6% is not the gate.
+* **13 different features win across 35 vessels** — pressure 5×, a boundary condition 5×,
+  `speed_nd` 5×, and a **raw y-coordinate 5×**. A coordinate beating every physics feature means
+  the ranker found *where in this vessel*, not *why*.
+* **t=0 → final is an ignition map, not a regression.** ~90% of growth is autocatalytic, which is
+  a bifurcation: marginally-above runs away, marginally-below never starts. §20.4 measured the
+  degradation directly — t=0 predicts the **t=20 seeds at 0.903** but the **final map at 0.806**.
+  And "before clot affects flow" holds only for initiation: §10.1 puts within-vessel onset spread
+  at **0.346 of the horizon**, with `mu1(Mat)` stepping viscosity 1→80 at commitment, so for a
+  third of the run committed nodes are changing the flow uncommitted nodes see.
+
+### 1.5c THEREFORE — what the physics model is actually for
+
+**Not better ranking.** Ranking is already 0.884 and is not the bottleneck.
+
+**The level should EMERGE rather than be predicted.** A learned model must choose an operating
+point that §1.5b shows is unknowable from t=0. The law sets the amount dynamically — through
+saturation `Sat = 1 − M_tot/Minf`, the `Da` rate scale, and the finite horizon. **Mass
+conservation replaces a threshold nobody can transfer.** That is the mechanism by which a
+physics-mirroring model could generalize where fifteen learned legs did not.
+
+**So Step 0's real question is not "does the law rank correctly" — it is "does the law get the
+AMOUNT right, per vessel".** Report per-vessel predicted vs GT committed-node count and mass
+ratio, not just correlation. If the levels match, generalization follows and §1.5a's 0.597
+projection is conservative, because that projection assumed the ranking-plus-rollout path rather
+than a physically-set level. If the levels do not match, no architecture fixes it, and the goal
+must be restated against §20.5's split.
+
 ### 1.6 Kill criteria
 
 * **Step 0 fails** (law + GT species does not reproduce GT `dMat`) → the premise is wrong; stop
   and report rather than tuning around it.
+* **Step 0's forward model gets the LEVEL wrong per vessel** (§1.5c) → the law does not supply
+  the operating point either, and since §1.5b shows nothing else does, the >0.6 goal is not
+  reachable from t=0 and must be restated against §20.5's split.
 * **Step 0's forward model has the wrong spatial pattern** (§1.5) → t=0 gates are insufficient
   because the flow evolves with the clot; the coupled flow is needed even under the bandaid.
 * **The learned correction needs real capacity to close the residual** → the physics framing is
