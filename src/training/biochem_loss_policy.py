@@ -296,9 +296,18 @@ class ActiveGrowthHuberLoss(nn.Module):
 
         losses: list[torch.Tensor] = []
         beta = self.beta
+        # s26 T4(c): the FP branch selects `p_raw > max(fp_threshold, delta_thresh)` = 2e-5 by
+        # default, against predicted deltas that log at ~1e-7 (val_pred_delta). s12.6.2 argued
+        # from a MEAN that the branch selects no nodes, which a mean cannot establish. These
+        # counters measure the selection directly, per channel, in the training path.
+        fp_n = [0] * n_ch
+        active_n = [0] * n_ch
+        pred_max = [0.0] * n_ch
         for ch in range(n_ch):
             thr_raw = self._channel_thr(ch)
             active = t_raw[:, ch] > thr_raw
+            active_n[ch] = int(active.sum().item())
+            pred_max[ch] = float(p_raw[:, ch].max().item())
             if bool(active.any().item()):
                 losses.append(
                     ch_w[ch]
@@ -323,6 +332,7 @@ class ActiveGrowthHuberLoss(nn.Module):
                 st = current_log_state.reshape(-1, current_log_state.shape[-1])[m]
                 mature = st[:, ch] >= (self.mature_frac * float(self.mature_max_log[ch]))
                 fp = fp & (~mature)
+            fp_n[ch] = int(fp.sum().item())
             if bool(fp.any().item()):
                 element_loss = F.huber_loss(
                     p[fp, ch],
@@ -339,6 +349,29 @@ class ActiveGrowthHuberLoss(nn.Module):
                     * self.fp_weight
                     * element_loss.mean()
                 )
+        self._record_fp_branch(fp_n, active_n, pred_max)
         if not losses:
             return pred_delta.sum() * 0.0
         return torch.stack(losses).mean()
+
+    def _record_fp_branch(
+        self,
+        fp_n: Sequence[int],
+        active_n: Sequence[int],
+        pred_max: Sequence[float],
+    ) -> None:
+        """Report FP-branch selection to the loss accounting (s26 T4(c)).
+
+        Lazy import: `species_pushforward_continuous` imports THIS module, so a top-level
+        import here would be circular. Gated by `set_loss_accounting`, so it is silent
+        outside the training path and costs a dict lookup when off.
+        """
+        try:
+            from src.core_physics.species_pushforward_continuous import record_loss_term
+        except Exception:
+            return
+        for ch, (n_fp, n_act, p_mx) in enumerate(zip(fp_n, active_n, pred_max)):
+            record_loss_term(f"diag_fp_nodes_ch{ch}", float(n_fp))
+            record_loss_term(f"diag_active_nodes_ch{ch}", float(n_act))
+            record_loss_term(f"diag_pred_max_ch{ch}", p_mx)
+        record_loss_term("diag_fp_thresh", float(max(self.fp_threshold, self.delta_threshold)))

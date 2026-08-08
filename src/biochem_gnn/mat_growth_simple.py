@@ -225,6 +225,8 @@ LADDER_LEG_ORDER: tuple[str, ...] = (
     "WG_phase2b_nobrake",
     "WG_phase3a_closedloop",
     "WG_phase3b_zkin_ablate",
+    "WG_t1a_perstep_only",
+    "WG_t1b_rolledf1_only",
 )
 
 # Full-length clot-rich anchors (T=201, off-wall >=30%) from docs/GENERALIZATION_PLAN.md EDA.
@@ -1517,6 +1519,119 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "latent_ablate": True,
             },
             runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # =================================================================================
+        # s26 T1 -- the single-term ablation pair. THE question these answer:
+        #
+        #   is the per-step block the attractor?
+        #
+        # s25.1 measured two materially different objectives ending 26% as far APART as
+        # either moved from the shared warm start -- ~3/4 of the weight update is common to
+        # both. Five interventions, five nulls, and every one of them edited a term OUTSIDE
+        # the per-step block, which is 72% of the loss and the only term measured to move the
+        # model. Rather than guess a sixth, these two legs cut the objective in half along
+        # that seam and run each half alone.
+        #
+        # Read: if A alone reproduces the 3a/Phase-1 rollout (mass ~3.06-3.08, fp ~242-244 at
+        # ep1), the per-step block IS the attractor, every objective edit outside it is
+        # futile, and the search moves to parameterisation (T3, unfreeze the backbone). If A
+        # and B diverge strongly, the objective is steerable after all and the five nulls need
+        # re-examining.
+        #
+        # THREE live term families were found unaccounted while wiring this (s26): the
+        # per-step phi/mu readout (weights 1.0 / 0.25), the FINAL phi/mu readout (same
+        # weights x0.5), and the speed-FP bleed (weight 4.0). None was recorded by the s23.7
+        # decomposition, so `per_step_block = 72%` was never purely the growth Huber. Both
+        # legs switch them off (`physics_readout=False`, `speed_fp_weight=0.0`) so that "the
+        # per-step growth Huber alone" is literally true, and both are now recorded so the
+        # next decomposition sees them.
+        "WG_t1a_perstep_only": MatGrowthLegSpec(
+            code="WG_t1a_perstep_only",
+            label="s26 T1 leg A: per-step growth Huber + spatial ONLY -- every rolled-state "
+                  "and readout term off",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_beta": 0.5,
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                "closed_loop_init": 1.0,
+                # --- the ablation: everything except the per-step block, off ---
+                "per_step_weight": 1.0,
+                "rolled_soft_f1_weight": 0.0,
+                "step_soft_f1_weight": 0.0,
+                "final_state_weight": 0.0,
+                "physics_readout": False,
+            },
+            runtime_kwargs={
+                **_SUBCOHORT_RUNTIME_V11PLUS,
+                "prior_source": "analytic",
+                "speed_fp_weight": 0.0,
+            },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # Leg B is leg A's exact complement: the per-step block off, the rolled soft-F_beta
+        # surrogate alone. Kept at 3a's weight (120) and beta (0.5) so a difference is
+        # attributable to the ablation and not to a resized surrogate. NB s26 T5: `loss_scale`
+        # does NOT multiply the per-step block, so 120 has always been implicitly /10 against
+        # the term it competes with -- which is exactly the comparison this leg removes.
+        "WG_t1b_rolledf1_only": MatGrowthLegSpec(
+            code="WG_t1b_rolledf1_only",
+            label="s26 T1 leg B: rolled soft-F_beta ONLY -- the per-step block off",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_beta": 0.5,
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                "closed_loop_init": 1.0,
+                # --- the ablation: the per-step block off, the surrogate alone ---
+                "per_step_weight": 0.0,
+                "rolled_soft_f1_weight": 120.0,
+                "step_soft_f1_weight": 0.0,
+                "final_state_weight": 0.0,
+                "physics_readout": False,
+            },
+            runtime_kwargs={
+                **_SUBCOHORT_RUNTIME_V11PLUS,
+                "prior_source": "analytic",
+                "speed_fp_weight": 0.0,
+            },
             env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
         ),
         # v8 = v7 + the soft-F_beta rolled-state surrogate (s12.5 change E). The brake, even

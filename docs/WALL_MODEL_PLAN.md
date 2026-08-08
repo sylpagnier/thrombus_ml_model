@@ -3944,3 +3944,375 @@ repair, and beta is a metric-matching correction. The one behavioural variable i
 asserted in a test so it cannot drift.
 
 Suite: **575 passed**.
+
+# 25. Handoff — state, the central finding, and what to do next (2026-08-08)
+
+All processes stopped. `WG_phase3a_closedloop` reached 2 of 4 epochs; its salvage checkpoint is
+retained at `outputs/biochem/eda/phase3/WG_phase3a_closedloop/`.
+
+## 25.1 THE central finding: different objectives converge to the same weights
+
+Two materially different loss configurations, one epoch each, same warm start:
+
+```
+||Phase1cfg - warm|| / ||warm||   = 0.3058     both move ~30% from the warm start
+||3a cfg    - warm|| / ||warm||   = 0.3016
+||Phase1cfg - 3a cfg|| / ||warm|| = 0.0795     but end only 26% as far APART as either moved
+```
+
+**About three-quarters of the weight update is common to both objectives.** The trainable heads
+move substantially — a "the model is frozen" hypothesis was tested and rejected, relative
+movement across all legs on record runs 0.24-1.35 — but they move to nearly the *same place*
+regardless of what the loss says.
+
+This is the unifying explanation for every null in sections 12, 23 and 24:
+
+| intervention | loss change | rollout change |
+|---|---|---|
+| v4 `fp_weight` 6->16 | none (bit-identical) | none |
+| v5 aux horizon 40->150 | none | none |
+| v6 unroll 5->25 | +21% magnitude | none |
+| Phase 2b brake removed | -11.1% | ~1% (epochs 2-3 identical to 4 dp) |
+| Phase 3a `closed_loop_init` 0.45->1.0 | -9.2% | ~0% (epochs 1-2 identical to 4 dp) |
+
+Five interventions, five nulls, one mechanism.
+
+## 25.2 What Phase 0 and 1 actually achieved
+
+Real and measurable, and it should not be lost in the nulls above:
+
+* the `fp~292` attractor is **gone** — Phase 1 visited **10 distinct fp states** (25-242) where
+  every leg v3-v10 visited 2;
+* **four epochs passed selection**, against **zero** across v2-v10 combined;
+* the metric has one canonical implementation (20.1) and labels are per-vessel (21.2);
+* **reproducibility exists** — Phase 2a matched Phase 1 to 4 decimals for 4 epochs;
+* nine dead constants found and either fixed or documented.
+
+Best in-training deploy score to date: **0.4889** (Phase 1 epoch 6, mass 2.062). The zero-shot
+warm start remains the best *deployed* configuration on a held-out vessel.
+
+## 25.3 The one thing that is NOT yet explained
+
+`per_step_block` is 72% of the loss, is the only term that moves the model, and correlates with
+deploy score at **rho = +0.119** (n=8). Every intervention so far has edited the other 28%.
+That is the gap between "we understand why nothing worked" and "we know what will".
+
+## 25.4 Ranked next steps
+
+1. **T1 — single-term loss ablations.** Per-step Huber ONLY vs soft-F_beta ONLY, 1-2 epochs
+   each (~50 min). Directly tests whether the per-step block is the attractor. If leg A alone
+   reproduces the Phase-1 rollout (mass ~3.06, fp ~242 at ep1), every objective edit outside
+   that block is futile and the search moves to parameterisation.
+2. **T2 — `z_kin` ablation.** Wired, tested, unrun, one command. 256 of 287 input dims against
+   a flow channel Z1 measured at 0.041 AUC.
+3. **T3 — unfreeze the backbone.** Never tried in 13 legs. 24% of params train; the reachable
+   set may simply be too small for any objective to distinguish itself, which would explain
+   25.1 directly.
+4. **T4 — rethink the per-step block.** Check `fp_thresh` inertness FIRST (5 minutes; if the FP
+   branch selects no nodes then `fp_weight` is unreachable and (b) is moot), then the 2:1
+   suppression weighting.
+5. **T5 — `loss_scale` asymmetry.** Rolled terms are implicitly /10 against the per-step block.
+   Cheap, and it invalidates the 12.6.6 surrogate sizing that assumed comparability.
+
+## 25.5 Closed — do not reopen
+
+* **The brake.** Dead (12.6.1) -> revived (Phase 0) -> still inert (24.1, removing it moved the
+  rollout ~1%). Mechanism understood: rolled terms attach to a 5-step window that begins near
+  GT, so the penalty sits at its floor against a per-step Huber with 5x the terms. No payoff in
+  further investigation.
+* **Mass in the loss.** `deploy_clot_score` is relaxed precision gated by a recall floor; a mass
+  target optimises what the metric does not reward. Survives as a selection guard only.
+* **Regime routing** (13.4, all six cohort vessels are normal-regime), **change-B objective
+  reweighting** (12.3, three failed specifications), **shear decoding** (Z4, +/-0.001).
+
+## 25.6 Two corrections carried forward
+
+Both are mine, and both were stated confidently before being checked:
+
+* **`closed_loop_init` is NOT dead.** It is consumed at
+  `train_species_pushforward_continuous.py:1334` and already started 45% of windows from the
+  model's own rolled state. The claim that "every window starts from GT" was wrong, and it was
+  the basis for ranking the state-distribution hypothesis first.
+* **Per-term loss shares were inflated ~4.9x** by a denominator bug (24.2). The brake is 11.1%
+  of the loss, not 54.3%. Signs survive; magnitudes do not. `set_loss_accounting()` now gates
+  recording to the training path, but shares should still be verified by removal rather than
+  read directly.
+
+# 26. T7/T4(c)/T5 findings and the T1 ablation pair (2026-08-08)
+
+## 26.1 Standing constraints, re-verified before anything ran (T7)
+
+* Sealed set resolves to exactly the eight of 21.1 and is **disjoint** from
+  `WALL_COHORT_V2_TRAIN` (26). `patient041` is in the train constant and the launcher removes it
+  when it is the val anchor, so a run sees 25 train vessels. Neither junk vessel is present.
+* `go_phase1_baseline.ps1` refuses a sealed `-ValAnchor` (line 49) and re-checks the train list
+  against the seal, the junk list and a minimum size after resolution.
+* `test_s24_legs_are_single_variable_against_each_other` still pins 3a vs 3b to `latent_ablate`.
+* GPU idle at launch (0 MiB / 0%); one leg at a time, per the 650s -> 1900s contention result.
+
+## 26.2 T4(c): the FP branch selects no nodes, now measured rather than inferred
+
+12.6.2 argued the FP branch was unreachable from a **mean** predicted delta of ~1e-7 against
+`fp_thr = max(fp_thresh=2e-5, delta_thresh=5e-6) = 2e-5`. A mean cannot establish that, because
+the branch fires on the tail: `fp = (~gt_active) & (p_raw > fp_thr)` selects any single node
+over the threshold.
+
+What is now established:
+
+* every logged `val_pred_delta` across all ten Phase-1 epochs and both Phase-3a epochs lies
+  between **4.5e-8 and 5.2e-7** — 40x to 450x below the threshold;
+* `ActiveGrowthHuberLoss` now counts its own selection. At 3e-7 with everything GT-inactive the
+  count is **0**; at 5e-5 it is the full node set, so the counter is not stuck
+  (`test_fp_branch_selection_is_counted_and_is_empty_at_realistic_deltas`);
+* the counters (`diag_fp_nodes_ch*`, `diag_active_nodes_ch*`, `diag_pred_max_ch*`,
+  `diag_fp_thresh`) are recorded through the existing accounting, so every future leg reports
+  the **tail** statistic `diag_pred_max` in its train log and the question closes empirically.
+
+`fp_weight=6.0` therefore multiplies an empty set, and **T4(b) is moot as stated**: the 2:1
+suppression ratio of `fp_weight=6.0` against `underpred_weight=3.0` does not exist, because only
+`underpred_weight` is reachable. The per-step block's suppression pressure comes from
+`gate_fp_weight=4.0` (the BCE gate branch, live and unthresholded) — not from `fp_weight`.
+
+## 26.3 A tenth dead constant, and three live terms nobody was accounting for
+
+Found while wiring T1. Under the cohort runtime, **not** the dataclass defaults:
+
+| term | site | weight | recorded by 23.7? |
+|---|---|---|---|
+| per-step gelation phi | inside the per-step block | **20.0** | no — hidden inside `per_step_block` |
+| final gelation phi | added after `per_step_block` is recorded | **10.0** (20 x 0.5) | **no — in no term at all** |
+| speed-FP bleed | added last | **4.0** | **no — in no term at all** |
+| per-step / final mu | both | 0.0 | inert |
+
+`physics_readout=True` on `WG_phase1_baseline` and `WG_phase3a_closedloop`, so all three were
+live for every Phase-1/2/3 number. This is a second, independent reason the 23.7 shares cannot
+be read directly, on top of the 24.2 denominator bug: the recorded terms did not sum to the
+total. All five are now recorded (`step_phi`, `final_phi`, `step_mu`, `final_mu`,
+`speed_fp_bleed`), and both T1 legs switch them off so that "the per-step growth Huber alone" is
+literally true.
+
+## 26.4 T5: the `loss_scale` asymmetry is real, and it is a dual-head regression
+
+`loss_scale`=0.1 multiplies every rolled term at its own site — `rolled_soft_f1_loss`,
+`rolled_final_mass_fp_penalty`, the final-state Huber. It also multiplies the per-step loss in
+`continuous_delta_loss`. But `continuous_delta_loss` is the **single-head** path; every cohort
+leg runs `dual_head=True`, and `dual_head_step_loss` never picked the scale up.
+
+So the asymmetry is not a design choice — it is a constant that was correct for one path and was
+not carried to the path that replaced it, which is the same shape as the other ten. Consequence:
+every weight ever set on a rolled term has been implicitly **/10** against the only term measured
+to move the model, `rolled_soft_f1_weight=120` included. **12.6.6's "120 = 8.2x the noise floor"
+is invalid** — the realised multiplier was 0.82x.
+
+Wired as `loss_scale_unified`, **off by default**, applying `1/loss_scale` to the rolled terms
+where they are summed. Cancelling on the rolled side rather than scaling the per-step block down
+leaves the dominant term's gradient magnitude untouched, so turning it on does not silently
+recalibrate the learning rate. It is off in all four live legs, asserted in
+`test_live_legs_have_not_silently_adopted_the_unified_scale`, and the asymmetry itself is pinned
+by `test_loss_scale_reaches_rolled_terms_but_not_the_dual_head_block` so a future edit cannot
+move a term across the seam unnoticed. The re-derived surrogate weight needs T1's measured term
+magnitudes and is deliberately not guessed here.
+
+## 26.5 A correction: 25.1's convergence number is an EPOCH-1 measurement
+
+25.1's method now has a script (`scripts/diag_ckpt_weight_geometry.py`) and reproduces its 3a
+figure exactly (**0.3016**). Its Phase-1 figure does not reproduce from the artifacts on disk:
+
+```
+||Phase1 best.pth - warm|| / ||warm|| = 0.5190   [epoch 4, the SELECTED checkpoint]
+||3a     best.pth - warm|| / ||warm|| = 0.3016   [epoch 1]
+||Phase1 - 3a||   / ||warm||          = 0.3447   -> 84% of how far they each moved
+```
+
+25.1 compared two **epoch-1** checkpoints; Phase 1's epoch-1 state is no longer on disk, having
+been overwritten by later best-saves. The 84% above is **confounded** — epoch 4 against epoch 1
+measures training time as much as objective — and is not evidence against 25.1. But it does
+bound its scope: *"different objectives converge to the same weights" is established for the
+first epoch, and for nothing beyond it.* The script now prints each checkpoint's epoch and warns
+on a mismatch, because that confound is invisible in the norms themselves.
+
+## 26.6 T1 as wired
+
+`WG_t1a_perstep_only` and `WG_t1b_rolledf1_only`, both from the `WG_clotrich_nplus` warm start,
+2 epochs each, run strictly one at a time. They differ from each other by exactly two knobs —
+`per_step_weight` (1.0 / 0.0) and `rolled_soft_f1_weight` (0.0 / 120.0) — which is the seam, and
+by nothing else (`test_t1_legs_are_exact_complements`). Everything off the seam is zero in both:
+the four mass penalties, `step_soft_f1_weight`, `final_state_weight`, `physics_readout`, and
+`speed_fp_weight`.
+
+`per_step_weight` is new. The per-step block was the only term in the objective without a weight
+knob, which is why the complementary ablation had never been reachable; 1.0 is the historical
+behaviour exactly.
+
+Mechanism verified engaged in leg A's fingerprint before trusting anything: `per_step_weight=1.0`,
+`rolled_soft_f1_weight=0.0`, `step_soft_f1_weight=0.0`, `final_state_weight=0.00`,
+`physics_readout=False`/`physics=0`, `speed_fp_weight=0.0`, `closed_loop_init=1.00`,
+`prior_source=analytic`, `frozen=32 trainable_heads=8`. Note the fingerprint's env-var block is a
+stale legacy echo (it prints `CLOSED_LOOP_INIT=0.45`, `FP_WEIGHT=8`, `FINAL_STATE_WEIGHT=0.35`);
+the `config_kwargs`/`runtime_kwargs` blocks below it are the live values.
+
+Both legs run 2 epochs, so `last.pth` gives a **matched-epoch** A-vs-B comparison — which
+26.5 shows is the only kind worth computing.
+
+## 26.7 An eleventh dead mechanism, and it is in the DEPLOY path
+
+Surfaced by leg A's log, not by looking for it:
+
+```
+[WARN] Failed to initialize closed-loop flow coupler in deploy rollout: Error(s) in loading
+state_dict for LocalKinematicCorrector:
+  size mismatch for readout.2.weight: copying a param with shape torch.Size([2, 64]) from
+  checkpoint, the shape in current model is torch.Size([3, 64]).
+```
+
+Commit `9eba0db` (2026-08-06 23:57, "add dShear output to local kinematic corrector") widened
+`LocalKinematicCorrector.readout[-1]` to `nn.Linear(hidden_dim, 3)` for `[dU, dV, dShear]`. The
+only corrector checkpoint on disk,
+`outputs/kinematics/local_corrector/local_kinematic_corrector_best.pth`, still has
+`readout.2.weight` at `(2, 64)`. `load_local_corrector` loads strictly, so it raises; both call
+sites (`species_pushforward_continuous.py:4268`, `species_gnn_clot_rollout.py:360`) catch it,
+print a WARN, and leave `coupler = None`. The rollout then falls through to uncoupled flow.
+
+The path is gated by `SPECIES_CLOSED_LOOP_COUPLING == "1" or flow_source == "auto"`, and every
+cohort leg runs `flow_feats_source: "auto"` — so it is attempted, and fails, on **every run since
+2026-08-06**. Same shape as the other ten: a mechanism widened at one point, its stored artifact
+left at the old width, failing silently into a fallback.
+
+**The comparability consequence is the serious part.** The zero-shot benchmark — `patient043`
+`deploy_clot_score = 0.6925`, `outputs/biochem/eda/commit_order/eval_p043_gate25.json`, dated
+**2026-08-05**, `flow_feats_source: auto` — was measured while the coupler still **loaded**.
+Every Phase 1, Phase 2 and Phase 3 number was measured with it **off**. So the standing headline,
+*"thirteen fine-tune legs have not beaten the zero-shot warm start"*, spans an unrecorded change
+in the deploy path. That does not make the gap spurious, but it does mean the two sides of it
+were not measured by the same rollout, and 22's re-baseline rule needs a second clause:
+
+> Numbers from before 2026-08-06 were produced with closed-loop flow coupling ON. Numbers from
+> Phase 1 onward were produced with it OFF. They are not directly comparable either.
+
+**Not fixed here, deliberately.** The breakage is byte-identical across Phase 1, Phase 3a and both
+T1 legs, so every comparison *within* that set is valid; changing the deploy path mid-experiment
+would invalidate the only clean A/B this study has. Queued as its own task. When it is fixed, the
+fix must not be `strict=False` — that would leave the dShear head at its init and silently alter
+the flow correction instead of restoring it — and the failure must stop being a WARN, because a
+caught exception that disables a deploy mechanism is exactly what let this run for two days.
+
+## 26.8 T1 RESULT — the per-step block is the attractor, and the objective IS steerable
+
+Both legs, 2 epochs each, warm start `WG_clotrich_nplus`, one at a time. Mechanism verified
+engaged in both fingerprints before any number was read; leg B additionally logged
+`per_step_block_eff = 0` and `final_soft_f1 = 11.46`, so the ablation is confirmed from inside
+the loss and not only from the config.
+
+### Epoch 1 — the four legs are genuinely different
+
+| leg | score | mass | fp | rprec | val_dlt | seeds | front |
+|---|---|---|---|---|---|---|---|
+| Phase 1 | 0.4104 | 3.062 | 242 | 0.408 | 2.19e-07 | 2.0 | 2.81 |
+| 3a | 0.4056 | 3.080 | 244 | 0.402 | 2.10e-07 | 2.0 | 2.73 |
+| leg A (per-step only) | 0.4353 | 2.743 | 206 | 0.437 | 2.00e-07 | 2.0 | 2.44 |
+| **leg B (surrogate only)** | **0.2660** | **4.451** | **399** | **0.253** | **1.69e-06** | **69.0** | **5.02** |
+
+### Epoch 2 — the split is exactly "does the objective contain the per-step block?"
+
+| leg | per-step block | `deploy_clot_score` | `deploy_clot_mass_ratio` | fp |
+|---|---|---|---|---|
+| Phase 1 | yes | 0.3706237861441937 | 2.7079646017699117 | 202 |
+| 3a | yes | 0.3706237861441937 | 2.7079646017699117 | 202 |
+| leg A | yes | 0.3706237861441937 | 2.7079646017699117 | 202 |
+| **leg B** | **no** | **0.35997755749156174** | **2.7964601769911503** | **212** |
+
+Three objectives sharing almost nothing except the per-step block produce a **bit-identical**
+committed set — 17 significant figures, same fp, same fn, same relaxed precision — having
+started epoch 1 apart (fp 242 / 244 / 206). The one leg without it does not join them.
+
+This is not a pinned metric: Phase 1 visits ten distinct fp states (25-242) and six distinct fn
+states (9-91) across its ten epochs. Nor is it a saturated rollout: saturation would have been
+identical at epoch 1 too, and it was not.
+
+### Weight geometry, matched epoch (both legs at ep 2, so 26.5's confound does not apply)
+
+```
+||legA - warm|| / ||warm|| = 0.3625
+||legB - warm|| / ||warm|| = 0.5467
+||legA - legB|| / ||warm|| = 0.5812   ->  128% of their mean movement
+```
+
+Above 100% means the separation exceeds the average distance travelled — the two updates point
+in **obtuse** directions. Set against 25.1's 26% for Phase-1-cfg vs 3a-cfg, the contrast is the
+whole result:
+
+| pair | differs by | separation |
+|---|---|---|
+| Phase1 cfg vs 3a cfg (25.1) | rolled terms only, all /10-suppressed | 26% — convergent |
+| leg A vs leg B | whether the per-step block is present | **128% — near-opposite** |
+
+### The verdict, and the reconciliation
+
+Both branches of T1's pre-registered read turn out to be half right, and they fit together:
+
+1. **The per-step block is the attractor.** Every objective containing it lands on the same
+   committed set regardless of what else is in the loss. Every objective edit *outside* it is
+   futile — the five nulls, plus leg A's epoch-2 identity, are six instances of one fact.
+2. **The objective is nevertheless steerable — but only through that block.** Removing it moves
+   the model enormously and in the opposite direction. "The model cannot be steered" was never
+   true; the interventions on record were simply never applied where the gradient lives.
+
+25.1's convergence measurement is now explained rather than overturned: it compared two
+objectives that differ *only* in rolled terms, and 26.4 shows those terms had always been
+implicitly **/10** against an unscaled per-step block. They converged because neither had
+actually changed the objective by much. Together with T4(c) — `fp_weight` multiplying an empty
+set — every one of the five nulls edited a term that was either **dead** or **/10-suppressed**.
+
+### A second result: change E's surrogate steers AWAY from the metric
+
+Leg B is the soft-F_beta surrogate alone — "the deploy metric itself, softened", the only term in
+the objective with a TP numerator (12.6.4). Run alone it produces the **worst** score of the four
+legs (0.266 at ep1), by overpainting to mass 4.45 at precision 0.253 with 69 seeds against
+everyone else's 2. It does this at `rolled_soft_f1_beta=0.5`, already tilted toward precision, so
+beta is not the fault — the soft-occupancy relaxation is. Raising predicted Mat everywhere grows
+soft-tp faster than soft-fp, so the term rewards blanket growth, and the per-tensor movement says
+where it goes: `spatial_head.2.bias` — the single scalar governing global commit propensity —
+moves **46x** its warm-start norm in leg B against 6.1x in leg A.
+
+Caveat, held deliberately: leg B also removed the only term with direct per-node supervision, so
+some of the overpainting is "no anchor" rather than "bad surrogate". What is established is that
+the surrogate steers hard and steers the wrong way; that it is *solely* responsible is not.
+
+### What this means for the ranked next steps
+
+* **T3 (unfreeze the backbone) loses its motivating premise.** It was ranked on 25.1 — "the
+  reachable set may be too small for any objective to distinguish itself". Leg A vs leg B at 128%
+  separation shows the head-only parameterisation distinguishes objectives just fine. T3 may
+  still help, but not for that reason.
+* **T5 is promoted from cleanup to the leading candidate.** `loss_scale_unified` is wired and
+  off; turning it on is the one-variable leg that lets a rolled term compete with the per-step
+  block for the first time. It is now the cheapest test of whether the objective can be steered
+  *toward* the metric rather than merely away from it.
+* **T4 becomes "reshape the per-step block", and 4(b) is dead** — `fp_weight` is unreachable
+  (26.2). The live suppression knob is `gate_fp_weight=4.0`; the live growth knob is
+  `underpred_weight=3.0`. Those two, and `channel_weight_mat=8.0`, are where the gradient is.
+* **Change E needs re-specification before it is trusted anywhere**, surrogate weight included.
+  Re-deriving that weight was T5's open item; leg B says the term's *shape* is the problem, not
+  only its scale.
+
+### 26.8.1 Cold-eval numbers and retention
+
+`eval_val_cold.json` on `patient041`, the selected checkpoint of each leg:
+
+| leg | selected epoch | cold score | mass | fp |
+|---|---|---|---|---|
+| leg A | 1 (passed selection) | 0.3900 | 2.743 | 206 |
+| leg B | 2 (**salvage promotion** — `best_score=-0.001`, no epoch passed) | 0.3858 | 2.796 | 212 |
+
+Leg B's selection gate rejected both epochs, and `best_salvage.pth` was promoted as designed
+(12.6.4 item 1) — the leg still produced an artifact rather than nothing. Note the cold numbers
+land close together (0.390 vs 0.386) even though the two models are 128% apart in weight space
+and 0.435 vs 0.266 apart in-training at epoch 1. The cold eval is taken at each leg's *selected*
+epoch, not at a matched one, so it is not a like-for-like comparison and should not be read as
+"the two legs are equivalent". The matched-epoch comparison is the 26.8 table.
+
+Neither leg beats the 0.6925 zero-shot warm start — and per 26.7, that number was measured with
+the closed-loop flow coupler working while both of these were not, so the gap is not yet a
+like-for-like measurement either.
+
+Suite: **581 passed** (575 before this section, +6 guards).

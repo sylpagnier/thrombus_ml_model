@@ -254,3 +254,168 @@ def test_s24_legs_are_single_variable_against_each_other():
     assert a["rolled_soft_f1_beta"] < 1.0
     assert a["closed_loop_init"] == pytest.approx(1.0)
     assert a["final_state_value_scaled"] is True
+
+
+# --- s26 T1: the single-term ablation pair --------------------------------------------------
+
+def test_t1_legs_are_exact_complements():
+    """A and B must cut the objective along ONE seam and land on opposite sides of it.
+
+    If they ever differ by a third knob the result stops being attributable, which is how
+    v1-v6 were spent (9.12, 9.14).
+    """
+    from src.biochem_gnn.mat_growth_simple import (
+        get_mat_growth_config_kwargs as C,
+        get_mat_growth_runtime_kwargs as R,
+    )
+
+    a, b = C("WG_t1a_perstep_only"), C("WG_t1b_rolledf1_only")
+    diff = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    assert diff == {"per_step_weight", "rolled_soft_f1_weight"}, (
+        f"T1 A vs B must differ only along the per-step/rolled seam, got {diff}"
+    )
+    # Leg A: the per-step block alone.
+    assert a["per_step_weight"] == 1.0
+    assert a["rolled_soft_f1_weight"] == 0.0
+    # Leg B: the rolled surrogate alone, at 3a's unchanged weight and beta.
+    assert b["per_step_weight"] == 0.0
+    assert b["rolled_soft_f1_weight"] == 120.0
+    assert b["rolled_soft_f1_beta"] == C("WG_phase3a_closedloop")["rolled_soft_f1_beta"]
+
+    # Everything NOT on the seam must be off in both, or "only" is a lie.
+    for leg, k in ((a, k) for k in (
+        "step_mass_penalty", "step_prec_fp_penalty", "final_mass_penalty",
+        "final_prec_fp_penalty", "step_soft_f1_weight", "final_state_weight",
+    )):
+        assert leg[k] == 0.0, f"{k} must be 0 in leg A"
+    for k in ("step_mass_penalty", "step_prec_fp_penalty", "final_mass_penalty",
+              "final_prec_fp_penalty", "step_soft_f1_weight", "final_state_weight"):
+        assert b[k] == 0.0, f"{k} must be 0 in leg B"
+    # The three families s23.7 never recorded (per-step phi/mu, final phi/mu, speed-FP bleed).
+    for leg, name in ((a, "A"), (b, "B")):
+        assert leg["physics_readout"] is False, f"phi/mu readout must be off in leg {name}"
+    for leg, name in ((R("WG_t1a_perstep_only"), "A"), (R("WG_t1b_rolledf1_only"), "B")):
+        assert leg["speed_fp_weight"] == 0.0, f"speed-FP bleed must be off in leg {name}"
+
+
+def test_per_step_weight_is_wired_and_scales_the_block():
+    """`per_step_weight` must reach the summation point, not just the dataclass.
+
+    The dominant failure mode here is a knob that resolves correctly and never multiplies
+    anything -- nine dead constants on record.
+    """
+    from src.core_physics.species_pushforward_continuous import continuous_per_step_weight
+
+    with use_pushforward_config(PushforwardConfig(species_scope="mat")):
+        assert continuous_per_step_weight() == 1.0  # historical behaviour unchanged
+    with use_pushforward_config(PushforwardConfig(species_scope="mat", per_step_weight=0.0)):
+        assert continuous_per_step_weight() == 0.0
+
+    src = Path("src/core_physics/species_pushforward_continuous.py").read_text(encoding="utf-8")
+    body = src[src.index('record_loss_term("per_step_block", step_loss)'):]
+    body = body[:body.index("fw = continuous_final_state_weight()")]
+    assert "step_loss = step_loss * psw" in body, (
+        "per_step_weight must multiply the assembled block, immediately after it is recorded"
+    )
+
+
+def test_fp_branch_selection_is_counted_and_is_empty_at_realistic_deltas():
+    """s26 T4(c): does the growth Huber's FP branch select any node at all?
+
+    `fp = (~gt_active) & (p_raw > max(fp_thresh=2e-5, delta_thresh=5e-6))`, while logged
+    `val_pred_delta` runs 4.5e-8 to 5.2e-7 across every Phase-1 and Phase-3a epoch. s12.6.2
+    inferred emptiness from a MEAN, which a mean cannot establish -- this asserts the
+    selection directly, and the same counters now report it in situ from the training log.
+    """
+    from src.training.biochem_loss_policy import ActiveGrowthHuberLoss
+    from src.core_physics.species_pushforward_continuous import (
+        get_loss_terms,
+        reset_loss_terms,
+        set_loss_accounting,
+    )
+
+    n = 64
+    loss = ActiveGrowthHuberLoss(
+        delta_threshold=5e-6, beta=0.5, fp_weight=6.0, fp_threshold=2e-5,
+        value_scale=1.5e5, underpred_weight=3.0,
+    )
+    band = torch.ones(n, dtype=torch.bool)
+    gt = torch.zeros(n, 2)  # every node GT-inactive: the FP branch's whole domain
+
+    # Predicted deltas at the magnitude the model actually produces.
+    reset_loss_terms()
+    set_loss_accounting(True)
+    try:
+        loss(torch.full((n, 2), 3e-7), gt, band)
+        terms = get_loss_terms()
+    finally:
+        set_loss_accounting(False)
+    assert terms["diag_fp_thresh"] == pytest.approx(2e-5)
+    for ch in (0, 1):
+        assert terms[f"diag_fp_nodes_ch{ch}"] == 0.0, (
+            "at ~3e-7 the FP branch selects no nodes, so fp_weight multiplies an empty set"
+        )
+
+    # Two orders of magnitude up, the branch does fire -- the counter is not stuck at 0.
+    reset_loss_terms()
+    set_loss_accounting(True)
+    try:
+        loss(torch.full((n, 2), 5e-5), gt, band)
+        terms = get_loss_terms()
+    finally:
+        set_loss_accounting(False)
+    for ch in (0, 1):
+        assert terms[f"diag_fp_nodes_ch{ch}"] == float(n)
+
+
+# --- s26 T5: the loss_scale asymmetry -------------------------------------------------------
+
+def test_loss_scale_reaches_rolled_terms_but_not_the_dual_head_block():
+    """Pins the asymmetry itself, so a future edit cannot quietly move a term across it.
+
+    `loss_scale`=0.1 multiplies every rolled term at its own site. The per-step path applies
+    it in `continuous_delta_loss` (single head) and NOT in `dual_head_step_loss` -- and every
+    cohort leg runs `dual_head=True`. So the rolled terms have always been /10 against the
+    only term measured to move the model.
+    """
+    src = Path("src/core_physics/species_pushforward_continuous.py").read_text(encoding="utf-8")
+
+    def _body(fn: str) -> str:
+        start = src.index(f"def {fn}(")
+        nxt = src.index("\ndef ", start + 1)
+        return src[start:nxt]
+
+    # The rolled-term sites scale; the dual-head per-step path does not.
+    for fn in ("rolled_soft_f1_loss", "rolled_final_mass_fp_penalty", "continuous_delta_loss"):
+        assert "continuous_loss_scale()" in _body(fn), f"{fn} lost its loss_scale"
+    assert "continuous_loss_scale()" not in _body("dual_head_step_loss"), (
+        "if dual_head_step_loss ever scales itself, s26 T5's premise changes and the "
+        "surrogate weight must be re-derived again"
+    )
+
+
+def test_loss_scale_unified_is_off_by_default_and_cancels_the_scale_when_on():
+    from src.core_physics.species_pushforward_continuous import rolled_scale_gain
+
+    with use_pushforward_config(PushforwardConfig(species_scope="mat", loss_scale=0.1)):
+        assert rolled_scale_gain() == 1.0, "default must be the historical behaviour exactly"
+    with use_pushforward_config(
+        PushforwardConfig(species_scope="mat", loss_scale=0.1, loss_scale_unified=True)
+    ):
+        assert rolled_scale_gain() == pytest.approx(10.0)
+    # A leg that never set loss_scale must not be perturbed by turning the flag on.
+    with use_pushforward_config(
+        PushforwardConfig(species_scope="mat", loss_scale=1.0, loss_scale_unified=True)
+    ):
+        assert rolled_scale_gain() == pytest.approx(1.0)
+
+
+def test_live_legs_have_not_silently_adopted_the_unified_scale():
+    """T1's two legs must run on the historical scale, or they are not comparable with 3a."""
+    from src.biochem_gnn.mat_growth_simple import get_mat_growth_config_kwargs as C
+
+    for leg in ("WG_phase1_baseline", "WG_phase3a_closedloop",
+                "WG_t1a_perstep_only", "WG_t1b_rolledf1_only"):
+        assert C(leg).get("loss_scale_unified", False) is False, (
+            f"{leg} must stay on the historical scale until T5 is run as its own leg"
+        )

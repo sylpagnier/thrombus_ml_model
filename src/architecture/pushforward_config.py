@@ -97,6 +97,8 @@ ENV_KEY_TO_FIELD: dict[str, str] = {
     "SPECIES_CONTINUOUS_LOSS_SCALE": "loss_scale",
     "SPECIES_CONTINUOUS_HUBER_BETA": "huber_beta",
     "SPECIES_CONTINUOUS_FINAL_STATE_WEIGHT": "final_state_weight",
+    "SPECIES_CONTINUOUS_PER_STEP_WEIGHT": "per_step_weight",
+    "SPECIES_CONTINUOUS_LOSS_SCALE_UNIFIED": "loss_scale_unified",
     "SPECIES_CONTINUOUS_FINAL_MASS_PENALTY": "final_mass_penalty",
     "SPECIES_CONTINUOUS_FINAL_MASS_TARGET": "final_mass_target",
     "SPECIES_CONTINUOUS_FINAL_PREC_FP_PENALTY": "final_prec_fp_penalty",
@@ -315,6 +317,25 @@ class PushforwardConfig:
     huber_beta: float = 1e-4
     final_state_weight: float = 0.35
     final_state_all_band: bool = True
+    # --- Per-step block scale (WALL_MODEL_PLAN.md s26, T1) ---------------------------------
+    # The per-step block -- growth Huber + spatial focal + any per-step aux -- is 72% of the
+    # loss, the only term measured to move the model, and correlates with deploy score at
+    # rho=+0.119. Every intervention through s24 edited the OTHER 28%, and all five were null.
+    # Every other term in the objective already has a weight knob; this one did not, so the
+    # complementary ablation ("everything except the per-step block") was unreachable. 1.0 is
+    # the historical behaviour exactly.
+    per_step_weight: float = 1.0
+    # --- loss_scale symmetry (WALL_MODEL_PLAN.md s26, T5) ------------------------------------
+    # `loss_scale` (0.1 on every cohort leg) multiplies the ROLLED terms -- step_mass_fp,
+    # step_soft_f1, final_state, final_mass_fp, final_soft_f1 -- and NOT the per-step block
+    # they compete with. It IS applied in `continuous_delta_loss`, the SINGLE-head per-step
+    # path, but `dual_head_step_loss` never picked it up, and every cohort leg runs
+    # `dual_head=True`. So every weight ever set on a rolled term was implicitly /10 against
+    # the one term measured to move the model -- including `rolled_soft_f1_weight=120`, sized
+    # in 12.6.6 on the assumption that the two were comparable.
+    # ON puts the rolled terms back on the per-step block's scale at the summation point.
+    # OFF (default) is the historical behaviour exactly.
+    loss_scale_unified: bool = False
     # Soft mass / FP penalties on the rolled final state (train–deploy alignment).
     # Differentiable occupancy vs GT; 0 disables (legacy behavior).
     final_mass_penalty: float = 0.0

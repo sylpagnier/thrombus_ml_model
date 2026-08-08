@@ -1060,6 +1060,38 @@ def get_loss_terms(*, mean: bool = True) -> dict[str, float]:
     return {k: v / max(_LOSS_TERM_COUNTS.get(k, 1), 1) for k, v in _LOSS_TERMS.items()}
 
 
+def continuous_per_step_weight() -> float:
+    """Scale on the whole per-step block (s26 T1). 1.0 is the historical behaviour."""
+    cfg = resolve_config()
+    if cfg is not None:
+        return max(float(cfg.per_step_weight), 0.0)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_PER_STEP_WEIGHT") or "1.0").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 1.0
+
+
+def rolled_scale_gain() -> float:
+    """Gain that puts the rolled terms on the per-step block's scale (s26 T5).
+
+    Every rolled term multiplies itself by `loss_scale` at its own site; the per-step block
+    under `dual_head=True` does not. Applying `1/loss_scale` to the rolled terms where they
+    are summed cancels that, without touching the dominant term's gradient magnitude (and so
+    without silently recalibrating the learning rate). Returns 1.0 when off -- the historical
+    behaviour exactly.
+    """
+    cfg = resolve_config()
+    if cfg is not None:
+        on = bool(cfg.loss_scale_unified)
+    else:
+        raw = (os.environ.get("SPECIES_CONTINUOUS_LOSS_SCALE_UNIFIED") or "0").strip().lower()
+        on = raw in ("1", "true", "yes", "on")
+    if not on:
+        return 1.0
+    return 1.0 / max(continuous_loss_scale(), 1e-9)
+
+
 def continuous_final_state_value_scaled() -> bool:
     cfg = resolve_config()
     if cfg is not None:
@@ -3481,6 +3513,9 @@ def unroll_continuous_loss(
     if n_steps <= 0:
         z = base_feats.sum() * 0.0
         return z, [], []
+    # s26 T5: 1.0 unless `loss_scale_unified` is on. Resolved once so every rolled term in
+    # this window -- per-step and final alike -- gets the same gain.
+    rolled_gain = rolled_scale_gain()
 
     bind_band_geometry(model, {
         "pos_band": pos_band,
@@ -3754,7 +3789,7 @@ def unroll_continuous_loss(
                         step_train_mask,
                         mass_weight=smw,
                         fp_weight=spw,
-                    )
+                    ) * rolled_gain
                     losses.append(mass_fp_step)
                     loss_ws.append(float(step_w[step]))
                     record_loss_term("step_mass_fp", mass_fp_step)
@@ -3763,7 +3798,7 @@ def unroll_continuous_loss(
                 if ssf > 0.0:
                     _sf1 = rolled_soft_f1_loss(
                         log_state, log_series[step + 1], step_train_mask, weight=ssf,
-                    )
+                    ) * rolled_gain
                     losses.append(_sf1)
                     loss_ws.append(float(step_w[step]))
                     record_loss_term("step_soft_f1", _sf1)
@@ -3809,9 +3844,11 @@ def unroll_continuous_loss(
                 if pw > 0.0:
                     losses.append(phi_l * pw)
                     loss_ws.append(float(step_w[step]))
+                    record_loss_term("step_phi", phi_l * pw)
                 if mw > 0.0:
                     losses.append(mu_l * mw)
                     loss_ws.append(float(step_w[step]))
+                    record_loss_term("step_mu", mu_l * mw)
 
     if not losses:
         z = base_feats.sum() * 0.0
@@ -3819,8 +3856,13 @@ def unroll_continuous_loss(
     wsum = max(sum(loss_ws), 1e-6)
     step_loss = sum(loss * w for loss, w in zip(losses, loss_ws)) / wsum
     # The per-step block as a whole (dominated by the growth Huber). Recorded before the
-    # final-state terms are added so the two are separable.
+    # final-state terms are added so the two are separable. Recorded UNSCALED so the number
+    # stays comparable with the 23.7 decomposition; the scaled value follows separately.
     record_loss_term("per_step_block", step_loss)
+    psw = continuous_per_step_weight()
+    if psw != 1.0:
+        step_loss = step_loss * psw
+        record_loss_term("per_step_block_eff", step_loss)
     fw = continuous_final_state_weight()
     if states:
         m = train_mask.reshape(-1).bool()
@@ -3841,15 +3883,15 @@ def unroll_continuous_loss(
                         final_tgt = final_tgt * _vs
                     final_loss = F.huber_loss(final_pred, final_tgt, delta=beta, reduction="mean")
                     final_loss = final_loss * continuous_loss_scale()
-                step_loss = step_loss + fw * final_loss
-                record_loss_term("final_state", fw * final_loss)
+                step_loss = step_loss + fw * final_loss * rolled_gain
+                record_loss_term("final_state", fw * final_loss * rolled_gain)
             # Soft mass / FP on the rolled final state (train–deploy alignment).
-            mass_fp = rolled_final_mass_fp_penalty(states[-1], log_series[-1], m)
+            mass_fp = rolled_final_mass_fp_penalty(states[-1], log_series[-1], m) * rolled_gain
             step_loss = step_loss + mass_fp
             record_loss_term("final_mass_fp", mass_fp)
             # Soft-F_beta on the rolled final state: the deploy metric itself, softened.
             # This is the term v6 proved the objective was missing (s12.3 change E).
-            _rsf1 = rolled_soft_f1_loss(states[-1], log_series[-1], m)
+            _rsf1 = rolled_soft_f1_loss(states[-1], log_series[-1], m) * rolled_gain
             step_loss = step_loss + _rsf1
             record_loss_term("final_soft_f1", _rsf1)
 
@@ -3874,8 +3916,10 @@ def unroll_continuous_loss(
             mw = continuous_mu_loss_weight() * 0.5
             if pw > 0.0:
                 step_loss = step_loss + pw * phi_l
+                record_loss_term("final_phi", pw * phi_l)
             if mw > 0.0:
                 step_loss = step_loss + mw * mu_l
+                record_loss_term("final_mu", mw * mu_l)
 
     spw = continuous_speed_fp_weight() if speed_fp_weight is None else float(speed_fp_weight)
     if spw > 0.0 and states and speed_series and len(speed_series) == len(states):
@@ -3885,6 +3929,7 @@ def unroll_continuous_loss(
         fp_mask = (pred_active > 0.5) & (gt_active <= 0.5)
         bleed = (fp_mask.float() * spd).mean()
         step_loss = step_loss + spw * bleed
+        record_loss_term("speed_fp_bleed", spw * bleed)
 
     return step_loss * float(window_weight), pred_deltas, states
 
