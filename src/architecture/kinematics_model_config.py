@@ -61,6 +61,7 @@ def snapshot_rgp_deq_model_config(model: RGP_DEQ) -> dict[str, Any]:
         "wss_fuse": bool(getattr(model, "wss_fuse", False)),
         "bc_envelope": bool(getattr(model, "bc_envelope", False)),
         "fourier_learnable": bool(getattr(model, "fourier_learnable", False)),
+        "shear_head": bool(getattr(model, "shear_head", False)),
         "num_global_tokens": 16,
         "phase": "kinematics",
     }
@@ -166,6 +167,8 @@ def resolve_rgp_deq_ctor_kwargs(
             )
         if "bc_envelope" not in ctor or ctor.get("bc_envelope") is None:
             ctor["bc_envelope"] = bool(int(os.environ.get("KINEMATICS_BC_ENVELOPE", "0")))
+        if "shear_head" not in ctor or ctor.get("shear_head") is None:
+            ctor["shear_head"] = any(str(k).startswith("shear_decoder.") for k in state_dict)
         return ctor
 
     if int(saved.get("schema", 0)) == KINEMATICS_MODEL_CONFIG_SCHEMA:
