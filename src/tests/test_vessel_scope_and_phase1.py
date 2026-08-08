@@ -213,6 +213,38 @@ def test_latent_ablate_is_symmetric_across_train_and_eval():
         assert float(maybe_drop_latent(x, _M(), True)[:, :256].abs().max()) > 0.0
 
 
+def test_latent_ablation_reaches_the_DEPLOY_rollout_too():
+    """The zeroing being correct is not enough -- the deploy path must call it.
+
+    `test_latent_ablate_is_symmetric_across_train_and_eval` proves `maybe_drop_latent` zeroes
+    z_kin at both train and eval, but it calls that helper directly. If the deploy rollout ever
+    stopped routing through it, the leg would train on ablated input and deploy on full input --
+    exactly the train/deploy asymmetry the hard ablation exists to avoid, and invisible in the
+    config fingerprint. The chain is
+    `deploy_species_rollout_series` -> `predict_continuous_step_delta` -> `maybe_drop_latent`.
+    """
+    src = Path("src/core_physics/species_pushforward_continuous.py").read_text(encoding="utf-8")
+
+    def _body(fn: str) -> str:
+        start = src.index(f"def {fn}(")
+        nxt = src.index("\ndef ", start + 1)
+        return src[start:nxt]
+
+    assert "predict_continuous_step_delta(" in _body("deploy_species_rollout_series"), (
+        "the deploy rollout no longer routes through predict_continuous_step_delta, so the "
+        "z_kin ablation would not apply at deploy"
+    )
+    assert "maybe_drop_latent(" in _body("predict_continuous_step_delta")
+    assert "maybe_drop_latent(" in _body("unroll_continuous_loss")
+
+    # The hard-ablation branch must sit BEFORE the `if not training` short-circuit, or deploy
+    # (training=False) would return early with z_kin intact.
+    body = _body("maybe_drop_latent")
+    assert body.index("continuous_latent_ablate()") < body.index("if not training:"), (
+        "hard ablation must precede the eval short-circuit"
+    )
+
+
 def test_loss_accounting_is_gated_to_the_training_path():
     """s24 fix 2: three call sites feed the loss; only the main loop may be counted."""
     from src.core_physics.species_pushforward_continuous import (

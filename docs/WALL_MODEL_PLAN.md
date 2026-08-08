@@ -4221,9 +4221,11 @@ the loss and not only from the config.
 | leg A | yes | 0.3706237861441937 | 2.7079646017699117 | 202 |
 | **leg B** | **no** | **0.35997755749156174** | **2.7964601769911503** | **212** |
 
-Three objectives sharing almost nothing except the per-step block produce a **bit-identical**
-committed set — 17 significant figures, same fp, same fn, same relaxed precision — having
-started epoch 1 apart (fp 242 / 244 / 206). The one leg without it does not join them.
+Three objectives sharing almost nothing except the per-step block — **and the same input** —
+produce a **bit-identical** committed set: 17 significant figures, same fp, same fn, same
+relaxed precision, having started epoch 1 apart (fp 242 / 244 / 206). The one leg without the
+block does not join them, and (26.9) neither does a leg that keeps the block but ablates the
+input.
 
 This is not a pinned metric: Phase 1 visits ten distinct fp states (25-242) and six distinct fn
 states (9-91) across its ten epochs. Nor is it a saturated rollout: saturation would have been
@@ -4250,9 +4252,14 @@ whole result:
 
 Both branches of T1's pre-registered read turn out to be half right, and they fit together:
 
-1. **The per-step block is the attractor.** Every objective containing it lands on the same
-   committed set regardless of what else is in the loss. Every objective edit *outside* it is
-   futile — the five nulls, plus leg A's epoch-2 identity, are six instances of one fact.
+1. **The per-step block is the attractor — holding the input representation fixed.** Every
+   objective containing it lands on the same committed set regardless of what else is in the
+   loss. Every objective edit *outside* it is futile — the five nulls, plus leg A's epoch-2
+   identity, are six instances of one fact. The qualifier is not cosmetic and is established in
+   26.9: `WG_phase3b_zkin_ablate` contains the per-step block and does **not** join the
+   attractor, because its input is ablated. So the attractor is a property of the per-step
+   supervision *acting on a given input*, not of the objective alone — which makes the input the
+   thing carrying the information and the rest of the objective decoration.
 2. **The objective is nevertheless steerable — but only through that block.** Removing it moves
    the model enormously and in the opposite direction. "The model cannot be steered" was never
    true; the interventions on record were simply never applied where the gradient lives.
