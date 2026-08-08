@@ -63,10 +63,10 @@ training label, 151 / 41.7%; §14.6 reported 92 / 51.1%. Neither matches. **Quot
 ### 1.2 Build C1
 
 ```
-dMat = NUCLEATION(current field)  +  GROWTH(local committed Mat) · gate(shear)
+dMat = NUCLEATION(field, t)  +  GROWTH(local committed Mat) · gate(shear)
 ```
-(§1.4a: "current", not "static" — an earlier draft had it static and the timing probe disproved
-that. Read §1.4a before implementing the head.)
+(The `t` is not decoration — §1.4a shows early and late nucleation happen in *different places*,
+so a time-invariant rate cannot express both. Read §1.4a before implementing the head.)
 
 The change that matters is **`+`**. Nucleation is an additive, neighbour-independent rate.
 
@@ -84,18 +84,19 @@ The masks that would suppress nucleation are already off and must stay off:
 **NUCLEATION design constraints:**
 
 * Reads **only deploy-legal field features**: `-anaSpd`, `-sdf`, `wgrad`, `shear_potential`,
-  `curv` (§16.3's survivors), evaluated on the **current** flow field rather than only at t=0.
-  **NOT `mu_eff`** — it is anti-predictive on 19 of 35 vessels (§16.3), and the Tier-C spec in
-  §14.x that lists it predates that finding. The leaked CFD channels (`u_prior`, `v_prior`,
-  `mu_prior`, §16.1c) are not deploy-legal either.
+  `curv` (§16.3's survivors). **NOT `mu_eff`** — anti-predictive on 19 of 35 vessels (§16.3), and
+  the Tier-C spec in §14.x that lists it predates that finding. The leaked CFD channels
+  (`u_prior`, `v_prior`, `mu_prior`, §16.1c) are not deploy-legal either. **Do not add
+  `graph_degree` or `bio_x_mu_bc_nd` without the mesh check in §1.4a** — they are the strongest
+  late-site predictors and both are plausibly artifacts.
 * **Must not see neighbouring clot.** If it reads the fused GNN hidden state it inherits
   neighbour aggregation and stops being nucleation. That is the whole point.
-* **NOT a static per-node field.** An earlier draft of this handoff said it was, and §1.4a
-  disproves it: late nucleation sites are off-wall where early ones are on-wall, so a
-  time-invariant rate cannot express both. NUCLEATION must read the **current** (coupled) flow
-  field. It stays independent of *adjacent committed clot* — that is the definition and the whole
-  point — but it is not independent of time or of the global clot configuration acting through
-  the flow.
+* **NOT time-invariant.** An earlier draft specified a static per-node rate, and §1.4a disproves
+  it: late nucleation sites are off-wall where early ones are on-wall, so one rate cannot express
+  both. The head needs **time conditioning**. It does *not* necessarily need the evolving flow
+  field — t=0 features rank late sites about as well as early ones (§1.4a) — so try time
+  conditioning first and add the coupled field only if that is insufficient. It stays independent
+  of *adjacent committed clot*; that is what makes it nucleation rather than growth.
 
 ### 1.3 Why fresh (random init), not another fine-tune
 
@@ -168,12 +169,31 @@ populations pointing in *opposite* directions:
 seeds learns "nucleate near the wall" and ranks late sites *below* chance — worse than useless
 on the 7 late-dominant vessels.
 
-**Consequence for §1.2 — the NUCLEATION term is NOT a static field.** That was this handoff's
-first draft and it is wrong. It holds for early nucleation only. Late nucleation is off-wall and
-appears to be driven by the *evolving* flow field once existing clot has altered it — which is
-exactly what the new coupled corrector (§5.3) supplies. So NUCLEATION must read the **current**
-flow field, not just t=0 geometry. It stays independent of *adjacent committed clot* (that is
-still the definition), but it is not time-invariant.
+**Consequence for §1.2 — the NUCLEATION term must NOT be time-invariant.** This handoff's first
+draft specified a static per-node rate; that is wrong, because a single rate cannot place early
+sites on the wall and late sites off it.
+
+But it is *not* true that late nucleation needs the evolving flow field. The same probe measured
+how well t=0 deploy-legal features rank each population against band negatives:
+
+```
+best single-feature signal on EARLY sites:  0.406 above chance
+best single-feature signal on LATE  sites:  0.416 above chance
+```
+
+**Late sites are just as learnable from t=0 features as early ones** — by *different* features,
+pointing the other way (early: `shear_potential` 0.885, `sdf_nd` 0.115; late: `graph_degree`
+0.916, `sdf_nd` 0.631). So the hard requirement is **time conditioning** — the head needs to know
+*when* it is predicting. Reading the current coupled flow field is a plausible enhancement and
+matches the physical story, but the data does not force it. Do the cheap thing first.
+
+**RED FLAG — check before using it.** The strongest late-site predictor is `graph_degree`, which
+is a **mesh property, not physics**: high degree means local mesh refinement. If late nucleation
+correlates with mesh density, a head that learns it will score well in training and fail on any
+new mesh — the exact shape of failure this project can least afford to add. `bio_x_mu_bc_nd`
+(0.793) is a boundary-condition channel and deserves the same scrutiny. Before either enters the
+nucleation feature set, check whether its signal survives across vessels with different mesh
+densities, or drop it.
 
 **A confound you must carry:** as the wall becomes committed, a new wall-adjacent commit is more
 likely to *have* a committed neighbour and so be classified as growth rather than nucleation.
@@ -181,9 +201,8 @@ Part of "late nucleation is off-wall" is therefore a selection effect, not neces
 It does not change what the head must do — the sites it must rank late are off-wall either way —
 but the *mechanism* is not established, and an experiment that assumes it is would be unsound.
 
-**Still open, and worth doing before the head is finalised:** does a nucleation head conditioned
-on the current flow field rank Q4 sites, where the static one cannot? That is the direct test of
-the paragraph above and it needs the new corrector.
+**Still open:** whether `graph_degree`'s late-site signal is physical or a mesh artifact. That is
+cheap to check and gates whether it may be used at all.
 
 **Kill criterion, corrected.** The Tier-C spec says "if the nucleation head cannot beat the
 logreg of §14.5" — **§14.5 is retracted**, so that bar is a dead number. Use instead:

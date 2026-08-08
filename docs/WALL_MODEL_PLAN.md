@@ -4626,3 +4626,29 @@ late are off-wall -- but the mechanism is not established and must not be assume
 (2026-08-05, the config refactor); the sibling call `_resolve_uv_for_temporal_risk(...,
 vel_source=vel_source)` shows a parameter was intended and never added to the signature. Fixed by
 adding `vel_source: str | None = None`. This blocked the whole t=0 feature-table path.
+
+## 26.13.1 Late nucleation IS learnable from t=0 features — the requirement is time, not flow
+
+A refinement of 26.13, from the same probe data. Direction-agnostic signal strength of the best
+deploy-legal t=0 feature against band negatives:
+
+```
+EARLY (Q1) sites:  0.406 above chance
+LATE  (Q4) sites:  0.416 above chance
+```
+
+Late sites are **as learnable as early ones**; they are simply carried by *different* features,
+pointing the opposite way (early: `shear_potential` 0.885, `sdf_nd` 0.115 -- on-wall; late:
+`graph_degree` 0.916, `sdf_nd` 0.631 -- off-wall).
+
+So 26.13's design conclusion needs narrowing: the nucleation head must not be **time-invariant**,
+but it does **not** require the evolving flow field. Time conditioning alone may suffice, and the
+coupled field is an enhancement to try second. The physical story (late nucleation is flow-driven
+once clot alters the field) remains plausible and remains untested.
+
+**A red flag for C1's feature set.** The strongest late-site predictor is `graph_degree` -- a mesh
+property, not physics. High degree means local mesh refinement. A head that learns "nucleate where
+the mesh is fine" will train well and fail on any new mesh, which is precisely the generalization
+failure this project is trying to escape. `bio_x_mu_bc_nd` (0.793) is a boundary-condition channel
+with the same problem. Neither should enter the nucleation feature set until its signal is shown
+to survive across vessels of differing mesh density.
