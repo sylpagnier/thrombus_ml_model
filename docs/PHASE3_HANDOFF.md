@@ -63,8 +63,10 @@ training label, 151 / 41.7%; §14.6 reported 92 / 51.1%. Neither matches. **Quot
 ### 1.2 Build C1
 
 ```
-dMat = NUCLEATION(static field)  +  GROWTH(local committed Mat) · gate(shear)
+dMat = NUCLEATION(current field)  +  GROWTH(local committed Mat) · gate(shear)
 ```
+(§1.4a: "current", not "static" — an earlier draft had it static and the timing probe disproved
+that. Read §1.4a before implementing the head.)
 
 The change that matters is **`+`**. Nucleation is an additive, neighbour-independent rate.
 
@@ -81,14 +83,19 @@ The masks that would suppress nucleation are already off and must stay off:
 
 **NUCLEATION design constraints:**
 
-* Reads **only deploy-legal static field features**: `-anaSpd`, `-sdf`, `wgrad`,
-  `shear_potential`, `curv` (§16.3's survivors). **NOT `mu_eff`** — it is anti-predictive on
-  19 of 35 vessels (§16.3), and the Tier-C spec in §14.x that lists it predates that finding.
+* Reads **only deploy-legal field features**: `-anaSpd`, `-sdf`, `wgrad`, `shear_potential`,
+  `curv` (§16.3's survivors), evaluated on the **current** flow field rather than only at t=0.
+  **NOT `mu_eff`** — it is anti-predictive on 19 of 35 vessels (§16.3), and the Tier-C spec in
+  §14.x that lists it predates that finding. The leaked CFD channels (`u_prior`, `v_prior`,
+  `mu_prior`, §16.1c) are not deploy-legal either.
 * **Must not see neighbouring clot.** If it reads the fused GNN hidden state it inherits
   neighbour aggregation and stops being nucleation. That is the whole point.
-* Consequence: the nucleation rate is a **static per-node field**, computable once per vessel
-  rather than per rollout step. Big efficiency win, and it is what "independent of neighbouring
-  clot" actually means.
+* **NOT a static per-node field.** An earlier draft of this handoff said it was, and §1.4a
+  disproves it: late nucleation sites are off-wall where early ones are on-wall, so a
+  time-invariant rate cannot express both. NUCLEATION must read the **current** (coupled) flow
+  field. It stays independent of *adjacent committed clot* — that is the definition and the whole
+  point — but it is not independent of time or of the global clot configuration acting through
+  the flow.
 
 ### 1.3 Why fresh (random init), not another fine-tune
 
@@ -138,13 +145,45 @@ head then learns a field→propensity map from the cleanest available examples a
 all times. It is wrong if they are different places, in which case a seed-trained head
 systematically misses those 7 vessels.
 
-**Step 0, before building the head (pure CPU, no GPU):** take Q1 nucleation sites and Q4
-nucleation sites, and compare them under the deploy-legal features — same feature distribution?
-Same best-feature AUC? If similar, train on seeds as §20.4 says and move on. If they separate,
-the nucleation head needs a time input or a slow rate modulation, and the seed-only target is a
-mis-specification that would be very hard to diagnose after the fact.
+**This was run (`scripts/diag_nucleation_timing_probe.py`) and the answer is NO — they are
+different places. §20.4's seed-only target is a mis-specification.**
 
-This is the highest-value pre-build analysis available and it is cheap. Do it first.
+12 vessels had >=5 nucleation sites in both Q1 and Q4 (333 Q1 sites, 211 Q4 sites). Against a
+permutation null that re-labels the *same* sites at random — necessary, because with 80+ features
+and small site counts raw separation is large by chance:
+
+```
+feature                     sep    null   excess   AUC(Q1|neg)  AUC(Q4|neg)
+hop_from_wall              0.478  0.079   +0.399      0.119        0.520
+sdf_nd                     0.478  0.093   +0.385      0.115        0.631
+kine_x_shear_potential     0.478  0.093   +0.385      0.885        0.369
+on_wall                    0.449  0.078   +0.371      0.866        0.417
+```
+
+Chance is ~0.08; observed ~0.48; **excess +0.399**. And the two right-hand columns show the two
+populations pointing in *opposite* directions:
+
+**Early nucleation is ON the wall. Late nucleation is AWAY from it.** `sdf_nd` ranks Q1 sites at
+0.115 (near wall) and Q4 sites at 0.631 (far). `on_wall`: 0.866 vs 0.417. A head trained on t=20
+seeds learns "nucleate near the wall" and ranks late sites *below* chance — worse than useless
+on the 7 late-dominant vessels.
+
+**Consequence for §1.2 — the NUCLEATION term is NOT a static field.** That was this handoff's
+first draft and it is wrong. It holds for early nucleation only. Late nucleation is off-wall and
+appears to be driven by the *evolving* flow field once existing clot has altered it — which is
+exactly what the new coupled corrector (§5.3) supplies. So NUCLEATION must read the **current**
+flow field, not just t=0 geometry. It stays independent of *adjacent committed clot* (that is
+still the definition), but it is not time-invariant.
+
+**A confound you must carry:** as the wall becomes committed, a new wall-adjacent commit is more
+likely to *have* a committed neighbour and so be classified as growth rather than nucleation.
+Part of "late nucleation is off-wall" is therefore a selection effect, not necessarily physics.
+It does not change what the head must do — the sites it must rank late are off-wall either way —
+but the *mechanism* is not established, and an experiment that assumes it is would be unsound.
+
+**Still open, and worth doing before the head is finalised:** does a nucleation head conditioned
+on the current flow field rank Q4 sites, where the static one cannot? That is the direct test of
+the paragraph above and it needs the new corrector.
 
 **Kill criterion, corrected.** The Tier-C spec says "if the nucleation head cannot beat the
 logreg of §14.5" — **§14.5 is retracted**, so that bar is a dead number. Use instead:

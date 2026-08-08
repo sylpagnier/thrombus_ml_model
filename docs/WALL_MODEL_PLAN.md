@@ -4581,3 +4581,48 @@ Pure CPU.
 **Known limitation of the census tool:** its `seed_reach` column is degenerate — bimodal 0%/100%,
 because it is really measuring "did anything commit by `t=20`" rather than reachability. 14.6's
 43-81% does not reproduce and should not be cited either. Redefine that metric before using it.
+
+## 26.13 Step 0 RESULT — early and late nucleation are different places, and C1's head spec was wrong
+
+26.12.1 flagged the question; `scripts/diag_nucleation_timing_probe.py` answers it. 12 vessels
+had >=5 nucleation sites in both Q1 and Q4 (333 Q1, 211 Q4). Measured against a permutation null
+that re-labels the *same* sites at random -- required, because with 80+ features and small site
+counts raw separation is large by chance:
+
+```
+feature                     sep    null   excess   AUC(Q1|neg)  AUC(Q4|neg)
+hop_from_wall              0.478  0.079   +0.399      0.119        0.520
+sdf_nd                     0.478  0.093   +0.385      0.115        0.631
+kine_x_shear_potential     0.478  0.093   +0.385      0.885        0.369
+on_wall                    0.449  0.078   +0.371      0.866        0.417
+```
+
+Chance ~0.08, observed ~0.48, **excess +0.399**. Not a small-sample artifact.
+
+**Early nucleation is ON the wall; late nucleation is AWAY from it** -- the two populations rank
+in opposite directions on every top feature. `sdf_nd` puts Q1 at 0.115 and Q4 at 0.631; `on_wall`
+0.866 vs 0.417.
+
+**This kills the seed-only head target.** 20.4 settled it on the grounds that `t=20` seeds are
++0.097 AUC more predictable; that is true and irrelevant if the seeds are a different population
+from what the head must predict later. A seed-trained head learns "nucleate near the wall" and
+ranks late sites BELOW chance -- worse than useless on the seven late-dominant vessels of 26.12.
+
+**And it corrects the C1 spec.** `docs/PHASE3_HANDOFF.md`'s first draft had NUCLEATION as a
+static per-node field computable once per vessel. That is wrong: a time-invariant rate cannot
+place early sites on the wall and late sites off it. NUCLEATION must read the **current** flow
+field -- which is what the new coupled corrector supplies -- while staying independent of
+*adjacent committed clot*, which is what makes it nucleation rather than growth.
+
+**Confound, stated because it is substantial:** as the wall commits, a new wall-adjacent commit is
+more likely to have a committed neighbour and so be classified as growth. Part of "late
+nucleation is off-wall" is a selection effect of the growth/nucleation definition itself, not
+necessarily physics. The design consequence survives either way -- the sites the head must rank
+late are off-wall -- but the mechanism is not established and must not be assumed.
+
+**Incidental fix:** `gt_neg_dgamma_dx_phys` referenced an undefined `vel_source`, raising
+`NameError` on every call unless `T0_R4_FLOW_SOURCE` or `CLOT_PHI_VEL_SOURCE` was set to
+`kinematics` (the `or` chain short-circuits before the bad name). Broken since 393dcac
+(2026-08-05, the config refactor); the sibling call `_resolve_uv_for_temporal_risk(...,
+vel_source=vel_source)` shows a parameter was intended and never added to the signature. Fixed by
+adding `vel_source: str | None = None`. This blocked the whole t=0 feature-table path.

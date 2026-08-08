@@ -177,6 +177,7 @@ def gt_neg_dgamma_dx_phys(
     time_index: int,
     bio_cfg: BiochemConfig,
     device: torch.device,
+    vel_source: str | None = None,
 ) -> torch.Tensor:
     """COMSOL-aligned ``max(0, -d(gamma)/dx)`` [1/(m*s)] from GT ``u,v`` (matches ``d(spf.sr,x)`` band)."""
     use_kine = False
