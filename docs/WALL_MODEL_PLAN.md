@@ -4952,3 +4952,72 @@ This supersedes 26.15's Step 0 (which asked whether the law reproduces GT `dMat`
 **It also reframes the whole project.** The GNN has been learning `dMat` from a flow field that Z1
 says is nearly uninformative. If 26.17's check shows gate discrimination collapsing on predicted
 flow, that single fact explains sections 9 through 26.
+
+## 26.18 Phase 3 re-scoped: GT flow at t=0 as an explicit BANDAID, and the feasibility number
+
+**Decision (user, 2026-08-08): Phase 3 assumes the GT flow field at `t=0` only**, plus geometry,
+ICs and BCs, and asks whether a wall-only clot model can generalize to unseen vessels at
+`deploy_clot_score > 0.6`. **Phase 5 removes the bandaid** and substitutes the deployable ML
+kinematic model.
+
+**This is logged as temporary.** A model needing a CFD solve at `t=0` per new vessel is not
+deployable in the sense the project targets. Every Phase 3 number is an **upper bound** on the
+deployable system, and the Phase 3 -> Phase 5 delta is exactly the flow surrogate's error. Any
+result out of Phase 3 must carry the words "with GT t=0 flow". The rationale is confound removal:
+26.17 showed all structure enters through the flow-derived gates while Z1 put the *predicted*
+flow's marginal contribution at 0.041 AUC, so developing chemistry on top of it makes every
+negative ambiguous.
+
+### Is >0.6 attainable from t=0? Measured: marginal
+
+`scripts/diag_t0_ceiling.py`, 35 vessels. Oracle-thresholded, oracle-feature ranking of wall-band
+nodes by the best deploy-legal t=0 feature -- deliberately generous:
+
+```
+mean best-single-feature AUC : 0.885
+mean ORACLE-THRESHOLD F1     : 0.463
+vessels with oracle F1 >= 0.6:  5 / 35
+vessels with oracle F1 >= 0.5: 12 / 35
+```
+
+**AUC 0.885 yields F1 0.463 because the base rate is 2-21% (mean ~7%).** At that imbalance
+ranking quality converts poorly into F1: the base rate, not the ranking, is what makes this hard.
+
+**But the rollout beats that ceiling**, which is the load-bearing fact for the physics plan.
+Against 19.2's per-vessel GNN F1:
+
+```
+vessel   t=0 oracle F1   GNN F1 (19.2)   rollout gain
+039          0.647           0.518          -0.129
+040          0.388           0.704          +0.316
+041          0.438           0.255          -0.183
+042          0.402           0.513          +0.111
+043          0.416           0.650          +0.234
+044          0.401           0.602          +0.201
+                                     mean   +0.092
+```
+
+Same information, better inductive bias: autocatalytic growth produces spatially coherent
+components where per-node thresholding produces scatter. That is exactly what a physics-mirroring
+rollout supplies.
+
+```
+0.463 (t=0 oracle ranking, n=35) + 0.092 (mean rollout gain) = 0.554 F1
+deploy_clot_score runs ~+0.04 above f1 (p043: 0.6925 vs 0.6497) ~ 0.597
+target                                                            0.600
+```
+
+**The projection lands on the line**, and is biased optimistic three ways: the rollout gain is
+n=6 with range -0.183..+0.316 and two of six negative; those six are 039-044, which 20.5 measured
+as materially easier (0.516 vs 0.322 for a random draw of nine); and the 0.463 baseline already
+used oracle feature selection AND oracle thresholding.
+
+**Verdict: >0.6 on one favourable vessel is demonstrated (p043 = 0.6925). >0.6 as a mean over
+randomly drawn unseen vessels is NOT supported by current evidence.** The real Phase 3 objective
+is therefore to **close the rollout-gain variance** -- turn +0.316/-0.183 into a consistent gain
+-- not to assume the mean projection holds. If encoding the correct mechanism makes the gain
+consistent, the target is reachable; if the gain stays vessel-dependent, it is not, and 20.5's
+goal-split question becomes unavoidable.
+
+Handoff rewritten accordingly: `docs/PHASE3_HANDOFF.md`, now Phase 3/4/5 with the bandaid stated
+up front (0a), the feasibility measurement as 1.5a, and Phase 5 as its own section (4a).

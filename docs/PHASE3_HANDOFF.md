@@ -1,14 +1,17 @@
-# PHASE 3/4 HANDOFF — build a physics-mirroring wall model
+# PHASE 3/4/5 HANDOFF — a t=0-flow physics wall model
 
 Written 2026-08-08 for a new context window.
 
-**The mission: build a new wall-only clot model whose structure mirrors the COMSOL PDE, instead
-of a generic network that must rediscover it.** The deposition law is already in this repo,
-validated against COMSOL exports to machine precision. Roughly fifteen legs have been spent
-teaching a 187k-parameter GraphSAGE to approximate a function we already have exactly.
+**The mission (Phase 3): using the GT flow field at `t=0` ONLY, plus geometry, initial and
+boundary conditions, build a new wall-only clot model that generalizes to unseen vessels at
+`deploy_clot_score > 0.6`.**
+
+**Phase 5 removes the t=0-GT-flow assumption** and substitutes the deployable ML kinematic model.
+Phase 3 is deliberately scoped *inside* a bandaid so the biochem model can be developed against a
+clean flow input instead of being confounded by flow-surrogate error.
 
 Repo: `C:\Users\pgssy\thrombus_ml_model` (Windows; PowerShell and Git Bash both available).
-History: `docs/WALL_MODEL_PLAN.md` (~4400 lines, every claim cites a `§N`).
+History: `docs/WALL_MODEL_PLAN.md` (~4500 lines, every claim cites a `§N`).
 **Read §26 first** (the session that produced this), then §10.1, §10.4, §19.2.
 Do **not** read §1–§13 linearly — they contain retracted conclusions, cited from later sections
 where still valid. §14.5 in particular is RETRACTED by §19.2.
@@ -17,19 +20,40 @@ where still valid. §14.5 in particular is RETRACTED by §19.2.
 
 ## 0. Goal, and where things actually stand
 
-`deploy_clot_score > 0.6` on **unseen vessels**, **wall clot only** (inside the 3-hop wall band).
-Floor 0.50.
+`deploy_clot_score > 0.6` on **unseen vessels**, **wall clot only** (3-hop wall band). Floor 0.50.
 
 | | |
 |---|---|
-| best *deployed* result | **0.6925** — zero-shot warm start `WG_clotrich_nplus` on `patient043`, no cohort training (§9.3) |
+| best *deployed* result | **0.6925** — zero-shot warm start on `patient043`, no cohort training (§9.3) |
 | best *in-training* | 0.4889 — Phase 1 epoch 6 |
 | fine-tune legs that beat the warm start | **none, out of ~15** |
 
 **Read §6.3 before comparing anything to 0.6925** — it was measured with the flow coupler
 working, and every number since 2026-08-06 was measured with it silently disabled.
 
-Phase 0, 1 and 2 of the project ladder are complete. This document replaces Phase 3.
+Phase 0, 1 and 2 of the project ladder are complete. This document replaces Phase 3 onward.
+
+---
+
+## 0a. THE BANDAID — temporary, and it must be removed
+
+**Phase 3 assumes the ground-truth flow field at `t = 0` is available for any vessel, including
+unseen ones.** Nothing else from the GT solution is permitted: no flow at `t > 0`, no GT species
+beyond `t=0` initial conditions, and **not** the converged `u_prior`/`v_prior`/`mu_prior` (§16.1c
+— those are the *clot-affected converged* solution and remain illegal).
+
+**Why it is defensible for now.** §26.16/§26.17 established that all spatial structure in `Mat`
+enters through the flow-derived gates, and Z1 measured the *predicted* flow's marginal
+contribution to clot ranking at 0.041 AUC. Developing the biochem model on top of a flow
+surrogate that weak makes every negative result ambiguous — is the chemistry wrong, or the flow?
+The bandaid removes that confound so Phase 3 answers one question at a time.
+
+**What it costs.** A model that needs a CFD solve at `t=0` per new vessel is **not deployable** in
+the sense this project targets. Every Phase 3 number is an **upper bound** on the deployable
+system, and the Phase 3 → Phase 5 gap is exactly the flow surrogate's error.
+
+**When it goes.** Phase 5. Do not let it become permanent by omission: **every result reported out
+of Phase 3 must carry the words "with GT t=0 flow".**
 
 ---
 
@@ -161,37 +185,108 @@ two-gate sum may reproduce the cohort's bimodality for free**, since the separat
 with `|dsrx|`, which is largest exactly on the fast vessels. §10.4 separately measured the regime
 itself routable from `band_speed_q25` at AUC 0.975 / **90.6% LOO**.
 
-### 1.5 STEP 0 — the one measurement that decides the project
+### 1.5 STEP 0 — does the law + t=0 gates reproduce GT `Mat`?
 
-**Every AUC in §1.4 was computed from GROUND-TRUTH velocity** (`gamma_si` derives from
-`y[:,0], y[:,1]`). Z1 measured the *predicted* flow field's marginal contribution to clot ranking
-at **0.041 AUC**.
+Under the bandaid (§0a) the flow at `t=0` is exact, so the question "does the flow surrogate
+support the gates" moves to **Phase 5** (§4a). Phase 3's Step 0 is the end-to-end physics check:
 
-> **How much gate discrimination survives when the gates are computed from PREDICTED flow?**
+> **Integrate `j0_mat_si` forward using t=0 gates, `rp`/`ap` held at their measured constants, and
+> the autocatalytic `Mas` feedback. Does the resulting `Mat` trajectory match GT?**
 
-* **Survives** → the physics plan works, and the learned component is the flow correction.
-* **Collapses** → the flow surrogate is the entire problem. No chemistry work, no architecture
-  work, and no objective work helps, and improving flow becomes the project.
+Run it per vessel and report correlation and relative error against GT `Mat`, plus the resulting
+`deploy_clot_score`. This is the whole plan in one measurement, and it is CPU-only.
 
-It is cheap: recompute `gamma_si` and `dshear_ds` from the corrector/kinematics flow instead of
-from `y`, rerun `scripts/diag_physics_gate_support.py`, and compare the two AUC columns
-vessel-by-vessel.
+What it distinguishes:
 
-**This supersedes the earlier Step 0** ("does the law reproduce GT `dMat` from GT species?"),
-which is a weaker question now that §26.16 shows the species are constants. Note also that the
-unit risk that earlier draft warned about does not exist — `gamma_si` is already SI (range
-~0.006–1264 1/s, so `lss=25` sits well inside it), `dshear_ds` is already in the gate's units,
-and `is_low_shear` is already computed in the t=0 feature table.
+* **Matches** → the law plus t=0 gates plus autocatalysis *is* the model. Whatever residual
+  remains is what the learned component must supply, and it will be small and well-posed.
+* **Systematically under/over-grows** → the `Da` scale or `step2t` activation gate needs
+  calibrating per vessel. That is a small learned correction, not a new architecture.
+* **Wrong spatial pattern** → the t=0 gates are insufficient because the flow *evolves* as the
+  clot narrows the lumen. That is the one failure mode the bandaid cannot hide, and it would
+  mean the coupled flow is needed even in Phase 3.
 
-**If the gates hold up on predicted flow, then run the law end-to-end** against GT `Mat`
-trajectories as a second check before building anything.
+**The unit risk an earlier draft warned about does not exist.** `gamma_si` is already SI (range
+~0.006–1264 1/s, so `lss=25` sits well inside it), `dshear_ds` is already in the gate's units, and
+`is_low_shear` is already computed in the t=0 feature table
+(`build_feature_table_at_time(data, 0, ...)`). The only conversion still needed is `log1p_nd`
+species → SI for `mas`/`sat_m`, and §26.16 says `rp`/`ap` can simply be held constant.
+
+**Do not fix a poor result by adjusting the constants** — they are calibrated and pinned by
+`test_comsol_wall_deposition_calibration.py`. A mismatch means the plumbing is wrong, or the
+premise is.
+
+### 1.5a IS >0.6 ACTUALLY ATTAINABLE FROM t=0? — measured, and it is marginal
+
+Do not start without reading this. `scripts/diag_t0_ceiling.py`, 35 vessels.
+
+**The information at t=0, as a pure ranking problem.** Rank wall-band nodes by the best
+deploy-legal t=0 feature and sweep the threshold — oracle feature *and* oracle threshold, so this
+is doubly generous:
+
+```
+mean best-single-feature AUC : 0.885
+mean ORACLE-THRESHOLD F1     : 0.463
+vessels with oracle F1 >= 0.6:  5 / 35
+vessels with oracle F1 >= 0.5: 12 / 35
+```
+
+**AUC 0.885 sounds excellent and yields F1 0.463**, because the base rate is 2–21% (mean ~7%). At
+that imbalance, ranking quality converts poorly into F1. **The base rate, not the ranking, is what
+makes this hard.**
+
+**But the rollout beats that "ceiling", and that is the key to the whole plan.** Against §19.2's
+per-vessel GNN F1 on the same vessels:
+
+```
+vessel     t=0 oracle F1   GNN F1 (19.2)   rollout gain
+039            0.647           0.518          -0.129
+040            0.388           0.704          +0.316
+041            0.438           0.255          -0.183
+042            0.402           0.513          +0.111
+043            0.416           0.650          +0.234
+044            0.401           0.602          +0.201
+                                        mean  +0.092
+```
+
+The rollout adds ~+0.09 F1 over oracle node-ranking with the *same information*. It wins on
+**inductive bias**: autocatalytic growth produces spatially coherent components where independent
+per-node thresholding produces scatter. That is exactly what the physics model in §1.2–§1.4
+supplies, and it is the strongest argument for building it.
+
+**Naive projection:**
+
+```
+0.463 (t=0 oracle ranking, 35 vessels) + 0.092 (mean rollout gain) = 0.554 F1
+deploy_clot_score runs ~+0.04 above f1 (p043: 0.6925 vs 0.6497)    ~ 0.597
+target                                                               0.600
+```
+
+**It lands on the line.** Read that as *marginal, not comfortable*, and note it is biased
+**optimistic** three ways:
+
+* the rollout gain is n=6, range −0.183 to +0.316 — enormous variance, and two of six are
+  negative;
+* those six are `039`–`044`, which §20.5 measured as a materially easier subset (mean F1 0.516
+  against 0.322 for a random draw of nine);
+* the 0.463 baseline already used oracle feature selection *and* oracle thresholding.
+
+**So: >0.6 on a single favourable vessel is demonstrated (`patient043`, 0.6925). >0.6 as a mean
+over randomly drawn unseen vessels is not supported by current evidence.**
+
+The honest objective for Phase 3 is therefore **not** "add 0.09 to 0.463 and hope" — it is
+**close the rollout-gain variance**: turn +0.316/−0.183 into a consistent gain. If encoding the
+right mechanism makes the gain consistent, the target is reachable. If the gain stays
+vessel-dependent, it is not, and §20.5's goal-split question becomes unavoidable.
 
 ### 1.6 Kill criteria
 
 * **Step 0 fails** (law + GT species does not reproduce GT `dMat`) → the premise is wrong; stop
   and report rather than tuning around it.
-* **Gate discrimination collapses on predicted flow** (§1.5) → the flow surrogate is the whole
-  problem; stop and make flow the project.
+* **Step 0's forward model has the wrong spatial pattern** (§1.5) → t=0 gates are insufficient
+  because the flow evolves with the clot; the coupled flow is needed even under the bandaid.
+* **The learned correction needs real capacity to close the residual** → the physics framing is
+  not buying what it promised; fall back to §3's comparison arm.
 * **Whole model** against §19.2's bar: logreg **0.516**, GNN **0.540**. And against the standing
   0.6925 once §6.3 makes that comparison legitimate.
 
@@ -201,15 +296,18 @@ trajectories as a second check before building anything.
 
 0. **Resolve the metric split** (§6.1a). CPU, and it decides whether any epoch selection to date
    is trustworthy.
-1. **Step 0** (§1.5). CPU. Everything depends on it.
-2. **Confirm the new corrector loads** (§6.3) — 3-output `[dU, dV, dShear]`, no WARN. It supplies
-   `shear_sr`/`dsrx`, so the law is only as good as it is.
-3. **Flow → gates.** The learned component is the flow correction, not chemistry (§1.3). Feed the
-   corrector's `u,v` (and its shear head) into `gamma_si` / `dshear_ds`, and measure the gate AUCs
-   against the GT-flow numbers in §1.4. Improving that gap IS the model.
-4. **Assemble**: flow → gates → `j0_mat_si` with `rp`/`ap` held at their measured constants →
-   integrate `Mat` → `mu1(Mat)` step → clot readout. Compare against GT `Mat` trajectories.
-   Treat `rp`/`ap` as constants first; only make them learned if the residual demands it.
+1. **Step 0** (§1.5) — integrate the law on t=0 gates, compare to GT `Mat`. CPU. Everything
+   depends on it, and §1.5a says the margin is thin, so measure before building.
+2. **Assemble the forward model**: t=0 GT flow → `gamma_si`/`dshear_ds` → both gates →
+   `j0_mat_si` with `rp`/`ap` at their measured constants → integrate `Mat` with the `Mas`
+   feedback → `mu1(Mat)` step → clot readout. No learned parameters yet. Score it.
+3. **Measure the residual.** Where does the pure-physics forward model differ from GT? That
+   residual — and nothing else — defines what the learned component should do. Candidates, in
+   order of how little they assume: per-vessel `Da` scale, the `step2t` activation gate, then the
+   ~10% `AP` variation (§26.16).
+4. **Add the smallest learned correction that closes the residual**, and check it against a
+   logreg baseline before adding any capacity. §19.2 is the cautionary tale: 187k parameters
+   bought +0.024 over a logistic regression.
 5. **Then** single-variable legs from that baseline. The assembly in (4) is a **re-baseline**, not
    an A/B — label it as such in the log, as Phase 1 was.
 
@@ -242,7 +340,7 @@ If §1 stalls, this is the fallback, and the two are directly comparable on the 
 
 ---
 
-## 4. PHASE 4 — after the physics model lands
+## 4. PHASE 4 — after the physics model lands (still under the bandaid)
 
 * **Species as a residual.** §26.16 shows `rp`/`ap` are constants to 0.3%/10%. If the assembled
   model has structured residuals that the gates cannot explain, revisit whether the ~10% `AP`
@@ -253,6 +351,24 @@ If §1 stalls, this is the fallback, and the two are directly comparable on the 
 * **B3 — longer windows.** One clean re-test at `unroll` 25–50, `curriculum_unroll=False`.
 * **Re-baseline `patient043`'s 0.6925 with the coupler ON** (§6.3). Required before any deploy
   claim.
+
+---
+
+## 4a. PHASE 5 — remove the bandaid
+
+Substitute the deployable ML kinematic model for the GT `t=0` flow, and measure what it costs.
+
+1. **Re-run `scripts/diag_physics_gate_support.py` with predicted flow.** The GT-flow gate AUCs in
+   §1.4 are the reference; the drop is the flow surrogate's error expressed in the only units that
+   matter here. This is the single number that says whether the deployable system can work.
+2. **Re-run the Phase 3 model end-to-end on predicted flow.** The Phase 3 → Phase 5 delta is the
+   deployability gap.
+3. **If the gap is large, the flow surrogate becomes the project.** Z1 put its marginal
+   contribution at 0.041 AUC, so this is the likely outcome and should not be a surprise. The
+   corrector with its shear head (§6.3) is the natural place to start.
+
+Phase 5 is where the project's actual deployability claim is decided. Phase 3 only establishes
+whether the *chemistry and dynamics* are right given good flow.
 
 ---
 
@@ -428,12 +544,13 @@ you build; that file is why the last session caught four dead mechanisms.
 ## 9. OPEN QUESTIONS
 
 0. **Why do the in-training and canonical metrics disagree in direction?** §6.1a. It decides
-   whether any "best epoch" on record is trustworthy, and it is cheap to answer. Do it alongside
-   Step 0.
-1. **Does the law reproduce GT `dMat` on the graph packs?** §1.5. Everything depends on it.
-2. **Is the flow good enough?** The law consumes `shear_sr` and `dsrx` directly. Z1 scored the
-   flow channel at 0.041 AUC on clot-ranking. If Step 0 passes and the assembled model still
-   underperforms, this is the answer, and the flow surrogate becomes the project.
+   whether any "best epoch" on record is trustworthy, and it is cheap. Do it alongside Step 0.
+1. **Does the law on t=0 gates reproduce GT `Mat`?** §1.5. Everything depends on it.
+2. **Can the rollout-gain variance be closed?** §1.5a — the projection lands on 0.597 against a
+   0.600 target only if the +0.316/−0.183 spread becomes consistent. This is the real Phase 3
+   question, not the mean.
+3. **Is the flow good enough without the bandaid?** Phase 5 (§4a). Z1 scored the flow channel at
+   0.041 AUC. Likely the binding constraint on the deployable system.
 3. **Does `z_kin` carry vessel-specific information?** Shuffle test, §6.4. Gates D3.
 4. **The goal split** (§20.5): `039`–`044` scores mean F1 0.516 where a random draw of 9 scores
    0.322. Be explicit about which set any ">0.6" claim is on.
