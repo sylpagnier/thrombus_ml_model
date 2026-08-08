@@ -45,14 +45,22 @@ caught this project generalising from those exact six — so it was re-measured 
 
 ```
 n = 35 distinct vessels (mirror_y duplicates excluded)
-nucleation %:  mean 40.3   sd 10.3   range 27.0 .. 82.0
-vessels below 27%:  NONE          vessels above 58%: patient002, patient003
+
+growth rule    mean nucleation    range
+1 hop               40.3%        27.0 .. 82.0   <- TOO STRICT, see 1.4a
+2 hop               21.2%         4.2 .. 60.0   <- use this
+3 hop               18.9%         3.4 .. 58.0
 ```
 
-**Every vessel in the inventory is at least 27% nucleation.** C1's premise is confirmed far more
-strongly than §14.6 stated it. The architecture structurally cannot express ~40% of commits, and
-§14.6's conclusion stands: *"A seed-and-grow model has a ceiling near F1 0.58 on this cohort.
-That ceiling is where ten fine-tuning legs have been stuck."*
+**Genuine nucleation is ~20% of commits.** A strict 1-hop adjacency rule counts the advancing
+growth front as nucleation and doubles the figure (§1.4a); §14.6's 27–58% has the same flaw.
+~20% is also what §10.1 predicts, where 40% was not — fresh deposition is ~7% of Mat *mass flux*,
+and a nucleating node starts small, so it is a larger share of *events* than of mass.
+
+C1's premise survives: this is still a mechanism the multiplicative architecture cannot express,
+and §14.6's conclusion stands — *"a seed-and-grow model has a ceiling near F1 0.58 on this cohort;
+that ceiling is where ten fine-tuning legs have been stuck."* But **size the expected gain against
+20%, not 40%**, and note it is under 5% on some vessels.
 
 **Caveat you must carry: §14.6's exact per-vessel numbers do NOT reproduce.** It predates both
 the canonical metric (§20.1) and the `rel_max` labels (§21.2) and never recorded which GT it
@@ -63,12 +71,12 @@ training label, 151 / 41.7%; §14.6 reported 92 / 51.1%. Neither matches. **Quot
 ### 1.2 Build C1
 
 ```
-dMat = NUCLEATION(field, t)  +  GROWTH(local committed Mat) · gate(shear)
+dMat = NUCLEATION(field)  +  GROWTH(local committed Mat) · gate(shear)
 ```
-(The `t` is not decoration — §1.4a shows early and late nucleation happen in *different places*,
-so a time-invariant rate cannot express both. Read §1.4a before implementing the head.)
 
-The change that matters is **`+`**. Nucleation is an additive, neighbour-independent rate.
+**Read §1.5a before implementing this — the form above does not match the PDE, and §10.1 should
+probably win.** It is left here because it is the specification of record from the project
+ladder; §1.5a states the mismatch and the alternative.
 
 **Half of it already exists and is switched off:**
 
@@ -86,17 +94,14 @@ The masks that would suppress nucleation are already off and must stay off:
 * Reads **only deploy-legal field features**: `-anaSpd`, `-sdf`, `wgrad`, `shear_potential`,
   `curv` (§16.3's survivors). **NOT `mu_eff`** — anti-predictive on 19 of 35 vessels (§16.3), and
   the Tier-C spec in §14.x that lists it predates that finding. The leaked CFD channels
-  (`u_prior`, `v_prior`, `mu_prior`, §16.1c) are not deploy-legal either. **Do not add
-  `graph_degree` or `bio_x_mu_bc_nd` without the mesh check in §1.4a** — they are the strongest
-  late-site predictors and both are plausibly artifacts.
+  (`u_prior`, `v_prior`, `mu_prior`, §16.1c) are not deploy-legal either. `graph_degree` looked
+  like a strong late-site predictor; §1.4a explains it as a symptom of the misclassification
+  (growth fronts sit in mesh-refined regions). It is not needed and should not be added.
 * **Must not see neighbouring clot.** If it reads the fused GNN hidden state it inherits
   neighbour aggregation and stops being nucleation. That is the whole point.
-* **NOT time-invariant.** An earlier draft specified a static per-node rate, and §1.4a disproves
-  it: late nucleation sites are off-wall where early ones are on-wall, so one rate cannot express
-  both. The head needs **time conditioning**. It does *not* necessarily need the evolving flow
-  field — t=0 features rank late sites about as well as early ones (§1.4a) — so try time
-  conditioning first and add the coupled field only if that is insufficient. It stays independent
-  of *adjacent committed clot*; that is what makes it nucleation rather than growth.
+* **A static per-node rate is fine.** An intermediate draft claimed it needed time conditioning;
+  §1.4a retracts that. Genuine nucleation is early, so a time-invariant rate trained on `t=20`
+  seeds is the right specification.
 
 ### 1.3 Why fresh (random init), not another fine-tune
 
@@ -129,80 +134,45 @@ t=20 seeds   n=32   mean best-feature AUC 0.903   sd 0.032
 Seeds are **+0.097 AUC more predictable and 2.7x more consistent across vessels**. §20.4:
 *"train the nucleation head on early commits, and let the growth term carry it forward."*
 
-### 1.4a The one thing that could break the seed target — RESOLVE THIS FIRST
+### 1.4a RETRACTED — late "nucleation" is 2-hop growth. §20.4's seed target is SOUND.
 
-The census also profiled *when* nucleation happens, by time quartile:
-
-```
-purely-early (all nucleation in Q1):   10/35 vessels
-LATE-dominant (Q3+Q4 > Q1+Q2):          7/35 vessels
-  patient001 [2,2,10,11]   patient010 [9,1,8,16]   patient021 [21,1,8,18]
-  patient032 [0,13,9,47]  <- 47 of its nucleation events in the FINAL quartile
-```
-
-**A fifth of the inventory nucleates predominantly late.** §20.4's recommendation to train the
-head on t=20 seeds is sound *if* early and late nucleation sites are the same kind of place — the
-head then learns a field→propensity map from the cleanest available examples and applies it at
-all times. It is wrong if they are different places, in which case a seed-trained head
-systematically misses those 7 vessels.
-
-**This was run (`scripts/diag_nucleation_timing_probe.py`) and the answer is NO — they are
-different places. §20.4's seed-only target is a mis-specification.**
-
-12 vessels had >=5 nucleation sites in both Q1 and Q4 (333 Q1 sites, 211 Q4 sites). Against a
-permutation null that re-labels the *same* sites at random — necessary, because with 80+ features
-and small site counts raw separation is large by chance:
+This section previously concluded that early and late nucleation are different places and that
+the head needs time conditioning. **Both claims are withdrawn** (§26.13.2). Measuring each
+"nucleation" site's distance to the nearest already-committed node at its commit time:
 
 ```
-feature                     sep    null   excess   AUC(Q1|neg)  AUC(Q4|neg)
-hop_from_wall              0.478  0.079   +0.399      0.119        0.520
-sdf_nd                     0.478  0.093   +0.385      0.115        0.631
-kine_x_shear_potential     0.478  0.093   +0.385      0.885        0.369
-on_wall                    0.449  0.078   +0.371      0.866        0.417
+                 n     <=2 hop   median hop
+patient013 Q1    84     28.6%        4
+patient013 Q4    30    100.0%        2      <- every late site is 2 hops from existing clot
+patient020 Q4    28    100.0%        2
+patient041 Q4    17    100.0%        2
 ```
 
-Chance is ~0.08; observed ~0.48; **excess +0.399**. And the two right-hand columns show the two
-populations pointing in *opposite* directions:
+Every late-quartile site in all six vessels tested sits within 2 hops of existing clot. The
+1-hop adjacency rule was too strict: those are the growth front advancing off the wall into the
+lumen — growth, and out of scope for a wall model. The "early on-wall / late off-wall" split was
+its signature, and `graph_degree` was a symptom (growth fronts sit in mesh-refined regions), not
+a mesh artifact to defend against.
 
-**Early nucleation is ON the wall. Late nucleation is AWAY from it.** `sdf_nd` ranks Q1 sites at
-0.115 (near wall) and Q4 sites at 0.631 (far). `on_wall`: 0.866 vs 0.417. A head trained on t=20
-seeds learns "nucleate near the wall" and ranks late sites *below* chance — worse than useless
-on the 7 late-dominant vessels.
+**So: train the nucleation head on `t=20` seeds as §20.4 says.** Genuine nucleation *is* early.
+No time conditioning, no coupled-flow requirement for the head.
 
-**Consequence for §1.2 — the NUCLEATION term must NOT be time-invariant.** This handoff's first
-draft specified a static per-node rate; that is wrong, because a single rate cannot place early
-sites on the wall and late sites off it.
-
-But it is *not* true that late nucleation needs the evolving flow field. The same probe measured
-how well t=0 deploy-legal features rank each population against band negatives:
+**The premise is half the size §14.6 and the census implied.** With a hop-tolerant growth rule:
 
 ```
-best single-feature signal on EARLY sites:  0.406 above chance
-best single-feature signal on LATE  sites:  0.416 above chance
+growth rule    mean nucleation    range
+1 hop (old)         40.3%        27.0 .. 82.0
+2 hop               21.2%         4.2 .. 60.0
+3 hop               18.9%         3.4 .. 58.0
 ```
 
-**Late sites are just as learnable from t=0 features as early ones** — by *different* features,
-pointing the other way (early: `shear_potential` 0.885, `sdf_nd` 0.115; late: `graph_degree`
-0.916, `sdf_nd` 0.631). So the hard requirement is **time conditioning** — the head needs to know
-*when* it is predicting. Reading the current coupled flow field is a plausible enhancement and
-matches the physical story, but the data does not force it. Do the cheap thing first.
+Genuine nucleation is **~20% of commits**, under 5% on some vessels. C1's premise survives — it
+is still a mechanism the multiplicative architecture cannot express — but size the expected gain
+against 20%, not 40%. Use `scripts/diag_nucleation_census.py --growth-hops 2`.
 
-**RED FLAG — check before using it.** The strongest late-site predictor is `graph_degree`, which
-is a **mesh property, not physics**: high degree means local mesh refinement. If late nucleation
-correlates with mesh density, a head that learns it will score well in training and fail on any
-new mesh — the exact shape of failure this project can least afford to add. `bio_x_mu_bc_nd`
-(0.793) is a boundary-condition channel and deserves the same scrutiny. Before either enters the
-nucleation feature set, check whether its signal survives across vessels with different mesh
-densities, or drop it.
-
-**A confound you must carry:** as the wall becomes committed, a new wall-adjacent commit is more
-likely to *have* a committed neighbour and so be classified as growth rather than nucleation.
-Part of "late nucleation is off-wall" is therefore a selection effect, not necessarily physics.
-It does not change what the head must do — the sites it must rank late are off-wall either way —
-but the *mechanism* is not established, and an experiment that assumes it is would be unsound.
-
-**Still open:** whether `graph_degree`'s late-site signal is physical or a mesh artifact. That is
-cheap to check and gates whether it may be used at all.
+**And ~20% is what the PDE predicts, where 40% was not.** §10.1: fresh deposition is ~7% of Mat
+*mass flux*. ~20% of *events* is consistent (a nucleating node starts small). Read §1.5a before
+building anything — the C1 form in §1.2 does not match §10.1 either.
 
 **Kill criterion, corrected.** The Tier-C spec says "if the nucleation head cannot beat the
 logreg of §14.5" — **§14.5 is retracted**, so that bar is a dead number. Use instead:
@@ -235,6 +205,43 @@ the current model growth-only. So:
 * **Select and discriminate on `deploy_mat_f1`, not `deploy_clot_score` alone.** See §5.2.
 
 ---
+
+### 1.5a THE OPEN DESIGN QUESTION — C1's form vs the actual PDE
+
+Checked late, and it should have been checked before §1.2 was written. §10.1, what COMSOL solves:
+
+```
+J0_Mat = Da·( [d(sr,x) < sgt]·(L/gamma)·|d(sr,x)|·common   <- separation gate, 21%
+            + [sr < lss]·common )                           <- low-shear gate, 79.7% DOMINANT
+common = Sat(M)·k_rs·rp + Sat(M)·k_as·ap + (Mas/Minf)·k_aa·ap
+```
+
+Two mismatches with §1.2:
+
+1. **There is no spatial propagation term.** `(Mas/Minf)·k_aa·ap` autocatalyses on the node's
+   OWN adsorbed mass. Clot does not spread neighbour-to-neighbour — each node ignites when its
+   *local* shear gate fires, then self-accelerates; spatial clustering is inherited from the
+   shear field being smooth. But `_apply_autocatalytic`, the implemented GROWTH term, aggregates
+   over `edge_index` — **neighbours**. That is the wrong autocatalysis, and it is the same error
+   the 1-hop nucleation rule made: assuming propagation where the physics has local ignition.
+2. **The form is multiplicative, not additive.** Nucleation and growth are one equation, not two
+   mechanisms to sum: `k_dep` dominates at `Mat_i ~ 0`, `k_auto·Mat_i` once ignited. Both sit
+   INSIDE the same shear gate.
+
+A physics-faithful form:
+
+```
+dMat = gate_shear(regime) · Sat(Mat_i) · ( k_dep(field) + k_auto · Mat_i / Minf )
+```
+
+`gate_shear` routes between the low-shear and separation mechanisms — which is exactly §10.4's
+bimodality, and it is **already measured as routable from t=0** by `band_speed_q25` at 90.6%
+leave-one-vessel-out (AUC 0.975). "Clots form differently depending on geometry" is *which gate
+is in charge*.
+
+This preserves C1's motivation — an explicit ignition term the current architecture cannot
+express — while grounding the form in the PDE rather than in commit-event statistics that proved
+definitionally fragile twice in one session. **Decide this before writing the head.**
 
 ## 2. STANDING CONSTRAINTS — violating one invalidates the result, not just the run
 

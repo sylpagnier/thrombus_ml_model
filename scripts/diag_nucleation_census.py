@@ -42,6 +42,7 @@ if str(REPO) not in sys.path:
 
 from src.config import BiochemConfig, PhysicsConfig  # noqa: E402
 CEILING_HOPS: int | None = None
+GROWTH_HOPS = 1
 MAT_REL_FRAC = 0.10  # 21.2: rel_max at 10% of each vessel's peak Mat
 
 from src.core_physics.clot_growth_masks import (  # noqa: E402
@@ -105,9 +106,15 @@ def census_one(path: Path, device: torch.device, phys: PhysicsConfig,
     src, dst = ei[0], ei[1]
     ft = first.clone()
     ft[~committed] = torch.iinfo(torch.long).max
-    # min over neighbours of each node's commit time
-    nbr_min = torch.full_like(ft, torch.iinfo(torch.long).max)
-    nbr_min = nbr_min.scatter_reduce(0, dst, ft[src], reduce="amin", include_self=True)
+    # min over neighbours of each node's commit time, propagated GROWTH_HOPS times so that
+    # "had committed material nearby" tolerates more than one hop. s26.13.2: with a strict
+    # 1-hop rule, EVERY late-quartile "nucleation" site in six vessels sat exactly 2 hops from
+    # existing clot -- i.e. it was growth, misclassified. 1 reproduces the original rule.
+    nbr_min = ft.clone()
+    for _ in range(max(GROWTH_HOPS, 1)):
+        prop = torch.full_like(ft, torch.iinfo(torch.long).max)
+        prop = prop.scatter_reduce(0, dst, nbr_min[src], reduce="amin", include_self=True)
+        nbr_min = torch.minimum(nbr_min, prop)
     is_growth = committed & (nbr_min < first)
     is_nucleation = committed & ~is_growth
 
@@ -145,11 +152,15 @@ def main() -> int:
     ap.add_argument("--label", choices=("mu", "mat"), default="mu",
                     help="mu = deploy-metric GT; mat = rel_max training label")
     ap.add_argument("--ceiling-hops", type=int, default=None)
+    ap.add_argument("--growth-hops", type=int, default=1,
+                    help="a commit counts as GROWTH if committed material is within "
+                         "this many hops. 1 = the original (too strict) rule.")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    global CEILING_HOPS
+    global CEILING_HOPS, GROWTH_HOPS
     CEILING_HOPS = args.ceiling_hops
+    GROWTH_HOPS = args.growth_hops
     device = torch.device("cpu")
     phys, bio = PhysicsConfig(phase="biochem"), BiochemConfig(phase="biochem")
 

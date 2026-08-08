@@ -4652,3 +4652,93 @@ the mesh is fine" will train well and fail on any new mesh, which is precisely t
 failure this project is trying to escape. `bio_x_mu_bc_nd` (0.793) is a boundary-condition channel
 with the same problem. Neither should enter the nucleation feature set until its signal is shown
 to survive across vessels of differing mesh density.
+
+## 26.13.2 RETRACTION of 26.13 — late "nucleation" is 2-hop growth, misclassified
+
+26.13 concluded that early and late nucleation happen in different places and that C1's head
+therefore needs time conditioning. **That conclusion is withdrawn.** The user challenged whether
+late sites were simply clot growing on existing clot, and they are.
+
+For each "nucleation" site, distance at its commit time to the nearest already-committed node:
+
+| vessel | pop | n | <=2 hop | median hop |
+|---|---|---|---|---|
+| `patient013` | Q1 | 84 | 28.6% | 4 |
+| `patient013` | **Q4** | 30 | **100%** | **2** |
+| `patient020` | Q1 | 6 | 33.3% | 99 |
+| `patient020` | **Q4** | 28 | **100%** | **2** |
+| `patient041` | Q1 | 5 | 20.0% | 99 |
+| `patient041` | **Q4** | 17 | **100%** | **2** |
+
+**Every late-quartile "nucleation" site in all six vessels sits within 2 hops of existing clot,
+median exactly 2.** Early sites are genuinely isolated (median 3 to infinity, 20-43% within 2
+hops). The 1-hop adjacency rule was too strict: late sites are the growth front advancing
+outward from the wall into the lumen -- growth, and out of scope for a wall model.
+
+What this retracts:
+
+* **the "early on-wall / late off-wall" separation** -- it is the signature of an outward growth
+  front, not two populations of ignition sites;
+* **"the nucleation head needs time conditioning"** -- withdrawn; 20.4's seed-only target is
+  sound, because genuine nucleation *is* early;
+* **`graph_degree` as a late-site predictor** -- explained: growth fronts sit in the mesh-refined
+  regions that follow wall geometry. A symptom of the misclassification, not a signal.
+
+### The corrected premise
+
+Re-running the census with a hop-tolerant growth rule (`--growth-hops`):
+
+```
+growth rule    mean nucleation    range
+1 hop (old)         40.3%        27.0 .. 82.0
+2 hop               21.2%         4.2 .. 60.0
+3 hop               18.9%         3.4 .. 58.0
+```
+
+**Genuine nucleation is ~20% of commits, not ~40%**, and on some vessels under 5%. C1's premise
+survives -- it is still a mechanism the multiplicative architecture cannot express -- but the
+prize is half the size 14.6 and 26.12 implied, and it is not uniform across the inventory.
+
+**And the corrected number agrees with the PDE, where the old one did not.** 10.1: fresh
+deposition is ~7% of Mat *mass flux*, the remainder autocatalytic. ~20% of commit *events* being
+ignition-dominated is consistent with that (a nucleating node starts small, so it is a larger
+share of events than of mass). 40% was not consistent with 10.1, and that should have been
+caught when the census was written.
+
+## 26.13.3 C1 as specified does not match 10.1, and 10.1 should win
+
+Checked after the above, and it should have been checked before the C1 spec was written.
+
+```
+J0_Mat = Da·( [d(sr,x) < sgt]·(L/gamma)·|d(sr,x)|·common   <- separation gate, 21%
+            + [sr < lss]·common )                           <- low-shear gate, 79.7% DOMINANT
+common = Sat(M)·k_rs·rp + Sat(M)·k_as·ap + (Mas/Minf)·k_aa·ap
+```
+
+Two mismatches with `dMat = NUCLEATION(field) + GROWTH(local committed Mat)·gate(shear)`:
+
+1. **There is no spatial propagation term in the PDE.** `(Mas/Minf)·k_aa·ap` autocatalyses on the
+   node's OWN adsorbed mass. Clot does not spread neighbour-to-neighbour; each node ignites when
+   its *local* shear gate fires and then self-accelerates. Spatial clustering is inherited from
+   the shear field being smooth. But `_apply_autocatalytic` -- the implemented GROWTH term --
+   aggregates over `edge_index`, i.e. **neighbours**. That is the wrong autocatalysis, and it is
+   the same error the 1-hop nucleation rule made: assuming propagation where the physics has
+   local ignition.
+2. **The form is multiplicative, not additive.** Nucleation and growth are not two mechanisms to
+   sum; they are one equation, with `k_dep` dominating at `Mat_i ~ 0` and `k_auto·Mat_i`
+   dominating once ignited. Both sit INSIDE the same shear gate.
+
+A physics-faithful form is closer to
+
+```
+dMat = gate_shear(regime) · Sat(Mat_i) · ( k_dep(field) + k_auto · Mat_i / Minf )
+```
+
+with `gate_shear` routing between the low-shear and separation mechanisms -- which is exactly
+10.4's bimodality, separable at t=0 by `band_speed_q25` with **90.6% leave-one-vessel-out**. The
+"clots form differently depending on geometry" observation is *which gate is in charge*, and it
+has already been measured as routable.
+
+This keeps C1's motivation -- an explicit ignition term the current architecture cannot express
+-- while grounding the form in the PDE rather than in commit-event statistics that turned out to
+be definitionally fragile.
