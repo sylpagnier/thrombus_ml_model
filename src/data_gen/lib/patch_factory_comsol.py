@@ -560,6 +560,8 @@ class PatchFactoryComsolGenerator:
         )
         if mu is not None:
             payload["mu"] = mu
+        if sr is not None:
+            payload["d_shear"] = sr - s.shear_rate
         np.savez(self._npz_path(s), **payload)
         with open(self._sidecar(s), "w", encoding="utf-8") as f:
             json.dump(s.to_meta(), f, indent=2)
