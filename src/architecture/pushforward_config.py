@@ -109,6 +109,8 @@ ENV_KEY_TO_FIELD: dict[str, str] = {
     "SPECIES_CONTINUOUS_STEP_SOFT_F1_WEIGHT": "step_soft_f1_weight",
     "SPECIES_CONTINUOUS_MAT_LABEL_THRESH_MODE": "mat_label_thresh_mode",
     "SPECIES_CONTINUOUS_MAT_LABEL_REL_FRAC": "mat_label_rel_frac",
+    "SPECIES_CONTINUOUS_FINAL_STATE_VALUE_SCALED": "final_state_value_scaled",
+    "SPECIES_CONTINUOUS_LATENT_ABLATE": "latent_ablate",
     "SPECIES_CONTINUOUS_AUTOCAT_GROWTH": "autocatalytic_growth",
     "SPECIES_CONTINUOUS_AUTOCAT_K_DEP_INIT": "autocat_k_dep_init",
     "SPECIES_CONTINUOUS_AUTOCAT_K_AUTO_INIT": "autocat_k_auto_init",
@@ -368,6 +370,17 @@ class PushforwardConfig:
     # (CLOT_POCKET_GATE_PCT).
     mat_label_thresh_mode: str = "absolute"   # "absolute" | "rel_max"
     mat_label_rel_frac: float = 0.10
+    # --- s24 fixes ---------------------------------------------------------------------------
+    # (5) The final-state Huber runs on RAW log-state values (O(1e-4)) while the growth Huber
+    # lifts its inputs by `delta_value_scale` (1.5e5) first. Measured gap: 1.5e9x, so the term
+    # contributes ~1.75e-10 and is the ninth dead constant in this codebase. When True the
+    # final-state term is lifted by the same value scale, putting it on a comparable footing.
+    final_state_value_scaled: bool = False
+    # (4) Hard z_kin ablation: zero the latent block at BOTH train and eval. Distinct from
+    # `latent_dropout`, which is stochastic and a no-op at eval -- that asymmetry would train
+    # and deploy on different inputs. Z1 measured the whole flow channel at 0.041 AUC while
+    # z_kin occupies 256 of 287 input dims, so this settles whether it earns its width.
+    latent_ablate: bool = False
     autocatalytic_growth: bool = False
     autocat_k_dep_init: float = 1.0
     autocat_k_auto_init: float = 1.0

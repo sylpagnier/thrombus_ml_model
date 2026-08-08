@@ -79,6 +79,9 @@ from src.core_physics.species_pushforward_continuous import (
     deploy_eval_dual_full_weight,
     deploy_horizon_aux_all_packs,
     deploy_horizon_aux_cap_steps,
+    get_loss_terms,
+    reset_loss_terms,
+    set_loss_accounting,
     train_deploy_eval_flow_source,
     use_vessel_mat_max,
     continuous_teacher_fp_frac,
@@ -1281,6 +1284,7 @@ def main() -> int:
     for ep in range(1, int(args.epochs) + 1):
         t0_ep = time.time()
         model.train()
+        reset_loss_terms()          # per-term loss accounting for this epoch (s23)
         ep_losses: list[float] = []
         cur_unroll = curriculum_unroll_for_epoch(ep)
         pack_order = packs[:]
@@ -1350,6 +1354,7 @@ def main() -> int:
                   flow_series_win = _flow_series_for_unroll(
                       pack_data_gpu, static_gpu, device, win_use, velocity_series
                   )
+                  set_loss_accounting(True)   # s24 fix 2: training path only
                   loss, _, _ = unroll_continuous_loss(
                       model,
                       base_feats=static_gpu["base_feats"],
@@ -1377,6 +1382,7 @@ def main() -> int:
                   )
                   if not loss.requires_grad:
                       continue
+                  set_loss_accounting(False)
                   opt.zero_grad(set_to_none=True)
                   loss.backward()
                   if grad_clip > 0.0:
@@ -1791,6 +1797,8 @@ def main() -> int:
         )
         row["select_mode"] = select_mode
         row["select_score"] = score
+        for _tname, _tval in get_loss_terms().items():
+            row[f"lossterm_{_tname}"] = _tval
         # Gate-independent retention: keep the highest raw deploy score we ever saw.
         if float(deploy_clot_score) > salvage_score:
             salvage_score = float(deploy_clot_score)

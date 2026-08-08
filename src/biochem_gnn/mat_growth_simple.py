@@ -221,6 +221,10 @@ LADDER_LEG_ORDER: tuple[str, ...] = (
     "WG_stenosis_subcohort_ft_v9",
     "WG_stenosis_subcohort_ft_v10",
     "WG_phase1_baseline",
+    "WG_phase2a_decomp",
+    "WG_phase2b_nobrake",
+    "WG_phase3a_closedloop",
+    "WG_phase3b_zkin_ablate",
 )
 
 # Full-length clot-rich anchors (T=201, off-wall >=30%) from docs/GENERALIZATION_PLAN.md EDA.
@@ -1320,6 +1324,199 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 **_SUBCOHORT_RUNTIME_V11PLUS,
                 "prior_source": "analytic",
             },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # WG_phase2a_decomp -- IDENTICAL training config to WG_phase1_baseline. The only
+        # difference is instrumentation (per-term loss accounting), which never enters the
+        # optimizer. Purpose (s23): Phase 1 gave the first trustworthy misalignment measurement
+        # -- 10 distinct deploy states, stable jackknife, Spearman(loss, score) = +0.564 -- but
+        # a total says nothing about WHICH of ~8 terms fights the metric, and guessing that is
+        # exactly how v1-v10 were spent. This run correlates each term with deploy score
+        # separately, and doubles as a reproducibility check on Phase 1.
+        "WG_phase2a_decomp": MatGrowthLegSpec(
+            code="WG_phase2a_decomp",
+            label="Phase 2a: Phase-1 config + per-term loss decomposition (instrumentation only)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.75,
+                "step_prec_fp_penalty": 0.5,
+                "final_mass_penalty": 1.5,
+                "final_mass_target": 3.0,
+                "final_prec_fp_penalty": 1.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 1.0,
+                "step_soft_f1_weight": 40.0,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # WG_phase2b_nobrake -- Phase 2a's decomposition made the objective fix TARGETED for the
+        # first time (s23.7). Measured over 8 epochs, config byte-identical to Phase 1:
+        #
+        #   term            share of loss   rho(term, deploy_clot_score)
+        #   final_mass_fp        39%              +0.464   <- minimising it HURTS the score
+        #   step_mass_fp         16%              +0.429   <- same
+        #   final_soft_f1        15%              -0.321   <- correct direction
+        #   step_soft_f1          5%              -0.393   <- correct direction
+        #
+        # The mass-brake family is 54% of the loss and points the WRONG way; the soft-F_beta
+        # surrogate is 20% and points the right way. They pull against each other 2.8:1 in
+        # favour of the brake -- which is precisely the mechanism of Phase 1's mass collapse to
+        # 0.43-0.96 when the score optimum is ~2.0-2.4 (23.3).
+        #
+        # ONE conceptual change from Phase 1: switch the brake family OFF, leaving soft-F_beta
+        # as the rolled-state objective. This is not another reweighting guess -- it removes the
+        # single term family measured to be anti-correlated with the metric.
+        #
+        # `final_mass_target` also drops 3.0 -> 2.2. That is NOT a second variable: with the
+        # brake at zero the target is inert (it only parameterises the brake). It is set to the
+        # measured score-optimum so the constant is not left stale if the brake is restored.
+        "WG_phase2b_nobrake": MatGrowthLegSpec(
+            code="WG_phase2b_nobrake",
+            label="Phase 2b: Phase-1 minus the mass-brake family (s23.7 -- the terms measured "
+                  "anti-correlated with deploy_clot_score)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                # THE change: the anti-correlated family, off.
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "final_mass_target": 2.2,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 1.0,
+                "step_soft_f1_weight": 40.0,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # =================================================================================
+        # s24 fix legs. Effectively SINGLE-VARIABLE despite touching several knobs, because
+        # Phase 2b measured the mass terms to be inert (removing them moved mass 0.028) and
+        # fixes 2/5 are accounting and scale repair. The one BEHAVIOURAL variable in 3a is
+        # closed_loop_init 0.45 -> 1.0.
+        #
+        # NB a correction to s24: `closed_loop_init` is NOT dead -- it is consumed at
+        # train_species_pushforward_continuous.py:1334 and already starts 45%% of windows from
+        # `rollout_prefix_log_state`, i.e. the model's own free-running state. The claim that
+        # "every window starts from GT" was wrong. Raising it to 1.0 makes EVERY window start
+        # from the model's own drifted state, which is the only state deploy ever sees.
+        "WG_phase3a_closedloop": MatGrowthLegSpec(
+            code="WG_phase3a_closedloop",
+            label="s24 fixes + closed_loop_init 0.45->1.0 (every window from the model's own state)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                # (3) mass OUT of the loss entirely. Phase 2b proved these terms are inert
+                # (removing them moved mass by 0.028), and deploy_clot_score is relaxed
+                # PRECISION gated by a recall floor -- a mass target optimises a quantity the
+                # metric does not reward. Mass survives only as a SELECTION guard.
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                # (3b) beta 1.0 -> 0.5. F1 weights precision and recall equally, but the metric
+                # is precision-dominated once recall clears the floor. The surrogate meant to
+                # track the metric was itself mis-specified against it.
+                "rolled_soft_f1_beta": 0.5,
+                "step_soft_f1_weight": 40.0,
+                # (5) lift the final-state Huber onto the growth loss's value scale (1.5e9x).
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                # THE behavioural variable.
+                "closed_loop_init": 1.0,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # (4) z_kin ablation. Z1 measured the entire flow channel at 0.041 AUC while z_kin is
+        # 256 of 287 input dims. Hard ablation (train AND eval) so the two match; `in_dim`
+        # stays 287, sidestepping the s13.8 warm-start blocker that killed the shrink.
+        "WG_phase3b_zkin_ablate": MatGrowthLegSpec(
+            code="WG_phase3b_zkin_ablate",
+            label="s24 fix 4: hard z_kin ablation (zeroed at train AND eval), in_dim unchanged",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                # (3) mass OUT of the loss entirely. Phase 2b proved these terms are inert
+                # (removing them moved mass by 0.028), and deploy_clot_score is relaxed
+                # PRECISION gated by a recall floor -- a mass target optimises a quantity the
+                # metric does not reward. Mass survives only as a SELECTION guard.
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                # (3b) beta 1.0 -> 0.5. F1 weights precision and recall equally, but the metric
+                # is precision-dominated once recall clears the floor. The surrogate meant to
+                # track the metric was itself mis-specified against it.
+                "rolled_soft_f1_beta": 0.5,
+                "step_soft_f1_weight": 40.0,
+                # (5) lift the final-state Huber onto the growth loss's value scale (1.5e9x).
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                "closed_loop_init": 1.0,
+                # THE variable vs 3a.
+                "latent_ablate": True,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
             env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
         ),
         # v8 = v7 + the soft-F_beta rolled-state surrogate (s12.5 change E). The brake, even

@@ -1009,6 +1009,78 @@ def mat_label_thresh() -> float:
     return max(float(vmax) * max(frac, 0.0), 0.0)
 
 
+# --- per-term loss accounting (WALL_MODEL_PLAN.md 23) ----------------------------------------
+# Phase 1 produced the first TRUSTWORTHY measurement of loss/metric misalignment: 10 distinct
+# deploy states, stable jackknife, Spearman(loss, deploy_clot_score) = +0.564. Knowing the total
+# is misaligned does not say WHICH of ~8 terms fights the metric, and guessing that is how v1-v10
+# were spent. This accumulates per-term contributions so each can be correlated with deploy score
+# independently. Pure instrumentation: it never affects the value returned to the optimizer.
+_LOSS_TERMS: dict[str, float] = {}
+_LOSS_TERM_COUNTS: dict[str, int] = {}
+
+
+def reset_loss_terms() -> None:
+    _LOSS_TERMS.clear()
+    _LOSS_TERM_COUNTS.clear()
+
+
+_LOSS_ACCOUNTING_ON: bool = False
+
+
+def set_loss_accounting(on: bool) -> None:
+    """Gate term accounting to the TRAINING path only (s24 fix 2).
+
+    `unroll_continuous_loss` is called from three places (main loop, deploy aux, window eval).
+    Accumulating all of them while dividing by each term's own call count put terms on
+    different denominators and inflated the recorded shares by ~4.9x versus the true
+    contribution measured by removal. Only the main training loop should count.
+    """
+    global _LOSS_ACCOUNTING_ON
+    _LOSS_ACCOUNTING_ON = bool(on)
+
+
+def record_loss_term(name: str, value) -> None:
+    """Accumulate a term's scalar contribution. Detached; never in the graph."""
+    if not _LOSS_ACCOUNTING_ON:
+        return
+    try:
+        v = float(value.detach()) if hasattr(value, "detach") else float(value)
+    except Exception:
+        return
+    if v != v:  # NaN
+        return
+    _LOSS_TERMS[name] = _LOSS_TERMS.get(name, 0.0) + v
+    _LOSS_TERM_COUNTS[name] = _LOSS_TERM_COUNTS.get(name, 0) + 1
+
+
+def get_loss_terms(*, mean: bool = True) -> dict[str, float]:
+    """Per-term totals (or means) since the last reset."""
+    if not mean:
+        return dict(_LOSS_TERMS)
+    return {k: v / max(_LOSS_TERM_COUNTS.get(k, 1), 1) for k, v in _LOSS_TERMS.items()}
+
+
+def continuous_final_state_value_scaled() -> bool:
+    cfg = resolve_config()
+    if cfg is not None:
+        return bool(cfg.final_state_value_scaled)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_FINAL_STATE_VALUE_SCALED") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def continuous_latent_ablate() -> bool:
+    """Hard z_kin ablation at BOTH train and eval (s24 fix 4).
+
+    Distinct from `latent_dropout`, which is stochastic and a no-op at eval -- that asymmetry
+    would train and deploy on different inputs and confound the ablation.
+    """
+    cfg = resolve_config()
+    if cfg is not None:
+        return bool(cfg.latent_ablate)
+    raw = (os.environ.get("SPECIES_CONTINUOUS_LATENT_ABLATE") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def log_series_on_band(
     data,
     time_indices: Sequence[int],
@@ -2675,10 +2747,15 @@ def maybe_drop_latent(base_feats: torch.Tensor, model: nn.Module, training: bool
     columns of ``base_feats``, ahead of sdf + flow features). Resampled per call so each unrolled
     step independently sees latent or not.
     """
+    ld = int(getattr(model, "kin_latent_dim", 0) or 0)
+    # s24 fix 4: hard ablation applies at train AND eval, before the training short-circuit.
+    if continuous_latent_ablate() and ld > 0 and int(base_feats.shape[1]) >= ld:
+        out = base_feats.clone()
+        out[:, :ld] = 0.0
+        return out
     if not training:
         return base_feats
     p = float(getattr(model, "latent_dropout_p", 0.0) or 0.0)
-    ld = int(getattr(model, "kin_latent_dim", 0) or 0)
     if p <= 0.0 or ld <= 0 or int(base_feats.shape[1]) < ld:
         return base_feats
     if torch.rand((), device=base_feats.device).item() >= p:
@@ -3680,18 +3757,16 @@ def unroll_continuous_loss(
                     )
                     losses.append(mass_fp_step)
                     loss_ws.append(float(step_w[step]))
+                    record_loss_term("step_mass_fp", mass_fp_step)
                 # Soft-F_beta on the rolled state at this step vs that step's GT (change E).
                 ssf = continuous_step_soft_f1_weight()
                 if ssf > 0.0:
-                    losses.append(
-                        rolled_soft_f1_loss(
-                            log_state,
-                            log_series[step + 1],
-                            step_train_mask,
-                            weight=ssf,
-                        )
+                    _sf1 = rolled_soft_f1_loss(
+                        log_state, log_series[step + 1], step_train_mask, weight=ssf,
                     )
+                    losses.append(_sf1)
                     loss_ws.append(float(step_w[step]))
+                    record_loss_term("step_soft_f1", _sf1)
 
             # --- Scheduled sampling: intermittent noisy-GT anchoring ---
             # With probability (1 - keep_prob), reset log_state to (noisy) GT
@@ -3743,6 +3818,9 @@ def unroll_continuous_loss(
         return z, pred_deltas, states
     wsum = max(sum(loss_ws), 1e-6)
     step_loss = sum(loss * w for loss, w in zip(losses, loss_ws)) / wsum
+    # The per-step block as a whole (dominated by the growth Huber). Recorded before the
+    # final-state terms are added so the two are separable.
+    record_loss_term("per_step_block", step_loss)
     fw = continuous_final_state_weight()
     if states:
         m = train_mask.reshape(-1).bool()
@@ -3754,15 +3832,26 @@ def unroll_continuous_loss(
                     beta = continuous_huber_beta()
                     final_tgt = log_series[-1][m]
                     final_pred = states[-1][m]
+                    # s24 fix 5: raw log-states are O(1e-4); the growth Huber lifts its inputs by
+                    # delta_value_scale (1.5e5) and this one did not, leaving it ~1.5e9x smaller
+                    # and numerically dead. Lift both sides identically when enabled.
+                    if continuous_final_state_value_scaled():
+                        _vs = float(continuous_delta_value_scale())
+                        final_pred = final_pred * _vs
+                        final_tgt = final_tgt * _vs
                     final_loss = F.huber_loss(final_pred, final_tgt, delta=beta, reduction="mean")
                     final_loss = final_loss * continuous_loss_scale()
                 step_loss = step_loss + fw * final_loss
+                record_loss_term("final_state", fw * final_loss)
             # Soft mass / FP on the rolled final state (train–deploy alignment).
             mass_fp = rolled_final_mass_fp_penalty(states[-1], log_series[-1], m)
             step_loss = step_loss + mass_fp
+            record_loss_term("final_mass_fp", mass_fp)
             # Soft-F_beta on the rolled final state: the deploy metric itself, softened.
             # This is the term v6 proved the objective was missing (s12.3 change E).
-            step_loss = step_loss + rolled_soft_f1_loss(states[-1], log_series[-1], m)
+            _rsf1 = rolled_soft_f1_loss(states[-1], log_series[-1], m)
+            step_loss = step_loss + _rsf1
+            record_loss_term("final_soft_f1", _rsf1)
 
     if physics_ctx is not None and states:
         from src.core_physics.species_gelation_readout import (

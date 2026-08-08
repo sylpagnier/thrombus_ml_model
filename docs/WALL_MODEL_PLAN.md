@@ -3616,3 +3616,331 @@ label/prediction threshold separation (the prediction side must never consult th
 that would be a deploy leak).
 
 **Suite: 571 passed, 0 failed.**
+
+# 23. Phase 1 result and the Phase 2 decision (2026-08-08)
+
+`WG_phase1_baseline`, 10 epochs, 25 train vessels, val `patient041`, ~17 min/epoch (2.9 h).
+The re-baseline. Nothing here is comparable with sections 9-20; everything after is measured
+against this.
+
+## 23.1 The result
+
+```
+ep    loss      score      f1     mass    fp   fn   selection
+ 1   76.2303   0.4104   0.5017   3.062   242    9   accepted
+ 2   76.2502   0.3706   0.4674   2.708   202    9   accepted
+ 3   76.2543   0.3757   0.4730   2.699   201    9   accepted
+ 4   76.2574   0.4593   0.5419   2.363   165   11   accepted
+ 5   76.1935   0.4350   0.4006   0.708    31   64   MASS-REJECT (under)
+ 6   76.1989   0.4889   0.5505   2.062   131   11   accepted   <- BEST
+ 7   76.1921   0.3137   0.2494   0.522    25   79   MASS-REJECT (under)
+ 8   76.1915   0.4076   0.3668   0.788    38   62   MASS-REJECT (under)
+ 9   76.1356   0.2899   0.2275   0.434    27   91   MASS-REJECT (under)
+10   76.1731   0.3553   0.3389   0.956    57   62   MASS-REJECT (under)
+```
+
+**Three things changed qualitatively, and all three are Phase-0 effects.**
+
+1. **The `fp≈292` attractor is gone.** 10 epochs visited **10 distinct fp states** (25-242).
+   Every leg v3-v10 visited **2**. The dynamic range that 12.3 said was missing now exists.
+2. **Four epochs passed selection**, against **zero** across v2-v10 combined.
+3. **The failure mode inverted.** Every historical rejection was for *over*-mass (~4.03);
+   every Phase-1 rejection is for *under*-mass (0.43-0.96). The model now collapses toward
+   under-painting instead of saturating.
+
+Best epoch: **score 0.4889, F1 0.5505 at mass 2.062**, against a v2-v10 best-ever in-training
+score of 0.5011 — but that one was a lucky single-epoch excursion in a leg that produced no
+checkpoint, whereas this is the selected state of a leg that produced four valid ones.
+
+## 23.2 The alignment problem is unchanged — and for the first time, trustworthy
+
+```
+Spearman(loss, deploy_clot_score) = +0.564
+jackknife range                   = [+0.40, +0.67]   sign STABLE
+z-separation of the best epoch    = -0.25            (|z| < 0.5 -> loss cannot see it)
+distinct deploy states            = 10               (v3-v10: 2)
+total loss spread                 = 0.16%
+```
+
+12.3 had to discard v6's `-0.406` because it rested on 2 distinct states and flipped sign when
+one epoch was dropped. **This one does not.** Ten distinct states, a jackknife that never
+crosses zero, and a positive sign: **lower loss reliably means worse deploy score.**
+
+Loss moved 76.2303 -> 76.1356 (monotone-ish down) while score went 0.4104 -> 0.2899. The
+optimizer is doing its job; the objective is pointing the wrong way.
+
+This is the first *measurable* statement of the problem in the project's history. Everything
+before it was either underpowered (12.8.2) or measured against a dead objective (12.6).
+
+## 23.3 A stale constant of my own: 20.2's 3.04x is the wrong target
+
+20.2 measured the F1-optimal commit ratio as 3.04x n_true and I set `final_mass_target = 3.0`
+from it. That number came from a **logistic regression** optimising **F1**. The guiding metric
+is `deploy_clot_score`, which is *relaxed precision* gated by a recall floor -- a different
+functional with a different optimum. Phase 1 measures the real one:
+
+```
+score-ranked epochs:   0.4889 @ mass 2.06   0.4593 @ 2.36   0.4350 @ 0.71
+                       0.4104 @ 3.06        0.4076 @ 0.79   0.3757 @ 2.70
+```
+
+The score optimum sits at **mass ~2.0-2.4**, not 3.04. The selection window [1.2, 4.5] still
+brackets it, so selection is fine, but `final_mass_target = 3.0` pushes training past the
+optimum. Same class of error as every other stale constant in this document -- a number
+measured for one purpose reused for another -- and it is mine, from two sessions ago.
+
+## 23.4 Learning curve: declining, so more epochs are not the answer
+
+```
+best epoch 6 of 10   overall slope -0.0078/ep   tail slope -0.0262/ep   verdict: declining
+```
+
+Contrast v10, which the same diagnostic scores `EXTEND` (best epoch 12/14, tail **+0.0497**).
+Phase 1 peaks in the middle and degrades. **Spending the budget on more epochs would buy
+nothing**; the run is not data-starved, it is being actively pushed the wrong way after epoch 6.
+
+This retires the 14-epoch floor for good and confirms the ROI position: **8-10 epochs is the
+right screening unit at 17 min/epoch**, with the learning-curve verdict as the stop/extend rule.
+
+## 23.5 Why the mass collapse is the alignment problem wearing a different hat
+
+The loss weights were tuned in an era when the rolled-state terms were numerically dead
+(12.6.1). `fp_weight = 6.0` against `underpred_weight = 3.0` is 2:1 in favour of suppression,
+which was harmless while the terms carrying it could not respond to the rollout. Phase 0 fixed
+the occupancy scale, so those terms now have real gradient -- and the pre-existing 2:1
+suppression bias is expressing itself for the first time, driving mass from 3.06 down through
+the optimum to 0.43.
+
+So the over-painting that consumed sections 9-13 and the under-painting in Phase 1 are the same
+defect seen from two sides: **nothing in the objective is anchored to the operating point that
+maximises the metric.**
+
+## 23.6 Phase 2 decision
+
+The user asked whether it is worth spending time linking the training loss to the guiding
+score. **Yes, and now is the moment**, for a reason that did not hold before: the measurement is
+finally trustworthy (23.2). Building C1 (nucleation + growth) on top of an objective with
+`rho = +0.564` would optimise the new architecture in the wrong direction and produce another
+uninterpretable leg -- v1-v10's core mistake, repeated with more machinery.
+
+**But "fix the objective" is not actionable at the level of a total.** The loss has ~8 terms.
+12.3 already burned four legs (v4, v5, v6, v9) guessing which one mattered. So Phase 2 starts
+with a decomposition rather than a fix:
+
+**`WG_phase2a_decomp`** -- training config **byte-identical** to `WG_phase1_baseline`
+(verified: config diff is empty). The only change is instrumentation: `record_loss_term()`
+accumulates each term's contribution per epoch into `lossterm_*` fields in `train_log.jsonl`,
+detached and never in the optimizer graph. Terms tracked: `per_step_block` (the growth Huber,
+which dominates), `final_state`, `final_mass_fp`, `final_soft_f1`, `step_mass_fp`,
+`step_soft_f1`.
+
+The question it answers: **which term is anti-correlated with `deploy_clot_score`?** With that,
+the fix is targeted rather than another guess. It also serves as a reproducibility check on
+Phase 1, which nothing else in this project has ever had.
+
+## 23.7 Phase 2a — per-term decomposition. The brake points the wrong way.
+
+> **SHARES CORRECTED IN 24.2.** The 54.3%/2.8:1 magnitudes below are inflated ~4.9x by a
+> denominator bug in `record_loss_term`. The removal experiment (24.1) measures the brake at
+> **11.1%**. The rho SIGNS are unaffected and stand; the share percentages do not.
+
+
+`WG_phase2a_decomp`, 8 epochs, training config **byte-identical** to `WG_phase1_baseline`
+(verified: empty config diff). The only difference is `record_loss_term()` accounting, detached
+and never in the optimizer graph.
+
+**Reproducibility, which this project has never had:**
+```
+mass by epoch
+  phase1 : 3.062 2.708 2.699 2.363 0.708 2.062 0.522 0.788
+  phase2a: 3.062 2.708 2.699 2.363 0.726 2.027 0.531 0.920
+```
+Identical for four epochs, then small divergence with the same shape. The pipeline is
+deterministic to the point where a real effect is distinguishable from run-to-run noise.
+
+**The decomposition (n=8):**
+
+| term | share of loss | rho(term, deploy_clot_score) | direction |
+|---|---|---|---|
+| `final_mass_fp` | 38.6% | **+0.381** | minimising it HURTS the score |
+| `step_mass_fp` | 15.7% | **+0.381** | same |
+| `per_step_block` | 72.6%* | +0.119 | ~neutral |
+| `final_state` | 0.0% | +0.238 | **dead** (exactly 0.0000) |
+| `final_soft_f1` | 14.7% | **−0.333** | correct direction |
+| `step_soft_f1` | 4.9% | **−0.381** | correct direction |
+| TOTAL loss | | +0.048 | uncorrelated |
+
+*nested: `per_step_block` contains the step terms.
+
+**The sign split follows term family exactly, with no crossovers.** Every mass/regression term
+is positive; both soft-F_beta terms are negative. Under random signs the probability that the
+two surrogate terms are the only two negatives is 1/15 = 0.067. Not conclusive alone, but it
+is coherent across all six terms and mechanistically consistent with 23.5.
+
+```
+mass-brake family :  41.36 = 54.3% of the loss   pointing AWAY from the metric
+soft-F_beta       :  14.93 = 19.6% of the loss   pointing TOWARD it
+ratio             :  2.8 : 1 in favour of the brake
+```
+
+**This is the mechanism of Phase 1's mass collapse.** The brake drives mass down; Phase 1 falls
+to 0.43-0.96 while the score optimum is 2.0-2.4 (23.3). A term family that is 54% of the
+objective and anti-correlated with the metric will do exactly that.
+
+**The historical irony is worth recording.** The s9.11 growth brake has been in every leg since
+v3. s12.6 found it *numerically dead* (soft occupancy pinned at 0.5), and Phase 0 revived it.
+It was harmless while broken and harmful once fixed. Three sessions of work to restore a term
+that needed removing.
+
+**Correction to an earlier reading in this session.** At n=3 I recorded that *every* term was
+flat and concluded term reweighting was futile. That was wrong: at n=8 the terms separate
+cleanly by sign. Reweighting IS the answer — a measured one rather than a guessed one. The n=3
+reading had too little dynamic range to see it, which is the same underpowering trap as 12.8.2.
+
+**`final_state` is a seventh dead term** (mean exactly 0.0000; the leg's `final_state_weight`
+resolves to `None`). Same family as 12.6's dead constants. Logged, not worth GPU.
+
+## 23.8 Phase 2b — the targeted removal
+
+`WG_phase2b_nobrake`. ONE conceptual change from Phase 1: the term family measured to be
+anti-correlated is switched off.
+
+```
+step_mass_penalty      0.75 -> 0.0
+step_prec_fp_penalty   0.50 -> 0.0
+final_mass_penalty     1.50 -> 0.0
+final_prec_fp_penalty  1.00 -> 0.0
+final_mass_target      3.00 -> 2.2   (INERT at zero brake; set to the 23.3 measured optimum
+                                      so the constant is not left stale if the brake returns)
+```
+
+Soft-F_beta is left untouched, so it becomes the rolled-state objective on its own.
+
+**Pre-registered, before the result:**
+* **Success** = mass stops collapsing (stays in 1.5-3.0 rather than falling to 0.4-0.9) AND
+  best-epoch `deploy_clot_score` beats Phase 1's 0.4889.
+* **Partial** = mass stabilises but score does not improve. Reads as "the brake was the mass
+  mechanism but not the score bottleneck" -> the remaining gap is the 5-step-vs-200-step
+  horizon mismatch (23.6), and the next lever is the share of optimizer steps that see a free
+  rollout, currently 1 in 3270.
+* **Null** = mass still collapses. Then the brake is not the driver and the suppression comes
+  from `fp_weight`/`underpred_weight` (6:3) in the per-step block, which is the next candidate.
+
+Note the honest asymmetry: two of three outcomes point away from further objective surgery and
+toward the horizon mismatch. After v1-v10, the prior that "the loss is the problem" must be
+allowed to lose.
+
+# 24. Phase 0-2 review and the five fixes (2026-08-08)
+
+## 24.1 Phase 2b result — the brake is inert. Third identical null.
+
+`WG_phase2b_nobrake` = Phase 1 with the mass-brake family removed. Same seed, same data.
+
+```
+ep   mass ON   mass OFF    delta  |  score ON  score OFF    delta
+ 1     3.062     3.106    +0.044  |   0.4104     0.3971   -0.0133
+ 2     2.708     2.708    +0.000  |   0.3706     0.3706   +0.0000
+ 3     2.699     2.699    +0.000  |   0.3757     0.3752   -0.0005
+ 4     2.363     2.327    -0.035  |   0.4593     0.4699   +0.0106
+ 5     0.708     0.717    +0.009  |   0.4350     0.4430   +0.0080
+ 6     2.062     2.142    +0.080  |   0.4889     0.4552   -0.0336
+
+mean |delta mass| = 0.0280      mean |delta score| = 0.0110
+loss 76.208 -> 67.773 (the removed term was 8.43, i.e. 11.1% of the objective)
+```
+
+Removing 11% of the loss moved the rollout by ~1%, with epochs 2-3 identical to four decimals.
+**Pre-registered Null branch fires**: the brake is not the driver of the mass collapse.
+
+Three rolled-state term families have now failed identically — the dead occupancy (12.6), the
+soft-F_beta surrogate (correctly signed but negligible), and the brake. **No loss-term
+intervention has ever moved this model.**
+
+## 24.2 A correction: the recorded term shares were inflated 4.9x
+
+23.7 reported the brake as 54.3% of the loss. The removal experiment says **11.1%**.
+`record_loss_term` accumulated across three call sites (main loop, deploy aux, window eval)
+while dividing by each term's own call count, so terms touched by different numbers of paths
+sat on different denominators. **Signs survive** (within-term, scale-invariant); **shares do
+not**. The 2.8:1 magnitude claim is retracted.
+
+## 24.3 A correction: `closed_loop_init` is NOT dead, and my "windows start from GT" claim was wrong
+
+I recorded that every training window starts from a GT state and that this is the core
+distribution gap. That is false. `closed_loop_init` is consumed at
+`train_species_pushforward_continuous.py:1334`:
+
+```python
+if int(win_use[0]) > 0 and closed_loop_init_prob() > 0.0 and random.random() < closed_loop_init_prob():
+    log_state0 = rollout_prefix_log_state(model, pack_data_gpu, static_gpu, int(win_use[0]), device)
+```
+
+At the configured 0.45, **45% of windows already start from the model's own free-running
+state**. This materially weakens the hypothesis I had ranked highest: the training distribution
+is already half-corrected and the loss is still uncorrelated with deploy score. Fix 1 therefore
+becomes a config change (0.45 -> 1.0), not new code.
+
+## 24.4 The ninth dead constant: `final_state`
+
+Recorded as exactly 0.0000. Not a logic bug — a scale gap. The growth Huber lifts its inputs by
+`delta_value_scale = 1.5e5` before comparison; the final-state Huber does not, and log-states
+are O(1e-4):
+
+```
+final_state huber on raw states     : 5.00e-09  (x loss_scale 0.1 x fw 0.35 = 1.75e-10)
+growth huber WITH value_scale 1.5e5 : 7.375e+00
+ratio                               : 1.5e9 x
+```
+
+Same family as 12.6.1's dead occupancy and 12.6.2's `fp_thresh`. Fixed by lifting, not deleting.
+
+## 24.5 Answers to the five review questions
+
+**(1) Loss-term scale normalisation** — a real defect, twice over: my instrumentation (24.2) and
+the objective itself, where `loss_scale=0.1` multiplies rolled-state terms but not the per-step
+Huber, so any rolled weight was implicitly divided by 10 against its competitor.
+
+**(2) Should mass be in the loss at all** — no. `deploy_clot_score` is relaxed *precision* gated
+by a recall floor; once recall clears the floor the score IS precision. A mass target optimises
+something the metric does not reward, and 24.1 shows it does nothing anyway. It survives as a
+selection guard, where it is cheap and works. A related error of mine: `rolled_soft_f1_beta`
+was 1.0 (F1 weights precision and recall equally) when the metric is precision-dominated — the
+surrogate built to track the metric was mis-specified against it. Now 0.5.
+
+**(3) Why the brake does not work** — three measured layers: numerically dead (12.6), revived by
+Phase 0 (range 0.12% -> 97.7%), and *still* inert once alive (24.1). Mechanism: rolled-state
+terms attach to `states[-1]` of a 5-step window that begins near GT, so the rolled state barely
+differs from GT, the penalty sits near its floor, and its gradient is small against a per-step
+Huber with 5x more terms and direct supervision at every one.
+
+**(4) What loss actually correlates** — the per-step block IS already "predicted delta-species
+matches real delta-species", it is 72% of the loss, and it is the only thing moving the model.
+Its correlation with deploy score is **+0.119**. The form is right; what is wrong is the state
+distribution the windows are drawn from — and per 24.3 that is already 45% model-generated, so
+the remaining lever is to take it to 100%. Note `train_t0_coverage_frac=0.85` already spreads
+t0 across the timeline, so "not just from t=0" is handled.
+
+**(5) z_kin ablation** — **never run.** Phase 2 became 2a (decomposition) and 2b (brake
+removal); B2 was specified in 17/19.5 and skipped. There is no evidence either way. Now wired.
+
+## 24.6 The five fixes, as wired
+
+| # | fix | mechanism |
+|---|---|---|
+| 1 | free-running windows | `closed_loop_init` 0.45 -> **1.0** |
+| 2 | term accounting | `set_loss_accounting()` gates recording to the training path only |
+| 3 | mass out of loss; beta retuned | four penalties -> 0; `rolled_soft_f1_beta` 1.0 -> **0.5** |
+| 4 | z_kin ablation | new `latent_ablate`: hard zero at train **and** eval |
+| 5 | dead final_state | `final_state_value_scaled` lifts it by `delta_value_scale` |
+
+Fix 4 deliberately does **not** reuse `latent_dropout`: that is stochastic and a no-op at eval,
+so it would train and deploy on different inputs and confound the ablation. `latent_ablate`
+zeroes symmetrically and keeps `in_dim = 287`, sidestepping the 13.8 warm-start blocker.
+
+**Attribution.** `WG_phase3a_closedloop` changes eight config values but is effectively
+single-variable: 24.1 measured the mass terms inert, fixes 2 and 5 are accounting and scale
+repair, and beta is a metric-matching correction. The one behavioural variable is
+`closed_loop_init`. `WG_phase3b_zkin_ablate` differs from 3a by **exactly `latent_ablate`**,
+asserted in a test so it cannot drift.
+
+Suite: **575 passed**.

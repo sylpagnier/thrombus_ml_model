@@ -187,3 +187,70 @@ def test_label_and_prediction_thresholds_stay_separate_in_source():
     assert "_VESSEL_MAT_MAX" not in commit_src and "mat_label" not in commit_src, (
         "prediction-side threshold must not consult the vessel max -- that is a deploy leak"
     )
+
+
+# --- s24 fixes ------------------------------------------------------------------------------
+
+def test_latent_ablate_is_symmetric_across_train_and_eval():
+    """Hard ablation must apply at BOTH train and eval.
+
+    `latent_dropout` is stochastic and a no-op at eval; using it as an ablation would train and
+    deploy on different inputs and confound the result.
+    """
+    from src.core_physics.species_pushforward_continuous import maybe_drop_latent
+
+    class _M:
+        kin_latent_dim = 256
+        latent_dropout_p = 0.0
+
+    x = torch.randn(40, 287)
+    with use_pushforward_config(PushforwardConfig(species_scope="mat", latent_ablate=True)):
+        for training in (True, False):
+            out = maybe_drop_latent(x, _M(), training)
+            assert float(out[:, :256].abs().max()) == 0.0, f"z_kin not ablated (training={training})"
+            assert float(out[:, 256:].abs().max()) > 0.0, "non-latent block must be untouched"
+    with use_pushforward_config(PushforwardConfig(species_scope="mat", latent_ablate=False)):
+        assert float(maybe_drop_latent(x, _M(), True)[:, :256].abs().max()) > 0.0
+
+
+def test_loss_accounting_is_gated_to_the_training_path():
+    """s24 fix 2: three call sites feed the loss; only the main loop may be counted."""
+    from src.core_physics.species_pushforward_continuous import (
+        get_loss_terms, record_loss_term, reset_loss_terms, set_loss_accounting,
+    )
+    reset_loss_terms()
+    set_loss_accounting(False)
+    record_loss_term("t", 1.0)
+    assert get_loss_terms() == {}, "terms recorded while accounting was off"
+    set_loss_accounting(True)
+    record_loss_term("t", 5.0)
+    set_loss_accounting(False)
+    assert get_loss_terms()["t"] == pytest.approx(5.0)
+
+
+def test_final_state_value_scaling_defaults_off_and_is_readable():
+    from src.core_physics.species_pushforward_continuous import (
+        continuous_final_state_value_scaled,
+    )
+    with use_pushforward_config(PushforwardConfig(species_scope="mat")):
+        assert continuous_final_state_value_scaled() is False
+    with use_pushforward_config(
+        PushforwardConfig(species_scope="mat", final_state_value_scaled=True)
+    ):
+        assert continuous_final_state_value_scaled() is True
+
+
+def test_s24_legs_are_single_variable_against_each_other():
+    from src.biochem_gnn.mat_growth_simple import get_mat_growth_config_kwargs as C
+
+    a, b = C("WG_phase3a_closedloop"), C("WG_phase3b_zkin_ablate")
+    diff = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    assert diff == {"latent_ablate"}, f"3a vs 3b must differ only by latent_ablate, got {diff}"
+    # mass is out of the LOSS entirely; deploy_clot_score rewards precision, not mass
+    for k in ("step_mass_penalty", "step_prec_fp_penalty",
+              "final_mass_penalty", "final_prec_fp_penalty"):
+        assert a[k] == 0.0, f"{k} must be 0 -- mass belongs in selection, not the loss"
+    # the surrogate must match the metric's precision tilt, not F1's symmetry
+    assert a["rolled_soft_f1_beta"] < 1.0
+    assert a["closed_loop_init"] == pytest.approx(1.0)
+    assert a["final_state_value_scaled"] is True
