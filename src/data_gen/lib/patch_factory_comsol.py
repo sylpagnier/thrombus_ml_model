@@ -590,7 +590,7 @@ class PatchFactoryComsolGenerator:
         except Exception as exc:
             logger.warning("[%s] solve failed: %s: %s", s.idx, type(exc).__name__, exc)
             raise
-        u, v, p, mu = self._evaluate_grid(x, y)
+        u, v, p, mu, sr = self._evaluate_grid(x, y)
 
         for name, arr in (("u", u), ("v", v), ("p", p)):
             if np.isnan(arr).any():
@@ -600,7 +600,7 @@ class PatchFactoryComsolGenerator:
             logger.warning("[%s] trivial solution (u~0); discarding.", s.idx)
             return False
 
-        self._write_sample(s, x, y, nx, ny, u, v, p, mu)
+        self._write_sample(s, x, y, nx, ny, u, v, p, mu, sr)
         return True
 
     def dry_run_one(self, s: PatchSample) -> None:
