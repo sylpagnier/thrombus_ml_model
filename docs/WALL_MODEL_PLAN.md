@@ -4481,3 +4481,48 @@ offset (`runtime_bound` False in training, True in the scoring scope) — the sa
 already showed. The integrity check of 26.10 lesson 2 now passes for both legs.
 
 Suite: **583 passed** (575 at the start of section 26, +8 guards).
+
+## 26.11 T5 result (partial) and the pivot to Phase 3
+
+### T5: the loss_scale asymmetry was load-bearing
+
+`WG_t5_unified_scale` = 3a + `loss_scale_unified`, one variable (asserted). Epoch 1:
+
+| leg | score | mass | fp | `deploy_mat_f1` |
+|---|---|---|---|---|
+| 3a (baseline) | 0.4056 | 3.080 | 244 | 0.2646 |
+| leg A (per-step only) | 0.4353 | 2.743 | 206 | 0.2828 |
+| leg B (surrogate only) | 0.2660 | 4.451 | 399 | 0.2638 |
+| **T5 (unified scale)** | **0.4334** | **2.823** | **215** | **0.2819** |
+
+**Not a null** — and it moves *inside* the epoch 1-3 plateau where Phase 2b and Phase 3a were
+bit-identical to baseline: score **+0.028**, fp **-29**, mass **-0.26**, `mat_f1` **+0.017**, all
+in the precision-improving direction. So a global/rolled term does steer the model once it is no
+longer implicitly /10 against the per-step block. That is the first positive objective result in
+this project, and it de-risks training C1's nucleation head with a global ranking objective.
+
+Read it as n=1 epoch. Note also that *removing* the weak rolled terms (leg A, 0.4353) and
+*strengthening them 10x* (T5, 0.4334) land in nearly the same place, which is not obviously
+consistent; the weak middle ground being the worst of the three is a hypothesis, not a result.
+A 6-epoch run was relaunched to confirm past the ep4 breakout.
+
+### The pivot
+
+Phase 0, Phase 1 and Phase 2 of the project ladder are complete; **Phase 3 (C1) has never been
+started**, and 0f (§20.4) already settled its head target. The T1-T7 list was a diagnosis of the
+*current* model's objective — legitimate as debugging, but the ladder's own text had already
+ruled that work uninterpretable before C1 ("C3 only if C1 lands"), and §14.6 had already
+established that the multiplicative architecture cannot express 27-58% of commits.
+
+What survives the pivot is the **instrument repair**, not the objective conclusions: `fp_weight`
+unreachable (26.2), the `loss_scale` asymmetry (26.4), `latent_ablate` no-op at eval (26.10),
+the coupler off since 2026-08-06 (26.7), the five unaccounted terms (26.3), and `deploy_mat_f1`
+as a discrimination metric with resolution where `deploy_clot_score` plateaus (26.9/26.11).
+
+**Phase 3 is a fresh build, not a fine-tune** — 13 warm-started legs all degraded the warm
+start, and the additive nucleation term changes the function class. Full specification, standing
+constraints, and the state of the instrument are in **`docs/PHASE3_HANDOFF.md`**, written for a
+new context window.
+
+Closed by the pivot: **T3** (premise refuted, moot under fresh init), **T4** (folds into C1's
+loss design), and the 6-epoch re-run of T1's legs (moot once that objective is abandoned).
