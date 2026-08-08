@@ -4526,3 +4526,58 @@ new context window.
 
 Closed by the pivot: **T3** (premise refuted, moot under fresh init), **T4** (folds into C1's
 loss design), and the 6-epoch re-run of T1's legs (moot once that objective is abandoned).
+
+## 26.12 Nucleation census across the whole inventory — C1's premise, re-measured
+
+14.6's growth-vs-nucleation split is the entire justification for C1, and it was computed on
+**six** vessels (039-044) under a GT definition that was never recorded. 16.3 had already caught
+this project generalising from exactly those six. So it was redone on the full inventory:
+`scripts/diag_nucleation_census.py --label mat --ceiling-hops 3`.
+
+```
+n = 35 distinct vessels (mirror_y augmented duplicates excluded)
+nucleation %:  mean 40.3   sd 10.3   range 27.0 .. 82.0
+vessels below 27%:   NONE
+vessels above 58%:   patient002 (58.2), patient003 (82.0)
+```
+
+**Every vessel in the inventory is at least 27% nucleation, mean 40.3%.** C1's premise is
+confirmed, and more strongly than 14.6 stated it.
+
+**But 14.6's per-vessel numbers do not reproduce**, under either GT definition:
+
+| vessel | 14.6 | deploy-metric GT (`mu`) | rel_max label (`mat`) |
+|---|---|---|---|
+| `039` | 92 commits / 51.1% | 30 / 16.7% | 151 / 41.7% |
+| `041` | 266 / 30.1% | 198 / 38.4% | 138 / 33.3% |
+| `043` | 167 / 58.1% | 104 / 44.2% | 109 / 37.6% |
+
+14.6 predates both the canonical metric (20.1) and the per-vessel `rel_max` labels (21.2) and
+did not record which it used. The *conclusion* survives; the *numbers* should be quoted from the
+census from now on.
+
+### 26.12.1 The finding that changes C1's head target
+
+The census also profiles nucleation by time quartile:
+
+```
+purely-early (all nucleation in Q1):   10/35 vessels
+LATE-dominant (Q3+Q4 > Q1+Q2):          7/35 vessels
+  patient001 [2,2,10,11]   patient010 [9,1,8,16]   patient021 [21,1,8,18]
+  patient032 [0,13,9,47]   <- 47 of its nucleation events in the FINAL quartile
+```
+
+20.4 settled C1's head target as the `t=20` seeds, because seeds are +0.097 AUC more predictable
+and 2.7x more consistent than the final map. That reasoning is sound **only if early and late
+nucleation sites are the same kind of place.** A fifth of the inventory nucleates predominantly
+late, so if they are not, a seed-trained head systematically misses those seven vessels — a
+mis-specification that would be extremely hard to diagnose after C1 is built and underperforming.
+
+**This is now step 0 of Phase 3, ahead of any code:** compare Q1 nucleation sites against Q4
+nucleation sites under the deploy-legal features. Same distribution and same best-feature AUC ->
+train on seeds per 20.4. Separated -> the head needs a time input or a slow rate modulation.
+Pure CPU.
+
+**Known limitation of the census tool:** its `seed_reach` column is degenerate — bimodal 0%/100%,
+because it is really measuring "did anything commit by `t=20`" rather than reachability. 14.6's
+43-81% does not reproduce and should not be cited either. Redefine that metric before using it.

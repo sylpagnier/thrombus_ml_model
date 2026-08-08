@@ -35,22 +35,30 @@ pred_delta = spatial_gate * magnitude * autocat_factor
 ```
 
 Every factor scales a growth signal. A node with no committed neighbour and no existing Mat can
-only produce ~0. But §14.6 decomposed every commit event into growth (had a committed neighbour)
-vs nucleation (did not):
+only produce ~0. But every commit event decomposes into **growth** (the node had a committed
+neighbour when it turned on) or **nucleation** (it did not) — and nucleation is not a minority
+case.
 
-| vessel | nucleation % |
-|---|---|
-| `039` | 51.1% |
-| `040` | 47.2% |
-| `041` | 30.1% |
-| `042` | 26.7% |
-| `043` | 58.1% |
-| `044` | 31.4% |
+§14.6 measured that on **six** vessels (27–58%). That was a thin foundation — §16.3 had already
+caught this project generalising from those exact six — so it was re-measured this session on the
+**whole inventory** with `scripts/diag_nucleation_census.py`:
 
-**27–58% of all commits are nucleation, continuing into the final time quartile** — not an
-initial transient. The architecture structurally cannot express them. §14.6's conclusion:
-*"A seed-and-grow model has a ceiling near F1 0.58 on this cohort. That ceiling is where ten
-fine-tuning legs have been stuck."*
+```
+n = 35 distinct vessels (mirror_y duplicates excluded)
+nucleation %:  mean 40.3   sd 10.3   range 27.0 .. 82.0
+vessels below 27%:  NONE          vessels above 58%: patient002, patient003
+```
+
+**Every vessel in the inventory is at least 27% nucleation.** C1's premise is confirmed far more
+strongly than §14.6 stated it. The architecture structurally cannot express ~40% of commits, and
+§14.6's conclusion stands: *"A seed-and-grow model has a ceiling near F1 0.58 on this cohort.
+That ceiling is where ten fine-tuning legs have been stuck."*
+
+**Caveat you must carry: §14.6's exact per-vessel numbers do NOT reproduce.** It predates both
+the canonical metric (§20.1) and the `rel_max` labels (§21.2) and never recorded which GT it
+used. Under the deploy-metric GT `039` gives 30 commits / 16.7% nucleation; under the `rel_max`
+training label, 151 / 41.7%; §14.6 reported 92 / 51.1%. Neither matches. **Quote the census, not
+§14.6.** The census uses `--label mat` (`rel_max` at 10% of vessel peak) and `--ceiling-hops 3`.
 
 ### 1.2 Build C1
 
@@ -102,7 +110,8 @@ dominates.
 
 ### 1.4 Training target and kill criterion
 
-**Target (§20.4, item 0f).** Same deploy-legal features, two targets, 35 vessels:
+**Target (§20.4, item 0f) — but read §1.4a first, it is not as settled as §20.4 implies.**
+Same deploy-legal features, two targets, 35 vessels:
 
 ```
 final map    n=35   mean best-feature AUC 0.806   sd 0.085
@@ -111,7 +120,31 @@ t=20 seeds   n=32   mean best-feature AUC 0.903   sd 0.032
 
 Seeds are **+0.097 AUC more predictable and 2.7x more consistent across vessels**. §20.4:
 *"train the nucleation head on early commits, and let the growth term carry it forward."*
-That is settled — do not re-litigate it.
+
+### 1.4a The one thing that could break the seed target — RESOLVE THIS FIRST
+
+The census also profiled *when* nucleation happens, by time quartile:
+
+```
+purely-early (all nucleation in Q1):   10/35 vessels
+LATE-dominant (Q3+Q4 > Q1+Q2):          7/35 vessels
+  patient001 [2,2,10,11]   patient010 [9,1,8,16]   patient021 [21,1,8,18]
+  patient032 [0,13,9,47]  <- 47 of its nucleation events in the FINAL quartile
+```
+
+**A fifth of the inventory nucleates predominantly late.** §20.4's recommendation to train the
+head on t=20 seeds is sound *if* early and late nucleation sites are the same kind of place — the
+head then learns a field→propensity map from the cleanest available examples and applies it at
+all times. It is wrong if they are different places, in which case a seed-trained head
+systematically misses those 7 vessels.
+
+**Step 0, before building the head (pure CPU, no GPU):** take Q1 nucleation sites and Q4
+nucleation sites, and compare them under the deploy-legal features — same feature distribution?
+Same best-feature AUC? If similar, train on seeds as §20.4 says and move on. If they separate,
+the nucleation head needs a time input or a slow rate modulation, and the seed-only target is a
+mis-specification that would be very hard to diagnose after the fact.
+
+This is the highest-value pre-build analysis available and it is cheap. Do it first.
 
 **Kill criterion, corrected.** The Tier-C spec says "if the nucleation head cannot beat the
 logreg of §14.5" — **§14.5 is retracted**, so that bar is a dead number. Use instead:
@@ -300,6 +333,7 @@ number.**
 | `scripts/diag_leg_alignment.py --logs <train_log.jsonl> --per-epoch` | Spearman + exact permutation p + jackknife + z-separation + distinct-state count; learning-curve stop/extend verdict |
 | `scripts/diag_ckpt_weight_geometry.py` | weight-space geometry between checkpoints sharing a warm start; **warns on epoch-mismatched comparisons**, which that measurement needs |
 | `src/core_physics/vessel_scope.py` | per-vessel priors + label scale, one primitive |
+| `scripts/diag_nucleation_census.py` | growth-vs-nucleation census across the whole inventory + time-quartile profile. `--label mat --ceiling-hops 3` reproduces §1.2's numbers. **Known limitation:** its `seed_reach` column is degenerate (bimodal 0/100 — it is really measuring "did anything commit by t=20"), so ignore that column or redefine it. |
 
 Retention: `best_salvage.pth` keeps the top-scoring epoch even if selection rejects every one,
 and is promoted to `best.pth` with a loud warning. No leg can silently produce nothing.
@@ -328,9 +362,8 @@ it as you build C1; that file is why the last session caught four dead mechanism
    0.322. The cohort is materially easier than a random draw. Cohort v2's sealed 8 addresses
    this, but when you claim ">0.6", be explicit about which set it is on.
 
-3. **Nucleation continues into the last time quartile** (§14.6). A purely static nucleation rate
-   may be right, but check whether the rate needs a slow time modulation before concluding the
-   head underperforms.
+3. **Nucleation timing** — superseded by §1.4a, which makes this a step-0 blocker rather than a
+   note. 7 of 35 vessels are late-dominant.
 
 ---
 
