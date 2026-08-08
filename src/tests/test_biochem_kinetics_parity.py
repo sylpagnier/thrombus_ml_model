@@ -132,7 +132,7 @@ class TestBiochemKineticsParity:
         eps = 1e-8
         # COMSOL truth: ``reac1`` exports the unbounded Michaelis-Menten rate
         # ``(kfi * th * fg) / (kmfi + fg)`` (see oracle_kinetics.csv column header
-        # emitted by phase2_nowound_001.mph). There is no FI saturation taper.
+        # emitted by phase2_wound_001.mph). There is no FI saturation taper.
         reaction_rate = (bio_cfg.kfi * state["T"] * state["FG"]) / (kinetics.kmfi + state["FG"] + eps)
         expected_fi = reaction_rate
         expected_fg = -expected_fi

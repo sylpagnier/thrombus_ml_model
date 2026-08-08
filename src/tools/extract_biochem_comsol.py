@@ -1,6 +1,6 @@
 """Interactive biochem COMSOL -> PyG graph extraction.
 
-**Default:** COMSOL auto-pull is on. Save solves as ``comsol_models/phase2_nowound_XXX.mph``
+**Default:** COMSOL auto-pull is on. Save solves as ``comsol_models/phase2_wound_XXX.mph``
 with Export nodes ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes`` configured.
 
     python -m src.tools.extract_biochem_comsol
@@ -195,7 +195,7 @@ def print_status_table(
         "[extracted] = biochem graph exists."
     )
     print(
-        "[i] patient007 -> comsol_models/phase2_nowound_007.mph. Mesh/export stem mismatch:\n"
+        "[i] patient007 -> comsol_models/phase2_wound_007.mph. Mesh/export stem mismatch:\n"
         "      python -m src.tools.prepare_biochem_anchors --strip-prefix-underscore"
     )
 
@@ -434,7 +434,7 @@ def _interactive_loop(
             picked = picked_list[0]
             if not _can_run_status(picked, from_comsol=from_comsol):
                 print(
-                    f"[ERR] {picked.stem}: need domain .txt or phase2_nowound_XXX.mph "
+                    f"[ERR] {picked.stem}: need domain .txt or phase2_wound_XXX.mph "
                     f"(--from-comsol exports mesh + fields)."
                 )
                 continue

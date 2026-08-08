@@ -83,7 +83,7 @@ class PatientDataExtractor:
     ``PhysicsConfig.viscosity_si_to_nd`` (canonical cross-phase ND viscosity reference).
 
     Default entry: ``python -m src.data_gen.lib.extract_biochem_comsol_data`` pulls solved
-    ``comsol_models/phase2_nowound_XXX.mph`` (``patientXXX``) via ``pull_comsol_exports``, then
+    ``comsol_models/phase2_wound_XXX.mph`` (``patientXXX``) via ``pull_comsol_exports``, then
     builds graphs. Manual COMSOL txt only with ``--no-from-comsol``.
 
     --- Manual COMSOL Export Instructions ---
@@ -948,13 +948,13 @@ class PatientDataExtractor:
     ) -> None:
         """Batch-extract all anchor meshes (optionally pull COMSOL fields first)."""
         if stems is None:
-            from src.data_gen.lib.biochem_comsol_auto_export import stems_from_phase2_nowound_mph
+            from src.data_gen.lib.biochem_comsol_auto_export import stems_from_phase2_wound_mph
 
             mesh_stems = []
             if self.raw_dir.is_dir():
                 files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
                 mesh_stems = sorted({Path(f).stem for f in files})
-            mph_stems = stems_from_phase2_nowound_mph()
+            mph_stems = stems_from_phase2_wound_mph()
             seen: set[str] = set()
             stems = []
             for s in mesh_stems + mph_stems:
@@ -963,10 +963,10 @@ class PatientDataExtractor:
                     stems.append(s)
             stems.sort()
             if not stems:
-                print(f"CRITICAL ERROR: No meshes under {self.raw_dir} and no phase2_nowound_*.mph in comsol_models/")
+                print(f"CRITICAL ERROR: No meshes under {self.raw_dir} and no phase2_wound_*.mph in comsol_models/")
                 return
             if mph_stems and not mesh_stems:
-                print(f"[i] Using {len(mph_stems)} stem(s) from comsol_models/phase2_nowound_*.mph only.")
+                print(f"[i] Using {len(mph_stems)} stem(s) from comsol_models/phase2_wound_*.mph only.")
             elif mph_stems:
                 extra = [s for s in mph_stems if s not in set(mesh_stems)]
                 if extra:
@@ -982,7 +982,7 @@ class PatientDataExtractor:
                     if not domain_txt.is_file():
                         print(
                             f"[WARN] Skipping {stem}: no domain .txt and no "
-                            f"phase2_nowound_XXX.mph for patientXXX in comsol_models/.",
+                            f"phase2_wound_XXX.mph for patientXXX in comsol_models/.",
                             flush=True,
                         )
                         continue
@@ -1006,7 +1006,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Extract biochem anchor graphs. Default: pull solved COMSOL fields from "
-            "comsol_models/phase2_nowound_XXX.mph (patientXXX) via mph, then write .pt graphs."
+            "comsol_models/phase2_wound_XXX.mph (patientXXX) via mph, then write .pt graphs."
         )
     )
     parser.add_argument(

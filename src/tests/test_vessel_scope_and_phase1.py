@@ -351,6 +351,45 @@ def test_t1_legs_are_exact_complements():
         assert leg["speed_fp_weight"] == 0.0, f"speed-FP bleed must be off in leg {name}"
 
 
+def test_t3_leg_is_single_variable_against_3a():
+    """T3 must differ from 3a by `freeze_backbone` and nothing else.
+
+    In particular NOT by the learning rate: 25 suggests a lower trunk LR, but the trainer has
+    no per-group LRs, so adding one would be new machinery and a second variable in one leg.
+    """
+    from src.biochem_gnn.mat_growth_simple import (
+        get_mat_growth_config_kwargs as C,
+        get_mat_growth_runtime_kwargs as R,
+    )
+
+    a, b = C("WG_phase3a_closedloop"), C("WG_t3_unfrozen")
+    diff = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    assert diff == {"freeze_backbone"}, f"T3 vs 3a must differ only by freeze_backbone, got {diff}"
+    assert a["freeze_backbone"] is True and b["freeze_backbone"] is False
+    ra, rb = R("WG_phase3a_closedloop"), R("WG_t3_unfrozen")
+    assert {k for k in set(ra) | set(rb) if ra.get(k) != rb.get(k)} == set()
+
+
+def test_t5_leg_is_single_variable_against_3a():
+    """T5 must differ from 3a by `loss_scale_unified` and nothing else.
+
+    In particular the surrogate weight must NOT be re-tuned in the same leg: the whole point is
+    to measure what 120 does once it is no longer implicitly /10 (26.4).
+    """
+    from src.biochem_gnn.mat_growth_simple import (
+        get_mat_growth_config_kwargs as C,
+        get_mat_growth_runtime_kwargs as R,
+    )
+
+    a, b = C("WG_phase3a_closedloop"), C("WG_t5_unified_scale")
+    diff = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    assert diff == {"loss_scale_unified"}, f"T5 vs 3a must differ only by that flag, got {diff}"
+    assert b["loss_scale_unified"] is True
+    assert b["rolled_soft_f1_weight"] == a["rolled_soft_f1_weight"] == 120.0
+    assert {k for k in set(R("WG_phase3a_closedloop")) | set(R("WG_t5_unified_scale"))
+            if R("WG_phase3a_closedloop").get(k) != R("WG_t5_unified_scale").get(k)} == set()
+
+
 def test_per_step_weight_is_wired_and_scales_the_block():
     """`per_step_weight` must reach the summation point, not just the dataclass.
 
@@ -467,6 +506,7 @@ def test_live_legs_have_not_silently_adopted_the_unified_scale():
     """T1's two legs must run on the historical scale, or they are not comparable with 3a."""
     from src.biochem_gnn.mat_growth_simple import get_mat_growth_config_kwargs as C
 
+    # WG_t5_unified_scale is the deliberate exception -- it exists to turn the flag on.
     for leg in ("WG_phase1_baseline", "WG_phase3a_closedloop",
                 "WG_t1a_perstep_only", "WG_t1b_rolledf1_only"):
         assert C(leg).get("loss_scale_unified", False) is False, (

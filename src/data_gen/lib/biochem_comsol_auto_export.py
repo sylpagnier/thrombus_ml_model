@@ -6,7 +6,7 @@ files are generated from Gmsh mesh tags (no COMSOL boundary export needed).
 
 Typical workflow::
 
-    1. Run the biochem study in COMSOL; save as ``comsol_models/phase2_nowound_XXX.mph``.
+    1. Run the biochem study in COMSOL; save as ``comsol_models/phase2_wound_XXX.mph``.
     2. Ensure Results > Export nodes exist: ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes``.
     3. ``python -m src.tools.extract_biochem_comsol`` (default) runs those exports + builds graphs.
 
@@ -100,12 +100,12 @@ def _parse_expr_list(raw: str | None) -> tuple[str, ...]:
 
 
 _PATIENT_STEM_RE = re.compile(r"^patient(\d+)$", re.IGNORECASE)
-_PHASE2_NOWOUND_MPH_RE = re.compile(r"^phase2_nowound_(\d+)\.mph$", re.IGNORECASE)
+_PHASE2_WOUND_MPH_RE = re.compile(r"^phase2_wound_(\d+)\.mph$", re.IGNORECASE)
 
 
 def patient_stem_from_phase2_mph(path: Path) -> str | None:
-    """Map ``phase2_nowound_008.mph`` -> ``patient008``."""
-    m = _PHASE2_NOWOUND_MPH_RE.match(path.name)
+    """Map ``phase2_wound_008.mph`` -> ``patient008``."""
+    m = _PHASE2_WOUND_MPH_RE.match(path.name)
     if not m:
         return None
     return f"patient{int(m.group(1)):03d}"
@@ -173,7 +173,7 @@ def resolve_stem_selection(
 
 
 def collect_biochem_extract_stems(raw_dir: Path, label_dir: Path) -> list[str]:
-    """Union of mesh stems, domain export stems, and ``phase2_nowound_*.mph`` (sorted)."""
+    """Union of mesh stems, domain export stems, and ``phase2_wound_*.mph`` (sorted)."""
     seen: set[str] = set()
     out: list[str] = []
     if raw_dir.is_dir():
@@ -190,39 +190,39 @@ def collect_biochem_extract_stems(raw_dir: Path, label_dir: Path) -> list[str]:
             if stem not in seen:
                 seen.add(stem)
                 out.append(stem)
-    for stem in stems_from_phase2_nowound_mph():
+    for stem in stems_from_phase2_wound_mph():
         if stem not in seen:
             seen.add(stem)
             out.append(stem)
     return sorted(out)
 
 
-def stems_from_phase2_nowound_mph(models_dir: Path | None = None) -> list[str]:
-    """Anchor stems implied by ``comsol_models/phase2_nowound_*.mph`` files."""
+def stems_from_phase2_wound_mph(models_dir: Path | None = None) -> list[str]:
+    """Anchor stems implied by ``comsol_models/phase2_wound_*.mph`` files."""
     root = models_dir if models_dir is not None else comsol_models_dir()
     if not root.is_dir():
         return []
     out: list[str] = []
-    for p in sorted(root.glob("phase2_nowound_*.mph")):
+    for p in sorted(root.glob("phase2_wound_*.mph")):
         stem = patient_stem_from_phase2_mph(p)
         if stem:
             out.append(stem)
     return out
 
 
-def phase2_nowound_mph_name_for_stem(stem: str) -> str | None:
-    """Map anchor stem ``patient007`` -> COMSOL filename ``phase2_nowound_007.mph``."""
+def phase2_wound_mph_name_for_stem(stem: str) -> str | None:
+    """Map anchor stem ``patient007`` -> COMSOL filename ``phase2_wound_007.mph``."""
     m = _PATIENT_STEM_RE.match(stem.strip())
     if not m:
         return None
-    return f"phase2_nowound_{int(m.group(1)):03d}.mph"
+    return f"phase2_wound_{int(m.group(1)):03d}.mph"
 
 
 def resolve_biochem_comsol_model_path(stem: str, explicit: Path | None = None) -> Path | None:
     """Return first existing ``.mph`` for ``stem`` (explicit path, env, then search dirs).
 
-    Anchor stems ``patientXXX`` resolve to ``comsol_models/phase2_nowound_XXX.mph``
-    (3-digit index, e.g. ``patient7`` -> ``phase2_nowound_007.mph``).
+    Anchor stems ``patientXXX`` resolve to ``comsol_models/phase2_wound_XXX.mph``
+    (3-digit index, e.g. ``patient7`` -> ``phase2_wound_007.mph``).
     """
     if explicit is not None:
         p = Path(explicit)
@@ -243,7 +243,7 @@ def resolve_biochem_comsol_model_path(stem: str, explicit: Path | None = None) -
         models_dir / "runs" / f"{stem}.mph",
         models_dir / f"{stem}.mph",
     ]
-    mapped = phase2_nowound_mph_name_for_stem(stem)
+    mapped = phase2_wound_mph_name_for_stem(stem)
     if mapped:
         candidates.append(models_dir / mapped)
 

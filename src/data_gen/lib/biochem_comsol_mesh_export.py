@@ -24,7 +24,7 @@ _BOUNDARY_SPECS: tuple[tuple[str, str], ...] = (
     ("wall", "is_wall"),
 )
 
-# Phase-2 anchors (e.g. phase2_nowound_008): explicit box selections labeled inlet/outlet/wall.
+# Phase-2 anchors (e.g. phase2_wound_008): explicit box selections labeled inlet/outlet/wall.
 # Older templates: is_inlet=sel1(x,y) or box1/box2/dif1 tags.
 _STATIC_BOUNDARY_EXPRS: dict[str, tuple[str, ...]] = {
     "inlet": ("inlet(x,y)", "is_inlet", "sel1(x,y)", "box1(x,y)"),

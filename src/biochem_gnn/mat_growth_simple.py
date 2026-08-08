@@ -227,6 +227,8 @@ LADDER_LEG_ORDER: tuple[str, ...] = (
     "WG_phase3b_zkin_ablate",
     "WG_t1a_perstep_only",
     "WG_t1b_rolledf1_only",
+    "WG_t3_unfrozen",
+    "WG_t5_unified_scale",
 )
 
 # Full-length clot-rich anchors (T=201, off-wall >=30%) from docs/GENERALIZATION_PLAN.md EDA.
@@ -1632,6 +1634,115 @@ def mat_growth_leg_spec(leg: str) -> MatGrowthLegSpec:
                 "prior_source": "analytic",
                 "speed_fp_weight": 0.0,
             },
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # =================================================================================
+        # s26 T5 -- put the rolled terms on the per-step block's scale. 26.4: `loss_scale`=0.1
+        # multiplies every rolled term at its own site, and IS applied to the per-step loss in
+        # `continuous_delta_loss` -- but that is the SINGLE-head path, and every cohort leg runs
+        # `dual_head=True`, where `dual_head_step_loss` never picked it up. So every weight ever
+        # set on a rolled term has been implicitly /10 against the one term measured to move the
+        # model, `rolled_soft_f1_weight=120` included: 12.6.6 sized it as 8.2x the noise floor,
+        # and the realised multiplier was 0.82x.
+        #
+        # T1 promoted this from cleanup to the leading candidate (26.8). Leg B showed the rolled
+        # surrogate steers the model hard when it is not competing with the per-step block; this
+        # leg is the first time it competes on equal footing while the block is still there.
+        #
+        # ONE variable against 3a: `loss_scale_unified`. The gain is applied on the ROLLED side
+        # (x1/loss_scale) rather than by scaling the block down, so the dominant term's gradient
+        # magnitude -- and therefore the LR calibration -- is untouched.
+        #
+        # 6 epochs: 26.9 -- epochs 1-3 are a low-sensitivity plateau that Phase 1 and 3b both
+        # leave at ep4, so a shorter leg measures nothing.
+        "WG_t5_unified_scale": MatGrowthLegSpec(
+            code="WG_t5_unified_scale",
+            label="s26 T5: rolled terms on the per-step block's scale (loss_scale_unified)",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                "freeze_backbone": True,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 0.5,
+                "step_soft_f1_weight": 40.0,
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                "closed_loop_init": 1.0,
+                # THE variable vs 3a.
+                "loss_scale_unified": True,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
+            env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
+        ),
+        # =================================================================================
+        # s26 T3 -- unfreeze the backbone. Never tried in 13 legs: every one trained 8 of 40
+        # tensors, 45,186 of 186,887 params (24%), both final readout MLPs only, leaving the
+        # whole GraphSAGE trunk AND the `readout` head frozen.
+        #
+        # NB the premise this was originally ranked on is REFUTED (26.8). It was proposed
+        # because 25.1 suggested the reachable set might be too small for any objective to
+        # distinguish itself -- and legs A and B then separated by 128% in weight space under
+        # exactly that head-only parameterisation. So this is no longer "the explanation for the
+        # nulls"; it is the plainer question of whether 4x the parameters reaches a better
+        # solution than the heads alone.
+        #
+        # ONE variable against 3a: `freeze_backbone`. Deliberately NOT also lowering the trunk
+        # LR, though 25 suggests considering it -- there are no per-group LRs in the trainer
+        # today, so adding them would be new machinery AND a second variable in one leg. If
+        # 5e-5 on 186,887 params destabilises from a good warm start, that IS the result, and a
+        # follow-up leg adds the lower trunk LR as its own single variable.
+        #
+        # 6 epochs, not 4: 26.9 established that epochs 1-3 are a low-sensitivity plateau which
+        # both Phase 1 and 3b leave at ep4. A leg that stops before the breakout measures
+        # nothing.
+        "WG_t3_unfrozen": MatGrowthLegSpec(
+            code="WG_t3_unfrozen",
+            label="s26 T3: unfreeze the backbone (186,887 params vs 45,186), else identical to 3a",
+            no_init=False,
+            init_ckpt=WG_CLOTRICH_NPLUS_CKPT,
+            init_mode="full",
+            config_kwargs={
+                **v3_config,
+                "geom_feats": True,
+                "geom_feats_rich": True,
+                "flux_stag_feat": True,
+                "underpred_weight": 3.0,
+                "fp_weight": 6.0,
+                # THE variable vs 3a.
+                "freeze_backbone": False,
+                "train_t0_coverage_frac": 0.85,
+                "step_mass_penalty": 0.0,
+                "step_prec_fp_penalty": 0.0,
+                "final_mass_penalty": 0.0,
+                "final_prec_fp_penalty": 0.0,
+                "mature_fp_exempt": False,
+                "rolled_soft_k_relative": True,
+                "rolled_soft_f1_k": 10.0,
+                "rolled_soft_f1_weight": 120.0,
+                "rolled_soft_f1_beta": 0.5,
+                "step_soft_f1_weight": 40.0,
+                "final_state_value_scaled": True,
+                "mat_label_thresh_mode": "rel_max",
+                "mat_label_rel_frac": 0.10,
+                "closed_loop_init": 1.0,
+            },
+            runtime_kwargs={**_SUBCOHORT_RUNTIME_V11PLUS, "prior_source": "analytic"},
             env_overrides={"CLOT_POCKET_GATE_PCT": "25"},
         ),
         # v8 = v7 + the soft-F_beta rolled-state surrogate (s12.5 change E). The brake, even
