@@ -245,6 +245,27 @@ def test_latent_ablation_reaches_the_DEPLOY_rollout_too():
     )
 
 
+def test_eval_bundle_binds_kin_latent_dim_so_ablation_is_not_a_no_op():
+    """s26.10: `maybe_drop_latent` no-ops when `model.kin_latent_dim` is 0 or absent.
+
+    Training binds it; the eval bundle loader did not, so `latent_ablate` was a silent no-op in
+    the canonical eval and an ablated leg was scored on intact z_kin. The call chain being
+    present is not enough -- the width has to be bound too, which is the same class of gap as
+    the chain itself.
+    """
+    src = Path("src/core_physics/species_pushforward_continuous.py").read_text(encoding="utf-8")
+    start = src.index("def load_continuous_bundle(")
+    body = src[start:src.index("\ndef ", start + 1)]
+    assert "model.kin_latent_dim" in body, (
+        "the eval bundle must bind kin_latent_dim, or latent_ablate does nothing at eval"
+    )
+
+    # And the guard it feeds must actually gate on a positive width.
+    drop = src[src.index("def maybe_drop_latent("):]
+    drop = drop[:drop.index("\ndef ")]
+    assert "ld > 0" in drop, "maybe_drop_latent no longer gates on the latent width"
+
+
 def test_loss_accounting_is_gated_to_the_training_path():
     """s24 fix 2: three call sites feed the loss; only the main loop may be counted."""
     from src.core_physics.species_pushforward_continuous import (

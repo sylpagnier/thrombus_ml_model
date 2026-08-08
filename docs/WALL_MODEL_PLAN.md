@@ -4252,14 +4252,16 @@ whole result:
 
 Both branches of T1's pre-registered read turn out to be half right, and they fit together:
 
-1. **The per-step block is the attractor — holding the input representation fixed.** Every
-   objective containing it lands on the same committed set regardless of what else is in the
-   loss. Every objective edit *outside* it is futile — the five nulls, plus leg A's epoch-2
-   identity, are six instances of one fact. The qualifier is not cosmetic and is established in
-   26.9: `WG_phase3b_zkin_ablate` contains the per-step block and does **not** join the
-   attractor, because its input is ablated. So the attractor is a property of the per-step
-   supervision *acting on a given input*, not of the objective alone — which makes the input the
-   thing carrying the information and the rest of the objective decoration.
+1. **Epochs 1-3 are a LOW-SENSITIVITY PLATEAU in which the committed set is fixed by (input
+   representation, per-step block) and is insensitive to every other loss term.** This is
+   weaker than the "attractor" this section originally claimed, and 26.9 is why: neither
+   plateau state persists. `3b` freezes bit-identically at ep2->ep3 and then leaves at ep4;
+   Phase 1 sits at 202/2.708 on ep2, 201/2.699 on ep3, and departs decisively from ep4
+   (fp 165, then 31). They are early transients, not fixed points.
+   The qualifier about the input is separately established and does hold:
+   `WG_phase3b_zkin_ablate` contains the per-step block and never joins the intact-input
+   plateau at all, so the plateau is a property of the per-step supervision *acting on a given
+   input* — which makes the input the thing carrying the information.
 2. **The objective is nevertheless steerable — but only through that block.** Removing it moves
    the model enormously and in the opposite direction. "The model cannot be steered" was never
    true; the interventions on record were simply never applied where the gradient lives.
@@ -4269,6 +4271,38 @@ objectives that differ *only* in rolled terms, and 26.4 shows those terms had al
 implicitly **/10** against an unscaled per-step block. They converged because neither had
 actually changed the objective by much. Together with T4(c) — `fp_weight` multiplying an empty
 set — every one of the five nulls edited a term that was either **dead** or **/10-suppressed**.
+
+### The plateau indicts the whole null record, including this section's own comparison
+
+Once 26.9 shows epochs 1-3 are a low-sensitivity window, the *measurement window* of every null
+on record has to be checked — and they were all taken inside it:
+
+| null | window it was measured in |
+|---|---|
+| Phase 2b (brake removed) | "epochs 2-3 identical to 4 dp" — **the plateau** |
+| Phase 3a (`closed_loop_init`) | "epochs 1-2 identical to 4 dp" — **the plateau** |
+| v4 (`fp_weight` 6->16) | bit-identical — but independently explained: the term is dead (26.2) |
+| **leg A vs Phase 1 / 3a (this section)** | **epoch 2 — the plateau** |
+
+So the project has been A/B-testing objectives in the one window where the committed set
+provably cannot distinguish them, and this section's own headline comparison shares that flaw.
+Phase 1's later epochs prove the metric *is* sensitive outside it — ep4-10 range 0.29-0.49 with
+fp from 25 to 165.
+
+**Therefore "every objective edit outside the per-step block is futile" is NOT established.** It
+holds for epochs 1-3 and is untested beyond them. What survives the plateau objection intact is
+everything measured by legs that never entered the plateau at all:
+
+* **leg B never joins it** — removing the per-step block moves the committed set immediately, at
+  epoch 1, and by a large margin (0.266 vs 0.406);
+* **3b never joins it** — ablating the input does the same (0.224 vs 0.406);
+* the **128% matched-epoch weight separation** between legs A and B.
+
+Steerability therefore stands; futility does not. The correction is a budget rule: **an
+objective A/B must run to at least epoch 4-6, past the breakout, or it is measuring nothing.**
+The 8-10 epoch guidance in 25's handoff was right, and this section's 2-epoch budget — taken
+from T1's own "1-2 epochs each" — was long enough to prove divergence but too short to prove
+its absence. Legs A and B need re-running to 6 epochs before "futile" can be claimed either way.
 
 ### A second result: change E's surrogate steers AWAY from the metric
 
@@ -4323,3 +4357,127 @@ the closed-loop flow coupler working while both of these were not, so the gap is
 like-for-like measurement either.
 
 Suite: **581 passed** (575 before this section, +6 guards).
+
+## 26.9 T2 RESULT — `z_kin` is load-bearing, and the plateau is not a fixed point
+
+`WG_phase3b_zkin_ablate`, 4 epochs, differing from `WG_phase3a_closedloop` by exactly
+`latent_ablate` (asserted in `test_s24_legs_are_single_variable_against_each_other`; re-checked
+at launch — config diff `{latent_ablate}`, runtime diff empty).
+
+Mechanism verified end-to-end before any number was read, because "the config fingerprint says
+True" is exactly what v4 and v5 looked like:
+
+1. fingerprint carries `latent_ablate: True`;
+2. `maybe_drop_latent` zeroes the first 256 columns at train **and** eval (pre-existing test);
+3. the training path calls it (`unroll_continuous_loss`);
+4. the **deploy** path calls it too —
+   `deploy_species_rollout_series` -> `predict_continuous_step_delta` -> `maybe_drop_latent`.
+   This link had no test; it now has one. Without it the leg would train ablated and deploy
+   full, with an identical fingerprint either way;
+5. the hard-ablation branch precedes the `if not training` short-circuit, so eval cannot return
+   early with `z_kin` intact;
+6. run log shows `in_dim=287 latent=256`, so the zeroed slice is the right one.
+
+### Result: ablating 256 of 287 input dims is severely harmful
+
+| epoch | 3a (intact) | 3b (ablated) | delta |
+|---|---|---|---|
+| 1 | 0.4056 / mass 3.080 / fp 244 | 0.2241 / 4.655 / 422 | **-0.182** score, +178 fp |
+| 2 | 0.3706 / mass 2.708 / fp 202 | 0.2187 / 4.743 / 432 | **-0.152** score, +230 fp |
+
+**The `z_kin` ladder does NOT close.** 89% of the input is not dead weight, the model does not
+shrink, and D3 / 11.2.1 stay open. This is the strong version of the v10 result that
+`latent_dropout=0.30` regressed the holdout by -0.137, which 25 recorded as "weak evidence
+`z_kin` is load-bearing".
+
+**The Z1 paradox sharpens rather than resolves.** Z1 scored the entire flow channel at 0.041 AUC
+(GT field 0.789 vs zero-prior 0.748) — near-useless by that probe — yet zeroing the latent costs
+45% of the deploy score. Whatever `z_kin` carries is invisible to an AUC probe on the flow
+field. That gap is now the largest unexplained result on the board and is not on any task list.
+
+**One confound, stated plainly.** The warm start was trained *with* `z_kin`, so ablation hands
+the model an input distribution it has never seen. This establishes that the latent cannot be
+dropped from this checkpoint; it does not establish that a model trained from scratch on 31 dims
+would fail. The 13.8 warm-start blocker is exactly why `in_dim` was held at 287, so that
+stronger question is unanswered — but it is now expensive rather than cheap, which was the point
+of running the cheap version first.
+
+### The incidental finding that matters more: the plateau breaks
+
+3b froze **bit-identically** across ep2 -> ep3 while its internals kept moving hard:
+
+```
+ep2  score=0.21871653855248357  mass=4.743362831858407  fp=432  front=4.565  val_dlt=6.33e-07
+ep3  score=0.21871653855248357  mass=4.743362831858407  fp=432  front=6.704  val_dlt=7.47e-07
+ep4  score=0.23317               mass=4.5044             fp=405  front=2.015  val_dlt=1.12e-07
+       ^ BREAKS OUT
+```
+
+Front speed rose 47% and the predicted-delta scale 18% between ep2 and ep3 with the committed
+set frozen to the last digit — then it left. Phase 1 does the same thing at the same place:
+202 on ep2, 201 on ep3, then 165 / 31 / 131 from ep4.
+
+So the epoch-2 identity in 26.8 is a **plateau in an early transient, not a fixed point**, on
+both input representations. The consequence for how this project measures anything is written
+up at the end of 26.8: every null on record was measured inside that window.
+
+
+## 26.10 A twelfth dead mechanism: `latent_ablate` was a no-op in the CANONICAL EVAL
+
+Caught by a cross-check, not by looking: leg A's cold eval reproduced its in-training rollout
+**exactly** (mass 2.7434, fp 206, both), while 3b's did not — in-training ep4 gave mass 4.504 /
+fp 405, and the cold eval of that same checkpoint gave mass 0.212 / fp 9. A 21x mass gap from
+the same weights on the same vessel is not a scoring difference; it is a different rollout.
+
+Mechanism:
+
+* `maybe_drop_latent` reads the width to zero from `model.kin_latent_dim`, and its guard is
+  `if continuous_latent_ablate() and ld > 0`;
+* `kin_latent_dim` is bound in exactly one place —
+  `train_species_pushforward_continuous.py:940`, inside the **training** process;
+* `load_continuous_bundle`, which the canonical eval uses, computed `latent_dim` from meta,
+  stored it on the *bundle*, and never set it on the *model*;
+* so at eval `ld = 0`, the guard fails, and the ablation is skipped.
+
+Verified directly rather than argued: the eval-loaded model had no `kin_latent_dim` attribute at
+all, and `maybe_drop_latent` under `latent_ablate=True` returned z_kin with max |value| 3.49
+instead of 0.
+
+**A leg fine-tuned on zeroed z_kin was being scored on intact z_kin** — precisely the
+train/deploy asymmetry the hard ablation was chosen over `latent_dropout` to avoid (24 fix 4).
+Same shape as the other eleven: a value bound for one path and not carried to the other.
+
+**What this does and does not invalidate.** 26.9's conclusion is **unaffected** — it rests on the
+in-training epoch-1/2 comparison against 3a, and both ran inside the training process where the
+binding exists. Only the 3b *cold* number (0.2928) was meaningless, and it was never load-bearing.
+
+**Fixed**, and the fix is provably scoped: `model.kin_latent_dim` is now bound in the loader.
+With `latent_ablate` off — every other leg — `maybe_drop_latent` returns its input at eval
+regardless of the width, so **no existing number moves**; verified in both directions.
+
+Two lessons worth keeping:
+
+1. **The guard test I added in 26.9 was not enough.** It pinned the *call chain*
+   (`deploy_species_rollout_series` -> `predict_continuous_step_delta` -> `maybe_drop_latent`)
+   but not the *width binding* the chain depends on — the same class of gap it was written to
+   close. `test_eval_bundle_binds_kin_latent_dim_so_ablation_is_not_a_no_op` now covers it.
+2. **In-training vs cold-eval agreement is a free integrity check.** When a leg's cold eval
+   reproduces its in-training `mass` and `fp` exactly, the two paths agree; when it does not,
+   something differs between them. Leg A agreeing is what made 3b's disagreement legible. Worth
+   running on every leg from now on — it costs nothing and it caught this.
+
+### 26.10.1 Fix verified end-to-end
+
+Re-running the 3b cold eval on the same epoch-4 checkpoint, before and after:
+
+| | score | mass | fp |
+|---|---|---|---|
+| before (ablation a no-op) | 0.2928 | 0.2124 | 9 |
+| **after (ablation applied)** | 0.2442 | **4.5044** | **405** |
+| in-training ep4 | 0.2332 | **4.5044** | **405** |
+
+`mass` and `fp` now reproduce the training-time rollout exactly, leaving only the scoring-scope
+offset (`runtime_bound` False in training, True in the scoring scope) — the same signature leg A
+already showed. The integrity check of 26.10 lesson 2 now passes for both legs.
+
+Suite: **583 passed** (575 at the start of section 26, +8 guards).

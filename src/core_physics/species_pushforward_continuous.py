@@ -4920,9 +4920,18 @@ def load_continuous_bundle(
             ).to(dev)
         load_pushforward_state_dict_partial(model, payload["model_state"], quiet=quiet)
         model.eval()
+        _latent_dim = int(meta.get("latent_dim", in_dim - 1 - _sd()))
+        # s26.10: `maybe_drop_latent` reads `model.kin_latent_dim` and silently no-ops when it
+        # is 0 or absent. The TRAINING process binds it (train_species_pushforward_continuous
+        # :940); this loader never did, so `latent_ablate` was a no-op in the canonical eval --
+        # a leg fine-tuned on zeroed z_kin was scored on INTACT z_kin, which is exactly the
+        # train/deploy asymmetry the hard ablation exists to prevent. Harmless for every other
+        # leg: with `latent_ablate` off and dropout 0, `maybe_drop_latent` returns its input at
+        # eval regardless of this value, so no existing number moves.
+        model.kin_latent_dim = _latent_dim
         return SpeciesContinuousBundle(
             model=model,
-            latent_dim=int(meta.get("latent_dim", in_dim - 1 - _sd())),
+            latent_dim=_latent_dim,
             hidden=hidden,
             unroll=int(meta.get("unroll", pushforward_unroll_steps(config))),
             stride=int(meta.get("stride", pushforward_step_stride(config))),
