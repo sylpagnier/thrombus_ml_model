@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.core_physics.mls_gradient import graph_gradient_operators
 from src.config import BiochemConfig, NodeFeat, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
 from src.utils import species_channels as sc
 from src.core_physics.clot_kinematics_fields import adjacent_band_mask, compute_clot_kinematics_fields, compute_shear_rate
@@ -127,8 +128,7 @@ def gt_gamma_dot_nd(data, time_index: int, device: torch.device) -> torch.Tensor
         u = y[:, 0]
         v = y[:, 1]
     u_col = u.reshape(-1, 1)
-    G_x = data.G_x.to(device=device)
-    G_y = data.G_y.to(device=device)
+    G_x, G_y = graph_gradient_operators(data, device=device)
     du_dx = torch.sparse.mm(G_x, u_col).squeeze(1)
     du_dy = torch.sparse.mm(G_y, u_col).squeeze(1)
     dv_dx = torch.sparse.mm(G_x, v.reshape(-1, 1)).squeeze(1)
@@ -510,8 +510,7 @@ def carreau_mu_si_from_uv(
     dtype = torch.float32
     u = u_nd.reshape(-1, 1).to(device=device, dtype=dtype)
     v = v_nd.reshape(-1, 1).to(device=device, dtype=dtype)
-    G_x = data.G_x.to(device=device)
-    G_y = data.G_y.to(device=device)
+    G_x, G_y = graph_gradient_operators(data, device=device)
     du_dx = torch.sparse.mm(G_x, u)
     du_dy = torch.sparse.mm(G_y, u)
     dv_dx = torch.sparse.mm(G_x, v)
@@ -536,8 +535,7 @@ def gamma_dot_nd_graph_from_uv(data, u_nd: torch.Tensor, v_nd: torch.Tensor) -> 
     device = u_nd.device
     u = u_nd.reshape(-1, 1).to(device=device, dtype=torch.float32)
     v = v_nd.reshape(-1, 1).to(device=device, dtype=torch.float32)
-    G_x = data.G_x.to(device=device)
-    G_y = data.G_y.to(device=device)
+    G_x, G_y = graph_gradient_operators(data, device=device)
     du_dx = torch.sparse.mm(G_x, u)
     du_dy = torch.sparse.mm(G_y, u)
     dv_dx = torch.sparse.mm(G_x, v)
@@ -2045,8 +2043,7 @@ def node_features_from_gt(
     fi = y_slice[:, 12].to(device=device, dtype=torch.float32)
     mat = y_slice[:, 15].to(device=device, dtype=torch.float32)
     u_col = u.reshape(-1, 1)
-    G_x = data.G_x.to(device=device)
-    G_y = data.G_y.to(device=device)
+    G_x, G_y = graph_gradient_operators(data, device=device)
     du_dx = torch.sparse.mm(G_x, u_col).squeeze(1)
     du_dy = torch.sparse.mm(G_y, u_col).squeeze(1)
     dv_dx = torch.sparse.mm(G_x, v.reshape(-1, 1)).squeeze(1)

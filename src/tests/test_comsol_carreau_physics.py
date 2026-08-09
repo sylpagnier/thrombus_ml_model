@@ -22,10 +22,26 @@ def anchor_graph():
     return torch.load(str(paths[0]), map_location="cpu", weights_only=False)
 
 
-def test_comsol_carreau_bulk_closer_than_fixed_carreau(anchor_graph):
-    """Gel-scaled Carreau with max(g,wls,poi,kin) gamma should beat fixed-mu Carreau vs GT bulk."""
+def test_carreau_on_a_real_shear_field_reproduces_gt_bulk_viscosity(anchor_graph):
+    """Carreau evaluated on the WLS shear must reproduce COMSOL's ``spf.mu`` in the bulk.
+
+    PREMISE CHANGED 2026-08-09.  This test used to assert the opposite ranking -- that
+    ``comsol_carreau(gamma_mode="max")`` beats plain Carreau -- and it held only because
+    the packs' ``G_x``/``G_y`` returned ~0 for an interior derivative, so plain Carreau
+    saw zero shear and returned the zero-shear plateau viscosity everywhere.  The
+    ``max(g, wls, poi, kin)`` blend was a workaround for that.  Measured on patient007
+    across the two operator modes:
+
+        operator   plain Carreau err   comsol_carreau(max) err
+        legacy           4.75e-02              6.17e-04
+        MLS              2.10e-05              8.54e-05
+
+    The fix improves both by orders of magnitude and inverts their order, because
+    COMSOL's ``spf.mu`` IS Carreau evaluated at ``spf.sr`` -- given the real shear field
+    the plain form is exact and the blend's geometric proxies only add error.
+    See docs/PHASE3_RESULTS.md 1 and src/core_physics/mls_gradient.py.
+    """
     phys = PhysicsConfig(phase="biochem")
-    bio = BiochemConfig(phase="biochem")
     data = anchor_graph
     device = torch.device("cpu")
     t = min(35, int(data.y.shape[0]) - 1)
@@ -42,9 +58,15 @@ def test_comsol_carreau_bulk_closer_than_fixed_carreau(anchor_graph):
         pytest.skip("no bulk nodes")
     err_fixed = (mu_gt[bulk] - mu_c[bulk]).abs().median()
     err_comsol = (mu_gt[bulk] - mu_comsol[bulk]).abs().median()
-    assert err_comsol < err_fixed
-    ratio = (mu_gt[bulk] / mu_comsol[bulk].clamp(min=1e-8)).median()
-    assert 0.85 <= float(ratio) <= 1.15
+    # Plain Carreau on a real shear field is near-exact: within 1% of the bulk scale.
+    assert float(err_fixed) < 0.01 * float(mu_gt[bulk].median())
+    assert err_fixed < err_comsol, (
+        "plain Carreau should beat the max() blend once the shear operator is correct; "
+        "a flip here means the gradient operator regressed"
+    )
+    for mu in (mu_c, mu_comsol):
+        ratio = (mu_gt[bulk] / mu[bulk].clamp(min=1e-8)).median()
+        assert 0.85 <= float(ratio) <= 1.15
 
 
 def test_kinematic_gamma_bulk_matches_gt(anchor_graph):

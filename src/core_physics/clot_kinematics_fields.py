@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from src.core_physics.mls_gradient import graph_gradient_operators
 from src.utils.rheology import compute_shear_rate
 
 if TYPE_CHECKING:
@@ -28,6 +29,13 @@ class ClotKinematicsFields:
 
     gamma_si: torch.Tensor
     dshear_ds_phys: torch.Tensor
+    # COMSOL's actual separation-gate input, d(spf.sr,x) in SI 1/(s*m), comparable to
+    # ``bio_cfg.sgt`` directly. ``dgamma_dx_phys`` below is the LEGACY field: despite the
+    # name it is per non-dimensional length (no /d_bar), which is why the tuned
+    # ``BIOCHEM_PRIOR_DGAMMA_DX_THRESH`` defaults are 35/800 rather than 7.5e4. Left
+    # as-is so the tuned prior keeps its meaning.
+    dgamma_dx_si: torch.Tensor
+    is_separation_dx: torch.Tensor
     dgamma_dx_phys: torch.Tensor
     dgamma_dy_phys: torch.Tensor
     is_low_shear: torch.Tensor
@@ -105,10 +113,11 @@ def compute_clot_kinematics_fields(
     n = int(u.shape[0])
     device = u.device
 
-    du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
-    du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
-    dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
-    dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
+    G_x, G_y = graph_gradient_operators(data, device=device, dtype=u.dtype)
+    du_dx = torch.sparse.mm(G_x, u.unsqueeze(1)).squeeze(1)
+    du_dy = torch.sparse.mm(G_y, u.unsqueeze(1)).squeeze(1)
+    dv_dx = torch.sparse.mm(G_x, v.unsqueeze(1)).squeeze(1)
+    dv_dy = torch.sparse.mm(G_y, v.unsqueeze(1)).squeeze(1)
     
     if pred_shear_nd is not None:
         gamma_dot_nd = pred_shear_nd.reshape(-1).to(dtype=torch.float32).clamp(min=1e-6)
@@ -122,8 +131,8 @@ def compute_clot_kinematics_fields(
     scale_si = u_ref / d_safe
     gamma_si = gamma_dot_nd * scale_si
 
-    gx = torch.sparse.mm(data.G_x, gamma_si.unsqueeze(1)).squeeze(1)
-    gy = torch.sparse.mm(data.G_y, gamma_si.unsqueeze(1)).squeeze(1)
+    gx = torch.sparse.mm(G_x, gamma_si.unsqueeze(1)).squeeze(1)
+    gy = torch.sparse.mm(G_y, gamma_si.unsqueeze(1)).squeeze(1)
     dgamma_dx_phys = gx
     dgamma_dy_phys = gy
 
@@ -138,6 +147,11 @@ def compute_clot_kinematics_fields(
     is_low_shear = torch.sigmoid(((float(bio_cfg.lss) - gamma_si) / T_ls).clamp(-50.0, 50.0))
     is_separation_stream = torch.sigmoid(
         ((float(bio_cfg.sgt) - dshear_ds_phys) / T_gr).clamp(-50.0, 50.0)
+    )
+    # COMSOL gates on d(spf.sr,x), not on the streamwise derivative.
+    dgamma_dx_si = gx / d_safe
+    is_separation_dx = torch.sigmoid(
+        ((float(bio_cfg.sgt) - dgamma_dx_si) / T_gr).clamp(-50.0, 50.0)
     )
 
     sgt_ref = max(abs(float(bio_cfg.sgt)), 1e-6)
@@ -175,6 +189,8 @@ def compute_clot_kinematics_fields(
     return ClotKinematicsFields(
         gamma_si=gamma_si,
         dshear_ds_phys=dshear_ds_phys,
+        dgamma_dx_si=dgamma_dx_si,
+        is_separation_dx=is_separation_dx,
         dgamma_dx_phys=dgamma_dx_phys,
         dgamma_dy_phys=dgamma_dy_phys,
         is_low_shear=is_low_shear,

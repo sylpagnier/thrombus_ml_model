@@ -29,20 +29,17 @@ class PhysicsKernels:
 
     def _get_geometric_props(self, data):
         """
-        Extracts precomputed geometric properties for direct 2nd-order Weighted Least Squares (WLS).
+        Extracts precomputed geometric properties for legacy compatibility, 
+        and passes the graph data for MLS operators.
         """
         return {
-            'row': data.edge_index[0],
-            'col': data.edge_index[1],
             'num_nodes': data.num_nodes,
-            'V': data.V,
-            'W': data.W,
-            'M_inv': data.M_inv
+            'data': data
         }
 
     def _compute_derivatives(self, u, data_or_props):
         """
-        Computes 1st and 2nd derivatives using the precomputed 2nd-order WLS operator.
+        Computes 1st and 2nd derivatives using the 3-hop MLS operator.
         Safely handles either a PyG Data object or a props dictionary.
 
         Contract for ``u`` (no batch/time axis):
@@ -51,29 +48,24 @@ class PhysicsKernels:
 
         Do not pass ``[1, N, C]`` or other ranks; edge indices address nodes along dim 0.
         """
-        boundary_mask = None
-        boundary_normals = None
+        from src.core_physics.mls_gradient import graph_gradient_operators
+        
         if isinstance(data_or_props, dict):
-            row, col = data_or_props['row'], data_or_props['col']
-            num_nodes = data_or_props['num_nodes']
-            V, W, M_inv = data_or_props['V'], data_or_props['W'], data_or_props['M_inv']
+            data = data_or_props['data']
         else:
-            row, col = data_or_props.edge_index
-            num_nodes = data_or_props.num_nodes
-            V, W, M_inv = data_or_props.V, data_or_props.W, data_or_props.M_inv
-            boundary_mask, boundary_normals = self._get_boundary_wls_context(data_or_props, num_nodes, V.dtype, V.device)
+            data = data_or_props
 
-        edge_index = torch.stack([row, col], dim=0)
-        return wls_derivatives(
-            u,
-            edge_index,
-            num_nodes,
-            V,
-            W,
-            M_inv,
-            boundary_mask=boundary_mask,
-            boundary_normals=boundary_normals,
-        )
+        G_x, G_y = graph_gradient_operators(data, device=u.device, dtype=u.dtype)
+        
+        u_col = u if u.dim() == 2 else u.unsqueeze(-1)
+        
+        u_x = torch.sparse.mm(G_x, u_col)
+        u_y = torch.sparse.mm(G_y, u_col)
+        u_xx = torch.sparse.mm(G_x, u_x)
+        u_xy = torch.sparse.mm(G_x, u_y)
+        u_yy = torch.sparse.mm(G_y, u_y)
+        
+        return torch.stack([u_x, u_y, u_xx, u_xy, u_yy], dim=1)
 
     def _get_boundary_wls_context(self, data, num_nodes, dtype, device):
         """Assemble boundary mask + outward normals for one-sided boundary WLS rows."""

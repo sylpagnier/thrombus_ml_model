@@ -34,6 +34,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from src.core_physics.mls_gradient import graph_gradient_operators
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
 from src.utils import species_channels as sc
 from src.core_physics.clot_phi_simple import (
@@ -571,10 +572,11 @@ def mlp_mu_map_gamma_thresh_nd() -> float:
 def gamma_dot_nd_from_uv(data, u_nd: torch.Tensor, v_nd: torch.Tensor) -> torch.Tensor:
     u = u_nd.reshape(-1, 1).to(dtype=torch.float32)
     v = v_nd.reshape(-1, 1).to(dtype=torch.float32)
-    du_dx = torch.sparse.mm(data.G_x, u)
-    du_dy = torch.sparse.mm(data.G_y, u)
-    dv_dx = torch.sparse.mm(data.G_x, v)
-    dv_dy = torch.sparse.mm(data.G_y, v)
+    _gx, _gy = graph_gradient_operators(data, device=u.device, dtype=u.dtype)
+    du_dx = torch.sparse.mm(_gx, u)
+    du_dy = torch.sparse.mm(_gy, u)
+    dv_dx = torch.sparse.mm(_gx, v)
+    dv_dy = torch.sparse.mm(_gy, v)
     return compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy).reshape(-1)
 
 

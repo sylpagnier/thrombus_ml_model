@@ -5172,3 +5172,133 @@ aggregates of features built on the broken operator; the level was never in thos
 because the gates were never in them. `scripts/check_no_clot_vessels.py`.
 
 Test suite: **591 passing** (585 + 6 new in `src/tests/test_mls_gradient_and_gates.py`).
+
+**27.1 The lumen specialist can also be replaced by scalars — narrowly.** Off-wall clot is
+20.9% of GT clot, sits at hops 2-3, and **never** nucleates away from committed wall tissue
+(0 orphans in 890 nodes), so the lumen arm is a propagation rule seeded by the wall arm. It
+is real clot: on the p007 domain export `mu1(Mat)` is saturated at 79/80 there and fibrin
+`mu2` is identically 0. A two-scalar rule (dilate 2 hops from predicted wall clot, admit
+`speed_nd < 0.3`) reaches **offwall_relaxed_f1 0.559 train / 0.532 sealed** against the
+learned specialist's **0.4726**, and on the full-horizon half of `orig10` the compound
+physics model scores **0.8469 vs the learned compound's 0.8428**. The margin is thin
+(−0.004 train, +0.013 sealed) and the rule's oracle ceiling is ~0.56, because off-wall clot
+occupies a one-cell mesh shell at a near-constant normal offset (1.7-1.8 median edge
+lengths on every vessel) rather than a growth-dependent thickness. Full record:
+`docs/PHASE3_RESULTS.md` 11.
+
+**Blocking caveat:** `deploy_clot_phi_trajectory` multiplies pred AND GT by `mask_wall`
+unconditionally, so the canonical eval currently reports structurally-zero off-wall metrics
+for every model. The compound reference predates that. Gate the masking on the wall-only
+model before trusting any compound number.
+
+### 27.1 The fix is wired into the stack, and it exposed a third defect
+
+`mls_gradient.graph_gradient_operators` now backs 41 call sites across
+`biochem_physics_kernels` (incl. `biochem_wall_residual`), `clot_kinematics_fields`,
+`clot_phi_simple`, `clot_t0_extended_probe`, `clot_phi_mu_inject` and
+`kinematics_clot_prior`. `BIOCHEM_GRAD_OPERATOR=legacy` reproduces every pre-2026-08-09
+number. Data-gen and the kinematics DEQ solver are deliberately NOT routed.
+
+**Third defect, independent of the operator.** With the operator fixed, `gamma_si` went
+0.19 -> 0.998 against COMSOL but `dshear_ds` stayed exactly `[0., 0., -0.]`. The kernel
+takes a **streamwise** derivative and evaluates it **at the wall**, where no-slip makes
+`u = v = 0` — so `u_dir = v_dir = 0` and the quantity is identically zero under ANY
+operator. `is_separation` and all three `pathological_*_adhesion` terms have never
+contributed to the wall residual. COMSOL gates on `d(spf.sr,x)`, now the default
+(`BIOCHEM_SEPARATION_GATE=stream` restores the old form):
+
+```
+config                          sr int  sr wall   |dsr| max  sep open  low open
+legacy G_x + streamwise           0.01     2.21           0     0.0%     57.6%
+MLS + streamwise                 11.79    77.90           0     0.0%     15.3%
+MLS + d(sr,x)   [new default]    11.79    77.90    3.14e+05    14.9%     15.3%
+COMSOL reference                    --    77.90           --   14.6%        --
+```
+
+`scripts/verify_wall_residual_gates.py` reads those activations out of the kernel itself,
+per standing constraint 5.3.
+
+One test premise died: `test_comsol_carreau_bulk_closer_than_fixed_carreau` asserted the
+`max(g,wls,poi,kin)` shear blend beats plain Carreau, which held only because plain
+Carreau saw zero shear. Corrected, plain Carreau's bulk error drops 4.75e-2 -> 2.10e-5
+(2260x) and now wins. Test updated to pin the corrected relation. Suite: **594 passing**.
+The §27 headline numbers are bit-identical after the wiring.
+
+---
+
+## 28 TEMPORAL DYNAMICS, AND THE STALE DIAGNOSTICS RE-RUN
+
+Session 2026-08-09, second pass. Full record: **`docs/PHASE3_RESULTS.md` §13-14**.
+
+**The defect.** 27's model nails the final mask but has no time axis, and the ODE behind
+it ignites in a flash: patient043's 84 nodes all cross in the *same step* (onset spread
+0.000 of the horizon against GT's 0.725), because its gate is 100% low-shear, `gate == 1`
+uniformly, and every node then has an identical ODE.
+
+**`da_scale` was half the fix, and the selection metric could not see it.** 27 found every
+`da_scale` above ~50 gives a bit-identical committed set. That made the value look free.
+Holding everything else fixed, `da_scale` 100 -> 40 takes `curve_l1` from **0.2998 to
+0.1018** at a **bit-identical** deploy score. A quantity the selection metric cannot
+resolve needs a second metric, not a shrug.
+
+**Arm 1, graded gate** (a decreasing function of the margin below `lss`, grading the
+stagnation branch only): `curve_l1` **0.2998 -> 0.0649**, deploy score held. But onset
+rank correlation `rho` *falls* 0.713 -> 0.651: grading fixes *when the population ignites*,
+not *which node goes first*.
+
+**Arm 2 as briefed is built on a false premise, measured twice.** Local `Mat` -> blockage
+-> `1/r^3` shear rescale moved `curve_l1` only 0.2998 -> 0.2827, because:
+
+* the occluded cross-section fraction is **0.000 median — using the GT clot**, not just the
+  model's (the lumen is 14-27 mesh cells deep, the clot 1-3 cells thick);
+* recomputing `spf.sr` from the GT velocity at all 201 timesteps gives **median
+  `sr(t_final)/sr(t=0)` = 0.9974**, spearman(t=0, t_final) 0.838, and only 6.4% of wall
+  nodes ever flip their low-shear gate.
+
+**The frozen-t=0 gate is essentially right.** Arm 2 was approximating a 0.3% effect.
+
+**But the sign was backwards.** The gate open-fraction *rises* through the run (patient032
+0.000 -> 0.202, patient007 0.153 -> 0.298). Narrowing would accelerate the flow and close
+gates; committed tissue is a no-slip obstacle at 80x viscosity and sheds a **stagnation
+wake**. With `sr -> sr*(1 - wake*phi)` (one sparse matvec every 5 steps, no network):
+train score 0.7919 -> **0.8513**, sealed 0.8645 -> **0.8957**.
+
+**Arm 3 is closed on an oracle bound.** Integrating the same ODE against GT's own
+time-varying gates — a flow model with zero error, which no learned corrector can beat —
+scores **0.8913 train / 0.9066 sealed**. The algebraic wake rule recovers 60% of that train
+gain and 74% of the sealed gain, and arm 1 alone already **beats the oracle** on curve
+shape (0.0649 vs 0.0670). Remaining headroom for a perfect in-loop corrector: **0.040 train,
+0.011 sealed.** Not worth a network.
+
+**Honest split.** The temporal model does not replace 27's mask model: it wins on train
+(+0.033) but 27's `gate + graph growth` still wins on **sealed** on both flow arms, by
+0.041 on the deployable one. What the temporal arms buy is a growth curve the mask model
+cannot produce at all (`curve_l1` ~0.08, onset spread ratio ~1.03 against GT).
+
+### 28.1 The stale diagnostics, re-run
+
+`BIOCHEM_GRAD_OPERATOR=legacy|mls` switches the operator, so the published numbers are
+reproducible and the correction is a one-line re-run. `legacy` reproduces them exactly.
+
+| measurement | legacy (as published) | **fixed operator** |
+|---|---|---|
+| 26.17 % of **non-committing** band nodes below `lss` | **44.4%** | **7.4%** |
+| 26.17 mean AUC separation gate | 0.659 | **0.746** |
+| 26.17 mean AUC low-shear gate | 0.510 | 0.489 |
+| 26.18 mean best-single-feature AUC | 0.884 | **0.921** |
+| 26.18 mean ORACLE-THRESHOLD F1 | 0.462 | **0.583** |
+| 26.18 vessels with oracle F1 >= 0.6 | 5 / 35 | **15 / 35** |
+
+**26.19's headline supporting fact is gone.** "The gate is open on 45.6% of band nodes and
+only ~7% ever commit — necessary-ish and wildly insufficient" was an artefact of the
+operator: the gate fires on **7.4%** of non-committing nodes. And 26.18's feasibility
+arithmetic, redone, gives `0.583 + 0.092 -> ~0.715` where it previously gave ~0.597 and was
+read as "lands on the line". The realised result is 0.787. **The margin was never thin; the
+instrument was.**
+
+Still stale, and both downstream of the same operator: **13.4's regime routing** and
+**Z1's 0.041 AUC for the flow channel**.
+
+Test suite: **603 passing** (+9 in `src/tests/test_temporal_wall_model.py`, which pins the
+flash, the graded gate's monotonicity and its hard-step limit, and that the blockage
+callable is actually applied).

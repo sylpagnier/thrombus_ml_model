@@ -8,6 +8,7 @@ from src.config import BULK_SPECIES_ORDER, SPECIES_GROUPS, BulkSpecies, BiochemN
 from src.utils.channel_schema import biochem_encoder_x
 from src.utils.rheology import compute_shear_rate
 from src.utils.nondim import time_ratio_global_to_convective
+from src.core_physics.mls_gradient import graph_gradient_operators
 from src.utils.tensor_utils import as_tensor_like
 
 
@@ -109,6 +110,16 @@ class BiochemPhysicsKernels:
         if key not in self._adr_norm_scales_cache:
             self._adr_norm_scales_cache[key] = self.adr_norm_scales.to(device=device, dtype=dtype)
         return self._adr_norm_scales_cache[key]
+
+    @staticmethod
+    def _grad_ops(data, like: torch.Tensor):
+        """Gradient operators for ``data``, in the packs' non-dimensional length unit.
+
+        Routes through ``mls_gradient`` because the shipped ``data.G_x``/``G_y`` are
+        rank-deficient away from the wall and return ~0 for an interior derivative
+        (docs/PHASE3_RESULTS.md 1). ``BIOCHEM_GRAD_OPERATOR=legacy`` restores them.
+        """
+        return graph_gradient_operators(data, device=like.device, dtype=like.dtype)
 
     def set_biochem_huber_delta(self, delta: float) -> None:
         """Update shared residual Huber delta during curriculum annealing."""
@@ -261,8 +272,9 @@ class BiochemPhysicsKernels:
 
         # Sparse Matrix Gradient Calculation
         mu_col = mu_total.unsqueeze(1)
-        dmu_dx = torch.sparse.mm(data.G_x, mu_col).squeeze(1)
-        dmu_dy = torch.sparse.mm(data.G_y, mu_col).squeeze(1)
+        _gx, _gy = self._grad_ops(data, mu_col)
+        dmu_dx = torch.sparse.mm(_gx, mu_col).squeeze(1)
+        dmu_dy = torch.sparse.mm(_gy, mu_col).squeeze(1)
 
         grad_mu_sq = dmu_dx ** 2 + dmu_dy ** 2
 
@@ -381,16 +393,17 @@ class BiochemPhysicsKernels:
 
             # Sparse matrix gradients/Laplacian in normalized coordinates (x* = x / d_bar).
             C_col_nd = C_nd.unsqueeze(1)
-            dC_dx_nd = torch.sparse.mm(data.G_x, C_col_nd).squeeze(1)
-            dC_dy_nd = torch.sparse.mm(data.G_y, C_col_nd).squeeze(1)
+            _gx, _gy = self._grad_ops(data, C_col_nd)
+            dC_dx_nd = torch.sparse.mm(_gx, C_col_nd).squeeze(1)
+            dC_dy_nd = torch.sparse.mm(_gy, C_col_nd).squeeze(1)
             advection_nd = u * dC_dx_nd + v * dC_dy_nd
 
             # Diffusion in dimensionless form: div((1/Pe) grad(C_nd)).
             laplacian_C_nd = torch.sparse.mm(data.Laplacian, C_col_nd).squeeze(1)
             inv_pe = as_tensor_like(D, like=u_ref_safe) / (u_ref_safe * d_bar_safe)
             inv_pe_col = inv_pe.unsqueeze(1)
-            dinvpe_dx = torch.sparse.mm(data.G_x, inv_pe_col).squeeze(1)
-            dinvpe_dy = torch.sparse.mm(data.G_y, inv_pe_col).squeeze(1)
+            dinvpe_dx = torch.sparse.mm(_gx, inv_pe_col).squeeze(1)
+            dinvpe_dy = torch.sparse.mm(_gy, inv_pe_col).squeeze(1)
             diffusion_nd = (inv_pe * laplacian_C_nd) + (dinvpe_dx * dC_dx_nd + dinvpe_dy * dC_dy_nd)
 
             # Local convective-time reaction scale for all species.
@@ -496,8 +509,9 @@ class BiochemPhysicsKernels:
             n_mobile = len(mobile_species)
             for sp in mobile_species:
                 C_col = linear_bulk[:, sp.value].unsqueeze(1)
-                dC_dx = torch.sparse.mm(data.G_x, C_col).squeeze(1) / d_bar_safe
-                dC_dy = torch.sparse.mm(data.G_y, C_col).squeeze(1) / d_bar_safe
+                _gx, _gy = self._grad_ops(data, C_col)
+                dC_dx = torch.sparse.mm(_gx, C_col).squeeze(1) / d_bar_safe
+                dC_dy = torch.sparse.mm(_gy, C_col).squeeze(1) / d_bar_safe
                 dC_dn = dC_dx[mask_outlet] * nx + dC_dy[mask_outlet] * ny
                 dC_dn = torch.nan_to_num(dC_dn, nan=0.0, posinf=0.0, neginf=0.0)
                 d_nd = dC_dn / flux_scale
@@ -573,15 +587,24 @@ class BiochemPhysicsKernels:
         u_ref_wall_safe = torch.clamp(u_ref_wall, min=1e-8)
         conv_time = d_bar_wall / u_ref_wall_safe
 
-        # Streamwise Directional Derivative (d/ds)
-        dshear_dx = torch.sparse.mm(data.G_x, global_shear.unsqueeze(1)).squeeze(1)
-        dshear_dy = torch.sparse.mm(data.G_y, global_shear.unsqueeze(1)).squeeze(1)
+        _gx, _gy = self._grad_ops(data, global_shear)
+        dshear_dx = torch.sparse.mm(_gx, global_shear.unsqueeze(1)).squeeze(1)
+        dshear_dy = torch.sparse.mm(_gy, global_shear.unsqueeze(1)).squeeze(1)
 
-        vel_mag = torch.sqrt(u ** 2 + v ** 2) + 1e-8
-        u_dir = u / vel_mag
-        v_dir = v / vel_mag
-
-        dshear_ds = (u_dir * dshear_dx) + (v_dir * dshear_dy)
+        # COMSOL's separation gate is `d(spf.sr,x) < sgt` -- a GLOBAL-AXIS derivative.
+        # This kernel used a STREAMWISE derivative instead, which is identically zero at
+        # every wall node: no-slip makes u = v = 0 there, so `u_dir`/`v_dir` are 0/1e-8.
+        # With sgt < 0 the soft step then evaluates sigmoid(sgt/T) ~ 0 everywhere and the
+        # entire separation branch -- 21% of COMSOL's deposition mechanism, and the
+        # branch that carries the FAST vessels -- has never contributed. Measured on
+        # patient007: the repo's `dshear_ds` percentiles are exactly [0, 0, -0].
+        # `BIOCHEM_SEPARATION_GATE=stream` restores the old behaviour.
+        # See docs/PHASE3_RESULTS.md 1.
+        if (os.environ.get("BIOCHEM_SEPARATION_GATE") or "dx").strip().lower() == "stream":
+            vel_mag = torch.sqrt(u ** 2 + v ** 2) + 1e-8
+            dshear_ds = ((u / vel_mag) * dshear_dx) + ((v / vel_mag) * dshear_dy)
+        else:
+            dshear_ds = dshear_dx
         dshear_ds_wall = (dshear_ds / d_bar_safe)[mask_wall]
         dshear_abs = torch.abs(dshear_ds_wall) + 1e-6
 
@@ -714,8 +737,9 @@ class BiochemPhysicsKernels:
             C_field = linear_biochem_preds[:, idx].unsqueeze(1)
 
             # Sparse Matrix Gradient Calculation
-            dC_dx = torch.sparse.mm(data.G_x, C_field).squeeze(1) / d_bar_safe
-            dC_dy = torch.sparse.mm(data.G_y, C_field).squeeze(1) / d_bar_safe
+            _fgx, _fgy = self._grad_ops(data, C_field)
+            dC_dx = torch.sparse.mm(_fgx, C_field).squeeze(1) / d_bar_safe
+            dC_dy = torch.sparse.mm(_fgy, C_field).squeeze(1) / d_bar_safe
 
             # Dot with outward normal vector (D * grad(C) dot n)
             dC_dn_wall = dC_dx[mask_wall] * nx + dC_dy[mask_wall] * ny
@@ -741,10 +765,11 @@ class BiochemPhysicsKernels:
 
     def _compute_shear_rate(self, u, v, spatial_props, data):
         # Sparse Matrix Gradient Calculation
-        du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
-        du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
-        dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
-        dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
+        _gx, _gy = self._grad_ops(data, u)
+        du_dx = torch.sparse.mm(_gx, u.unsqueeze(1)).squeeze(1)
+        du_dy = torch.sparse.mm(_gy, u.unsqueeze(1)).squeeze(1)
+        dv_dx = torch.sparse.mm(_gx, v.unsqueeze(1)).squeeze(1)
+        dv_dy = torch.sparse.mm(_gy, v.unsqueeze(1)).squeeze(1)
 
         # This is non-dimensional.
         gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)

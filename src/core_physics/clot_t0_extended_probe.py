@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from src.config import BiochemConfig, PhysicsConfig, STATE_CHANNEL_MU_EFF_ND
+from src.core_physics.mls_gradient import graph_gradient_operators
 from src.core_physics.clot_anchor_survey import _graph_props, discover_anchor_paths
 from src.core_physics.clot_growth_masks import resolve_ceiling_mask
 from src.core_physics.clot_kinematics_fields import (
@@ -76,10 +77,11 @@ def _flow_derivatives(
 ) -> dict[str, torch.Tensor]:
     u = u.reshape(-1).float()
     v = v.reshape(-1).float()
-    du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
-    du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
-    dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
-    dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
+    G_x, G_y = graph_gradient_operators(data, device=u.device, dtype=u.dtype)
+    du_dx = torch.sparse.mm(G_x, u.unsqueeze(1)).squeeze(1)
+    du_dy = torch.sparse.mm(G_y, u.unsqueeze(1)).squeeze(1)
+    dv_dx = torch.sparse.mm(G_x, v.unsqueeze(1)).squeeze(1)
+    dv_dy = torch.sparse.mm(G_y, v.unsqueeze(1)).squeeze(1)
     gamma = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy)
     u_ref = props["u_ref"].reshape(-1).clamp(min=1e-8)
     d_bar = props["d_bar"].reshape(-1).clamp(min=1e-8)
@@ -135,6 +137,10 @@ def build_feature_table_at_time(
         ("dgamma_dy", fields.dgamma_dy_phys, "shear_grad", "computed"),
         ("neg_dgamma_dx", neg_dx, "shear_grad", "computed"),
         ("dshear_ds", fields.dshear_ds_phys, "shear_grad", "computed"),
+        # COMSOL's actual separation-gate input. `dshear_ds` above is the streamwise
+        # derivative, which no-slip pins to exactly 0 at every wall node.
+        ("dgamma_dx_si", fields.dgamma_dx_si, "shear_grad", "computed"),
+        ("is_separation_dx", fields.is_separation_dx, "shear_grad", "computed"),
         ("gamma_si", fields.gamma_si, "flow", "computed"),
         ("flux_path_dx", fields.flux_path_dx, "prior", "computed"),
         ("flux_stag", fields.flux_stag, "prior", "computed"),

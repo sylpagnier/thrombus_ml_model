@@ -24,7 +24,8 @@ from src.core_physics.clot_kinematics_fields import (
 )
 
 if TYPE_CHECKING:
-    from src.config import BiochemConfig
+    from src.core_physics.mls_gradient import graph_gradient_operators
+from src.config import BiochemConfig
 
 
 def _max_neighbor_dilate_1d(v: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
@@ -67,10 +68,11 @@ def shear_rate_si(data, u_nd: torch.Tensor, v_nd: torch.Tensor, props: dict) -> 
 
     u = u_nd.reshape(-1).to(dtype=torch.float32)
     v = v_nd.reshape(-1).to(dtype=torch.float32)
-    du_dx = torch.sparse.mm(data.G_x, u.unsqueeze(1)).squeeze(1)
-    du_dy = torch.sparse.mm(data.G_y, u.unsqueeze(1)).squeeze(1)
-    dv_dx = torch.sparse.mm(data.G_x, v.unsqueeze(1)).squeeze(1)
-    dv_dy = torch.sparse.mm(data.G_y, v.unsqueeze(1)).squeeze(1)
+    _gx, _gy = graph_gradient_operators(data, device=u.device, dtype=u.dtype)
+    du_dx = torch.sparse.mm(_gx, u.unsqueeze(1)).squeeze(1)
+    du_dy = torch.sparse.mm(_gy, u.unsqueeze(1)).squeeze(1)
+    dv_dx = torch.sparse.mm(_gx, v.unsqueeze(1)).squeeze(1)
+    dv_dy = torch.sparse.mm(_gy, v.unsqueeze(1)).squeeze(1)
     gamma_dot_nd = compute_shear_rate(du_dx, du_dy, dv_dx, dv_dy, eps=1e-6)
     u_ref = props["u_ref"].to(device=u.device, dtype=torch.float32).reshape(-1)
     d_bar = props["d_bar"].to(device=u.device, dtype=torch.float32).reshape(-1)

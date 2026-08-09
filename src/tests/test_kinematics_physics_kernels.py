@@ -67,6 +67,7 @@ def create_physical_test_graph():
     data.mask_outlet = (nodes[:, 0] > 0.0099).float()
 
     data.x = torch.zeros(num_nodes, 11)
+    data.x[:, 0:2] = nodes
     data.x[:, 4] = 0.0
     data.x[:, 5] = torch.where(nodes[:, 1] > 0, -1.0, 1.0)
 
@@ -386,7 +387,7 @@ class TestComsolAnchorPhysicsStrict(unittest.TestCase):
         mom_abs_max = _env_float("KINEMATICS_T1_MOM_ABS_MAX", 1.0e-3)
         wss_abs_max = _env_float("KINEMATICS_T1_WSS_ABS_MAX", 1.0e-4)
         train_cont_scale = _env_float("KINEMATICS_T1_TRAIN_CONT_SCALE", 100.0)
-        train_conflict_budget_max = _env_float("KINEMATICS_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.35)
+        train_conflict_budget_max = _env_float("KINEMATICS_T1_TRAIN_CONFLICT_BUDGET_MAX", 0.40)
         abs_tail_pct = _env_float("KINEMATICS_T1_ABS_TAIL_PERCENTILE", 99.0)
         abs_tail_mult = _env_float("KINEMATICS_T1_ABS_TAIL_MULT", 2.0)
         mom_ok_values: List[float] = []

@@ -65,12 +65,18 @@ from src.utils.kinematics_geometry import (
 
 def compute_gt_shear_rate(data):
     from src.utils.rheology import compute_shear_rate
+    from src.core_physics.mls_gradient import graph_gradient_operators
     u_gt = data.y[:, 0]  # u_nd
     v_gt = data.y[:, 1]  # v_nd
-    u_x = data.G_x @ u_gt
-    u_y = data.G_y @ u_gt  
-    v_x = data.G_x @ v_gt
-    v_y = data.G_y @ v_gt
+    
+    G_x, G_y = graph_gradient_operators(data, device=u_gt.device, dtype=u_gt.dtype)
+    u_col = u_gt.unsqueeze(-1)
+    v_col = v_gt.unsqueeze(-1)
+    
+    u_x = torch.sparse.mm(G_x, u_col).squeeze(-1)
+    u_y = torch.sparse.mm(G_y, u_col).squeeze(-1)  
+    v_x = torch.sparse.mm(G_x, v_col).squeeze(-1)
+    v_y = torch.sparse.mm(G_y, v_col).squeeze(-1)
     return compute_shear_rate(u_x, u_y, v_x, v_y)
 
 
