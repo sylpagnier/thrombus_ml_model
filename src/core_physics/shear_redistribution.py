@@ -107,8 +107,15 @@ def make_blockage(
         if state["gate"] is not None and (step - state["last"]) < every:
             return state["gate"]
         occ = (mat >= crit).astype(np.float64)
-        phi = np.clip(np.asarray(B @ occ).reshape(-1), 0.0, phi_max)
-        if feedback == "wake":
+        if feedback == "thrombin":
+            # Same mechanism as 'wake' -- committed tissue lowers the shear its neighbours
+            # see, flipping their gates -- but the RANGE comes from D_T and the horizon
+            # (src/core_physics/thrombin_field.py) instead of a fitted ball radius. This is
+            # the fitted-scalar-for-derived-constant trade the whole rung exists to test.
+            phi = np.clip(thrombin_solve(occ), 0.0, phi_max)
+        else:
+            phi = np.clip(np.asarray(B @ occ).reshape(-1), 0.0, phi_max)
+        if feedback in ("wake", "thrombin"):
             amp = np.clip(1.0 - float(wake) * phi, 0.02, 1.0)
         else:
             amp = (1.0 - phi) ** (-float(exponent))
