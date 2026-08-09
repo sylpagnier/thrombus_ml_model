@@ -137,6 +137,7 @@ def patch_to_data(
         ch = _scalar(z, "clot_height")
         clot_mu = _scalar(z, "clot_mu_peak", 0.0)
         shear = _scalar(z, "shear_rate", 0.0)
+        d_shear_arr = np.asarray(z["d_shear"], dtype=np.float64) if "d_shear" in z.files else None
 
     if not (np.isfinite(du).all() and np.isfinite(dv).all() and np.isfinite(mu).all()):
         return None
@@ -169,7 +170,7 @@ def patch_to_data(
 
     x_c = crop(x); y_c = crop(y)
     du_c = crop(du); dv_c = crop(dv); ub_c = crop(u_base); mu_c = crop(mu)
-    d_shear = np.asarray(z["d_shear"], dtype=np.float64) if "d_shear" in z.files else np.zeros_like(x)
+    d_shear = d_shear_arr if d_shear_arr is not None else np.zeros_like(x)
     dshear_c = crop(d_shear)
     ny_c, nx_c = x_c.shape
     if ny_c < 2 or nx_c < 2:

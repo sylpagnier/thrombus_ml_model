@@ -1,5 +1,15 @@
 # PHASE 3/4/5 HANDOFF — a t=0-flow physics wall model
 
+> **SUPERSEDED IN PART, 2026-08-09 — read `docs/PHASE3_RESULTS.md` first.**
+> `data.G_x`/`G_y` do not compute derivatives (median ONE non-zero per row; `G_x @ x` = 0
+> across the interior). Every flow-derived measurement quoted below — §1.4's gate AUCs,
+> §1.5a's ceiling, §1.5b's "the LEVEL does not transfer", §9's open questions 0-3 — was
+> computed on that operator. With a correct one, the t=0 gates score
+> **0.9093 on the sealed set with GT t=0 flow and 0.8567 without it**, zero learned
+> parameters. §1.5's Step 0 is answered; §1.5c is refuted (the level does not emerge from
+> `Da`); §1.6's kill criteria are not triggered. §1.5b is refuted too — on the eight
+> no-clot vessels the model predicts zero nodes, a 0.0% false-positive rate.
+
 Written 2026-08-08 for a new context window.
 
 **The mission (Phase 3): using the GT flow field at `t=0` ONLY, plus geometry, initial and

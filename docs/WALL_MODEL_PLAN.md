@@ -5102,3 +5102,73 @@ unanswered.** That is now the single most valuable measurement in the project: n
 rank correctly" (we know ranking is adequate) but **"does the law get the AMOUNT right per
 vessel"**. If it does, generalization follows and the >0.6 projection in 26.18 is conservative. If
 it does not, no architecture fixes it and the goal needs restating against 20.5's split.
+
+---
+
+## 27 THE GATES WERE NEVER BEING COMPUTED — Step 0 answered, target cleared
+
+Session 2026-08-09. Full record: **`docs/PHASE3_RESULTS.md`**. Summary only here.
+
+**The finding.** `data.G_x` / `data.G_y`, on which every flow-derived feature in this
+document rests, have a **median of one non-zero per row**, and `G_x @ x` returns **0
+across the interior** (exact answer: 1). They are linearly consistent only on wall rows.
+Audited against COMSOL's own exported `spf.sr` / `d(spf.sr,x)` for patient007:
+
+```
+                         spearman(spf.sr)   spearman(d(spf.sr,x))
+packs' G_x / G_y               0.19                 0.00
+MLS, 3 graph hops              0.998                0.990
+```
+
+The repo's `dshear_ds` is *identically zero*. The separation gate — 21% of the deposition
+mechanism — has never fired in this project. 26.17's gate AUCs, 26.18's ceiling, 26.19's
+"nothing predicts the base rate", 10.4's regime split and Z1's 0.041 were all measured on
+features built from that operator.
+
+**Step 0 (26.18 / handoff 1.5), answered on COMSOL's own export.** The law in
+`comsol_surface_deposition.py` reproduces the exported `J0_Mat` at rel-err 9.6e-17;
+`Sat(M) = 1 − Mas/Minf` (not `1 − M_tot/Minf`); **96.9% of Mat growth mass sits where the
+two-gate union is open**; and the t=0 gate alone classifies patient007's final committed
+wall set at **precision 0.981 / recall 0.760**.
+
+**26.19.2 / handoff 1.5c is refuted.** The level does not emerge from `Da`. Sweeping
+`da_scale` over 50…1000 gives a bit-identical committed set — autocatalysis is a
+bifurcation and `Sat` saturates in ~1300 s of a 30000 s horizon. The level is set by
+*where the gates are open*, which is precisely what 1 broke.
+
+**Result** — canonical wall-masked `deploy_clot_score`, fingerprint verified identical to
+`scripts/eval_mat_growth_simple.py`, zero learned parameters, three scalars fit on
+`WALL_COHORT_V2_TRAIN`:
+
+| subset | with GT t=0 flow | **deployable (no bandaid)** |
+|---|---|---|
+| all vessels | 0.7866 (27/34 ≥0.6) | 0.7210 (20/27 ≥0.6) |
+| **SEALED** | **0.9093 (8/8)** | **0.8567 (6/6)** |
+| full-horizon T≥150 | 0.8556 (25/27) | 0.7784 (18/21) |
+
+Against the standing bar: 0.6925 (one favourable vessel, 9.3), GNN 0.540, logreg 0.516
+(19.2). `patient043` goes 0.6925 → 0.9796. Trivial predictors on the same metric score
+0.20–0.23, and **the repo's own `is_low_shear` feature scores 0.2326** — indistinguishable
+from random, which is 27.1 restated as a score.
+
+**Phase 5 is not the project.** Swapping `u0_pred`/`v0_pred` for the GT t=0 flow costs
+−0.0666 (train) once the MLS stencil is re-fit per arm; the noisier field wants a wider
+stencil. Arm B clears 0.6 on every sealed vessel.
+
+**Residual.** Every over-predicting vessel is a truncated run (patient009 T=67, 008 T=49,
+003 T=29, …), where GT is clot onset, not the converged map — the rule this document
+already states for T≥150 holdouts. Two genuine full-horizon failures remain: 028 and 018.
+
+**Highest-value follow-up:** `biochem_wall_residual` computes its shear and Neumann fluxes
+with the same `G_x`/`G_y`, so the physics loss carries the same defect. Route every
+consumer to `src/core_physics/mls_gradient.py`, then re-run 26.17, 26.18, 26.19, 10.4 and
+Z1 on fixed operators.
+
+**26.19 / handoff 1.5b is also refuted.** On the eight vessels excluded from every cohort
+as having *no clot* (017, 022, 023, 026, 027, 030, 033, 034), the model predicts **zero**
+wall nodes in both flow arms — a 0.0% false-positive rate with no threshold, no
+calibration and no cohort prior. "The level does not transfer" was measured over 225
+aggregates of features built on the broken operator; the level was never in those features
+because the gates were never in them. `scripts/check_no_clot_vessels.py`.
+
+Test suite: **591 passing** (585 + 6 new in `src/tests/test_mls_gradient_and_gates.py`).
