@@ -324,11 +324,12 @@ def cmd_thrombin(bio, phys, args):
         print("    wash_coef %-6g median %8.3f hops   [%.3f .. %.3f]"
               % (wc, np.median(r), r.min(), r.max()))
 
-    def run(c, *, gain, wake, dilate, wash=0.01):
+    def run(c, *, gain, wake, dilate, wash=0.0, feedback="wake"):
         d, wall = c["d"], c["wall"]
         g0 = graded_gate(c["f"]["gt"], bio, mode="hard") * wall
         blk = (make_blockage(c["f"]["gt"], bio, c["B"], wall, every=EVERY,
-                             feedback="wake", wake=wake) if wake > 0 else None)
+                             feedback=feedback, wake=wake,
+                             thrombin_solve=c["solvers"][wash][0]) if wake > 0 else None)
         boost = (make_ap_boost(c["solvers"][wash][0], bio, gain=gain, every=EVERY)
                  if gain > 0 else None)
         traj, t = integrate_mat_trajectory(d, bio, g0, da_scale=DA, blockage=blk,
@@ -346,9 +347,16 @@ def cmd_thrombin(bio, phys, args):
     for tag, kw in (("wake only (current B)", dict(gain=0.0, wake=WAKE, dilate=False)),
                     ("wake + graph dilation (C)", dict(gain=0.0, wake=WAKE, dilate=True))):
         out.append(report(tag, {a: run(c, **kw) for a, c in cache.items()}, tr, sl))
-    for wash, gain in itertools.product(WASH, (4.0, 16.0)):
-        out.append(report("wake + thrombin wash=%-6g gain=%-4.1f" % (wash, gain),
-                          {a: run(c, gain=gain, wake=WAKE, dilate=False, wash=wash)
+    # (a) thrombin field REPLACES the fitted-radius wake: derived range vs fitted ball.
+    for wash, wk in itertools.product(WASH, (2.0, 8.0)):
+        out.append(report("thrombin-wake wash=%-6g wake=%-4.1f" % (wash, wk),
+                          {a: run(c, gain=0.0, wake=wk, dilate=False, wash=wash,
+                                  feedback="thrombin") for a, c in cache.items()}, tr, sl))
+    # (b) AP boost on top: this can only reorder WITHIN the gated set -- every deposition
+    #     term is gated, so chemistry cannot ignite an ungated node. Ordering, not spread.
+    for gain in (4.0, 16.0):
+        out.append(report("wake + AP boost gain=%-4.1f (ordering)" % gain,
+                          {a: run(c, gain=gain, wake=WAKE, dilate=False, wash=0.0)
                            for a, c in cache.items()}, tr, sl))
     best = max([o for o in out if "thrombin" in o["tag"]], key=lambda z: z["train"]["score"])
     dilb = [o for o in out if "dilation" in o["tag"]][0]
