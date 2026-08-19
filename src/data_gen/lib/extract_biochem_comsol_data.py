@@ -598,13 +598,17 @@ class PatientDataExtractor:
             wall_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
         )
         
-        mask_wound = torch.zeros(num_nodes, dtype=torch.bool)
-        if wound_path.exists():
-            mask_wound, _ = self._load_spatial_mask(
-                wound_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
-            )
+        mask_wound, diag_wound = self._load_spatial_mask(
+            wound_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
+        )
         if bool(mask_wound.any()):
             mask_wall = mask_wall & ~mask_wound
+        elif biochem_variant == "wound":
+            print(
+                f"[WARN] {stem}: biochem_variant=wound but mask_wound is empty. "
+                "Expected *_wound.txt from the COMSOL wound selection.",
+                flush=True,
+            )
 
         d_bar = resolve_d_bar_si_from_sidecar_or_inlet(
             sidecar_meta,
@@ -882,6 +886,7 @@ class PatientDataExtractor:
             "inlet": diag_inlet,
             "outlet": diag_outlet,
             "wall": diag_wall,
+            "wound": diag_wound,
         }
         metadata = {
             "stem": stem,
@@ -961,6 +966,17 @@ class PatientDataExtractor:
             f"Imbal={avg_flux_imbalance:.2%} | centerline={centerline_source} | "
             f"uv_prior_max={float(x_kine[:, 11:13].abs().max()):.3f}"
         )
+        from src.data_gen.lib.biochem_extract_transfer import stage_extract_transfer_bundle
+
+        bundle = stage_extract_transfer_bundle(
+            stem,
+            raw_dir=self.raw_dir,
+            label_dir=self.label_dir,
+            proc_dir=self.proc_dir,
+            kine_dir=self.kine_anchor_dir,
+        )
+        if bundle is not None:
+            print(f"[save] transfer bundle -> {bundle}")
 
     def run(
         self,

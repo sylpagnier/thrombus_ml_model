@@ -10,11 +10,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_BOUNDARY_NAMES = ("inlet", "outlet", "wall")
+_BOUNDARY_NAMES = ("inlet", "outlet", "wall", "wound")
 _SKIP_DOMAIN_LABEL_PARTS = (
     "inlet",
     "outlet",
     "wall",
+    "wound",
     "oracle",
     "filtro",
     "filter",
@@ -179,6 +180,7 @@ def resolve_boundary_datasets(model_java) -> dict[str, str]:
         "inlet": (os.environ.get("BIOCHEM_COMSOL_INLET_DATASET") or "").strip(),
         "outlet": (os.environ.get("BIOCHEM_COMSOL_OUTLET_DATASET") or "").strip(),
         "wall": (os.environ.get("BIOCHEM_COMSOL_WALL_DATASET") or "").strip(),
+        "wound": (os.environ.get("BIOCHEM_COMSOL_WOUND_DATASET") or "").strip(),
     }
     found: dict[str, str] = {k: v for k, v in env_map.items() if v}
     best_score: dict[str, int] = {k: 10_000 for k in found}

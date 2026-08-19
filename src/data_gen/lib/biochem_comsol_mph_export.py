@@ -364,7 +364,9 @@ def pull_exports_via_mph_nodes(
             logger.info("[OK] %s: %s from export '%s'", stem, bname, tags[bname])
 
         wound_tag = tags.get("wound")
-        if wound_tag and (force or not wound_path.is_file()):
+        from src.data_gen.lib.biochem_comsol_mesh_export import boundary_txt_has_coords
+
+        if wound_tag and (force or not boundary_txt_has_coords(wound_path)):
             try:
                 tmp_w = tmp_dir / f"{stem}_wound.txt"
                 run_comsol_data_export(model_java, wound_tag, tmp_w)
@@ -378,4 +380,31 @@ def pull_exports_via_mph_nodes(
         except Exception:
             pass
 
+    from src.data_gen.lib.biochem_comsol_datasets import resolve_solution_dataset
+    from src.data_gen.lib.biochem_comsol_mesh_export import ensure_wound_boundary_txt
+    from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
+
+    mesh_path = resolve_anchor_mesh_path(raw_dir, stem)
+    coords_cm = None
+    if mesh_path is not None:
+        try:
+            import meshio
+
+            mesh = meshio.read(mesh_path)
+            coords_cm = np.asarray(mesh.points[:, :2], dtype=np.float64)
+        except Exception as exc:
+            logger.debug("[i] %s: could not read mesh for wound mask (%s)", stem, exc)
+    try:
+        dataset_tag = resolve_solution_dataset(model_java, "sol1")
+    except Exception:
+        dataset_tag = "dset1"
+    ensure_wound_boundary_txt(
+        model_java,
+        coords_cm,
+        mesh_path,
+        label_dir,
+        stem,
+        dataset_tag=dataset_tag,
+        force=force,
+    )
     return True

@@ -8,7 +8,9 @@ Typical workflow::
 
     1. Run the biochem study in COMSOL; save as either
        ``comsol_models/phase2_nowound_XXX.mph`` or ``comsol_models/phase2_wound_XXX.mph``.
-    2. Ensure Results > Export nodes exist: ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes``.
+    2. Ensure Results > Export nodes exist: ``sol_data``, ``inlet_nodes``,
+       ``outlet_nodes``, ``wall_nodes``. A ``wound_nodes`` export is optional;
+       the wound geometry selection (``wound`` / ``sel1``) is always evaluated.
     3. ``python -m src.tools.extract_biochem_comsol`` (default) runs those exports + builds graphs.
 
 Extract identity (do not collapse both physics onto ``patientXXX``)::
@@ -385,7 +387,12 @@ def write_boundary_txt_from_mesh(
     inlet_p = label_dir / f"{stem}_inlet.txt"
     outlet_p = label_dir / f"{stem}_outlet.txt"
     wall_p = label_dir / f"{stem}_wall.txt"
-    if not force and inlet_p.is_file() and outlet_p.is_file() and wall_p.is_file():
+    wound_p = label_dir / f"{stem}_wound.txt"
+    from src.data_gen.lib.biochem_comsol_mesh_export import boundary_txt_has_coords
+
+    need_main = force or not (inlet_p.is_file() and outlet_p.is_file() and wall_p.is_file())
+    need_wound = force or not boundary_txt_has_coords(wound_p)
+    if not need_main and not need_wound:
         return inlet_p, outlet_p, wall_p
 
     mesh = meshio.read(mesh_path)
@@ -438,12 +445,11 @@ def write_boundary_txt_from_mesh(
             lines.append(f"0 0 {x:.10f} {y:.10f}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    _write_one(inlet_p, masks["inlet"])
-    _write_one(outlet_p, masks["outlet"])
-    _write_one(wall_p, masks["wall"])
-    
-    wound_p = label_dir / f"{stem}_wound.txt"
-    if masks["wound"].any():
+    if need_main:
+        _write_one(inlet_p, masks["inlet"])
+        _write_one(outlet_p, masks["outlet"])
+        _write_one(wall_p, masks["wall"])
+    if need_wound and masks["wound"].any():
         _write_one(wound_p, masks["wound"])
     logger.info(
         "[OK] %s: boundary txt from mesh (inlet=%d outlet=%d wall=%d wound=%d unique coords)",

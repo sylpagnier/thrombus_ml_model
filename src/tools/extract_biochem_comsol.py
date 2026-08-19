@@ -14,6 +14,16 @@ overwrite the canonical nowound cohort graphs.
 Runs those exports (mesh from comp1/mesh1), writes ``cfd_results_biochem/*.txt``, builds
 ``graphs_biochem_anchors/*.pt``. Creates data folders automatically if missing.
 
+After each successful extract, a *lite* pack (graph + mesh, no ``.mph``) is written
+to ``data/extract_transfer/<stem>/``. For Google Drive, zip once and upload that::
+
+    python -m src.tools.extract_biochem_comsol --pack-transfer --zip-transfer --stem wound_patient001,wound_patient002
+
+On this laptop leave the Drive download in Downloads (the ``extract_transfer``
+folder or ``extract_transfer.zip``), then::
+
+    python -m src.tools.extract_biochem_comsol --install-bundles
+
 **Manual path:** export domain + boundary ``.txt`` yourself, then run without ``--from-comsol``.
 
 PyCharm: **Run** module ``src.tools.extract_biochem_comsol`` (working directory = repo root).
@@ -23,6 +33,8 @@ CLI::
     python -m src.data_gen.lib.extract_biochem_comsol_data --stem patient007
     python -m src.data_gen.lib.extract_biochem_comsol_data --stem wound_patient007
     python -m src.tools.extract_biochem_comsol --list-only
+    python -m src.tools.extract_biochem_comsol --pack-transfer --zip-transfer
+    python -m src.tools.extract_biochem_comsol --install-bundles
     python -m src.data_gen.lib.extract_biochem_comsol_data --no-from-comsol
 """
 
@@ -555,6 +567,33 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Explicit path to solved .mph (default: <stem>.mph in biochem_anchors or BIOCHEM_COMSOL_MODEL).",
     )
+    parser.add_argument(
+        "--install-bundles",
+        action="store_true",
+        help="Install a transfer folder/zip from Downloads into canonical data/ paths and exit.",
+    )
+    parser.add_argument(
+        "--pack-transfer",
+        action="store_true",
+        help="Rebuild transfer bundles for --stem (or all extracted stems) without re-pulling COMSOL. "
+        "Default pack is lite (graph + mesh only).",
+    )
+    parser.add_argument(
+        "--full-transfer",
+        action="store_true",
+        help="With --pack-transfer: include domain txt, .nas, and kine.pt (not needed for graph work).",
+    )
+    parser.add_argument(
+        "--zip-transfer",
+        action="store_true",
+        help="Zip data/extract_transfer to data/extract_transfer.zip (one Drive upload).",
+    )
+    parser.add_argument(
+        "--transfer-dir",
+        type=Path,
+        default=None,
+        help="Override the incoming folder or zip (default: Downloads/extract_transfer).",
+    )
     args = parser.parse_args(argv)
 
     dr = data_root()
@@ -565,6 +604,72 @@ def main(argv: list[str] | None = None) -> None:
 
     extractor = PatientDataExtractor(phase="biochem_anchors", raw_dir=raw_dir, label_dir=label_dir)
     ensure_biochem_extract_dirs(raw_dir, label_dir, extractor.proc_dir)
+
+    from src.data_gen.lib.biochem_extract_transfer import (
+        default_downloads_dir,
+        extract_transfer_dir,
+        install_incoming_extract_transfer,
+        stage_extract_transfer_bundle,
+        zip_extract_transfer_dir,
+    )
+
+    if args.install_bundles:
+        incoming, results = install_incoming_extract_transfer(
+            transfer_dir=args.transfer_dir,
+            downloads_dir=default_downloads_dir(),
+            data_transfer_dir=extract_transfer_dir(),
+            stems=[s.strip() for s in args.stem.split(",") if s.strip()] or None,
+            force=args.force,
+        )
+        if incoming is None or not results:
+            downloads = default_downloads_dir()
+            raise SystemExit(
+                "[ERR] No transfer folder or extract_transfer.zip found. "
+                f"Looked in {downloads} and data/extract_transfer/."
+            )
+        print(f"[i] installing from {incoming.label}")
+        for name, written in results:
+            print(f"[OK] installed {name}")
+            for key, dest in written.items():
+                print(f"      {key} -> {dest}")
+        raise SystemExit(0)
+
+    if args.pack_transfer:
+        if args.stem.strip():
+            pack_stems = [s.strip() for s in args.stem.split(",") if s.strip()]
+            resolved = []
+            for token in pack_stems:
+                ref = parse_biochem_extract_stem(token)
+                resolved.append(ref.stem if ref is not None else token)
+            pack_stems = resolved
+        else:
+            pack_stems = sorted(p.stem for p in extractor.proc_dir.glob("*.pt") if p.is_file())
+        if not pack_stems:
+            raise SystemExit("[ERR] No stems to pack.")
+        n = 0
+        for stem in pack_stems:
+            bundle = stage_extract_transfer_bundle(
+                stem,
+                raw_dir=raw_dir,
+                label_dir=label_dir,
+                proc_dir=extractor.proc_dir,
+                kine_dir=extractor.kine_anchor_dir,
+                lite=not args.full_transfer,
+            )
+            if bundle is None:
+                print(f"[WARN] {stem}: no graph.pt, skip pack")
+                continue
+            print(f"[save] {bundle}")
+            n += 1
+        if args.zip_transfer:
+            archive = zip_extract_transfer_dir(transfer_dir=args.transfer_dir)
+            print(f"[save] {archive}")
+        raise SystemExit(0 if n else 1)
+
+    if args.zip_transfer:
+        archive = zip_extract_transfer_dir(transfer_dir=args.transfer_dir)
+        print(f"[save] {archive}")
+        raise SystemExit(0)
 
     if not args.skip_sidecars:
         _auto_scaffold_anchor_sidecars(raw_dir)

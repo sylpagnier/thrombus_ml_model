@@ -191,6 +191,115 @@ def test_write_boundary_txt_from_mesh_writes_optional_wound(tmp_path):
     assert "0 0" in wound_p.read_text(encoding="utf-8")
 
 
+def test_write_boundary_txt_from_mesh_writes_wound_even_if_wall_exists(tmp_path):
+    import meshio
+
+    points = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+    lines = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int64)
+    tri = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    line_tags = np.array([101, 102, 104, 103], dtype=np.int32)
+    tri_tags = np.array([201, 201], dtype=np.int32)
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[("triangle", tri), ("line", lines)],
+        cell_data={"gmsh:physical": [tri_tags, line_tags]},
+    )
+    msh = tmp_path / "sqw2.msh"
+    meshio.write(msh, mesh, file_format="gmsh22", binary=False)
+    (tmp_path / "sqw2_inlet.txt").write_text("% x  y\n0 0 0.0 0.0\n", encoding="utf-8")
+    (tmp_path / "sqw2_outlet.txt").write_text("% x  y\n0 0 1.0 0.0\n", encoding="utf-8")
+    (tmp_path / "sqw2_wall.txt").write_text("% x  y\n0 0 0.0 1.0\n", encoding="utf-8")
+    write_boundary_txt_from_mesh(msh, tmp_path, "sqw2")
+    assert (tmp_path / "sqw2_wound.txt").is_file()
+    # Did not clobber the existing wall file.
+    assert "0.0 1.0" in (tmp_path / "sqw2_wall.txt").read_text(encoding="utf-8")
+
+
+def test_ensure_boundary_txt_files_writes_wound_when_wall_already_exists(tmp_path):
+    import meshio
+    import numpy as np
+
+    from src.config import VesselConfig
+    from src.data_gen.lib.biochem_comsol_mesh_export import ensure_boundary_txt_files
+
+    points = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+    lines = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int64)
+    tri = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    line_tags = np.array([101, 102, 104, 103], dtype=np.int32)
+    tri_tags = np.array([201, 201], dtype=np.int32)
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[("triangle", tri), ("line", lines)],
+        cell_data={"gmsh:physical": [tri_tags, line_tags]},
+    )
+    msh = tmp_path / "sqw3.msh"
+    meshio.write(msh, mesh, file_format="gmsh22", binary=False)
+    for name in ("inlet", "outlet", "wall"):
+        (tmp_path / f"sqw3_{name}.txt").write_text("% x  y\n0 0 0.0 0.0\n", encoding="utf-8")
+    coords = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+    ensure_boundary_txt_files(
+        None,
+        coords,
+        msh,
+        tmp_path,
+        "sqw3",
+        vessel_cfg=VesselConfig(phase="biochem_anchors"),
+        force_boundary=False,
+    )
+    assert (tmp_path / "sqw3_wound.txt").is_file()
+
+
+def test_ensure_wound_from_comsol_selection_mask(tmp_path, monkeypatch):
+    import numpy as np
+
+    from src.data_gen.lib.biochem_comsol_mesh_export import ensure_wound_boundary_txt
+
+    coords = np.array([[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]], dtype=np.float64)
+
+    def _fake_candidates(_model, bname):
+        assert bname == "wound"
+        return ["wound(x,y)"]
+
+    def _fake_eval(_model, coords_cm, expr, *, dataset_tag="dset1"):
+        del _model, expr, dataset_tag
+        return np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export.boundary_mask_expr_candidates",
+        _fake_candidates,
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export._evaluate_boundary_mask",
+        _fake_eval,
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export.resolve_boundary_datasets",
+        lambda _m: {},
+    )
+    ok = ensure_wound_boundary_txt(
+        object(),
+        coords,
+        None,
+        tmp_path,
+        "wound_patient001",
+        force=True,
+    )
+    assert ok
+    text = (tmp_path / "wound_patient001_wound.txt").read_text(encoding="utf-8")
+    assert "0.5000000000 0.0000000000" in text
+    assert "1.0000000000 0.0000000000" not in text
+
+
+def test_boundary_txt_has_coords_ignores_header_only(tmp_path):
+    from src.data_gen.lib.biochem_comsol_mesh_export import boundary_txt_has_coords
+
+    empty = tmp_path / "empty_wound.txt"
+    empty.write_text("% Model: COMSOL mask (wound(x,y))\n% x  y\n", encoding="utf-8")
+    assert boundary_txt_has_coords(empty) is False
+    empty.write_text("% x  y\n0 0 1.0 2.0\n", encoding="utf-8")
+    assert boundary_txt_has_coords(empty) is True
+
+
 def test_comsol_steady_kine_builder_does_not_import_removed_gt_prior():
     import inspect
 

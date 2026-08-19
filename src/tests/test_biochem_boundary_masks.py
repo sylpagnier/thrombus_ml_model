@@ -68,6 +68,19 @@ def test_discover_boundary_mask_exprs_from_legacy_box_tags():
     assert "inlet(x,y)" in boundary_mask_expr_candidates(model, "inlet")
 
 
+def test_discover_boundary_mask_exprs_wound_selection_not_union():
+    model = _FakeModelJava(
+        {
+            "sel1": "wound",
+            "uni1": "wallandwound",
+            "wall": "wall",
+        }
+    )
+    found = discover_boundary_mask_exprs(model)
+    assert found["wound"] == "sel1(x,y)"
+    assert found["wall"] == "wall(x,y)"
+
+
 def test_write_boundary_txt_from_axis_extents(tmp_path):
     # Channel along x: inlet at x=0, outlet at x=1, walls at y=0 and y=1.
     coords = np.array(

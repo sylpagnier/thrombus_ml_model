@@ -120,6 +120,189 @@ def _evaluate_boundary_mask(
     return vals
 
 
+def boundary_txt_has_coords(path: Path) -> bool:
+    """True when a boundary txt exists and has at least one non-comment coordinate row."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("%"):
+            return True
+    return False
+
+
+def _write_xy_boundary_txt(path: Path, coords: np.ndarray, header: str) -> None:
+    pts = np.unique(np.asarray(coords, dtype=np.float64).reshape(-1, 2), axis=0)
+    lines = [header, "% x  y"]
+    for x, y in pts:
+        lines.append(f"0 0 {x:.10f} {y:.10f}")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _mesh_coords_cm(mesh_path: Path | None) -> np.ndarray | None:
+    if mesh_path is None or not Path(mesh_path).is_file():
+        return None
+    try:
+        mesh = meshio.read(mesh_path)
+        pts = np.asarray(mesh.points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] < 1 or pts.shape[1] < 2:
+            return None
+        return pts[:, :2]
+    except Exception:
+        return None
+
+
+def write_wound_txt_from_comsol_mask(
+    model_java,
+    coords_cm: np.ndarray,
+    label_dir: Path,
+    stem: str,
+    *,
+    dataset_tag: str = "dset1",
+    threshold: float = 0.5,
+    force: bool = False,
+) -> bool:
+    """Evaluate the COMSOL ``wound`` selection on mesh nodes and write ``*_wound.txt``.
+
+    Returns True when the file has coordinates.
+    """
+    wound_path = Path(label_dir) / f"{stem}_wound.txt"
+    if boundary_txt_has_coords(wound_path) and not force:
+        return True
+    coords_cm = np.asarray(coords_cm, dtype=np.float64)
+    if coords_cm.ndim != 2 or coords_cm.shape[0] < 1:
+        return False
+    wound_mask = None
+    wound_expr = None
+    for expr in boundary_mask_expr_candidates(model_java, "wound"):
+        try:
+            vals = _evaluate_boundary_mask(
+                model_java,
+                coords_cm,
+                expr,
+                dataset_tag=dataset_tag,
+            )
+            wound_mask = vals > threshold
+            wound_expr = expr
+            break
+        except Exception:
+            continue
+    if wound_mask is None or not np.any(wound_mask):
+        return False
+    _write_xy_boundary_txt(
+        wound_path,
+        coords_cm[wound_mask, :2],
+        f"% Model: COMSOL mask ({wound_expr})",
+    )
+    logger.info(
+        "[OK] %s: wound boundary via %s (%d unique coords)",
+        stem,
+        wound_expr,
+        int(np.unique(coords_cm[wound_mask, :2], axis=0).shape[0]),
+    )
+    return True
+
+
+def ensure_wound_boundary_txt(
+    model_java,
+    coords_cm: np.ndarray | None,
+    mesh_path: Path | None,
+    label_dir: Path,
+    stem: str,
+    *,
+    vessel_cfg=None,
+    dataset_tag: str = "dset1",
+    force: bool = False,
+) -> bool:
+    """Write ``*_wound.txt`` from Gmsh tags, a Wound dataset, or the COMSOL wound selection.
+
+    Inlet/outlet/wall already existing does not skip this. Nowound stems stay silent
+    when no wound selection exists. Returns True when the file has coordinates.
+    """
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    wound_path = label_dir / f"{stem}_wound.txt"
+    if boundary_txt_has_coords(wound_path) and not force:
+        return True
+
+    mesh_path = Path(mesh_path) if mesh_path is not None else None
+    if mesh_path is not None and mesh_has_gmsh_boundary_tags(mesh_path):
+        from src.data_gen.lib.biochem_comsol_auto_export import write_boundary_txt_from_mesh
+
+        write_boundary_txt_from_mesh(
+            mesh_path,
+            label_dir,
+            stem,
+            vessel_cfg=vessel_cfg,
+            force=force,
+        )
+        if boundary_txt_has_coords(wound_path) and not force:
+            return True
+
+    pts = None if coords_cm is None else np.asarray(coords_cm, dtype=np.float64)
+    if pts is None:
+        pts = _mesh_coords_cm(mesh_path)
+
+    if model_java is not None and pts is not None:
+        try:
+            bmap = resolve_boundary_datasets(model_java)
+        except Exception:
+            bmap = {}
+        dset = bmap.get("wound")
+        if dset:
+            try:
+                ref = None
+                for edim in (1, None):
+                    try:
+                        ref = sample_coords_from_dataset(model_java, dset, edim=edim)
+                        break
+                    except Exception:
+                        continue
+                if ref is not None and ref.size:
+                    tol_cm = _boundary_snap_tol_cm(pts)
+                    tree = cKDTree(np.asarray(ref, dtype=np.float64)[:, :2])
+                    dist, _ = tree.query(pts[:, :2])
+                    mask = dist <= tol_cm
+                    if np.any(mask):
+                        _write_xy_boundary_txt(
+                            wound_path,
+                            pts[mask, :2],
+                            f"% Model: mesh nodes snapped to dataset {dset} (tol={tol_cm:.4g} cm)",
+                        )
+                        logger.info(
+                            "[OK] %s: wound = %d mesh nodes (snap to '%s')",
+                            stem,
+                            int(np.unique(pts[mask, :2], axis=0).shape[0]),
+                            dset,
+                        )
+                        if not force:
+                            return True
+            except Exception as exc:
+                logger.debug("[i] %s: wound dataset snap failed (%s)", stem, exc)
+
+        if write_wound_txt_from_comsol_mask(
+            model_java,
+            pts,
+            label_dir,
+            stem,
+            dataset_tag=dataset_tag,
+            force=force,
+        ):
+            return True
+
+    from src.data_gen.lib.biochem_comsol_auto_export import parse_biochem_extract_stem
+
+    ref = parse_biochem_extract_stem(stem)
+    if ref is not None and ref.variant == "wound" and not boundary_txt_has_coords(wound_path):
+        logger.warning(
+            "[WARN] %s: wound variant but no wound nodes written "
+            "(no Gmsh Wound tag, no wound_nodes export, and wound(x,y)/sel1 did not match).",
+            stem,
+        )
+    return boundary_txt_has_coords(wound_path)
+
+
 def write_boundary_txt_from_axis_extents(
     coords_cm: np.ndarray,
     label_dir: Path,
@@ -377,35 +560,15 @@ def write_boundary_txt_from_comsol_masks(
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         logger.info("[OK] %s: %s boundary via %s (%d unique coords)", stem, bname, expr_used, len(coords))
 
-    wound_path = label_dir / f"{stem}_wound.txt"
-    if (not wound_path.is_file()) or force:
-        wound_mask = None
-        wound_expr = None
-        for expr in boundary_mask_expr_candidates(model_java, "wound"):
-            try:
-                vals = _evaluate_boundary_mask(
-                    model_java,
-                    coords_cm,
-                    expr,
-                    dataset_tag=dataset_tag,
-                )
-                wound_mask = vals > threshold
-                wound_expr = expr
-                break
-            except Exception:
-                continue
-        if wound_mask is not None and np.any(wound_mask):
-            coords = np.unique(coords_cm[wound_mask, :2], axis=0)
-            lines = [f"% Model: COMSOL mask ({wound_expr})", "% x  y"]
-            for x, y in coords:
-                lines.append(f"0 0 {x:.10f} {y:.10f}")
-            wound_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.info(
-                "[OK] %s: wound boundary via %s (%d unique coords)",
-                stem,
-                wound_expr,
-                len(coords),
-            )
+    write_wound_txt_from_comsol_mask(
+        model_java,
+        coords_cm,
+        label_dir,
+        stem,
+        dataset_tag=dataset_tag,
+        threshold=threshold,
+        force=force,
+    )
 
     if failures:
         raise RuntimeError(
@@ -426,80 +589,96 @@ def ensure_boundary_txt_files(
     dataset_tag: str = "dset1",
     force_boundary: bool = False,
 ) -> None:
-    """Write missing boundary txt from Gmsh tags, COMSOL masks, or mesh-extent heuristic."""
+    """Write missing boundary txt from Gmsh tags, COMSOL masks, or mesh-extent heuristic.
+
+    Wound identity is always attempted afterwards, even when inlet/outlet/wall already exist.
+    """
     from src.data_gen.lib.biochem_comsol_auto_export import write_boundary_txt_from_mesh
 
     label_dir = Path(label_dir)
     paths = tuple(label_dir / f"{stem}_{b}.txt" for b in ("inlet", "outlet", "wall"))
-    if all(p.is_file() for p in paths) and not force_boundary:
-        return
-
-    if mesh_has_gmsh_boundary_tags(mesh_path):
-        write_boundary_txt_from_mesh(
+    try:
+        if not (all(p.is_file() for p in paths) and not force_boundary):
+            if mesh_has_gmsh_boundary_tags(mesh_path):
+                write_boundary_txt_from_mesh(
+                    mesh_path,
+                    label_dir,
+                    stem,
+                    vessel_cfg=vessel_cfg,
+                    force=force_boundary,
+                )
+            else:
+                wrote = False
+                try:
+                    wrote = write_boundary_txt_from_mesh_snap_to_datasets(
+                        model_java,
+                        coords_cm,
+                        label_dir,
+                        stem,
+                        force=force_boundary,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[WARN] %s: mesh snap to boundary datasets failed (%s); trying raw dataset coords.",
+                        stem,
+                        exc,
+                    )
+                if not wrote:
+                    try:
+                        wrote = write_boundary_txt_from_boundary_datasets(
+                            model_java,
+                            label_dir,
+                            stem,
+                            force=force_boundary,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[WARN] %s: COMSOL boundary datasets failed (%s); trying mask expressions.",
+                            stem,
+                            exc,
+                        )
+                if not wrote:
+                    try:
+                        write_boundary_txt_from_comsol_masks(
+                            model_java,
+                            coords_cm,
+                            label_dir,
+                            stem,
+                            dataset_tag=dataset_tag,
+                            force=force_boundary,
+                            preserve_existing_on_failure=not force_boundary,
+                        )
+                    except Exception as exc:
+                        if all(p.is_file() for p in paths):
+                            logger.warning(
+                                "[WARN] %s: COMSOL boundary masks unavailable (%s); using existing boundary txt.",
+                                stem,
+                                exc,
+                            )
+                        else:
+                            logger.warning(
+                                "[WARN] %s: COMSOL boundary masks failed (%s); trying mesh-extent heuristic.",
+                                stem,
+                                exc,
+                            )
+                            write_boundary_txt_from_axis_extents(
+                                coords_cm,
+                                label_dir,
+                                stem,
+                                force=force_boundary,
+                            )
+    finally:
+        ensure_wound_boundary_txt(
+            model_java,
+            coords_cm,
             mesh_path,
             label_dir,
             stem,
             vessel_cfg=vessel_cfg,
-            force=force_boundary,
-        )
-        return
-
-    try:
-        if write_boundary_txt_from_mesh_snap_to_datasets(
-            model_java,
-            coords_cm,
-            label_dir,
-            stem,
-            force=force_boundary,
-        ):
-            return
-    except Exception as exc:
-        logger.warning(
-            "[WARN] %s: mesh snap to boundary datasets failed (%s); trying raw dataset coords.",
-            stem,
-            exc,
-        )
-
-    try:
-        if write_boundary_txt_from_boundary_datasets(
-            model_java,
-            label_dir,
-            stem,
-            force=force_boundary,
-        ):
-            return
-    except Exception as exc:
-        logger.warning("[WARN] %s: COMSOL boundary datasets failed (%s); trying mask expressions.", stem, exc)
-
-    try:
-        write_boundary_txt_from_comsol_masks(
-            model_java,
-            coords_cm,
-            label_dir,
-            stem,
             dataset_tag=dataset_tag,
             force=force_boundary,
-            preserve_existing_on_failure=not force_boundary,
         )
-    except Exception as exc:
-        if all(p.is_file() for p in paths):
-            logger.warning(
-                "[WARN] %s: COMSOL boundary masks unavailable (%s); using existing boundary txt.",
-                stem,
-                exc,
-            )
-            return
-        logger.warning(
-            "[WARN] %s: COMSOL boundary masks failed (%s); trying mesh-extent heuristic.",
-            stem,
-            exc,
-        )
-        write_boundary_txt_from_axis_extents(
-            coords_cm,
-            label_dir,
-            stem,
-            force=force_boundary,
-        )
+
 
 
 def ensure_anchor_mesh_from_comsol(
