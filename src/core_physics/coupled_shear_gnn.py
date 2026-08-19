@@ -115,6 +115,7 @@ def assemble_local_corrector_features(
     delta_mu_nd: torch.Tensor,
     clot_nodes: torch.Tensor,
     subset: torch.Tensor,
+    R: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the corrector input ``[dx, dy, dist_to_wall, u0, v0, delta_mu]`` for ``subset``.
 
@@ -130,16 +131,30 @@ def assemble_local_corrector_features(
     averaged over ``clot_nodes`` ONLY -- never the (possibly boundary-truncated)
     ``subset`` -- so the patch is dynamically re-centered the same way in train and
     deploy.
+    
+    Rotational invariance: If ``R`` is provided, it must be a 2x2 rotation matrix 
+    that transforms from the global frame to a local flow-aligned frame. The 
+    relative coordinates ``(dx, dy)`` and base flow ``(u0, v0)`` will be rotated.
     """
     pos_nd = pos_nd.reshape(-1, 2)
     com = pos_nd[clot_nodes].mean(dim=0, keepdim=True)
     dx_dy = pos_nd[subset] - com
+    u_sub = u0_nd.reshape(-1, 1)[subset]
+    v_sub = v0_nd.reshape(-1, 1)[subset]
+    
+    if R is not None:
+        # R rotates from global to local.
+        dx_dy = dx_dy @ R.T
+        uv_sub = torch.cat([u_sub, v_sub], dim=-1) @ R.T
+        u_sub = uv_sub[:, 0:1]
+        v_sub = uv_sub[:, 1:2]
+        
     feats = torch.cat(
         [
             dx_dy,
             sdf_nd.reshape(-1, 1)[subset],
-            u0_nd.reshape(-1, 1)[subset],
-            v0_nd.reshape(-1, 1)[subset],
+            u_sub,
+            v_sub,
             delta_mu_nd.reshape(-1, 1)[subset],
         ],
         dim=-1,

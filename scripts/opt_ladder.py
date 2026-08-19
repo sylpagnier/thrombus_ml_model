@@ -456,9 +456,15 @@ def cmd_lovo(bio, phys, args):
     print("\n  LOVO (honest) train estimate %.4f   vs in-sample %.4f   optimism %+.4f"
           % (float(np.mean(held)), float(np.mean([M[(gi_all, a)]["score"] for a in tr])),
              float(np.mean([M[(gi_all, a)]["score"] for a in tr])) - float(np.mean(held))))
-    uniq = len(set(picks))
-    print("  config chosen by %d/%d folds is the same one: %s"
-          % (picks.count(gi_all), len(picks), "STABLE" if uniq <= 2 else "UNSTABLE (%d distinct)" % uniq))
+    uniq = sorted(set(picks))
+    modal = max(uniq, key=picks.count)
+    frac = picks.count(modal) / max(len(picks), 1)
+    print("  fold-to-fold selection: %d distinct configs, modal one wins %d/%d folds (%.0f%%) -> %s"
+          % (len(uniq), picks.count(modal), len(picks), 100 * frac,
+             "STABLE" if frac >= 0.7 else "UNSTABLE -- the scalars are being fit to noise"))
+    if modal != gi_all:
+        print("    NB modal LOVO pick %s differs from the all-train pick %s"
+              % (grid[modal], grid[gi_all]))
 
     print("\n  per-parameter ablation (freeze one to a neutral value, refit the rest on train):")
     for name, neutral in (("wake", 0.0), ("mode", "hard"), ("da", 40)):

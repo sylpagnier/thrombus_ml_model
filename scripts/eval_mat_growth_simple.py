@@ -640,13 +640,14 @@ def main() -> int:
         pf_overrides["mat_commit_thresh"] = float(args.deploy_mat_commit_thresh)
     if args.deploy_clot_trigger_commit_thresh is not None:
         os.environ["CLOT_TRIGGER_COMMIT_THRESH"] = str(float(args.deploy_clot_trigger_commit_thresh))
+    pct = None
     if args.pocket_gate_pct is not None:
         pct = float(args.pocket_gate_pct)
         if not (0.0 <= pct <= 100.0):
             print(f"[ERROR] --pocket-gate-pct {pct} outside [0, 100]")
             return 1
         os.environ["CLOT_POCKET_GATE_PCT"] = str(pct)
-        from src.evaluation.clot_relaxed_metrics import scoring_fingerprint
+    from src.evaluation.clot_relaxed_metrics import scoring_fingerprint
     print(f"[i] SCORING FINGERPRINT {scoring_fingerprint()}", flush=True)
     print(f"[i] pocket gate percentile = {pct} (unset = gate off)", flush=True)
 

@@ -23,12 +23,13 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from src.config import BiochemConfig, PhysicsConfig  # noqa: E402
-from src.core_physics.physics_wall_model import node_positions, t0_flow_fields  # noqa: E402
+from src.core_physics.physics_wall_model import node_positions, t0_flow_fields, integrate_mat_trajectory, graded_gate  # noqa: E402
+from src.core_physics.shear_redistribution import build_crosssection_operator, sdf_nd, make_blockage  # noqa: E402
+from src.core_physics.thrombin_field import make_thrombin_solver, make_ap_boost  # noqa: E402
 from src.core_physics.t0_mu_physics import gt_clot_phi_at_time  # noqa: E402
-from scripts.diag_ignition_timing import integrate_mat_trajectory  # noqa: E402
 
 DIR = Path("data/processed/graphs_biochem_anchors")
-VESSELS = ["patient043", "patient014", "patient001", "patient007", "patient013"]
+VESSELS = ["patient043", "patient044", "patient014", "patient001", "patient007", "patient013"]
 N_FRAMES = 13
 MAX_BG_POINTS = 1800
 
@@ -46,7 +47,14 @@ def main() -> None:
         bg = interior[::stride]
 
         f = t0_flow_fields(d, bio, hops=3, flow_source="gt")
-        traj, t = integrate_mat_trajectory(d, bio, f, da_scale=100.0)
+        g0 = graded_gate(f, bio, mode="hard") * wall
+        
+        ts, _ = make_thrombin_solver(d, bio, pos, f.sr, wash_coef=0.0, wall=wall)
+        B = build_crosssection_operator(pos, sdf_nd(d), wall, radius_mult=0.30)
+        blk = make_blockage(f, bio, B, wall, every=5, feedback="wake", wake=8.0)
+        boost = make_ap_boost(ts, bio, gain=4.0, every=5)
+        
+        traj, t = integrate_mat_trajectory(d, bio, g0, da_scale=40.0, blockage=blk, ap_boost=boost)
         crit = float(bio.viscosity_mat_crit)
         model_hot = (traj >= crit) & wall[None, :]           # [T, N]
 

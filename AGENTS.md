@@ -59,6 +59,16 @@ Always-apply rule: [`.cursor/rules/robust-system-wide-changes.mdc`](.cursor/rule
 - Active only: [scripts/README.md](scripts/README.md)
 - Retired: `scripts/archive/` — do not revive GNODE / clot-ML / T0 trainers without restoring modules from git ([docs/BIOCHEM_LEGACY_LESSONS.md](docs/BIOCHEM_LEGACY_LESSONS.md))
 
+## Debugging visualizations — "viz" means this
+
+**If a human says "viz", "visualize", or asks to look at a vessel/model, read
+[docs/VIZ_STANDARD.md](docs/VIZ_STANDARD.md) and extend that template — do not build a
+new one from scratch.** Standard shape: two synced windows (Model | Ground truth), a
+time slider scrubbing real simulated seconds, synced zoom/pan, wall=circle/lumen=square
+with a depth-into-lumen color gradient, and the canonical deploy score shown live,
+domain-restricted (wall vs off-wall) and over time — not just a final-mask number.
+Reference build: `scripts/gen_offwall_temporal_data.py` + `scripts/build_offwall_temporal_artifact.py`.
+
 ## Console (PowerShell)
 
 No emoji in `print` / launcher banners. Use ASCII tags (`[OK]`, `[WARN]`, `[i]`). See [.cursor/rules/powershell-console-ascii.mdc](.cursor/rules/powershell-console-ascii.mdc).
@@ -85,17 +95,44 @@ Canonical small cohort (unless a leg explicitly overrides):
 
 Launchers: `go_flow_source_ab.ps1`, `go_phase1_sweep_v3.ps1`, `go_baseline_validation.ps1`.
 
-**Active plan: [docs/WALL_MODEL_PLAN.md](docs/WALL_MODEL_PLAN.md)** — current scope (wall model
-only, wall clots only, target `deploy_clot_f1` > 0.5), ordered next steps, and the list of
-parked arms. Read it before proposing wall-gen work. Historical context:
-[docs/GENERALIZATION_PLAN.md](docs/GENERALIZATION_PLAN.md).
+## Clot-map scoring: use the strict protocol, and respect the noise floor
+
+**[docs/PHASE10_V4.md](docs/PHASE10_V4.md) supersedes the readout half of
+[docs/PHASE9_ML.md](docs/PHASE9_ML.md).** Two rules:
+
+1. **Score with `scripts/eval_strict.py` (final time) / `scripts/eval_strict_temporal.py`
+   (mean-over-time + final).** They select every readout scalar on the *out-of-fold* scores
+   of vessels outside the held-out fold. `train_time_conditioned.py`'s hard-coded
+   `score >= 0.73 / 0.92` cuts are a whole-pool leak; PHASE9's numbers are ~0.02 optimistic.
+   Always quote **both** mean-over-time and the last time point — they disagree.
+2. **The cohort noise floor is ±0.024 wall and ±0.091 off-wall** (`scripts/eval_significance.py`;
+   three configs of the *same* arm spread that much). **A 0.01–0.03 cohort-mean difference on
+   these 19 vessels is not a result** — quote a paired bootstrap CI or call it undetermined.
+   This applies retroactively to several PHASE9 claims.
+
+Corollary: prefer levers that do not need a per-config effect to be detectable — ensembling,
+and deterministic readout fixes. Adding selection layers (inner-CV family choice, per-domain
+family choice, rule selection) was measured and all of it **loses** at this n.
+
+**Active findings: [docs/PHASE7_FINDINGS.md](docs/PHASE7_FINDINGS.md)** — the off-wall
+problem, `.mph` reading, and the corrections it makes to Phase 6. Read it first.
+Earlier scope: [docs/WALL_MODEL_PLAN.md](docs/WALL_MODEL_PLAN.md) (wall model only, wall
+clots only, target `deploy_clot_f1` > 0.5), ordered next steps, and the list of parked arms.
+Historical context: [docs/GENERALIZATION_PLAN.md](docs/GENERALIZATION_PLAN.md).
+
+## COMSOL ground truth — read the `.mph`, do not re-derive from exports
+
+`.mph` files are **zip archives**; `smodel.json` inside is the full model tree. Trust the
+**physics node tree** over the parameter list (stale parameters for deleted mechanisms
+survive). `phase2_nowound_001/002/003.mph` are an experimental branch and are **not** the
+production physics — see [docs/PHASE7_FINDINGS.md](docs/PHASE7_FINDINGS.md) §0–1.
 
 ## Eval / off-wall
 
 - Persist `leg`, `config_kwargs`, `runtime_kwargs` (and residual `env_overrides` only if needed) in checkpoint `meta`
 - On eval / load: `PushforwardConfig.from_meta(meta)` + `BiochemRuntimeConfig.from_meta(meta)` — do not inject into `os.environ`
 - Off-wall: hop >= 1 helpers (`deploy_clot_offwall_relaxed_f1`, …)
-- Generalization claims: follow **Generalization / wall-gen eval policy** above (deploy-faithful + `patient020` holdout)
+- **Wall-cohort physics** (`predict_wall_clot`, Phase 3–8 scalars): FIT / DEV / SEALED from [`src/core_physics/wall_cohort_splits.py`](src/core_physics/wall_cohort_splits.py), same lists as `scripts/sweep_ml_clean_protocol.py`. Fit on **FIT**, select on **DEV** (039/040/041/044). `patient020` is FIT, not a holdout. **SEALED** (`WALL_COHORT_V2_GENERALIZATION`) is spent once — do not tune against it. Do not quote a TRAIN-mean (27, or the 19 eligible full-horizon subset) as a decision metric; it mixes FIT with DEV. Comparison table: `python scripts/eval_wall_protocol.py`.
 
 ## Hardware
 
@@ -109,4 +146,5 @@ Biochem corrector / GNODE run logs live under [docs/archive/BIOCHEM_TRAINING_PRO
 
 - **Graph Dimensionality**: The simulations (via COMSOL) generate strictly **2D meshes**. Do not assume 3D spatial environments.
 - **Node Features**: The `biochem_gnn` PyTorch `Data` objects do **not** use a standard `data.pos` tensor. Spatial coordinates are embedded directly in the node feature matrix `data.x` (specifically the first two columns: `x_nd` and `y_nd`). There is no Z coordinate.
+- **The meshes are QUADRATIC, and ~3/4 of every pack's nodes are mid-edge nodes** (0.742–0.746 on all 19 wall-cohort vessels; 49.6% of *wall* nodes). `M/Mas/Mat` are not populated on the wall-normal ones, so GT `Mat` is zero at 44.6% of mid-side wall nodes against 17.6% of corner nodes. Any per-node metric over "all wall nodes" is therefore half-scoring a structural zero block — a rank correlation reads 0.534 that way and 0.193 on species-carrying nodes. Use `midside_nodes` / `first_corner_shell` in `src/core_physics/physics_lumen_model.py`; see [docs/PHASE7_FINDINGS.md](docs/PHASE7_FINDINGS.md) §8.
 - **Baselines**: The `drop-xy` baseline zeroes out these first two columns of `data.x` to strip global positioning and force the model to learn from graph connectivity and flow features.

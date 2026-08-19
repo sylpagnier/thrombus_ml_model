@@ -432,6 +432,7 @@ def couple_flow_with_corrector(
     from torch_geometric.data import Data, Batch
     data_list = []
     subset_list = []
+    R_list = []
 
     for cluster in clusters:
         if cluster.numel() == 0:
@@ -446,12 +447,50 @@ def couple_flow_with_corrector(
         )
         if subset.numel() == 0:
             continue
+            
+        # Compute local flow-aligned coordinate frame
+        com = pos_nd[cluster].mean(dim=0, keepdim=True)
+        dx_dy = pos_nd[subset] - com
+        sdf_sub = sdf_nd[subset]
+        u_sub = u_coupled[subset]
+        v_sub = v_coupled[subset]
+        
+        # 1. Estimate wall normal using least-squares gradient of SDF
+        X = dx_dy
+        y = sdf_sub.unsqueeze(1)
+        # Add ridge regularization to prevent singular matrix on collinear nodes
+        XTX = X.T @ X + 1e-6 * torch.eye(2, device=device)
+        grad = torch.linalg.pinv(XTX) @ (X.T @ y)
+        normal = grad.squeeze()
+        n_norm = normal.norm()
+        if n_norm > 1e-8:
+            normal = normal / n_norm
+        else:
+            normal = torch.tensor([0.0, 1.0], device=device)
+            
+        # 2. Estimate average flow vector
+        u_avg = u_sub.mean()
+        v_avg = v_sub.mean()
+        flow = torch.stack([u_avg, v_avg])
+        
+        # 3. Tangent is the flow direction projected onto the wall tangent plane
+        t = flow - (flow @ normal) * normal
+        t_norm = t.norm()
+        if t_norm > 1e-8:
+            t = t / t_norm
+        else:
+            t = torch.stack([normal[1], -normal[0]])
+            
+        # R rotates from global to local: local = global @ R.T
+        R = torch.stack([t, normal])
+
         # Step D: translation-invariant features (dx, dy centered on this cluster's COM).
         x_sub = assemble_local_corrector_features(
-            pos_nd, sdf_nd, u_coupled, v_coupled, delta_mu_nd, cluster, subset
+            pos_nd, sdf_nd, u_coupled, v_coupled, delta_mu_nd, cluster, subset, R=R
         )
         data_list.append(Data(x=x_sub, edge_index=sub_edge_index))
         subset_list.append(subset)
+        R_list.append(R)
 
     if data_list:
         # Step E: predict the diversion in a single batched forward pass and accumulate.
@@ -459,11 +498,16 @@ def couple_flow_with_corrector(
         delta_uv_batch = corrector(batch.x, batch.edge_index)
         
         ptr = 0
-        for subset in subset_list:
+        for subset, R in zip(subset_list, R_list):
             num_nodes = subset.numel()
             delta_uv = delta_uv_batch[ptr:ptr + num_nodes]
-            du_sum[subset] += delta_uv[:, 0]
-            dv_sum[subset] += delta_uv[:, 1]
+            
+            # delta_uv[:, 0:2] is in local frame. Rotate back to global.
+            # local = global @ R.T => global = local @ R
+            du_dv_global = delta_uv[:, 0:2] @ R
+            
+            du_sum[subset] += du_dv_global[:, 0]
+            dv_sum[subset] += du_dv_global[:, 1]
             if delta_uv.shape[-1] >= 3:
                 dshear_sum[subset] += delta_uv[:, 2]
             hits[subset] += 1.0

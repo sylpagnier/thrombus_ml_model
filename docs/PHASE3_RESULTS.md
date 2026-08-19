@@ -412,6 +412,10 @@ Read with §5's "two lines across which numbers are not comparable" — this is 
 
 ## 9. NEXT
 
+0. **The flow-coupled corrector arm is CLOSED** (docs/PHASE6_RESULTS.md 22): +0.020 on
+   TRAIN, **-0.014 on SEALED and -0.021 on dev-holdout, negative on 9 of 10 held-out
+   vessels**. Isolated behind `predict_phi(mode="corrector")`; the shipped path is
+   unchanged. Do not reopen without a fresh holdout.
 1. ~~Route every consumer to the MLS operators.~~ **DONE — §6b.** Remaining: the data-gen
    builders still emit the rank-deficient `G_x`/`G_y`, and the kinematics DEQ solver
    (`train_kinematics_predictor`, `species_pushforward_gnn`) still uses them. Fixing the

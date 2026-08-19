@@ -83,8 +83,10 @@ class PatientDataExtractor:
     ``PhysicsConfig.viscosity_si_to_nd`` (canonical cross-phase ND viscosity reference).
 
     Default entry: ``python -m src.data_gen.lib.extract_biochem_comsol_data`` pulls solved
-    ``comsol_models/phase2_wound_XXX.mph`` (``patientXXX``) via ``pull_comsol_exports``, then
-    builds graphs. Manual COMSOL txt only with ``--no-from-comsol``.
+    ``comsol_models/phase2_nowound_XXX.mph`` (``patientXXX``) and
+    ``comsol_models/phase2_wound_XXX.mph`` (``wound_patientXXX``) via ``pull_comsol_exports``,
+    then builds graphs. The two families never share a stem. Manual COMSOL txt only with
+    ``--no-from-comsol``.
 
     --- Manual COMSOL Export Instructions ---
     Alternatively, export the exact node-wise data from COMSOL to match the .msh topology.
@@ -534,6 +536,18 @@ class PatientDataExtractor:
         Full extraction pipeline with Physics-Informed Sanity Checks and
         Training Metadata generation.
         """
+        from src.data_gen.lib.biochem_comsol_auto_export import (
+            parse_biochem_extract_stem,
+            resolve_biochem_comsol_model_path,
+        )
+
+        ref = parse_biochem_extract_stem(stem)
+        if ref is not None:
+            stem = ref.stem
+        biochem_variant = ref.variant if ref is not None else "unknown"
+        source_mph = resolve_biochem_comsol_model_path(stem)
+        source_mph_name = source_mph.name if source_mph is not None else None
+
         # 1. Path Setup and Mesh Loading
         from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 
@@ -589,6 +603,8 @@ class PatientDataExtractor:
             mask_wound, _ = self._load_spatial_mask(
                 wound_path, mesh_tree, num_nodes, mesh_edge_scale_m=mesh_edge_scale_m
             )
+        if bool(mask_wound.any()):
+            mask_wall = mask_wall & ~mask_wound
 
         d_bar = resolve_d_bar_si_from_sidecar_or_inlet(
             sidecar_meta,
@@ -869,6 +885,8 @@ class PatientDataExtractor:
         }
         metadata = {
             "stem": stem,
+            "biochem_variant": biochem_variant,
+            "source_mph": source_mph_name,
             "quality": {
                 "max_wls_condition_number": max_cond,
                 "mass_flux_imbalance": avg_flux_imbalance,
@@ -909,6 +927,7 @@ class PatientDataExtractor:
             mask_inlet=mask_inlet,
             mask_outlet=mask_outlet,
             mask_wall=mask_wall,
+            mask_wound=mask_wound,
             is_anchor=is_anchor,
             d_bar=torch.tensor([d_bar], dtype=torch.float32),
             u_ref=torch.tensor([u_ref_actual], dtype=torch.float32),
@@ -928,13 +947,17 @@ class PatientDataExtractor:
         )
         data = attach_patient_anchor_graph_metadata(data, mask_wall=mask_wall)
         data.centerline_source = centerline_source
+        data.graph_stem = stem
+        data.biochem_variant = biochem_variant
+        if source_mph_name:
+            data.source_mph = source_mph_name
 
         # Run physical boundaries and mass balance health check before saving
         validate_graph_physical_integrity(data, stem, avg_flux_imbalance)
 
         torch.save(data, self.proc_dir / f"{stem}.pt")
         print(
-            f"[OK] Saved {stem}: D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | "
+            f"[OK] Saved {stem} ({biochem_variant}): D={d_bar * 1000:.1f}mm | Re_ML={re_actual:.0f} | "
             f"Imbal={avg_flux_imbalance:.2%} | centerline={centerline_source} | "
             f"uv_prior_max={float(x_kine[:, 11:13].abs().max()):.3f}"
         )
@@ -948,13 +971,13 @@ class PatientDataExtractor:
     ) -> None:
         """Batch-extract all anchor meshes (optionally pull COMSOL fields first)."""
         if stems is None:
-            from src.data_gen.lib.biochem_comsol_auto_export import stems_from_phase2_wound_mph
+            from src.data_gen.lib.biochem_comsol_auto_export import stems_from_phase2_mph
 
             mesh_stems = []
             if self.raw_dir.is_dir():
                 files = [f for f in os.listdir(self.raw_dir) if f.endswith(".nas") or f.endswith(".msh")]
                 mesh_stems = sorted({Path(f).stem for f in files})
-            mph_stems = stems_from_phase2_wound_mph()
+            mph_stems = stems_from_phase2_mph()
             seen: set[str] = set()
             stems = []
             for s in mesh_stems + mph_stems:
@@ -963,10 +986,16 @@ class PatientDataExtractor:
                     stems.append(s)
             stems.sort()
             if not stems:
-                print(f"CRITICAL ERROR: No meshes under {self.raw_dir} and no phase2_wound_*.mph in comsol_models/")
+                print(
+                    f"CRITICAL ERROR: No meshes under {self.raw_dir} and no "
+                    f"phase2_nowound_*.mph / phase2_wound_*.mph in comsol_models/"
+                )
                 return
             if mph_stems and not mesh_stems:
-                print(f"[i] Using {len(mph_stems)} stem(s) from comsol_models/phase2_wound_*.mph only.")
+                print(
+                    f"[i] Using {len(mph_stems)} stem(s) from comsol_models/"
+                    f"phase2_nowound_*.mph and phase2_wound_*.mph only."
+                )
             elif mph_stems:
                 extra = [s for s in mph_stems if s not in set(mesh_stems)]
                 if extra:
@@ -981,8 +1010,8 @@ class PatientDataExtractor:
                 if mph_path is None:
                     if not domain_txt.is_file():
                         print(
-                            f"[WARN] Skipping {stem}: no domain .txt and no "
-                            f"phase2_wound_XXX.mph for patientXXX in comsol_models/.",
+                            f"[WARN] Skipping {stem}: no domain .txt and no matching "
+                            f"phase2_nowound_XXX.mph / phase2_wound_XXX.mph in comsol_models/.",
                             flush=True,
                         )
                         continue
@@ -1006,14 +1035,22 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Extract biochem anchor graphs. Default: pull solved COMSOL fields from "
-            "comsol_models/phase2_wound_XXX.mph (patientXXX) via mph, then write .pt graphs."
+            "comsol_models/phase2_nowound_XXX.mph (patientXXX) and "
+            "phase2_wound_XXX.mph (wound_patientXXX) via mph, then write .pt graphs."
         )
     )
     parser.add_argument(
         "--stem",
         type=str,
         default="",
-        help="One or more stems: patient007 | 7 | 5,8,9 | 5-9 (default: all meshes in table).",
+        help="One or more stems: patient007 | wound_patient007 | 7 | 5,8,9 | 5-9 "
+        "(default: all meshes in table). Combine with --variant wound to restamp patientXXX.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("nowound", "wound", "all"),
+        default="all",
+        help="Restrict extraction to nowound (patientXXX) or wound (wound_patientXXX).",
     )
     parser.add_argument("--force", action="store_true", help="Re-pull COMSOL txt and overwrite graphs.")
     parser.add_argument(
@@ -1029,6 +1066,7 @@ def main(argv: list[str] | None = None) -> None:
     _auto_scaffold_anchor_sidecars(extractor.raw_dir)
 
     stem_list = None
+    variant = None if args.variant == "all" else args.variant
     if args.stem.strip():
         from src.data_gen.lib.biochem_comsol_auto_export import (
             collect_biochem_extract_stems,
@@ -1036,9 +1074,23 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         table = collect_biochem_extract_stems(extractor.raw_dir, extractor.label_dir)
-        stem_list = resolve_stem_selection(args.stem.strip(), table)
+        stem_list = resolve_stem_selection(args.stem.strip(), table, variant=variant)
         if not stem_list:
             raise SystemExit("[ERR] No stems matched --stem.")
+    elif variant:
+        from src.data_gen.lib.biochem_comsol_auto_export import (
+            collect_biochem_extract_stems,
+            parse_biochem_extract_stem,
+        )
+
+        table = collect_biochem_extract_stems(extractor.raw_dir, extractor.label_dir)
+        stem_list = [
+            s
+            for s in table
+            if (ref := parse_biochem_extract_stem(s)) is not None and ref.variant == variant
+        ]
+        if not stem_list:
+            raise SystemExit(f"[ERR] No {variant} stems found.")
     extractor.run(
         from_comsol=not args.no_from_comsol,
         force_comsol_pull=args.force,

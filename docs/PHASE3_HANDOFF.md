@@ -48,9 +48,29 @@ Phase 0, 1 and 2 of the project ladder are complete. This document replaces Phas
 ## 0a. THE BANDAID — temporary, and it must be removed
 
 **Phase 3 assumes the ground-truth flow field at `t = 0` is available for any vessel, including
-unseen ones.** Nothing else from the GT solution is permitted: no flow at `t > 0`, no GT species
-beyond `t=0` initial conditions, and **not** the converged `u_prior`/`v_prior`/`mu_prior` (§16.1c
-— those are the *clot-affected converged* solution and remain illegal).
+unseen ones.** Nothing else from the GT solution is permitted: no flow at `t > 0`, and no GT
+species beyond `t=0` initial conditions.
+
+> **CORRECTED 2026-08-13.** This paragraph used to add "and **not** the converged
+> `u_prior`/`v_prior`/`mu_prior` (§16.1c — those are the *clot-affected converged* solution and
+> remain illegal)". **That is factually wrong and it was suppressing legal inputs.** Measured on
+> the packs (`deploy_features.prior_channel_audit`):
+>
+> | field | corr vs GT `t=0` | corr vs GT `t_final` |
+> |---|---|---|
+> | `data.x` `u_prior` | **1.000** | 0.999 (flow barely evolves) |
+> | `data.x` `mu_prior_nd` | **1.000** | 0.05 |
+> | `data.mu_prior` attr | 0.41–0.53 | **−0.04 … −0.07** |
+>
+> The `data.x` prior channels are the **GT `t=0` fields** — legal under this bandaid, which
+> grants exactly that. The `data.mu_prior` *attribute* is an approximate `t=0` prior and
+> correlates ~0 with the converged field, so it is not the clot-affected solution either.
+> `wss_prior_nd` is identically constant in every pack — a dead channel.
+>
+> **The real constraint is different and was being missed:** `data.x` is static, so it keeps
+> serving GT `t=0` flow even when a model runs with `flow_source="pred"`. That silently
+> re-imports the bandaid into the arm meant to be free of it. Phase-5 arms must rebuild those
+> channels from predicted flow — `src/differentiable_wall_model/deploy_features.py`.
 
 **Why it is defensible for now.** §26.16/§26.17 established that all spatial structure in `Mat`
 enters through the flow-derived gates, and Z1 measured the *predicted* flow's marginal

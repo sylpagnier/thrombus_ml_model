@@ -9,6 +9,7 @@ OUT_PATH = Path("outputs/phase3_temporal_report.html")
 
 VESSEL_LABELS = {
     "patient043": "patient043 — previous project best (0.6925)",
+    "patient044": "patient044 — stenosis holdout",
     "patient014": "patient014 — closest timing match",
     "patient001": "patient001",
     "patient007": "patient007 — validated against raw COMSOL export",
@@ -157,8 +158,18 @@ h2.section { font-family: var(--serif); font-weight: 600; font-size: 1.3rem; mar
 
   <div class="stage">
     <div class="panel-box">
-      <h2 id="spatial-title">Wall map</h2>
-      <canvas id="spatial-canvas" width="600" height="600"></canvas>
+      <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.7rem;">
+        <h2 id="spatial-title" style="margin: 0;">Wall map</h2>
+        <select id="view-mode" style="font-size: 0.8rem; border-radius: 4px; border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); padding: 0.2rem;">
+          <option value="overlay">Overlay (Differences)</option>
+          <option value="split">Split (Model | GT)</option>
+        </select>
+      </div>
+      <div style="position: relative; width: 100%;">
+        <canvas id="spatial-canvas" width="600" height="600"></canvas>
+        <input type="range" id="split-slider" min="0" max="1" step="0.005" value="0.5" style="display: none; position: absolute; width: 100%; top: 50%; left: 0; margin: 0; opacity: 0; cursor: ew-resize; z-index: 10;" />
+        <div id="split-line" style="display: none; position: absolute; width: 2px; height: 100%; top: 0; left: 50%; background: var(--ink); pointer-events: none; z-index: 5;"></div>
+      </div>
     </div>
     <div class="panel-box">
       <h2>Committed wall nodes over time</h2>
@@ -229,6 +240,21 @@ h2.section { font-family: var(--serif); font-weight: 600; font-size: 1.3rem; mar
   const readout = document.getElementById('time-readout');
   const title = document.getElementById('spatial-title');
   const playBtn = document.getElementById('play-btn');
+  const viewMode = document.getElementById('view-mode');
+  const splitSlider = document.getElementById('split-slider');
+  const splitLine = document.getElementById('split-line');
+
+  viewMode.addEventListener('change', () => {
+    const isSplit = viewMode.value === 'split';
+    splitSlider.style.display = isSplit ? 'block' : 'none';
+    splitLine.style.display = isSplit ? 'block' : 'none';
+    redraw();
+  });
+
+  splitSlider.addEventListener('input', () => {
+    splitLine.style.left = (splitSlider.value * 100) + '%';
+    redraw();
+  });
 
   function css(name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -272,21 +298,53 @@ h2.section { font-family: var(--serif); font-weight: 600; font-size: 1.3rem; mar
 
     const gt = d.frame_gt[frame], model = d.frame_model[frame];
     const tp = css('--tp'), fn = css('--fn'), fp = css('--fp'), tn = css('--muted');
+    const isSplit = viewMode.value === 'split';
+    const splitX = w * parseFloat(splitSlider.value);
+
     for (let i = 0; i < d.wall_pos.length; i++) {
       const g = gt[i], m = model[i];
-      let color, r;
-      if (g && m) { color = tp; r = 2.6; }
-      else if (g && !m) { color = fn; r = 2.6; }
-      else if (!g && m) { color = fp; r = 2.6; }
-      else { color = tn; r = 1.5; }
-      sctx.globalAlpha = (g || m) ? 1 : 0.5;
-      sctx.fillStyle = color;
       const [x, y] = d.wall_pos[i];
+      const posX = px(x);
+      const posY = py(y);
+
+      let color, r;
+      if (isSplit) {
+        const isLeft = posX < splitX;
+        const active = isLeft ? m : g;
+        if (active) {
+          color = isLeft ? css('--model-line') : css('--gt-line');
+          r = 2.6;
+          sctx.globalAlpha = 1;
+        } else {
+          color = tn;
+          r = 1.5;
+          sctx.globalAlpha = 0.5;
+        }
+      } else {
+        if (g && m) { color = tp; r = 2.6; }
+        else if (g && !m) { color = fn; r = 2.6; }
+        else if (!g && m) { color = fp; r = 2.6; }
+        else { color = tn; r = 1.5; }
+        sctx.globalAlpha = (g || m) ? 1 : 0.5;
+      }
+      
+      sctx.fillStyle = color;
       sctx.beginPath();
-      sctx.arc(px(x), py(y), r, 0, Math.PI * 2);
+      sctx.arc(posX, posY, r, 0, Math.PI * 2);
       sctx.fill();
     }
     sctx.globalAlpha = 1;
+
+    if (isSplit) {
+      sctx.font = 'bold 13px ' + css('--mono');
+      sctx.fillStyle = css('--ink');
+      sctx.globalAlpha = 0.8;
+      sctx.fillText('Model', 12, 22);
+      sctx.textAlign = 'right';
+      sctx.fillText('GT', w - 12, 22);
+      sctx.textAlign = 'left';
+      sctx.globalAlpha = 1;
+    }
   }
 
   function drawChart() {

@@ -128,6 +128,21 @@ def test_discover_export_tags_phase2_data_nodes():
     assert got["wall"] == "data4"
 
 
+def test_discover_export_tags_optional_wound_nodes():
+    model = _FakeModelForExport(
+        {
+            "sol_data": _FakeExportNode(label="sol_data", expr_count=24, dataset="dset1"),
+            "inlet_nodes": _FakeExportNode(label="inlet_nodes", expr_count=2, dataset="edg1"),
+            "outlet_nodes": _FakeExportNode(label="outlet_nodes", expr_count=2, dataset="edg2"),
+            "wall_nodes": _FakeExportNode(label="wall_nodes", expr_count=2, dataset="edg3"),
+            "wound_nodes": _FakeExportNode(label="wound_nodes", expr_count=2, dataset="edg4"),
+        }
+    )
+    got = discover_export_tags(model)
+    assert got["wound"] == "wound_nodes"
+    assert got["wall"] == "wall_nodes"
+
+
 def test_resolve_export_tags_uses_discovery(monkeypatch):
     monkeypatch.delenv("BIOCHEM_COMSOL_EXPORT_DOMAIN", raising=False)
     model = _FakeModelForExport(

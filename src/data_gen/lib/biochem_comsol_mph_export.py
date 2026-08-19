@@ -21,7 +21,7 @@ _ENV_EXPORT_KEYS = {
     "domain": "BIOCHEM_COMSOL_EXPORT_DOMAIN",
     "inlet": "BIOCHEM_COMSOL_EXPORT_INLET",
     "outlet": "BIOCHEM_COMSOL_EXPORT_OUTLET",
-    "wall": "BIOCHEM_COMSOL_EXPORT_WALL",
+    "wound": "BIOCHEM_COMSOL_EXPORT_WOUND",
 }
 
 
@@ -92,6 +92,7 @@ def discover_export_tags(model_java) -> dict[str, str]:
         "inlet": ("inlet_nodes", "inlet node", "inlet"),
         "outlet": ("outlet_nodes", "outlet node", "outlet"),
         "wall": ("wall_nodes", "wall node", "wall"),
+        "wound": ("wound_nodes", "wound node", "wound"),
     }
     for role, patterns in label_patterns.items():
         for ex in entries:
@@ -141,8 +142,9 @@ def resolve_export_tags(model_java=None) -> dict[str, str]:
     if model_java is not None:
         discovered = discover_export_tags(model_java)
         available = set(list_result_export_tags(model_java))
-        for role in ("domain", "inlet", "outlet", "wall"):
-            if (os.environ.get(_ENV_EXPORT_KEYS[role]) or "").strip():
+        for role in ("domain", "inlet", "outlet", "wall", "wound"):
+            env_name = _ENV_EXPORT_KEYS.get(role)
+            if env_name and (os.environ.get(env_name) or "").strip():
                 continue
             tag = discovered.get(role)
             if tag and tag in available:
@@ -309,6 +311,7 @@ def pull_exports_via_mph_nodes(
         "outlet": label_dir / f"{stem}_outlet.txt",
         "wall": label_dir / f"{stem}_wall.txt",
     }
+    wound_path = label_dir / f"{stem}_wound.txt"
 
     need_domain = force or not domain_p.is_file()
     need_b = {k: force or not p.is_file() for k, p in boundary_paths.items()}
@@ -359,6 +362,16 @@ def pull_exports_via_mph_nodes(
             run_comsol_data_export(model_java, tags[bname], tmp_b)
             _normalize_boundary_export(tmp_b, dest)
             logger.info("[OK] %s: %s from export '%s'", stem, bname, tags[bname])
+
+        wound_tag = tags.get("wound")
+        if wound_tag and (force or not wound_path.is_file()):
+            try:
+                tmp_w = tmp_dir / f"{stem}_wound.txt"
+                run_comsol_data_export(model_java, wound_tag, tmp_w)
+                _normalize_boundary_export(tmp_w, wound_path)
+                logger.info("[OK] %s: wound from export '%s'", stem, wound_tag)
+            except Exception as exc:
+                logger.info("[i] %s: optional wound export skipped (%s)", stem, exc)
     finally:
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)

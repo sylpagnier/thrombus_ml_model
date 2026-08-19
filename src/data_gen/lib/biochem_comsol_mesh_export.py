@@ -24,12 +24,13 @@ _BOUNDARY_SPECS: tuple[tuple[str, str], ...] = (
     ("wall", "is_wall"),
 )
 
-# Phase-2 anchors (e.g. phase2_wound_008): explicit box selections labeled inlet/outlet/wall.
+# Phase-2 anchors (phase2_nowound_008 / phase2_wound_008): box selections labeled inlet/outlet/wall.
 # Older templates: is_inlet=sel1(x,y) or box1/box2/dif1 tags.
 _STATIC_BOUNDARY_EXPRS: dict[str, tuple[str, ...]] = {
     "inlet": ("inlet(x,y)", "is_inlet", "sel1(x,y)", "box1(x,y)"),
     "outlet": ("outlet(x,y)", "is_outlet", "sel2(x,y)", "box2(x,y)"),
     "wall": ("wall(x,y)", "is_wall", "sel3(x,y)", "dif1(x,y)"),
+    "wound": ("wound(x,y)", "is_wound", "sel4(x,y)"),
 }
 
 
@@ -46,7 +47,7 @@ def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
     except Exception:
         return found
 
-    for bname in ("inlet", "outlet", "wall"):
+    for bname in ("inlet", "outlet", "wall", "wound"):
         for sid in tags:
             low = sid.lower()
             if "nastran" in low or low.startswith("imp"):
@@ -68,6 +69,7 @@ def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
             ("inlet", ("inlet",)),
             ("outlet", ("outlet",)),
             ("wall", ("wall",)),
+            ("wound", ("wound",)),
         ):
             if bname in found:
                 continue
@@ -374,6 +376,36 @@ def write_boundary_txt_from_comsol_masks(
             lines.append(f"0 0 {x:.10f} {y:.10f}")
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         logger.info("[OK] %s: %s boundary via %s (%d unique coords)", stem, bname, expr_used, len(coords))
+
+    wound_path = label_dir / f"{stem}_wound.txt"
+    if (not wound_path.is_file()) or force:
+        wound_mask = None
+        wound_expr = None
+        for expr in boundary_mask_expr_candidates(model_java, "wound"):
+            try:
+                vals = _evaluate_boundary_mask(
+                    model_java,
+                    coords_cm,
+                    expr,
+                    dataset_tag=dataset_tag,
+                )
+                wound_mask = vals > threshold
+                wound_expr = expr
+                break
+            except Exception:
+                continue
+        if wound_mask is not None and np.any(wound_mask):
+            coords = np.unique(coords_cm[wound_mask, :2], axis=0)
+            lines = [f"% Model: COMSOL mask ({wound_expr})", "% x  y"]
+            for x, y in coords:
+                lines.append(f"0 0 {x:.10f} {y:.10f}")
+            wound_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.info(
+                "[OK] %s: wound boundary via %s (%d unique coords)",
+                stem,
+                wound_expr,
+                len(coords),
+            )
 
     if failures:
         raise RuntimeError(

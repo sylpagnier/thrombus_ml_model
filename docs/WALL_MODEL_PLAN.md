@@ -2733,6 +2733,31 @@ of its headline claims.** Everything below is measured on all 35 usable packs, n
 
 ## 16.1 RETRACTION OF 14.3 — `u_prior` IS a leak, and the RGP-DEQ is fed the answer
 
+> **PARTIALLY CORRECTED 2026-08-13 — see `docs/PHASE3_RESULTS.md` §15.** The word "leak" in
+> 16.1/16.1c is too strong, and it was being read as "these channels are illegal", which
+> suppressed inputs that are in fact permitted. Measured directly
+> (`deploy_features.prior_channel_audit`):
+>
+> ```
+> data.x u_prior       corr 1.000 vs GT u at t=0
+> data.x mu_prior_nd   corr 1.000 vs GT mu_eff at t=0,  0.05 vs t_final
+> data.mu_prior attr   corr 0.41-0.53 vs t=0,          -0.04..-0.07 vs t_final
+> data.x wss_prior_nd  identically CONSTANT (dead channel)
+> ```
+>
+> Neither the x-channels nor the attributes are the *clot-affected converged* field: the
+> attribute correlates ~0 with `t_final`. The x-channels are the GT **t=0** fields.
+>
+> * Under the Phase-3 bandaid (which grants GT flow at t=0) they are **legal**.
+> * For a **deployable** claim they are not, and the mechanism is subtler than 16.1 states:
+>   `data.x` is static, so a model run with `flow_source="pred"` still reads GT t=0 flow out
+>   of its own feature vector. Rebuild those channels from predicted flow
+>   (`src/differentiable_wall_model/deploy_features.py`) or the Phase-5 number is optimistic.
+>
+> 16.1's substantive point — that the RGP-DEQ's unassisted accuracy was never measured —
+> stands, and §13.5 now measures it: the predicted-flow arm costs ~0.05 deploy score and
+> collapses onset ordering (rho 0.685 -> 0.393).
+
 Section 14.3 argued that because `y[0]` is clot-free, `u_prior = u_nd(t=0)` is a legitimate
 initial condition rather than leakage. **That reasoning was incomplete and the conclusion is
 wrong.** Three measurements settle it.

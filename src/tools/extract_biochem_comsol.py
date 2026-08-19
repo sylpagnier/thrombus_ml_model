@@ -1,9 +1,15 @@
 """Interactive biochem COMSOL -> PyG graph extraction.
 
-**Default:** COMSOL auto-pull is on. Save solves as ``comsol_models/phase2_wound_XXX.mph``
-with Export nodes ``sol_data``, ``inlet_nodes``, ``outlet_nodes``, ``wall_nodes`` configured.
+**Default:** COMSOL auto-pull is on. Save solves as either
+``comsol_models/phase2_nowound_XXX.mph`` (stem ``patientXXX``) or
+``comsol_models/phase2_wound_XXX.mph`` (stem ``wound_patientXXX``).
 
     python -m src.tools.extract_biochem_comsol
+    python -m src.tools.extract_biochem_comsol --variant nowound
+    python -m src.tools.extract_biochem_comsol --stem patient007 --variant wound
+
+Both physics families extract; they never share a stem, so wound solves cannot
+overwrite the canonical nowound cohort graphs.
 
 Runs those exports (mesh from comp1/mesh1), writes ``cfd_results_biochem/*.txt``, builds
 ``graphs_biochem_anchors/*.pt``. Creates data folders automatically if missing.
@@ -15,6 +21,7 @@ PyCharm: **Run** module ``src.tools.extract_biochem_comsol`` (working directory 
 CLI::
 
     python -m src.data_gen.lib.extract_biochem_comsol_data --stem patient007
+    python -m src.data_gen.lib.extract_biochem_comsol_data --stem wound_patient007
     python -m src.tools.extract_biochem_comsol --list-only
     python -m src.data_gen.lib.extract_biochem_comsol_data --no-from-comsol
 """
@@ -28,6 +35,7 @@ from pathlib import Path
 
 from src.data_gen.lib.biochem_comsol_auto_export import (
     collect_biochem_extract_stems,
+    parse_biochem_extract_stem,
     resolve_biochem_comsol_model_path,
     resolve_stem_selection,
 )
@@ -36,7 +44,7 @@ from src.data_gen.pipeline_biochem import _auto_scaffold_anchor_sidecars
 from src.tools.prepare_biochem_anchors import enrich_anchor_meshes, stems_in_dir
 from src.utils.paths import data_root
 
-_BOUNDARY_SUFFIXES = ("_inlet", "_outlet", "_wall")
+_BOUNDARY_SUFFIXES = ("_inlet", "_outlet", "_wall", "_wound")
 
 
 @dataclass(frozen=True)
@@ -47,11 +55,17 @@ class AnchorExtractStatus:
     has_inlet_txt: bool
     has_outlet_txt: bool
     has_wall_txt: bool
+    has_wound_txt: bool
     has_biochem_graph: bool
     has_kine_graph: bool
     biochem_graph_mtime: float | None
     has_comsol_model: bool
     comsol_model_path: Path | None
+
+    @property
+    def variant(self) -> str:
+        ref = parse_biochem_extract_stem(self.stem)
+        return ref.variant if ref is not None else "-"
 
     @property
     def export_count(self) -> int:
@@ -105,6 +119,9 @@ def _status_for_stem(
     proc_dir: Path,
     kine_dir: Path,
 ) -> AnchorExtractStatus:
+    ref = parse_biochem_extract_stem(stem)
+    if ref is not None:
+        stem = ref.stem
     mesh = (raw_dir / f"{stem}.nas").exists() or (raw_dir / f"{stem}.msh").exists()
     biochem_pt = proc_dir / f"{stem}.pt"
     kine_pt = kine_dir / f"{stem}.pt"
@@ -117,6 +134,7 @@ def _status_for_stem(
         has_inlet_txt=(label_dir / f"{stem}_inlet.txt").is_file(),
         has_outlet_txt=(label_dir / f"{stem}_outlet.txt").is_file(),
         has_wall_txt=(label_dir / f"{stem}_wall.txt").is_file(),
+        has_wound_txt=(label_dir / f"{stem}_wound.txt").is_file(),
         has_biochem_graph=biochem_pt.is_file(),
         has_kine_graph=kine_pt.is_file(),
         biochem_graph_mtime=mtime,
@@ -175,10 +193,10 @@ def print_status_table(
         print("[WARN] No anchor stems found (need .msh/.nas and/or domain .txt exports).")
         return
     print(
-        f"{'#':>3}  {'stem':<18}  {'tag':<14}  {'mesh':<5}  {'exports':<14}  "
-        f"{'biochem .pt':<20}  {'kine':<6}  {'COMSOL .mph':<22}"
+        f"{'#':>3}  {'stem':<22}  {'variant':<8}  {'tag':<14}  {'mesh':<5}  {'exports':<14}  "
+        f"{'biochem .pt':<20}  {'kine':<6}  {'COMSOL .mph':<28}"
     )
-    print("-" * 110)
+    print("-" * 128)
     for i, s in enumerate(statuses, start=1):
         mesh = "yes" if s.has_mesh else "no"
         graph = "yes" if s.has_biochem_graph else "no"
@@ -187,15 +205,18 @@ def print_status_table(
         kine = "yes" if s.has_kine_graph else "no"
         mph = s.comsol_model_path.name if s.comsol_model_path else "-"
         print(
-            f"{i:>3}  {s.stem:<18}  {_row_tag(s):<14}  {mesh:<5}  "
-            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<22}"
+            f"{i:>3}  {s.stem:<22}  {s.variant:<8}  {_row_tag(s):<14}  {mesh:<5}  "
+            f"{_exports_label(s):<14}  {graph:<20}  {kine:<6}  {mph:<28}"
         )
     print(
         "\n[i] [ready] = mesh + domain txt. [mph->mesh] = .mph only (mesh auto-exported on extract). "
         "[extracted] = biochem graph exists."
     )
     print(
-        "[i] patient007 -> comsol_models/phase2_wound_007.mph. Mesh/export stem mismatch:\n"
+        "[i] phase2_nowound_007.mph -> patient007 (canonical cohort). "
+        "phase2_wound_007.mph -> wound_patient007 (does not overwrite nowound).\n"
+        "    Aliases: patient007_wound, --stem patient007 --variant wound. "
+        "Mesh/export stem mismatch:\n"
         "      python -m src.tools.prepare_biochem_anchors --strip-prefix-underscore"
     )
 
@@ -221,10 +242,11 @@ def _resolve_choices(
     label_dir: Path,
     proc_dir: Path,
     kine_dir: Path,
+    variant: str | None = None,
 ) -> list[AnchorExtractStatus]:
-    """Parse ``5,8,9``, ``5-9``, or ``patient005,patient008`` into status rows."""
+    """Parse ``5,8,9``, ``5-9``, ``patient005``, or ``wound_patient007`` into status rows."""
     try:
-        stems = resolve_stem_selection(raw, statuses)
+        stems = resolve_stem_selection(raw, statuses, variant=variant)
     except ValueError as exc:
         print(f"  {exc}")
         return []
@@ -274,9 +296,11 @@ def _maybe_pull_comsol(
 
     resolved = resolve_biochem_comsol_model_path(stem, model_path)
     if resolved is None:
+        ref = parse_biochem_extract_stem(stem)
+        mph_hint = ref.mph_name if ref is not None else f"{stem}.mph"
         print(
-            f"[ERR] {stem}: no .mph found. Save solved model to "
-            f"{extractor.raw_dir / f'{stem}.mph'} or set BIOCHEM_COMSOL_MODEL."
+            f"[ERR] {stem}: no .mph found. Expected comsol_models/{mph_hint} "
+            f"(or {extractor.raw_dir / f'{stem}.mph'} / BIOCHEM_COMSOL_MODEL)."
         )
         return False
 
@@ -299,6 +323,9 @@ def _run_extract(
     from_comsol: bool,
     model_path: Path | None,
 ) -> bool:
+    ref = parse_biochem_extract_stem(stem)
+    if ref is not None:
+        stem = ref.stem
     if not _maybe_pull_comsol(
         stem, extractor, from_comsol=from_comsol, model_path=model_path, force=force
     ):
@@ -391,6 +418,7 @@ def _interactive_loop(
     raw_dir: Path,
     from_comsol: bool,
     model_path: Path | None,
+    variant: str | None = None,
 ) -> None:
     ready = [
         s
@@ -400,8 +428,8 @@ def _interactive_loop(
     ]
     print(f"\n[i] {len(ready)} stem(s) ready to extract (not yet graphed).")
     print(
-        "[i] Enter index or stem, or several: 5 | 5,8,9 | 5-9 | patient008,patient009 | "
-        "'l' relist, 'q' quit.\n"
+        "[i] Enter index or stem, or several: 5 | 5,8,9 | 5-9 | patient008 | "
+        "wound_patient007 | patient007_wound | 'l' relist, 'q' quit.\n"
     )
 
     while True:
@@ -426,6 +454,7 @@ def _interactive_loop(
             label_dir=extractor.label_dir,
             proc_dir=extractor.proc_dir,
             kine_dir=extractor.kine_anchor_dir,
+            variant=variant,
         )
         if not picked_list:
             continue
@@ -434,7 +463,8 @@ def _interactive_loop(
             picked = picked_list[0]
             if not _can_run_status(picked, from_comsol=from_comsol):
                 print(
-                    f"[ERR] {picked.stem}: need domain .txt or phase2_wound_XXX.mph "
+                    f"[ERR] {picked.stem}: need domain .txt or matching "
+                    f"phase2_nowound_XXX.mph / phase2_wound_XXX.mph "
                     f"(--from-comsol exports mesh + fields)."
                 )
                 continue
@@ -476,7 +506,14 @@ def main(argv: list[str] | None = None) -> None:
         "--stem",
         type=str,
         default="",
-        help="One or more stems: patient007 | 7 | 5,8,9 | 5-9 | patient008,patient011 (non-interactive).",
+        help="One or more stems: patient007 | wound_patient007 | 7 | 5,8,9 | 5-9 "
+        "(non-interactive). Combine with --variant wound to restamp patientXXX.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("nowound", "wound", "all"),
+        default="all",
+        help="Restrict listing/extraction to nowound (patientXXX) or wound (wound_patientXXX).",
     )
     parser.add_argument(
         "--force",
@@ -538,6 +575,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         for stem in stems
     ]
+    if args.variant != "all":
+        statuses = [s for s in statuses if s.variant == args.variant]
 
     print_status_table(statuses, raw_dir=raw_dir, label_dir=label_dir, proc_dir=extractor.proc_dir)
 
@@ -553,6 +592,7 @@ def main(argv: list[str] | None = None) -> None:
             label_dir=label_dir,
             proc_dir=extractor.proc_dir,
             kine_dir=extractor.kine_anchor_dir,
+            variant=None if args.variant == "all" else args.variant,
         )
         if not picked_list:
             raise SystemExit("[ERR] No stems matched --stem selection.")
@@ -589,6 +629,7 @@ def main(argv: list[str] | None = None) -> None:
         raw_dir=raw_dir,
         from_comsol=args.from_comsol,
         model_path=args.model_path,
+        variant=None if args.variant == "all" else args.variant,
     )
 
 

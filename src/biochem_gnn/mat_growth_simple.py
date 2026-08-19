@@ -4876,3 +4876,12 @@ WALL_COHORT_V2_DEV: tuple[str, ...] = (
     "patient042", "patient043", "patient044",
 )
 WALL_COHORT_V2_DEV_HOLDOUT: tuple[str, ...] = ("patient042", "patient043")
+# DEV-train slice of TRAIN (042/043 live in SEALED, not here).  Same four names as
+# scripts/sweep_ml_clean_protocol.py DEV_CANDIDATES -- FIT/DEV/SEALED for any wall-cohort
+# scalar or architecture choice.
+WALL_COHORT_V2_DEV_TRAIN: tuple[str, ...] = tuple(
+    n for n in WALL_COHORT_V2_DEV if n not in WALL_COHORT_V2_DEV_HOLDOUT
+)
+WALL_COHORT_V2_FIT: tuple[str, ...] = tuple(
+    n for n in WALL_COHORT_V2_TRAIN if n not in WALL_COHORT_V2_DEV_TRAIN
+)

@@ -1,0 +1,38 @@
+{
+  "name": "clot_gnn_v3",
+  "kind": "temporal_v3",
+  "path": "outputs/clot_ml/locked/clot_gnn_v3",
+  "manifest": "outputs/clot_ml/locked/clot_gnn_v3/manifest.json",
+  "base_set_model": "clot_gnn_v2",
+  "promoted_at": "2026-08-17T18:34:18Z",
+  "docs": "docs/PHASE9_ML.md",
+  "supersedes": "clot_gnn_v2",
+  "scores_out_of_fold_cv": {
+    "all": {
+      "wall": 0.8845,
+      "off": 0.611
+    },
+    "priority": {
+      "wall": 0.9047,
+      "off": 0.7943
+    },
+    "baselines": {
+      "frozen": {
+        "wall": 0.7953,
+        "off": 0.4209
+      },
+      "v2_plus_ode": {
+        "wall": 0.8547,
+        "off": 0.5369
+      },
+      "oracle_schedule": {
+        "wall": 0.8908,
+        "off": 0.6619
+      },
+      "oracle": {
+        "wall": 0.9705,
+        "off": 0.8396
+      }
+    }
+  }
+}
