@@ -290,6 +290,66 @@ def test_ensure_wound_from_comsol_selection_mask(tmp_path, monkeypatch):
     assert "1.0000000000 0.0000000000" not in text
 
 
+def test_ensure_wound_from_geometry_selection_snap(tmp_path, monkeypatch):
+    import numpy as np
+
+    from src.data_gen.lib.biochem_comsol_mesh_export import ensure_wound_boundary_txt
+
+    coords = np.array(
+        [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0], [0.5, 0.5]],
+        dtype=np.float64,
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export.resolve_boundary_datasets",
+        lambda _m: {},
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export.discover_boundary_selection_tags",
+        lambda _m: {"wound": "sel1"},
+    )
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_mesh_export.sample_coords_from_named_selection",
+        lambda _m, _tag, *, parent_dataset="dset1": np.array([[0.50, 0.0], [0.49, 0.0]]),
+    )
+    monkeypatch.setenv("BIOCHEM_BOUNDARY_SNAP_CM", "0.05")
+    ok = ensure_wound_boundary_txt(
+        object(),
+        coords,
+        None,
+        tmp_path,
+        "wound_patient001",
+        force=True,
+    )
+    assert ok
+    text = (tmp_path / "wound_patient001_wound.txt").read_text(encoding="utf-8")
+    assert "selection 'sel1'" in text
+    assert "0.5000000000 0.0000000000" in text
+    assert "1.0000000000 0.0000000000" not in text
+    assert "0.5000000000 0.5000000000" not in text
+
+
+def test_wound_snap_retries_meter_to_cm(tmp_path, monkeypatch):
+    import numpy as np
+
+    from src.data_gen.lib.biochem_comsol_mesh_export import _write_wound_snap_txt
+
+    pts = np.array([[2.0, 0.0], [0.0, 0.0]], dtype=np.float64)
+    ref_m = np.array([[0.02, 0.0]], dtype=np.float64)
+    monkeypatch.setenv("BIOCHEM_BOUNDARY_SNAP_CM", "0.05")
+    ok = _write_wound_snap_txt(
+        tmp_path / "w.txt",
+        pts,
+        ref_m,
+        stem="wound_patient001",
+        source="selection 'sel1'",
+    )
+    assert ok
+    text = (tmp_path / "w.txt").read_text(encoding="utf-8")
+    assert "*100" in text
+    assert "0 0 2.0000000000 0.0000000000" in text
+    assert "0 0 0.0000000000 0.0000000000" not in text
+
+
 def test_boundary_txt_has_coords_ignores_header_only(tmp_path):
     from src.data_gen.lib.biochem_comsol_mesh_export import boundary_txt_has_coords
 

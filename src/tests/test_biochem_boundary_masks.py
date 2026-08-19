@@ -7,6 +7,7 @@ import numpy as np
 from src.data_gen.lib.biochem_comsol_mesh_export import (
     boundary_mask_expr_candidates,
     discover_boundary_mask_exprs,
+    discover_boundary_selection_tags,
     write_boundary_txt_from_axis_extents,
 )
 
@@ -79,6 +80,20 @@ def test_discover_boundary_mask_exprs_wound_selection_not_union():
     found = discover_boundary_mask_exprs(model)
     assert found["wound"] == "sel1(x,y)"
     assert found["wall"] == "wall(x,y)"
+    assert discover_boundary_selection_tags(model)["wound"] == "sel1"
+
+
+def test_discover_wound_ignores_union_listed_first():
+    model = _FakeModelJava(
+        {
+            "uni1": "wallandwound",
+            "sel1": "wound",
+            "wall": "wall",
+        }
+    )
+    found = discover_boundary_selection_tags(model)
+    assert found["wound"] == "sel1"
+    assert found["wall"] == "wall"
 
 
 def test_write_boundary_txt_from_axis_extents(tmp_path):

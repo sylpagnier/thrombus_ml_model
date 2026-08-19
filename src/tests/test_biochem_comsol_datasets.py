@@ -7,6 +7,7 @@ from src.data_gen.lib.biochem_comsol_datasets import (
     list_comsol_datasets,
     resolve_boundary_datasets,
     resolve_solution_dataset,
+    sample_coords_from_named_selection,
 )
 
 
@@ -110,3 +111,71 @@ def test_list_comsol_datasets():
     rows = list_comsol_datasets(model)
     assert rows[0]["tag"] == "dset1"
     assert rows[0]["label"] == "Wall"
+
+
+def test_sample_coords_from_named_selection_edge2d_and_cleanup(monkeypatch):
+    import numpy as np
+
+    created: list[tuple[str, str]] = []
+    removed: list[str] = []
+
+    class _Sel:
+        def __init__(self) -> None:
+            self.named_tag = None
+
+        def named(self, tag: str) -> None:
+            self.named_tag = tag
+
+    class _Ds:
+        def __init__(self) -> None:
+            self.props: dict[str, str] = {}
+            self._sel = _Sel()
+
+        def set(self, key: str, val: str) -> None:
+            self.props[key] = val
+
+        def selection(self) -> _Sel:
+            return self._sel
+
+    class _DsRoot:
+        def __init__(self) -> None:
+            self.last: _Ds | None = None
+
+        def create(self, tag: str, dtype: str) -> _Ds:
+            created.append((tag, dtype))
+            self.last = _Ds()
+            return self.last
+
+        def remove(self, tag: str) -> None:
+            removed.append(tag)
+
+    class _Result:
+        def __init__(self) -> None:
+            self._ds = _DsRoot()
+
+        def dataset(self) -> _DsRoot:
+            return self._ds
+
+        def numerical(self):
+            raise AssertionError("Eval fallback should not run when Edge2D succeeds")
+
+    class _Model:
+        def __init__(self) -> None:
+            self._r = _Result()
+
+        def result(self) -> _Result:
+            return self._r
+
+    monkeypatch.setattr(
+        "src.data_gen.lib.biochem_comsol_datasets.sample_coords_from_dataset",
+        lambda _m, _tag, *, edim=1, exprs=("x", "y"): np.array([[1.0, 2.0]], dtype=np.float64),
+    )
+    model = _Model()
+    xy = sample_coords_from_named_selection(model, "sel1", parent_dataset="dset1")
+    assert xy.shape == (1, 2)
+    assert float(xy[0, 0]) == 1.0 and float(xy[0, 1]) == 2.0
+    assert created[0][1] == "Edge2D"
+    assert model._r._ds.last is not None
+    assert model._r._ds.last.props["data"] == "dset1"
+    assert model._r._ds.last._sel.named_tag == "sel1"
+    assert "py_wound_sel" in removed

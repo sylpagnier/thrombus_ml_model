@@ -12,7 +12,11 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from src.data_gen.lib.biochem_comsol_auto_export import _evaluate_at_coords_and_time
-from src.data_gen.lib.biochem_comsol_datasets import resolve_boundary_datasets, sample_coords_from_dataset
+from src.data_gen.lib.biochem_comsol_datasets import (
+    resolve_boundary_datasets,
+    sample_coords_from_dataset,
+    sample_coords_from_named_selection,
+)
 from src.data_gen.lib.centerline_utils import resolve_anchor_mesh_path
 from src.tools.prepare_biochem_anchors import scaffold_anchor_sidecars
 
@@ -38,8 +42,14 @@ def _env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
-    """Map inlet/outlet/wall -> ``<selection_tag>(x,y)`` from COMSOL Definitions > Selections."""
+def _selection_looks_like_union(sid: str, label: str) -> bool:
+    low = sid.lower()
+    ll = label.lower()
+    return low.startswith("uni") or "and" in ll or "union" in ll
+
+
+def discover_boundary_selection_tags(model_java) -> dict[str, str]:
+    """Map inlet/outlet/wall/wound -> COMSOL selection tag (``sel1``, ``box1``, ...)."""
     found: dict[str, str] = {}
     s_root = model_java.selection()
     try:
@@ -47,15 +57,7 @@ def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
     except Exception:
         return found
 
-    for bname in ("inlet", "outlet", "wall", "wound"):
-        for sid in tags:
-            low = sid.lower()
-            if "nastran" in low or low.startswith("imp"):
-                continue
-            if low == bname:
-                found[bname] = f"{sid}(x,y)"
-                break
-
+    rows: list[tuple[str, str, str]] = []
     for sid in tags:
         low = sid.lower()
         if "nastran" in low or low.startswith("imp"):
@@ -64,21 +66,35 @@ def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
             label = str(s_root.get(sid).name()).lower()
         except Exception:
             label = low
-        expr = f"{sid}(x,y)"
-        for bname, keys in (
-            ("inlet", ("inlet",)),
-            ("outlet", ("outlet",)),
-            ("wall", ("wall",)),
-            ("wound", ("wound",)),
-        ):
+        rows.append((sid, low, label))
+
+    for bname in ("inlet", "outlet", "wall", "wound"):
+        for sid, low, _label in rows:
+            if low == bname:
+                found[bname] = sid
+                break
+
+    for sid, low, label in rows:
+        for bname in ("inlet", "outlet", "wall", "wound"):
             if bname in found:
                 continue
             if label == bname or low == bname:
-                found[bname] = expr
+                found[bname] = sid
+
+    for sid, low, label in rows:
+        if _selection_looks_like_union(sid, label):
+            continue
+        for bname in ("inlet", "outlet", "wall"):
+            if bname in found:
                 continue
-            if any(k in label for k in keys) or any(k in low for k in keys):
-                found[bname] = expr
+            if bname in label or bname in low:
+                found[bname] = sid
     return found
+
+
+def discover_boundary_mask_exprs(model_java) -> dict[str, str]:
+    """Map inlet/outlet/wall/wound -> ``<selection_tag>(x,y)`` from Definitions > Selections."""
+    return {name: f"{tag}(x,y)" for name, tag in discover_boundary_selection_tags(model_java).items()}
 
 
 def boundary_mask_expr_candidates(model_java, bname: str) -> list[str]:
@@ -153,6 +169,98 @@ def _mesh_coords_cm(mesh_path: Path | None) -> np.ndarray | None:
         return None
 
 
+def snap_mesh_xy_to_ref(
+    pts: np.ndarray,
+    ref: np.ndarray,
+    *,
+    tol_cm: float | None = None,
+) -> tuple[np.ndarray, float, float]:
+    """Unique mesh xy within ``tol_cm`` of ref points. Also returns (tol, min_dist)."""
+    pts2 = np.asarray(pts, dtype=np.float64)
+    if pts2.ndim != 2 or pts2.shape[1] < 2:
+        return np.zeros((0, 2), dtype=np.float64), float(tol_cm or 0.0), float("inf")
+    pts2 = pts2[:, :2]
+    ref2 = np.asarray(ref, dtype=np.float64)
+    if ref2.ndim != 2 or ref2.shape[1] < 2 or ref2.shape[0] < 1:
+        return np.zeros((0, 2), dtype=np.float64), float(tol_cm or 0.0), float("inf")
+    ref2 = ref2[:, :2]
+    if pts2.shape[0] < 1:
+        return np.zeros((0, 2), dtype=np.float64), float(tol_cm or 0.0), float("inf")
+    if tol_cm is None:
+        tol_cm = _boundary_snap_tol_cm(pts2)
+    tree = cKDTree(ref2)
+    dist, _ = tree.query(pts2)
+    min_dist = float(np.min(dist)) if dist.size else float("inf")
+    mask = dist <= float(tol_cm)
+    if not np.any(mask):
+        return np.zeros((0, 2), dtype=np.float64), float(tol_cm), min_dist
+    return np.unique(pts2[mask], axis=0), float(tol_cm), min_dist
+
+
+def _ref_unit_scales(ref: np.ndarray) -> tuple[tuple[str, np.ndarray], ...]:
+    ref2 = np.asarray(ref, dtype=np.float64).reshape(-1, 2)
+    return (
+        ("1", ref2),
+        ("*100", ref2 * 100.0),
+        ("/100", ref2 / 100.0),
+    )
+
+
+def _write_wound_snap_txt(
+    wound_path: Path,
+    pts: np.ndarray,
+    ref: np.ndarray,
+    *,
+    stem: str,
+    source: str,
+) -> bool:
+    """Snap mesh nodes to ref coords (try cm/m scales) and write ``*_wound.txt``."""
+    ranked: list[tuple[int, float, bool, str, np.ndarray, float, float, int]] = []
+    for scale_name, scaled in _ref_unit_scales(ref):
+        nref = int(np.asarray(scaled).reshape(-1, 2).shape[0])
+        snapped, tol, min_dist = snap_mesh_xy_to_ref(pts, scaled)
+        ranked.append(
+            (
+                int(snapped.shape[0]),
+                -float(min_dist),
+                scale_name == "1",
+                scale_name,
+                snapped,
+                tol,
+                float(min_dist),
+                nref,
+            )
+        )
+    ranked.sort(reverse=True)
+    n, _neg, _prefer_one, scale_name, snapped, last_tol, last_min, last_nref = ranked[0]
+    if n < 1:
+        logger.info(
+            "[i] %s: %s sampled %d ref pts but none within tol=%.4g cm (min dist=%.4g)",
+            stem,
+            source,
+            last_nref,
+            last_tol,
+            last_min,
+        )
+        return False
+    scale_note = "" if scale_name == "1" else f", unit scale {scale_name}"
+    _write_xy_boundary_txt(
+        wound_path,
+        snapped,
+        f"% Model: mesh nodes snapped to {source} (tol={last_tol:.4g} cm{scale_note})",
+    )
+    logger.info(
+        "[OK] %s: wound = %d mesh nodes (snap to %s, %d ref pts, tol=%.4g cm%s)",
+        stem,
+        int(snapped.shape[0]),
+        source,
+        last_nref,
+        last_tol,
+        scale_note,
+    )
+    return True
+
+
 def write_wound_txt_from_comsol_mask(
     model_java,
     coords_cm: np.ndarray,
@@ -183,7 +291,10 @@ def write_wound_txt_from_comsol_mask(
                 expr,
                 dataset_tag=dataset_tag,
             )
-            wound_mask = vals > threshold
+            mask = vals > threshold
+            if not np.any(mask):
+                continue
+            wound_mask = mask
             wound_expr = expr
             break
         except Exception:
@@ -215,7 +326,7 @@ def ensure_wound_boundary_txt(
     dataset_tag: str = "dset1",
     force: bool = False,
 ) -> bool:
-    """Write ``*_wound.txt`` from Gmsh tags, a Wound dataset, or the COMSOL wound selection.
+    """Write ``*_wound.txt`` from Gmsh tags, a Wound dataset, or the geometry selection.
 
     Inlet/outlet/wall already existing does not skip this. Nowound stems stay silent
     when no wound selection exists. Returns True when the file has coordinates.
@@ -259,27 +370,53 @@ def ensure_wound_boundary_txt(
                         break
                     except Exception:
                         continue
-                if ref is not None and ref.size:
-                    tol_cm = _boundary_snap_tol_cm(pts)
-                    tree = cKDTree(np.asarray(ref, dtype=np.float64)[:, :2])
-                    dist, _ = tree.query(pts[:, :2])
-                    mask = dist <= tol_cm
-                    if np.any(mask):
-                        _write_xy_boundary_txt(
-                            wound_path,
-                            pts[mask, :2],
-                            f"% Model: mesh nodes snapped to dataset {dset} (tol={tol_cm:.4g} cm)",
-                        )
-                        logger.info(
-                            "[OK] %s: wound = %d mesh nodes (snap to '%s')",
-                            stem,
-                            int(np.unique(pts[mask, :2], axis=0).shape[0]),
-                            dset,
-                        )
-                        if not force:
-                            return True
+                if ref is not None and np.asarray(ref).size:
+                    if _write_wound_snap_txt(
+                        wound_path,
+                        pts,
+                        ref,
+                        stem=stem,
+                        source=f"dataset '{dset}'",
+                    ) and not force:
+                        return True
             except Exception as exc:
                 logger.debug("[i] %s: wound dataset snap failed (%s)", stem, exc)
+
+        sel_tag = None
+        try:
+            sel_tag = discover_boundary_selection_tags(model_java).get("wound")
+        except Exception as exc:
+            logger.debug("[i] %s: wound selection discovery failed (%s)", stem, exc)
+        if sel_tag:
+            logger.info("[i] %s: wound geometry selection '%s'", stem, sel_tag)
+            try:
+                sel_ref = sample_coords_from_named_selection(
+                    model_java,
+                    sel_tag,
+                    parent_dataset=dataset_tag,
+                )
+                if sel_ref is not None and np.asarray(sel_ref).size:
+                    if _write_wound_snap_txt(
+                        wound_path,
+                        pts,
+                        sel_ref,
+                        stem=stem,
+                        source=f"selection '{sel_tag}'",
+                    ):
+                        return True
+                else:
+                    logger.info(
+                        "[i] %s: selection '%s' returned no coordinates",
+                        stem,
+                        sel_tag,
+                    )
+            except Exception as exc:
+                logger.info(
+                    "[i] %s: geometry selection '%s' snap failed (%s)",
+                    stem,
+                    sel_tag,
+                    exc,
+                )
 
         if write_wound_txt_from_comsol_mask(
             model_java,
@@ -297,7 +434,7 @@ def ensure_wound_boundary_txt(
     if ref is not None and ref.variant == "wound" and not boundary_txt_has_coords(wound_path):
         logger.warning(
             "[WARN] %s: wound variant but no wound nodes written "
-            "(no Gmsh Wound tag, no wound_nodes export, and wound(x,y)/sel1 did not match).",
+            "(no Gmsh Wound tag, no wound_nodes export, and geometry selection snap did not match).",
             stem,
         )
     return boundary_txt_has_coords(wound_path)

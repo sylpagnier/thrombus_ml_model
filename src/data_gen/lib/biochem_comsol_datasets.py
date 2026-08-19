@@ -238,3 +238,187 @@ def sample_coords_from_dataset(
             results.numerical().remove(tag)
         except Exception:
             pass
+
+
+_TEMP_NAMED_SEL_DATASET = "py_wound_sel"
+_TEMP_NAMED_SEL_EVAL = "py_wound_eval"
+_NAMED_SEL_DATASET_TYPES = ("Edge2D", "Selection", "Edge")
+
+
+def _as_int_ids(raw) -> list[int]:
+    if raw is None:
+        return []
+    try:
+        return [int(x) for x in list(raw)]
+    except TypeError:
+        try:
+            return [int(raw)]
+        except Exception:
+            return []
+
+
+def _first_geom_tag(model_java) -> str:
+    try:
+        tags = [str(t) for t in model_java.geom().tags()]
+        if tags:
+            return tags[0]
+    except Exception:
+        pass
+    try:
+        for ctag in model_java.component().tags():
+            geom = model_java.component(str(ctag)).geom()
+            try:
+                gt = [str(t) for t in geom.tags()]
+                if gt:
+                    return gt[0]
+            except Exception:
+                pass
+            try:
+                tag = str(geom.tag())
+                if tag and tag not in ("None", "null"):
+                    return tag
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "geom1"
+
+
+def _bind_named_selection(node, sel_tag: str, model_java) -> None:
+    """Restrict a dataset/numerical node to a model-level named selection."""
+    sel = node.selection()
+    try:
+        sel.named(sel_tag)
+        return
+    except Exception:
+        pass
+    src = None
+    try:
+        src = model_java.selection().get(sel_tag)
+    except Exception:
+        src = None
+    if src is None:
+        raise RuntimeError(f"named selection {sel_tag!r} is not available")
+    geom_tag = _first_geom_tag(model_java)
+    try:
+        g = src.geom()
+        if g is not None and str(g).strip() not in ("", "None", "null"):
+            geom_tag = str(g)
+    except Exception:
+        pass
+    last_exc: Exception | None = None
+    for dim in (1, 0, 2):
+        try:
+            ids = _as_int_ids(src.entities(dim))
+        except Exception as exc:
+            last_exc = exc
+            continue
+        if not ids:
+            continue
+        try:
+            sel.geom(geom_tag, int(dim))
+        except Exception:
+            pass
+        try:
+            sel.set(ids)
+            return
+        except Exception as exc:
+            last_exc = exc
+            try:
+                sel.set(*ids)
+                return
+            except Exception as exc2:
+                last_exc = exc2
+    raise RuntimeError(f"could not bind selection {sel_tag!r}") from last_exc
+
+
+def _remove_dataset(model_java, tag: str) -> None:
+    try:
+        model_java.result().dataset().remove(tag)
+    except Exception:
+        pass
+
+
+def _remove_numerical(model_java, tag: str) -> None:
+    try:
+        model_java.result().numerical().remove(tag)
+    except Exception:
+        pass
+
+
+def sample_coords_from_named_selection(
+    model_java,
+    sel_tag: str,
+    *,
+    parent_dataset: str = "dset1",
+) -> np.ndarray:
+    """Sample x,y on a geometry selection (wound / sel1), like snapping to a Wall dataset.
+
+    Interp of ``sel1(x,y)`` on the volume dataset does not mark boundary edges.
+    This builds a temporary Edge2D (or Selection) dataset restricted to ``sel_tag``.
+    """
+    sel_tag = str(sel_tag).strip()
+    if not sel_tag:
+        return np.zeros((0, 2), dtype=np.float64)
+    parent_dataset = str(parent_dataset).strip() or "dset1"
+    results = model_java.result()
+    last_exc: Exception | None = None
+
+    _remove_dataset(model_java, _TEMP_NAMED_SEL_DATASET)
+    for dtype in _NAMED_SEL_DATASET_TYPES:
+        ds = None
+        try:
+            ds = results.dataset().create(_TEMP_NAMED_SEL_DATASET, dtype)
+            try:
+                ds.set("data", parent_dataset)
+            except Exception:
+                pass
+            _bind_named_selection(ds, sel_tag, model_java)
+            coords = None
+            for edim in (1, None):
+                try:
+                    coords = sample_coords_from_dataset(
+                        model_java,
+                        _TEMP_NAMED_SEL_DATASET,
+                        edim=edim,
+                    )
+                    if coords is not None and np.asarray(coords).size:
+                        return np.asarray(coords, dtype=np.float64).reshape(-1, 2)
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+        except Exception as exc:
+            last_exc = exc
+        finally:
+            _remove_dataset(model_java, _TEMP_NAMED_SEL_DATASET)
+
+    _remove_numerical(model_java, _TEMP_NAMED_SEL_EVAL)
+    for ntype in ("Eval", "EvalPoint"):
+        try:
+            ev = results.numerical().create(_TEMP_NAMED_SEL_EVAL, ntype)
+            ev.set("data", parent_dataset)
+            ev.set("expr", ["x", "y"])
+            for edim in (1, "edge"):
+                try:
+                    ev.set("edim", edim)
+                    break
+                except Exception:
+                    continue
+            _bind_named_selection(ev, sel_tag, model_java)
+            raw = ev.getData()
+            x = np.asarray(raw[0], dtype=np.float64).reshape(-1)
+            y = np.asarray(raw[1], dtype=np.float64).reshape(-1)
+            if x.size and x.size == y.size:
+                return np.column_stack([x, y])
+        except Exception as exc:
+            last_exc = exc
+        finally:
+            _remove_numerical(model_java, _TEMP_NAMED_SEL_EVAL)
+
+    if last_exc is not None:
+        logger.debug(
+            "[i] named selection %s coord sample failed (%s)",
+            sel_tag,
+            last_exc,
+        )
+    return np.zeros((0, 2), dtype=np.float64)

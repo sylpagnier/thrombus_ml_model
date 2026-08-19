@@ -10,7 +10,8 @@ Typical workflow::
        ``comsol_models/phase2_nowound_XXX.mph`` or ``comsol_models/phase2_wound_XXX.mph``.
     2. Ensure Results > Export nodes exist: ``sol_data``, ``inlet_nodes``,
        ``outlet_nodes``, ``wall_nodes``. A ``wound_nodes`` export is optional;
-       the wound geometry selection (``wound`` / ``sel1``) is always evaluated.
+       the wound geometry selection (``wound`` / ``sel1``) is sampled as an
+       Edge2D dataset and snapped to mesh nodes.
     3. ``python -m src.tools.extract_biochem_comsol`` (default) runs those exports + builds graphs.
 
 Extract identity (do not collapse both physics onto ``patientXXX``)::
