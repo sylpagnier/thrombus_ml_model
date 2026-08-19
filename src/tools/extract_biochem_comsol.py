@@ -345,7 +345,11 @@ def _run_extract(
         enrich_anchor_meshes(raw_dir, overwrite=False, dry_run=False, stems=[stem])
 
     print(f"\n[NEW] Extracting {stem} ...")
-    extractor.process_patient(stem)
+    try:
+        extractor.process_patient(stem)
+    except Exception as exc:
+        print(f"[ERR] Extraction failed for {stem}: {exc}")
+        return False
     if biochem_pt.is_file():
         print(f"[OK] Wrote {biochem_pt}")
         kine_pt = extractor.kine_anchor_dir / f"{stem}.pt"

@@ -191,11 +191,9 @@ def build_kinematics_graph_from_comsol_steady(
     """Assemble a single steady-state kinematics ``Data`` object (trainer schema).
 
     ``prior_mode``:
-      - ``gt_flow``: COMSOL t=0 u,v,mu (+ WSS from GT) in prior channels (anchors).
-      - ``analytic``: Poiseuille/Carreau priors only (synthetic meshes).
+      - ``gt_flow``: deprecated; COMSOL velocity is never written into prior channels.
+      - ``analytic``: Poiseuille/Carreau priors only (required for deploy-faithful graphs).
     """
-    from src.data_gen.lib.node_feature_assembly import apply_gt_flow_priors_to_kine_x
-
     phys_cfg = phys_cfg or PhysicsConfig(phase="kinematics", rheology="carreau")
     ref_mu = float(phys_cfg.mu_ref)
     n = int(mesh_nodes_si.shape[0])

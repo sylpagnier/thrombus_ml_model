@@ -189,3 +189,12 @@ def test_write_boundary_txt_from_mesh_writes_optional_wound(tmp_path):
     wound_p = tmp_path / "sqw_wound.txt"
     assert wound_p.is_file()
     assert "0 0" in wound_p.read_text(encoding="utf-8")
+
+
+def test_comsol_steady_kine_builder_does_not_import_removed_gt_prior():
+    import inspect
+
+    from src.data_gen.lib.kinematics_graph_builder import build_kinematics_graph_from_comsol_steady
+
+    source = inspect.getsource(build_kinematics_graph_from_comsol_steady)
+    assert "apply_gt_flow_priors_to_kine_x" not in source
