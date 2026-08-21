@@ -41,8 +41,17 @@ def soft_dilate(p: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
 
 
 def soft_score(p: torch.Tensor, gt: torch.Tensor, D: torch.Tensor,
-               domain: torch.Tensor, gt_dil: torch.Tensor) -> torch.Tensor:
-    """Differentiable `0.5*dilation_IoU + 0.5*relaxed_F0.5` restricted to ``domain``."""
+               domain: torch.Tensor, gt_dil: torch.Tensor,
+               shape_w: float = 0.5) -> torch.Tensor:
+    """Differentiable `shape_w*dilation_IoU + (1-shape_w)*relaxed_F0.5` over ``domain``.
+
+    ``shape_w`` exists because the two halves are NOT equally binding.  Measured per vessel
+    on the shipped off-wall mask (docs/PHASE10_V4.md 13.1), recall is already 1.000 on nine
+    of thirteen vessels and `patient012` still scores 0.845 with precision 1.000 and recall
+    0.988 -- because its dilation IoU is 0.691.  Above ~0.85 the off-wall score is a SHAPE
+    problem, and the training loss has always weighted shape at exactly the 0.5 the
+    evaluation metric uses.  The EVALUATION weight never changes; this is the loss only.
+    """
     p = p * domain
     g = gt * domain
     n_gt = g.sum()
@@ -57,4 +66,4 @@ def soft_score(p: torch.Tensor, gt: torch.Tensor, D: torch.Tensor,
     inter = torch.minimum(p_dil, gd).sum()
     union = torch.maximum(p_dil, gd).sum()
     iou = inter / (union + EPS)
-    return 0.5 * iou + 0.5 * f05
+    return shape_w * iou + (1.0 - shape_w) * f05

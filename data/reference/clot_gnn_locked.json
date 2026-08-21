@@ -1,38 +1,98 @@
 {
-  "name": "clot_gnn_v3",
-  "kind": "temporal_v3",
-  "path": "outputs/clot_ml/locked/clot_gnn_v3",
-  "manifest": "outputs/clot_ml/locked/clot_gnn_v3/manifest.json",
-  "base_set_model": "clot_gnn_v2",
-  "promoted_at": "2026-08-17T18:34:18Z",
-  "docs": "docs/PHASE9_ML.md",
-  "supersedes": "clot_gnn_v2",
-  "scores_out_of_fold_cv": {
-    "all": {
-      "wall": 0.8845,
-      "off": 0.611
-    },
-    "priority": {
-      "wall": 0.9047,
-      "off": 0.7943
-    },
-    "baselines": {
-      "frozen": {
-        "wall": 0.7953,
-        "off": 0.4209
+  "name": "clot_gnn_v4",
+  "kind": "temporal_v4",
+  "path": "outputs/clot_ml/locked/clot_gnn_v4",
+  "manifest": "outputs/clot_ml/locked/clot_gnn_v4/manifest.json",
+  "promoted_at": "2026-08-21T06:45:22Z",
+  "docs": "docs/PHASE10_V4.md",
+  "supersedes": "clot_gnn_v3",
+  "scores_strict_cv": {
+    "protocol": "geometry-stratified 5-fold; every readout scalar selected on the OUT-OF-FOLD scores of vessels outside the held-out fold (scripts/eval_strict.py)",
+    "v4": {
+      "final": {
+        "all": {
+          "wall": 0.9176,
+          "off": 0.7366
+        },
+        "baseline": {
+          "wall": 0.9186,
+          "off": 0.6973
+        },
+        "priority": {
+          "wall": 0.9123,
+          "off": 0.8674
+        }
       },
-      "v2_plus_ode": {
-        "wall": 0.8547,
-        "off": 0.5369
+      "mean_over_time": {
+        "all": {
+          "wall": 0.875,
+          "off": 0.7188
+        },
+        "baseline": {
+          "wall": 0.8741,
+          "off": 0.6821
+        },
+        "priority": {
+          "wall": 0.8798,
+          "off": 0.8411
+        }
       },
-      "oracle_schedule": {
-        "wall": 0.8908,
-        "off": 0.6619
-      },
-      "oracle": {
-        "wall": 0.9705,
-        "off": 0.8396
+      "oracle_timing_same_set": {
+        "all": {
+          "wall": 0.9662,
+          "off": 0.8709
+        }
       }
+    },
+    "v3_same_protocol": {
+      "final": {
+        "all": {
+          "wall": 0.9014,
+          "off": 0.7011
+        }
+      },
+      "mean_over_time": {
+        "all": {
+          "wall": 0.8687,
+          "off": 0.6389
+        }
+      }
+    },
+    "physics_backbone": {
+      "final": {
+        "all": {
+          "wall": 0.8766,
+          "off": 0.4141
+        }
+      }
+    },
+    "noise_floor": {
+      "wall": 0.024,
+      "off": 0.091,
+      "note": "config spread of one arm; docs/PHASE10_V4.md 2. A 0.01-0.03 cohort-mean difference on these 19 vessels is not a result."
+    },
+    "paired_bootstrap_v3_to_v4": {
+      "mean_off": [
+        0.0685,
+        0.0281,
+        0.1116
+      ],
+      "final_off": [
+        0.0355,
+        0.01,
+        0.0619
+      ],
+      "mean_wall": [
+        0.0063,
+        -0.015,
+        0.0353
+      ],
+      "final_wall": [
+        0.0162,
+        -0.0153,
+        0.0572
+      ],
+      "note": "P(diff<=0) = 0.000 / 0.002 off-wall; 0.342 / 0.203 wall"
     }
   }
 }

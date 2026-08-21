@@ -803,9 +803,17 @@ Remaining to true oracle: +0.086 wall, +0.229 off-wall.
 
 ---
 
-## 14. THE LOCKED ARTIFACT — `clot_gnn_v3` (supersedes `clot_gnn_v2`, kept alongside v1/v2)
+## 14. THE LOCKED ARTIFACT — `clot_gnn_v3` (superseded 2026-08-21 by `clot_gnn_v4`)
 
-`clot_gnn_v3` ships the time-conditioned model from 13.9.  It does not retrain the GNN: it
+**No longer shipped.** `data/reference/clot_gnn_locked.json` now points to `clot_gnn_v4`
+(`kind: temporal_v4`) -- COMSOL's advection operator as features plus an honestly-selected
+readout (expected-score off-wall budget, adaptive wall cut) and an ODE-anchored learned
+off-wall lag, all validated under the strict protocol.  See `docs/PHASE10_V4.md` 8b, 10, 15
+for what changed and why; the numbers below are historical.  `clot_gnn_v3`'s files are
+untouched on disk and still loadable by name (`load_ensemble(name="clot_gnn_v3")` /
+`load_temporal_v3()`).
+
+`clot_gnn_v3` shipped the time-conditioned model from 13.9.  It does not retrain the GNN: it
 reuses the locked `clot_gnn_v2` ensemble as the committed SET (v2's classifier score is one
 of its input features) and adds a small gradient-boosted head that reads
 `{v2's 56 features, ODE onset time, t=0 rate r0, v2 score, query time, whether the ODE has

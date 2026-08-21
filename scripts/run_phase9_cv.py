@@ -30,7 +30,7 @@ OUT = REPO / "outputs/phase9_scores"
 PACKS = REPO / "data/processed/graphs_biochem_anchors"
 BASE = dict(epochs=80, dim=64, layers=4, drop=0.1, lr=3e-3, wd=1e-4, pos_weight=30.0,
             reg_w=1.0, metric_w=2.0, metric_start=0.3, rounds=3, off_mult=1.0,
-            metric="legacy", adv_fb=0)
+            metric="legacy", adv_fb=0, off_only=0, loss_shape_w=0.5)
 
 
 def main() -> int:
@@ -47,6 +47,7 @@ def main() -> int:
     cfg = SimpleNamespace(**{k: getattr(args, k) for k in BASE}, seeds=1)
     # advective recurrence (src/clot_ml/recurrent.feedback_channels_advective)
     cfg.adv_fb = bool(cfg.adv_fb)
+    cfg.off_only = bool(cfg.off_only)   # off-wall specialist (train_clot_gnn.train_one)
 
     dev_t = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cache = attach_physics(load_cache(args.cache))

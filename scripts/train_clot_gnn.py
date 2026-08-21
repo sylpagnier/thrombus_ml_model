@@ -161,7 +161,7 @@ def prepare(cache, anchors, mu, sd, dev_t, need_soft=True, need_fb=False, adv_fb
             g["D"] = to_torch_sparse(D, dev_t)
             gt = g["y"]
             g["gt_dil"] = soft_dilate(gt, g["D"]).detach()
-            g["off"] = 1.0 - g["wall"]
+        g["off"] = 1.0 - g["wall"]
         G[a] = g
     return G
 
@@ -174,6 +174,7 @@ def train_one(train_anchors, cache, args, dev_t, seed=0):
     sd[sd < 1e-6] = 1.0
     rounds = int(getattr(args, "rounds", 1))
     adv_fb = bool(getattr(args, "adv_fb", False))
+    off_only = bool(getattr(args, "off_only", False))
     G = prepare(cache, train_anchors, mu, sd, dev_t, need_soft=args.metric_w > 0,
                 need_fb=rounds > 1, adv_fb=adv_fb)
     in_dim = G[train_anchors[0]]["x"].shape[1]
@@ -194,19 +195,36 @@ def train_one(train_anchors, cache, args, dev_t, seed=0):
             g = G[train_anchors[i]]
             opt.zero_grad(set_to_none=True)
             logit, reg = rollout(model, g, rounds, adv_fb)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                logit, g["y"], pos_weight=pw)
-            loss = loss + args.reg_w * torch.nn.functional.smooth_l1_loss(reg, g["mat_gt"])
+            # OFF-WALL SPECIALIST.  The metric is domain-restricted, so a model whose whole
+            # loss is the off-wall domain is a legitimate arm (docs/PHASE9_ML.md 0 already
+            # reports a wall-specialised ensemble).  `off_mult` only reweights the metric
+            # term on a shared trunk that the wall's ~5x larger BCE still dominates; this
+            # masks BCE and the regression too, so nothing in the objective is wall.
+            if off_only:
+                sel_n = g["off"] > 0.5
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logit[sel_n], g["y"][sel_n], pos_weight=pw)
+                loss = loss + args.reg_w * torch.nn.functional.smooth_l1_loss(
+                    reg[sel_n], g["mat_gt"][sel_n])
+            else:
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logit, g["y"], pos_weight=pw)
+                loss = loss + args.reg_w * torch.nn.functional.smooth_l1_loss(
+                    reg, g["mat_gt"])
             if use_metric:
                 p = torch.sigmoid(logit)
                 parts = []
                 # off-wall is the domain furthest from target (0.63 vs 0.70) and it holds a
                 # fifth of the nodes; weight its metric term explicitly.
                 use_sev = str(getattr(args, "metric", "legacy")) == "severity"
-                for dom, mult in (("wall", 1.0), ("off", float(getattr(args, "off_mult", 1.0)))):
+                doms_ = ((("off", 1.0),) if off_only
+                         else (("wall", 1.0),
+                               ("off", float(getattr(args, "off_mult", 1.0)))))
+                for dom, mult in doms_:
                     sc_ = (soft_severity(p, g["y"], g["D"], g[dom], g["gt_dil"], SEVERITY_CFG)
                            if use_sev else
-                           soft_score(p, g["y"], g["D"], g[dom], g["gt_dil"]))
+                           soft_score(p, g["y"], g["D"], g[dom], g["gt_dil"],
+                                      float(getattr(args, "loss_shape_w", 0.5))))
                     if sc_ is not None:
                         parts.append(mult * (1.0 - sc_))
                 if parts:

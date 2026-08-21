@@ -262,6 +262,157 @@ def predict_temporal_v3(bundle: dict, data, times, *, flow: str = "gt",
     return dict(score=score, mask=series[int(times[-1])], onset=onset, series=series)
 
 
+# ---------------------------------------------------------------------------
+# v4: expected-score readout + ODE-anchored learned off-wall lag
+# (docs/PHASE10_V4.md 10, 15; scripts/promote_clot_gnn_v4_temporal.py)
+# ---------------------------------------------------------------------------
+def load_temporal_v4(name: str | None = None) -> dict:
+    """Load a v4-kind artifact: the v4 GNN ensemble plus the temporal readout.
+
+    Unlike v3's fixed thresholds, the committed SET is the readout family
+    `scripts/promote_clot_gnn_v4_temporal.py` selected honestly on the whole pool (an
+    adaptive keep/add cut on the wall, an expected-score budget off it -- 10), and the
+    off-wall SCHEDULE is a learned per-node lag anchored on the ODE's own owner crossing
+    (15) rather than a threshold rule.  The pickle holds only plain sklearn estimators, not
+    a wrapper class, so it does not depend on any script module at unpickle time.
+    """
+    ptr = json.loads(POINTER.read_text())
+    root = REPO / (ptr["path"] if name is None else f"outputs/clot_ml/locked/{name}")
+    manifest = json.loads((root / "manifest.json").read_text())
+    ens = load_ensemble(name=manifest["name"])
+    with (root / manifest["temporal_file"]).open("rb") as fh:
+        temporal = pickle.load(fh)
+    return dict(ens=ens, temporal=temporal, manifest=manifest)
+
+
+def _committed_set_v4(S: dict, sc: np.ndarray, temporal: dict) -> np.ndarray:
+    """Apply the shipped wall + off-wall committed-set specs to one vessel's scores."""
+    from scripts.eval_expected_score_readout import expected_curve  # noqa: PLC0415
+    from scripts.eval_strict import apply_adapt, readout_resid  # noqa: PLC0415
+    from src.clot_ml.softmetric import dilation_operator, to_torch_sparse  # noqa: PLC0415
+
+    def apply_spec(spec, dom_of):
+        d = dom_of(S)
+        if spec["kind"] == "cohort_cut":
+            return d & (sc >= spec["t"])
+        if spec["kind"] == "resid":
+            return d & readout_resid(S, sc, tuple(spec["th"]))
+        if spec["kind"] == "resid_adapt":
+            return d & apply_adapt(S, sc, "resid", tuple(spec["th"]), dom_of,
+                                   spec["b"], spec["med"])
+        if spec["kind"] == "expected_tuned":
+            dev = torch.device("cpu")
+            Dt = to_torch_sparse(dilation_operator(S["edge_index"], len(S["wall"]), 2), dev)
+            ks, vals = expected_curve(sc, d, Dt, dev, spec["gamma"])
+            if len(ks) < 2:
+                return np.zeros(len(sc), bool)
+            k = int(np.clip(round(ks[int(np.argmax(vals))] * spec["kscale"]), 1, ks[-1]))
+            order = np.flatnonzero(d)[np.argsort(-sc[d])]
+            m = np.zeros(len(sc), bool)
+            m[order[:k]] = True
+            return m
+        raise ValueError(spec["kind"])
+
+    wall_of, off_of = (lambda S_: S_["wall"]), (lambda S_: ~S_["wall"])
+    return (apply_spec(temporal["wall_spec"], wall_of)
+            | apply_spec(temporal["off_spec"], off_of))
+
+
+def predict_temporal_v4(bundle: dict, data, times, *, flow: str = "gt",
+                        sample: dict | None = None) -> dict:
+    """Time-conditioned v4 prediction.  Returns ``{score, mask, onset, series}``, the same
+    shape as :func:`predict_clot_series` / :func:`predict_temporal_v3`.
+
+    ``times`` is used directly as the evaluation grid (sorted, deduplicated) -- the
+    time-resolved transport field (mat_adv_t) is solved fresh for exactly these times, so
+    unlike a precomputed cache this is not restricted to any fixed grid density.
+    """
+    from scripts.eval_strict_temporal import (  # noqa: PLC0415
+        lag_features, node_features, ode_wall_series, offwall_by_learned_lag, series_masks,
+        time_block,
+    )
+    from src.clot_ml.temporal import ode_trajectory  # noqa: PLC0415
+    from src.clot_ml.transport import _node_volume, _solve_upwind, upwind_operator  # noqa: PLC0415,E501
+    from src.config import BiochemConfig  # noqa: PLC0415
+
+    temporal = bundle["temporal"]
+    bio = BiochemConfig(phase="biochem")
+    S = sample if sample is not None else build_sample(data, bio, flow=flow, variant="v4")
+    wall, owner = S["wall"], S["owner"]
+    crit = float(bio.viscosity_mat_crit)
+
+    sc = predict_scores(bundle["ens"], S)
+    gm = _committed_set_v4(S, sc, temporal)
+
+    grid = sorted({int(t) for t in times})
+    traj, t_grid = ode_trajectory(data, bio, flow=flow)
+    T_raw = traj.shape[0]
+    r0 = traj[1] / max(float(t_grid[1] - t_grid[0]), 1e-9)
+    hot = traj >= crit
+    oon = np.where(hot.any(0), hot.argmax(0), T_raw)
+
+    # time-resolved transport for exactly the requested grid -- build_temporal_transport.py's
+    # construction, run live (t=0 flow only, deploy-legal): the operator is linear and
+    # time-independent, only the wall source `traj[ti]` changes per query time.
+    pos = S["pos"].astype(np.float64)
+    u, v = S["u"].astype(np.float64), S["v"].astype(np.float64)
+    L = float(np.ptp(pos[:, 0]) + np.ptp(pos[:, 1]))
+    H = L / (float(np.median(np.hypot(u, v)[~wall])) + 1e-12)
+    F, out = upwind_operator(pos, S["edge_index"], u, v)
+    vol = _node_volume(pos, S["edge_index"])
+    n_grid = len(grid)
+    adv = np.zeros((n_grid, len(wall)), dtype=np.float32)
+    own = np.zeros_like(adv)
+    slf = np.zeros_like(adv)
+    for j, ti in enumerate(grid):
+        ti_c = int(np.clip(ti, 0, T_raw - 1))
+        src = np.zeros(len(wall))
+        src[wall] = np.maximum(traj[ti_c][wall], 0.0)
+        adv[j] = _solve_upwind(F, out, src * vol, vol, H).astype(np.float32)
+        own[j] = traj[ti_c][owner].astype(np.float32)
+        slf[j] = traj[ti_c].astype(np.float32)
+    tt = dict(mat_adv_t=np.log1p(np.maximum(adv, 0) / crit).astype(np.float32),
+              mat_owner_t=np.log1p(np.maximum(own, 0) / crit).astype(np.float32),
+              mat_self_t=np.log1p(np.maximum(slf, 0) / crit).astype(np.float32))
+
+    Vd = {"q": dict(S=S, T=T_raw, times=grid, r0=r0, oon=oon, oon_c={1.0: oon}, tt=tt,
+                    clock=[])}
+    oofs = {"v4": {"q": sc}}
+
+    P = np.zeros((n_grid, len(wall)), dtype=np.float32)
+    for j in range(n_grid):
+        row = np.concatenate([node_features(Vd, "q", oofs), time_block(Vd, "q", j)], axis=1)
+        P[j] = np.mean([m.predict_proba(row)[:, 1] for m in temporal["head"]], axis=0)
+    P = np.maximum.accumulate(P, axis=0)
+
+    th_w, cf_w = temporal["time_th_wall"]
+    th_o, cf_o = temporal["time_th_off"]
+    M_wall = series_masks(gm, P, th_w, bool(cf_w), owner, wall)
+
+    burden_gate = temporal["burden_gate"]
+    lag_models = temporal["lag_models"]
+    off_burden = int((gm & ~wall).sum())
+    if burden_gate is not None and lag_models and off_burden >= burden_gate:
+        lag_pred = np.mean([m.predict(lag_features(Vd, "q", oofs)) for m in lag_models],
+                           axis=0)
+        Mw_ode = ode_wall_series(Vd, "q", gm, n_grid)
+        M_off = offwall_by_learned_lag(Mw_ode, gm, owner, wall, lag_pred, bool(cf_o))
+    else:
+        M_off = series_masks(gm, P, th_o, bool(cf_o), owner, wall)
+
+    raw = {grid[j]: (M_wall[j] & wall) | (M_off[j] & ~wall) for j in range(n_grid)}
+    series = enforce_owner_and_monotone(raw, wall, owner, grid)
+
+    onset = np.full(len(wall), -1, dtype=int)
+    seen = np.zeros(len(wall), dtype=bool)
+    for ti in grid:
+        newly = series[int(ti)] & ~seen
+        onset[newly] = int(ti)
+        seen |= series[int(ti)]
+    score = P[-1] if n_grid else sc
+    return dict(score=score, mask=series[grid[-1]], onset=onset, series=series)
+
+
 def load_default(device=None) -> tuple[dict, str]:
     """Follow the pointer and load whatever generation is currently shipped.
 
@@ -270,6 +421,8 @@ def load_default(device=None) -> tuple[dict, str]:
     """
     ptr = json.loads(POINTER.read_text())
     kind = ptr.get("kind", "gnn_ensemble")
+    if kind == "temporal_v4":
+        return load_temporal_v4(), kind
     if kind == "temporal_v3":
         return load_temporal_v3(), kind
     return load_ensemble(device=device), kind
@@ -277,6 +430,8 @@ def load_default(device=None) -> tuple[dict, str]:
 
 def predict_default_series(bundle: dict, kind: str, data, times, *, flow: str = "gt",
                            sample: dict | None = None) -> dict:
+    if kind == "temporal_v4":
+        return predict_temporal_v4(bundle, data, times, flow=flow, sample=sample)
     if kind == "temporal_v3":
         return predict_temporal_v3(bundle, data, times, flow=flow, sample=sample)
     return predict_clot_series(bundle, data, times, flow=flow, sample=sample)

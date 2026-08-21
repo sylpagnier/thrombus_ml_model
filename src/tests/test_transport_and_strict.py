@@ -157,3 +157,36 @@ def test_v4_manifest_is_consistent_and_excludes_sealed():
     assert len(cols) == m["n_features"]
     assert cols[-1] == "phys_mask"
     assert cols[-14:-1] == list(V4_CHANNELS)
+
+
+def test_temporal_v4_manifest_is_consistent_and_excludes_sealed():
+    """If a temporal_v4-kind artifact is promoted (the shipped default, 2026-08-21+), it
+    must be internally consistent and its training pool must never include SEALED."""
+    import json
+
+    root = REPO / "outputs/clot_ml/locked/clot_gnn_v4"
+    if not (root / "temporal.pkl").exists():
+        pytest.skip("clot_gnn_v4 temporal head not promoted in this checkout")
+    man = json.loads((root / "manifest.json").read_text())
+    assert man["kind"] == "temporal_v4"
+    assert (root / man["temporal_file"]).exists()
+    from src.core_physics.wall_cohort_splits import SEALED
+    assert not (set(man["training_pool"]) & set(SEALED))
+    # the pickle must hold only plain sklearn estimators, not a custom wrapper class --
+    # unlike a class instance, these unpickle without scripts/ on sys.path (docs/PHASE10_V4.md)
+    import pickle
+    with (root / man["temporal_file"]).open("rb") as fh:
+        artifact = pickle.load(fh)
+    assert isinstance(artifact["head"], list) and len(artifact["head"]) > 0
+    assert artifact["lag_models"] is None or isinstance(artifact["lag_models"], list)
+
+
+def test_default_pointer_dispatches_to_a_known_kind():
+    """The shipped pointer's `kind` must be one this repo's dispatcher actually handles."""
+    import json
+
+    ptr_path = REPO / "data/reference/clot_gnn_locked.json"
+    if not ptr_path.exists():
+        pytest.skip("clot_gnn_locked not promoted in this checkout")
+    ptr = json.loads(ptr_path.read_text())
+    assert ptr.get("kind") in ("gnn_ensemble", "temporal_v3", "temporal_v4")

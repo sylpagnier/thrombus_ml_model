@@ -101,6 +101,15 @@ def precompute(pool, cache, n_times):
         for ti in reversed(times):
             go[gt[ti]] = ti
         traj, t = ode_trajectory(d, bio, flow="gt")
+        # The owner's crossing of c*crit, for several c.  Off-wall commits when
+        # att*Mat_owner >= crit, i.e. when the owner reaches crit/att -- PHASE9 12.2 found
+        # crit/att unreachable as a hard RULE because the ODE's Mat is biased low, but as
+        # the ANCHOR of a learned residual an unreachable level is just a shifted clock, and
+        # c=1 (the plain ODE crossing) is in the grid so this can only move if it pays.
+        oon_c = {}
+        for c in ANCHOR_C:
+            hc = traj >= c * crit
+            oon_c[c] = np.where(hc.any(0), hc.argmax(0), traj.shape[0])
         r0 = traj[1] / max(t[1] - t[0], 1e-9)               # t=0 deposition rate
         hot = traj >= crit
         oon = np.where(hot.any(0), hot.argmax(0), T)        # ODE crossing index
@@ -114,8 +123,15 @@ def precompute(pool, cache, n_times):
             # taken past `crit` (log1p(Mat/crit) >= log 2) by each grid time
             hot_t = (tt["mat_adv_t"] >= np.log(2.0))
             clock.append(hot_t.mean(axis=1).astype(np.float32))
+        # grid step at which the ADVECTED field crosses crit at this node -- the physics'
+        # own direct prediction of when an off-wall node clots, with no owner indirection.
+        if tt is not None:
+            hot_a = tt["mat_adv_t"] >= float(np.log(2.0))
+            t_adv = np.where(hot_a.any(0), hot_a.argmax(0), len(times)).astype(float)
+        else:
+            t_adv = np.full(len(S["wall"]), float(len(times)))
         V[a] = dict(S=S, T=T, times=times, gt=gt, go=go, oon=oon, r0=r0, clock=clock,
-                    tt=tt,
+                    tt=tt, t_adv=t_adv, oon_c=oon_c,
                     scorer={ti: SeverityScorer(S["edge_index"], gt[ti], len(S["wall"]),
                                                DEFAULT) for ti in times})
         print("   [prep] %s T=%d" % (a, T), flush=True)
@@ -134,6 +150,11 @@ def node_features(V, a, oofs):
 #: filled in by the two-stage pass: per anchor, the stage-1 predicted commit fraction of
 #: each node's OWNER wall node at each grid time.  Empty -> single-stage behaviour.
 OWNER_PRED: dict = {}
+#: one-element box so the apply path can see the chosen lag anchor
+LAG_ANCHOR = ["pred"]
+#: owner-trajectory levels (multiples of crit) offered as the lag anchor; 1.0 = plain ODE
+ANCHOR_C = [1.0, 2.0, 4.0, 8.0]
+ANCHOR_LEVEL = [1.0]
 
 
 def time_block(V, a, j, sel=None):
@@ -260,9 +281,42 @@ def predict_series(V, a, m, oofs):
 
 
 LAG_GRID = list(range(0, 9))
+#: predicted off-wall burden (committed nodes) above which the LEARNED lag is trusted.
+#: 0 = always, a large value = never; both ends are in the grid so the in-fold tuner can
+#: fall back to either pure rule.
+BURDEN_GRID = [0, 8, 15, 25, 40, 60, 90, 10 ** 9]
+#: committed WALL nodes above which the learned ODE-onset residual is trusted.  `None` is
+#: "never" -- i.e. keep the probability rule, which is the arm this must beat.
+WBURDEN_GRID = [None, 0, 40, 80, 150, 300]
 
 
-def fit_lag_model(V, anchors, oofs):
+def lag_features(V, a, oofs):
+    """Node features for the lag regression, plus the PHYSICS' own predicted lag.
+
+    The transport solve already answers the question the lag model is asking.  For each node
+    it gives the grid step at which the advected field crosses `crit`, and for that node's
+    owner the step at which the wall ODE does; their difference is the lag the physics
+    predicts, with no fitting at all.  Handing the regression that residual target is much
+    easier than making it rediscover the boundary-layer filling time from static features.
+    """
+    X = node_features(V, a, oofs)
+    v, S = V[a], V[a]["S"]
+    if v["tt"] is None:
+        return X
+    thr = float(np.log(2.0))
+    n_t = len(v["times"])
+
+    def first_cross(F):
+        hot = F >= thr
+        return np.where(hot.any(0), hot.argmax(0), n_t).astype(np.float32)
+
+    t_adv = first_cross(v["tt"]["mat_adv_t"])          # when transport says THIS node fires
+    t_own = first_cross(v["tt"]["mat_self_t"])[S["owner"]]   # ... and when its owner does
+    return np.concatenate([X, t_adv[:, None], t_own[:, None],
+                           (t_adv - t_own)[:, None]], axis=1)
+
+
+def fit_lag_model(V, anchors, oofs, seeds=3, anchor="pred"):
     """Regress the per-node lag behind the owner, on off-wall GT nodes.
 
     `scripts/diag_offwall_structure.py` measures the lag distribution (median +4 of 11 grid
@@ -282,29 +336,128 @@ def fit_lag_model(V, anchors, oofs):
         # the GT lag in GRID steps: where each node sits relative to its owner
         gi = np.searchsorted(np.asarray(v["times"]), v["go"], side="left")
         lag = (gi - gi[S["owner"]])[off]
-        Xs.append(node_features(V, a, oofs)[off])
+        Xs.append(lag_features(V, a, oofs)[off])
         ys.append(lag)
     if not Xs:
         return None
-    return HistGradientBoostingRegressor(max_iter=200, max_depth=4, learning_rate=0.06,
-                                         l2_regularization=1.0,
-                                         random_state=0).fit(np.concatenate(Xs),
-                                                             np.concatenate(ys))
+    X, y = np.concatenate(Xs), np.concatenate(ys)
+    ms = [HistGradientBoostingRegressor(max_iter=200, max_depth=4, learning_rate=0.06,
+                                        l2_regularization=1.0,
+                                        random_state=s).fit(X, y)
+          for s in range(max(int(seeds), 1))]
+    return _LagEnsemble(ms)
 
 
-def offwall_by_learned_lag(M_wall, gm, owner, wall, lag_per_node, commit_final=True):
-    """As :func:`offwall_by_lag` but with a per-node lag instead of a cohort constant."""
+def fit_wall_residual(V, anchors, oofs, seeds=3):
+    """Regress GT wall onset MINUS the ODE's onset, in grid steps, on committed wall nodes.
+
+    The off-wall gain came from a residual on a physics anchor (the owner's predicted onset)
+    rather than from predicting an absolute time; this is the same construction on the wall,
+    where the anchor is the zero-parameter ODE's own crossing.  `PHASE9` 13.5 measured that
+    the ODE's contribution is its **per-vessel time calibration**, not its ordering, which is
+    exactly what a residual keeps and an absolute prediction throws away.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    Xs, ys = [], []
+    for a in anchors:
+        v, S = V[a], V[a]["S"]
+        on = S["wall"] & (v["go"] < v["T"])
+        if not on.any():
+            continue
+        g = np.asarray(v["times"])
+        gi = np.searchsorted(g, v["go"], side="left")
+        oi = np.searchsorted(g, v["oon"], side="left")
+        Xs.append(lag_features(V, a, oofs)[on])
+        ys.append((gi - oi)[on])   # wall residual stays in grid steps (it is not de-quantised)
+    if not Xs:
+        return None
+    X, y = np.concatenate(Xs), np.concatenate(ys)
+    return _LagEnsemble([HistGradientBoostingRegressor(
+        max_iter=200, max_depth=4, learning_rate=0.06, l2_regularization=1.0,
+        random_state=s).fit(X, y) for s in range(max(int(seeds), 1))])
+
+
+def wall_by_residual(V, a, gm, resid, n_t):
+    """Wall mask series with onset = the ODE's grid onset + the learned residual."""
+    v, S = V[a], V[a]["S"]
+    oi = np.searchsorted(np.asarray(v["times"]), v["oon"], side="left")
+    on = np.clip(oi + np.rint(resid).astype(int), 0, n_t)
+    M = np.zeros((n_t, len(S["wall"])), dtype=bool)
+    for j in range(n_t):
+        M[j] = gm & S["wall"] & (on <= j)
+    M[-1] = gm & S["wall"]
+    return np.maximum.accumulate(M, axis=0)
+
+
+class _LagEnsemble:
+    """Seed-averaged lag regressor -- variance reduction is what this cohort rewards."""
+
+    def __init__(self, models):
+        self.models = models
+
+    def predict(self, X):
+        return np.mean([m.predict(X) for m in self.models], axis=0)
+
+
+def offwall_by_learned_lag(M_wall, gm, owner, wall, lag_per_node, commit_final=True,
+                           times=None, horizon=None):
+    """As :func:`offwall_by_lag` but with a per-node lag instead of a cohort constant.
+
+    ``times``/``horizon`` switch the lag from WHOLE GRID STEPS to a continuous fraction of
+    the run.  The quantised form is why refining the regression was measured EXACTLY neutral
+    to four decimals: the lag is rounded to one of eleven steps, so a better prediction never
+    crosses a step boundary and the mask does not change.  Continuous lags are added to the
+    owner's commit TIME and compared against the real grid times, so a predicted 0.36 T and a
+    0.44 T land on different steps where 4-vs-4 steps could not.
+    """
     T, N = M_wall.shape
     won = np.full(N, T, dtype=int)
     for j in range(T - 1, -1, -1):
         won[M_wall[j]] = j
-    on = np.clip(won[owner] + np.rint(lag_per_node).astype(int), 0, T)
-    M = np.zeros((T, N), dtype=bool)
-    for j in range(T):
-        M[j] = gm & ~wall & (on <= j)
+    if times is None or horizon is None:
+        on_idx = np.clip(won[owner] + np.rint(lag_per_node).astype(int), 0, T)
+        M = np.zeros((T, N), dtype=bool)
+        for j in range(T):
+            M[j] = gm & ~wall & (on_idx <= j)
+    else:
+        tt = np.asarray(times, dtype=float)
+        big = float(tt[-1]) + 10.0 * float(horizon)
+        own_t = np.where(won[owner] < T, tt[np.clip(won[owner], 0, T - 1)], big)
+        on_t = own_t + np.asarray(lag_per_node, dtype=float) * float(horizon)
+        M = np.zeros((T, N), dtype=bool)
+        for j in range(T):
+            M[j] = gm & ~wall & (on_t <= tt[j])
     if commit_final:
         M[-1] = gm & ~wall
     return np.maximum.accumulate(M, axis=0)
+
+
+def offwall_from_adv(V, a, gm, resid, n_t, commit_final=True):
+    """Off-wall onset = the advected field's own crossing + a learned residual.
+
+    The most direct physics anchor available: `mat_adv(t)` is COMSOL's transport operator
+    solved on the actual mesh, so its crossing of `crit` is the equation's own answer to
+    "when does this node clot".  Everything learned is the correction to it.
+    """
+    S = V[a]["S"]
+    on = V[a]["t_adv"] + np.rint(np.asarray(resid, float))
+    M = np.zeros((n_t, len(S["wall"])), dtype=bool)
+    for j in range(n_t):
+        M[j] = gm & ~S["wall"] & (on <= j)
+    if commit_final:
+        M[-1] = gm & ~S["wall"]
+    return np.maximum.accumulate(M, axis=0)
+
+
+def ode_wall_series(V, a, gm, n_t):
+    """Wall commit series taken from the ODE's own crossing -- the physics anchor."""
+    v, S = V[a], V[a]["S"]
+    oi = np.searchsorted(np.asarray(v["times"]), v["oon_c"][ANCHOR_LEVEL[0]], side="left")
+    M = np.zeros((n_t, len(S["wall"])), dtype=bool)
+    for j in range(n_t):
+        M[j] = gm & S["wall"] & (oi <= j)
+    return M
 
 
 def offwall_by_lag(M_wall, gm, owner, wall, lag, commit_final=True):
@@ -375,17 +528,24 @@ def series_masks(gm, P, th, commit_final=True, owner=None, wall=None):
     return M
 
 
-def score_vessel(V, a, P, oofs, set_th, time_th, prefix="", lag=None):
+def score_vessel(V, a, P, oofs, set_th, time_th, prefix="", lag=None,
+                 wall_resid=None, owner_cut=None):
     """-> (mean-over-time, final) per domain."""
     v, S = V[a], V[a]["S"]
     gm = candidate_mask(S, arm_scores(oofs, a), set_th, a)
     out = {}
-    M_wall = series_masks(gm, P, time_th[0][0], time_th[0][1], S["owner"], S["wall"])
+    M_wall = (wall_by_residual(V, a, gm, wall_resid, len(v["times"]))
+              if wall_resid is not None
+              else series_masks(gm, P, time_th[0][0], time_th[0][1], S["owner"], S["wall"]))
     for key, dom in (("wall", S["wall"]), ("off", ~S["wall"])):
         th, cf = time_th[0] if key == "wall" else time_th[1]
-        if key == "off" and lag is not None:
+        if key == "wall" and wall_resid is not None:
+            M = M_wall
+        elif key == "off" and lag is not None:
             Mw = M_wall & S["wall"]
-            if isinstance(lag, tuple):          # ("learned", per-node prediction)
+            if isinstance(lag, tuple) and LAG_ANCHOR[0] == "adv":
+                M = offwall_from_adv(V, a, gm, lag[1], len(v["times"]), cf)
+            elif isinstance(lag, tuple):        # ("learned", per-node prediction)
                 M = offwall_by_learned_lag(Mw, gm, S["owner"], S["wall"], lag[1], cf)
             else:
                 M = offwall_by_lag(Mw, gm, S["owner"], S["wall"], lag, cf)
@@ -434,10 +594,77 @@ def tune_set(cache, V, anchors, oofs):
     return out
 
 
-def tune_lag(V, anchors, Pin, oofs, set_th, time_th, lag_model=None):
-    """Cohort or learned lag, chosen on inner OOF predictions.  `None` if the prob rule wins."""
+def offwall_burden(V, a, oofs, set_th):
+    """How many off-wall nodes this vessel's committed set holds -- label-free."""
+    S = V[a]["S"]
+    return int((candidate_mask(S, arm_scores(oofs, a), set_th, a) & ~S["wall"]).sum())
+
+
+def _lag_quality(V, anchors, Pin, oofs, set_th, time_th, lag_pred, lag):
+    """Mean off-wall score of a given (anchor level, lag rule) on the selection vessels."""
+    vals = []
+    for a in anchors:
+        v, S = V[a], V[a]["S"]
+        dom = ~S["wall"]
+        gm = candidate_mask(S, arm_scores(oofs, a), set_th, a)
+        th, cf = time_th[1]
+        use = isinstance(lag, tuple) and a in lag_pred and             offwall_burden(V, a, oofs, set_th) >= lag[1]
+        if use:
+            Mw = ode_wall_series(V, a, gm, len(v["times"]))
+            M = offwall_by_learned_lag(Mw, gm, S["owner"], S["wall"], lag_pred[a], cf)
+        else:
+            M = series_masks(gm, Pin[a], th, cf, S["owner"], S["wall"])
+        for j, ti in enumerate(v["times"]):
+            x = v["scorer"][ti].score(M[j] & dom, dom)
+            if x == x:
+                vals.append(x)
+    return float(np.mean(vals)) if vals else -1e9
+
+
+def tune_owner_cut(V, anchors, Pin, oofs, set_th, time_th, lag_pred):
+    """The wall cut used ONLY to date the owner for the off-wall lag rule.
+
+    The off-wall arm needs "when did my owner commit"; it has been reusing the wall cut that
+    maximises the WALL score, which is a different objective.  A cut that is slightly early
+    or late can be better for the wall's own mask and worse as a clock.  One scalar, chosen
+    in-fold against the OFF-WALL score.
+    """
     best = None
-    opts = [None] + LAG_GRID + (["learned"] if lag_model is not None else [])
+    for t_o in TIME_GRID:
+        vals = []
+        for a in anchors:
+            v, S = V[a], V[a]["S"]
+            dom = ~S["wall"]
+            gm = candidate_mask(S, arm_scores(oofs, a), set_th, a)
+            Mw = series_masks(gm, Pin[a], t_o, time_th[0][1], S["owner"], S["wall"]) & S["wall"]
+            M = offwall_by_learned_lag(Mw, gm, S["owner"], S["wall"], lag_pred[a],
+                                       time_th[1][1])
+            for j, ti in enumerate(v["times"]):
+                x = v["scorer"][ti].score(M[j] & dom, dom)
+                if x == x:
+                    vals.append(x)
+        q = float(np.mean(vals)) if vals else -1e9
+        if best is None or q > best[0]:
+            best = (q, float(t_o))
+    return best[1]
+
+
+def tune_lag(V, anchors, Pin, oofs, set_th, time_th, lag_pred=None):
+    """Cohort / learned / burden-gated lag, on inner OOF predictions.
+
+    The learned per-node lag regression wins the in-fold selection every time and, held out,
+    gains **+0.056 on the priority class** while losing 0.023 on the low-burden baseline
+    vessels (docs/PHASE10_V4.md 12.2b).  That split is not mysterious: the stenoses carry 84
+    and 122 off-wall GT nodes and `patient005` carries 4, so on a low-burden vessel the
+    regression is extrapolating and a single mistimed node is most of the score.
+
+    So the lag rule is GATED on the predicted off-wall burden, which needs no label -- it is
+    the size of the committed set.  Below the gate the probability rule is used instead.
+    """
+    best = None
+    opts = [None] + LAG_GRID
+    if lag_pred:
+        opts += [("learned", B) for B in BURDEN_GRID]
     for lag in opts:
         vals = []
         for a in anchors:
@@ -445,14 +672,19 @@ def tune_lag(V, anchors, Pin, oofs, set_th, time_th, lag_model=None):
             dom = ~S["wall"]
             gm = candidate_mask(S, arm_scores(oofs, a), set_th, a)
             th, cf = time_th[1]
-            if lag is None:
+            use_learned = (isinstance(lag, tuple)
+                           and offwall_burden(V, a, oofs, set_th) >= lag[1])
+            if lag is None or (isinstance(lag, tuple) and not use_learned):
                 M = series_masks(gm, Pin[a], th, cf, S["owner"], S["wall"])
             else:
-                Mw = series_masks(gm, Pin[a], time_th[0][0], time_th[0][1],
-                                  S["owner"], S["wall"]) & S["wall"]
-                if lag == "learned":
-                    pl = lag_model.predict(node_features(V, a, oofs))
-                    M = offwall_by_learned_lag(Mw, gm, S["owner"], S["wall"], pl, cf)
+                Mw = (ode_wall_series(V, a, gm, len(v["times"])) if LAG_ANCHOR[0] == "ode"
+                      else series_masks(gm, Pin[a], time_th[0][0], time_th[0][1],
+                                        S["owner"], S["wall"]) & S["wall"])
+                if use_learned and LAG_ANCHOR[0] == "adv":
+                    M = offwall_from_adv(V, a, gm, lag_pred[a], len(v["times"]), cf)
+                elif use_learned:
+                    M = offwall_by_learned_lag(Mw, gm, S["owner"], S["wall"],
+                                               lag_pred[a], cf)
                 else:
                     M = offwall_by_lag(Mw, gm, S["owner"], S["wall"], lag, cf)
             for j, ti in enumerate(v["times"]):
@@ -501,6 +733,16 @@ def main() -> int:
     ap.add_argument("--n-times", type=int, default=11)
     ap.add_argument("--inner", type=int, default=3)
     ap.add_argument("--save", default="")
+    ap.add_argument("--wall-resid", action="store_true",
+                    help="wall onset = the ODE's grid onset + a learned residual")
+    ap.add_argument("--lag-seeds", type=int, default=3,
+                    help="seed-average the lag regression")
+    ap.add_argument("--lag-anchor", default="pred", choices=["pred", "ode", "adv"],
+                    help="date the owner by the head's prediction, or by the ODE crossing")
+    ap.add_argument("--owner-cut", action="store_true",
+                    help="tune a separate wall cut used only to date the owner off-wall")
+    ap.add_argument("--oracle-lag", action="store_true",
+                    help="ORACLE per-node lag with the PREDICTED wall onset (a probe)")
     ap.add_argument("--learn-lag", action="store_true",
                     help="offer a PER-NODE learned lag alongside the cohort constants")
     ap.add_argument("--owner-lag", action="store_true",
@@ -538,6 +780,7 @@ def main() -> int:
         EXTERNAL_SET.update({a: z[a].astype(bool) for a in z.files})
         print("[i] committed set taken from %s (%d vessels)"
               % (args.set_masks, len(EXTERNAL_SET)), flush=True)
+    LAG_ANCHOR[0] = args.lag_anchor
     print("[i] precomputing %d vessels ..." % len(pool), flush=True)
     V = precompute(pool, cache, args.n_times)
     if args.no_tt:
@@ -588,15 +831,115 @@ def main() -> int:
             m_k = fit_head(V, sel, oofs, set_th, args.head_seeds)
 
         time_th = tune_time(V, sel, Pin, oofs, set_th)
-        lag = None
-        if args.owner_lag:
-            lm = fit_lag_model(V, sel, oofs) if args.learn_lag else None
-            lag = tune_lag(V, sel, Pin, oofs, set_th, time_th, lm)
+        owner_cut = None
+        wres, wm, wres_pred = None, None, {}
+        if args.wall_resid:
+            for iv in inner:
+                itr = [a for a in sel if a not in iv]
+                m_w = fit_wall_residual(V, itr, oofs, args.lag_seeds)
+                if m_w is None:
+                    continue
+                for a in iv:
+                    wres_pred[a] = m_w.predict(lag_features(V, a, oofs))
+            wm = fit_wall_residual(V, sel, oofs, args.lag_seeds)
+            # Choose against the probability rule on the inner out-of-fold predictions, and
+            # GATE on wall burden -- the same construction that made the off-wall lag work
+            # (12.2b).  A residual fitted across the cohort is only trustworthy on vessels
+            # with enough committed wall nodes to have contributed to it.
+            n_t = len(V[sel[0]]["times"])
+
+            def wburden(a):
+                S = V[a]["S"]
+                return int((candidate_mask(S, arm_scores(oofs, a), set_th, a)
+                            & S["wall"]).sum())
+
+            best = None
+            for B in WBURDEN_GRID:
+                vals = []
+                for a in sel:
+                    v, S = V[a], V[a]["S"]
+                    gm = candidate_mask(S, arm_scores(oofs, a), set_th, a)
+                    th, cf = time_th[0]
+                    use = (B is not None) and (a in wres_pred) and (wburden(a) >= B)
+                    M = (wall_by_residual(V, a, gm, wres_pred[a], n_t) if use
+                         else series_masks(gm, Pin[a], th, cf, S["owner"], S["wall"]))
+                    for j, ti in enumerate(v["times"]):
+                        x = v["scorer"][ti].score(M[j] & S["wall"], S["wall"])
+                        if x == x:
+                            vals.append(x)
+                q = float(np.mean(vals)) if vals else -1e9
+                if best is None or q > best[0]:
+                    best = (q, B)
+            wres = best[1]
+        # ORACLE-LAG probe: the true per-node lag with our OWN predicted wall onset.  This
+        # splits the remaining timing gap into "we mis-predict the lag" and "we mis-predict
+        # when the owner commits", which need opposite work.
+        if args.oracle_lag:
+            for a in pool:
+                v_, S_ = V[a], V[a]["S"]
+                g_ = np.asarray(v_["times"])
+                gi = np.searchsorted(g_, v_["go"], side="left")
+                lag_pred_o = (gi - gi[S_["owner"]]).astype(float)
+                OWNER_PRED.setdefault("__orc__", {})[a] = lag_pred_o
+        lag, lm, lag_pred = None, None, {}
+        if args.oracle_lag:
+            lag = ("learned", 0)
+            lag_pred = {a: OWNER_PRED["__orc__"][a] for a in pool}
+            lm = None
+        elif args.owner_lag:
+            if args.learn_lag:
+                # OUT-OF-FOLD lag predictions for the selection vessels, on the same inner
+                # split the head uses.  Fitting the lag model on `sel` and then judging it
+                # on `sel` is the leak this whole evaluator exists to remove: the regression
+                # would be reading its own training labels, and the in-fold tuner would then
+                # always prefer it -- which is exactly what it did before this was fixed.
+                for iv in inner:
+                    itr = [a for a in sel if a not in iv]
+                    m_l = fit_lag_model(V, itr, oofs, args.lag_seeds, args.lag_anchor)
+                    if m_l is None:
+                        continue
+                    for a in iv:
+                        lag_pred[a] = m_l.predict(lag_features(V, a, oofs))
+                lm = fit_lag_model(V, sel, oofs, args.lag_seeds, args.lag_anchor)
+            if args.lag_anchor == "ode" and len(ANCHOR_C) > 1:
+                bestc = None
+                for c in ANCHOR_C:
+                    ANCHOR_LEVEL[0] = c
+                    lp = {}
+                    for iv in inner:
+                        m_c = fit_lag_model(V, [a for a in sel if a not in iv], oofs,
+                                            args.lag_seeds, "ode")
+                        if m_c is None:
+                            continue
+                        for a in iv:
+                            lp[a] = m_c.predict(lag_features(V, a, oofs))
+                    lg = tune_lag(V, sel, Pin, oofs, set_th, time_th, lp)
+                    q = _lag_quality(V, sel, Pin, oofs, set_th, time_th, lp, lg)
+                    if bestc is None or q > bestc[0]:
+                        bestc = (q, c, lp, lg)
+                ANCHOR_LEVEL[0] = bestc[1]
+                lag_pred, lag = bestc[2], bestc[3]
+                lm = fit_lag_model(V, sel, oofs, args.lag_seeds, "ode")
+            else:
+                lag = tune_lag(V, sel, Pin, oofs, set_th, time_th, lag_pred)
+            if args.owner_cut and isinstance(lag, tuple) and lag_pred:
+                owner_cut = tune_owner_cut(V, sel, Pin, oofs, set_th, time_th, lag_pred)
         for a in held:
             P = predict_series(V, a, m_k, oofs)
-            lag_a = (("learned", lm.predict(node_features(V, a, oofs)))
-                     if lag == "learned" else lag)
-            r = score_vessel(V, a, P, oofs, set_th, time_th, lag=lag_a)
+            lag_a = lag
+            if isinstance(lag, tuple):
+                pl = (lag_pred[a] if lm is None else lm.predict(lag_features(V, a, oofs)))
+                lag_a = (("learned", pl)
+                         if offwall_burden(V, a, oofs, set_th) >= lag[1] else None)
+            wr = None
+            if wres is not None and wm is not None:
+                S_ = V[a]["S"]
+                nb = int((candidate_mask(S_, arm_scores(oofs, a), set_th, a)
+                          & S_["wall"]).sum())
+                if nb >= wres:
+                    wr = wm.predict(lag_features(V, a, oofs))
+            r = score_vessel(V, a, P, oofs, set_th, time_th, lag=lag_a, wall_resid=wr,
+                             owner_cut=owner_cut)
             # the STATIC readout on the same set, as the reference the temporal arm must
             # beat: frozen mask, replayed at every timestep
             r.update(score_vessel(V, a, np.ones_like(P), oofs, set_th,
@@ -612,7 +955,9 @@ def main() -> int:
         desc = " ".join("%s:%s/%s" % (d, set_th[d][0][:10], set_th[d][1])
                         for d in ("wall", "off"))
         tdesc = (" ".join("%.2f%s" % (t, "C" if c else "-") for t, c in time_th)
-                 + ("" if lag is None else " lag=%s" % lag))
+                 + ("" if lag is None else " lag=%s" % (lag,))
+                 + ("" if wres is None else " wres>=%d" % wres)
+                 + ("" if owner_cut is None else " ocut=%.2f" % owner_cut))
         print("  fold %d %s time=%s  %s  (%.0fs)"
               % (k, desc, tdesc,
                  " ".join("%s m%.3f f%.3f" % (a[-3:], rows[a]["wall"], rows[a]["wall_final"])

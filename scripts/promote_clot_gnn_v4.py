@@ -11,7 +11,7 @@ outside the held-out fold -- `scripts/eval_strict.py`, `scripts/eval_strict_temp
 
                   mean wall   mean off   FIN wall   FIN off
     v3 (cv5a,b,c)    0.8687     0.6389     0.9014     0.7011
-    v4 (v5a,b,c)     0.8750     0.6833     0.9176     0.7359
+    v4 (v5a,b,c)     0.8750     0.7188     0.9176     0.7366
 
 Read `docs/PHASE10_V4.md` 2 before quoting any of it: the cohort noise floor is +-0.024 wall
 and +-0.091 off-wall, so what supports v4 is the direction being consistent on all four
@@ -63,22 +63,25 @@ MEMBERS = {
 STRICT_CV = dict(
     protocol=("geometry-stratified 5-fold; every readout scalar selected on the OUT-OF-FOLD "
               "scores of vessels outside the held-out fold (scripts/eval_strict.py)"),
-    v4=dict(final=dict(all=dict(wall=0.9176, off=0.7359),
+    v4=dict(final=dict(all=dict(wall=0.9176, off=0.7366),
                        baseline=dict(wall=0.9186, off=0.6973),
-                       priority=dict(wall=0.9123, off=0.8644)),
-            mean_over_time=dict(all=dict(wall=0.8750, off=0.6833),
-                                baseline=dict(wall=0.8741, off=0.6532),
-                                priority=dict(wall=0.8798, off=0.7836)),
-            oracle_timing_same_set=dict(all=dict(wall=0.9662, off=0.8910))),
+                       priority=dict(wall=0.9123, off=0.8674)),
+            mean_over_time=dict(all=dict(wall=0.8750, off=0.7188),
+                                baseline=dict(wall=0.8741, off=0.6821),
+                                priority=dict(wall=0.8798, off=0.8411)),
+            oracle_timing_same_set=dict(all=dict(wall=0.9662, off=0.8709))),
     v3_same_protocol=dict(final=dict(all=dict(wall=0.9014, off=0.7011)),
                           mean_over_time=dict(all=dict(wall=0.8687, off=0.6389))),
     physics_backbone=dict(final=dict(all=dict(wall=0.8766, off=0.4141))),
     noise_floor=dict(wall=0.024, off=0.091,
                      note=("config spread of one arm; docs/PHASE10_V4.md 2. A 0.01-0.03 "
                            "cohort-mean difference on these 19 vessels is not a result.")),
-    paired_bootstrap_final_v3_to_v4=dict(wall=[0.0124, -0.0169, 0.0528],
-                                         off=[-0.0015, -0.0283, 0.0209],
-                                         note="feature effect only, before the readout"))
+    #: paired vessel bootstrap of the FULL v3 -> v4 change, [mean, lo95, hi95].
+    #: The OFF-WALL gains are significant; the WALL gains are not.
+    paired_bootstrap_v3_to_v4=dict(
+        mean_off=[0.0685, 0.0281, 0.1116], final_off=[0.0355, 0.0100, 0.0619],
+        mean_wall=[0.0063, -0.0150, 0.0353], final_wall=[0.0162, -0.0153, 0.0572],
+        note="P(diff<=0) = 0.000 / 0.002 off-wall; 0.342 / 0.203 wall"))
 
 #: The readout these scores are produced with.  It is NOT a plain threshold, and the choice
 #: between the two arms is made per domain inside each fold
@@ -93,8 +96,15 @@ READOUT = dict(
          "in-fold scalars (gamma sharpening, prefix scale) correcting for miscalibration. "
          "This is the fix for the low-burden precision problem: the budget adapts per "
          "vessel with no label.  Off-wall 0.7136 -> 0.7359 against a cohort cut."),
-    temporal=("time-conditioned head, 4 seeds averaged, monotone in time, and every node in "
-              "the committed set is clot at the last timestep (commit_final)"),
+    temporal=("time-conditioned head, 4 seeds averaged, monotone in time, every node in the "
+              "committed set clot at the last timestep (commit_final), off-wall never before "
+              "its owner, and OFF-WALL ONSET from a learned per-node LAG behind the owner "
+              "(--owner-lag --learn-lag --lag-anchor ode): the lag regression is fitted "
+              "OUT-OF-FOLD on the inner split, gated on predicted off-wall burden, and "
+              "anchored on the ODE's OWN owner crossing rather than the head's predicted "
+              "one -- target and anchor must be the same object at train and apply time, "
+              "and wall-onset error is worth 2.3x the lag error (docs/PHASE10_V4.md 15). "
+              "Together worth +0.038 mean-over-time off-wall."),
     scripts=["scripts/eval_expected_score_readout.py", "scripts/eval_strict_temporal.py"])
 
 

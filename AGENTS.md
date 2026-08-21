@@ -114,6 +114,12 @@ Corollary: prefer levers that do not need a per-config effect to be detectable �
 and deterministic readout fixes. Adding selection layers (inner-CV family choice, per-domain
 family choice, rule selection) was measured and all of it **loses** at this n.
 
+**Wound vessels: [docs/WOUND_PROGRESS.md](docs/WOUND_PROGRESS.md)** — the wound is the wall
+law with the shear gates deleted; 100% of wound nodes clot and the t=0 gate fires on 0% of
+them. Also records the solid-boundary pack fix (`solid_boundary_mask`) and why
+`comsol_models/phase2_template_*.mph` no longer exist — **read the `.mph` off the latest
+`phase2_wound_*` / `phase2_nowound_*` patient runs**, which are always the format in use.
+
 **Active findings: [docs/PHASE7_FINDINGS.md](docs/PHASE7_FINDINGS.md)** — the off-wall
 problem, `.mph` reading, and the corrections it makes to Phase 6. Read it first.
 Earlier scope: [docs/WALL_MODEL_PLAN.md](docs/WALL_MODEL_PLAN.md) (wall model only, wall
@@ -122,7 +128,8 @@ Historical context: [docs/GENERALIZATION_PLAN.md](docs/GENERALIZATION_PLAN.md).
 
 ## COMSOL ground truth — read the `.mph`, do not re-derive from exports
 
-`.mph` files are **zip archives**; `smodel.json` inside is the full model tree. Trust the
+`.mph` files are **zip archives**; `smodel.json` inside is the model tree and `dmodel.xml`
+carries the expressions (`J0` strings are only in `dmodel.xml`). Trust the
 **physics node tree** over the parameter list (stale parameters for deleted mechanisms
 survive). `phase2_nowound_001/002/003.mph` are an experimental branch and are **not** the
 production physics — see [docs/PHASE7_FINDINGS.md](docs/PHASE7_FINDINGS.md) §0–1.

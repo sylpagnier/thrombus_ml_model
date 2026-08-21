@@ -76,6 +76,15 @@ def expected_curve(sc, dom, D_t, dev, gamma):
     return ks, np.asarray(vals)
 
 
+def rank01(x, d):
+    out = np.zeros_like(np.asarray(x, np.float64))
+    v = np.asarray(x, np.float64)[d]
+    if v.size == 0:
+        return out
+    out[d] = np.argsort(np.argsort(v)).astype(np.float64) / max(v.size - 1, 1)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tags", required=True)
@@ -90,6 +99,19 @@ def main() -> int:
     cache = attach_physics(load_cache(args.cache))
     pool, folds, sc_all = load_scores(args.tags.split(","))
     pool = [a for a in pool if a in cache]
+    # the regression head, if the tags carry it -- a MEASURABLY better off-wall field
+    # (scripts/eval_reg_readout.py: 0.6006 against the classifier's 0.5105 on the same
+    # weights) that fusion could not use as a THRESHOLD field.  Here it is used only to
+    # ORDER the nodes; the prefix length still comes from the expected-score objective, so
+    # the rank-flattening that killed `fuse_rank` does not apply.
+    zs = [np.load(REPO / f"outputs/phase9_scores/{t}.npz", allow_pickle=True)
+          for t in args.tags.split(",")]
+    has_reg = all(any(k.startswith("reg|") for k in z.files) for z in zs)
+    reg = {}
+    if has_reg:
+        fo0 = {a: k for k, held in folds.items() for a in held}
+        for a in pool:
+            reg[a] = np.mean([z["reg|%d|%s" % (fo0[a], a)] for z in zs], axis=0)
     classes = classes_for(pool, PACKS)
     fo = {a: k for k, held in folds.items() for a in held}
     sc = {a: sc_all[(fo[a], a)] for a in pool}
@@ -108,19 +130,27 @@ def main() -> int:
                 curves[(a, dk, g)] = expected_curve(sc[a], d_of(cache[a]), Dt[a], dev, g)
     print("[i] done", flush=True)
 
-    def mask_for(a, dk, d_of, g, ks_scale):
+    def order_field(a, d, how):
+        if how == "cls" or not has_reg:
+            return sc[a]
+        if how == "reg":
+            return reg[a]
+        return 0.5 * (rank01(sc[a], d) + rank01(reg[a], d))       # "both"
+
+    def mask_for(a, dk, d_of, g, ks_scale, how="cls"):
         ks, vals = curves[(a, dk, g)]
         if len(ks) < 2:
             return np.zeros(len(sc[a]), bool)
         k = int(np.clip(round(ks[int(np.argmax(vals))] * ks_scale), 1, ks[-1]))
         d = d_of(cache[a])
-        order = np.flatnonzero(d)[np.argsort(-sc[a][d])]
+        f = order_field(a, d, how)
+        order = np.flatnonzero(d)[np.argsort(-f[d])]
         m = np.zeros(len(sc[a]), bool)
         m[order[:k]] = True
         return m
 
-    ARMS = ["cohort_cut", "expected", "expected_tuned", "resid", "resid_adapt",
-            "nested_pick"]
+    ARMS = ["cohort_cut", "expected", "expected_tuned", "expected_reg", "expected_both",
+            "resid", "resid_adapt", "nested_pick"]
     rows = {r: {a: {} for a in pool} for r in ARMS}
     masks = {a: np.zeros(len(sc[a]), bool) for a in pool}
     for k, held in sorted(folds.items()):
@@ -134,17 +164,22 @@ def main() -> int:
                 if v and np.mean(v) > top:
                     top, t_cut = float(np.mean(v)), float(t)
             # expected-score readout, gamma and kscale fitted on the selection vessels
-            best = None
-            for g in GAMMA:
-                for kscl in KSCALE:
-                    v = []
-                    for a in sel:
-                        x = vs[a].score(mask_for(a, dk, d_of, g, kscl), d_of(cache[a]))
-                        if x == x:
-                            v.append(x)
-                    q = float(np.mean(v)) if v else -1e9
-                    if best is None or q > best[0]:
-                        best = (q, g, kscl)
+            bests = {}
+            for how in ("cls", "reg", "both"):
+                b = None
+                for g in GAMMA:
+                    for kscl in KSCALE:
+                        v = []
+                        for a in sel:
+                            x = vs[a].score(mask_for(a, dk, d_of, g, kscl, how),
+                                            d_of(cache[a]))
+                            if x == x:
+                                v.append(x)
+                        q = float(np.mean(v)) if v else -1e9
+                        if b is None or q > b[0]:
+                            b = (q, g, kscl)
+                bests[how] = b
+            best = bests["cls"]
             _, g_b, k_b = best
             # the physics-conditioned readout, and its adaptive perturbation
             sub = {a: sc[a] for a in sel}
@@ -160,6 +195,10 @@ def main() -> int:
                     d_of(cache[a]) & (sc[a] >= t_cut), d_of(cache[a]))),
                     lambda a: d_of(cache[a]) & (sc[a] >= t_cut)),
                 "expected_tuned": (best[0], lambda a: mask_for(a, dk, d_of, g_b, k_b)),
+                "expected_reg": (bests["reg"][0], lambda a: mask_for(
+                    a, dk, d_of, bests["reg"][1], bests["reg"][2], "reg")),
+                "expected_both": (bests["both"][0], lambda a: mask_for(
+                    a, dk, d_of, bests["both"][1], bests["both"][2], "both")),
                 "resid": (q_of(lambda a: vs[a].score(
                     FAMILIES["resid"][1](cache[a], sc[a], th_r) & d_of(cache[a]),
                     d_of(cache[a]))),
@@ -177,6 +216,8 @@ def main() -> int:
                 rows["expected"][a][dk] = vs[a].score(mask_for(a, dk, d_of, 1.0, 1.0), d)
                 rows["expected_tuned"][a][dk] = vs[a].score(
                     cands["expected_tuned"][1](a), d)
+                rows["expected_reg"][a][dk] = vs[a].score(cands["expected_reg"][1](a), d)
+                rows["expected_both"][a][dk] = vs[a].score(cands["expected_both"][1](a), d)
                 rows["resid"][a][dk] = vs[a].score(cands["resid"][1](a), d)
                 rows["resid_adapt"][a][dk] = vs[a].score(cands["resid_adapt"][1](a), d)
                 m_pick = cands[pick][1](a)
