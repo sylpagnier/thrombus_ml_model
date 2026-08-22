@@ -241,6 +241,8 @@ class VesselConfig:
     wound_count_range: tuple[int, int] = (1, 1)  # (min, max) wound sites per vessel
     wound_center_frac_range: tuple[float, float] = (0.3, 0.7)  # Allowed location range along vessel
     wound_half_width_frac_range: tuple[float, float] = (0.02, 0.08)  # Half-width as fraction of length
+    # Max |center - pathology peak| (fraction of length) when --wound-at-pathology is set.
+    wound_pathology_jitter_frac: float = 0.04
 
     # Physical Group Tags
     TAGS: Dict[str, int] = field(default_factory=lambda: {

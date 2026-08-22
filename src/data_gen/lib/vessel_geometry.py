@@ -115,6 +115,11 @@ def _build_meta(
             {"center_frac": ws.center_frac, "half_width_frac": ws.half_width_frac}
             for ws in wound_sites
         ]
+    peak_frac = params.get("pathology_peak_frac")
+    if peak_frac is not None:
+        meta["pathology_peak_frac"] = float(peak_frac)
+    if params.get("wound_at_pathology"):
+        meta["wound_at_pathology"] = True
 
     return meta
 

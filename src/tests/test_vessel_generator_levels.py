@@ -239,3 +239,119 @@ def test_random_sampling_can_reach_configured_maxes():
                 aneurysm_hits += 1
     assert stenosis_hits >= 1
     assert aneurysm_hits >= 1
+
+
+def test_wound_at_pathology_centers_on_stenosis_peak():
+    cfg = VesselConfig(phase="biochem", wound_pathology_jitter_frac=0.0)
+    rng = np.random.default_rng(0)
+    for i in range(16):
+        p = _sample_params(
+            i,
+            1,
+            cfg,
+            rng,
+            pathology_mode="max_stenosis",
+            wound_probability=1.0,
+            wound_at_pathology=True,
+        )
+        assert p["v_type"] == "stenosis"
+        assert p["wound_at_pathology"] is True
+        peak = p["pathology_peak_frac"]
+        assert peak is not None
+        assert len(p["wound_sites"]) == 1
+        assert p["wound_sites"][0]["center_frac"] == pytest.approx(peak, abs=1e-9)
+        geom = compute_geometry_from_params(p, _gen_cfg(cfg))
+        assert geom.meta["pathology_peak_frac"] == pytest.approx(peak)
+        assert geom.meta["wound_at_pathology"] is True
+
+
+def test_wound_at_pathology_centers_on_aneurysm_peak():
+    cfg = VesselConfig(phase="biochem", wound_pathology_jitter_frac=0.0)
+    rng = np.random.default_rng(4)
+    p = _sample_params(
+        0,
+        1,
+        cfg,
+        rng,
+        pathology_mode="max_aneurysm",
+        wound_probability=1.0,
+        wound_at_pathology=True,
+    )
+    assert p["v_type"] == "aneurysm"
+    assert p["wound_sites"][0]["center_frac"] == pytest.approx(
+        p["pathology_peak_frac"], abs=1e-9
+    )
+
+
+def test_wound_at_pathology_stays_within_jitter():
+    jitter = 0.04
+    cfg = VesselConfig(phase="biochem", wound_pathology_jitter_frac=jitter)
+    rng = np.random.default_rng(8)
+    for i in range(24):
+        p = _sample_params(
+            i,
+            1,
+            cfg,
+            rng,
+            pathology_mode="max_stenosis",
+            wound_probability=1.0,
+            wound_at_pathology=True,
+        )
+        center = p["wound_sites"][0]["center_frac"]
+        peak = p["pathology_peak_frac"]
+        assert abs(center - peak) <= jitter + 1e-9
+
+
+def test_wound_at_pathology_falls_back_on_straight():
+    cfg = VesselConfig(phase="kinematics", wound_pathology_jitter_frac=0.0)
+    rng = np.random.default_rng(1)
+    found = 0
+    lo, hi = cfg.wound_center_frac_range
+    for i in range(200):
+        p = _sample_params(
+            i, 0, cfg, rng, wound_probability=1.0, wound_at_pathology=True
+        )
+        if p["v_type"] != "straight":
+            continue
+        found += 1
+        assert p["pathology_peak_frac"] is None
+        assert len(p["wound_sites"]) == 1
+        center = p["wound_sites"][0]["center_frac"]
+        assert lo - 0.05 <= center <= hi + 0.05
+    assert found >= 5
+
+
+def test_wound_random_placement_is_not_forced_to_peak():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(2)
+    far = 0
+    for i in range(40):
+        p = _sample_params(
+            i,
+            1,
+            cfg,
+            rng,
+            pathology_mode="max_stenosis",
+            wound_probability=1.0,
+            wound_at_pathology=False,
+        )
+        d = abs(p["wound_sites"][0]["center_frac"] - p["pathology_peak_frac"])
+        if d > 0.1:
+            far += 1
+    assert far >= 1
+
+
+def test_wound_at_pathology_without_wounds_is_a_noop():
+    cfg = VesselConfig(phase="biochem")
+    rng = np.random.default_rng(3)
+    p = _sample_params(
+        0,
+        1,
+        cfg,
+        rng,
+        pathology_mode="max_stenosis",
+        wound_probability=0.0,
+        wound_at_pathology=True,
+    )
+    assert p["wound_sites"] == []
+    assert p["pathology_peak_frac"] is not None

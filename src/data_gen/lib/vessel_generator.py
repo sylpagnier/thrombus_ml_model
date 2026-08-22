@@ -323,6 +323,46 @@ def stenosis_wall_offset_for_occlusion(
     return (lumen_frac - 1.0) * float(width) / 2.0
 
 
+_WOUND_END_MARGIN_FRAC = 0.05  # keep Wound B-splines off inlet/outlet endpoints
+
+
+def _clip_wound_center(center: float, half_width: float) -> float:
+    """Clamp a wound center so the segment stays on the interior of the wall."""
+    lo = float(half_width + _WOUND_END_MARGIN_FRAC)
+    hi = float(1.0 - half_width - _WOUND_END_MARGIN_FRAC)
+    if hi < lo:
+        return 0.5
+    return float(np.clip(center, lo, hi))
+
+
+def _sample_wound_sites(
+    rng: np.random.Generator,
+    cfg: VesselConfig,
+    *,
+    wound_probability: float,
+    wound_at_pathology: bool = False,
+    pathology_peak_frac: float | None = None,
+) -> list[dict[str, float]]:
+    """Draw wound collars. Pathology placement is used only when a peak exists."""
+    if float(rng.random()) >= float(wound_probability):
+        return []
+    n_wounds = int(rng.integers(cfg.wound_count_range[0], cfg.wound_count_range[1] + 1))
+    sites: list[dict[str, float]] = []
+    place_at_peak = bool(wound_at_pathology) and pathology_peak_frac is not None
+    jitter = max(0.0, float(cfg.wound_pathology_jitter_frac))
+    for _ in range(n_wounds):
+        half_w = float(rng.uniform(*cfg.wound_half_width_frac_range))
+        if place_at_peak:
+            center = float(pathology_peak_frac) + float(rng.uniform(-jitter, jitter))
+        else:
+            center = float(rng.uniform(*cfg.wound_center_frac_range))
+        sites.append({
+            "center_frac": _clip_wound_center(center, half_w),
+            "half_width_frac": half_w,
+        })
+    return sites
+
+
 def _sample_params(
         idx: int,
         level: int,
@@ -331,6 +371,7 @@ def _sample_params(
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
         wound_probability: float | None = None,
+        wound_at_pathology: bool = False,
 ) -> Dict[str, Any]:
     """
     Draw ALL random numbers for one vessel and return a plain picklable dict.
@@ -383,6 +424,7 @@ def _sample_params(
 
     # 1. Main Clinical Pathology
     offsets = np.zeros(n)
+    pathology_peak_frac: float | None = None
     if v_type != "straight":
         if magnitude_mode == "max_stenosis":
             mag = cfg.max_stenosis_wall_offset(width)
@@ -430,6 +472,7 @@ def _sample_params(
             skew_factor = float(rng.uniform(-0.3, 0.3))
             skew = 1.0 + skew_factor * ((x_idx - peak) / n)
         offsets = mag * gauss * skew
+        pathology_peak_frac = float(peak) / float(max(n - 1, 1))
 
     if v_type == "straight":
         path_loc = 2
@@ -520,14 +563,14 @@ def _sample_params(
                 amplitude = abs(float(amplitude))
 
     # 5. Wound Sites
-    wound_sites = []
     wound_prob = wound_probability if wound_probability is not None else cfg.wound_probability
-    if float(rng.random()) < wound_prob:
-        n_wounds = int(rng.integers(cfg.wound_count_range[0], cfg.wound_count_range[1] + 1))
-        for _ in range(n_wounds):
-            center = float(rng.uniform(*cfg.wound_center_frac_range))
-            half_w = float(rng.uniform(*cfg.wound_half_width_frac_range))
-            wound_sites.append({"center_frac": center, "half_width_frac": half_w})
+    wound_sites = _sample_wound_sites(
+        rng,
+        cfg,
+        wound_probability=float(wound_prob),
+        wound_at_pathology=wound_at_pathology,
+        pathology_peak_frac=pathology_peak_frac,
+    )
 
     return {
         "idx": idx,
@@ -547,6 +590,8 @@ def _sample_params(
         "path_loc": path_loc,
         "pathology_mode": pathology_mode or "random",
         "aneurysm_wall_mode": aneurysm_wall_mode,
+        "pathology_peak_frac": pathology_peak_frac,
+        "wound_at_pathology": bool(wound_at_pathology),
         "wound_sites": wound_sites,
     }
 
@@ -883,6 +928,7 @@ class VesselGenerator:
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
         wound_probability: float | None = None,
+        wound_at_pathology: bool = False,
     ) -> Dict[str, Any]:
         """Sample one vessel parameter dict.
 
@@ -897,6 +943,7 @@ class VesselGenerator:
             pathology_mode=pathology_mode,
             aneurysm_wall_mode=aneurysm_wall_mode,
             wound_probability=wound_probability,
+            wound_at_pathology=wound_at_pathology,
         )
 
     def _cfg_dict(self) -> Dict[str, Any]:
@@ -995,6 +1042,7 @@ class VesselGenerator:
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
         wound_probability: float | None = None,
+        wound_at_pathology: bool = False,
     ) -> None:
         """
         Parallel batch vessel generation.
@@ -1018,6 +1066,9 @@ class VesselGenerator:
                          or ``straight_max`` (straight vessel + max stenosis or aneurysm).
         aneurysm_wall_mode : ``one`` (default, max offset on a single wall) or
                              ``mirrored`` (both walls). Applies to max-strength aneurysms.
+        wound_probability : chance each vessel gets a Wound physical group (``1`` via ``--wound``).
+        wound_at_pathology : if True, center wounds on the stenosis/aneurysm peak when present;
+                             straight vessels keep the random ``wound_center_frac_range`` draw.
         """
         pathology_mode = normalize_pathology_mode(pathology_mode)
         aneurysm_wall_mode = normalize_aneurysm_wall_mode(aneurysm_wall_mode)
@@ -1045,6 +1096,13 @@ class VesselGenerator:
             logger.info("Pathology mode: %s", pathology_mode)
         if aneurysm_wall_mode != "one":
             logger.info("Aneurysm wall mode: %s", aneurysm_wall_mode)
+        if wound_probability:
+            extra = (
+                "; placed at stenosis/aneurysm when present"
+                if wound_at_pathology
+                else ""
+            )
+            logger.info("Wound sites enabled (p=%.2f)%s", float(wound_probability), extra)
 
         cfg_d   = self._cfg_dict()
         cfg_d["unit"] = unit
@@ -1061,6 +1119,7 @@ class VesselGenerator:
                 pathology_mode=pathology_mode,
                 aneurysm_wall_mode=aneurysm_wall_mode,
                 wound_probability=wound_probability,
+                wound_at_pathology=wound_at_pathology,
             )
             for i in range(n)
         ]
@@ -1143,6 +1202,7 @@ class VesselGenerator:
                     pathology_mode=pathology_mode,
                     aneurysm_wall_mode=aneurysm_wall_mode,
                     wound_probability=wound_probability,
+                    wound_at_pathology=wound_at_pathology,
                 )
                 for failed_p in failed_params
             ]
@@ -1209,6 +1269,7 @@ class VesselGeneratorPhase3(VesselGenerator):
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
         wound_probability: float | None = None,
+        wound_at_pathology: bool = False,
     ) -> None:
         if start_idx is None:
             start_idx = 0
@@ -1224,6 +1285,7 @@ class VesselGeneratorPhase3(VesselGenerator):
             pathology_mode=pathology_mode,
             aneurysm_wall_mode=aneurysm_wall_mode,
             wound_probability=wound_probability,
+            wound_at_pathology=wound_at_pathology,
         )
 
 
@@ -1354,9 +1416,12 @@ class BoundaryLayerPatchGenerator(VesselGenerator):
         rng: np.random.Generator,
         pathology_mode: str | None = None,
         aneurysm_wall_mode: str | None = None,
+        wound_probability: float | None = None,
+        wound_at_pathology: bool = False,
+        **_unused: Any,
     ) -> Dict[str, Any]:
-        # Patch cohort ignores level / pathology_mode / aneurysm_wall_mode: flat clot box.
-        del pathology_mode, aneurysm_wall_mode
+        # Patch cohort ignores level / pathology / wound knobs: flat clot box.
+        del pathology_mode, aneurysm_wall_mode, wound_probability, wound_at_pathology, _unused
         return _sample_patch_params(idx, self.cfg, rng)
 
 
@@ -1500,7 +1565,15 @@ def _vessel_gen_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--wound",
         action="store_true",
-        help="Enable synthetic wound sites (adds Wound tag to random boundary segments).",
+        help="Enable synthetic wound sites (adds Wound tag to boundary segments).",
+    )
+    p.add_argument(
+        "--wound-at-pathology",
+        action="store_true",
+        help=(
+            "Center wound sites on the stenosis or aneurysm peak when a pathology is present "
+            "(small jitter; straight vessels keep random placement). Implies --wound."
+        ),
     )
     p.add_argument("--no-plot", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -1529,7 +1602,8 @@ if __name__ == "__main__":
         unit_choice = str(args.unit).lower()
         pathology_mode = normalize_pathology_mode(args.pathology_mode)
         aneurysm_wall_mode = normalize_aneurysm_wall_mode(args.aneurysm_wall)
-        wound_probability = 1.0 if args.wound else 0.0
+        wound_at_pathology = bool(args.wound_at_pathology)
+        wound_probability = 1.0 if (args.wound or wound_at_pathology) else 0.0
     else:
         phase_n = _prompt_int_choice("Dataset (1=kinematics, 2=biochem)", (1, 2))
         level = _prompt_int_choice("Level (0=straight, 1=curved, 2=pro-clot)", (0, 1, 2))
@@ -1567,7 +1641,17 @@ if __name__ == "__main__":
             "Show matplotlib preview of generated meshes after this run?",
             default=False,
         )
-        wound_probability = 1.0 if (args.wound or _prompt_yes_no("Add wound sites to vessels?", default=False)) else 0.0
+        wound_probability = 1.0 if (
+            args.wound
+            or args.wound_at_pathology
+            or _prompt_yes_no("Add wound sites to vessels?", default=False)
+        ) else 0.0
+        wound_at_pathology = bool(args.wound_at_pathology)
+        if wound_probability > 0.0 and not wound_at_pathology:
+            wound_at_pathology = _prompt_yes_no(
+                "Place wounds near stenosis/aneurysm when present?",
+                default=False,
+            )
 
     if all(trio):
         vg = VesselGenerator(phase=phase)
@@ -1588,6 +1672,7 @@ if __name__ == "__main__":
         pathology_mode=pathology_mode,
         aneurysm_wall_mode=aneurysm_wall_mode,
         wound_probability=wound_probability,
+        wound_at_pathology=wound_at_pathology,
     )
 
     if show_vessel_plot:
